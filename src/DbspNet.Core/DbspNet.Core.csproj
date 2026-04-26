@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <!-- DbspNet.Sql implements its own IOperator for the recursive-CTE
+         batch-fixed-point runtime; that operator is a SQL-layer concern but
+         needs to register itself with the Core circuit via the internal
+         AddRawOperator surface. -->
+    <InternalsVisibleTo Include="DbspNet.Sql" />
+    <InternalsVisibleTo Include="DbspNet.Tests" />
+  </ItemGroup>
+</Project>

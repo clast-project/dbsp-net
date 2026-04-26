@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- CA1720 flags identifiers that collide with CLR type names. This
+         codebase models SQL, where "Integer", "Decimal", "Float", "String",
+         "Char", "Double" are canonical term names; enforcing the rule here
+         is noise. -->
+    <!-- CA1859 (prefer concrete return types for perf) fires pervasively on
+         polymorphic resolver helpers whose whole purpose is to return one of
+         several subtypes. Idiomatic code shouldn't fight the abstract return. -->
+    <NoWarn>$(NoWarn);CA1720;CA1859</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The PBT harness in DbspNet.Tests uses BatchPlanEvaluator as an oracle
+         for the incremental circuit; the evaluator is internal to the SQL
+         layer but safe to expose to tests within the same repo. -->
+    <InternalsVisibleTo Include="DbspNet.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Benchmark output is perf-data, not library code; suppress rules that
+         don't add signal here. CA1305 (IFormatProvider on interpolated
+         strings) is noise for ASCII-only numeric report text. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CA1305</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />
+    <ProjectReference Include="..\DbspNet.Sql\DbspNet.Sql.csproj" />
+  </ItemGroup>
+</Project>

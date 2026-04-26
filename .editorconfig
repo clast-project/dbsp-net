@@ -1,0 +1,44 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml,md}]
+indent_size = 2
+
+[*.{csproj,props,targets,xml}]
+indent_size = 2
+
+[*.cs]
+# Namespace style
+csharp_style_namespace_declarations = file_scoped:warning
+
+# Expression-bodied members
+csharp_style_expression_bodied_methods = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties = true:suggestion
+
+# var usage
+csharp_style_var_for_built_in_types = true:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_style_var_elsewhere = true:suggestion
+
+# Using directives
+csharp_using_directive_placement = outside_namespace:warning
+dotnet_sort_system_directives_first = true
+
+# Unused — IDE0005 requires GenerateDocumentationFile; leave at default severity
+dotnet_diagnostic.CA1707.severity = none   # underscore-named identifiers OK in tests
+dotnet_diagnostic.CA1000.severity = none   # static Empty/etc. on generics is idiomatic
+dotnet_diagnostic.CA1815.severity = none   # struct equality suggested when records already provide it
+dotnet_diagnostic.CA1051.severity = none   # visible instance fields OK in internal value types
+dotnet_diagnostic.CA1861.severity = none   # inline arrays in tests are fine
+dotnet_diagnostic.CA1002.severity = none   # List&lt;T&gt; surface is fine for prototype
+dotnet_diagnostic.CA1034.severity = none   # nested public types allowed
+dotnet_diagnostic.CA1711.severity = none   # Stream/etc. suffixes are idiomatic in DBSP
+dotnet_diagnostic.CA1822.severity = none   # fluent builder methods don't all need instance state
+dotnet_diagnostic.CA1716.severity = none   # VB keyword collisions (Optional) don't matter here

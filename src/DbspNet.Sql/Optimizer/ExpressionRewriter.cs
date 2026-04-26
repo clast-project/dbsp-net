@@ -1,0 +1,188 @@
+using System.Collections.Generic;
+using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
+using BinOp = DbspNet.Sql.Parser.Ast.BinaryOperator;
+
+namespace DbspNet.Sql.Optimizer;
+
+/// <summary>
+/// Structural manipulation of <see cref="ResolvedExpression"/> trees —
+/// helpers the optimizer uses for predicate pushdown and projection
+/// composition. Every routine is pure and returns a new tree; nothing is
+/// mutated.
+/// </summary>
+internal static class ExpressionRewriter
+{
+    /// <summary>
+    /// Split a top-level <c>AND</c> conjunction into its conjuncts. Nested
+    /// ANDs flatten, so <c>(a AND b) AND c</c> yields <c>[a, b, c]</c>.
+    /// Non-AND expressions yield a single-element list.
+    /// </summary>
+    public static List<ResolvedExpression> SplitAnd(ResolvedExpression expr)
+    {
+        var result = new List<ResolvedExpression>();
+        Walk(expr, result);
+        return result;
+
+        static void Walk(ResolvedExpression e, List<ResolvedExpression> acc)
+        {
+            if (e is ResolvedBinary { Operator: BinOp.And } b)
+            {
+                Walk(b.Left, acc);
+                Walk(b.Right, acc);
+            }
+            else
+            {
+                acc.Add(e);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Combine a list of conjuncts into a single <c>a AND b AND …</c>
+    /// expression (left-associative). Throws on an empty list.
+    /// </summary>
+    public static ResolvedExpression AndAll(IReadOnlyList<ResolvedExpression> conjuncts)
+    {
+        if (conjuncts.Count == 0)
+        {
+            throw new ArgumentException("AndAll requires at least one conjunct", nameof(conjuncts));
+        }
+
+        var result = conjuncts[0];
+        for (var i = 1; i < conjuncts.Count; i++)
+        {
+            var nullable = result.Type.Nullable || conjuncts[i].Type.Nullable;
+            result = new ResolvedBinary(
+                BinOp.And, result, conjuncts[i], new SqlBooleanType(nullable));
+        }
+
+        return result;
+    }
+
+    /// <summary>Collect every distinct column index referenced by the expression.</summary>
+    public static HashSet<int> CollectColumnIndices(ResolvedExpression expr)
+    {
+        var set = new HashSet<int>();
+        Walk(expr, set);
+        return set;
+
+        static void Walk(ResolvedExpression e, HashSet<int> acc)
+        {
+            switch (e)
+            {
+                case ResolvedColumn c:
+                    acc.Add(c.Index);
+                    break;
+                case ResolvedBinary b:
+                    Walk(b.Left, acc);
+                    Walk(b.Right, acc);
+                    break;
+                case ResolvedUnary u:
+                    Walk(u.Operand, acc);
+                    break;
+                case ResolvedIsNull isn:
+                    Walk(isn.Operand, acc);
+                    break;
+                case ResolvedCast cast:
+                    Walk(cast.Operand, acc);
+                    break;
+                case ResolvedFunctionCall fn:
+                    foreach (var a in fn.Arguments)
+                    {
+                        Walk(a, acc);
+                    }
+
+                    break;
+                // ResolvedLiteral: no columns.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Shift every column index in the expression by <paramref name="delta"/>.
+    /// Used when pushing a predicate past a join into the right-side input:
+    /// join-output columns [leftCount, leftCount + rightCount) need to
+    /// become [0, rightCount) before being applied to the right input.
+    /// </summary>
+    public static ResolvedExpression ShiftColumnIndices(ResolvedExpression expr, int delta)
+    {
+        return expr switch
+        {
+            ResolvedColumn c => new ResolvedColumn(c.Index + delta, c.Type),
+            ResolvedBinary b => new ResolvedBinary(
+                b.Operator,
+                ShiftColumnIndices(b.Left, delta),
+                ShiftColumnIndices(b.Right, delta),
+                b.Type),
+            ResolvedUnary u => new ResolvedUnary(
+                u.Operator, ShiftColumnIndices(u.Operand, delta), u.Type),
+            ResolvedIsNull isn => new ResolvedIsNull(
+                ShiftColumnIndices(isn.Operand, delta), isn.Negated, isn.Type),
+            ResolvedCast cast => new ResolvedCast(
+                ShiftColumnIndices(cast.Operand, delta), cast.Type),
+            ResolvedFunctionCall fn => new ResolvedFunctionCall(
+                fn.FunctionName,
+                ShiftArgs(fn.Arguments, delta),
+                fn.Type),
+            _ => expr,
+        };
+
+        static List<ResolvedExpression> ShiftArgs(IReadOnlyList<ResolvedExpression> args, int d)
+        {
+            var list = new List<ResolvedExpression>(args.Count);
+            foreach (var a in args)
+            {
+                list.Add(ShiftColumnIndices(a, d));
+            }
+
+            return list;
+        }
+    }
+
+    /// <summary>
+    /// Substitute each <see cref="ResolvedColumn"/>(i) reference in
+    /// <paramref name="expr"/> with the expression
+    /// <paramref name="projection"/>[i]. Used to push a predicate past a
+    /// <see cref="ProjectPlan"/>: a predicate referring to projection
+    /// output columns is rewritten to refer to the projection's input.
+    /// </summary>
+    public static ResolvedExpression SubstituteViaProjection(
+        ResolvedExpression expr,
+        IReadOnlyList<ProjectionItem> projection)
+    {
+        return expr switch
+        {
+            ResolvedColumn c => projection[c.Index].Expression,
+            ResolvedBinary b => new ResolvedBinary(
+                b.Operator,
+                SubstituteViaProjection(b.Left, projection),
+                SubstituteViaProjection(b.Right, projection),
+                b.Type),
+            ResolvedUnary u => new ResolvedUnary(
+                u.Operator, SubstituteViaProjection(u.Operand, projection), u.Type),
+            ResolvedIsNull isn => new ResolvedIsNull(
+                SubstituteViaProjection(isn.Operand, projection), isn.Negated, isn.Type),
+            ResolvedCast cast => new ResolvedCast(
+                SubstituteViaProjection(cast.Operand, projection), cast.Type),
+            ResolvedFunctionCall fn => new ResolvedFunctionCall(
+                fn.FunctionName,
+                SubstituteArgs(fn.Arguments, projection),
+                fn.Type),
+            _ => expr,
+        };
+
+        static List<ResolvedExpression> SubstituteArgs(
+            IReadOnlyList<ResolvedExpression> args,
+            IReadOnlyList<ProjectionItem> p)
+        {
+            var list = new List<ResolvedExpression>(args.Count);
+            foreach (var a in args)
+            {
+                list.Add(SubstituteViaProjection(a, p));
+            }
+
+            return list;
+        }
+    }
+}
