@@ -20,6 +20,29 @@ Legend:
   but indexes are not user-declared.
 - **[P3]** Constraints beyond NOT NULL (UNIQUE, CHECK, FOREIGN KEY). Feldera
   has partial support.
+- **[P3]** `ALTER TABLE` / `DROP TABLE` / `DROP VIEW` / `COMMENT ON`. The
+  plan is built once from a complete source string; schema evolution
+  isn't part of the model and would need a mutable catalog.
+
+### DML and sessions
+
+DbspNet is push-driven: data enters via `TableInput.Push`, and queries
+are compiled once and stepped. The entries below are recognised neither
+by the parser nor by the engine model. The ones marked *by design*
+reflect that shape, not a backlog.
+
+- *by design* — `INSERT` / `UPDATE` / `DELETE` / `MERGE` / `TRUNCATE`.
+  Row mutation goes through `TableInput.Push(rows)` and weight-bearing
+  retractions, not statement-level DML. Feldera matches this: SQL is
+  view-definition only, with mutation through the connector layer.
+- *by design* — `BEGIN` / `COMMIT` / `ROLLBACK` / savepoints / isolation
+  levels. Each `Step()` is the atomic unit; there is no client-visible
+  transaction surface.
+- **[P2]** Bind parameters (`?`, `@name`, `$1`). Literals are baked into
+  the plan today; parameterised compilation would need a parameter-slot
+  AST node and a re-plan-with-bindings API.
+- **[P3]** `EXPLAIN`. The plan is reachable via the in-process API; no
+  SQL surface for it.
 
 ### Query constructs
 - **[P1]** `IN` / `EXISTS` subqueries. DbspNet supports uncorrelated scalar
@@ -66,6 +89,41 @@ Legend:
   Feldera supports neither `INTERSECT ALL` nor `EXCEPT ALL`.
 - **[P2]** `UNNEST`, `LATERAL`. Feldera supports both.
 - **[P2]** `GROUPING SETS`, `ROLLUP`, `CUBE`.
+- **[P1]** `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST`. No tokens
+  and no `SelectStatement` fields. Incremental TopK is a Feldera-
+  supported pattern (RANK / ROW_NUMBER restricted to TopK windows);
+  `LIMIT` without `ORDER BY` is also useful for snapshot queries.
+- **[P1]** `SELECT DISTINCT` (SELECT-list form). Distinct-inside-
+  aggregates is listed separately under Aggregate functions; the
+  list form (`SELECT DISTINCT a, b FROM t`) reduces to a `DistinctOp`
+  over the projection.
+- **[P1]** `CASE WHEN ... THEN ... [ELSE ...] END` and the function-
+  form variants (`IIF`, `DECODE`). No keyword, no AST node, no
+  expression-compiler support. Fundamental conditional.
+- **[P1]** `BETWEEN x AND y` / `NOT BETWEEN`. Desugars at parse time
+  to `x >= a AND x <= b`; no runtime work needed.
+- **[P1]** `LIKE`, `ILIKE`, `SIMILAR TO`. No keyword. Runtime story
+  ties into the Utf8String roadmap noted under Type system.
+- **[P1]** `IN (literal_list)` / `NOT IN (literal_list)`. Distinct
+  from the IN-subquery form already listed — desugars to a disjunction
+  of equalities at parse time, no operator-level support needed.
+- **[P1]** `IS [NOT] DISTINCT FROM`. NULL-safe equality. The parser's
+  `IS` arm only accepts `NULL` / `NOT NULL` today.
+- **[P2]** `IS TRUE` / `IS FALSE` / `IS UNKNOWN`. Boolean tests; same
+  parser arm as above.
+- **[P1]** `JOIN ... USING (col, ...)`. Parser only accepts `ON`.
+  Desugars to `ON a.c = b.c AND ...` plus dedup of the join columns
+  in the projection.
+- **[P2]** `VALUES (...), (...) AS t(a, b)` as a row source.
+  `ParsePrimaryTableRef` accepts only `(SELECT ...)` or a base table;
+  would need a literal-table constructor.
+- **[P1]** `||` string concatenation operator. Lexer has no `||`;
+  users must call `CONCAT(...)`. One lexer entry + one parser arm.
+- **[P2]** `ROW(...)` and `ARRAY[...]` constructors. Tied to the
+  deferred ROW/STRUCT and ARRAY types under Type system.
+- **[P2]** Exponentiation operator `**` / `^`. `POWER(x, y)` exists.
+- **[P2]** Bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`).
+- **[P2]** `OVERLAPS`, `ALL` / `ANY` / `SOME` quantifiers.
 
 ### Aggregate functions
 - **[P1]** `MIN`, `MAX` are included in v1 via per-group multiset tracking.
@@ -167,13 +225,35 @@ Legend:
 - **[P3]** CHAR(n) with space-padding semantics.
 
 ### Streaming extensions
-- **[P2]** `LATENESS` bounds. Feldera-specific.
+- **[P1]** `LATENESS` bounds — or any equivalent retain-keys story. The
+  `LATENESS` syntax is Feldera-specific, but the underlying capability
+  (bounded-history trace GC driven by a monotonicity analysis) is the
+  standard answer in every long-running IVM engine surveyed: Feldera's
+  `MonotoneAnalyzer` + `IntegrateTraceRetainKeysOperator`, Materialize's
+  temporal filters, Flink's watermark-driven state expiry. Without some
+  form of retain-keys analysis, `_leftTrace` / `_rightTrace` /
+  `RecursiveCteOp._r` grow without bound — that caps DbspNet to
+  bounded workloads. A minimal user-declared `LATENESS` annotation +
+  insert-limiter is small and unlocks long-running pipelines; the
+  full Calcite-style monotonicity analyser is heavier.
 - **[P3]** `WATERMARK` (experimental in Feldera).
 - **[P2]** `append_only` table annotation. Feldera-specific.
 - **[P2]** `emit_final` view annotation. Feldera-specific.
 
 ### UDFs
 - **[P2]** User-defined scalar, table, and aggregate functions.
+
+### Surface syntax
+
+Lexer-level dialect niceties not parsed today. None affect expressive
+power — each has an equivalent already supported — but they show up in
+copy-pasted queries from other engines.
+
+- **[P3]** Identifier quoting variants. Lexer accepts only double-
+  quoted identifiers; backtick (MySQL) and `[bracket]` (T-SQL) are
+  not recognised.
+- **[P3]** Postgres `expr::type` cast syntax. Only `CAST(expr AS type)`
+  is accepted.
 
 ### v1 resolver restrictions
 
@@ -188,8 +268,12 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   `ExtractKey` to run compiled delegates.
 - **[P1]** `INNER JOIN` requires at least one equi-key conjunct in the `ON`
   clause. Pure-inequality joins (`ON a.x > b.y`) and cross joins
-  (`ON TRUE`) are rejected. Feldera handles these via Calcite-style
-  cross-join-then-filter; v1 never materialises a cross product.
+  (`ON TRUE`) are rejected. v1 never materialises a cross product. The
+  v1 framing positioned this as a deliberate scope choice, but
+  Calcite-style cross-join-then-filter is standard SQL surface — TPC-H
+  Q3 and similar shapes need it — so loosening this is closer to a
+  completeness gap than a deferred niceness. Feldera handles it via
+  Calcite.
 - **[P1]** `SELECT *` is forbidden with `GROUP BY` / aggregates. Feldera
   (via Calcite) rewrites to an explicit column list during resolution.
 - **[P1]** Scalar function library is still modest. Currently supported:
@@ -266,3 +350,17 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
 - **[P2]** SqlLogicTest harness integration. Feldera's SLT suite is the
   gold standard for compatibility testing.
 - **[P2]** TPC-H, NEXMark benchmarks.
+
+## Non-goals
+
+Items explicitly *not* on the roadmap, recorded so future contributors
+don't ask whether they should be.
+
+- **Higher-order IVM** (DBToaster-style recursive differencing — the
+  delta of the delta of the delta…). DBToaster reports 3–6 orders of
+  magnitude over re-evaluation by materialising every derivative as
+  its own view, but both DBSP/Feldera and Materialize deliberately
+  stop at first-order incremental over the IR. The complexity cost is
+  large and the win shape doesn't match streaming workloads (it's
+  strongest for analytical refresh-on-update on small dimension
+  tables). DbspNet follows DBSP/Feldera here — first-order only.
