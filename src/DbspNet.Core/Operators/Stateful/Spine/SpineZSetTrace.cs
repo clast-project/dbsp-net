@@ -5,18 +5,18 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 
 /// <summary>
 /// LSM-style trace over a Z-set: holds the running integral as a tiered
-/// sequence of immutable batches rather than a single consolidated
-/// dictionary. <see cref="Integrate"/> appends a new batch at level 0
-/// (O(1) regardless of trace size) and triggers compaction up the tier
-/// hierarchy per the supplied <see cref="ICompactionStrategy"/>.
+/// sequence of immutable sorted-columnar batches rather than a single
+/// consolidated dictionary. <see cref="Integrate"/> appends a new batch
+/// at level 0 (O(|delta| · log|delta|) for the sort) and triggers
+/// compaction up the tier hierarchy per the supplied
+/// <see cref="ICompactionStrategy"/>.
 /// </summary>
 /// <remarks>
 /// <para><b>Compared to the flat <c>ZSetTrace</c>:</b> the spine trades
-/// per-key read cost (probe N batches, sum weights) for cheap
-/// <see cref="Integrate"/> (no merge-on-write) and per-batch
+/// per-key read cost (one bloom-gated binary search per batch) for
+/// cheap <see cref="Integrate"/> (no merge-on-write) and per-batch
 /// serialisability (each batch is independently dumpable as a snapshot
-/// chunk). Phase 1 of the spine migration: the data structure stands
-/// alone, no operators are wired through it yet.</para>
+/// chunk).</para>
 /// <para><b>Snapshot bridge:</b> <see cref="Materialize"/> flattens the
 /// spine into a single <see cref="ZSet{TKey,TWeight}"/> — exactly the
 /// shape the current <c>IZSetTraceCodec</c> serialises. Per-batch
@@ -26,28 +26,30 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private readonly List<List<ZSet<TKey, TWeight>>> _levels = new();
+    private readonly List<List<SpineBatch<TKey, TWeight>>> _levels = new();
     private readonly ICompactionStrategy _strategy;
+    private readonly IComparer<TKey> _comparer;
 
     /// <summary>
     /// Creates an empty spine that uses
     /// <see cref="TieredCompactionStrategy.Default"/> (4 batches per
-    /// level) for compaction.
+    /// level) and <see cref="Comparer{TKey}.Default"/>.
     /// </summary>
-    public SpineZSetTrace() : this(TieredCompactionStrategy.Default)
+    public SpineZSetTrace() : this(TieredCompactionStrategy.Default, comparer: null)
     {
     }
 
-    public SpineZSetTrace(ICompactionStrategy strategy)
+    public SpineZSetTrace(ICompactionStrategy strategy, IComparer<TKey>? comparer = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
+        _comparer = comparer ?? Comparer<TKey>.Default;
     }
 
     /// <summary>
     /// Folds <paramref name="delta"/> into the trace by appending it as a
-    /// new batch at level 0, then running compaction to settlement.
-    /// Empty deltas are a no-op.
+    /// new sorted batch at level 0, then running compaction to
+    /// settlement. Empty deltas are a no-op.
     /// </summary>
     public void Integrate(ZSet<TKey, TWeight> delta)
     {
@@ -58,14 +60,14 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         }
 
         EnsureLevel(0);
-        _levels[0].Add(delta);
+        _levels[0].Add(SpineBatch<TKey, TWeight>.FromZSet(delta, _comparer));
         RunCompaction();
     }
 
     /// <summary>
     /// Returns the integrated weight of <paramref name="key"/> by
-    /// summing across every batch. Cost is O(B) where B is the total
-    /// batch count.
+    /// summing across every batch. Per batch: a cache-line bloom probe;
+    /// only batches that pay the bloom go to binary search.
     /// </summary>
     public TWeight WeightOf(TKey key)
     {
@@ -173,7 +175,7 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     {
         while (_levels.Count <= level)
         {
-            _levels.Add(new List<ZSet<TKey, TWeight>>());
+            _levels.Add(new List<SpineBatch<TKey, TWeight>>());
         }
     }
 
@@ -211,7 +213,8 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         // recent arrivals stay at the front so frequently-touched keys
         // don't get pushed deep into the tier hierarchy on every
         // compaction round.
-        var merged = MergeBatches(src, 0, action.BatchCount);
+        var toMerge = src.GetRange(0, action.BatchCount);
+        var merged = SpineBatch<TKey, TWeight>.Merge(toMerge, _comparer);
         src.RemoveRange(0, action.BatchCount);
 
         EnsureLevel(action.SourceLevel + 1);
@@ -221,21 +224,6 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         }
     }
 
-    private static ZSet<TKey, TWeight> MergeBatches(
-        List<ZSet<TKey, TWeight>> batches, int start, int count)
-    {
-        var b = new ZSetBuilder<TKey, TWeight>();
-        for (var i = 0; i < count; i++)
-        {
-            foreach (var (k, w) in batches[start + i])
-            {
-                b.Add(k, w);
-            }
-        }
-
-        return b.Build();
-    }
-
     private Dictionary<TKey, TWeight> MergeEntries()
     {
         var merged = new Dictionary<TKey, TWeight>();
@@ -243,7 +231,7 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         {
             foreach (var batch in level)
             {
-                foreach (var (k, w) in batch)
+                foreach (var (k, w) in batch.Entries())
                 {
                     if (merged.TryGetValue(k, out var existing))
                     {

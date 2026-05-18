@@ -10,34 +10,41 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// operators hold.
 /// </summary>
 /// <remarks>
-/// <see cref="GroupFor"/> walks all batches and unions each batch's
-/// per-key group into a fresh <see cref="ZSet{TValue,TWeight}"/>;
-/// <see cref="Entries"/> does the same key-major merge over the whole
-/// trace. See <see cref="SpineZSetTrace{TKey,TWeight}"/> for the
-/// compaction model — identical here.
+/// Per-batch storage is sorted-columnar (outer keys sorted, inner
+/// values sorted within each group). <see cref="GroupFor"/> on each
+/// batch is a bloom-gated binary search; <see cref="Entries"/> still
+/// goes through a single materialising merge so the existing snapshot
+/// codec sees the same shape.
 /// </remarks>
 public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     where TKey : notnull
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private readonly List<List<IndexedZSet<TKey, TValue, TWeight>>> _levels = new();
+    private readonly List<List<SpineIndexedBatch<TKey, TValue, TWeight>>> _levels = new();
     private readonly ICompactionStrategy _strategy;
+    private readonly IComparer<TKey> _keyComparer;
+    private readonly IComparer<TValue> _valueComparer;
 
-    public SpineIndexedZSetTrace() : this(TieredCompactionStrategy.Default)
+    public SpineIndexedZSetTrace() : this(TieredCompactionStrategy.Default, keyComparer: null, valueComparer: null)
     {
     }
 
-    public SpineIndexedZSetTrace(ICompactionStrategy strategy)
+    public SpineIndexedZSetTrace(
+        ICompactionStrategy strategy,
+        IComparer<TKey>? keyComparer = null,
+        IComparer<TValue>? valueComparer = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
+        _keyComparer = keyComparer ?? Comparer<TKey>.Default;
+        _valueComparer = valueComparer ?? Comparer<TValue>.Default;
     }
 
     /// <summary>
-    /// Folds <paramref name="delta"/> in by appending it as a new batch
-    /// at level 0, then running compaction to settlement. Empty deltas
-    /// are a no-op.
+    /// Folds <paramref name="delta"/> in by appending it as a new sorted
+    /// batch at level 0, then running compaction to settlement. Empty
+    /// deltas are a no-op.
     /// </summary>
     public void Integrate(IndexedZSet<TKey, TValue, TWeight> delta)
     {
@@ -48,14 +55,16 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         }
 
         EnsureLevel(0);
-        _levels[0].Add(delta);
+        _levels[0].Add(SpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
+            delta, _keyComparer, _valueComparer));
         RunCompaction();
     }
 
     /// <summary>
     /// Returns the integrated group for <paramref name="key"/> — the
     /// union of every batch's group for that key, with weights summed
-    /// per value. Zero-weight values are filtered.
+    /// per value. Zero-weight values are filtered. Bloom-gated per
+    /// batch; matching batches binary-search for the key.
     /// </summary>
     public ZSet<TValue, TWeight> GroupFor(TKey key)
     {
@@ -171,7 +180,7 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     {
         while (_levels.Count <= level)
         {
-            _levels.Add(new List<IndexedZSet<TKey, TValue, TWeight>>());
+            _levels.Add(new List<SpineIndexedBatch<TKey, TValue, TWeight>>());
         }
     }
 
@@ -205,7 +214,9 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
                 $"at level {action.SourceLevel}, which holds {src.Count}");
         }
 
-        var merged = MergeBatches(src, 0, action.BatchCount);
+        var toMerge = src.GetRange(0, action.BatchCount);
+        var merged = SpineIndexedBatch<TKey, TValue, TWeight>.Merge(
+            toMerge, _keyComparer, _valueComparer);
         src.RemoveRange(0, action.BatchCount);
 
         EnsureLevel(action.SourceLevel + 1);
@@ -215,24 +226,6 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         }
     }
 
-    private static IndexedZSet<TKey, TValue, TWeight> MergeBatches(
-        List<IndexedZSet<TKey, TValue, TWeight>> batches, int start, int count)
-    {
-        var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        for (var i = 0; i < count; i++)
-        {
-            foreach (var (k, group) in batches[start + i])
-            {
-                foreach (var (v, w) in group)
-                {
-                    b.Add(k, v, w);
-                }
-            }
-        }
-
-        return b.Build();
-    }
-
     private List<KeyValuePair<TKey, ZSet<TValue, TWeight>>> MaterialiseGroups()
     {
         var perKey = new Dictionary<TKey, Dictionary<TValue, TWeight>>();
@@ -240,7 +233,7 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         {
             foreach (var batch in level)
             {
-                foreach (var (k, group) in batch)
+                foreach (var (k, group) in batch.Entries())
                 {
                     if (!perKey.TryGetValue(k, out var inner))
                     {

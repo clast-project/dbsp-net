@@ -28,7 +28,8 @@ public static class SpineStatefulOperators
         this CircuitBuilder builder,
         Stream<ZSet<TKey, TWeight>> input,
         ICompactionStrategy? compactionStrategy = null,
-        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null)
+        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
+        IComparer<TKey>? keyComparer = null)
         where TKey : notnull
         where TWeight : struct, IZRing<TWeight>
     {
@@ -37,7 +38,7 @@ public static class SpineStatefulOperators
 
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
         builder.AddRawOperator(
-            new SpineDistinctOp<TKey, TWeight>(input, output, compactionStrategy, snapshotCodec));
+            new SpineDistinctOp<TKey, TWeight>(input, output, compactionStrategy, snapshotCodec, keyComparer));
         return output;
     }
 }
