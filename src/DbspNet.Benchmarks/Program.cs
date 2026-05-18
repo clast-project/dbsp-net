@@ -30,6 +30,7 @@ RunJoinedGroupByBenchmark(output);
 RunJoinedGroupByEmittedCodecBenchmark(output);
 RunJoinedGroupByTypedBenchmark(output);
 RunTransitiveClosureBenchmark(output);
+PureTraceBenchmark.Run(output);
 
 AppendInterpretation(output);
 

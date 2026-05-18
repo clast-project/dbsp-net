@@ -72,6 +72,50 @@ internal static class BenchmarkHarness
         return times[times.Count / 2];
     }
 
+    /// <summary>
+    /// Same idea as <see cref="MedianPerStepMicros"/> but for
+    /// non-mutating sub-microsecond operations (probes, lookups). Each
+    /// sample times <paramref name="iterationsPerSample"/> back-to-back
+    /// calls and divides — necessary because the stopwatch resolution
+    /// (~100ns on Windows) otherwise rounds individual sub-100ns calls
+    /// to zero.
+    /// </summary>
+    /// <remarks>
+    /// Only safe for operations that don't mutate <typeparamref name="TState"/>.
+    /// For mutating ops (e.g. <c>Integrate</c>), use the per-step variant
+    /// so successive samples see a consistent state size.
+    /// </remarks>
+    public static double MedianPerStepNanos<TState>(
+        Func<TState> setup,
+        Action<TState> oneStep,
+        int warmupSteps = 100,
+        int measureSteps = 50,
+        int iterationsPerSample = 1000)
+    {
+        var state = setup();
+        for (var i = 0; i < warmupSteps; i++)
+        {
+            oneStep(state);
+        }
+
+        var times = new List<double>(measureSteps);
+        var sw = new Stopwatch();
+        for (var i = 0; i < measureSteps; i++)
+        {
+            sw.Restart();
+            for (var j = 0; j < iterationsPerSample; j++)
+            {
+                oneStep(state);
+            }
+
+            sw.Stop();
+            times.Add(sw.Elapsed.TotalNanoseconds / iterationsPerSample);
+        }
+
+        times.Sort();
+        return times[times.Count / 2];
+    }
+
     public static string FormatMs(double ms) =>
         ms switch
         {

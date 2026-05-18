@@ -9,5 +9,8 @@
     <!-- Persistence enumerates RootCircuit.Operators for snapshot
          orchestration; the IOperator/Operators surface is internal. -->
     <InternalsVisibleTo Include="DbspNet.Persistence" />
+    <!-- Benchmarks compare internal ZSetTrace / IndexedZSetTrace against
+         the public Spine variants. -->
+    <InternalsVisibleTo Include="DbspNet.Benchmarks" />
   </ItemGroup>
 </Project>
