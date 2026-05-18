@@ -18,7 +18,9 @@ namespace DbspNet.Core.Operators.Stateful;
 /// </para>
 /// <list type="bullet">
 /// <item><b>stayed-matched</b> (old ∃ right, new ∃ right): the standard
-/// inner-join bilinear delta.</item>
+/// inner-join bilinear delta, in its two-pass asymmetric form
+/// <c>dlK ⋈ newR + oldL ⋈ drK</c> (where <c>newR = oldR + drK</c> is
+/// already computed for the case-selection check below).</item>
 /// <item><b>stayed-unmatched</b> (old ∄ right, new ∄ right):
 /// <c>delta = dl × {NULL}</c>.</item>
 /// <item><b>gained-match</b> (old ∄ right, new ∃ right):
@@ -140,10 +142,11 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
 
             if (oldMatched && newMatched)
             {
-                // Bilinear inner-join delta, just for this key.
-                JoinInto(builder, key, dlK, oldR);
+                // Bilinear inner-join delta, just for this key. Two-pass
+                // asymmetric form: dlK ⋈ newR absorbs both dlK ⋈ oldR and
+                // the cross term dlK ⋈ drK.
+                JoinInto(builder, key, dlK, newR);
                 JoinInto(builder, key, oldL, drK);
-                JoinInto(builder, key, dlK, drK);
             }
             else if (!oldMatched && !newMatched)
             {
