@@ -13,7 +13,8 @@ public static class StatefulOperators
 {
     public static Stream<ZSet<TKey, TWeight>> Distinct<TKey, TWeight>(
         this CircuitBuilder builder,
-        Stream<ZSet<TKey, TWeight>> input)
+        Stream<ZSet<TKey, TWeight>> input,
+        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null)
         where TKey : notnull
         where TWeight : struct, IZRing<TWeight>
     {
@@ -21,7 +22,7 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(input);
 
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
-        builder.AddRawOperator(new DistinctOp<TKey, TWeight>(input, output));
+        builder.AddRawOperator(new DistinctOp<TKey, TWeight>(input, output, snapshotCodec));
         return output;
     }
 
@@ -85,7 +86,9 @@ public static class StatefulOperators
         this CircuitBuilder builder,
         Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
         Stream<IndexedZSet<TKey, TRight, TWeight>> right,
-        Func<TKey, TLeft, TRight, TOut> combine)
+        Func<TKey, TLeft, TRight, TOut> combine,
+        IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -98,7 +101,9 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(combine);
 
         var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
-        builder.AddRawOperator(new IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>(left, right, output, combine));
+        builder.AddRawOperator(
+            new IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
+                left, right, output, combine, leftSnapshotCodec, rightSnapshotCodec));
         return output;
     }
 
@@ -115,7 +120,9 @@ public static class StatefulOperators
         Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
         Stream<IndexedZSet<TKey, TRight, TWeight>> right,
         Func<TKey, TLeft, TRight, TOut> joinCombine,
-        Func<TKey, TLeft, TOut> nullPadCombine)
+        Func<TKey, TLeft, TOut> nullPadCombine,
+        IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -131,7 +138,8 @@ public static class StatefulOperators
         var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
         builder.AddRawOperator(
             new IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
-                left, right, output, joinCombine, nullPadCombine));
+                left, right, output, joinCombine, nullPadCombine,
+                leftSnapshotCodec, rightSnapshotCodec));
         return output;
     }
 
@@ -143,7 +151,8 @@ public static class StatefulOperators
     public static Stream<ZSet<(TKey Key, TOut Value), Z64>> IncrementalAggregate<TKey, TValue, TOut>(
         this CircuitBuilder builder,
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
-        IAggregator<TValue, TOut> aggregator)
+        IAggregator<TValue, TOut> aggregator,
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null)
         where TKey : notnull
         where TValue : notnull
         where TOut : notnull
@@ -153,7 +162,8 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(aggregator);
 
         var output = new Stream<ZSet<(TKey, TOut), Z64>>(ZSet<(TKey, TOut), Z64>.Empty);
-        builder.AddRawOperator(new IncrementalAggregateOp<TKey, TValue, TOut>(input, output, aggregator));
+        builder.AddRawOperator(
+            new IncrementalAggregateOp<TKey, TValue, TOut>(input, output, aggregator, snapshotCodec));
         return output;
     }
 }

@@ -14,7 +14,16 @@ public enum LiteralKind
     Null,
 }
 
-public sealed record LiteralExpression(LiteralKind Kind, object? Value) : Expression;
+public sealed record LiteralExpression(LiteralKind Kind, object? Value) : Expression
+{
+    /// <summary>
+    /// Source-text scale for <see cref="LiteralKind.Decimal"/> literals only.
+    /// "1.5" → 1; "1.50" → 2; integer-overflow fallback → 0. Ignored for
+    /// non-decimal kinds. Lets the resolver type a decimal literal as
+    /// <c>DECIMAL(38, scale)</c> without re-parsing the source.
+    /// </summary>
+    public byte DecimalScale { get; init; }
+}
 
 public sealed record ColumnReference(string? Qualifier, string Name) : Expression;
 

@@ -23,6 +23,9 @@ internal static class TypeInference
         "VARCHAR" => new SqlVarcharType(spec.Parameter1, nullable),
         "CHAR" => new SqlVarcharType(spec.Parameter1, nullable),
         "BOOLEAN" => new SqlBooleanType(nullable),
+        "DATE" => new SqlDateType(nullable),
+        "TIME" => new SqlTimeType(nullable),
+        "TIMESTAMP" => new SqlTimestampType(nullable),
         _ => throw new ResolveException($"unsupported type '{spec.Name}'"),
     };
 
@@ -32,6 +35,14 @@ internal static class TypeInference
     public static bool IsString(SqlType t) => t is SqlVarcharType;
 
     public static bool IsBoolean(SqlType t) => t is SqlBooleanType;
+
+    /// <summary>
+    /// True for date/time/timestamp types. Temporal types are comparable and
+    /// equatable only with their own kind — DATE with DATE, TIME with TIME,
+    /// TIMESTAMP with TIMESTAMP. No implicit promotion across temporal kinds.
+    /// </summary>
+    public static bool IsTemporal(SqlType t) =>
+        t is SqlDateType or SqlTimeType or SqlTimestampType;
 
     /// <summary>
     /// Promote two numerics to their common supertype for arithmetic /
@@ -82,6 +93,21 @@ internal static class TypeInference
             return new SqlBooleanType(a.Nullable || b.Nullable);
         }
 
+        if (a is SqlDateType && b is SqlDateType)
+        {
+            return new SqlDateType(a.Nullable || b.Nullable);
+        }
+
+        if (a is SqlTimeType && b is SqlTimeType)
+        {
+            return new SqlTimeType(a.Nullable || b.Nullable);
+        }
+
+        if (a is SqlTimestampType && b is SqlTimestampType)
+        {
+            return new SqlTimestampType(a.Nullable || b.Nullable);
+        }
+
         throw new ResolveException($"types {a.Display} and {b.Display} are not comparable");
     }
 
@@ -103,6 +129,55 @@ internal static class TypeInference
         var sb = b is SqlDecimalType db2 ? db2.Scale : 0;
         return new SqlDecimalType(Math.Max(pa, pb), Math.Max(sa, sb), nullable);
     }
+
+    /// <summary>
+    /// Operator-specific result type for decimal arithmetic, following the
+    /// SQL Server / Substrait promotion rules implemented in
+    /// <see cref="Clast.DatabaseDecimal.Arithmetic.DecimalTypeRules"/>:
+    /// addition / subtraction grow precision by one (carry digit), multiplication
+    /// grows scale by the sum of operand scales, division extends scale to
+    /// preserve fractional precision, all clamped to 38 with scale-borrowing.
+    ///
+    /// <para>Both operands must be at numeric rank ≤ 3 (INT / BIGINT / DECIMAL).
+    /// Non-decimal numeric operands are promoted to a DECIMAL of matching
+    /// precision (INT → DECIMAL(10, 0), BIGINT → DECIMAL(19, 0)).</para>
+    /// </summary>
+    public static SqlDecimalType DecimalArithmeticType(
+        BinaryOperator op, SqlType a, SqlType b)
+    {
+        var nullable = a.Nullable || b.Nullable;
+        var ad = ToDecimalForArithmetic(a);
+        var bd = ToDecimalForArithmetic(b);
+
+        var result = op switch
+        {
+            BinaryOperator.Add => Clast.DatabaseDecimal.Arithmetic.DecimalTypeRules.Add(ad, bd),
+            BinaryOperator.Subtract => Clast.DatabaseDecimal.Arithmetic.DecimalTypeRules.Subtract(ad, bd),
+            BinaryOperator.Multiply => Clast.DatabaseDecimal.Arithmetic.DecimalTypeRules.Multiply(ad, bd),
+            BinaryOperator.Divide => Clast.DatabaseDecimal.Arithmetic.DecimalTypeRules.Divide(ad, bd),
+            BinaryOperator.Modulo => Clast.DatabaseDecimal.Arithmetic.DecimalTypeRules.Modulus(ad, bd),
+            _ => throw new InvalidOperationException(
+                $"DecimalArithmeticType called for non-arithmetic operator {op}"),
+        };
+
+        return new SqlDecimalType(result.Precision, result.Scale, nullable);
+    }
+
+    /// <summary>
+    /// Map a numeric SQL type to its <see cref="Clast.DatabaseDecimal.DecimalType"/>
+    /// for arithmetic. INT, BIGINT, and DECIMAL pass through; other numerics
+    /// (REAL, DOUBLE) shouldn't reach this path — the resolver routes them
+    /// through <see cref="CommonNumericType"/> which returns a float type
+    /// instead of a decimal.
+    /// </summary>
+    private static Clast.DatabaseDecimal.DecimalType ToDecimalForArithmetic(SqlType t) => t switch
+    {
+        SqlDecimalType d => Clast.DatabaseDecimal.DecimalType.Numeric(d.Precision, d.Scale),
+        SqlIntegerType => Clast.DatabaseDecimal.DecimalType.Numeric(10, 0),
+        SqlBigintType => Clast.DatabaseDecimal.DecimalType.Numeric(19, 0),
+        _ => throw new InvalidOperationException(
+            $"non-decimal type {t.Display} reached decimal arithmetic path"),
+    };
 
     /// <summary>
     /// Type returned by a comparison operator on the given operand types —

@@ -12,19 +12,50 @@ namespace DbspNet.Core.Operators.Stateful;
 /// present, and -1 the tick it becomes absent — exactly mirroring SQL
 /// <c>DISTINCT</c> semantics under retractions.
 /// </summary>
-internal sealed class DistinctOp<TKey, TWeight> : IOperator
+internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
     private readonly Stream<ZSet<TKey, TWeight>> _input;
     private readonly Stream<ZSet<TKey, TWeight>> _output;
     private readonly ZSetTrace<TKey, TWeight> _trace = new();
+    private readonly IZSetTraceCodec<TKey, TWeight>? _snapshotCodec;
 
-    public DistinctOp(Stream<ZSet<TKey, TWeight>> input, Stream<ZSet<TKey, TWeight>> output)
+    public DistinctOp(
+        Stream<ZSet<TKey, TWeight>> input,
+        Stream<ZSet<TKey, TWeight>> output,
+        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null)
     {
         _input = input;
         _output = output;
+        _snapshotCodec = snapshotCodec;
     }
+
+    public void Save(ISnapshotWriter writer)
+    {
+        if (_snapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "DistinctOp was constructed without a snapshot codec; pass one " +
+                "to CircuitBuilder.Distinct to enable Snapshot.Write/Read.");
+        }
+
+        _snapshotCodec.Save(writer, "trace.arrows", _trace.Current);
+    }
+
+    public void Load(ISnapshotReader reader)
+    {
+        if (_snapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "DistinctOp was constructed without a snapshot codec.");
+        }
+
+        var loaded = _snapshotCodec.Load(reader, "trace.arrows");
+        _trace.Integrate(loaded);
+    }
+
+    public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
 
     public void Step()
     {

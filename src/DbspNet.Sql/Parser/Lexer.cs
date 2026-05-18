@@ -60,6 +60,9 @@ public sealed class Lexer
         ["text"] = TokenKind.Text,
         ["boolean"] = TokenKind.Boolean,
         ["bool"] = TokenKind.Bool,
+        ["date"] = TokenKind.Date,
+        ["time"] = TokenKind.Time,
+        ["timestamp"] = TokenKind.Timestamp,
     };
 
     private readonly string _source;
@@ -330,8 +333,12 @@ public sealed class Lexer
 
         if (hasDot)
         {
-            var dec = decimal.Parse(text, NumberStyles.Number, CultureInfo.InvariantCulture);
-            return new Token(TokenKind.DecimalLiteral, text, start) { DecimalValue = dec };
+            var (mantissa, scale) = ParseDecimalLiteral(text, start);
+            return new Token(TokenKind.DecimalLiteral, text, start)
+            {
+                DecimalMantissa = mantissa,
+                DecimalScale = scale,
+            };
         }
 
         if (long.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var lv))
@@ -339,9 +346,57 @@ public sealed class Lexer
             return new Token(TokenKind.IntegerLiteral, text, start) { IntegerValue = lv };
         }
 
-        // Integer out of long range: fall back to decimal.
-        var bigDec = decimal.Parse(text, NumberStyles.None, CultureInfo.InvariantCulture);
-        return new Token(TokenKind.DecimalLiteral, text, start) { DecimalValue = bigDec };
+        // Integer out of long range: parse as Int128 with scale 0.
+        var (bigMantissa, bigScale) = ParseDecimalLiteral(text, start);
+        return new Token(TokenKind.DecimalLiteral, text, start)
+        {
+            DecimalMantissa = bigMantissa,
+            DecimalScale = bigScale,
+        };
+    }
+
+    /// <summary>
+    /// Parse a decimal literal exactly — preserving the natural scale (digits
+    /// after the decimal point, if any). Mantissa is signed Int128. Throws
+    /// <see cref="LexException"/> if the digit count exceeds Int128 capacity.
+    /// </summary>
+    private (Int128 Mantissa, byte Scale) ParseDecimalLiteral(string text, SourcePosition start)
+    {
+        var mantissa = Int128.Zero;
+        var scale = 0;
+        var inFraction = false;
+        var digitCount = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (c == '.')
+            {
+                inFraction = true;
+                continue;
+            }
+
+            // Digits only — exponent / sign cases handled separately upstream.
+            digitCount++;
+            if (digitCount > 38)
+            {
+                throw new LexException(
+                    $"decimal literal exceeds 38-digit Int128 capacity",
+                    start);
+            }
+
+            mantissa = mantissa * 10 + (c - '0');
+            if (inFraction)
+            {
+                scale++;
+            }
+        }
+
+        if (scale > byte.MaxValue)
+        {
+            throw new LexException("decimal scale exceeds 255", start);
+        }
+
+        return (mantissa, (byte)scale);
     }
 
     private Token LexPunctuationOrOperator(SourcePosition start)

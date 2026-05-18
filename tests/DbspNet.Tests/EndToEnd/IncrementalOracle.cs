@@ -5,6 +5,7 @@ using DbspNet.Core.Collections;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
+using DbspNet.Tests.Sql;
 
 namespace DbspNet.Tests.EndToEnd;
 
@@ -91,7 +92,10 @@ internal static class IncrementalOracle
         {
             if (e.Table == table)
             {
-                b.Add(new StructuralRow(e.Row), new Z64(e.Weight));
+                // The actual circuit goes through TableInput, which encodes
+                // raw strings to Utf8String for VARCHAR columns. Mirror that
+                // here so the oracle row representation matches.
+                b.Add(new StructuralRow(SqlTestHelpers.EncodeStrings(e.Row)), new Z64(e.Weight));
             }
         }
 

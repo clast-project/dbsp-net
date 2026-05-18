@@ -14,8 +14,18 @@
          for the incremental circuit; the evaluator is internal to the SQL
          layer but safe to expose to tests within the same repo. -->
     <InternalsVisibleTo Include="DbspNet.Tests" />
+    <!-- WalRecorder subscribes to TableInput.OnPushed to capture per-tick
+         input deltas for the durable log. -->
+    <InternalsVisibleTo Include="DbspNet.Persistence" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />
+    <!-- Cross-repo reference to the shared decimal-math library. Local while
+         both projects co-evolve; will swap to a NuGet feed once the surface
+         stabilises. -->
+    <ProjectReference Include="C:\src\GitHub\database-decimal\src\Clast.DatabaseDecimal\Clast.DatabaseDecimal.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" Version="9.0.0" />
   </ItemGroup>
 </Project>

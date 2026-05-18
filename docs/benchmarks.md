@@ -13,21 +13,21 @@ Pipelined filter over a flat table. No stateful operators — the per-update cos
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 71.9 µs | 1.00 µs | 71.9× |
-|       1000 | 645.9 µs | 1.10 µs | 587× |
-|      10000 | 4.31 ms | 900.0 ns | 4792× |
-|     100000 | 51.14 ms | 500.0 ns | 102287× |
+|        100 | 73.1 µs | 1.00 µs | 73.1× |
+|       1000 | 649.0 µs | 1.10 µs | 590× |
+|      10000 | 4.23 ms | 1.00 µs | 4235× |
+|     100000 | 48.01 ms | 500.0 ns | 96019× |
 
 ## Multi-aggregate — `SUM / COUNT / MIN / MAX` over 100 groups
 
-Stateful composite aggregator with retractions on every group-key hit. SUM / COUNT fold the per-group delta into running state; MIN / MAX still rescan the post-delta per-group multiset (see interpretation below).
+Stateful composite aggregator with retractions on every group-key hit. All four aggregators are now O(|delta|) per changed group: SUM / COUNT fold the delta into running state; MIN / MAX maintain a per-group sorted set of distinct values with positive net weight, indexed for O(log n) extremum lookup.
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 146.9 µs | 3.70 µs | 39.7× |
-|       1000 | 702.7 µs | 5.50 µs | 128× |
-|      10000 | 5.06 ms | 21.70 µs | 233× |
-|     100000 | 91.96 ms | 305.90 µs | 301× |
+|        100 | 170.4 µs | 3.70 µs | 46.1× |
+|       1000 | 1.00 ms | 4.20 µs | 239× |
+|      10000 | 8.34 ms | 10.70 µs | 779× |
+|     100000 | 175.06 ms | 73.80 µs | 2372× |
 
 ## Joined GROUP BY — `SUM(amount)` per region over `orders ⋈ customers`
 
@@ -35,10 +35,10 @@ Inner join feeding a SUM aggregator. Per-update cost = probing the fixed custome
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 123.9 µs | 5.10 µs | 24.3× |
-|       1000 | 909.5 µs | 8.20 µs | 111× |
-|      10000 | 9.25 ms | 37.50 µs | 247× |
-|     100000 | 95.93 ms | 175.80 µs | 546× |
+|        100 | 102.9 µs | 3.90 µs | 26.4× |
+|       1000 | 1.07 ms | 7.00 µs | 153× |
+|      10000 | 14.33 ms | 34.60 µs | 414× |
+|     100000 | 95.79 ms | 161.90 µs | 592× |
 
 ## Joined GROUP BY (`EmittedEqualityCodec`) — same query shape
 
@@ -46,10 +46,10 @@ Identical query and circuit shape as the preceding Joined GROUP BY benchmark, bu
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 165.2 µs | 3.50 µs | 47.2× |
-|       1000 | 1.40 ms | 4.60 µs | 303× |
-|      10000 | 17.14 ms | 20.30 µs | 844× |
-|     100000 | 124.89 ms | 153.40 µs | 814× |
+|        100 | 155.7 µs | 3.20 µs | 48.7× |
+|       1000 | 1.46 ms | 4.80 µs | 303× |
+|      10000 | 14.62 ms | 22.10 µs | 662× |
+|     100000 | 88.10 ms | 141.40 µs | 623× |
 
 ## Joined GROUP BY (typed rows, hand-wired) — same query shape
 
@@ -57,10 +57,10 @@ Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 101.0 µs | 4.40 µs | 23.0× |
-|       1000 | 927.3 µs | 11.70 µs | 79.3× |
-|      10000 | 3.73 ms | 45.60 µs | 81.9× |
-|     100000 | 13.73 ms | 64.40 µs | 213× |
+|        100 | 99.2 µs | 4.40 µs | 22.5× |
+|       1000 | 901.9 µs | 11.80 µs | 76.4× |
+|      10000 | 3.72 ms | 46.10 µs | 80.6× |
+|     100000 | 13.16 ms | 63.00 µs | 209× |
 
 ## Transitive closure — recursive CTE over a path graph
 
@@ -68,10 +68,10 @@ Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|         50 | 23.43 ms | 323.00 µs | 72.5× |
-|        100 | 123.55 ms | 483.60 µs | 255× |
-|        200 | 2.23 s | 1.67 ms | 1338× |
-|        500 | 34.76 s | 11.43 ms | 3040× |
+|         50 | 22.49 ms | 354.30 µs | 63.5× |
+|        100 | 125.17 ms | 536.60 µs | 233× |
+|        200 | 2.15 s | 1.53 ms | 1410× |
+|        500 | 34.55 s | 11.18 ms | 3090× |
 
 ## Interpretation
 
@@ -85,7 +85,5 @@ The number to read is the **Speedup** column — how many times faster an increm
 ### Where the curves end up
 
 - **Joined GROUP BY** (pure SUM) is the cleanest positive result: speedup now climbs past 500× at N=100k. Every hot path is O(|delta|) — SUM folds the per-group delta into running state, and the indexed traces (`IndexedZSetTrace`) integrate in place rather than rebuilding. The residual sub-linear growth in the incremental column is dominated by allocator / cache effects on a larger running state, not an algorithmic scan.
-- **Multi-aggregate** (SUM / COUNT / MIN / MAX) reaches ~300× at N=100k and still climbs with N, but more slowly. SUM / COUNT are O(|delta|); MIN / MAX inherit the default `Update`, which rescans the post-delta per-group multiset — retracting the current extremum requires knowing the next-best value, which needs a heap or sorted trace per group to incrementalize. So the residual O(group size) cost per tick is the MIN/MAX rescan, not the trace rebuild.
-
-The remaining aggregate gap (incremental MIN/MAX) is filed in `docs/skipped.md`.
+- **Multi-aggregate** (SUM / COUNT / MIN / MAX) now climbs steeply with N, reaching ~2000× at N=100k. All four aggregators are incremental: SUM / COUNT fold the delta; MIN / MAX maintain a per-group sorted set of distinct positive-weight values for O(log n) extremum lookup. Per-update cost is dominated by trace and aggregate-state dictionary ops at this point — the visible ceiling is now the same allocator / cache effect that limits Joined GROUP BY at scale.
 

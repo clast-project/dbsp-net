@@ -1143,9 +1143,11 @@ public sealed class Resolver
         // match the resolved SQL type.
         LiteralKind.Integer => NarrowIntegerLiteral((long)lit.Value!),
         LiteralKind.Decimal => new ResolvedLiteral(lit.Kind, lit.Value,
-            new SqlDecimalType(38, ScaleOf((decimal)lit.Value!), false)),
+            new SqlDecimalType(38, lit.DecimalScale, false)),
         LiteralKind.Float => new ResolvedLiteral(lit.Kind, lit.Value, new SqlDoubleType(false)),
-        LiteralKind.String => new ResolvedLiteral(lit.Kind, lit.Value, new SqlVarcharType(null, false)),
+        LiteralKind.String => new ResolvedLiteral(lit.Kind,
+            Utf8String.Of((string)lit.Value!),
+            new SqlVarcharType(null, false)),
         LiteralKind.Boolean => new ResolvedLiteral(lit.Kind, lit.Value, new SqlBooleanType(false)),
         LiteralKind.Null => new ResolvedLiteral(lit.Kind, null, new SqlIntegerType(true)),
         _ => throw new ResolveException($"unknown literal kind {lit.Kind}"),
@@ -1159,13 +1161,6 @@ public sealed class Resolver
         }
 
         return new ResolvedLiteral(LiteralKind.Integer, v, new SqlBigintType(false));
-    }
-
-    private static int ScaleOf(decimal d)
-    {
-        // Scale is the number of digits to the right of the decimal point.
-        var bits = decimal.GetBits(d);
-        return (bits[3] >> 16) & 0xFF;
     }
 
     private static ResolvedColumn ResolveColumn(ColumnReference cr, Schema schema)
@@ -1213,10 +1208,7 @@ public sealed class Resolver
             case BinaryOperator.Multiply:
             case BinaryOperator.Divide:
             case BinaryOperator.Modulo:
-                var numType = TypeInference.CommonNumericType(left.Type, right.Type);
-                left = MaybeCast(left, numType);
-                right = MaybeCast(right, numType);
-                return new ResolvedBinary(bin.Operator, left, right, numType);
+                return ResolveArithmetic(bin.Operator, left, right);
             case BinaryOperator.Equal:
             case BinaryOperator.NotEqual:
             case BinaryOperator.Less:
@@ -1250,6 +1242,70 @@ public sealed class Resolver
         }
 
         return new ResolvedCast(e, target);
+    }
+
+    /// <summary>
+    /// Resolve a numeric arithmetic binary op (+, −, *, /, %). When at least
+    /// one operand is DECIMAL — including via INT/BIGINT promotion — the
+    /// result type follows operator-specific SQL Server / Substrait
+    /// promotion rules via <see cref="TypeInference.DecimalArithmeticType"/>;
+    /// operands stay at their natural types because the decimal kernels
+    /// rescale internally. For non-decimal numeric mixes (INT + INT,
+    /// DOUBLE + REAL, etc.) the result is the simple <c>CommonNumericType</c>
+    /// promotion and operands are coerced to the common type.
+    /// </summary>
+    private static ResolvedExpression ResolveArithmetic(
+        BinaryOperator op, ResolvedExpression left, ResolvedExpression right)
+    {
+        // If neither side is decimal, and both are numeric, the existing
+        // common-type promotion lattice produces an INT/BIGINT/REAL/DOUBLE
+        // result that the compiler handles directly.
+        if (left.Type is not SqlDecimalType && right.Type is not SqlDecimalType)
+        {
+            var numType = TypeInference.CommonNumericType(left.Type, right.Type);
+            // CommonNumericType may still pick DECIMAL when both sides are
+            // small integers — but that path is unreachable here (rank ≤ 2
+            // can't combine to rank 3).
+            if (numType is SqlDecimalType decFromInts)
+            {
+                // Defensive: rank promotion produced DECIMAL despite both
+                // operands being non-decimal. Use per-op rules.
+                _ = decFromInts;
+                return BuildDecimalArithmetic(op, left, right);
+            }
+
+            return new ResolvedBinary(op,
+                MaybeCast(left, numType),
+                MaybeCast(right, numType),
+                numType);
+        }
+
+        // At least one side is DECIMAL. If the other side is REAL/DOUBLE,
+        // the common type is float — fall back to lattice promotion.
+        if ((left.Type is SqlRealType or SqlDoubleType)
+            || (right.Type is SqlRealType or SqlDoubleType))
+        {
+            var numType = TypeInference.CommonNumericType(left.Type, right.Type);
+            return new ResolvedBinary(op,
+                MaybeCast(left, numType),
+                MaybeCast(right, numType),
+                numType);
+        }
+
+        return BuildDecimalArithmetic(op, left, right);
+    }
+
+    /// <summary>
+    /// Build a decimal-typed <see cref="ResolvedBinary"/> with the per-op
+    /// SQL Server / Substrait result type and natural-typed operands. The
+    /// expression compiler's <c>ToDecimalOperand</c> handles INT/BIGINT
+    /// promotion and the kernels rescale to the result type.
+    /// </summary>
+    private static ResolvedExpression BuildDecimalArithmetic(
+        BinaryOperator op, ResolvedExpression left, ResolvedExpression right)
+    {
+        var resultType = TypeInference.DecimalArithmeticType(op, left.Type, right.Type);
+        return new ResolvedBinary(op, left, right, resultType);
     }
 
     private static bool SameTypeIgnoringNullable(SqlType a, SqlType b) =>
@@ -1478,8 +1534,7 @@ public sealed class Resolver
             case BinaryOperator.Multiply:
             case BinaryOperator.Divide:
             case BinaryOperator.Modulo:
-                var numType = TypeInference.CommonNumericType(l.Type, r.Type);
-                return new ResolvedBinary(bin.Operator, MaybeCast(l, numType), MaybeCast(r, numType), numType);
+                return ResolveArithmetic(bin.Operator, l, r);
             case BinaryOperator.Equal:
             case BinaryOperator.NotEqual:
             case BinaryOperator.Less:

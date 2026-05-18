@@ -125,8 +125,8 @@ public class ExpressionCompilerTests
     {
         var schema = Sch(("s", new SqlVarcharType(null, false)));
         var f = Compile("s < 'n'", schema);
-        Assert.Equal(true, f(["banana"]));
-        Assert.Equal(false, f(["orange"]));
+        Assert.Equal(true, f([Utf8String.Of("banana")]));
+        Assert.Equal(false, f([Utf8String.Of("orange")]));
     }
 
     // --- 3VL boolean ---
@@ -211,7 +211,7 @@ public class ExpressionCompilerTests
     {
         var schema = Sch(("s", new SqlVarcharType(null, false)));
         var f = Compile("CAST(s AS INTEGER)", schema);
-        Assert.Equal(42, (int)f(["42"])!);
+        Assert.Equal(42, (int)f([Utf8String.Of("42")])!);
     }
 
     // --- COALESCE ---

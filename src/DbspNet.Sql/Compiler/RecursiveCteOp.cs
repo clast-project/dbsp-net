@@ -55,9 +55,12 @@ namespace DbspNet.Sql.Compiler;
 /// DRED/DBSP-weight-propagation alternative.
 /// </para>
 /// </remarks>
-internal sealed class RecursiveCteOp : IOperator
+internal sealed class RecursiveCteOp : IOperator, ISnapshotable
 {
     public const int MaxIterations = 10_000;
+
+    private const string ResultFileName = "r.arrows";
+    private const string PreviousResultFileName = "prev.arrows";
 
     private readonly IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> _externalDeltaStreams;
     private readonly Dictionary<string, ZSetTrace<StructuralRow, Z64>> _externalTraces;
@@ -65,6 +68,8 @@ internal sealed class RecursiveCteOp : IOperator
     private readonly LogicalPlan _basePlan;
     private readonly LogicalPlan _recursivePlan;
     private readonly CteRef _selfRef;
+    private readonly IReadOnlyDictionary<string, IZSetTraceCodec<StructuralRow, Z64>>? _externalSnapshotCodecs;
+    private readonly IZSetTraceCodec<StructuralRow, Z64>? _resultSnapshotCodec;
     private ZSet<StructuralRow, Z64> _r = ZSet<StructuralRow, Z64>.Empty;
     private ZSet<StructuralRow, Z64> _previousResult = ZSet<StructuralRow, Z64>.Empty;
 
@@ -73,13 +78,17 @@ internal sealed class RecursiveCteOp : IOperator
         Stream<ZSet<StructuralRow, Z64>> output,
         LogicalPlan basePlan,
         LogicalPlan recursivePlan,
-        CteRef selfRef)
+        CteRef selfRef,
+        IReadOnlyDictionary<string, IZSetTraceCodec<StructuralRow, Z64>>? externalSnapshotCodecs = null,
+        IZSetTraceCodec<StructuralRow, Z64>? resultSnapshotCodec = null)
     {
         _externalDeltaStreams = externalDeltaStreams;
         _output = output;
         _basePlan = basePlan;
         _recursivePlan = recursivePlan;
         _selfRef = selfRef;
+        _externalSnapshotCodecs = externalSnapshotCodecs;
+        _resultSnapshotCodec = resultSnapshotCodec;
 
         _externalTraces = new Dictionary<string, ZSetTrace<StructuralRow, Z64>>(StringComparer.Ordinal);
         foreach (var name in externalDeltaStreams.Keys)
@@ -87,6 +96,82 @@ internal sealed class RecursiveCteOp : IOperator
             _externalTraces[name] = new ZSetTrace<StructuralRow, Z64>();
         }
     }
+
+    public void Save(ISnapshotWriter writer)
+    {
+        if (_externalSnapshotCodecs is null || _resultSnapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "RecursiveCteOp was constructed without snapshot codecs; compile via " +
+                "PlanToCircuit.Compile(plan, snapshotCodecs) to enable Snapshot.Write/Read.");
+        }
+
+        // External base-table traces — one file per table. Filenames are
+        // "ext_{tableName}.arrows".
+        foreach (var (name, trace) in _externalTraces)
+        {
+            if (!_externalSnapshotCodecs.TryGetValue(name, out var codec))
+            {
+                throw new InvalidOperationException(
+                    $"RecursiveCteOp: missing snapshot codec for external table '{name}'");
+            }
+
+            codec.Save(writer, ExternalTraceFileName(name), trace.Current);
+        }
+
+        // The materialised CTE result and prior-tick result share a schema,
+        // so a single result codec writes both under separate filenames.
+        _resultSnapshotCodec.Save(writer, ResultFileName, _r);
+        _resultSnapshotCodec.Save(writer, PreviousResultFileName, _previousResult);
+    }
+
+    public void Load(ISnapshotReader reader)
+    {
+        if (_externalSnapshotCodecs is null || _resultSnapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "RecursiveCteOp was constructed without snapshot codecs.");
+        }
+
+        foreach (var (name, trace) in _externalTraces)
+        {
+            if (!_externalSnapshotCodecs.TryGetValue(name, out var codec))
+            {
+                throw new InvalidOperationException(
+                    $"RecursiveCteOp: missing snapshot codec for external table '{name}'");
+            }
+
+            trace.Integrate(codec.Load(reader, ExternalTraceFileName(name)));
+        }
+
+        _r = _resultSnapshotCodec.Load(reader, ResultFileName);
+        _previousResult = _resultSnapshotCodec.Load(reader, PreviousResultFileName);
+    }
+
+    public string SchemaFingerprint
+    {
+        get
+        {
+            if (_externalSnapshotCodecs is null || _resultSnapshotCodec is null)
+            {
+                return string.Empty;
+            }
+
+            // External-table fingerprints in name order so it's stable
+            // across reorderings of the underlying dictionary.
+            var sb = new System.Text.StringBuilder();
+            foreach (var name in _externalSnapshotCodecs.Keys.OrderBy(k => k, StringComparer.Ordinal))
+            {
+                sb.Append(name).Append('=').Append(_externalSnapshotCodecs[name].SchemaFingerprint).Append(';');
+            }
+
+            sb.Append("result=").Append(_resultSnapshotCodec.SchemaFingerprint);
+            return sb.ToString();
+        }
+    }
+
+    private static string ExternalTraceFileName(string tableName) =>
+        "ext_" + tableName + ".arrows";
 
     public void Step()
     {

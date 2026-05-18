@@ -36,6 +36,7 @@ public enum TokenKind
     // Type keywords
     Int, Integer, BigInt, Real, Double, Precision,
     Decimal, Numeric, Varchar, Char, Text, Boolean, Bool,
+    Date, Time, Timestamp,
 
     // Punctuation
     LParen, RParen, Comma, Semicolon, Dot, Star,
@@ -47,19 +48,27 @@ public enum TokenKind
 
 /// <summary>
 /// A single token produced by <see cref="Lexer"/>. For numeric literals the
-/// parsed value is stored in <see cref="IntegerValue"/>, <see cref="DecimalValue"/>,
-/// or <see cref="FloatValue"/> depending on <see cref="Kind"/>; for string
-/// literals the decoded (unescaped) payload is in <see cref="Text"/>. For
-/// identifiers, <see cref="Text"/> holds the canonical spelling (unquoted
-/// identifiers are lower-cased; double-quoted identifiers preserve case).
+/// parsed value is stored in <see cref="IntegerValue"/>, <see cref="DecimalMantissa"/>
+/// + <see cref="DecimalScale"/>, or <see cref="FloatValue"/> depending on
+/// <see cref="Kind"/>; for string literals the decoded (unescaped) payload
+/// is in <see cref="Text"/>. For identifiers, <see cref="Text"/> holds the
+/// canonical spelling (unquoted identifiers are lower-cased; double-quoted
+/// identifiers preserve case).
 /// </summary>
+/// <remarks>
+/// Decimal literals are carried as a fixed-point pair (mantissa, scale) —
+/// scale-in-type model, matching <see cref="Clast.DatabaseDecimal.Values.Decimal128"/>
+/// downstream. <c>1.5</c> → (mantissa=15, scale=1); <c>1.50</c> →
+/// (mantissa=150, scale=2). Mantissa width up to 128-bit (~38 digits).
+/// </remarks>
 public sealed record Token(
     TokenKind Kind,
     string Text,
     SourcePosition Position)
 {
     public long IntegerValue { get; init; }
-    public decimal DecimalValue { get; init; }
+    public Int128 DecimalMantissa { get; init; }
+    public byte DecimalScale { get; init; }
     public double FloatValue { get; init; }
     public bool QuotedIdentifier { get; init; }
 }

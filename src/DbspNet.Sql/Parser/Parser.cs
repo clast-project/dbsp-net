@@ -211,6 +211,15 @@ public sealed class Parser
             case TokenKind.Bool:
                 Advance();
                 return new SqlTypeSpec("BOOLEAN");
+            case TokenKind.Date:
+                Advance();
+                return new SqlTypeSpec("DATE");
+            case TokenKind.Time:
+                Advance();
+                return new SqlTypeSpec("TIME");
+            case TokenKind.Timestamp:
+                Advance();
+                return new SqlTypeSpec("TIMESTAMP");
             default:
                 throw Error(t, $"expected SQL type, got {Describe(t)}");
         }
@@ -736,7 +745,12 @@ public sealed class Parser
                 return new LiteralExpression(LiteralKind.Integer, t.IntegerValue);
             case TokenKind.DecimalLiteral:
                 Advance();
-                return new LiteralExpression(LiteralKind.Decimal, t.DecimalValue);
+                return new LiteralExpression(
+                    LiteralKind.Decimal,
+                    new Clast.DatabaseDecimal.Values.Decimal128(t.DecimalMantissa))
+                {
+                    DecimalScale = t.DecimalScale,
+                };
             case TokenKind.FloatLiteral:
                 Advance();
                 return new LiteralExpression(LiteralKind.Float, t.FloatValue);

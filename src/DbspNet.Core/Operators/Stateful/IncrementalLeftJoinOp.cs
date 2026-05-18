@@ -38,13 +38,16 @@ namespace DbspNet.Core.Operators.Stateful;
 /// non-null-keyed rows only, since the key must be hashable and equality-comparable.
 /// </para>
 /// </remarks>
-internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator
+internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
     where TOut : notnull
     where TWeight : struct, IZRing<TWeight>
 {
+    private const string LeftTraceFile = "left.arrows";
+    private const string RightTraceFile = "right.arrows";
+
     private readonly Stream<IndexedZSet<TKey, TLeft, TWeight>> _leftIn;
     private readonly Stream<IndexedZSet<TKey, TRight, TWeight>> _rightIn;
     private readonly Stream<ZSet<TOut, TWeight>> _output;
@@ -52,20 +55,54 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private readonly Func<TKey, TLeft, TOut> _nullPadCombine;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
     private readonly IndexedZSetTrace<TKey, TRight, TWeight> _rightTrace = new();
+    private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
+    private readonly IIndexedZSetTraceCodec<TKey, TRight, TWeight>? _rightSnapshotCodec;
 
     public IncrementalLeftJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
         Stream<IndexedZSet<TKey, TRight, TWeight>> rightIn,
         Stream<ZSet<TOut, TWeight>> output,
         Func<TKey, TLeft, TRight, TOut> joinCombine,
-        Func<TKey, TLeft, TOut> nullPadCombine)
+        Func<TKey, TLeft, TOut> nullPadCombine,
+        IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null)
     {
         _leftIn = leftIn;
         _rightIn = rightIn;
         _output = output;
         _joinCombine = joinCombine;
         _nullPadCombine = nullPadCombine;
+        _leftSnapshotCodec = leftSnapshotCodec;
+        _rightSnapshotCodec = rightSnapshotCodec;
     }
+
+    public void Save(ISnapshotWriter writer)
+    {
+        if (_leftSnapshotCodec is null || _rightSnapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "IncrementalLeftJoinOp was constructed without snapshot codecs; pass " +
+                "them to CircuitBuilder.IncrementalLeftJoin to enable Snapshot.Write/Read.");
+        }
+
+        _leftSnapshotCodec.Save(writer, LeftTraceFile, _leftTrace.Current);
+        _rightSnapshotCodec.Save(writer, RightTraceFile, _rightTrace.Current);
+    }
+
+    public void Load(ISnapshotReader reader)
+    {
+        if (_leftSnapshotCodec is null || _rightSnapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "IncrementalLeftJoinOp was constructed without snapshot codecs.");
+        }
+
+        _leftTrace.Integrate(_leftSnapshotCodec.Load(reader, LeftTraceFile));
+        _rightTrace.Integrate(_rightSnapshotCodec.Load(reader, RightTraceFile));
+    }
+
+    public string SchemaFingerprint =>
+        $"left={_leftSnapshotCodec?.SchemaFingerprint ?? ""};right={_rightSnapshotCodec?.SchemaFingerprint ?? ""}";
 
     public void Step()
     {

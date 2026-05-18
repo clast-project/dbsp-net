@@ -3,6 +3,7 @@ using DbspNet.Core.Collections;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Tests.Sql;
 
@@ -22,7 +23,7 @@ public class ScalarFunctionTests
     }
 
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
-        z.WeightOf(new StructuralRow(row)).Value;
+        z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
 
     // Compile a single-row scenario and return the projected object-value.
     private static object? EvalOne(string[] ddl, string query, Action<CompiledQuery> push)
@@ -33,7 +34,11 @@ public class ScalarFunctionTests
         Assert.Equal(1, q.Current.Count);
         var entry = Assert.Single(q.Current);
         Assert.Equal(1, entry.Value.Value);  // weight
-        return entry.Key[0];                  // one-column row
+        var raw = entry.Key[0];               // one-column row
+        // Decode UTF-8 to .NET string at the test boundary so assertions
+        // can compare against string literals without knowing about
+        // the internal Utf8String storage.
+        return raw is Utf8String u ? u.ToStringDecoded() : raw;
     }
 
     // ---- UPPER / LOWER ----
@@ -59,6 +64,22 @@ public class ScalarFunctionTests
             ["CREATE TABLE t (s VARCHAR)"],
             "SELECT UPPER(s) FROM t",
             q => q.Table("t").Insert((object?)null)));
+    }
+
+    [Fact]
+    public void Upper_AndLower_WorkOnMultibyte()
+    {
+        // Native UTF-8 case folding: 'café' → 'CAFÉ' via Rune-based fold,
+        // no .NET string round-trip.
+        Assert.Equal("CAFÉ", EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT UPPER(s) FROM t",
+            q => q.Table("t").Insert("café")));
+
+        Assert.Equal("éclair", EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT LOWER(s) FROM t",
+            q => q.Table("t").Insert("ÉCLAIR")));
     }
 
     [Fact]

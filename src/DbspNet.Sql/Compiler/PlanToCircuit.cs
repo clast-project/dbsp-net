@@ -22,10 +22,10 @@ namespace DbspNet.Sql.Compiler;
 /// </remarks>
 public static class PlanToCircuit
 {
-    public static CompiledQuery Compile(LogicalPlan plan)
+    public static CompiledQuery Compile(LogicalPlan plan, ISqlSnapshotCodecs? snapshotCodecs = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        return CompileCore(plan, StructuralRowCodec.Instance);
+        return CompileCore(plan, StructuralRowCodec.Instance, snapshotCodecs);
     }
 
     /// <summary>
@@ -38,16 +38,19 @@ public static class PlanToCircuit
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(codec);
-        return CompileCore(plan, codec);
+        return CompileCore(plan, codec, snapshotCodecs: null);
     }
 
     public static CompiledQuery Compile(CreateViewPlan view)
     {
         ArgumentNullException.ThrowIfNull(view);
-        return CompileCore(view.Query, StructuralRowCodec.Instance);
+        return CompileCore(view.Query, StructuralRowCodec.Instance, snapshotCodecs: null);
     }
 
-    private static CompiledQuery CompileCore(LogicalPlan plan, IRowCodec<StructuralRow> codec)
+    private static CompiledQuery CompileCore(
+        LogicalPlan plan,
+        IRowCodec<StructuralRow> codec,
+        ISqlSnapshotCodecs? snapshotCodecs)
     {
         // Walk the plan to find every scanned table; each becomes a circuit input.
         var tables = CollectScans(plan);
@@ -67,7 +70,7 @@ public static class PlanToCircuit
                 inputs[name] = new TableInput(handle, schema, codec);
             }
 
-            var ctx = new CompileContext(streams, codec);
+            var ctx = new CompileContext(streams, tables, codec, snapshotCodecs);
             var queryStream = CompilePlan(builder, plan, ctx);
             output = builder.Output(queryStream);
         });
@@ -79,14 +82,25 @@ public static class PlanToCircuit
     {
         public CompileContext(
             IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> scans,
-            IRowCodec<StructuralRow> codec)
+            IReadOnlyDictionary<string, Schema> tableSchemas,
+            IRowCodec<StructuralRow> codec,
+            ISqlSnapshotCodecs? snapshotCodecs)
         {
             Scans = scans;
+            TableSchemas = tableSchemas;
             Codec = codec;
+            SnapshotCodecs = snapshotCodecs;
         }
 
         /// <summary>Stream per declared table — the circuit's inputs.</summary>
         public IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> Scans { get; }
+
+        /// <summary>
+        /// Schema per declared base table — used by stateful operators
+        /// (currently <see cref="RecursiveCteOp"/>) that need to construct
+        /// per-table snapshot codecs at compile time.
+        /// </summary>
+        public IReadOnlyDictionary<string, Schema> TableSchemas { get; }
 
         /// <summary>
         /// Per-CTE compiled stream cache. The first <see cref="CteScanPlan"/>
@@ -100,6 +114,13 @@ public static class PlanToCircuit
         /// pipeline stage.
         /// </summary>
         public IRowCodec<StructuralRow> Codec { get; }
+
+        /// <summary>
+        /// Optional snapshot codec factory. When non-null, stateful operators
+        /// register a codec at construction so the circuit can be snapshotted
+        /// via <c>DbspNet.Persistence.Snapshot</c>.
+        /// </summary>
+        public ISqlSnapshotCodecs? SnapshotCodecs { get; }
     }
 
     // ---- Scan collection ----
@@ -243,7 +264,11 @@ public static class PlanToCircuit
                 }
 
             case DistinctPlan d:
-                return builder.Distinct(CompilePlan(builder, d.Input, ctx));
+                {
+                    var distinctCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(d.Schema);
+                    return builder.Distinct(
+                        CompilePlan(builder, d.Input, ctx), distinctCodec);
+                }
 
             case DifferencePlan diff:
                 {
@@ -361,10 +386,13 @@ public static class PlanToCircuit
 
         var leftCount = plan.Left.Schema.Count;
         var rightCount = plan.Right.Schema.Count;
+        var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
+        var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
         var joined = builder.IncrementalInnerJoin(
             leftIndexed,
             rightIndexed,
-            (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount));
+            (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
+            leftCodec, rightCodec);
 
         if (plan.Residual is { } residual)
         {
@@ -416,11 +444,14 @@ public static class PlanToCircuit
             row => ExtractKey(codec, rightKeySchema, row, rightIndices),
             row => row);
 
+        var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
+        var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
         var joined = builder.IncrementalLeftJoin(
             leftIndexed,
             rightIndexed,
             joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
-            nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount));
+            nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
+            leftCodec, rightCodec);
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
@@ -476,11 +507,16 @@ public static class PlanToCircuit
         // IncrementalLeftJoin treats its first arg as the preserved side.
         // Here: preserved = right; probed = left. In the combiners the
         // preserved-side row is the `b`/right row, probed is `a`/left.
+        // Codecs follow the same swap: the operator's "left trace" carries
+        // right rows, "right trace" carries left rows.
+        var preservedCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
+        var probedCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var joined = builder.IncrementalLeftJoin(
             rightIndexed,
             leftIndexed,
             joinCombine: (_, rrow, lrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
-            nullPadCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount));
+            nullPadCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
+            preservedCodec, probedCodec);
 
         var nullKeyPadded = builder.MapRows(
             nullKeyRight,
@@ -533,13 +569,34 @@ public static class PlanToCircuit
             externalStreams[name] = ctx.Scans[name];
         }
 
+        // Build snapshot codecs: one ZSet trace codec per external base
+        // table (using that table's row schema), plus one for the CTE
+        // result (used for both _r and _previousResult — they share a
+        // schema). When SnapshotCodecs is null, the operator gets null
+        // codecs and Snapshot.Write throws NotSupportedException at the
+        // operator boundary.
+        Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>? externalCodecs = null;
+        IZSetTraceCodec<StructuralRow, Z64>? resultCodec = null;
+        if (ctx.SnapshotCodecs is { } codecs)
+        {
+            externalCodecs = new Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>(StringComparer.Ordinal);
+            foreach (var name in externalNames)
+            {
+                externalCodecs[name] = codecs.CreateZSetTraceCodec(ctx.TableSchemas[name]);
+            }
+
+            resultCodec = codecs.CreateZSetTraceCodec(plan.Schema);
+        }
+
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
         var op = new RecursiveCteOp(
             externalStreams,
             output,
             plan.BasePlan,
             plan.RecursivePlan,
-            plan.SelfRef);
+            plan.SelfRef,
+            externalCodecs,
+            resultCodec);
         builder.AddRawOperator(op);
         return output;
     }
@@ -597,18 +654,29 @@ public static class PlanToCircuit
     // The left-join's nullPadCombine handles empty-subquery → NULL; when
     // the subquery's value changes tick-over-tick, the left-join correctly
     // retracts outer×oldScalar and emits outer×newScalar.
+    /// <summary>
+    /// Singleton zero-column row used as the unit join key in scalar subquery
+    /// fan-out. Two empty <see cref="StructuralRow"/>s are equal by value, so
+    /// any allocation works — the singleton just avoids per-row allocation.
+    /// </summary>
+    private static readonly StructuralRow s_unitKey = new(Array.Empty<object?>());
+
     private static Stream<ZSet<StructuralRow, Z64>> CompileScalarSubqueryJoin(
         CircuitBuilder builder,
         ScalarSubqueryJoinPlan plan,
         CompileContext ctx)
     {
         var current = CompilePlan(builder, plan.Input, ctx);
+        var currentSchema = plan.Input.Schema;
         foreach (var subPlan in plan.Subqueries)
         {
             var subStream = CompilePlan(builder, subPlan, ctx);
             // Project subquery rows to their single column wrapped in a 1-col StructuralRow.
             // (The subquery plan's output schema already has Count=1, so row[0] is the scalar.)
-            current = AttachScalarColumn(builder, current, subStream, ctx.Codec);
+            current = AttachScalarColumn(
+                builder, current, subStream, ctx.Codec, currentSchema, subPlan.Schema, ctx.SnapshotCodecs);
+            // Output of AttachScalarColumn appends the subquery's single column.
+            currentSchema = currentSchema.Concat(subPlan.Schema);
         }
 
         return current;
@@ -618,13 +686,24 @@ public static class PlanToCircuit
         CircuitBuilder builder,
         Stream<ZSet<StructuralRow, Z64>> outer,
         Stream<ZSet<StructuralRow, Z64>> subq,
-        IRowCodec<StructuralRow> codec)
+        IRowCodec<StructuralRow> codec,
+        Schema outerSchema,
+        Schema subqSchema,
+        ISqlSnapshotCodecs? snapshotCodecs)
     {
-        // Unit-key rekey of both sides: all outer rows under key 0, and the
-        // subquery's (expected) single row under key 0. LEFT JOIN ensures
-        // outer rows survive when the subquery is empty (NULL-padded).
-        var outerIndexed = builder.GroupProject<int, StructuralRow, StructuralRow, Z64>(outer, _ => 0, r => r);
-        var subqIndexed = builder.GroupProject<int, StructuralRow, StructuralRow, Z64>(subq, _ => 0, r => r);
+        // Unit-key rekey of both sides: all outer rows under the same
+        // 0-column key, and the subquery's (expected) single row under the
+        // same key. LEFT JOIN ensures outer rows survive when the subquery
+        // is empty (NULL-padded). Using a 0-column StructuralRow keeps the
+        // operator's TKey aligned with StructuralRow throughout the SQL
+        // layer, so the snapshot codec factory works uniformly.
+        var outerIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            outer, _ => s_unitKey, r => r);
+        var subqIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            subq, _ => s_unitKey, r => r);
+
+        var leftCodec = snapshotCodecs?.CreateIndexedZSetTraceCodec(Schema.Empty, outerSchema);
+        var rightCodec = snapshotCodecs?.CreateIndexedZSetTraceCodec(Schema.Empty, subqSchema);
 
         // ScalarSubqueryJoin appends one column per subquery; the per-iteration
         // schema isn't readily available here, so we let the codec fall back to
@@ -633,7 +712,8 @@ public static class PlanToCircuit
             outerIndexed,
             subqIndexed,
             joinCombine: (_, outerRow, scalarRow) => AppendColumn(codec, null, outerRow, scalarRow[0]),
-            nullPadCombine: (_, outerRow) => AppendColumn(codec, null, outerRow, null));
+            nullPadCombine: (_, outerRow) => AppendColumn(codec, null, outerRow, null),
+            leftCodec, rightCodec);
     }
 
     private static StructuralRow AppendColumn(IRowCodec<StructuralRow> codec, Schema? schema, StructuralRow row, object? value)
@@ -765,7 +845,12 @@ public static class PlanToCircuit
             row => ExtractKey(ctx.Codec, groupKeySchema, row, groupIndices),
             row => row);
 
-        var aggregated = builder.IncrementalAggregate(indexed, composite);
+        // Snapshot codec for the IndexedZSet trace inside IncrementalAggregateOp.
+        // Bootstrap rebuilds aggregator scratch from the trace on Load, so only
+        // the trace itself is round-tripped.
+        var aggCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(
+            groupKeySchema, plan.Input.Schema);
+        var aggregated = builder.IncrementalAggregate(indexed, composite, aggCodec);
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;

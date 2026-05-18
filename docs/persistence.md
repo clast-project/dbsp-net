@@ -1,13 +1,9 @@
 # Persistence and recovery — design sketch
 
-Unimplemented. DbspNet today holds all circuit state in memory: the
-per-stream `Current` buffers, the `ZSetTrace` / `IndexedZSetTrace` dicts
-behind joins / aggregates / distinct, the `_aggCache` / `_stateCache` dicts
-inside `IncrementalAggregateOp`, `RecursiveCteOp._r`, and the
-`InputHandle._pending` buffers. A crash or process restart loses all of it.
-This note sketches how to make state survive a restart — either by
-snapshotting the state or by replaying inputs. No code yet; this is a
-design discussion.
+Approaches (A), (B), and (C) below are now implemented in
+`DbspNet.Persistence`. (D) — log-structured trace — remains a future
+direction. The historical design discussion follows; see "Current
+state" at the bottom for what shipped.
 
 The natural checkpoint point is a **step boundary**: between ticks every
 operator is in a consistent "end-of-tick T" state.
@@ -144,3 +140,178 @@ cuts.
 
 (C) — snapshot + WAL hybrid — is what production looks like, but falls
 out of (A) + (B) naturally.
+
+## Current state
+
+| Approach | Status | Entry points |
+|---|---|---|
+| (A) input replay | Shipped | `WalRecorder(query, walStore)` |
+| (B) end-of-tick snapshot | Shipped | `Snapshot.Write` / `Snapshot.Read` |
+| (C) snapshot + WAL hybrid | Shipped | `WalRecorder(query, walStore, snapshotStore)` + `WalRecorder.WriteSnapshot()` |
+| (D) log-structured trace | Future | — |
+
+### Storage abstraction
+
+The persistence layer is built on `IBlobStore` — a thin abstraction
+modeled on cloud object stores (S3 / GCS / Azure Blob):
+
+```csharp
+interface IBlobStore {
+    Stream OpenWrite(string key);   // atomic on Dispose
+    Stream OpenRead(string key);
+    bool Exists(string key);
+    void Delete(string key);
+    IEnumerable<string> ListKeys(string prefix);
+}
+```
+
+Keys are slash-delimited (`"snap-5/op-3/trace.arrows"`). The single
+durability primitive is **atomic single-blob write**: until
+`Dispose`, the blob doesn't exist (or has its old value); on
+`Dispose`, the new value appears atomically. This contract is true
+of S3/GCS/Azure PUTs and is implemented locally by
+`LocalFileBlobStore` via tmp+rename.
+
+There are no directory operations, no atomic rename, no batched
+multi-blob commits. To replace state across many blobs, callers
+write all the new blobs first under their final keys, then commit by
+writing a small pointer blob (`current.txt`) last — the partial
+intermediate state is invisible until the pointer commits.
+
+**Convenience overloads.** Every public entry point has both an
+`IBlobStore` form and a `string`-path form; the string form opens a
+`LocalFileBlobStore` rooted at the given directory. New callers
+should prefer the explicit `IBlobStore` form so a future cloud impl
+swaps in without a code change.
+
+**Built-in impls.** `LocalFileBlobStore` (filesystem) and
+`InMemoryBlobStore` (process-lifetime; useful as a test double for
+cloud-shaped backends and where filesystem I/O would slow tests
+down). Both pass the same `BlobStoreContractTests` conformance suite
+— including the cloud-relevant cases like "reads during in-flight
+write see the prior value."
+
+**Cloud impls.** Out-of-the-box this ships only the local + in-memory
+impls; cloud-flavored stores (S3, GCS, Azure) are expected to live in
+separate projects that depend on `DbspNet.Persistence` and implement
+`IBlobStore`. The `OpenWrite` stream is the natural place to back a
+multipart upload — each `Write` queues a part, `Dispose` finalizes
+and the blob becomes visible. Any cloud impl that passes
+`BlobStoreContractTests` will work with the rest of the persistence
+layer end-to-end.
+
+### What ships in (B)
+
+Five stateful operators implement `ISnapshotable`: `DistinctOp`,
+`IncrementalAggregateOp`, `IncrementalJoinOp`,
+`IncrementalLeftJoinOp`, `RecursiveCteOp`. Each owns Z-set / indexed-
+Z-set traces (and, for the aggregate, per-group caches that bootstrap
+from the trace on `Load`). Codecs are wired via
+`PlanToCircuit.Compile(plan, ArrowSqlSnapshotCodecs.Instance)`; on-disk
+format is Arrow IPC under per-operator `op-{i}/` subdirectories with a
+top-level `manifest.json` recording schema version, plan fingerprint
+(operator type sequence), and tick.
+
+The `_aggCache` / `_stateCache` problem from the original B sketch is
+solved by *not* serialising them: on `Load` the operator walks the
+restored trace and calls `aggregator.Update(ref state, None, group,
+group)` per group — which is the existing increment path with a fresh
+state — so SUM/COUNT/AVG/MIN/MAX all converge to the right
+steady-state without per-state-class codecs.
+
+**Layout and retention.** Each snapshot lives under its own
+`snap-{tick}/` key prefix in the store, with the per-op `op-{i}/`
+contents and the snapshot's `manifest.json`. A top-level
+`{snapshotDir}/current.txt` names the latest snap-T and is the source
+of truth — `Snapshot.Read` reads it to find the loadable snapshot.
+`Snapshot.Write(circuit, dir, retainCount: N)` keeps the N
+most-recent snapshots; older ones are pruned after the new snapshot
+commits. Default `retainCount` is 1 — only the just-written snapshot
+survives, matching the prior overwrite semantics.
+`Snapshot.ListSnapshots(dir)` returns retained ticks in ascending
+order; useful for debugging and for time-travel queries (load an
+older `snap-T` directly by its manifest).
+
+**Cloud-native commit.** Per-op blobs and the `manifest.json` for a
+new snap-T are written directly to their final keys. The commit
+happens when `current.txt` is atomically updated last — before that,
+the new snapshot is invisible to readers (they're still resolving
+through the prior `current.txt`). This sequencing works on cloud
+object stores (where directory rename doesn't exist) and on the
+local store (which simulates atomic single-blob writes via
+tmp+rename internally). Pruning of older retained snap-T blobs is
+best-effort and runs after the `current.txt` commit. Crash points:
+
+- Mid-Save (operator throws): partial blobs may exist under
+  `snap-T/`, but `current.txt` is never updated, so `Read` and
+  `Exists` see the prior snapshot (or no snapshot). Orphans get
+  pruned eventually as ticks advance and retention catches up.
+- Between blob writes and `current.txt` commit: same — orphan
+  blobs invisible to readers.
+- During `current.txt` rename: atomic — either old or new pointer is
+  visible.
+- During pruning: best-effort. Failures leave orphan blobs but don't
+  break correctness; `Read` still uses `current.txt`.
+
+`Snapshot.Exists(store)` returns true iff `current.txt` exists and
+names a snap-T whose manifest exists.
+
+**Schema drift detection.** The manifest carries two fingerprints:
+
+- `PlanFingerprint` — operator types in positional order, including
+  generic args. Catches op add/remove/reorder and type-arg drift.
+- `SchemaFingerprint` — every snapshottable operator's
+  `ISnapshotable.SchemaFingerprint`, derived from its codec(s)' column
+  names + `SqlType.Display`. Catches drift the operator-type
+  fingerprint can't see: VARCHAR length changes (Arrow's `StringType`
+  carries no length), DECIMAL precision/scale changes, NULL/NOT NULL
+  flips, intermediate column rename/reorder. Manifest schema bumped to
+  v2 with the new field; v1 manifests are rejected on read.
+
+### What ships in (C)
+
+`WalRecorder` accepts an optional `snapshotDir`. On reopen, the
+recorder loads the snapshot first (via `Snapshot.Exists` so the
+`.old`-recovery case is handled), then replays only WAL ticks past
+the snapshot's tick. `WalSegment` carries `StartTick` (manifest schema
+v2, with v1 → v2 cumulative-reconstruction on read) so whole segments
+below the snapshot tick are skipped without opening their files;
+straddling segments read-and-discard ticks below.
+
+`WalRecorder.WriteSnapshot(snapshotRetainCount: N)` takes an
+end-of-tick snapshot, optionally retaining the N most-recent ones,
+and prunes WAL segments fully covered by the latest snapshot.
+The WAL is always pruned against the *latest* snapshot tick — older
+retained snapshots are point-in-time-only and can't be rolled forward
+with the current WAL. Operations are ordered for crash safety:
+
+1. `Snapshot.Write` (atomic via the snap-T rename + `current.txt`
+   commit).
+2. WAL manifest is rewritten with the pruned segments removed
+   (tmp+rename atomic at the manifest level).
+3. Best-effort delete of the now-orphaned `.arrows` files.
+
+A crash during step 1 leaves the old snapshot intact; during step 2,
+the snapshot is committed but the WAL manifest still references all
+segments, and replay just skips already-applied ticks; during step 3,
+the manifest no longer references the orphan files so replay never
+opens them, and the next `WriteSnapshot` cleans the leftovers.
+
+`Snapshot.Read` also restores `RootCircuit.TickCount` to the snapshot's
+tick so absolute tick numbers stay consistent across the
+snapshot/WAL boundary. The recorder validates the pairing on open:
+if the snapshot's tick exceeds the WAL's coverage, it throws
+`InvalidDataException` rather than silently producing wrong state.
+
+### Test coverage
+
+The persistence test suite (under `tests/DbspNet.Tests/Persistence/`)
+covers each stateful operator's snapshot round-trip in isolation, the
+snapshot-foundation contracts (manifest, plan fingerprint, schema
+version), the WAL recorder's input-replay path, the snapshot+WAL
+hybrid (snapshot-only, WAL-only, both, mid-session checkpoints, prune
+behavior, error paths), atomic-write semantics (mid-Save crash, stale
+`.tmp` cleanup, `.old` recovery), and multi-stateful-op compositions
+(JOIN+GROUP BY, three-way JOIN, UNION+GROUP BY, LEFT JOIN+GROUP BY,
+recursive CTE+GROUP BY, plus a manifest assertion that
+`SnapshottedIndices` records every stateful op in plan order).

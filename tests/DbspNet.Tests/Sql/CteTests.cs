@@ -23,7 +23,7 @@ public class CteTests
     }
 
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
-        z.WeightOf(new StructuralRow(row)).Value;
+        z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
 
     // ---- Parser-level ----
 

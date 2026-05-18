@@ -67,8 +67,10 @@ public class LexerTests
     {
         var tokens = Lexer.Tokenize("3.14 0.5");
         Assert.Equal(TokenKind.DecimalLiteral, tokens[0].Kind);
-        Assert.Equal(3.14m, tokens[0].DecimalValue);
-        Assert.Equal(0.5m, tokens[1].DecimalValue);
+        Assert.Equal((Int128)314, tokens[0].DecimalMantissa);
+        Assert.Equal(2, tokens[0].DecimalScale);
+        Assert.Equal((Int128)5, tokens[1].DecimalMantissa);
+        Assert.Equal(1, tokens[1].DecimalScale);
     }
 
     [Fact]

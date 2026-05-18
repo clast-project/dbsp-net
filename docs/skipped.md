@@ -68,13 +68,6 @@ Legend:
 - **[P2]** `GROUPING SETS`, `ROLLUP`, `CUBE`.
 
 ### Aggregate functions
-- **[P1]** Incrementalized `MIN` / `MAX`. SUM / COUNT / AVG now fold the
-  per-group delta into running state via `SqlAggregator.Update` (O(|delta|)
-  per changed group). `MIN` / `MAX` still inherit the default `Update`,
-  which rescans the post-delta multiset — retracting the current extremum
-  requires knowing the next-best value, so a proper incremental impl needs
-  a per-group retraction-aware structure (heap or sorted trace). See
-  `docs/benchmarks.md` for the effect on the composite-aggregate curve.
 - **[P1]** `MIN`, `MAX` are included in v1 via per-group multiset tracking.
 - **[P1]** `FILTER (WHERE …)` clause on aggregates.
 - **[P1]** `DISTINCT` in aggregates; `WITHIN DISTINCT`.
@@ -96,7 +89,73 @@ Legend:
   `BETWEEN … AND …` with named bounds.
 
 ### Type system
-- **[P1]** DATE, TIME, TIMESTAMP, INTERVAL. Feldera has full support.
+- **[P1]** INTERVAL. Feldera has full support.
+- **[P2]** TIMESTAMP WITH TIME ZONE, typed temporal literals
+  (`DATE 'yyyy-mm-dd'` etc.), and date/time arithmetic
+  (`date + interval`, `timestamp - timestamp`). DATE / TIME / TIMESTAMP
+  base types now exist with Arrow-aligned representations
+  (`Date32`, `Time64[microsecond]`, `Timestamp[microsecond]` naive),
+  with `CAST` from string and ordering / equality.
+- VARCHAR is stored as `Utf8String` (Arrow-aligned
+  `ReadOnlyMemory<byte>`) with native UTF-8 equality, ordering, hashing
+  (XxHash3), `LENGTH` (code points), byte-wise `CONCAT`, and `Rune`-based
+  invariant `UPPER` / `LOWER`. Substring / LIKE / position-based ops are
+  not yet implemented — when added they should also be native UTF-8 with
+  code-point semantics.
+- Apache Arrow boundary: `DbspNet.Arrow` exposes `CompiledQuery.ToArrowDelta()`
+  (returns a `RecordBatch` + parallel weights array — positive for inserts,
+  negative for retractions) and `TableInput.PushArrow(RecordBatch[, weights])`
+  on the input side. Schema mapping is mechanical (the type system was
+  pre-aligned to Arrow). Conversion is column-major — type dispatch is
+  hoisted out of the per-row loop into a single typed loop per column.
+  String output uses direct UTF-8 byte append (no `string` round-trip).
+  Opt-in `TableInput.PushArrowZeroCopy(...)` aliases Arrow `ValueBuffer`
+  slices via `Utf8String.FromBytes` for zero-allocation string ingest;
+  caller commits to keeping the `RecordBatch` alive for the lifetime of
+  engine state. Decimal128 mantissas memcpy directly between Arrow's
+  16-byte buffer and `Int128` via `MemoryMarshal` — same little-endian
+  layout, no per-cell `BinaryPrimitives` shuffling. IPC streaming is
+  available via `CompiledQuery.WriteArrowStream(stream)` /
+  `TableInput.ReadArrowStream(stream)` for one-shot snapshots, and
+  `OpenArrowDeltaWriter` / `ReadArrowStreamBatches` for multi-batch
+  pipelines. Z-set weights travel inline as a trailing
+  `__weight : Int64` column on the wire schema; readers that don't
+  expect weights see a well-formed Arrow stream and can ignore the
+  extra column.
+- Persistence (approach A — input WAL): `DbspNet.Persistence.WalRecorder`
+  captures every per-tick input delta to a directory of Arrow IPC
+  segments + a JSON manifest. Reopening with the same input table
+  schemas replays existing segments through the engine to reach the
+  recorded post-state, then opens a fresh segment for further appends.
+  Plan fingerprint guards against schema drift but ignores SELECT body
+  changes — the WAL stays valid across query refactors.
+- Persistence (approach B — state snapshots, partial): the foundation
+  is in place — `ISnapshotable` contract on operators, file-backed
+  `Snapshot.Write` / `Snapshot.Read` orchestration, manifest with
+  plan-structure fingerprint that hashes the operator type sequence.
+  `DistinctOp` round-trips its trace as Arrow IPC end-to-end via the
+  `ArrowSqlSnapshotCodecs` registry passed to `PlanToCircuit.Compile`.
+  **Still to do for B:** `IncrementalAggregateOp` (trace + per-key
+  aggregator state — needs `SqlAggregator.SaveState`/`LoadState` per
+  subclass), `IncrementalJoinOp` / `IncrementalLeftJoinOp` (two
+  per-side traces), `RecursiveCteOp`. **Deferred:** snapshot+WAL
+  hybrid (C — falls out of A+B with ~50 LOC of coordination once B
+  is complete), the spine/log-structured trace (D).
+- DECIMAL is stored as `Decimal128` (Arrow-aligned `Int128` mantissa with
+  scale-in-type) via the cross-repo `Clast.DatabaseDecimal` library.
+  Native arithmetic (`AddKernel` / `MultiplyKernel` / `DivideKernel`)
+  with banker's rounding for division, scale-aware comparison, mixed-
+  type promotion (INT + DECIMAL), CAST round-trips through string and
+  numeric, plus `ABS` / `FLOOR` / `CEIL` / `ROUND` (banker's rounding)
+  on the column scale. Per-operator result-type promotion follows
+  SQL Server / Substrait rules via `DecimalTypeRules` (precision grows
+  by 1 on add/sub for carry, scales add on multiply, scale extends on
+  divide; clamped to 38 with scale-borrowing). SUM / AVG accumulators
+  are widened to `Int256` so per-row mantissa × weight cannot silently
+  wrap; output is narrowed to `Decimal128` with an explicit overflow
+  check. The remaining hard upper bound is ~10^38 at the result column
+  itself (Decimal128 capacity); supporting Decimal256-typed result
+  columns is a future SQL-frontend extension.
 - **[P2]** Unsigned integer variants (`UINT8`, `UINT16`, etc.). Feldera
   supports them.
 - **[P2]** ARRAY, MAP, ROW/STRUCT. Feldera supports all three.

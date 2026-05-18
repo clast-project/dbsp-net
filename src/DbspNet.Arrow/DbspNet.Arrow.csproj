@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <!-- CA1859 (concrete return types) flags the per-type Arrow array
+         builders in ArrowColumns. The polymorphic IArrowArray return is
+         exactly what the dispatcher consumes; making it concrete defeats
+         the column-major switch. -->
+    <NoWarn>$(NoWarn);CA1859</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DbspNet.Sql\DbspNet.Sql.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- WalRecorder builds and parses the same Arrow IPC envelope that
+         ArrowIpcExtensions writes; sharing the AppendWeightField /
+         WeightFieldName constants avoids drift. -->
+    <InternalsVisibleTo Include="DbspNet.Persistence" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="21.0.0" />
+  </ItemGroup>
+</Project>

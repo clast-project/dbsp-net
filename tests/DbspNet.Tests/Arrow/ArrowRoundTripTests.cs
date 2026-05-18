@@ -1,0 +1,310 @@
+using Apache.Arrow;
+using Apache.Arrow.Types;
+using Clast.DatabaseDecimal.Values;
+using DbspNet.Arrow;
+using DbspNet.Sql.Compiler;
+using DbspNet.Sql.Parser;
+using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
+
+namespace DbspNet.Tests.Arrow;
+
+public class ArrowRoundTripTests
+{
+    private static CompiledQuery Compile(string[] ddl, string query)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        foreach (var s in ddl)
+        {
+            resolver.Resolve(Parser.ParseStatement(s));
+        }
+
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(query))).Query;
+        return PlanToCircuit.Compile(plan);
+    }
+
+    // ---- Output side: ToArrowDelta ----
+
+    [Fact]
+    public void OutputDelta_PassThroughSelect_RoundTripsAllScalarTypes()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE t (i INT NOT NULL, l BIGINT NOT NULL, " +
+                "d DOUBLE PRECISION NOT NULL, dec DECIMAL(10,2) NOT NULL, " +
+                "s VARCHAR NOT NULL, b BOOLEAN NOT NULL, " +
+                "dt DATE NOT NULL, ts TIMESTAMP NOT NULL)",
+            ],
+            "SELECT i, l, d, dec, s, b, dt, ts FROM t");
+
+        q.Table("t").Insert(
+            42, 100_000_000_000L, 3.14, "12.34", "hello", true,
+            Date32.Parse("2026-05-04"), Timestamp.Parse("2026-05-04 12:00:00"));
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+
+        Assert.Equal(1, delta.Rows.Length);
+        Assert.Equal(new long[] { 1 }, delta.Weights);
+
+        Assert.Equal(42, ((Int32Array)delta.Rows.Column(0)).Values[0]);
+        Assert.Equal(100_000_000_000L, ((Int64Array)delta.Rows.Column(1)).Values[0]);
+        Assert.Equal(3.14, ((DoubleArray)delta.Rows.Column(2)).Values[0]);
+        Assert.Equal("hello", ((StringArray)delta.Rows.Column(4)).GetString(0));
+        Assert.True(((BooleanArray)delta.Rows.Column(5)).GetValue(0));
+    }
+
+    [Fact]
+    public void OutputDelta_NegativeWeightsForRetractions()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (id INT NOT NULL)"],
+            "SELECT id FROM t");
+        q.Table("t").Insert(1);
+        q.Table("t").Insert(2);
+        q.Step();
+
+        // First step's delta has +1 weights for both rows.
+        var firstDelta = q.ToArrowDelta();
+        Assert.Equal(2, firstDelta.Rows.Length);
+        Assert.All(firstDelta.Weights, w => Assert.Equal(1, w));
+
+        // Delete row 1 → next step's delta has weight −1 on row 1.
+        q.Table("t").Delete(1);
+        q.Step();
+        var retractDelta = q.ToArrowDelta();
+        Assert.Equal(1, retractDelta.Rows.Length);
+        Assert.Equal(-1, retractDelta.Weights[0]);
+        Assert.Equal(1, ((Int32Array)retractDelta.Rows.Column(0)).Values[0]);
+    }
+
+    [Fact]
+    public void OutputDelta_NullValues()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (id INT NOT NULL, name VARCHAR)"],
+            "SELECT id, name FROM t");
+        q.Table("t").Insert(1, "alice");
+        q.Table("t").Insert(2, (object?)null);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        var nameCol = (StringArray)delta.Rows.Column(1);
+
+        // Locate each row by id — Z-set order isn't ordered.
+        var idCol = (Int32Array)delta.Rows.Column(0);
+        var aliceIdx = idCol.Values[0] == 1 ? 0 : 1;
+        var nullIdx = 1 - aliceIdx;
+        Assert.Equal("alice", nameCol.GetString(aliceIdx));
+        Assert.True(nameCol.IsNull(nullIdx));
+    }
+
+    // ---- Input side: PushArrow ----
+
+    [Fact]
+    public void InputBatch_RoundTripsThroughCompiledQuery()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE t (id INT NOT NULL, " +
+                "amount DECIMAL(10, 2) NOT NULL, name VARCHAR NOT NULL)",
+            ],
+            "SELECT id, amount, name FROM t");
+
+        var arrowSchema = ArrowSchemaBridge.ToArrow(q.Table("t").Schema);
+
+        var idBuilder = new Int32Array.Builder();
+        idBuilder.Append(1).Append(2).Append(3);
+
+        var amtType = new Decimal128Type(10, 2);
+        var amtBuilder = new Decimal128Array.Builder(amtType);
+        amtBuilder.Append(1234m).Append(2599m).Append(150m);
+
+        var nameBuilder = new StringArray.Builder();
+        nameBuilder.Append("alice").Append("bob").Append("carol");
+
+        var batch = new RecordBatch(arrowSchema, new IArrowArray[]
+        {
+            idBuilder.Build(),
+            amtBuilder.Build(),
+            nameBuilder.Build(),
+        }, length: 3);
+
+        q.Table("t").PushArrow(batch);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        Assert.Equal(3, delta.Rows.Length);
+        Assert.All(delta.Weights, w => Assert.Equal(1, w));
+    }
+
+    [Fact]
+    public void InputBatch_MixedWeights_AppliesInsertsAndRetractions()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (id INT NOT NULL)"],
+            "SELECT id FROM t");
+        q.Table("t").Insert(1);
+        q.Table("t").Insert(2);
+        q.Step();
+        Assert.Equal(2, q.Current.Count);
+
+        // Build a batch that retracts id=1 and inserts id=3 in one Step.
+        var arrowSchema = ArrowSchemaBridge.ToArrow(q.Table("t").Schema);
+        var idBuilder = new Int32Array.Builder();
+        idBuilder.Append(1).Append(3);
+        var batch = new RecordBatch(arrowSchema, new IArrowArray[]
+        {
+            idBuilder.Build(),
+        }, length: 2);
+
+        long[] weights = { -1, 1 };
+        q.Table("t").PushArrow(batch, weights);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        // Delta has the retraction (id=1, w=−1) and the insertion (id=3, w=+1).
+        Assert.Equal(2, delta.Rows.Length);
+        var ids = ((Int32Array)delta.Rows.Column(0));
+        for (var i = 0; i < delta.Rows.Length; i++)
+        {
+            if (ids.Values[i] == 1)
+            {
+                Assert.Equal(-1, delta.Weights[i]);
+            }
+            else
+            {
+                Assert.Equal(1, delta.Weights[i]);
+                Assert.Equal(3, ids.Values[i]);
+            }
+        }
+    }
+
+    [Fact]
+    public void RoundTrip_WithMultibyteString()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT s FROM t");
+
+        var arrowSchema = ArrowSchemaBridge.ToArrow(q.Table("t").Schema);
+        var sb = new StringArray.Builder();
+        sb.Append("café").Append("🎉");
+        var batch = new RecordBatch(arrowSchema, new IArrowArray[] { sb.Build() }, 2);
+
+        q.Table("t").PushArrow(batch);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        var col = (StringArray)delta.Rows.Column(0);
+        var values = new HashSet<string>();
+        for (var i = 0; i < delta.Rows.Length; i++)
+        {
+            values.Add(col.GetString(i));
+        }
+
+        Assert.Contains("café", values);
+        Assert.Contains("🎉", values);
+    }
+
+    [Fact]
+    public void RoundTrip_DecimalPreservesScaleAndValue()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (price DECIMAL(10, 2) NOT NULL)"],
+            "SELECT price FROM t");
+
+        var arrowSchema = ArrowSchemaBridge.ToArrow(q.Table("t").Schema);
+        var b = new Decimal128Array.Builder(new Decimal128Type(10, 2));
+        // Arrow's Decimal128Array.Builder normalises a System.Decimal by
+        // multiplying by 10^scale to get the stored mantissa.
+        b.Append(123.45m);  // → mantissa 12345 at scale 2
+        b.Append(0.99m);    // → mantissa 99
+        var batch = new RecordBatch(arrowSchema, new IArrowArray[] { b.Build() }, 2);
+
+        q.Table("t").PushArrow(batch);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        var col = (Decimal128Array)delta.Rows.Column(0);
+        var mantissas = new HashSet<long>();
+        for (var i = 0; i < delta.Rows.Length; i++)
+        {
+            var bytes = col.GetBytes(i);
+            mantissas.Add(System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(bytes));
+        }
+
+        Assert.Contains(12345L, mantissas);
+        Assert.Contains(99L, mantissas);
+    }
+
+    [Fact]
+    public void RoundTrip_DecimalEdgeValues_BitExact()
+    {
+        // Exercises the MemoryMarshal-based zero-copy path with values that
+        // stress the sign bit, lower/upper Int128 halves, and near-Int128
+        // capacity. If endianness or sign extension was off, these would
+        // round-trip to the wrong mantissa.
+        var q = Compile(
+            ["CREATE TABLE t (v DECIMAL(38, 0) NOT NULL)"],
+            "SELECT v FROM t");
+
+        // Carefully chosen mantissas:
+        //  - 1: smallest positive
+        //  - -1: smallest negative (tests sign extension)
+        //  - 2^63: requires upper Int64 half
+        //  - 99999999999999999999999999999999999999: 38 nines, near Int128 cap
+        //  - -99999999999999999999999999999999999999: same magnitude negated
+        q.Table("t").Insert("1");
+        q.Table("t").Insert("-1");
+        q.Table("t").Insert("9223372036854775808");
+        q.Table("t").Insert("99999999999999999999999999999999999999");
+        q.Table("t").Insert("-99999999999999999999999999999999999999");
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        Assert.Equal(5, delta.Rows.Length);
+
+        var col = (Decimal128Array)delta.Rows.Column(0);
+        var seen = new HashSet<Int128>();
+        for (var i = 0; i < delta.Rows.Length; i++)
+        {
+            var bytes = col.GetBytes(i);
+            seen.Add(System.Runtime.InteropServices.MemoryMarshal.Read<Int128>(bytes));
+        }
+
+        Assert.Contains((Int128)1, seen);
+        Assert.Contains((Int128)(-1), seen);
+        Assert.Contains((Int128)1 << 63, seen);
+
+        var bigPos = Int128.Parse(
+            "99999999999999999999999999999999999999",
+            System.Globalization.CultureInfo.InvariantCulture);
+        Assert.Contains(bigPos, seen);
+        Assert.Contains(-bigPos, seen);
+    }
+
+    [Fact]
+    public void RoundTrip_TemporalTypes()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (d DATE NOT NULL, ts TIMESTAMP NOT NULL)"],
+            "SELECT d, ts FROM t");
+
+        var d = Date32.Parse("2026-05-04");
+        var ts = Timestamp.Parse("2026-05-04 12:30:45");
+
+        q.Table("t").Insert(d, ts);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        Assert.Equal(1, delta.Rows.Length);
+
+        var dateCol = (Date32Array)delta.Rows.Column(0);
+        var tsCol = (TimestampArray)delta.Rows.Column(1);
+
+        Assert.Equal(d.Days, dateCol.Values[0]);
+        Assert.Equal(ts.Microseconds, tsCol.Values[0]);
+    }
+}

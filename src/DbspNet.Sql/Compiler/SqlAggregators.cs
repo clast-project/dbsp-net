@@ -1,7 +1,9 @@
 using System.Collections.Generic;
+using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Aggregators;
+using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
 
@@ -152,9 +154,16 @@ internal sealed class SqlSumAggregator : SqlAggregator
         public long DistinctNonNullRows;
     }
 
-    private sealed class SumStateDecimal
+    private sealed class SumStateDecimal128
     {
-        public decimal Sum;
+        // Mantissa accumulator at the column's scale (scale-implicit, same
+        // for every input row from a single column). Widened to Int256 so
+        // intermediate per-row mantissa × weight products can't silently
+        // wrap when row weights or values approach Int128 capacity. Narrowed
+        // back to Int128 at output via DecimalRuntime.NarrowToDecimal128,
+        // which throws OverflowException if the final running total
+        // legitimately exceeds the result type's range.
+        public Int256 Sum;
         public long DistinctNonNullRows;
     }
 
@@ -202,7 +211,7 @@ internal sealed class SqlSumAggregator : SqlAggregator
 
             case SqlDecimalType:
                 {
-                    decimal sum = 0;
+                    Int256 sum = Int256.Zero;
                     var any = false;
                     foreach (var (row, w) in rows)
                     {
@@ -212,11 +221,13 @@ internal sealed class SqlSumAggregator : SqlAggregator
                             continue;
                         }
 
-                        sum += Convert.ToDecimal(v, System.Globalization.CultureInfo.InvariantCulture) * w.Value;
+                        // Int256 multiply: Int128 mantissa widens implicitly,
+                        // long weight widens implicitly. No silent wrap.
+                        sum += (Int256)((Decimal128)v).Mantissa * w.Value;
                         any = true;
                     }
 
-                    return any ? sum : null;
+                    return any ? (object)DecimalRuntime.NarrowToDecimal128(sum) : null;
                 }
 
             default:
@@ -290,7 +301,7 @@ internal sealed class SqlSumAggregator : SqlAggregator
 
             case SqlDecimalType:
                 {
-                    var s = state as SumStateDecimal ?? new SumStateDecimal();
+                    var s = state as SumStateDecimal128 ?? new SumStateDecimal128();
                     foreach (var (row, w) in delta)
                     {
                         var v = _argExtract(row);
@@ -301,7 +312,7 @@ internal sealed class SqlSumAggregator : SqlAggregator
 
                         var afterW = after.WeightOf(row);
                         var beforeW = afterW.Value - w.Value;
-                        s.Sum += Convert.ToDecimal(v, System.Globalization.CultureInfo.InvariantCulture) * w.Value;
+                        s.Sum += (Int256)((Decimal128)v).Mantissa * w.Value;
                         if (beforeW == 0 && afterW.Value != 0)
                         {
                             s.DistinctNonNullRows++;
@@ -313,7 +324,9 @@ internal sealed class SqlSumAggregator : SqlAggregator
                     }
 
                     state = s;
-                    return s.DistinctNonNullRows > 0 ? (object)s.Sum : null;
+                    return s.DistinctNonNullRows > 0
+                        ? (object)DecimalRuntime.NarrowToDecimal128(s.Sum)
+                        : null;
                 }
 
             default:
@@ -331,6 +344,28 @@ internal sealed class SqlMinMaxAggregator : SqlAggregator
     {
         _argExtract = argExtract;
         _wantMin = wantMin;
+    }
+
+    /// <summary>
+    /// Per-group incremental state. <see cref="Counts"/> maps each distinct
+    /// non-null value <i>v</i> to the number of rows currently in the
+    /// post-delta multiset whose extracted value equals <i>v</i> AND whose
+    /// net weight is strictly positive. <see cref="Active"/> mirrors the
+    /// keys of <see cref="Counts"/> with positive counts, sorted by the
+    /// runtime <see cref="IComparable"/> ordering, so that <c>Min</c> /
+    /// <c>Max</c> are O(log n) on the distinct-value count.
+    /// </summary>
+    private sealed class State
+    {
+        public Dictionary<object, long> Counts = new();
+        public SortedSet<object> Active = new(ComparableComparer.Instance);
+    }
+
+    private sealed class ComparableComparer : IComparer<object>
+    {
+        public static readonly ComparableComparer Instance = new();
+
+        public int Compare(object? x, object? y) => ((IComparable)x!).CompareTo(y);
     }
 
     public override object? Compute(ZSet<StructuralRow, Z64> rows)
@@ -365,8 +400,66 @@ internal sealed class SqlMinMaxAggregator : SqlAggregator
         return best;
     }
 
-    // MIN/MAX use the default Update: Compute(after). Incrementalizing them
-    // requires retraction-aware structures (heap / sorted trace); deferred.
+    public override object? Update(
+        ref object? state,
+        object? oldValue,
+        ZSet<StructuralRow, Z64> delta,
+        ZSet<StructuralRow, Z64> after)
+    {
+        var s = state as State ?? new State();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (v is null)
+            {
+                continue;
+            }
+
+            // Detect transitions of *this row's* net weight across the
+            // positive/non-positive boundary. The set of values eligible
+            // for MIN/MAX is "values appearing in any positive-weight row",
+            // so per-value membership flips only on these transitions.
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            var wasPositive = beforeW > 0;
+            var isPositive = afterW > 0;
+            if (wasPositive == isPositive)
+            {
+                continue;
+            }
+
+            if (isPositive)
+            {
+                var c = s.Counts.GetValueOrDefault(v, 0L) + 1;
+                s.Counts[v] = c;
+                if (c == 1)
+                {
+                    s.Active.Add(v);
+                }
+            }
+            else
+            {
+                var c = s.Counts[v] - 1;
+                if (c == 0)
+                {
+                    s.Counts.Remove(v);
+                    s.Active.Remove(v);
+                }
+                else
+                {
+                    s.Counts[v] = c;
+                }
+            }
+        }
+
+        state = s;
+        if (s.Active.Count == 0)
+        {
+            return null;
+        }
+
+        return _wantMin ? s.Active.Min : s.Active.Max;
+    }
 }
 
 internal sealed class SqlAvgAggregator : SqlAggregator
@@ -386,9 +479,12 @@ internal sealed class SqlAvgAggregator : SqlAggregator
         public long NonNullCount;
     }
 
-    private sealed class AvgStateDecimal
+    private sealed class AvgStateDecimal128
     {
-        public decimal Sum;
+        // Int256 accumulator for the same reason as SumStateDecimal128.
+        // Division by count typically narrows the result back into Int128
+        // range, but per-row × weight can transiently exceed it.
+        public Int256 Sum;
         public long NonNullCount;
     }
 
@@ -396,7 +492,7 @@ internal sealed class SqlAvgAggregator : SqlAggregator
     {
         if (_resultType is SqlDecimalType)
         {
-            decimal sum = 0;
+            Int256 sum = Int256.Zero;
             long count = 0;
             foreach (var (row, w) in rows)
             {
@@ -406,11 +502,16 @@ internal sealed class SqlAvgAggregator : SqlAggregator
                     continue;
                 }
 
-                sum += Convert.ToDecimal(v, System.Globalization.CultureInfo.InvariantCulture) * w.Value;
+                sum += (Int256)((Decimal128)v).Mantissa * w.Value;
                 count += w.Value;
             }
 
-            return count == 0 ? null : sum / count;
+            // Result scale matches input column scale; integer-divide the
+            // accumulator by count (truncating) before narrowing back to
+            // Decimal128. Postgres-style precision extension is deferred.
+            return count == 0
+                ? null
+                : (object)DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
         }
         else
         {
@@ -440,7 +541,7 @@ internal sealed class SqlAvgAggregator : SqlAggregator
     {
         if (_resultType is SqlDecimalType)
         {
-            var s = state as AvgStateDecimal ?? new AvgStateDecimal();
+            var s = state as AvgStateDecimal128 ?? new AvgStateDecimal128();
             foreach (var (row, w) in delta)
             {
                 var v = _argExtract(row);
@@ -449,12 +550,14 @@ internal sealed class SqlAvgAggregator : SqlAggregator
                     continue;
                 }
 
-                s.Sum += Convert.ToDecimal(v, System.Globalization.CultureInfo.InvariantCulture) * w.Value;
+                s.Sum += (Int256)((Decimal128)v).Mantissa * w.Value;
                 s.NonNullCount += w.Value;
             }
 
             state = s;
-            return s.NonNullCount == 0 ? null : (object)(s.Sum / s.NonNullCount);
+            return s.NonNullCount == 0
+                ? null
+                : (object)DecimalRuntime.NarrowToDecimal128(s.Sum / (Int256)s.NonNullCount);
         }
         else
         {

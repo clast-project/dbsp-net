@@ -284,24 +284,27 @@ internal static class BuiltinScalarFunctions
         return result;
     }
 
-    private static readonly MethodInfo StringToUpperInvariant =
-        typeof(string).GetMethod(nameof(string.ToUpperInvariant), Type.EmptyTypes)!;
-    private static readonly MethodInfo StringToLowerInvariant =
-        typeof(string).GetMethod(nameof(string.ToLowerInvariant), Type.EmptyTypes)!;
+    private static readonly MethodInfo Utf8ToUpperInvariant =
+        typeof(Utf8String).GetMethod(nameof(Utf8String.ToUpperInvariant))!;
+    private static readonly MethodInfo Utf8ToLowerInvariant =
+        typeof(Utf8String).GetMethod(nameof(Utf8String.ToLowerInvariant))!;
 
     private static Expression BuildUpperLower(Expression arg, bool isUpper)
     {
-        return NullPropagatingUnary(arg, typeof(string), s =>
-            Expression.Call(s, isUpper ? StringToUpperInvariant : StringToLowerInvariant));
+        // Native UTF-8 case fold on Utf8String — no decode/encode round-trip.
+        var method = isUpper ? Utf8ToUpperInvariant : Utf8ToLowerInvariant;
+        return NullPropagatingUnary(arg, typeof(Utf8String), s =>
+            Expression.Call(s, method));
     }
 
-    private static readonly PropertyInfo StringLength =
-        typeof(string).GetProperty(nameof(string.Length))!;
+    private static readonly MethodInfo Utf8CodePointCount =
+        typeof(Utf8String).GetMethod(nameof(Utf8String.CodePointCount))!;
 
     private static Expression BuildLength(Expression arg)
     {
-        return NullPropagatingUnary(arg, typeof(string),
-            s => Expression.Property(s, StringLength));
+        // PG semantics: LENGTH = number of code points (not bytes).
+        return NullPropagatingUnary(arg, typeof(Utf8String),
+            s => Expression.Call(s, Utf8CodePointCount));
     }
 
     private static readonly MethodInfo ConcatRuntime =
@@ -317,27 +320,42 @@ internal static class BuiltinScalarFunctions
 
     private static Expression BuildAbs(Expression arg, SqlType argType)
     {
+        if (argType is SqlDecimalType)
+        {
+            var method = typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.Abs))!;
+            return NullPropagatingUnary(arg, typeof(Clast.DatabaseDecimal.Values.Decimal128),
+                unboxed => Expression.Call(method, unboxed));
+        }
+
         var clr = ClrOf(argType);
-        var method = typeof(Math).GetMethod(nameof(Math.Abs), new[] { clr })
+        var mathMethod = typeof(Math).GetMethod(nameof(Math.Abs), new[] { clr })
             ?? throw new InvalidOperationException($"no Math.Abs({clr.Name}) overload");
-        return NullPropagatingUnary(arg, clr, unboxed => Expression.Call(method, unboxed));
+        return NullPropagatingUnary(arg, clr, unboxed => Expression.Call(mathMethod, unboxed));
     }
 
     private static Expression BuildFloorCeil(Expression arg, SqlType argType, bool floor)
     {
-        // Integer types: no-op (FLOOR(5) = 5, CEIL(5) = 5). Float / double /
-        // decimal get dispatched to a runtime helper to hide the per-type
-        // overload juggling.
+        // Integer types: no-op (FLOOR(5) = 5, CEIL(5) = 5).
         if (argType is SqlIntegerType or SqlBigintType)
         {
             return arg;
         }
 
+        if (argType is SqlDecimalType d)
+        {
+            // Decimal path: scale baked in as a constant; runtime helper
+            // walks the mantissa with sign-aware rounding toward ±∞.
+            var methodName = floor ? nameof(DecimalRuntime.Floor) : nameof(DecimalRuntime.Ceil);
+            var method = typeof(DecimalRuntime).GetMethod(methodName)!;
+            return NullPropagatingUnary(arg, typeof(Clast.DatabaseDecimal.Values.Decimal128),
+                unboxed => Expression.Call(method, unboxed, Expression.Constant((byte)d.Scale)));
+        }
+
         var clr = ClrOf(argType);
-        var methodName = floor ? nameof(SqlBuiltinRuntime.Floor) : nameof(SqlBuiltinRuntime.Ceil);
-        var method = typeof(SqlBuiltinRuntime).GetMethod(methodName, new[] { clr })
-            ?? throw new InvalidOperationException($"no runtime {methodName} for {clr.Name}");
-        return NullPropagatingUnary(arg, clr, unboxed => Expression.Call(method, unboxed));
+        var fallbackName = floor ? nameof(SqlBuiltinRuntime.Floor) : nameof(SqlBuiltinRuntime.Ceil);
+        var fallback = typeof(SqlBuiltinRuntime).GetMethod(fallbackName, new[] { clr })
+            ?? throw new InvalidOperationException($"no runtime {fallbackName} for {clr.Name}");
+        return NullPropagatingUnary(arg, clr, unboxed => Expression.Call(fallback, unboxed));
     }
 
     private static Expression BuildRound(Expression[] args, IReadOnlyList<ResolvedExpression> argTypes)
@@ -346,6 +364,33 @@ internal static class BuiltinScalarFunctions
         if (argType is SqlIntegerType or SqlBigintType)
         {
             return args[0];
+        }
+
+        if (argType is SqlDecimalType decType)
+        {
+            // Decimal path: ROUND uses banker's rounding (matches the
+            // ScaleHelper.DivideRoundHalfEven semantics) and returns the
+            // same DecimalType — fractional digits beyond the requested
+            // precision become trailing zeros.
+            var roundMethod = typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.Round))!;
+            var scaleConst = Expression.Constant((byte)decType.Scale);
+
+            if (args.Length == 1)
+            {
+                return NullPropagatingUnary(args[0], typeof(Clast.DatabaseDecimal.Values.Decimal128),
+                    unboxed => Expression.Call(roundMethod, unboxed, scaleConst, Expression.Constant(0)));
+            }
+
+            var isNullDec = Expression.OrElse(
+                Expression.Equal(args[0], NullObject),
+                Expression.Equal(args[1], NullObject));
+            var unboxedXDec = Expression.Convert(args[0], typeof(Clast.DatabaseDecimal.Values.Decimal128));
+            var digitsClrDec = ClrOf(argTypes[1].Type);
+            var digitsAsIntDec = digitsClrDec == typeof(int)
+                ? Expression.Convert(args[1], typeof(int))
+                : Expression.Convert(Expression.Convert(args[1], digitsClrDec), typeof(int));
+            var callDec = Expression.Call(roundMethod, unboxedXDec, scaleConst, digitsAsIntDec);
+            return Expression.Condition(isNullDec, NullObject, Expression.Convert(callDec, typeof(object)));
         }
 
         var clr = ClrOf(argType);
@@ -417,18 +462,10 @@ internal static class BuiltinScalarFunctions
         var xUnboxed = Expression.Convert(x, clr);
         var yUnboxed = Expression.Convert(y, clr);
 
-        Expression equal;
-        if (clr == typeof(string))
-        {
-            var cmp = Expression.Call(
-                typeof(string).GetMethod(nameof(string.CompareOrdinal), new[] { typeof(string), typeof(string) })!,
-                xUnboxed, yUnboxed);
-            equal = Expression.Equal(cmp, Expression.Constant(0));
-        }
-        else
-        {
-            equal = Expression.Equal(xUnboxed, yUnboxed);
-        }
+        // All NULLIF-typed operands are value types in the current type
+        // system; Expression.Equal resolves to op_Equality on the value
+        // type when one is defined.
+        var equal = Expression.Equal(xUnboxed, yUnboxed);
 
         var inner = Expression.Condition(equal, NullObject, x);
         var yIsNullBranch = Expression.Condition(yIsNull, x, inner);
@@ -463,9 +500,12 @@ internal static class BuiltinScalarFunctions
         SqlBigintType => typeof(long),
         SqlRealType => typeof(float),
         SqlDoubleType => typeof(double),
-        SqlDecimalType => typeof(decimal),
-        SqlVarcharType => typeof(string),
+        SqlDecimalType => typeof(Clast.DatabaseDecimal.Values.Decimal128),
+        SqlVarcharType => typeof(Utf8String),
         SqlBooleanType => typeof(bool),
+        SqlDateType => typeof(Date32),
+        SqlTimeType => typeof(Time64),
+        SqlTimestampType => typeof(Timestamp),
         _ => throw new InvalidOperationException($"no CLR mapping for {t.Display}"),
     };
 }
@@ -479,21 +519,41 @@ internal static class SqlBuiltinRuntime
 {
     // ---- String ----
 
-    /// <summary>PG-style CONCAT: NULL args are skipped; result is never NULL.</summary>
-    public static string Concat(object?[] args)
+    /// <summary>
+    /// PG-style CONCAT: NULL args are skipped; result is never NULL. Uses
+    /// byte-wise concat over UTF-8 — no decode pass.
+    /// </summary>
+    public static Utf8String Concat(object?[] args)
     {
-        var sb = new StringBuilder();
+        // Single allocating pass: sum byte lengths, then copy.
+        var totalBytes = 0;
         foreach (var a in args)
         {
-            if (a is null)
+            if (a is Utf8String u)
+            {
+                totalBytes += u.ByteLength;
+            }
+        }
+
+        if (totalBytes == 0)
+        {
+            return Utf8String.Empty;
+        }
+
+        var buf = new byte[totalBytes];
+        var offset = 0;
+        foreach (var a in args)
+        {
+            if (a is not Utf8String u)
             {
                 continue;
             }
 
-            sb.Append((string)a);
+            u.Span.CopyTo(buf.AsSpan(offset));
+            offset += u.ByteLength;
         }
 
-        return sb.ToString();
+        return Utf8String.FromBytes(buf);
     }
 
     // ---- FLOOR / CEIL / ROUND per-type ----

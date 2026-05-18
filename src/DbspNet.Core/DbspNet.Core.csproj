@@ -6,5 +6,8 @@
          AddRawOperator surface. -->
     <InternalsVisibleTo Include="DbspNet.Sql" />
     <InternalsVisibleTo Include="DbspNet.Tests" />
+    <!-- Persistence enumerates RootCircuit.Operators for snapshot
+         orchestration; the IOperator/Operators surface is internal. -->
+    <InternalsVisibleTo Include="DbspNet.Persistence" />
   </ItemGroup>
 </Project>

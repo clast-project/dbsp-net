@@ -74,7 +74,7 @@ public class EmittedEqualityCodecTests
     {
         var codec = EmittedEqualityCodec.Instance;
         var twoInt = codec.BuildRow(TwoIntSchema, new object?[] { 1, 2 });
-        var intString = codec.BuildRow(IntStringSchema, new object?[] { 1, "two" });
+        var intString = codec.BuildRow(IntStringSchema, new object?[] { 1, Utf8String.Of("two") });
 
         Assert.NotEqual(twoInt.GetType(), intString.GetType());
         // Different schemas obviously hash differently — sanity check.
@@ -85,13 +85,15 @@ public class EmittedEqualityCodecTests
     public void EmittedRow_StringField()
     {
         var codec = EmittedEqualityCodec.Instance;
-        var r1 = codec.BuildRow(IntStringSchema, new object?[] { 5, "hello" });
-        var r2 = codec.BuildRow(IntStringSchema, new object?[] { 5, "hello" });
-        var r3 = codec.BuildRow(IntStringSchema, new object?[] { 5, "world" });
+        var hello = Utf8String.Of("hello");
+        var world = Utf8String.Of("world");
+        var r1 = codec.BuildRow(IntStringSchema, new object?[] { 5, hello });
+        var r2 = codec.BuildRow(IntStringSchema, new object?[] { 5, hello });
+        var r3 = codec.BuildRow(IntStringSchema, new object?[] { 5, world });
 
         Assert.True(r1.Equals(r2));
         Assert.False(r1.Equals(r3));
-        Assert.Equal("hello", r1[1]);
+        Assert.Equal(hello, r1[1]);
     }
 
     [Fact]
@@ -116,5 +118,33 @@ public class EmittedEqualityCodecTests
         // Falls back to the base class — no subclass, type is exactly
         // StructuralRow.
         Assert.Equal(typeof(StructuralRow), row.GetType());
+    }
+
+    [Fact]
+    public void EmittedRow_TemporalFields_EqualByValue()
+    {
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("d", new SqlDateType(false)),
+            new SchemaColumn("ts", new SqlTimestampType(false)),
+        });
+        var d = Date32.Parse("2026-04-27");
+        var ts = Timestamp.Parse("2026-04-27 12:00:00");
+
+        var codec = EmittedEqualityCodec.Instance;
+        var r1 = codec.BuildRow(schema, new object?[] { d, ts });
+        var r2 = codec.BuildRow(schema, new object?[] { d, ts });
+        var r3 = codec.BuildRow(schema, new object?[] { d, Timestamp.Parse("2026-04-27 13:00:00") });
+
+        Assert.True(r1.Equals(r2));
+        Assert.Equal(r1.GetHashCode(), r2.GetHashCode());
+        Assert.False(r1.Equals(r3));
+
+        // Cross-type compare against the base StructuralRow with the same
+        // logical values must agree (same dictionary-key invariant as the
+        // int / string cases above).
+        var baseRow = StructuralRowCodec.Instance.BuildRow(schema, new object?[] { d, ts });
+        Assert.Equal(r1.GetHashCode(), baseRow.GetHashCode());
+        Assert.True(r1.Equals(baseRow));
     }
 }

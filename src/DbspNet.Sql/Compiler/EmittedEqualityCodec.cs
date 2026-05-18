@@ -59,12 +59,9 @@ public sealed class EmittedEqualityCodec : IRowCodec<StructuralRow>
         {
             var col = schema[i];
             var clr = col.Type.ClrType;
-            // Spike scope: int / long / double / decimal / bool / string,
             // NOT NULL only. Nullable columns fall back to base StructuralRow
             // pending a future expansion of EmitFieldEqualityCheck.
-            if (col.Type.Nullable
-                || (clr != typeof(int) && clr != typeof(long) && clr != typeof(double)
-                    && clr != typeof(decimal) && clr != typeof(bool) && clr != typeof(string)))
+            if (col.Type.Nullable || !IsSupportedClrType(clr))
             {
                 fingerprint = default!;
                 return false;
@@ -76,6 +73,13 @@ public sealed class EmittedEqualityCodec : IRowCodec<StructuralRow>
         fingerprint = new Fingerprint(arr);
         return true;
     }
+
+    private static bool IsSupportedClrType(Type clr) =>
+        clr == typeof(int) || clr == typeof(long) || clr == typeof(double)
+        || clr == typeof(bool) || clr == typeof(string)
+        || clr == typeof(Date32) || clr == typeof(Time64) || clr == typeof(Timestamp)
+        || clr == typeof(Utf8String)
+        || clr == typeof(Clast.DatabaseDecimal.Values.Decimal128);
 
     private static Func<object?[], StructuralRow>? BuildCtorFor(Fingerprint fp)
     {
@@ -293,11 +297,23 @@ public sealed class EmittedEqualityCodec : IRowCodec<StructuralRow>
             return;
         }
 
-        // Nullable<T>: call EqualityComparer<T>.Default.Equals via box-to-object then
-        // base Equals — slower path. For the spike, treat nullable types as
-        // unsupported by the typed-equality fast path and force the schema
-        // out of the cache so we use base StructuralRow. (The fingerprint
-        // filter in TryFingerprint should already exclude these.)
+        // Generic value-type fallback: any struct that exposes a static
+        // op_Equality(T, T) -> bool. Record structs (Date32, Time64,
+        // Timestamp) auto-generate this; same for any user struct that
+        // overloads ==.
+        if (type.IsValueType)
+        {
+            var op = type.GetMethod("op_Equality", [type, type]);
+            if (op is not null)
+            {
+                il.Emit(OpCodes.Call, op);
+                il.Emit(OpCodes.Brfalse, notEqualLabel);
+                return;
+            }
+        }
+
+        // Nullable<T> / unsupported types fall through. The fingerprint
+        // filter in TryFingerprint should already exclude these.
         throw new NotSupportedException($"emitted Equals not supported for {type}");
     }
 

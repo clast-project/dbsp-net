@@ -20,7 +20,7 @@ namespace DbspNet.Core.Operators.Stateful;
 ///   <item>Drop cache entries for groups that became empty.</item>
 /// </list>
 /// </summary>
-internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator
+internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, ISnapshotable
     where TKey : notnull
     where TValue : notnull
     where TOut : notnull
@@ -31,16 +31,61 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator
     private readonly IndexedZSetTrace<TKey, TValue, Z64> _trace = new();
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
+    private readonly IIndexedZSetTraceCodec<TKey, TValue, Z64>? _snapshotCodec;
 
     public IncrementalAggregateOp(
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
         Stream<ZSet<(TKey Key, TOut Value), Z64>> output,
-        IAggregator<TValue, TOut> aggregator)
+        IAggregator<TValue, TOut> aggregator,
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null)
     {
         _input = input;
         _output = output;
         _aggregator = aggregator;
+        _snapshotCodec = snapshotCodec;
     }
+
+    public void Save(ISnapshotWriter writer)
+    {
+        if (_snapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "IncrementalAggregateOp was constructed without a snapshot codec; " +
+                "pass one to CircuitBuilder.IncrementalAggregate to enable Snapshot.Write/Read.");
+        }
+
+        _snapshotCodec.Save(writer, "trace.arrows", _trace.Current);
+    }
+
+    public void Load(ISnapshotReader reader)
+    {
+        if (_snapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "IncrementalAggregateOp was constructed without a snapshot codec.");
+        }
+
+        var loaded = _snapshotCodec.Load(reader, "trace.arrows");
+        _trace.Integrate(loaded);
+
+        // Rebuild the per-group caches from the restored trace. Each
+        // aggregator's Update is already the function that maps a
+        // multiset → (state, value); calling it with delta = afterMultiset
+        // = group and a fresh state recovers both, matching the
+        // steady-state invariants of every shipped aggregator (SUM/COUNT/
+        // AVG fold weights into running totals; MIN/MAX walk transitions
+        // out of beforeW=0 into the active set). One pass of size
+        // |trace|; amortised across subsequent ticks.
+        foreach (var (key, group) in _trace.Current)
+        {
+            object? state = null;
+            var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
+            _aggCache[key] = agg;
+            _stateCache[key] = state;
+        }
+    }
+
+    public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
 
     public void Step()
     {

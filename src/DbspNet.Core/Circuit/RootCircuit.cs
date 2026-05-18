@@ -25,6 +25,22 @@ public sealed class RootCircuit
     /// <summary>Number of times <see cref="Step"/> has completed.</summary>
     public long TickCount => Interlocked.Read(ref _tickCount);
 
+    /// <summary>
+    /// Restore the tick counter to an absolute value. Used by the
+    /// persistence layer when loading a snapshot — the snapshot
+    /// represents end-of-tick T, so the circuit's tick counter should
+    /// jump to T rather than restart from zero. Not for general use:
+    /// callers must guarantee the circuit's operator state is consistent
+    /// with the supplied tick count.
+    /// </summary>
+    internal void RestoreTickCount(long value)
+    {
+        lock (SyncRoot)
+        {
+            Interlocked.Exchange(ref _tickCount, value);
+        }
+    }
+
     internal void AddInput(IInputCommit input)
     {
         _inputs.Add(input);
@@ -34,6 +50,14 @@ public sealed class RootCircuit
     {
         _operators.Add(op);
     }
+
+    /// <summary>
+    /// Operators registered with this circuit, in topological-/registration-
+    /// order. Exposed for the persistence layer to enumerate snapshottable
+    /// operators; operator positions in this list serve as stable ids
+    /// (paired with a plan fingerprint that catches structural drift).
+    /// </summary>
+    internal IReadOnlyList<IOperator> Operators => _operators;
 
     /// <summary>
     /// Build a circuit by running <paramref name="configure"/> against a

@@ -10,5 +10,6 @@
   <ItemGroup>
     <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />
     <ProjectReference Include="..\DbspNet.Sql\DbspNet.Sql.csproj" />
+    <ProjectReference Include="..\DbspNet.Arrow\DbspNet.Arrow.csproj" />
   </ItemGroup>
 </Project>

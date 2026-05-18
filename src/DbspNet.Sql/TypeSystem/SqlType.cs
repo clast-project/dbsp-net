@@ -56,7 +56,11 @@ public sealed record SqlDoubleType(bool Nullable) : SqlType(Nullable)
 
 public sealed record SqlDecimalType(int Precision, int Scale, bool Nullable) : SqlType(Nullable)
 {
-    public override Type ClrType => typeof(decimal);
+    // Always Decimal128 regardless of declared precision. Multi-tier
+    // selection (Decimal32/64/128/256 by precision) is a future optimisation;
+    // 128-bit covers the common SQL Server / Substrait range (precision ≤ 38)
+    // with no behavioural difference vs. narrower tiers.
+    public override Type ClrType => typeof(Clast.DatabaseDecimal.Values.Decimal128);
 
     public override string Name => $"DECIMAL({Precision},{Scale})";
 
@@ -65,7 +69,7 @@ public sealed record SqlDecimalType(int Precision, int Scale, bool Nullable) : S
 
 public sealed record SqlVarcharType(int? MaxLength, bool Nullable) : SqlType(Nullable)
 {
-    public override Type ClrType => typeof(string);
+    public override Type ClrType => typeof(Utf8String);
 
     public override string Name => MaxLength is null ? "VARCHAR" : $"VARCHAR({MaxLength})";
 
@@ -79,4 +83,31 @@ public sealed record SqlBooleanType(bool Nullable) : SqlType(Nullable)
     public override string Name => "BOOLEAN";
 
     public override SqlType WithNullable(bool nullable) => new SqlBooleanType(nullable);
+}
+
+public sealed record SqlDateType(bool Nullable) : SqlType(Nullable)
+{
+    public override Type ClrType => typeof(Date32);
+
+    public override string Name => "DATE";
+
+    public override SqlType WithNullable(bool nullable) => new SqlDateType(nullable);
+}
+
+public sealed record SqlTimeType(bool Nullable) : SqlType(Nullable)
+{
+    public override Type ClrType => typeof(Time64);
+
+    public override string Name => "TIME";
+
+    public override SqlType WithNullable(bool nullable) => new SqlTimeType(nullable);
+}
+
+public sealed record SqlTimestampType(bool Nullable) : SqlType(Nullable)
+{
+    public override Type ClrType => typeof(Timestamp);
+
+    public override string Name => "TIMESTAMP";
+
+    public override SqlType WithNullable(bool nullable) => new SqlTimestampType(nullable);
 }

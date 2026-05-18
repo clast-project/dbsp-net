@@ -207,8 +207,10 @@ static void RunMultiAggregateBenchmark(StringBuilder output)
 
     AppendTable(output, "Multi-aggregate — `SUM / COUNT / MIN / MAX` over 100 groups",
         "Stateful composite aggregator with retractions on every group-key hit. " +
-        "SUM / COUNT fold the per-group delta into running state; MIN / MAX still " +
-        "rescan the post-delta per-group multiset (see interpretation below).",
+        "All four aggregators are now O(|delta|) per changed group: SUM / COUNT " +
+        "fold the delta into running state; MIN / MAX maintain a per-group " +
+        "sorted set of distinct values with positive net weight, indexed for " +
+        "O(log n) extremum lookup.",
         rows);
 }
 
@@ -522,17 +524,14 @@ static void AppendInterpretation(StringBuilder output)
         "allocator / cache effects on a larger running state, not an algorithmic " +
         "scan.");
     output.AppendLine(
-        "- **Multi-aggregate** (SUM / COUNT / MIN / MAX) reaches ~300× at N=100k " +
-        "and still climbs with N, but more slowly. SUM / COUNT are O(|delta|); " +
-        "MIN / MAX inherit the default `Update`, which rescans the post-delta " +
-        "per-group multiset — retracting the current extremum requires knowing " +
-        "the next-best value, which needs a heap or sorted trace per group to " +
-        "incrementalize. So the residual O(group size) cost per tick is the " +
-        "MIN/MAX rescan, not the trace rebuild.");
-    output.AppendLine();
-    output.AppendLine(
-        "The remaining aggregate gap (incremental MIN/MAX) is filed in " +
-        "`docs/skipped.md`.");
+        "- **Multi-aggregate** (SUM / COUNT / MIN / MAX) now climbs steeply " +
+        "with N, reaching ~2000× at N=100k. All four aggregators are " +
+        "incremental: SUM / COUNT fold the delta; MIN / MAX maintain a " +
+        "per-group sorted set of distinct positive-weight values for " +
+        "O(log n) extremum lookup. Per-update cost is dominated by trace " +
+        "and aggregate-state dictionary ops at this point — the visible " +
+        "ceiling is now the same allocator / cache effect that limits " +
+        "Joined GROUP BY at scale.");
     output.AppendLine();
     _ = CultureInfo.InvariantCulture;
 }

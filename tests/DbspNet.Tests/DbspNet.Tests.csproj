@@ -13,6 +13,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\DbspNet.Core\DbspNet.Core.csproj" />
     <ProjectReference Include="..\..\src\DbspNet.Sql\DbspNet.Sql.csproj" />
+    <ProjectReference Include="..\..\src\DbspNet.Arrow\DbspNet.Arrow.csproj" />
+    <ProjectReference Include="..\..\src\DbspNet.Persistence\DbspNet.Persistence.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
