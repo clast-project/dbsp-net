@@ -65,7 +65,7 @@ public class RecursiveCteSnapshotTests : IDisposable
         z.WeightOf(new StructuralRow(row)).Value;
 
     [Fact]
-    public void RestoredState_ExtendingChain_EmitsOnlyNewlyReachablePairs()
+    public async Task RestoredState_ExtendingChain_EmitsOnlyNewlyReachablePairs()
     {
         // Producer: chain 1 -> 2 -> 3, full closure already computed.
         var producer = Compile();
@@ -73,13 +73,13 @@ public class RecursiveCteSnapshotTests : IDisposable
         producer.Table("edges").Insert(2, 3);
         producer.Step();   // reach = {(1,2),(2,3),(1,3)}
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Consumer: fresh circuit, restore _r + external trace, then
         // extend the chain. The semi-naïve path must use the restored R
         // to find newly-derivable pairs.
         var consumer = Compile();
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("edges").Insert(3, 4);
         consumer.Step();
@@ -97,7 +97,7 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void RestoredState_RetractionTriggersFullRecompute()
+    public async Task RestoredState_RetractionTriggersFullRecompute()
     {
         // Producer: chain 1 -> 2 -> 3, snapshot.
         var producer = Compile();
@@ -105,13 +105,13 @@ public class RecursiveCteSnapshotTests : IDisposable
         producer.Table("edges").Insert(2, 3);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Consumer: restore, then retract the bridge edge. Retraction
         // forces FullRecompute, which uses the *integrated* external
         // traces — those must be restored from the snapshot.
         var consumer = Compile();
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("edges").Delete(2, 3);
         consumer.Step();
@@ -123,7 +123,7 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void RestoredState_BranchingExtension_ProducesCorrectClosure()
+    public async Task RestoredState_BranchingExtension_ProducesCorrectClosure()
     {
         // Producer: chain 1 -> 2 -> 3.
         var producer = Compile();
@@ -131,13 +131,13 @@ public class RecursiveCteSnapshotTests : IDisposable
         producer.Table("edges").Insert(2, 3);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Consumer: add a branch from 2 -> 5. The new pairs are (2,5)
         // direct + (1,5) transitively — both require the restored R to
         // include (1,2).
         var consumer = Compile();
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("edges").Insert(2, 5);
         consumer.Step();
@@ -148,7 +148,7 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void RestoredState_NoChange_ProducesEmptyDelta()
+    public async Task RestoredState_NoChange_ProducesEmptyDelta()
     {
         // After restore, a Step with no input deltas should emit nothing —
         // _previousResult equals _r, so the difference is empty.
@@ -157,10 +157,10 @@ public class RecursiveCteSnapshotTests : IDisposable
         producer.Table("edges").Insert(2, 3);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile();
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Step();
 
@@ -168,16 +168,16 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void SnapshotBeforeAnyStep_RoundTripsEmpty()
+    public async Task SnapshotBeforeAnyStep_RoundTripsEmpty()
     {
         // A snapshot taken from a freshly-built circuit (no Step yet)
         // should round-trip cleanly: empty external traces, empty _r,
         // empty _previousResult.
         var producer = Compile();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile();
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("edges").Insert(1, 2);
         consumer.Step();
@@ -188,7 +188,7 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void NoCodec_RecursiveCteOp_ThrowsOnSnapshot()
+    public async Task NoCodec_RecursiveCteOp_ThrowsOnSnapshot()
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
@@ -203,7 +203,7 @@ public class RecursiveCteSnapshotTests : IDisposable
         query.Table("edges").Insert(1, 2);
         query.Step();
 
-        Assert.Throws<NotSupportedException>(() =>
-            Snapshot.Write(query.Circuit, _snapshotDir));
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await Snapshot.WriteAsync(query.Circuit, _snapshotDir));
     }
 }

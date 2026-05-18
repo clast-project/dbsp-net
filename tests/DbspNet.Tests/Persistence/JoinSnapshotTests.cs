@@ -53,7 +53,7 @@ public class JoinSnapshotTests : IDisposable
     };
 
     [Fact]
-    public void InnerJoin_RestoredState_MatchesNewLeftRowAgainstOldRight()
+    public async Task InnerJoin_RestoredState_MatchesNewLeftRowAgainstOldRight()
     {
         // Producer: load right side (orders) only. After restore, insert a
         // new left row (customer); the consumer must find existing right
@@ -65,12 +65,12 @@ public class JoinSnapshotTests : IDisposable
         producer.Table("orders").Insert(101, 1, 75L);
         producer.Step();   // no joins yet — left side empty
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             CustomersDdl,
             "SELECT customers.name, orders.amt FROM customers JOIN orders ON customers.cid = orders.cid");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Insert the matching customer; the operator's L⋈dr formula needs
         // L_{t-1} (empty) but the new dl ⋈ R_{t-1} requires the right
@@ -84,7 +84,7 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void InnerJoin_RestoredState_MatchesNewRightRowAgainstOldLeft()
+    public async Task InnerJoin_RestoredState_MatchesNewRightRowAgainstOldLeft()
     {
         // Mirror: snapshot with left side populated, then insert a new
         // right row in the consumer.
@@ -95,12 +95,12 @@ public class JoinSnapshotTests : IDisposable
         producer.Table("customers").Insert(2, "bob");
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             CustomersDdl,
             "SELECT customers.name, orders.amt FROM customers JOIN orders ON customers.cid = orders.cid");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("orders").Insert(100, 2, 75L);
         consumer.Step();
@@ -110,7 +110,7 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void InnerJoin_RestoredState_RetractionFlowsThroughBothTraces()
+    public async Task InnerJoin_RestoredState_RetractionFlowsThroughBothTraces()
     {
         // Producer: left and right both populated and matched.
         var producer = Compile(
@@ -120,12 +120,12 @@ public class JoinSnapshotTests : IDisposable
         producer.Table("orders").Insert(100, 1, 50L);
         producer.Step();   // emits ('alice', 50): +1
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             CustomersDdl,
             "SELECT customers.name, orders.amt FROM customers JOIN orders ON customers.cid = orders.cid");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Retract the order on the consumer side: dr = -1 for the right
         // row; L_{t-1} ⋈ dr should produce ('alice', 50): -1.
@@ -137,7 +137,7 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void LeftJoin_RestoredState_GainedMatchEmitsRetractAndJoinedRow()
+    public async Task LeftJoin_RestoredState_GainedMatchEmitsRetractAndJoinedRow()
     {
         // Producer: only the left side populated. LEFT JOIN currently
         // emits NULL-padded rows for unmatched lefts.
@@ -147,12 +147,12 @@ public class JoinSnapshotTests : IDisposable
         producer.Table("customers").Insert(1, "alice");
         producer.Step();   // emits ('alice', NULL): +1
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             CustomersDdl,
             "SELECT customers.name, orders.amt FROM customers LEFT JOIN orders ON customers.cid = orders.cid");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Insert an order that matches: gained-match transition →
         // retract NULL-padded, emit joined.
@@ -165,7 +165,7 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void LeftJoin_RestoredState_LostMatchRetractsJoinAndEmitsNullPadded()
+    public async Task LeftJoin_RestoredState_LostMatchRetractsJoinAndEmitsNullPadded()
     {
         // Producer: matched.
         var producer = Compile(
@@ -175,12 +175,12 @@ public class JoinSnapshotTests : IDisposable
         producer.Table("orders").Insert(100, 1, 50L);
         producer.Step();   // emits ('alice', 50): +1
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             CustomersDdl,
             "SELECT customers.name, orders.amt FROM customers LEFT JOIN orders ON customers.cid = orders.cid");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Retract the order: lost-match transition → retract joined,
         // emit NULL-padded.
@@ -193,7 +193,7 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void RightJoin_RestoredState_PreservedSideUnmatchedAfterRestore()
+    public async Task RightJoin_RestoredState_PreservedSideUnmatchedAfterRestore()
     {
         // RIGHT JOIN compiles as LEFT JOIN with sides swapped. Snapshot
         // happens with right (preserved) populated and no left matches;
@@ -204,12 +204,12 @@ public class JoinSnapshotTests : IDisposable
         producer.Table("orders").Insert(100, 1, 50L);
         producer.Step();   // emits (NULL, 50): +1
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             CustomersDdl,
             "SELECT customers.name, orders.amt FROM customers RIGHT JOIN orders ON customers.cid = orders.cid");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("customers").Insert(1, "alice");
         consumer.Step();
@@ -220,7 +220,7 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void NoCodec_InnerJoin_ThrowsOnSnapshot()
+    public async Task NoCodec_InnerJoin_ThrowsOnSnapshot()
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
@@ -236,7 +236,7 @@ public class JoinSnapshotTests : IDisposable
         query.Table("customers").Insert(1, "alice");
         query.Step();
 
-        Assert.Throws<NotSupportedException>(() =>
-            Snapshot.Write(query.Circuit, _snapshotDir));
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await Snapshot.WriteAsync(query.Circuit, _snapshotDir));
     }
 }

@@ -46,7 +46,7 @@ public class DistinctSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void SnapshotAndRestore_DeduplicatesAcrossSessions()
+    public async Task SnapshotAndRestore_DeduplicatesAcrossSessions()
     {
         // Producer: insert duplicates across two ticks; SELECT DISTINCT
         // emits the new row +1 the first time, ignores subsequent
@@ -63,14 +63,14 @@ public class DistinctSnapshotTests : IDisposable
         producer.Step();           // delta: {3: +1} — id=1 was already present
 
         // Snapshot.
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Consumer: fresh circuit from the same plan. Restore the
         // DistinctOp's trace from the snapshot.
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t UNION SELECT id FROM t");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // After restore, the DistinctOp knows ids 1, 2, 3 are already
         // present. Inserting another duplicate of id=1 should produce
@@ -87,7 +87,7 @@ public class DistinctSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void RestoredState_HandlesRetraction()
+    public async Task RestoredState_HandlesRetraction()
     {
         // Producer: insert 1 and 2, snapshot, retract 1.
         var producer = Compile(
@@ -96,13 +96,13 @@ public class DistinctSnapshotTests : IDisposable
         producer.Table("t").Insert(1);
         producer.Table("t").Insert(2);
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Consumer: restore, retract 1.
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t UNION SELECT id FROM t");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("t").Delete(1);
         consumer.Step();
@@ -114,7 +114,7 @@ public class DistinctSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void NoCodec_OperatorsThrowOnSnapshot()
+    public async Task NoCodec_OperatorsThrowOnSnapshot()
     {
         // Compile WITHOUT a codec registry — DistinctOp has no codec.
         var catalog = new Catalog();
@@ -127,7 +127,7 @@ public class DistinctSnapshotTests : IDisposable
         query.Table("t").Insert(1);
         query.Step();
 
-        Assert.Throws<NotSupportedException>(() =>
-            Snapshot.Write(query.Circuit, _snapshotDir));
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await Snapshot.WriteAsync(query.Circuit, _snapshotDir));
     }
 }

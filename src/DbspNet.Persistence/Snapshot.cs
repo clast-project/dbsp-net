@@ -1,33 +1,34 @@
 using DbspNet.Core.Circuit;
+using DbspNet.Core.IO;
+using DbspNet.Persistence.IO.Local;
 
 namespace DbspNet.Persistence;
 
 /// <summary>
 /// Approach (B) end-of-tick state snapshots. Walks a
 /// <see cref="RootCircuit"/>'s operators, calls
-/// <see cref="ISnapshotable.Save"/> on those that opt in, and writes a
-/// manifest. <see cref="Read(RootCircuit, IBlobStore)"/> validates the
-/// manifest's plan and schema fingerprints, then walks the rebuilt
-/// circuit and calls <see cref="ISnapshotable.Load"/> on the matching
-/// positions.
+/// <see cref="ISnapshotable.SaveAsync"/> on those that opt in, and writes
+/// a manifest. <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
+/// validates the manifest's plan and schema fingerprints, then walks the
+/// rebuilt circuit and calls <see cref="ISnapshotable.LoadAsync"/> on the
+/// matching positions.
 /// </summary>
 /// <remarks>
 /// <para><b>Layout.</b> Each snapshot lives under
 /// <c>snap-{tick}/</c> with its own <c>manifest.json</c> and
 /// <c>op-{i}/</c> subkeys. A top-level <c>current.txt</c> names the
 /// latest snapshot (e.g. <c>"snap-42"</c>) and is the source of truth
-/// for which one <see cref="Read(RootCircuit, IBlobStore)"/> loads.
-/// Older snapshots are retained up to <c>retainCount</c> from
-/// <see cref="Write(RootCircuit, IBlobStore, int)"/>; pruning happens
-/// after the new snapshot commits.</para>
-/// <para><b>Cloud-native commit.</b> Per-op blobs and the snap-T
-/// manifest are written directly to their final keys. The commit
-/// happens when <c>current.txt</c> is atomically updated last —
-/// before that, the new snapshot is invisible to readers (they're
-/// still using the prior <c>current.txt</c>). This works on cloud
-/// stores (where directory rename doesn't exist) and on a filesystem
-/// store (which simulates atomic single-blob writes via tmp+rename
-/// internally).</para>
+/// for which one <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
+/// loads. Older snapshots are retained up to <c>retainCount</c> from
+/// <see cref="WriteAsync(RootCircuit, ITableFileSystem, int, CancellationToken)"/>;
+/// pruning happens after the new snapshot commits.</para>
+/// <para><b>Cloud-native commit.</b> Per-op files and the snap-T
+/// manifest are written directly to their final keys via
+/// <see cref="ITableFileSystem.CreateAsync"/> /
+/// <see cref="ITableFileSystem.WriteAllBytesAsync"/>. The commit happens
+/// when <c>current.txt</c> is rotated in last via the tmp+rename pattern
+/// — before that, the new snapshot is invisible to readers (they're
+/// still using the prior <c>current.txt</c>).</para>
 /// <para>Plan + schema fingerprints in the manifest catch operator-
 /// type drift and schema drift; if a snapshot is loaded into a
 /// circuit that doesn't match, an
@@ -39,17 +40,20 @@ public static class Snapshot
     private const string CurrentKey = "current.txt";
 
     /// <summary>
-    /// Snapshot the circuit to <paramref name="store"/>. Each call
-    /// produces a new snapshot under <c>snap-{tick}/</c> and updates
-    /// <c>current.txt</c> to point at it. Up to
-    /// <paramref name="retainCount"/> most-recent snapshots are kept;
-    /// older ones are pruned. Returns the number of operators that
-    /// participated.
+    /// Snapshot the circuit to <paramref name="fs"/>. Each call produces a
+    /// new snapshot under <c>snap-{tick}/</c> and updates <c>current.txt</c>
+    /// to point at it. Up to <paramref name="retainCount"/> most-recent
+    /// snapshots are kept; older ones are pruned. Returns the number of
+    /// operators that participated.
     /// </summary>
-    public static int Write(RootCircuit circuit, IBlobStore store, int retainCount = 1)
+    public static async ValueTask<int> WriteAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        int retainCount = 1,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(circuit);
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
         if (retainCount < 1)
         {
             throw new ArgumentOutOfRangeException(
@@ -59,12 +63,12 @@ public static class Snapshot
         var tick = circuit.TickCount;
         var snapName = SnapDirName(tick);
 
-        // Write per-op blobs directly under their final keys. If a Save
-        // throws partway through, the partially-written blobs are
-        // orphans — invisible to readers because current.txt hasn't
-        // been updated. Future writes either at the same tick (which
-        // overwrite the same keys) or different ticks (which leave the
-        // orphans for retention prune) handle cleanup.
+        // Write per-op files directly under their final keys. If a Save
+        // throws partway through, the partially-written files are orphans
+        // — invisible to readers because current.txt hasn't been updated.
+        // Future writes either at the same tick (which overwrite the same
+        // keys) or different ticks (which leave the orphans for retention
+        // prune) handle cleanup.
         var snapshotted = new List<int>();
         for (var i = 0; i < circuit.Operators.Count; i++)
         {
@@ -73,8 +77,8 @@ public static class Snapshot
                 continue;
             }
 
-            var ctx = new BlobStoreSnapshotContext(store, snapName + "/op-" + i);
-            s.Save(ctx);
+            var ctx = new TableFileSystemSnapshotContext(fs, snapName + "/op-" + i);
+            await s.SaveAsync(ctx, cancellationToken).ConfigureAwait(false);
             snapshotted.Add(i);
         }
 
@@ -85,77 +89,82 @@ public static class Snapshot
             circuit.TickCount,
             circuit.Operators.Count,
             snapshotted);
-        manifest.Write(store, snapName + "/manifest.json");
+        await manifest.WriteAsync(fs, snapName + "/manifest.json", cancellationToken).ConfigureAwait(false);
 
-        // Atomic commit. After this single-blob write, the new snapshot
-        // is the latest; before it, current.txt still names the prior
-        // snapshot (or doesn't exist).
-        WriteCurrentPointer(store, snapName);
+        // Commit. After this, the new snapshot is the latest; before, the
+        // pointer still names the prior snapshot (or doesn't exist).
+        await WriteCurrentPointerAsync(fs, snapName, cancellationToken).ConfigureAwait(false);
 
-        // Best-effort prune of older retained snapshots.
-        PruneOlderSnapshots(store, retainCount);
+        await PruneOlderSnapshotsAsync(fs, retainCount, cancellationToken).ConfigureAwait(false);
 
         return snapshotted.Count;
     }
 
     /// <summary>
     /// Convenience overload for the local filesystem case: opens a
-    /// <see cref="LocalFileBlobStore"/> rooted at
+    /// <see cref="LocalTableFileSystem"/> rooted at
     /// <paramref name="snapshotDir"/> and forwards to
-    /// <see cref="Write(RootCircuit, IBlobStore, int)"/>.
+    /// <see cref="WriteAsync(RootCircuit, ITableFileSystem, int, CancellationToken)"/>.
     /// </summary>
-    public static int Write(RootCircuit circuit, string snapshotDir, int retainCount = 1)
+    public static ValueTask<int> WriteAsync(
+        RootCircuit circuit,
+        string snapshotDir,
+        int retainCount = 1,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
-        return Write(circuit, new LocalFileBlobStore(snapshotDir), retainCount);
+        return WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken);
     }
 
     /// <summary>
-    /// True iff <paramref name="store"/> holds at least one readable
-    /// snapshot — i.e. <c>current.txt</c> exists and names a snap-T
-    /// directory whose <c>manifest.json</c> exists.
+    /// True iff <paramref name="fs"/> holds at least one readable snapshot
+    /// — i.e. <c>current.txt</c> exists and names a snap-T directory whose
+    /// <c>manifest.json</c> exists.
     /// </summary>
-    public static bool Exists(IBlobStore store)
+    public static async ValueTask<bool> ExistsAsync(
+        ITableFileSystem fs, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(store);
-        var current = TryReadCurrentPointer(store);
+        ArgumentNullException.ThrowIfNull(fs);
+        var current = await TryReadCurrentPointerAsync(fs, cancellationToken).ConfigureAwait(false);
         if (current is null)
         {
             return false;
         }
 
-        return store.Exists(current + "/manifest.json");
+        return await fs.ExistsAsync(current + "/manifest.json", cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Convenience overload for the local filesystem case.
     /// </summary>
-    public static bool Exists(string snapshotDir)
+    public static ValueTask<bool> ExistsAsync(
+        string snapshotDir, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
         if (!Directory.Exists(snapshotDir))
         {
-            return false;
+            return ValueTask.FromResult(false);
         }
 
-        return Exists(new LocalFileBlobStore(snapshotDir));
+        return ExistsAsync(new LocalTableFileSystem(snapshotDir), cancellationToken);
     }
 
     /// <summary>
-    /// Tick numbers of all retained snapshots in <paramref name="store"/>,
+    /// Tick numbers of all retained snapshots in <paramref name="fs"/>,
     /// in ascending order.
     /// </summary>
-    public static IReadOnlyList<long> ListSnapshots(IBlobStore store)
+    public static async ValueTask<IReadOnlyList<long>> ListSnapshotsAsync(
+        ITableFileSystem fs, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
         var ticks = new HashSet<long>();
-        foreach (var key in store.ListKeys("snap-"))
+        await foreach (var entry in fs.ListAsync("snap-", cancellationToken).ConfigureAwait(false))
         {
             // Extract the snap-T directory name (the part before the
-            // first '/' after the prefix). A key like "snap-5/op-3/x"
+            // first '/' after the prefix). A path like "snap-5/op-3/x"
             // yields "snap-5".
-            var slash = key.IndexOf('/');
-            var name = slash < 0 ? key : key.Substring(0, slash);
+            var slash = entry.Path.IndexOf('/');
+            var name = slash < 0 ? entry.Path : entry.Path[..slash];
             if (TryParseSnapDir(name, out var tick))
             {
                 ticks.Add(tick);
@@ -170,15 +179,16 @@ public static class Snapshot
     /// <summary>
     /// Convenience overload for the local filesystem case.
     /// </summary>
-    public static IReadOnlyList<long> ListSnapshots(string snapshotDir)
+    public static ValueTask<IReadOnlyList<long>> ListSnapshotsAsync(
+        string snapshotDir, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
         if (!Directory.Exists(snapshotDir))
         {
-            return Array.Empty<long>();
+            return ValueTask.FromResult<IReadOnlyList<long>>(Array.Empty<long>());
         }
 
-        return ListSnapshots(new LocalFileBlobStore(snapshotDir));
+        return ListSnapshotsAsync(new LocalTableFileSystem(snapshotDir), cancellationToken);
     }
 
     /// <summary>
@@ -193,12 +203,15 @@ public static class Snapshot
     /// <exception cref="FileNotFoundException">
     /// No snapshot present (missing or unreadable <c>current.txt</c>).
     /// </exception>
-    public static int Read(RootCircuit circuit, IBlobStore store)
+    public static async ValueTask<int> ReadAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(circuit);
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
 
-        var current = TryReadCurrentPointer(store);
+        var current = await TryReadCurrentPointerAsync(fs, cancellationToken).ConfigureAwait(false);
         if (current is null)
         {
             throw new FileNotFoundException(
@@ -206,7 +219,7 @@ public static class Snapshot
         }
 
         var manifestKey = current + "/manifest.json";
-        if (!store.Exists(manifestKey))
+        if (!await fs.ExistsAsync(manifestKey, cancellationToken).ConfigureAwait(false))
         {
             throw new FileNotFoundException(
                 $"snapshot '{current}' is missing its manifest at '{manifestKey}' " +
@@ -214,7 +227,7 @@ public static class Snapshot
                 manifestKey);
         }
 
-        var manifest = SnapshotManifest.Read(store, manifestKey);
+        var manifest = await SnapshotManifest.ReadAsync(fs, manifestKey, cancellationToken).ConfigureAwait(false);
         if (manifest.SchemaVersion != SnapshotManifest.CurrentSchemaVersion)
         {
             throw new InvalidDataException(
@@ -260,8 +273,8 @@ public static class Snapshot
                     $"but actual type {circuit.Operators[i].GetType().Name} is not");
             }
 
-            var ctx = new BlobStoreSnapshotContext(store, current + "/op-" + i);
-            s.Load(ctx);
+            var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+            await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
             restored++;
         }
 
@@ -272,10 +285,13 @@ public static class Snapshot
     /// <summary>
     /// Convenience overload for the local filesystem case.
     /// </summary>
-    public static int Read(RootCircuit circuit, string snapshotDir)
+    public static ValueTask<int> ReadAsync(
+        RootCircuit circuit,
+        string snapshotDir,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
-        return Read(circuit, new LocalFileBlobStore(snapshotDir));
+        return ReadAsync(circuit, new LocalTableFileSystem(snapshotDir), cancellationToken);
     }
 
     private static string SnapDirName(long tick) => $"snap-{tick}";
@@ -295,29 +311,51 @@ public static class Snapshot
             out tick);
     }
 
-    private static string? TryReadCurrentPointer(IBlobStore store)
+    private static async ValueTask<string?> TryReadCurrentPointerAsync(
+        ITableFileSystem fs, CancellationToken cancellationToken)
     {
-        if (!store.Exists(CurrentKey))
+        if (!await fs.ExistsAsync(CurrentKey, cancellationToken).ConfigureAwait(false))
         {
             return null;
         }
 
-        using var stream = store.OpenRead(CurrentKey);
-        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
-        var contents = reader.ReadToEnd().Trim();
+        var bytes = await fs.ReadAllBytesAsync(CurrentKey, cancellationToken).ConfigureAwait(false);
+        var contents = System.Text.Encoding.UTF8.GetString(bytes).Trim();
         return string.IsNullOrEmpty(contents) ? null : contents;
     }
 
-    private static void WriteCurrentPointer(IBlobStore store, string snapName)
+    private static async ValueTask WriteCurrentPointerAsync(
+        ITableFileSystem fs, string snapName, CancellationToken cancellationToken)
     {
-        using var stream = store.OpenWrite(CurrentKey);
-        using var writer = new StreamWriter(stream, System.Text.Encoding.UTF8);
-        writer.Write(snapName);
+        var bytes = System.Text.Encoding.UTF8.GetBytes(snapName);
+        var tmpKey = CurrentKey + ".tmp";
+
+        // Best-effort cleanup of any stale tmp from a previous failed write.
+        await fs.DeleteAsync(tmpKey, cancellationToken).ConfigureAwait(false);
+
+        await using (var file = await fs.CreateAsync(tmpKey, overwrite: true, cancellationToken).ConfigureAwait(false))
+        {
+            await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+        }
+
+        // RenameAsync returns false if the target already exists, so we
+        // delete the old pointer first. There is a microsecond-scale
+        // window where no pointer exists; the failure mode is "transient
+        // ExistsAsync returns false" which is equivalent to the snapshot
+        // not yet being written, and harmless under the single-writer
+        // assumption that holds throughout the persistence layer.
+        await fs.DeleteAsync(CurrentKey, cancellationToken).ConfigureAwait(false);
+        var renamed = await fs.RenameAsync(tmpKey, CurrentKey, cancellationToken).ConfigureAwait(false);
+        if (!renamed)
+        {
+            throw new IOException($"failed to rename '{tmpKey}' to '{CurrentKey}'");
+        }
     }
 
-    private static void PruneOlderSnapshots(IBlobStore store, int retainCount)
+    private static async ValueTask PruneOlderSnapshotsAsync(
+        ITableFileSystem fs, int retainCount, CancellationToken cancellationToken)
     {
-        var ticks = ListSnapshots(store);
+        var ticks = await ListSnapshotsAsync(fs, cancellationToken).ConfigureAwait(false);
         if (ticks.Count <= retainCount)
         {
             return;
@@ -327,14 +365,20 @@ public static class Snapshot
         for (var i = 0; i < pruneCount; i++)
         {
             var snapName = SnapDirName(ticks[i]);
-            // Delete every key under the snap-T prefix. Best-effort: a
-            // failure here leaves orphan blobs but doesn't break Read.
+            // Delete every file under the snap-T prefix. Best-effort: a
+            // failure here leaves orphan files but doesn't break ReadAsync.
             var prefix = snapName + "/";
-            foreach (var key in store.ListKeys(prefix).ToList())
+            var toDelete = new List<string>();
+            await foreach (var entry in fs.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
+            {
+                toDelete.Add(entry.Path);
+            }
+
+            foreach (var path in toDelete)
             {
                 try
                 {
-                    store.Delete(key);
+                    await fs.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
                 }
                 catch (IOException)
                 {

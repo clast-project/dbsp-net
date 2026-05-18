@@ -3,14 +3,17 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.IO;
+using DbspNet.Persistence.IO.Local;
 
 namespace DbspNet.Persistence;
 
 /// <summary>
-/// Top-level snapshot manifest. One per snapshot directory. Atomic write
-/// via tmp+rename. The plan fingerprint is hashed over the circuit's
-/// operator types in order — adding, removing, or reordering operators
-/// changes the fingerprint and makes the snapshot refuse to load.
+/// Top-level snapshot manifest. One per snapshot directory. Written via
+/// the small-file <see cref="ITableFileSystem.WriteAllBytesAsync"/>
+/// helper. The plan fingerprint is hashed over the circuit's operator
+/// types in order — adding, removing, or reordering operators changes
+/// the fingerprint and makes the snapshot refuse to load.
 /// </summary>
 public sealed record SnapshotManifest(
     [property: JsonPropertyName("schema_version")] int SchemaVersion,
@@ -33,39 +36,35 @@ public sealed record SnapshotManifest(
         WriteIndented = true,
     };
 
-    public static SnapshotManifest Read(IBlobStore store, string key)
+    public static async ValueTask<SnapshotManifest> ReadAsync(
+        ITableFileSystem fs, string key, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(key);
-        using var stream = store.OpenRead(key);
-        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
-        var json = reader.ReadToEnd();
-        return JsonSerializer.Deserialize<SnapshotManifest>(json, JsonOptions)
+        var bytes = await fs.ReadAllBytesAsync(key, cancellationToken).ConfigureAwait(false);
+        return JsonSerializer.Deserialize<SnapshotManifest>(bytes, JsonOptions)
             ?? throw new InvalidDataException($"snapshot manifest at '{key}' is empty");
     }
 
     /// <summary>
     /// Convenience overload for tests / debugging that operate on local
-    /// filesystem paths. Resolves the path's parent as the blob-store
+    /// filesystem paths. Resolves the path's parent as the filesystem
     /// root and the filename as the key.
     /// </summary>
-    public static SnapshotManifest Read(string path)
+    public static ValueTask<SnapshotManifest> ReadAsync(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
         var dir = Path.GetDirectoryName(path) ?? ".";
         var name = Path.GetFileName(path);
-        return Read(new LocalFileBlobStore(dir), name);
+        return ReadAsync(new LocalTableFileSystem(dir), name);
     }
 
-    public void Write(IBlobStore store, string key)
+    public ValueTask WriteAsync(ITableFileSystem fs, string key, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(key);
-        // The blob store's atomic-single-blob-write contract handles
-        // the tmp+rename equivalent internally; we just stream JSON.
-        using var stream = store.OpenWrite(key);
-        using var writer = new StreamWriter(stream, System.Text.Encoding.UTF8);
-        writer.Write(JsonSerializer.Serialize(this, JsonOptions));
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(this, JsonOptions);
+        return fs.WriteAllBytesAsync(key, bytes, cancellationToken);
     }
 
     /// <summary>
@@ -95,8 +94,7 @@ public sealed record SnapshotManifest(
     /// in positional order. Catches schema drift the operator-type
     /// fingerprint misses — e.g. a VARCHAR(8) column widened to
     /// VARCHAR(16) leaves operator types and Arrow types unchanged but
-    /// changes the codec's <see cref="SqlType.Display"/>-based
-    /// fingerprint.
+    /// changes the codec's <c>SqlType.Display</c>-based fingerprint.
     /// </summary>
     internal static string ComputeSchemaFingerprint(RootCircuit circuit)
     {

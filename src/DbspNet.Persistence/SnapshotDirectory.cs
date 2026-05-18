@@ -1,42 +1,42 @@
 using DbspNet.Core.Circuit;
+using DbspNet.Core.IO;
 
 namespace DbspNet.Persistence;
 
 /// <summary>
-/// Blob-store-backed implementation of <see cref="ISnapshotWriter"/>
-/// and <see cref="ISnapshotReader"/>. One context wraps an
-/// <see cref="IBlobStore"/> and a key prefix (the operator's
-/// subdirectory inside the snapshot tree) — operators write whatever
-/// named artifacts they need under that prefix.
+/// <see cref="ITableFileSystem"/>-backed implementation of
+/// <see cref="ISnapshotWriter"/> and <see cref="ISnapshotReader"/>.
+/// One context wraps an <see cref="ITableFileSystem"/> and a key prefix
+/// (the operator's subdirectory inside the snapshot tree) — operators
+/// read and write whatever named artifacts they need under that prefix.
 /// </summary>
-internal sealed class BlobStoreSnapshotContext : ISnapshotWriter, ISnapshotReader
+internal sealed class TableFileSystemSnapshotContext : ISnapshotWriter, ISnapshotReader
 {
-    private readonly IBlobStore _store;
+    private readonly ITableFileSystem _fs;
     private readonly string _prefix;
 
-    public BlobStoreSnapshotContext(IBlobStore store, string prefix)
+    public TableFileSystemSnapshotContext(ITableFileSystem fs, string prefix)
     {
-        _store = store;
-        // Normalise: ensure prefix ends with '/' so OpenWrite/OpenRead
-        // get clean key concatenation.
+        _fs = fs;
+        // Normalise: ensure prefix ends with '/' so file keys concatenate cleanly.
         _prefix = prefix.EndsWith('/') ? prefix : prefix + "/";
     }
 
-    public Stream OpenWrite(string filename)
+    public ValueTask<ISequentialFile> CreateAsync(string filename, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(filename);
-        return _store.OpenWrite(_prefix + filename);
+        return _fs.CreateAsync(_prefix + filename, overwrite: true, cancellationToken);
     }
 
-    public Stream OpenRead(string filename)
+    public ValueTask<IRandomAccessFile> OpenReadAsync(string filename, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(filename);
-        return _store.OpenRead(_prefix + filename);
+        return _fs.OpenReadAsync(_prefix + filename, cancellationToken);
     }
 
-    public bool Exists(string filename)
+    public ValueTask<bool> ExistsAsync(string filename, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(filename);
-        return _store.Exists(_prefix + filename);
+        return _fs.ExistsAsync(_prefix + filename, cancellationToken);
     }
 }

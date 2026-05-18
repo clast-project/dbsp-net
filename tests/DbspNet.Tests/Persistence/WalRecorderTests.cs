@@ -38,44 +38,44 @@ public class WalRecorderTests : IDisposable
     }
 
     [Fact]
-    public void RecordSession_CreatesManifestAndSegmentFiles()
+    public async Task RecordSession_CreatesManifestAndSegmentFiles()
     {
         var query = Compile(
             ["CREATE TABLE t (id INT NOT NULL, name VARCHAR NOT NULL)"],
             "SELECT id, name FROM t");
-        using (var wal = new WalRecorder(query, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(query, _walDir))
         {
             query.Table("t").Insert(1, "alice");
-            wal.Step();
+            await wal.StepAsync();
             query.Table("t").Insert(2, "bob");
-            wal.Step();
+            await wal.StepAsync();
         }
 
         Assert.True(File.Exists(Path.Combine(_walDir, "manifest.json")));
         Assert.True(File.Exists(Path.Combine(_walDir, "t.0.arrows")));
 
-        var manifest = WalManifest.Read(Path.Combine(_walDir, "manifest.json"));
+        var manifest = await WalManifest.ReadAsync(Path.Combine(_walDir, "manifest.json"));
         Assert.Single(manifest.Segments);
         Assert.Equal(2, manifest.Segments[0].Ticks);
     }
 
     [Fact]
-    public void Replay_RestoresEngineToSameOutputState()
+    public async Task Replay_RestoresEngineToSameOutputState()
     {
         // First session: record several ticks of inputs.
         var producer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT COUNT(*) FROM t");
-        using (var wal = new WalRecorder(producer, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(producer, _walDir))
         {
             producer.Table("t").Insert(1);
             producer.Table("t").Insert(2);
             producer.Table("t").Insert(3);
-            wal.Step();
+            await wal.StepAsync();
             producer.Table("t").Insert(4);
-            wal.Step();
+            await wal.StepAsync();
             producer.Table("t").Delete(1);
-            wal.Step();
+            await wal.StepAsync();
         }
         // After: count is 3 (4 inserts - 1 delete).
 
@@ -84,7 +84,7 @@ public class WalRecorderTests : IDisposable
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT COUNT(*) FROM t");
-        using (var wal = new WalRecorder(consumer, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(consumer, _walDir))
         {
             // Replay happens during construction; at this point consumer
             // should already hold the post-WAL state.
@@ -106,7 +106,7 @@ public class WalRecorderTests : IDisposable
     }
 
     [Fact]
-    public void Replay_ReproducesDeltaSequence()
+    public async Task Replay_ReproducesDeltaSequence()
     {
         // Record ticks; capture each tick's output delta.
         var producer = Compile(
@@ -115,19 +115,19 @@ public class WalRecorderTests : IDisposable
 
         var producerDeltas = new List<HashSet<(int id, long weight)>>();
 
-        using (var wal = new WalRecorder(producer, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(producer, _walDir))
         {
             producer.Table("t").Insert(1);
             producer.Table("t").Insert(2);
-            wal.Step();
+            await wal.StepAsync();
             producerDeltas.Add(SnapshotIds(producer));
 
             producer.Table("t").Insert(3);
-            wal.Step();
+            await wal.StepAsync();
             producerDeltas.Add(SnapshotIds(producer));
 
             producer.Table("t").Delete(1);
-            wal.Step();
+            await wal.StepAsync();
             producerDeltas.Add(SnapshotIds(producer));
         }
 
@@ -143,7 +143,7 @@ public class WalRecorderTests : IDisposable
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t");
-        using (var wal = new WalRecorder(consumer, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(consumer, _walDir))
         {
         }
 
@@ -152,16 +152,16 @@ public class WalRecorderTests : IDisposable
     }
 
     [Fact]
-    public void Reopen_PlanFingerprintMismatch_Throws()
+    public async Task Reopen_PlanFingerprintMismatch_Throws()
     {
         // Record into the WAL with one schema.
         var firstSchema = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t");
-        using (var wal = new WalRecorder(firstSchema, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(firstSchema, _walDir))
         {
             firstSchema.Table("t").Insert(1);
-            wal.Step();
+            await wal.StepAsync();
         }
 
         // Reopen with a different table schema (added column).
@@ -169,9 +169,9 @@ public class WalRecorderTests : IDisposable
             ["CREATE TABLE t (id INT NOT NULL, extra VARCHAR NOT NULL)"],
             "SELECT id, extra FROM t");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
         {
-            using var wal = new WalRecorder(changedSchema, _walDir);
+            await using var wal = await WalRecorder.CreateAsync(changedSchema, _walDir);
         });
 
         Assert.Contains("plan fingerprint mismatch", ex.Message,
@@ -179,18 +179,18 @@ public class WalRecorderTests : IDisposable
     }
 
     [Fact]
-    public void Reopen_PlanFingerprintMatch_QueryBodyChanged_Succeeds()
+    public async Task Reopen_PlanFingerprintMatch_QueryBodyChanged_Succeeds()
     {
         // The fingerprint is over input schemas only — changing the
         // SELECT body should not invalidate an existing WAL.
         var firstQuery = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t");
-        using (var wal = new WalRecorder(firstQuery, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(firstQuery, _walDir))
         {
             firstQuery.Table("t").Insert(1);
             firstQuery.Table("t").Insert(2);
-            wal.Step();
+            await wal.StepAsync();
         }
 
         // Reopen with the same table schema but a different SELECT body.
@@ -199,31 +199,31 @@ public class WalRecorderTests : IDisposable
             "SELECT COUNT(*) FROM t");
 
         // No throw expected.
-        using var wal2 = new WalRecorder(differentBody, _walDir);
+        await using var wal2 = await WalRecorder.CreateAsync(differentBody, _walDir);
     }
 
     [Fact]
-    public void MultipleSessions_AppendNewSegments()
+    public async Task MultipleSessions_AppendNewSegments()
     {
         // Session 1: 2 ticks → segment 0 (2 ticks).
         var q1 = Compile(["CREATE TABLE t (id INT NOT NULL)"], "SELECT id FROM t");
-        using (var wal = new WalRecorder(q1, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(q1, _walDir))
         {
             q1.Table("t").Insert(1);
-            wal.Step();
+            await wal.StepAsync();
             q1.Table("t").Insert(2);
-            wal.Step();
+            await wal.StepAsync();
         }
 
         // Session 2: 1 tick → segment 1 (1 tick).
         var q2 = Compile(["CREATE TABLE t (id INT NOT NULL)"], "SELECT id FROM t");
-        using (var wal = new WalRecorder(q2, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(q2, _walDir))
         {
             q2.Table("t").Insert(3);
-            wal.Step();
+            await wal.StepAsync();
         }
 
-        var manifest = WalManifest.Read(Path.Combine(_walDir, "manifest.json"));
+        var manifest = await WalManifest.ReadAsync(Path.Combine(_walDir, "manifest.json"));
         Assert.Equal(2, manifest.Segments.Count);
         Assert.Equal(2, manifest.Segments[0].Ticks);
         Assert.Equal(1, manifest.Segments[1].Ticks);
@@ -231,7 +231,7 @@ public class WalRecorderTests : IDisposable
         // Session 3 (replay-only): verify the final delta reflects the
         // last-recorded action across both segments.
         var q3 = Compile(["CREATE TABLE t (id INT NOT NULL)"], "SELECT id FROM t");
-        using (var wal = new WalRecorder(q3, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(q3, _walDir))
         {
         }
 
@@ -241,28 +241,28 @@ public class WalRecorderTests : IDisposable
     }
 
     [Fact]
-    public void EmptyTick_RoundTrips()
+    public async Task EmptyTick_RoundTrips()
     {
         var producer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t");
-        using (var wal = new WalRecorder(producer, _walDir))
+        await using (var wal = await WalRecorder.CreateAsync(producer, _walDir))
         {
             producer.Table("t").Insert(1);
-            wal.Step();
+            await wal.StepAsync();
             // Tick 2: no inputs.
-            wal.Step();
+            await wal.StepAsync();
             producer.Table("t").Insert(2);
-            wal.Step();
+            await wal.StepAsync();
         }
 
-        var manifest = WalManifest.Read(Path.Combine(_walDir, "manifest.json"));
+        var manifest = await WalManifest.ReadAsync(Path.Combine(_walDir, "manifest.json"));
         Assert.Equal(3, manifest.Segments[0].Ticks);
 
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t");
-        using var wal2 = new WalRecorder(consumer, _walDir);
+        await using var wal2 = await WalRecorder.CreateAsync(consumer, _walDir);
 
         // Replay must process all 3 ticks; final delta is from tick 3
         // (insert id=2).

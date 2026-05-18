@@ -97,13 +97,13 @@ internal sealed class RecursiveCteOp : IOperator, ISnapshotable
         }
     }
 
-    public void Save(ISnapshotWriter writer)
+    public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_externalSnapshotCodecs is null || _resultSnapshotCodec is null)
         {
             throw new NotSupportedException(
                 "RecursiveCteOp was constructed without snapshot codecs; compile via " +
-                "PlanToCircuit.Compile(plan, snapshotCodecs) to enable Snapshot.Write/Read.");
+                "PlanToCircuit.Compile(plan, snapshotCodecs) to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
         // External base-table traces — one file per table. Filenames are
@@ -116,16 +116,16 @@ internal sealed class RecursiveCteOp : IOperator, ISnapshotable
                     $"RecursiveCteOp: missing snapshot codec for external table '{name}'");
             }
 
-            codec.Save(writer, ExternalTraceFileName(name), trace.Current);
+            await codec.SaveAsync(writer, ExternalTraceFileName(name), trace.Current, cancellationToken).ConfigureAwait(false);
         }
 
         // The materialised CTE result and prior-tick result share a schema,
         // so a single result codec writes both under separate filenames.
-        _resultSnapshotCodec.Save(writer, ResultFileName, _r);
-        _resultSnapshotCodec.Save(writer, PreviousResultFileName, _previousResult);
+        await _resultSnapshotCodec.SaveAsync(writer, ResultFileName, _r, cancellationToken).ConfigureAwait(false);
+        await _resultSnapshotCodec.SaveAsync(writer, PreviousResultFileName, _previousResult, cancellationToken).ConfigureAwait(false);
     }
 
-    public void Load(ISnapshotReader reader)
+    public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
     {
         if (_externalSnapshotCodecs is null || _resultSnapshotCodec is null)
         {
@@ -141,11 +141,11 @@ internal sealed class RecursiveCteOp : IOperator, ISnapshotable
                     $"RecursiveCteOp: missing snapshot codec for external table '{name}'");
             }
 
-            trace.Integrate(codec.Load(reader, ExternalTraceFileName(name)));
+            trace.Integrate(await codec.LoadAsync(reader, ExternalTraceFileName(name), cancellationToken).ConfigureAwait(false));
         }
 
-        _r = _resultSnapshotCodec.Load(reader, ResultFileName);
-        _previousResult = _resultSnapshotCodec.Load(reader, PreviousResultFileName);
+        _r = await _resultSnapshotCodec.LoadAsync(reader, ResultFileName, cancellationToken).ConfigureAwait(false);
+        _previousResult = await _resultSnapshotCodec.LoadAsync(reader, PreviousResultFileName, cancellationToken).ConfigureAwait(false);
     }
 
     public string SchemaFingerprint

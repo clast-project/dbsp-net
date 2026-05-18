@@ -5,6 +5,7 @@ using DbspNet.Arrow;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
+using DbspNet.Core.IO;
 using DbspNet.Core.Operators.Stateful;
 using ArrowSchema = Apache.Arrow.Schema;
 using SqlSchema = DbspNet.Sql.Plan.Schema;
@@ -47,10 +48,11 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
     public string SchemaFingerprint { get; }
 
-    public void Save(
+    public async ValueTask SaveAsync(
         ISnapshotWriter writer,
         string fileName,
-        IndexedZSet<StructuralRow, StructuralRow, Z64> trace)
+        IndexedZSet<StructuralRow, StructuralRow, Z64> trace,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(fileName);
@@ -117,22 +119,27 @@ internal sealed class ArrowIndexedZSetTraceCodec
         arrays[keyCount + valueCount] = weightBuilder.Build();
 
         using var batch = new RecordBatch(_arrowSchemaWithWeight, arrays, rowCount);
-        using var stream = writer.OpenWrite(fileName);
+        await using var file = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false);
+        await using var stream = file.AsStream();
         using var ipcWriter = new ArrowStreamWriter(stream, _arrowSchemaWithWeight, leaveOpen: true);
         ipcWriter.WriteRecordBatch(batch);
         ipcWriter.WriteEnd();
     }
 
-    public IndexedZSet<StructuralRow, StructuralRow, Z64> Load(ISnapshotReader reader, string fileName)
+    public async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(fileName);
-        if (!reader.Exists(fileName))
+        if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
         {
             return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
         }
 
-        using var stream = reader.OpenRead(fileName);
+        await using var file = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
+        await using var stream = file.AsStream();
         using var ipcReader = new ArrowStreamReader(stream, leaveOpen: true);
         var batch = ipcReader.ReadNextRecordBatch();
         if (batch is null)

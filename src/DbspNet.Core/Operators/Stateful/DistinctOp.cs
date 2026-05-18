@@ -31,19 +31,19 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         _snapshotCodec = snapshotCodec;
     }
 
-    public void Save(ISnapshotWriter writer)
+    public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
         {
             throw new NotSupportedException(
                 "DistinctOp was constructed without a snapshot codec; pass one " +
-                "to CircuitBuilder.Distinct to enable Snapshot.Write/Read.");
+                "to CircuitBuilder.Distinct to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        _snapshotCodec.Save(writer, "trace.arrows", _trace.Current);
+        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Current, cancellationToken);
     }
 
-    public void Load(ISnapshotReader reader)
+    public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
         {
@@ -51,7 +51,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable
                 "DistinctOp was constructed without a snapshot codec.");
         }
 
-        var loaded = _snapshotCodec.Load(reader, "trace.arrows");
+        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         _trace.Integrate(loaded);
     }
 

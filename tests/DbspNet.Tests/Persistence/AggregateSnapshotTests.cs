@@ -48,7 +48,7 @@ public class AggregateSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void Sum_RestoredState_EmitsOnlyDeltaOnNextTick()
+    public async Task Sum_RestoredState_EmitsOnlyDeltaOnNextTick()
     {
         // Producer: per-category running sums. Two ticks of inserts so
         // the producer's _aggCache holds non-trivial values to rebuild.
@@ -62,13 +62,13 @@ public class AggregateSnapshotTests : IDisposable
         producer.Table("sales").Insert("a", 5L);
         producer.Step();   // emits (a,10):-1, (a,15):+1
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Consumer: fresh circuit from the same plan; restore state.
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Insert another 'a' value: the operator must know prev sum was 15
         // to retract (a,15) and emit (a,18).
@@ -81,7 +81,7 @@ public class AggregateSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void Sum_RestoredState_HandlesRetractionToZero()
+    public async Task Sum_RestoredState_HandlesRetractionToZero()
     {
         // Producer: insert 'a':10 and 'a':5 — running sum = 15. Retract 5.
         var producer = Compile(
@@ -91,12 +91,12 @@ public class AggregateSnapshotTests : IDisposable
         producer.Table("sales").Insert("a", 5L);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Retract one of the 'a' rows: prev sum 15 → new sum 10.
         consumer.Table("sales").Delete("a", 5L);
@@ -108,7 +108,7 @@ public class AggregateSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void MinMax_RestoredState_EmitsCorrectDelta()
+    public async Task MinMax_RestoredState_EmitsCorrectDelta()
     {
         // Restoring MIN/MAX exercises the Counts dictionary + Active sorted
         // set state — both must be rebuilt from the trace for the next
@@ -121,12 +121,12 @@ public class AggregateSnapshotTests : IDisposable
         producer.Table("sales").Insert("a", 20L);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, MIN(amt), MAX(amt) FROM sales GROUP BY cat");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // New min: prev (5,20) → new (3,20).
         consumer.Table("sales").Insert("a", 3L);
@@ -138,7 +138,7 @@ public class AggregateSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void Avg_RestoredState_AccumulatesAcrossSnapshot()
+    public async Task Avg_RestoredState_AccumulatesAcrossSnapshot()
     {
         var producer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
@@ -147,12 +147,12 @@ public class AggregateSnapshotTests : IDisposable
         producer.Table("sales").Insert("a", 20L);
         producer.Step();   // avg = 15.0
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, AVG(amt) FROM sales GROUP BY cat");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // After restore, avg should still know NonNullCount=2, Sum=30.
         // Adding 30 → avg becomes 60/3 = 20.0.
@@ -165,7 +165,7 @@ public class AggregateSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void NoCodec_OperatorThrowsOnSnapshot()
+    public async Task NoCodec_OperatorThrowsOnSnapshot()
     {
         // Compile WITHOUT a codec registry — IncrementalAggregateOp has no codec.
         var catalog = new Catalog();
@@ -179,12 +179,12 @@ public class AggregateSnapshotTests : IDisposable
         query.Table("sales").Insert("a", 10L);
         query.Step();
 
-        Assert.Throws<NotSupportedException>(() =>
-            Snapshot.Write(query.Circuit, _snapshotDir));
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await Snapshot.WriteAsync(query.Circuit, _snapshotDir));
     }
 
     [Fact]
-    public void EmptyGroup_AfterSnapshot_NewKeyEmitsAtPlusOne()
+    public async Task EmptyGroup_AfterSnapshot_NewKeyEmitsAtPlusOne()
     {
         // Producer has only group 'a'. Consumer inserts a brand-new 'b'.
         // No retraction expected for 'b' (it didn't exist before).
@@ -194,12 +194,12 @@ public class AggregateSnapshotTests : IDisposable
         producer.Table("sales").Insert("a", 10L);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         consumer.Table("sales").Insert("b", 7L);
         consumer.Step();

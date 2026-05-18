@@ -57,20 +57,20 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         _rightSnapshotCodec = rightSnapshotCodec;
     }
 
-    public void Save(ISnapshotWriter writer)
+    public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_leftSnapshotCodec is null || _rightSnapshotCodec is null)
         {
             throw new NotSupportedException(
                 "IncrementalJoinOp was constructed without snapshot codecs; pass them " +
-                "to CircuitBuilder.IncrementalInnerJoin to enable Snapshot.Write/Read.");
+                "to CircuitBuilder.IncrementalInnerJoin to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        _leftSnapshotCodec.Save(writer, LeftTraceFile, _leftTrace.Current);
-        _rightSnapshotCodec.Save(writer, RightTraceFile, _rightTrace.Current);
+        await _leftSnapshotCodec.SaveAsync(writer, LeftTraceFile, _leftTrace.Current, cancellationToken).ConfigureAwait(false);
+        await _rightSnapshotCodec.SaveAsync(writer, RightTraceFile, _rightTrace.Current, cancellationToken).ConfigureAwait(false);
     }
 
-    public void Load(ISnapshotReader reader)
+    public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
     {
         if (_leftSnapshotCodec is null || _rightSnapshotCodec is null)
         {
@@ -78,8 +78,8 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
                 "IncrementalJoinOp was constructed without snapshot codecs.");
         }
 
-        _leftTrace.Integrate(_leftSnapshotCodec.Load(reader, LeftTraceFile));
-        _rightTrace.Integrate(_rightSnapshotCodec.Load(reader, RightTraceFile));
+        _leftTrace.Integrate(await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false));
+        _rightTrace.Integrate(await _rightSnapshotCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false));
     }
 
     public string SchemaFingerprint =>

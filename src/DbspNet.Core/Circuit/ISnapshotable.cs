@@ -1,3 +1,5 @@
+using DbspNet.Core.IO;
+
 namespace DbspNet.Core.Circuit;
 
 /// <summary>
@@ -17,10 +19,10 @@ namespace DbspNet.Core.Circuit;
 public interface ISnapshotable
 {
     /// <summary>Persist the operator's state through <paramref name="writer"/>.</summary>
-    void Save(ISnapshotWriter writer);
+    ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default);
 
     /// <summary>Restore the operator's state from <paramref name="reader"/>.</summary>
-    void Load(ISnapshotReader reader);
+    ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Stable hash of the operator's row/key/value schemas, derived from
@@ -30,7 +32,7 @@ public interface ISnapshotable
     /// length changes (Arrow's StringType carries no length), DECIMAL
     /// precision/scale changes, or column reorders that leave operator
     /// generic args unchanged. Operators without snapshot codecs return
-    /// the empty string; their <see cref="Save"/> already throws.
+    /// the empty string; their <see cref="SaveAsync"/> already throws.
     /// </summary>
     string SchemaFingerprint { get; }
 }
@@ -38,19 +40,18 @@ public interface ISnapshotable
 /// <summary>
 /// Output side of a snapshot context. Implementations are typically
 /// directory-backed (one subdirectory per operator); operators open
-/// named files via <see cref="OpenWrite"/> and write whatever format is
-/// natural for their state. A small operator might write a single
+/// named files via <see cref="CreateAsync"/> and write whatever format
+/// is natural for their state. A small operator might write a single
 /// <c>"state.json"</c>; a trace-backed operator might write
-/// <c>"keys.arrow"</c>, <c>"values.arrow"</c>, and <c>"manifest.json"</c>.
+/// <c>"keys.arrows"</c>, <c>"values.arrows"</c>, and <c>"manifest.json"</c>.
 /// </summary>
 public interface ISnapshotWriter
 {
     /// <summary>
-    /// Open a stream for writing one named artifact. Caller disposes;
-    /// implementations are responsible for atomicity at the directory
-    /// level (typically tmp+rename on the directory as a whole).
+    /// Create a new file for writing one named artifact. Caller disposes
+    /// the returned <see cref="ISequentialFile"/>.
     /// </summary>
-    Stream OpenWrite(string filename);
+    ValueTask<ISequentialFile> CreateAsync(string filename, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -58,9 +59,12 @@ public interface ISnapshotWriter
 /// </summary>
 public interface ISnapshotReader
 {
-    /// <summary>Open a stream for reading one named artifact.</summary>
-    Stream OpenRead(string filename);
+    /// <summary>
+    /// Open a file for random-access reading. Caller disposes the returned
+    /// <see cref="IRandomAccessFile"/>.
+    /// </summary>
+    ValueTask<IRandomAccessFile> OpenReadAsync(string filename, CancellationToken cancellationToken = default);
 
     /// <summary>True if a file with the given name exists in this snapshot.</summary>
-    bool Exists(string filename);
+    ValueTask<bool> ExistsAsync(string filename, CancellationToken cancellationToken = default);
 }

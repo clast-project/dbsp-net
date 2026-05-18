@@ -25,14 +25,21 @@ public interface IIndexedZSetTraceCodec<TKey, TValue, TWeight>
     /// operators with multiple (e.g. join's left/right) pass
     /// disambiguating names.
     /// </summary>
-    void Save(ISnapshotWriter writer, string fileName, IndexedZSet<TKey, TValue, TWeight> trace);
+    ValueTask SaveAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        IndexedZSet<TKey, TValue, TWeight> trace,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Read the saved entries from <paramref name="fileName"/> and return
     /// them as an indexed Z-set ready to be folded into a fresh trace
     /// via <c>IndexedZSetTrace.Integrate</c>.
     /// </summary>
-    IndexedZSet<TKey, TValue, TWeight> Load(ISnapshotReader reader, string fileName);
+    ValueTask<IndexedZSet<TKey, TValue, TWeight>> LoadAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Stable hash of the codec's key + value schemas. See

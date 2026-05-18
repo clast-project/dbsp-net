@@ -1,5 +1,8 @@
+using System.Buffers;
+using System.Globalization;
 using System.Text;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.IO;
 using DbspNet.Persistence;
 
 namespace DbspNet.Tests.Persistence;
@@ -40,18 +43,20 @@ public class SnapshotFoundationTests : IDisposable
             Value++;
         }
 
-        public void Save(ISnapshotWriter writer)
+        public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
         {
-            using var stream = writer.OpenWrite("value.txt");
-            using var sw = new StreamWriter(stream, Encoding.UTF8);
-            sw.Write(Value);
+            await using var file = await writer.CreateAsync("value.txt", cancellationToken).ConfigureAwait(false);
+            var bytes = Encoding.UTF8.GetBytes(Value.ToString(CultureInfo.InvariantCulture));
+            await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         }
 
-        public void Load(ISnapshotReader reader)
+        public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
         {
-            using var stream = reader.OpenRead("value.txt");
-            using var sr = new StreamReader(stream, Encoding.UTF8);
-            Value = int.Parse(sr.ReadToEnd(), System.Globalization.CultureInfo.InvariantCulture);
+            await using var file = await reader.OpenReadAsync("value.txt", cancellationToken).ConfigureAwait(false);
+            var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+            using var owner = await file.ReadAsync(new FileRange(0, length), cancellationToken).ConfigureAwait(false);
+            var text = Encoding.UTF8.GetString(owner.Memory.Span[..(int)length]);
+            Value = int.Parse(text, CultureInfo.InvariantCulture);
         }
 
         public string SchemaFingerprint => "counter-op";
@@ -75,13 +80,13 @@ public class SnapshotFoundationTests : IDisposable
     }
 
     [Fact]
-    public void Write_CreatesSnapDirWithManifestAndPerOperatorSubdirs()
+    public async Task Write_CreatesSnapDirWithManifestAndPerOperatorSubdirs()
     {
         var c = new CounterOp { Value = 7 };
         var p = new PassiveOp();
         var circuit = Build(c, p);
 
-        var snapshotted = Snapshot.Write(circuit, _snapshotDir);
+        var snapshotted = await Snapshot.WriteAsync(circuit, _snapshotDir);
 
         // Layout: {snapshotDir}/snap-{tick}/{manifest.json, op-0/, ...}
         // plus {snapshotDir}/current.txt naming the latest snap-T.
@@ -92,81 +97,81 @@ public class SnapshotFoundationTests : IDisposable
         Assert.True(File.Exists(Path.Combine(snapDir, "op-0", "value.txt")));
         Assert.False(Directory.Exists(Path.Combine(snapDir, "op-1")));
 
-        var manifest = SnapshotManifest.Read(Path.Combine(snapDir, "manifest.json"));
+        var manifest = await SnapshotManifest.ReadAsync(Path.Combine(snapDir, "manifest.json"));
         Assert.Equal(2, manifest.OperatorCount);
         Assert.Equal(new[] { 0 }, manifest.SnapshottedIndices);
     }
 
     [Fact]
-    public void Read_RestoresStateIntoFreshCircuit()
+    public async Task Read_RestoresStateIntoFreshCircuit()
     {
         // Producer: build, mutate state, snapshot.
         var producerCounter = new CounterOp { Value = 42 };
         var producer = Build(producerCounter, new PassiveOp());
-        Snapshot.Write(producer, _snapshotDir);
+        await Snapshot.WriteAsync(producer, _snapshotDir);
 
         // Consumer: same plan shape, fresh state, load snapshot.
         var consumerCounter = new CounterOp { Value = 0 };
         var consumer = Build(consumerCounter, new PassiveOp());
-        var restored = Snapshot.Read(consumer, _snapshotDir);
+        var restored = await Snapshot.ReadAsync(consumer, _snapshotDir);
 
         Assert.Equal(1, restored);
         Assert.Equal(42, consumerCounter.Value);
     }
 
     [Fact]
-    public void Read_WrongOperatorCount_Throws()
+    public async Task Read_WrongOperatorCount_Throws()
     {
         var producer = Build(new CounterOp { Value = 1 }, new PassiveOp());
-        Snapshot.Write(producer, _snapshotDir);
+        await Snapshot.WriteAsync(producer, _snapshotDir);
 
         // Consumer has fewer operators — fingerprint hashes the type
         // sequence so this trips both the explicit count check and the
         // fingerprint check.
         var consumer = Build(new CounterOp { Value = 0 });
 
-        Assert.Throws<InvalidDataException>(() => Snapshot.Read(consumer, _snapshotDir));
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await Snapshot.ReadAsync(consumer, _snapshotDir));
     }
 
     [Fact]
-    public void Read_ReorderedOperators_ThrowsFingerprintMismatch()
+    public async Task Read_ReorderedOperators_ThrowsFingerprintMismatch()
     {
         var producer = Build(new CounterOp { Value = 1 }, new PassiveOp());
-        Snapshot.Write(producer, _snapshotDir);
+        await Snapshot.WriteAsync(producer, _snapshotDir);
 
         // Same operator types but different order — fingerprint includes
         // the position, so this should fail.
         var consumer = Build(new PassiveOp(), new CounterOp { Value = 0 });
 
-        var ex = Assert.Throws<InvalidDataException>(
-            () => Snapshot.Read(consumer, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(
+            async () => await Snapshot.ReadAsync(consumer, _snapshotDir));
         Assert.Contains("fingerprint mismatch", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void Manifest_TickAndSchemaVersion_Recorded()
+    public async Task Manifest_TickAndSchemaVersion_Recorded()
     {
         var circuit = Build(new CounterOp { Value = 0 });
         circuit.Step();
         circuit.Step();
         circuit.Step();
 
-        Snapshot.Write(circuit, _snapshotDir);
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
         var snapDir = Path.Combine(_snapshotDir, "snap-3");
-        var manifest = SnapshotManifest.Read(Path.Combine(snapDir, "manifest.json"));
+        var manifest = await SnapshotManifest.ReadAsync(Path.Combine(snapDir, "manifest.json"));
 
         Assert.Equal(SnapshotManifest.CurrentSchemaVersion, manifest.SchemaVersion);
         Assert.Equal(3, manifest.Tick);
     }
 
     [Fact]
-    public void Read_MissingManifest_Throws()
+    public async Task Read_MissingManifest_Throws()
     {
         var consumer = Build(new CounterOp { Value = 0 });
         Directory.CreateDirectory(_snapshotDir);  // empty dir, no manifest
 
-        Assert.Throws<FileNotFoundException>(
-            () => Snapshot.Read(consumer, _snapshotDir));
+        await Assert.ThrowsAsync<FileNotFoundException>(
+            async () => await Snapshot.ReadAsync(consumer, _snapshotDir));
     }
 }

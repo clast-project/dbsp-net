@@ -45,19 +45,19 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         _snapshotCodec = snapshotCodec;
     }
 
-    public void Save(ISnapshotWriter writer)
+    public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
         {
             throw new NotSupportedException(
                 "IncrementalAggregateOp was constructed without a snapshot codec; " +
-                "pass one to CircuitBuilder.IncrementalAggregate to enable Snapshot.Write/Read.");
+                "pass one to CircuitBuilder.IncrementalAggregate to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        _snapshotCodec.Save(writer, "trace.arrows", _trace.Current);
+        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Current, cancellationToken);
     }
 
-    public void Load(ISnapshotReader reader)
+    public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
         {
@@ -65,7 +65,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
                 "IncrementalAggregateOp was constructed without a snapshot codec.");
         }
 
-        var loaded = _snapshotCodec.Load(reader, "trace.arrows");
+        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         _trace.Integrate(loaded);
 
         // Rebuild the per-group caches from the restored trace. Each

@@ -47,7 +47,7 @@ public class MultiOpSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void InnerJoinPlusGroupBy_StateComposesAcrossSnapshot()
+    public async Task InnerJoinPlusGroupBy_StateComposesAcrossSnapshot()
     {
         // Classic analytics shape: two stateful ops in series.
         // Stateful ops produced by this plan: 1 IncrementalJoinOp + 1
@@ -71,10 +71,10 @@ public class MultiOpSnapshotTests : IDisposable
         producer.Step();
         // Producer state: electronics=150, books=30.
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(ddl, Query);
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // New order on an existing product: must traverse the restored
         // join trace (to find the matching product) AND the restored
@@ -88,7 +88,7 @@ public class MultiOpSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void ThreeWayJoin_BothJoinTracesRestoreIndependently()
+    public async Task ThreeWayJoin_BothJoinTracesRestoreIndependently()
     {
         // Stateful ops: 2 IncrementalJoinOps. Each holds its own
         // (left, right) trace pair under op-{i}/left.arrows /
@@ -113,10 +113,10 @@ public class MultiOpSnapshotTests : IDisposable
         producer.Step();
         // Output: (100, 999), (200, 888).
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(ddl, Query);
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // New row in a + new row in b that creates a third complete chain
         // a→b→c using the restored b/c traces.
@@ -130,7 +130,7 @@ public class MultiOpSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void UnionPlusGroupBy_DistinctAndAggregateBothRestore()
+    public async Task UnionPlusGroupBy_DistinctAndAggregateBothRestore()
     {
         // UNION (without ALL) compiles as UnionAll + DistinctOp.
         // GROUP BY adds the IncrementalAggregateOp. So this plan has
@@ -153,10 +153,10 @@ public class MultiOpSnapshotTests : IDisposable
         // After UNION dedup: {(a,10), (a,20), (b,5)}.
         // After GROUP BY: {(a, 30), (b, 5)}.
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(ddl, Query);
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Insert (a,20) into t2 — the Distinct trace already has (a,20) at +1
         // (from t1), so adding +1 from t2 makes the cumulative weight 2,
@@ -176,7 +176,7 @@ public class MultiOpSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void LeftJoinPlusGroupBy_PreservesUnmatchedSide()
+    public async Task LeftJoinPlusGroupBy_PreservesUnmatchedSide()
     {
         // LEFT JOIN keeps unmatched left rows (NULL-padded right). With
         // GROUP BY downstream, an unmatched customer should still appear
@@ -200,10 +200,10 @@ public class MultiOpSnapshotTests : IDisposable
         producer.Step();
         // Output: ('alice', 2), ('bob', 0).
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(ddl, Query);
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Bob's first order: gained-match in the LEFT JOIN, so the
         // restored join state retracts ('bob', NULL) and emits ('bob', 102).
@@ -217,7 +217,7 @@ public class MultiOpSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void RecursiveCtePlusGroupBy_BothOpsCompose()
+    public async Task RecursiveCtePlusGroupBy_BothOpsCompose()
     {
         // Stateful ops: 1 RecursiveCteOp (driving fixed-point) + 1
         // IncrementalAggregateOp (counting reachable nodes per source).
@@ -239,10 +239,10 @@ public class MultiOpSnapshotTests : IDisposable
         // reach: {(1,2),(2,3),(1,3)}. Counts: src=1 → 2 (reaches 2,3),
         // src=2 → 1 (reaches 3).
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(ddl, Query);
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 
         // Extend the chain. The recursive CTE's restored R lets the
         // semi-naïve path discover (3,4),(2,4),(1,4) as new derivations.
@@ -259,7 +259,7 @@ public class MultiOpSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void Manifest_RecordsAllStatefulOpPositions()
+    public async Task Manifest_RecordsAllStatefulOpPositions()
     {
         // Verify the snapshot manifest's SnapshottedIndices captures
         // every ISnapshotable operator (not just the first), and the
@@ -279,9 +279,9 @@ public class MultiOpSnapshotTests : IDisposable
         producer.Table("orders").Insert(101, 1, 1L);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
         var snapDir = Path.Combine(_snapshotDir, "snap-" + producer.Circuit.TickCount);
-        var manifest = SnapshotManifest.Read(Path.Combine(snapDir, "manifest.json"));
+        var manifest = await SnapshotManifest.ReadAsync(Path.Combine(snapDir, "manifest.json"));
 
         // JOIN + GROUP BY contributes 2 stateful ops.
         Assert.Equal(2, manifest.SnapshottedIndices.Count);

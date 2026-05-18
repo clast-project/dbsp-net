@@ -1,12 +1,15 @@
+using System.Buffers;
+using System.Globalization;
 using System.Text;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.IO;
 using DbspNet.Persistence;
 
 namespace DbspNet.Tests.Persistence;
 
 /// <summary>
-/// Atomic-commit semantics for <see cref="Snapshot.Write"/> under the
-/// versioned layout: each new snapshot is staged at
+/// Atomic-commit semantics for <see cref="Snapshot.WriteAsync(RootCircuit, string, int, CancellationToken)"/>
+/// under the versioned layout: each new snapshot is staged at
 /// <c>{snapshotDir}/snap-T.tmp/</c>, atomically renamed to
 /// <c>snap-T/</c>, and committed by an atomic update of
 /// <c>{snapshotDir}/current.txt</c>. Crashes anywhere in the sequence
@@ -45,23 +48,25 @@ public class AtomicSnapshotTests : IDisposable
 
         public void Step() => Value++;
 
-        public void Save(ISnapshotWriter writer)
+        public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
         {
             if (ThrowOnSave)
             {
                 throw new InvalidOperationException("simulated crash mid-Save");
             }
 
-            using var stream = writer.OpenWrite("value.txt");
-            using var sw = new StreamWriter(stream, Encoding.UTF8);
-            sw.Write(Value);
+            await using var file = await writer.CreateAsync("value.txt", cancellationToken).ConfigureAwait(false);
+            var bytes = Encoding.UTF8.GetBytes(Value.ToString(CultureInfo.InvariantCulture));
+            await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         }
 
-        public void Load(ISnapshotReader reader)
+        public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
         {
-            using var stream = reader.OpenRead("value.txt");
-            using var sr = new StreamReader(stream, Encoding.UTF8);
-            Value = int.Parse(sr.ReadToEnd(), System.Globalization.CultureInfo.InvariantCulture);
+            await using var file = await reader.OpenReadAsync("value.txt", cancellationToken).ConfigureAwait(false);
+            var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+            using var owner = await file.ReadAsync(new FileRange(0, length), cancellationToken).ConfigureAwait(false);
+            var text = Encoding.UTF8.GetString(owner.Memory.Span[..(int)length]);
+            Value = int.Parse(text, CultureInfo.InvariantCulture);
         }
 
         public string SchemaFingerprint => "faultable-counter";
@@ -79,7 +84,7 @@ public class AtomicSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void Write_OverwritingAtSameTick_PointsToLatest()
+    public async Task Write_OverwritingAtSameTick_PointsToLatest()
     {
         // Two writes at the same tick (Value mutates between them, but
         // circuit.TickCount stays 0 since we never Step). Both target
@@ -87,39 +92,39 @@ public class AtomicSnapshotTests : IDisposable
         // and current.txt names it.
         var op = new FaultableCounterOp { Value = 1 };
         var circuit = Build(op);
-        Snapshot.Write(circuit, _snapshotDir);
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
 
         op.Value = 2;
-        Snapshot.Write(circuit, _snapshotDir);
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
 
-        Assert.True(Snapshot.Exists(_snapshotDir));
+        Assert.True(await Snapshot.ExistsAsync(_snapshotDir));
 
         var consumerOp = new FaultableCounterOp();
         var consumer = Build(consumerOp);
-        Snapshot.Read(consumer, _snapshotDir);
+        await Snapshot.ReadAsync(consumer, _snapshotDir);
         Assert.Equal(2, consumerOp.Value);
     }
 
     [Fact]
-    public void Write_ThrowsMidSave_PriorSnapshotUntouched()
+    public async Task Write_ThrowsMidSave_PriorSnapshotUntouched()
     {
         // Establish a "good" snapshot at tick 0.
         var op = new FaultableCounterOp { Value = 7 };
         var circuit = Build(op);
-        Snapshot.Write(circuit, _snapshotDir);
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
 
         // Step so the next write would target snap-1 (different from
         // the existing snap-0). Then make Save throw.
         circuit.Step();
         op.ThrowOnSave = true;
-        Assert.Throws<InvalidOperationException>(() => Snapshot.Write(circuit, _snapshotDir));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await Snapshot.WriteAsync(circuit, _snapshotDir));
 
         // The prior good snapshot (snap-0) is still loadable: its
         // current.txt still names it.
         op.ThrowOnSave = false;
         var consumerOp = new FaultableCounterOp();
         var consumer = Build(consumerOp);
-        Snapshot.Read(consumer, _snapshotDir);
+        await Snapshot.ReadAsync(consumer, _snapshotDir);
         // CounterOp.Value was 8 (incremented by Step) when we tried to
         // write the second snapshot. That write failed, so the loaded
         // value comes from the original snap-0 where Value was 7.
@@ -127,7 +132,7 @@ public class AtomicSnapshotTests : IDisposable
     }
 
     [Fact]
-    public void Write_FailedMidSave_LeavesNoVisibleSnapshot()
+    public async Task Write_FailedMidSave_LeavesNoVisibleSnapshot()
     {
         // Mid-Save throw with no prior snapshot: current.txt is never
         // committed, so the partial state on disk is invisible to
@@ -135,23 +140,23 @@ public class AtomicSnapshotTests : IDisposable
         // Snapshot.Exists / Read only consult current.txt.)
         var op = new FaultableCounterOp { Value = 1, ThrowOnSave = true };
         var circuit = Build(op);
-        Assert.Throws<InvalidOperationException>(() => Snapshot.Write(circuit, _snapshotDir));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await Snapshot.WriteAsync(circuit, _snapshotDir));
 
-        Assert.False(Snapshot.Exists(_snapshotDir));
+        Assert.False(await Snapshot.ExistsAsync(_snapshotDir));
 
         // Next successful write commits cleanly.
         op.ThrowOnSave = false;
-        Snapshot.Write(circuit, _snapshotDir);
-        Assert.True(Snapshot.Exists(_snapshotDir));
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
+        Assert.True(await Snapshot.ExistsAsync(_snapshotDir));
 
         var consumerOp = new FaultableCounterOp();
         var consumer = Build(consumerOp);
-        Snapshot.Read(consumer, _snapshotDir);
+        await Snapshot.ReadAsync(consumer, _snapshotDir);
         Assert.Equal(1, consumerOp.Value);
     }
 
     [Fact]
-    public void Read_StaleCurrentPointer_ThrowsFileNotFound()
+    public async Task Read_StaleCurrentPointer_ThrowsFileNotFound()
     {
         // Manually point current.txt at a snap-T that doesn't exist —
         // simulates a corrupt or hand-edited pointer. Read should
@@ -161,26 +166,26 @@ public class AtomicSnapshotTests : IDisposable
         File.WriteAllText(Path.Combine(_snapshotDir, "current.txt"), "snap-999");
 
         var consumer = Build(new FaultableCounterOp());
-        Assert.Throws<FileNotFoundException>(() => Snapshot.Read(consumer, _snapshotDir));
+        await Assert.ThrowsAsync<FileNotFoundException>(async () => await Snapshot.ReadAsync(consumer, _snapshotDir));
     }
 
     [Fact]
-    public void Exists_ReturnsTrue_AfterSuccessfulWrite()
+    public async Task Exists_ReturnsTrue_AfterSuccessfulWrite()
     {
         var op = new FaultableCounterOp { Value = 1 };
         var circuit = Build(op);
-        Snapshot.Write(circuit, _snapshotDir);
-        Assert.True(Snapshot.Exists(_snapshotDir));
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
+        Assert.True(await Snapshot.ExistsAsync(_snapshotDir));
     }
 
     [Fact]
-    public void Exists_ReturnsFalse_WhenDirectoryDoesNotExist()
+    public async Task Exists_ReturnsFalse_WhenDirectoryDoesNotExist()
     {
-        Assert.False(Snapshot.Exists(_snapshotDir));
+        Assert.False(await Snapshot.ExistsAsync(_snapshotDir));
     }
 
     [Fact]
-    public void Exists_ReturnsFalse_WhenCurrentTxtMissing()
+    public async Task Exists_ReturnsFalse_WhenCurrentTxtMissing()
     {
         // Simulate orphan snap-T from a crash before current.txt was
         // committed. Without current.txt, no snapshot exists from the
@@ -190,16 +195,16 @@ public class AtomicSnapshotTests : IDisposable
             Path.Combine(_snapshotDir, "snap-0", "manifest.json"),
             "{}");
 
-        Assert.False(Snapshot.Exists(_snapshotDir));
+        Assert.False(await Snapshot.ExistsAsync(_snapshotDir));
     }
 
     [Fact]
-    public void Write_OrphanSnapDir_DoesNotAffectCurrentSnapshot()
+    public async Task Write_OrphanSnapDir_DoesNotAffectCurrentSnapshot()
     {
         // Establish a real snapshot at snap-0.
         var op = new FaultableCounterOp { Value = 5 };
         var circuit = Build(op);
-        Snapshot.Write(circuit, _snapshotDir);
+        await Snapshot.WriteAsync(circuit, _snapshotDir);
 
         // Drop a fake orphan snap-99 alongside (simulating a crash
         // between snap-T rename and current.txt commit). Read should
@@ -208,7 +213,7 @@ public class AtomicSnapshotTests : IDisposable
 
         var consumerOp = new FaultableCounterOp();
         var consumer = Build(consumerOp);
-        Snapshot.Read(consumer, _snapshotDir);
+        await Snapshot.ReadAsync(consumer, _snapshotDir);
         Assert.Equal(5, consumerOp.Value);
     }
 }

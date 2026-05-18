@@ -48,7 +48,7 @@ public class SchemaDriftTests : IDisposable
     }
 
     [Fact]
-    public void RoundTrip_SamePlanSameSchema_LoadsCleanly()
+    public async Task RoundTrip_SamePlanSameSchema_LoadsCleanly()
     {
         var producer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
@@ -56,17 +56,17 @@ public class SchemaDriftTests : IDisposable
         producer.Table("sales").Insert("a", 10L);
         producer.Step();
 
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
         // Should load without throwing.
-        Snapshot.Read(consumer.Circuit, _snapshotDir);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
     }
 
     [Fact]
-    public void VarcharLengthChange_DetectedBySchemaFingerprint()
+    public async Task VarcharLengthChange_DetectedBySchemaFingerprint()
     {
         // VARCHAR length doesn't show up in operator types or in Arrow's
         // StringType — but it changes SqlType.Display, which is what the
@@ -76,68 +76,68 @@ public class SchemaDriftTests : IDisposable
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
         producer.Table("sales").Insert("a", 10L);
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(16) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
-            Snapshot.Read(consumer.Circuit, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir));
         Assert.Contains("schema fingerprint mismatch", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void DecimalPrecisionChange_DetectedBySchemaFingerprint()
+    public async Task DecimalPrecisionChange_DetectedBySchemaFingerprint()
     {
         var producer = Compile(
             ["CREATE TABLE t (id INT NOT NULL, amt DECIMAL(10,2) NOT NULL)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
         producer.Table("t").Insert(1, "10.50");
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL, amt DECIMAL(12,2) NOT NULL)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
-            Snapshot.Read(consumer.Circuit, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir));
         Assert.Contains("schema fingerprint mismatch", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void DecimalScaleChange_DetectedBySchemaFingerprint()
+    public async Task DecimalScaleChange_DetectedBySchemaFingerprint()
     {
         var producer = Compile(
             ["CREATE TABLE t (id INT NOT NULL, amt DECIMAL(10,2) NOT NULL)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
         producer.Table("t").Insert(1, "10.50");
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // Scale change with same precision still alters the type.
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL, amt DECIMAL(10,4) NOT NULL)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
-            Snapshot.Read(consumer.Circuit, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir));
         Assert.Contains("schema fingerprint mismatch", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void NullabilityChange_DetectedBySchemaFingerprint()
+    public async Task NullabilityChange_DetectedBySchemaFingerprint()
     {
         var producer = Compile(
             ["CREATE TABLE t (id INT NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
         producer.Table("t").Insert(1, 10L);
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         // amt becomes nullable — same width, same Arrow type, but
         // SqlType.Display differs.
@@ -145,14 +145,14 @@ public class SchemaDriftTests : IDisposable
             ["CREATE TABLE t (id INT NOT NULL, amt BIGINT)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
-            Snapshot.Read(consumer.Circuit, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir));
         Assert.Contains("schema fingerprint mismatch", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void ColumnRename_DetectedBySchemaFingerprint()
+    public async Task ColumnRename_DetectedBySchemaFingerprint()
     {
         // The renamed column flows into the codec's schema (column
         // names are part of SqlType.Display? No — names are separate.
@@ -162,20 +162,20 @@ public class SchemaDriftTests : IDisposable
             "SELECT id, SUM(amount) FROM t GROUP BY id");
         producer.Table("t").Insert(1, 10L);
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var consumer = Compile(
             ["CREATE TABLE t (id INT NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT id, SUM(amt) FROM t GROUP BY id");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
-            Snapshot.Read(consumer.Circuit, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir));
         Assert.Contains("schema fingerprint mismatch", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void OldManifestSchemaVersion_RejectedCleanly()
+    public async Task OldManifestSchemaVersion_RejectedCleanly()
     {
         // Hand-craft a v1 manifest (without SchemaFingerprint) and
         // verify it's rejected with a clear "not supported" error,
@@ -197,24 +197,24 @@ public class SchemaDriftTests : IDisposable
             ["CREATE TABLE t (id INT NOT NULL)"],
             "SELECT id FROM t UNION SELECT id FROM t");
 
-        var ex = Assert.Throws<InvalidDataException>(() =>
-            Snapshot.Read(consumer.Circuit, _snapshotDir));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir));
         Assert.Contains("schema version 1 not supported", ex.Message,
             StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void ManifestPersistsSchemaFingerprint()
+    public async Task ManifestPersistsSchemaFingerprint()
     {
         var producer = Compile(
             ["CREATE TABLE sales (cat VARCHAR(8) NOT NULL, amt BIGINT NOT NULL)"],
             "SELECT cat, SUM(amt) FROM sales GROUP BY cat");
         producer.Table("sales").Insert("a", 10L);
         producer.Step();
-        Snapshot.Write(producer.Circuit, _snapshotDir);
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
         var snapDir = Path.Combine(_snapshotDir, "snap-" + producer.Circuit.TickCount);
-        var manifest = SnapshotManifest.Read(Path.Combine(snapDir, "manifest.json"));
+        var manifest = await SnapshotManifest.ReadAsync(Path.Combine(snapDir, "manifest.json"));
         Assert.Equal(2, manifest.SchemaVersion);
         Assert.False(string.IsNullOrEmpty(manifest.SchemaFingerprint));
         Assert.Equal(16, manifest.SchemaFingerprint.Length);   // xxh3-64 hex

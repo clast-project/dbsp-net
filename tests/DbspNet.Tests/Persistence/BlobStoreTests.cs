@@ -1,13 +1,18 @@
+using System.Buffers;
+using System.Globalization;
 using System.Text;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.IO;
 using DbspNet.Persistence;
+using DbspNet.Persistence.IO;
+using DbspNet.Persistence.IO.Local;
 
 namespace DbspNet.Tests.Persistence;
 
 /// <summary>
 /// High-level integration tests that drive
 /// <see cref="Snapshot"/>/<see cref="WalRecorder"/> through an
-/// explicit <see cref="IBlobStore"/> reference (no string-path
+/// explicit <see cref="ITableFileSystem"/> reference (no string-path
 /// convenience). Proves the abstraction is the load-bearing surface,
 /// and that the persistence layer's behaviour is identical regardless
 /// of the backing impl. Per-impl contract conformance lives in
@@ -39,18 +44,20 @@ public class BlobStoreTests : IDisposable
 
         public void Step() => Value++;
 
-        public void Save(ISnapshotWriter writer)
+        public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
         {
-            using var stream = writer.OpenWrite("value.txt");
-            using var sw = new StreamWriter(stream, Encoding.UTF8);
-            sw.Write(Value);
+            await using var file = await writer.CreateAsync("value.txt", cancellationToken).ConfigureAwait(false);
+            var bytes = Encoding.UTF8.GetBytes(Value.ToString(CultureInfo.InvariantCulture));
+            await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         }
 
-        public void Load(ISnapshotReader reader)
+        public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
         {
-            using var stream = reader.OpenRead("value.txt");
-            using var sr = new StreamReader(stream, Encoding.UTF8);
-            Value = int.Parse(sr.ReadToEnd(), System.Globalization.CultureInfo.InvariantCulture);
+            await using var file = await reader.OpenReadAsync("value.txt", cancellationToken).ConfigureAwait(false);
+            var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+            using var owner = await file.ReadAsync(new FileRange(0, length), cancellationToken).ConfigureAwait(false);
+            var text = Encoding.UTF8.GetString(owner.Memory.Span[..(int)length]);
+            Value = int.Parse(text, CultureInfo.InvariantCulture);
         }
 
         public string SchemaFingerprint => "counter";
@@ -60,87 +67,93 @@ public class BlobStoreTests : IDisposable
         RootCircuit.Build(builder => builder.AddRawOperator(op));
 
     [Fact]
-    public void Snapshot_RoundTripsThroughLocalFileBlobStore()
+    public async Task Snapshot_RoundTripsThroughLocalFileBlobStore()
     {
-        var store = new LocalFileBlobStore(_root);
+        var fs = new LocalTableFileSystem(_root);
 
         var producerOp = new CounterOp { Value = 42 };
         var producer = Build(producerOp);
-        Snapshot.Write(producer, store);
+        await Snapshot.WriteAsync(producer, fs);
 
-        Assert.True(Snapshot.Exists(store));
+        Assert.True(await Snapshot.ExistsAsync(fs));
 
         var consumerOp = new CounterOp();
         var consumer = Build(consumerOp);
-        Snapshot.Read(consumer, store);
+        await Snapshot.ReadAsync(consumer, fs);
         Assert.Equal(42, consumerOp.Value);
     }
 
     [Fact]
-    public void Snapshot_RoundTripsThroughInMemoryBlobStore()
+    public async Task Snapshot_RoundTripsThroughInMemoryBlobStore()
     {
         // Identical scenario to the local case, but backed by
-        // InMemoryBlobStore — proves Snapshot doesn't accidentally rely
+        // InMemoryTableFileSystem — proves Snapshot doesn't accidentally rely
         // on filesystem semantics. This is the cloud-parity smoke
         // test: any cloud impl that satisfies BlobStoreContractTests
         // will also pass this.
-        var store = new InMemoryBlobStore();
+        var fs = new InMemoryTableFileSystem();
 
         var producerOp = new CounterOp { Value = 42 };
         var producer = Build(producerOp);
-        Snapshot.Write(producer, store);
+        await Snapshot.WriteAsync(producer, fs);
 
-        Assert.True(Snapshot.Exists(store));
+        Assert.True(await Snapshot.ExistsAsync(fs));
 
         var consumerOp = new CounterOp();
         var consumer = Build(consumerOp);
-        Snapshot.Read(consumer, store);
+        await Snapshot.ReadAsync(consumer, fs);
         Assert.Equal(42, consumerOp.Value);
     }
 
     [Fact]
-    public void Snapshot_ListSnapshots_ThroughIBlobStore()
+    public async Task Snapshot_ListSnapshots_ThroughIBlobStore()
     {
-        var store = new InMemoryBlobStore();
+        var fs = new InMemoryTableFileSystem();
 
         var op = new CounterOp();
         var circuit = Build(op);
         for (var i = 0; i < 3; i++)
         {
             circuit.Step();
-            Snapshot.Write(circuit, store, retainCount: 5);
+            await Snapshot.WriteAsync(circuit, fs, retainCount: 5);
         }
 
-        var ticks = Snapshot.ListSnapshots(store);
+        var ticks = await Snapshot.ListSnapshotsAsync(fs);
         Assert.Equal(new long[] { 1, 2, 3 }, ticks);
     }
 
     [Fact]
-    public void WalRecorder_AcceptsIBlobStoreDirectly()
+    public async Task WalRecorder_AcceptsIBlobStoreDirectly()
     {
         // WalRecorder has long-lived OpenWrite streams (ArrowDeltaWriter
         // wraps them across many ticks). Verifies the abstraction
         // supports that pattern — cloud impls back this with multipart
         // upload, in-memory impl with a buffered MemoryStream.
 #pragma warning disable CA1859
-        IBlobStore walStore = new InMemoryBlobStore();
-        IBlobStore snapshotStore = new InMemoryBlobStore();
+        ITableFileSystem walFs = new InMemoryTableFileSystem();
+        ITableFileSystem snapshotFs = new InMemoryTableFileSystem();
 #pragma warning restore CA1859
 
         var query = SqlSnapshotTestSupport.Compile();
-        using (var wal = new WalRecorder(query, walStore, snapshotStore))
+        await using (var wal = await WalRecorder.CreateAsync(query, walFs, snapshotFs))
         {
             query.Table("sales").Insert("a", 10L);
-            wal.Step();
-            wal.WriteSnapshot();
+            await wal.StepAsync();
+            await wal.WriteSnapshotAsync();
         }
 
-        Assert.True(Snapshot.Exists(snapshotStore));
-        Assert.NotEmpty(walStore.ListKeys(""));
+        Assert.True(await Snapshot.ExistsAsync(snapshotFs));
+        var walEntries = new List<string>();
+        await foreach (var entry in walFs.ListAsync(""))
+        {
+            walEntries.Add(entry.Path);
+        }
+
+        Assert.NotEmpty(walEntries);
     }
 
     [Fact]
-    public void HybridReplay_WorksAcrossInMemoryRestart()
+    public async Task HybridReplay_WorksAcrossInMemoryRestart()
     {
         // Restart pattern: open recorder, push and step, snapshot, dispose;
         // open a fresh recorder against the same in-memory stores; the
@@ -148,25 +161,25 @@ public class BlobStoreTests : IDisposable
         // time. Proves the cloud-parity story end-to-end: snapshot +
         // WAL replay through a non-filesystem backend.
 #pragma warning disable CA1859
-        IBlobStore walStore = new InMemoryBlobStore();
-        IBlobStore snapshotStore = new InMemoryBlobStore();
+        ITableFileSystem walFs = new InMemoryTableFileSystem();
+        ITableFileSystem snapshotFs = new InMemoryTableFileSystem();
 #pragma warning restore CA1859
 
         long producerTick;
         {
             var producer = SqlSnapshotTestSupport.Compile();
-            using var wal = new WalRecorder(producer, walStore, snapshotStore);
+            await using var wal = await WalRecorder.CreateAsync(producer, walFs, snapshotFs);
             producer.Table("sales").Insert("a", 10L);
             producer.Table("sales").Insert("b", 20L);
-            wal.Step();
-            wal.WriteSnapshot();
+            await wal.StepAsync();
+            await wal.WriteSnapshotAsync();
             producer.Table("sales").Insert("a", 5L);
-            wal.Step();
+            await wal.StepAsync();
             producerTick = producer.Circuit.TickCount;
         }
 
         var consumer = SqlSnapshotTestSupport.Compile();
-        using (var wal = new WalRecorder(consumer, walStore, snapshotStore))
+        await using (var wal = await WalRecorder.CreateAsync(consumer, walFs, snapshotFs))
         {
             Assert.Equal(producerTick, consumer.Circuit.TickCount);
         }

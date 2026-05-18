@@ -24,14 +24,21 @@ public interface IZSetTraceCodec<TKey, TWeight>
     /// trace pass <c>"trace.arrows"</c>; operators that hold multiple
     /// (e.g. join's left/right) pass disambiguating names.
     /// </summary>
-    void Save(ISnapshotWriter writer, string fileName, ZSet<TKey, TWeight> trace);
+    ValueTask SaveAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        ZSet<TKey, TWeight> trace,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Read the saved entries from <paramref name="fileName"/> and return
     /// them as a Z-set ready to be folded into a fresh trace via
     /// <c>ZSetTrace.Integrate</c>.
     /// </summary>
-    ZSet<TKey, TWeight> Load(ISnapshotReader reader, string fileName);
+    ValueTask<ZSet<TKey, TWeight>> LoadAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Stable hash of the codec's schema(s). Operators concatenate their

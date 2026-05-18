@@ -2,6 +2,8 @@ using System.IO.Hashing;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using DbspNet.Core.IO;
+using DbspNet.Persistence.IO.Local;
 using DbspNet.Sql.Compiler;
 
 namespace DbspNet.Persistence;
@@ -26,9 +28,8 @@ public sealed record WalSegment(
 
 /// <summary>
 /// Top-level WAL manifest. Pinned to a schema-version + plan-fingerprint;
-/// the recorder verifies these match on reopen. Atomic write semantics:
-/// the manifest is written to <c>manifest.json.tmp</c> then renamed (the
-/// rename is atomic on every reasonable filesystem).
+/// the recorder verifies these match on reopen. Written via
+/// <see cref="ITableFileSystem.WriteAllBytesAsync"/>.
 /// </summary>
 public sealed record WalManifest(
     [property: JsonPropertyName("schema_version")] int SchemaVersion,
@@ -49,20 +50,19 @@ public sealed record WalManifest(
         WriteIndented = true,
     };
 
-    public static WalManifest Read(IBlobStore store, string key)
+    public static async ValueTask<WalManifest> ReadAsync(
+        ITableFileSystem fs, string key, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(key);
-        using var stream = store.OpenRead(key);
-        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
-        var json = reader.ReadToEnd();
-        var raw = JsonSerializer.Deserialize<WalManifest>(json, JsonOptions)
+        var bytes = await fs.ReadAllBytesAsync(key, cancellationToken).ConfigureAwait(false);
+        var raw = JsonSerializer.Deserialize<WalManifest>(bytes, JsonOptions)
             ?? throw new InvalidDataException($"WAL manifest at '{key}' is empty");
 
         // v1 manifests pre-date the StartTick field; reconstruct it
         // cumulatively from segment Ticks and promote to v2 in memory. This
         // keeps existing on-disk WALs openable after the schema bump; the
-        // next WriteManifest persists the promotion.
+        // next WriteAsync persists the promotion.
         if (raw.SchemaVersion == 1)
         {
             var rewritten = new WalSegment[raw.Segments.Count];
@@ -80,25 +80,24 @@ public sealed record WalManifest(
         return raw;
     }
 
-    public void Write(IBlobStore store, string key)
+    public ValueTask WriteAsync(ITableFileSystem fs, string key, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(key);
-        using var stream = store.OpenWrite(key);
-        using var writer = new StreamWriter(stream, System.Text.Encoding.UTF8);
-        writer.Write(JsonSerializer.Serialize(this, JsonOptions));
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(this, JsonOptions);
+        return fs.WriteAllBytesAsync(key, bytes, cancellationToken);
     }
 
     /// <summary>
     /// Convenience overload for tests / debugging that operate on local
     /// filesystem paths.
     /// </summary>
-    public static WalManifest Read(string path)
+    public static ValueTask<WalManifest> ReadAsync(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
         var dir = Path.GetDirectoryName(path) ?? ".";
         var name = Path.GetFileName(path);
-        return Read(new LocalFileBlobStore(dir), name);
+        return ReadAsync(new LocalTableFileSystem(dir), name);
     }
 
     /// <summary>

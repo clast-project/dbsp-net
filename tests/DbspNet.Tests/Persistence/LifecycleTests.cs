@@ -78,7 +78,7 @@ public class LifecycleTests : IDisposable
     }
 
     [Fact]
-    public void RepeatedSnapshotRestart_MatchesReferenceOutputAtEveryTick()
+    public async Task RepeatedSnapshotRestart_MatchesReferenceOutputAtEveryTick()
     {
         // The reference session has no persistence — it just runs every
         // operation linearly and produces the canonical output sequence.
@@ -88,7 +88,7 @@ public class LifecycleTests : IDisposable
         // WriteSnapshot calls and simulated restarts. After every tick,
         // its output delta must match the reference's.
         var persistent = CompilePersistent();
-        var recorder = new WalRecorder(persistent, _walDir, _snapshotDir);
+        var recorder = await WalRecorder.CreateAsync(persistent, _walDir, _snapshotDir);
 
         try
         {
@@ -96,20 +96,20 @@ public class LifecycleTests : IDisposable
             InsertBoth(reference, persistent, "products", 1, "electronics");
             InsertBoth(reference, persistent, "products", 2, "books");
             InsertBoth(reference, persistent, "products", 3, "music");
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             InsertBoth(reference, persistent, "orders", 100, 1, 100L);
             InsertBoth(reference, persistent, "orders", 101, 1, 50L);
             InsertBoth(reference, persistent, "orders", 102, 2, 30L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // First snapshot.
-            recorder.WriteSnapshot();
+            await recorder.WriteSnapshotAsync();
 
             InsertBoth(reference, persistent, "orders", 103, 2, 20L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // ---- Restart 1: dispose recorder, rebuild circuit, reopen ----
@@ -119,51 +119,51 @@ public class LifecycleTests : IDisposable
             // least one new Step, outputs match" — that's what proves
             // the restored operator state is correct, since the next
             // delta depends on it.
-            recorder.Dispose();
+            await recorder.DisposeAsync();
             persistent = CompilePersistent();
-            recorder = new WalRecorder(persistent, _walDir, _snapshotDir);
+            recorder = await WalRecorder.CreateAsync(persistent, _walDir, _snapshotDir);
 
             // ---- Cycle 2: more inserts, retraction, another snapshot ----
             InsertBoth(reference, persistent, "orders", 104, 1, 25L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             DeleteBoth(reference, persistent, "orders", 100, 1, 100L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
-            recorder.WriteSnapshot();
+            await recorder.WriteSnapshotAsync();
 
             InsertBoth(reference, persistent, "orders", 105, 3, 99L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // ---- Restart 2 ----
-            recorder.Dispose();
+            await recorder.DisposeAsync();
             persistent = CompilePersistent();
-            recorder = new WalRecorder(persistent, _walDir, _snapshotDir);
+            recorder = await WalRecorder.CreateAsync(persistent, _walDir, _snapshotDir);
 
             // ---- Cycle 3: multiple ticks before next snapshot ----
             InsertBoth(reference, persistent, "orders", 106, 2, 15L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             InsertBoth(reference, persistent, "orders", 107, 1, 5L);
             DeleteBoth(reference, persistent, "orders", 102, 2, 30L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // Snapshot mid-cycle (no immediate restart).
-            recorder.WriteSnapshot();
+            await recorder.WriteSnapshotAsync();
 
             InsertBoth(reference, persistent, "orders", 108, 3, 1L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // Another snapshot back-to-back (no Step between) —
             // exercises the "snapshot after empty post-snapshot WAL"
             // edge case.
-            recorder.WriteSnapshot();
+            await recorder.WriteSnapshotAsync();
 
             // ---- Restart 3: trivial restart (snapshot at latest tick,
             //                 no post-snapshot ticks to replay).
@@ -171,18 +171,18 @@ public class LifecycleTests : IDisposable
             //                 stream isn't initialised when no replay
             //                 runs. The next Step recovers the
             //                 reference-equality invariant. ----
-            recorder.Dispose();
+            await recorder.DisposeAsync();
             persistent = CompilePersistent();
-            recorder = new WalRecorder(persistent, _walDir, _snapshotDir);
+            recorder = await WalRecorder.CreateAsync(persistent, _walDir, _snapshotDir);
 
             // ---- Cycle 4: a fresh product, then more orders ----
             InsertBoth(reference, persistent, "products", 4, "garden");
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             InsertBoth(reference, persistent, "orders", 109, 4, 200L);
             InsertBoth(reference, persistent, "orders", 110, 4, 50L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // After all this churn, the absolute tick counts on both
@@ -192,28 +192,28 @@ public class LifecycleTests : IDisposable
         }
         finally
         {
-            recorder.Dispose();
+            await recorder.DisposeAsync();
         }
     }
 
     [Fact]
-    public void RepeatedSnapshots_PrunedFilesDoNotAccumulate()
+    public async Task RepeatedSnapshots_PrunedFilesDoNotAccumulate()
     {
         // After many WriteSnapshot+Step cycles, the WAL directory should
         // contain only the segments past the latest snapshot, not a
         // growing pile of pruned ones. Verifies the prune-then-rotate
         // flow holds across many iterations.
         var persistent = CompilePersistent();
-        using var recorder = new WalRecorder(persistent, _walDir, _snapshotDir);
+        await using var recorder = await WalRecorder.CreateAsync(persistent, _walDir, _snapshotDir);
 
         persistent.Table("products").Insert(1, "electronics");
-        recorder.Step();
+        await recorder.StepAsync();
 
         for (var i = 0; i < 10; i++)
         {
             persistent.Table("orders").Insert(i, 1, (long)(i + 1));
-            recorder.Step();
-            recorder.WriteSnapshot();
+            await recorder.StepAsync();
+            await recorder.WriteSnapshotAsync();
         }
 
         // Each WriteSnapshot rotates to a new segment id; the prior
@@ -227,7 +227,7 @@ public class LifecycleTests : IDisposable
     }
 
     [Fact]
-    public void RestartWithoutSnapshot_FullWalReplayMatchesReference()
+    public async Task RestartWithoutSnapshot_FullWalReplayMatchesReference()
     {
         // Same scenario but with NO WriteSnapshot calls — pure WAL
         // replay across restarts. Verifies the legacy (A) path still
@@ -235,31 +235,31 @@ public class LifecycleTests : IDisposable
         var reference = CompileReference();
 
         var persistent = CompilePersistent();
-        var recorder = new WalRecorder(persistent, _walDir);
+        var recorder = await WalRecorder.CreateAsync(persistent, _walDir);
 
         try
         {
             InsertBoth(reference, persistent, "products", 1, "electronics");
             InsertBoth(reference, persistent, "products", 2, "books");
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             InsertBoth(reference, persistent, "orders", 100, 1, 100L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
 
             // Restart with no snapshot — full WAL replay.
-            recorder.Dispose();
+            await recorder.DisposeAsync();
             persistent = CompilePersistent();
-            recorder = new WalRecorder(persistent, _walDir);
+            recorder = await WalRecorder.CreateAsync(persistent, _walDir);
 
             InsertBoth(reference, persistent, "orders", 101, 2, 30L);
-            StepBoth(reference, recorder);
+            await StepBothAsync(reference, recorder);
             AssertSameOutput(reference, persistent);
         }
         finally
         {
-            recorder.Dispose();
+            await recorder.DisposeAsync();
         }
     }
 
@@ -275,10 +275,10 @@ public class LifecycleTests : IDisposable
         persistent.Table(table).Delete(values);
     }
 
-    private static void StepBoth(CompiledQuery reference, WalRecorder recorder)
+    private static async Task StepBothAsync(CompiledQuery reference, WalRecorder recorder)
     {
         reference.Step();
-        recorder.Step();
+        await recorder.StepAsync();
     }
 
     private static void AssertSameOutput(CompiledQuery reference, CompiledQuery persistent)
