@@ -6,15 +6,21 @@ namespace DbspNet.Core.Operators.Stateful;
 
 /// <summary>
 /// Incremental inner equi-join of two indexed Z-set streams. Emits a flat
-/// Z-set of combined rows. State: the integrated traces of both inputs. Per
-/// tick, the output is the bilinear incremental form
+/// Z-set of combined rows. State: the integrated traces of both inputs.
+/// Per tick, output is the asymmetric two-pass factoring of the join delta
+/// rule
 /// <code>
-/// out_t = dl ⋈ L_{t-1} + L_{t-1} ⋈ dr + dl ⋈ dr
-///       = dl ⋈ (L_{t-1} + dr) + L_{t-1} ⋈ dr         (equivalent factoring)
+/// out_t = dl ⋈ R_t + L_{t-1} ⋈ dr
 /// </code>
-/// where <c>dl, dr</c> are this tick's deltas and <c>L, R</c> are the
-/// integrated traces. Equivalent to the <c>D(↑Q(I, I))</c> sandwich on the
-/// bilinear operator <c>Q(a,b) = a ⋈ b</c> by the DBSP bilinearity theorem.
+/// where <c>dl, dr</c> are this tick's deltas, <c>L_{t-1}</c> is the
+/// delayed left trace, and <c>R_t</c> is the right trace with <c>dr</c>
+/// already folded in. This subsumes the literal three-term expansion
+/// <code>
+/// dl ⋈ R_{t-1} + L_{t-1} ⋈ dr + dl ⋈ dr
+/// </code>
+/// by absorbing the cross term <c>dl ⋈ dr</c> into <c>dl ⋈ R_t</c>.
+/// Equivalent to the <c>D(↑Q(I, I))</c> sandwich on the bilinear operator
+/// <c>Q(a,b) = a ⋈ b</c> by the DBSP bilinearity theorem.
 /// </summary>
 internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
     where TKey : notnull
@@ -84,20 +90,21 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         var dl = _leftIn.Current;
         var dr = _rightIn.Current;
 
-        var builder = new ZSetBuilder<TOut, TWeight>();
+        // Integrate dr into the right trace BEFORE the joins so the first
+        // pass sees R_t = R_{t-1} + dr — that absorbs the dl ⋈ dr cross
+        // term. The left trace stays at L_{t-1} for the second pass and is
+        // integrated AFTER. Order matters: do not move the two Integrate
+        // calls together.
+        _rightTrace.Integrate(dr);
 
-        // dl ⋈ R_{t-1}
+        var builder = new ZSetBuilder<TOut, TWeight>();
+        // dl ⋈ R_t
         JoinInto(dl, _rightTrace.Current, builder);
         // L_{t-1} ⋈ dr
         JoinInto(_leftTrace.Current, dr, builder);
-        // dl ⋈ dr
-        JoinInto(dl, dr, builder);
-
         _output.SetCurrent(builder.Build());
 
-        // Update integrated traces for next tick.
         _leftTrace.Integrate(dl);
-        _rightTrace.Integrate(dr);
     }
 
     private void JoinInto(
