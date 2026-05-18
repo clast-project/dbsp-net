@@ -28,6 +28,12 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// Whether this is a win in aggregate depends on the trace size and
 /// per-step delta size; see <see cref="DistinctBenchmark"/>.
 /// </remarks>
+/// <remarks>
+/// Sibling spine operators wired through the same trace family:
+/// <see cref="SpineIncrementalAggregateOp{TKey,TValue,TOut}"/>,
+/// <see cref="SpineIncrementalJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/>,
+/// <see cref="SpineIncrementalLeftJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/>.
+/// </remarks>
 internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>

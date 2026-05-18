@@ -1,0 +1,141 @@
+using DbspNet.Core.Algebra;
+using DbspNet.Core.Circuit;
+using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful.Aggregators;
+
+namespace DbspNet.Core.Operators.Stateful.Spine;
+
+/// <summary>
+/// Spine-backed incremental aggregate. Observable behaviour matches
+/// <see cref="IncrementalAggregateOp{TKey,TValue,TOut}"/>; the only
+/// difference is that the per-key value multisets are stored in a
+/// <see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}"/> rather than
+/// a flat <see cref="IndexedZSetTrace{TKey,TValue,TWeight}"/>.
+/// </summary>
+/// <remarks>
+/// Per tick the hot path is one <c>GroupFor</c> per delta key against
+/// the spine trace — bloom-gated binary search across each batch — plus
+/// the same aggregator update logic as the flat operator.
+/// </remarks>
+internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperator, ISnapshotable
+    where TKey : notnull
+    where TValue : notnull
+    where TOut : notnull
+{
+    private readonly Stream<IndexedZSet<TKey, TValue, Z64>> _input;
+    private readonly Stream<ZSet<(TKey Key, TOut Value), Z64>> _output;
+    private readonly IAggregator<TValue, TOut> _aggregator;
+    private readonly SpineIndexedZSetTrace<TKey, TValue, Z64> _trace;
+    private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
+    private readonly Dictionary<TKey, object?> _stateCache = new();
+    private readonly IIndexedZSetTraceCodec<TKey, TValue, Z64>? _snapshotCodec;
+
+    public SpineIncrementalAggregateOp(
+        Stream<IndexedZSet<TKey, TValue, Z64>> input,
+        Stream<ZSet<(TKey Key, TOut Value), Z64>> output,
+        IAggregator<TValue, TOut> aggregator,
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
+        ICompactionStrategy? compactionStrategy = null,
+        IComparer<TKey>? keyComparer = null,
+        IComparer<TValue>? valueComparer = null)
+    {
+        _input = input;
+        _output = output;
+        _aggregator = aggregator;
+        _trace = new SpineIndexedZSetTrace<TKey, TValue, Z64>(
+            compactionStrategy ?? TieredCompactionStrategy.Default,
+            keyComparer,
+            valueComparer);
+        _snapshotCodec = snapshotCodec;
+    }
+
+    public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
+    {
+        if (_snapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "SpineIncrementalAggregateOp was constructed without a snapshot codec.");
+        }
+
+        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Materialize(), cancellationToken);
+    }
+
+    public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
+    {
+        if (_snapshotCodec is null)
+        {
+            throw new NotSupportedException(
+                "SpineIncrementalAggregateOp was constructed without a snapshot codec.");
+        }
+
+        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        _trace.Integrate(loaded);
+
+        // Rebuild the per-group caches from the restored trace. Same
+        // logic as IncrementalAggregateOp.LoadAsync — see the flat op
+        // for the rationale.
+        foreach (var (key, group) in _trace.Entries())
+        {
+            object? state = null;
+            var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
+            _aggCache[key] = agg;
+            _stateCache[key] = state;
+        }
+    }
+
+    public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
+
+    public void Step()
+    {
+        var delta = _input.Current;
+        if (delta.IsEmpty)
+        {
+            _output.SetCurrent(ZSet<(TKey, TOut), Z64>.Empty);
+            return;
+        }
+
+        var builder = new ZSetBuilder<(TKey, TOut), Z64>();
+        foreach (var key in delta.Keys)
+        {
+            var groupDelta = delta.GroupFor(key);
+            var beforeGroup = _trace.GroupFor(key);
+            var afterGroup = beforeGroup + groupDelta;
+
+            var oldAgg = _aggCache.TryGetValue(key, out var cached)
+                ? cached
+                : Optional<TOut>.None;
+            _stateCache.TryGetValue(key, out var state);
+
+            var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
+
+            if (afterGroup.IsEmpty)
+            {
+                _aggCache.Remove(key);
+                _stateCache.Remove(key);
+            }
+            else
+            {
+                _aggCache[key] = newAgg;
+                _stateCache[key] = state;
+            }
+
+            if (oldAgg == newAgg)
+            {
+                continue;
+            }
+
+            if (oldAgg.HasValue)
+            {
+                builder.Add((key, oldAgg.Value), new Z64(-1));
+            }
+
+            if (newAgg.HasValue)
+            {
+                builder.Add((key, newAgg.Value), new Z64(1));
+            }
+        }
+
+        _output.SetCurrent(builder.Build());
+        _trace.Integrate(delta);
+    }
+}
