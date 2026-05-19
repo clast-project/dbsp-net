@@ -4,130 +4,226 @@ using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Linear;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
+using AstJoinType = DbspNet.Sql.Parser.Ast.JoinType;
 
 namespace DbspNet.Sql.Compiler;
 
 /// <summary>
-/// Typed-row compile path. Recognises a growing set of plan shapes —
-/// today: bare table scan, column or arbitrary-expression projections
-/// over a scan, and a <see cref="FilterPlan"/> between them — and
-/// builds a circuit whose streams carry per-schema emitted structs
-/// from <see cref="TypedRowEmitter"/> instead of
-/// <see cref="StructuralRow"/>. Projection and filter expressions are
-/// lowered via <see cref="TypedExpressionCompiler"/>. Plans outside
-/// the supported subset return <c>false</c>; callers fall back to
+/// Typed-row compile path. Recursively walks a <see cref="LogicalPlan"/>
+/// and builds an equivalent circuit whose streams carry per-schema
+/// emitted structs from <see cref="TypedRowEmitter"/> instead of
+/// <see cref="StructuralRow"/>. Supports <see cref="ScanPlan"/>,
+/// <see cref="FilterPlan"/>, <see cref="ProjectPlan"/>, and INNER
+/// <see cref="JoinPlan"/>. Expressions are lowered via
+/// <see cref="TypedExpressionCompiler"/>. Plans / subexpressions
+/// outside the supported subset cause the whole compile to return
+/// <c>false</c>; callers fall back to
 /// <see cref="PlanToCircuit.Compile(LogicalPlan, ISqlSnapshotCodecs?)"/>.
 /// </summary>
 public static class TypedPlanCompiler
 {
     /// <summary>
     /// Attempts to compile <paramref name="plan"/> into a
-    /// <see cref="TypedCompiledQuery"/>. Returns <c>false</c> if the
-    /// plan shape isn't supported by this phase or if any referenced
-    /// schema falls outside <see cref="TypedRowEmitter"/>'s scope.
+    /// <see cref="TypedCompiledQuery"/>. Returns <c>false</c> if any
+    /// part of the plan or any referenced schema falls outside the
+    /// typed pipeline's scope.
     /// </summary>
     public static bool TryCompile(LogicalPlan plan, out TypedCompiledQuery? compiled)
     {
         ArgumentNullException.ThrowIfNull(plan);
+        compiled = null;
 
-        if (!TryUnwrapScanFilterProject(plan,
-                out var scan, out var filterPredicate, out var projections, out var outputSchema))
+        var inputs = new Dictionary<string, TypedTableInput>(StringComparer.Ordinal);
+        TypedNode? topNode = null;
+        object? outputHandle = null;
+
+        try
         {
-            compiled = null;
+            var circuit = RootCircuit.Build(builder =>
+            {
+                var ctx = new CompileContext(builder, inputs);
+                topNode = TryCompileNode(plan, ctx)
+                    ?? throw new UnsupportedPlanException();
+                outputHandle = InvokeOutput(builder, topNode.RowType, topNode.Stream);
+            });
+
+            var factory = TypedRowEmitter.BuildBoxedFactory(topNode!.Schema)
+                ?? throw new InvalidOperationException(
+                    "TypedRowEmitter accepted the schema but produced no factory");
+
+            var currentGetter = BuildCurrentZSetGetter(topNode.RowType, outputHandle!);
+            var currentReader = BuildBoxedEntriesReader(topNode.RowType);
+            var weightOf = BuildWeightOf(topNode.RowType, factory, currentGetter);
+
+            compiled = new TypedCompiledQuery(
+                circuit, inputs, topNode.Schema, topNode.RowType,
+                currentGetter, currentReader, weightOf);
+            return true;
+        }
+        catch (UnsupportedPlanException)
+        {
             return false;
         }
-
-        var inputRowType = TypedRowEmitter.EmitRowType(scan.Schema);
-        if (inputRowType is null)
-        {
-            compiled = null;
-            return false;
-        }
-
-        var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
-        if (outputRowType is null)
-        {
-            compiled = null;
-            return false;
-        }
-
-        compiled = BuildScanFilterProject(
-            scan, filterPredicate, projections, outputSchema,
-            inputRowType, outputRowType);
-        return compiled is not null;
     }
 
     /// <summary>
-    /// Recognises plan shapes the typed compile path supports.
-    /// Accepts (top → bottom):
-    /// <list type="bullet">
-    /// <item>bare <see cref="ScanPlan"/> (identity projection)</item>
-    /// <item><see cref="ProjectPlan"/> over <see cref="ScanPlan"/></item>
-    /// <item><see cref="ProjectPlan"/> over <see cref="FilterPlan"/> over <see cref="ScanPlan"/></item>
-    /// <item><see cref="FilterPlan"/> over <see cref="ScanPlan"/> (identity projection)</item>
-    /// </list>
-    /// The projection list is whatever the plan exposes (or the
-    /// identity list synthesised for bare scans); whether the
-    /// expressions are typed-compilable is decided downstream.
+    /// One node's compiled output: the closed CLR type of rows on the
+    /// stream, the SQL schema of that row, and the (boxed) typed
+    /// stream object.
     /// </summary>
-    private static bool TryUnwrapScanFilterProject(
-        LogicalPlan plan,
-        out ScanPlan scan,
-        out ResolvedExpression? filterPredicate,
-        out IReadOnlyList<ProjectionItem> projections,
-        out Schema outputSchema)
+    private sealed record TypedNode(Type RowType, Schema Schema, object Stream);
+
+    private sealed class CompileContext
     {
-        scan = null!;
-        filterPredicate = null;
-        projections = null!;
-        outputSchema = null!;
+        public CircuitBuilder Builder { get; }
 
-        LogicalPlan inner;
-        if (plan is ProjectPlan project)
+        public Dictionary<string, TypedTableInput> Inputs { get; }
+
+        public CompileContext(CircuitBuilder builder, Dictionary<string, TypedTableInput> inputs)
         {
-            projections = project.Projections;
-            outputSchema = project.Schema;
-            inner = project.Input;
+            Builder = builder;
+            Inputs = inputs;
         }
-        else
-        {
-            inner = plan;
-        }
-
-        if (inner is FilterPlan filter)
-        {
-            filterPredicate = filter.Predicate;
-            inner = filter.Input;
-        }
-
-        if (inner is not ScanPlan s) return false;
-        scan = s;
-
-        if (projections is null)
-        {
-            projections = IdentityProjections(scan.Schema);
-            outputSchema = scan.Schema;
-        }
-
-        return true;
     }
 
-    private static IReadOnlyList<ProjectionItem> IdentityProjections(Schema schema)
+    private sealed class UnsupportedPlanException : Exception;
+
+    private static TypedNode? TryCompileNode(LogicalPlan plan, CompileContext ctx) => plan switch
     {
-        var items = new ProjectionItem[schema.Count];
-        for (var i = 0; i < schema.Count; i++)
+        ScanPlan s => CompileScan(s, ctx),
+        FilterPlan f => CompileFilter(f, ctx),
+        ProjectPlan p => CompileProject(p, ctx),
+        JoinPlan { JoinType: AstJoinType.Inner } j => CompileInnerJoin(j, ctx),
+        _ => null,
+    };
+
+    // ---- Plan node dispatch ----
+
+    private static TypedNode? CompileScan(ScanPlan scan, CompileContext ctx)
+    {
+        var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
+        if (rowType is null) return null;
+
+        var factory = TypedRowEmitter.BuildBoxedFactory(scan.Schema)!;
+        var (handle, stream) = InvokeZSetInput(ctx.Builder, rowType);
+        ctx.Inputs[scan.TableName] = new TypedTableInput(scan.Schema, rowType, factory, handle);
+        return new TypedNode(rowType, scan.Schema, stream);
+    }
+
+    private static TypedNode? CompileFilter(FilterPlan filter, CompileContext ctx)
+    {
+        var inner = TryCompileNode(filter.Input, ctx);
+        if (inner is null) return null;
+
+        var predicate = BuildTypedPredicateDelegate(filter.Predicate, inner.RowType);
+        if (predicate is null) return null;
+
+        var stream = InvokeFilter(ctx.Builder, inner.RowType, inner.Stream, predicate);
+        return new TypedNode(inner.RowType, inner.Schema, stream);
+    }
+
+    private static TypedNode? CompileProject(ProjectPlan project, CompileContext ctx)
+    {
+        var inner = TryCompileNode(project.Input, ctx);
+        if (inner is null) return null;
+
+        if (IsIdentityProjection(project.Projections, inner.Schema, project.Schema))
         {
-            items[i] = new ProjectionItem(
-                new ResolvedColumn(i, schema[i].Type),
-                schema[i].Name,
-                schema[i].Qualifier);
+            return inner;
         }
 
-        return items;
+        var outputRowType = TypedRowEmitter.EmitRowType(project.Schema);
+        if (outputRowType is null) return null;
+
+        var projDelegate = BuildTypedProjectionDelegate(
+            inner.RowType, outputRowType, project.Schema, project.Projections);
+        if (projDelegate is null) return null;
+
+        var stream = InvokeMapRows(
+            ctx.Builder, inner.RowType, outputRowType, inner.Stream, projDelegate);
+        return new TypedNode(outputRowType, project.Schema, stream);
     }
+
+    /// <summary>
+    /// Compiles an <see cref="AstJoinType.Inner"/> equi-join. Both
+    /// sides are recursively typed; the equi-key columns become a
+    /// per-join emitted struct (<c>TKey</c>); the combined row is the
+    /// concatenation of the two sides' columns (left first, then
+    /// right). A residual is applied as a subsequent typed
+    /// <see cref="LinearOperators.Filter"/>.
+    /// </summary>
+    /// <remarks>
+    /// LEFT / RIGHT OUTER joins are out of scope: NULL-padding the
+    /// missing side requires nullable output columns, which the typed
+    /// row gate rejects.
+    /// </remarks>
+    private static TypedNode? CompileInnerJoin(JoinPlan plan, CompileContext ctx)
+    {
+        if (plan.EquiKeys.Count == 0) return null;
+
+        var left = TryCompileNode(plan.Left, ctx);
+        if (left is null) return null;
+        var right = TryCompileNode(plan.Right, ctx);
+        if (right is null) return null;
+
+        // Equi-key columns must be NOT NULL on both sides — the typed
+        // row gate enforces this at the scan level, but a key column
+        // could in principle come from a derived plan with a nullable
+        // result. Belt and braces: reject explicitly.
+        var leftIndices = new int[plan.EquiKeys.Count];
+        var rightIndices = new int[plan.EquiKeys.Count];
+        for (var i = 0; i < plan.EquiKeys.Count; i++)
+        {
+            leftIndices[i] = plan.EquiKeys[i].LeftIndex;
+            rightIndices[i] = plan.EquiKeys[i].RightIndex;
+            if (left.Schema[leftIndices[i]].Type.Nullable) return null;
+            if (right.Schema[rightIndices[i]].Type.Nullable) return null;
+        }
+
+        var keySchema = left.Schema.SubsetByIndex(leftIndices);
+        var keyRowType = TypedRowEmitter.EmitRowType(keySchema);
+        if (keyRowType is null) return null;
+
+        var leftKeyExtractor = BuildKeyExtractorDelegate(
+            left.RowType, keyRowType, keySchema, leftIndices);
+        var rightKeyExtractor = BuildKeyExtractorDelegate(
+            right.RowType, keyRowType, keySchema, rightIndices);
+        if (leftKeyExtractor is null || rightKeyExtractor is null) return null;
+
+        var outputRowType = TypedRowEmitter.EmitRowType(plan.Schema);
+        if (outputRowType is null) return null;
+
+        var combineDelegate = BuildJoinCombineDelegate(
+            keyRowType, left.RowType, right.RowType, outputRowType,
+            plan.Schema, left.Schema.Count, right.Schema.Count);
+
+        var leftIndexed = InvokeGroupProject(
+            ctx.Builder, left.RowType, keyRowType, left.Stream, leftKeyExtractor);
+        var rightIndexed = InvokeGroupProject(
+            ctx.Builder, right.RowType, keyRowType, right.Stream, rightKeyExtractor);
+
+        var joined = InvokeIncrementalInnerJoin(
+            ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
+            leftIndexed, rightIndexed, combineDelegate);
+
+        var node = new TypedNode(outputRowType, plan.Schema, joined);
+
+        if (plan.Residual is not null)
+        {
+            var residual = BuildTypedPredicateDelegate(plan.Residual, outputRowType);
+            if (residual is null) return null;
+            var filtered = InvokeFilter(ctx.Builder, outputRowType, joined, residual);
+            node = new TypedNode(outputRowType, plan.Schema, filtered);
+        }
+
+        return node;
+    }
+
+    // ---- Helpers: identity / projection / predicate ----
 
     private static bool IsIdentityProjection(
         IReadOnlyList<ProjectionItem> projections, Schema inputSchema, Schema outputSchema)
@@ -145,103 +241,6 @@ public static class TypedPlanCompiler
         return true;
     }
 
-    /// <summary>
-    /// Builds the typed circuit for a scan + optional filter +
-    /// optional non-identity projection. Returns <c>null</c> if the
-    /// predicate or any projection expression is outside
-    /// <see cref="TypedExpressionCompiler"/>'s scope. The circuit
-    /// shape is, in order:
-    /// <list type="bullet">
-    /// <item><c>typed input</c></item>
-    /// <item><c>Filter&lt;TIn, Z64&gt;</c> (only if a predicate is present)</item>
-    /// <item><c>MapRows&lt;TIn, TOut, Z64&gt;</c> (only if the projection isn't an identity)</item>
-    /// <item><c>typed output</c></item>
-    /// </list>
-    /// </summary>
-    private static TypedCompiledQuery? BuildScanFilterProject(
-        ScanPlan scan,
-        ResolvedExpression? filterPredicate,
-        IReadOnlyList<ProjectionItem> projections,
-        Schema outputSchema,
-        Type inputRowType,
-        Type outputRowType)
-    {
-        var inputSchema = scan.Schema;
-        var inputFactory = TypedRowEmitter.BuildBoxedFactory(inputSchema)
-            ?? throw new InvalidOperationException(
-                "TypedRowEmitter accepted the input schema but produced no factory");
-        var outputFactory = TypedRowEmitter.BuildBoxedFactory(outputSchema)
-            ?? throw new InvalidOperationException(
-                "TypedRowEmitter accepted the output schema but produced no factory");
-
-        Delegate? predicateDelegate = null;
-        if (filterPredicate is not null)
-        {
-            predicateDelegate = BuildTypedPredicateDelegate(filterPredicate, inputRowType);
-            if (predicateDelegate is null) return null;
-        }
-
-        var identityProjection = IsIdentityProjection(projections, inputSchema, outputSchema);
-        Delegate? projectionDelegate = null;
-        if (!identityProjection)
-        {
-            projectionDelegate = BuildTypedProjectionDelegate(
-                inputRowType, outputRowType, outputSchema, projections);
-            if (projectionDelegate is null) return null;
-        }
-
-        RootCircuit? circuit = null;
-        object? handle = null;
-        object? outputHandle = null;
-
-        circuit = RootCircuit.Build(builder =>
-        {
-            var (h, stream) = InvokeZSetInput(builder, inputRowType);
-            handle = h;
-            if (predicateDelegate is not null)
-            {
-                stream = InvokeFilter(builder, inputRowType, stream, predicateDelegate);
-            }
-
-            if (projectionDelegate is not null)
-            {
-                stream = InvokeMapRows(builder, inputRowType, outputRowType, stream, projectionDelegate);
-                outputHandle = InvokeOutput(builder, outputRowType, stream);
-            }
-            else
-            {
-                outputHandle = InvokeOutput(builder, inputRowType, stream);
-            }
-        });
-
-        var inputs = new Dictionary<string, TypedTableInput>(StringComparer.Ordinal)
-        {
-            [scan.TableName] = new TypedTableInput(inputSchema, inputRowType, inputFactory, handle!),
-        };
-
-        // Output row type / factory depends on whether a non-identity
-        // projection was applied. Identity → stream still carries TIn.
-        var streamRowType = identityProjection ? inputRowType : outputRowType;
-        var streamFactory = identityProjection ? inputFactory : outputFactory;
-        var streamSchema = identityProjection ? inputSchema : outputSchema;
-
-        var currentGetter = BuildCurrentZSetGetter(streamRowType, outputHandle!);
-        var currentReader = BuildBoxedEntriesReader(streamRowType);
-        var weightOf = BuildWeightOf(streamRowType, streamFactory, currentGetter);
-
-        return new TypedCompiledQuery(
-            circuit!, inputs, streamSchema, streamRowType,
-            currentGetter, currentReader, weightOf);
-    }
-
-    /// <summary>
-    /// Builds <c>(TIn in) =&gt; new TOut(expr_0(in), expr_1(in), ...)</c>
-    /// as a <see cref="Delegate"/> of type <c>Func&lt;TIn, TOut&gt;</c>
-    /// by lowering each projection through
-    /// <see cref="TypedExpressionCompiler.TryBuildInto"/> and feeding
-    /// the results into the emitted typed-fields constructor. Returns
-    /// <c>null</c> if any projection expression is outside scope.
-    /// </summary>
     private static Delegate? BuildTypedProjectionDelegate(
         Type inputRowType, Type outputRowType, Schema outputSchema,
         IReadOnlyList<ProjectionItem> projections)
@@ -262,25 +261,15 @@ public static class TypedPlanCompiler
         {
             var built = TypedExpressionCompiler.TryBuildInto(projections[i].Expression, inParam);
             if (built is null) return null;
-            // Widen to the ctor's expected param type when the
-            // expression compiler returned a slightly narrower CLR
-            // type (e.g. int → long).
             args[i] = built.Type == ctorParamTypes[i]
                 ? built
                 : Expression.Convert(built, ctorParamTypes[i]);
         }
 
-        var body = Expression.New(ctor, args);
         var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, outputRowType);
-        return Expression.Lambda(delegateType, body, inParam).Compile();
+        return Expression.Lambda(delegateType, Expression.New(ctor, args), inParam).Compile();
     }
 
-    /// <summary>
-    /// Builds a typed predicate <c>Func&lt;TIn, bool&gt;</c>. Returns
-    /// <c>null</c> if the predicate is outside the typed expression
-    /// compiler's scope, or if it doesn't reduce to a plain
-    /// non-nullable BOOLEAN.
-    /// </summary>
     private static Delegate? BuildTypedPredicateDelegate(
         ResolvedExpression predicate, Type inputRowType)
     {
@@ -294,6 +283,88 @@ public static class TypedPlanCompiler
         return Expression.Lambda(delegateType, built, inParam).Compile();
     }
 
+    // ---- Helpers: join key extraction and row combine ----
+
+    /// <summary>
+    /// Builds <c>(TIn in) =&gt; new TKey(in.F{idx[0]}, in.F{idx[1]}, ...)</c>.
+    /// </summary>
+    private static Delegate? BuildKeyExtractorDelegate(
+        Type inputRowType, Type keyRowType, Schema keySchema, int[] indices)
+    {
+        var ctorParamTypes = new Type[keySchema.Count];
+        for (var i = 0; i < keySchema.Count; i++)
+        {
+            ctorParamTypes[i] = keySchema[i].Type.ClrType;
+        }
+
+        var ctor = keyRowType.GetConstructor(ctorParamTypes);
+        if (ctor is null) return null;
+
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var args = new Expression[indices.Length];
+        for (var i = 0; i < indices.Length; i++)
+        {
+            var field = inputRowType.GetField("F" + indices[i]);
+            if (field is null) return null;
+            args[i] = Expression.Field(inParam, field);
+        }
+
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, keyRowType);
+        return Expression.Lambda(delegateType, Expression.New(ctor, args), inParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds the inner-join combine
+    /// <c>(TKey _, TLeft l, TRight r) =&gt; new TOut(l.F0, ..., l.F{lN-1}, r.F0, ..., r.F{rN-1})</c>.
+    /// The output schema is the resolver-built side-by-side concatenation
+    /// (left columns first, then right). The TKey arg is ignored since
+    /// the key columns are already present in the left row.
+    /// </summary>
+    private static Delegate BuildJoinCombineDelegate(
+        Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
+        Schema outputSchema, int leftCount, int rightCount)
+    {
+        var ctorParamTypes = new Type[outputSchema.Count];
+        for (var i = 0; i < outputSchema.Count; i++)
+        {
+            ctorParamTypes[i] = outputSchema[i].Type.ClrType;
+        }
+
+        var ctor = outputRowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException(
+                "emitted output row missing typed-fields ctor");
+
+        var keyParam = Expression.Parameter(keyRowType, "k");
+        var leftParam = Expression.Parameter(leftRowType, "l");
+        var rightParam = Expression.Parameter(rightRowType, "r");
+
+        var args = new Expression[leftCount + rightCount];
+        for (var i = 0; i < leftCount; i++)
+        {
+            var field = leftRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("missing left field F" + i);
+            args[i] = Expression.Field(leftParam, field);
+            if (args[i].Type != ctorParamTypes[i])
+                args[i] = Expression.Convert(args[i], ctorParamTypes[i]);
+        }
+
+        for (var j = 0; j < rightCount; j++)
+        {
+            var field = rightRowType.GetField("F" + j)
+                ?? throw new InvalidOperationException("missing right field F" + j);
+            var arg = (Expression)Expression.Field(rightParam, field);
+            if (arg.Type != ctorParamTypes[leftCount + j])
+                arg = Expression.Convert(arg, ctorParamTypes[leftCount + j]);
+            args[leftCount + j] = arg;
+        }
+
+        var delegateType = typeof(Func<,,,>).MakeGenericType(
+            keyRowType, leftRowType, rightRowType, outputRowType);
+        return Expression.Lambda(
+            delegateType, Expression.New(ctor, args),
+            keyParam, leftParam, rightParam).Compile();
+    }
+
     // ---- Reflection-built generic calls ----
 
     /// <summary>builder.ZSetInput&lt;TRow, Z64&gt;()</summary>
@@ -304,16 +375,13 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(LinearOperators.ZSetInput) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
         var tuple = closed.Invoke(null, new object[] { builder })!;
-        // The tuple type is (InputHandle<ZSet<TRow, Z64>>, Stream<ZSet<TRow, Z64>>)
         var tupleType = tuple.GetType();
         var item1 = tupleType.GetField("Item1")!.GetValue(tuple)!;
         var item2 = tupleType.GetField("Item2")!.GetValue(tuple)!;
         return (item1, item2);
     }
 
-    /// <summary>
-    /// <c>builder.Filter&lt;TRow, Z64&gt;(stream, predicate)</c>.
-    /// </summary>
+    /// <summary><c>builder.Filter&lt;TRow, Z64&gt;(stream, predicate)</c>.</summary>
     private static object InvokeFilter(
         CircuitBuilder builder, Type rowType, object stream, Delegate predicate)
     {
@@ -324,9 +392,7 @@ public static class TypedPlanCompiler
         return closed.Invoke(null, new object[] { builder, stream, predicate })!;
     }
 
-    /// <summary>
-    /// <c>builder.MapRows&lt;TIn, TOut, Z64&gt;(inputStream, projection)</c>.
-    /// </summary>
+    /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>
     private static object InvokeMapRows(
         CircuitBuilder builder, Type inputRowType, Type outputRowType,
         object inputStream, Delegate projection)
@@ -336,6 +402,47 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(LinearOperators.MapRows) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(inputRowType, outputRowType, typeof(Z64));
         return closed.Invoke(null, new object[] { builder, inputStream, projection })!;
+    }
+
+    /// <summary>
+    /// <c>builder.GroupProject&lt;TKey, TRow, TRow, Z64&gt;(stream, keyOf, row =&gt; row)</c>.
+    /// The value extractor is the identity — every row is indexed by
+    /// its key with itself as the value.
+    /// </summary>
+    private static object InvokeGroupProject(
+        CircuitBuilder builder, Type rowType, Type keyRowType,
+        object stream, Delegate keyExtractor)
+    {
+        // (TRow row) => row — identity value extractor.
+        var rowParam = Expression.Parameter(rowType, "row");
+        var identityDelegateType = typeof(Func<,>).MakeGenericType(rowType, rowType);
+        var identity = Expression.Lambda(identityDelegateType, rowParam, rowParam).Compile();
+
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(StatefulOperators.GroupProject) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, rowType, rowType, typeof(Z64));
+        return closed.Invoke(null, new object[] { builder, stream, keyExtractor, identity })!;
+    }
+
+    /// <summary>
+    /// <c>builder.IncrementalInnerJoin&lt;TKey, TLeft, TRight, TOut, Z64&gt;(...)</c>.
+    /// </summary>
+    private static object InvokeIncrementalInnerJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        Type outputRowType, object leftIndexed, object rightIndexed, Delegate combine)
+    {
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(StatefulOperators.IncrementalInnerJoin)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(
+            keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        // Two trailing optional snapshot-codec args default to null; pass null.
+        return closed.Invoke(null, new object?[]
+        {
+            builder, leftIndexed, rightIndexed, combine, null, null,
+        })!;
     }
 
     /// <summary>builder.Output(stream) — generic over ZSet&lt;TRow, Z64&gt;</summary>
@@ -352,7 +459,6 @@ public static class TypedPlanCompiler
 
     private static Func<object> BuildCurrentZSetGetter(Type rowType, object outputHandle)
     {
-        // () => outputHandle.Current  (where Current : ZSet<TRow, Z64>)
         var zsetType = typeof(ZSet<,>).MakeGenericType(rowType, typeof(Z64));
         var handleType = typeof(OutputHandle<>).MakeGenericType(zsetType);
         var currentProp = handleType.GetProperty(nameof(OutputHandle<int>.Current))!;
@@ -362,20 +468,11 @@ public static class TypedPlanCompiler
         return Expression.Lambda<Func<object>>(boxed).Compile();
     }
 
-    /// <summary>
-    /// Returns a function that, given a boxed
-    /// <c>ZSet&lt;TRow, Z64&gt;</c>, enumerates its
-    /// <c>(boxed-row, weight)</c> entries.
-    /// </summary>
     private static Func<object, IEnumerable<KeyValuePair<object, Z64>>> BuildBoxedEntriesReader(Type rowType)
         => EnumerateBoxedEntries;
 
     private static IEnumerable<KeyValuePair<object, Z64>> EnumerateBoxedEntries(object zset)
     {
-        // ZSet<TRow, Z64> implements IEnumerable<KeyValuePair<TRow, Z64>>.
-        // Use the non-generic IEnumerable to avoid building a typed
-        // enumerator. Each element is a struct KeyValuePair<TRow, Z64>;
-        // reflect it back to (object, Z64).
         foreach (var kv in (System.Collections.IEnumerable)zset)
         {
             var kvType = kv!.GetType();
@@ -388,7 +485,6 @@ public static class TypedPlanCompiler
     private static Func<object?[], Z64> BuildWeightOf(
         Type rowType, Func<object?[], object> factory, Func<object> currentGetter)
     {
-        // (values) => current.WeightOf((TRow)factory(values))
         var zsetType = typeof(ZSet<,>).MakeGenericType(rowType, typeof(Z64));
         var weightOfMethod = zsetType.GetMethod(nameof(ZSet<int, Z64>.WeightOf), [rowType])!;
 

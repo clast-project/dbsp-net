@@ -391,6 +391,167 @@ public class TypedPlanCompilerTests
         Assert.Equal(1L, typed.WeightOf(10).Value);
     }
 
+    // ----- Inner Join -----
+
+    [Fact]
+    public void Join_SingleKey_TwoTables()
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE orders (id INT NOT NULL, cust_id INT NOT NULL)",
+                "CREATE TABLE customers (cust_id INT NOT NULL, name VARCHAR NOT NULL)",
+            ],
+            "SELECT id, name FROM orders INNER JOIN customers ON orders.cust_id = customers.cust_id");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Equal(2, typed!.OutputSchema.Count);
+
+        typed.Table("orders").Insert(1, 100);
+        typed.Table("orders").Insert(2, 200);
+        typed.Table("customers").Insert(100, "alice");
+        typed.Table("customers").Insert(200, "bob");
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, "alice").Value);
+        Assert.Equal(1L, typed.WeightOf(2, "bob").Value);
+        Assert.Equal(0L, typed.WeightOf(1, "bob").Value);
+    }
+
+    [Fact]
+    public void Join_NoMatch_EmptyOutput()
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT l.k, v, w FROM l INNER JOIN r ON l.k = r.k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("l").Insert(1, 10);
+        typed.Table("r").Insert(2, 20);
+        typed.Step();
+
+        Assert.Empty(typed.Current);
+    }
+
+    [Fact]
+    public void Join_MultiColumnKey()
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (a INT NOT NULL, b INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE r (a INT NOT NULL, b INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT v, w FROM l INNER JOIN r ON l.a = r.a AND l.b = r.b");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("l").Insert(1, 1, 100);
+        typed.Table("l").Insert(1, 2, 200);
+        typed.Table("r").Insert(1, 1, 999);
+        typed.Table("r").Insert(1, 3, 888);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(100, 999).Value);
+        Assert.Equal(0L, typed.WeightOf(200, 999).Value);
+        Assert.Equal(0L, typed.WeightOf(100, 888).Value);
+    }
+
+    [Fact]
+    public void Join_WithFilterOnInput()
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT v, w FROM l INNER JOIN r ON l.k = r.k WHERE l.v > 5");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("l").Insert(1, 3);    // filtered out
+        typed.Table("l").Insert(1, 10);
+        typed.Table("r").Insert(1, 100);
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(3, 100).Value);
+        Assert.Equal(1L, typed.WeightOf(10, 100).Value);
+    }
+
+    [Fact]
+    public void Join_RejectsLeftOuter()
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT v, w FROM l LEFT JOIN r ON l.k = r.k");
+
+        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Null(typed);
+    }
+
+    [Fact]
+    public void Join_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT id, v, w FROM l INNER JOIN r ON l.k = r.k";
+        var ddl = new[]
+        {
+            "CREATE TABLE l (id INT NOT NULL, k INT NOT NULL, v INT NOT NULL)",
+            "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+        };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var lDeltas = new[]
+        {
+            (new object?[] { 1, 100, 10 }, 1L),
+            (new object?[] { 2, 100, 20 }, 1L),
+            (new object?[] { 3, 200, 30 }, 1L),
+            (new object?[] { 1, 100, 10 }, -1L),
+        };
+        var rDeltas = new[]
+        {
+            (new object?[] { 100, 1000 }, 1L),
+            (new object?[] { 200, 2000 }, 1L),
+            (new object?[] { 100, 1000 }, 1L),  // duplicate right
+        };
+
+        for (var step = 0; step < Math.Max(lDeltas.Length, rDeltas.Length); step++)
+        {
+            if (step < lDeltas.Length)
+            {
+                typed!.Table("l").Push(new[] { lDeltas[step] });
+                structural.Table("l").Push(new[] { lDeltas[step] });
+            }
+
+            if (step < rDeltas.Length)
+            {
+                typed!.Table("r").Push(new[] { rDeltas[step] });
+                structural.Table("r").Push(new[] { rDeltas[step] });
+            }
+
+            typed!.Step();
+            structural.Step();
+
+            for (var id = 0; id <= 3; id++)
+            {
+                foreach (var v in new[] { 10, 20, 30 })
+                {
+                    foreach (var w in new[] { 1000, 2000 })
+                    {
+                        Assert.Equal(
+                            structural.WeightOf(id, v, w).Value,
+                            typed.WeightOf(id, v, w).Value);
+                    }
+                }
+            }
+        }
+    }
+
     [Fact]
     public void Filter_DifferentialAgainstStructural()
     {
