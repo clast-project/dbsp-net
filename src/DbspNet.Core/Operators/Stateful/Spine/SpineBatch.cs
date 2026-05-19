@@ -119,7 +119,7 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
             return TWeight.Zero;
         }
 
-        var idx = Array.BinarySearch(_keys, key, _comparer);
+        var idx = SortedKeySearch.IndexOf(_keys, key, _comparer);
         return idx >= 0 ? _weights[idx] : TWeight.Zero;
     }
 
@@ -400,7 +400,7 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
             return ZSet<TValue, TWeight>.Empty;
         }
 
-        var idx = Array.BinarySearch(_keys, key, _keyComparer);
+        var idx = SortedKeySearch.IndexOf(_keys, key, _keyComparer);
         if (idx < 0)
         {
             return ZSet<TValue, TWeight>.Empty;
