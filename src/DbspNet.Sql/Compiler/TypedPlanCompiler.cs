@@ -93,7 +93,8 @@ public static class TypedPlanCompiler
         CircuitBuilder builder,
         LogicalPlan plan,
         IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans,
-        IRowCodec<StructuralRow> outputCodec)
+        IRowCodec<StructuralRow> outputCodec,
+        ISqlSnapshotCodecs? snapshotCodecs = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(plan);
@@ -102,7 +103,7 @@ public static class TypedPlanCompiler
 
         try
         {
-            var ctx = new CompileContext(builder, structuralScans);
+            var ctx = new CompileContext(builder, structuralScans, snapshotCodecs);
             var topNode = TryCompileNode(plan, ctx)
                 ?? throw new UnsupportedPlanException();
 
@@ -139,20 +140,33 @@ public static class TypedPlanCompiler
         /// </summary>
         public Dictionary<string, TypedNode> LiftedScanCache { get; } = new(StringComparer.Ordinal);
 
+        /// <summary>
+        /// Snapshot codec factory threaded through from the SQL
+        /// compiler entry point. Stateful operators (Join, Aggregate)
+        /// build typed-adapted codecs from it via the
+        /// <see cref="TypedZSetTraceCodecAdapter{TKey}"/> and
+        /// <see cref="TypedIndexedZSetTraceCodecAdapter{TKey,TValue}"/>
+        /// adapters. <c>null</c> when snapshotting is disabled.
+        /// </summary>
+        public ISqlSnapshotCodecs? SnapshotCodecs { get; }
+
         public CompileContext(CircuitBuilder builder, Dictionary<string, TypedTableInput> inputs)
         {
             Builder = builder;
             Inputs = inputs;
             StructuralScans = null;
+            SnapshotCodecs = null;
         }
 
         public CompileContext(
             CircuitBuilder builder,
-            IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans)
+            IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans,
+            ISqlSnapshotCodecs? snapshotCodecs)
         {
             Builder = builder;
             Inputs = null;
             StructuralScans = structuralScans;
+            SnapshotCodecs = snapshotCodecs;
         }
     }
 
@@ -336,9 +350,15 @@ public static class TypedPlanCompiler
         var rightIndexed = InvokeGroupProject(
             ctx.Builder, right.RowType, keyRowType, right.Stream, rightKeyExtractor);
 
+        var leftSnapshotCodec = BuildAdaptedIndexedCodec(
+            ctx.SnapshotCodecs, keySchema, left.Schema, keyRowType, left.RowType);
+        var rightSnapshotCodec = BuildAdaptedIndexedCodec(
+            ctx.SnapshotCodecs, keySchema, right.Schema, keyRowType, right.RowType);
+
         var joined = InvokeIncrementalInnerJoin(
             ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
-            leftIndexed, rightIndexed, combineDelegate);
+            leftIndexed, rightIndexed, combineDelegate,
+            leftSnapshotCodec, rightSnapshotCodec);
 
         var node = new TypedNode(outputRowType, outputSchema, joined);
 
@@ -435,8 +455,11 @@ public static class TypedPlanCompiler
 
         // IncrementalAggregate<TKey, TIn, TAgg>(indexed, composite)
         // Output: Stream<ZSet<(TKey, TAgg), Z64>>
+        var aggSnapshotCodec = BuildAdaptedIndexedCodec(
+            ctx.SnapshotCodecs, keySchema, inner.Schema, keyRowType, inner.RowType);
         var aggregated = InvokeIncrementalAggregate(
-            ctx.Builder, keyRowType, inner.RowType, aggRowType, indexed, composite);
+            ctx.Builder, keyRowType, inner.RowType, aggRowType, indexed, composite,
+            aggSnapshotCodec);
 
         // Flatten (TKey, TAgg) -> TFinal: TFinal columns are
         // [group-key columns..., agg columns...]. We rely on the
@@ -806,6 +829,39 @@ public static class TypedPlanCompiler
             keyParam, leftParam, rightParam).Compile();
     }
 
+    // ---- Snapshot codec adapters ----
+
+    /// <summary>
+    /// Builds an <c>IIndexedZSetTraceCodec&lt;TKey, TValue, Z64&gt;</c>
+    /// for the typed pipeline, wrapping the structural
+    /// <see cref="ISqlSnapshotCodecs.CreateIndexedZSetTraceCodec"/>
+    /// in a <see cref="TypedIndexedZSetTraceCodecAdapter{TKey,TValue}"/>.
+    /// Returns <c>null</c> if <paramref name="snapshotCodecs"/> is
+    /// <c>null</c> (snapshotting disabled). Built reflectively because
+    /// the adapter's generics close over the emitted struct types.
+    /// </summary>
+    private static object? BuildAdaptedIndexedCodec(
+        ISqlSnapshotCodecs? snapshotCodecs,
+        Schema keySchema, Schema valueSchema,
+        Type keyRowType, Type valueRowType)
+    {
+        if (snapshotCodecs is null) return null;
+
+        var structuralCodec = snapshotCodecs.CreateIndexedZSetTraceCodec(keySchema, valueSchema);
+
+        var keyToStruct = BuildTypedToStructuralDelegate(
+            keyRowType, keySchema, StructuralRowCodec.Instance);
+        var valToStruct = BuildTypedToStructuralDelegate(
+            valueRowType, valueSchema, StructuralRowCodec.Instance);
+        var structToKey = BuildStructuralToTypedDelegate(keySchema, keyRowType);
+        var structToVal = BuildStructuralToTypedDelegate(valueSchema, valueRowType);
+
+        var adapterOpen = typeof(TypedIndexedZSetTraceCodecAdapter<,>);
+        var adapterClosed = adapterOpen.MakeGenericType(keyRowType, valueRowType);
+        return Activator.CreateInstance(adapterClosed,
+            structuralCodec, keyToStruct, valToStruct, structToKey, structToVal)!;
+    }
+
     // ---- Boundary adapters (structural ↔ typed) ----
 
     /// <summary>
@@ -974,7 +1030,8 @@ public static class TypedPlanCompiler
     /// </summary>
     private static object InvokeIncrementalInnerJoin(
         CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
-        Type outputRowType, object leftIndexed, object rightIndexed, Delegate combine)
+        Type outputRowType, object leftIndexed, object rightIndexed, Delegate combine,
+        object? leftSnapshotCodec = null, object? rightSnapshotCodec = null)
     {
         var openMethod = typeof(StatefulOperators)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
@@ -982,10 +1039,10 @@ public static class TypedPlanCompiler
                 && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(
             keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
-        // Two trailing optional snapshot-codec args default to null; pass null.
         return closed.Invoke(null, new object?[]
         {
-            builder, leftIndexed, rightIndexed, combine, null, null,
+            builder, leftIndexed, rightIndexed, combine,
+            leftSnapshotCodec, rightSnapshotCodec,
         })!;
     }
 
@@ -995,7 +1052,7 @@ public static class TypedPlanCompiler
     /// </summary>
     private static object InvokeIncrementalAggregate(
         CircuitBuilder builder, Type keyRowType, Type valueRowType, Type aggRowType,
-        object indexed, object aggregator)
+        object indexed, object aggregator, object? snapshotCodec = null)
     {
         var openMethod = typeof(StatefulOperators)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
@@ -1004,7 +1061,7 @@ public static class TypedPlanCompiler
         var closed = openMethod.MakeGenericMethod(keyRowType, valueRowType, aggRowType);
         return closed.Invoke(null, new object?[]
         {
-            builder, indexed, aggregator, null,  // trailing snapshot codec defaults to null
+            builder, indexed, aggregator, snapshotCodec,
         })!;
     }
 

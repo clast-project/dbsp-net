@@ -74,20 +74,19 @@ public static class PlanToCircuit
             // plan and every subexpression are within scope, the
             // internal operator stages run typed; only the input /
             // output boundaries pay a structural↔typed conversion.
-            // Outside the typed pipeline's scope, fall back to the
-            // structural compile below.
+            // Snapshot codecs flow through: typed stateful operators
+            // wrap the SQL codec in a typed adapter that round-trips
+            // typed↔structural at save/load time, so the on-disk
+            // format stays compatible with the structural pipeline.
             //
-            // The typed path doesn't yet wire per-stateful-operator
-            // snapshot codecs, so it's disabled when snapshotting is
-            // requested — that route stays on the structural pipeline
-            // for now. Same for non-default row codecs: the
-            // structural compile is the only path that honours an
-            // alternative codec on every stage's output row.
+            // Disabled when a non-default IRowCodec<StructuralRow> is
+            // supplied — the structural compile is the only path that
+            // honours an alternative codec on every stage's output row.
             Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
-            if (snapshotCodecs is null && ReferenceEquals(codec, StructuralRowCodec.Instance))
+            if (ReferenceEquals(codec, StructuralRowCodec.Instance))
             {
                 queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
-                    builder, plan, streams, codec);
+                    builder, plan, streams, codec, snapshotCodecs);
             }
 
             if (queryStream is null)
