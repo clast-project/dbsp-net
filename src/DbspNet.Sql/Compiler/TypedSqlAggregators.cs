@@ -295,6 +295,127 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 }
 
 /// <summary>
+/// Typed <c>MIN</c> / <c>MAX</c> over a per-group multiset. State
+/// mirrors the structural variant — <see cref="Counts"/> tracks how
+/// many distinct rows currently have positive net weight for each
+/// value, and <see cref="Active"/> is the sorted set of values with
+/// positive count, so MIN/MAX is O(log n) on the distinct-value
+/// count. The transition detection (was-positive vs is-positive)
+/// per delta row is identical to <c>SqlMinMaxAggregator.Update</c>;
+/// only the boxing through <c>object</c> is gone.
+/// </summary>
+internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+    where T : IComparable<T>
+{
+    private readonly Func<TIn, T> _argExtract;
+    private readonly bool _wantMin;
+
+    public TypedSqlMinMaxAggregator(Func<TIn, T> argExtract, bool wantMin)
+    {
+        _argExtract = argExtract;
+        _wantMin = wantMin;
+    }
+
+    private sealed class State
+    {
+        public Dictionary<T, long> Counts = new();
+        public SortedSet<T> Active = new(); // Comparer<T>.Default
+    }
+
+    public override Type ResultClrType => typeof(T);
+
+    public override object Compute(ZSet<TIn, Z64> rows)
+    {
+        T best = default!;
+        var hasBest = false;
+        foreach (var (row, w) in rows)
+        {
+            if (!Z64.IsPositive(w))
+            {
+                continue;
+            }
+
+            var v = _argExtract(row);
+            if (!hasBest)
+            {
+                best = v;
+                hasBest = true;
+                continue;
+            }
+
+            var cmp = v.CompareTo(best);
+            if (_wantMin ? cmp < 0 : cmp > 0)
+            {
+                best = v;
+            }
+        }
+
+        // The operator guarantees a non-empty multiset by the time
+        // Compute is called, but defensively guard against an
+        // all-non-positive-weight multiset (an ill-formed input —
+        // structural returns null here; we throw because the typed
+        // pipeline can't carry NULL).
+        if (!hasBest)
+        {
+            throw new InvalidOperationException(
+                "typed MIN/MAX on multiset with no positive-weight rows");
+        }
+
+        return best!;
+    }
+
+    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as State ?? new State();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            var wasPositive = beforeW > 0;
+            var isPositive = afterW > 0;
+            if (wasPositive == isPositive)
+            {
+                continue;
+            }
+
+            if (isPositive)
+            {
+                var c = s.Counts.GetValueOrDefault(v, 0L) + 1;
+                s.Counts[v] = c;
+                if (c == 1)
+                {
+                    s.Active.Add(v);
+                }
+            }
+            else
+            {
+                var c = s.Counts[v] - 1;
+                if (c == 0)
+                {
+                    s.Counts.Remove(v);
+                    s.Active.Remove(v);
+                }
+                else
+                {
+                    s.Counts[v] = c;
+                }
+            }
+        }
+
+        state = s;
+        if (s.Active.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "typed MIN/MAX on multiset with no positive-weight rows");
+        }
+
+        return (_wantMin ? s.Active.Min : s.Active.Max)!;
+    }
+}
+
+/// <summary>
 /// Typed composite that runs all of a query's aggregates over the
 /// per-group multiset and packs their results into the emitted
 /// aggregate-output row <typeparamref name="TAgg"/>.

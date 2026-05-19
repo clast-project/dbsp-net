@@ -436,12 +436,113 @@ public class TypedExpressionCompilerTests
     }
 
     [Fact]
-    public void Rejects_CastToVarchar()
+    public void Cast_BoolToVarchar()
     {
-        var (rowType, _) = RowFor(("a", new SqlIntegerType(false)));
+        var (rowType, factory) = RowFor(("b", new SqlBooleanType(false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (b BOOLEAN NOT NULL)"], "CAST(b AS VARCHAR)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        // bool.ToString returns "True" / "False" (capitalised).
+        Assert.Equal(Utf8String.Of("True"), Invoke(del!, factory(new object?[] { true })));
+        Assert.Equal(Utf8String.Of("False"), Invoke(del!, factory(new object?[] { false })));
+    }
+
+    [Fact]
+    public void Cast_VarcharToInt()
+    {
+        var (rowType, factory) = RowFor(("s", new SqlVarcharType(null, false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"], "CAST(s AS INT)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Equal(123, Invoke(del!, factory(new object?[] { Utf8String.Of("123") })));
+    }
+
+    [Fact]
+    public void Cast_VarcharToDouble()
+    {
+        var (rowType, factory) = RowFor(("s", new SqlVarcharType(null, false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"], "CAST(s AS DOUBLE PRECISION)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Equal(3.5, Invoke(del!, factory(new object?[] { Utf8String.Of("3.5") })));
+    }
+
+    [Fact]
+    public void Cast_VarcharToDate()
+    {
+        var (rowType, factory) = RowFor(("s", new SqlVarcharType(null, false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"], "CAST(s AS DATE)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var result = (Date32)Invoke(del!, factory(new object?[] { Utf8String.Of("2026-05-19") }));
+        Assert.Equal(Date32.Parse("2026-05-19"), result);
+    }
+
+    [Fact]
+    public void Cast_DateToVarchar()
+    {
+        var schema = new Schema(new[] { new SchemaColumn("d", new SqlDateType(false)) });
+        var rowType = TypedRowEmitter.EmitRowType(schema)!;
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (d DATE NOT NULL)"], "CAST(d AS VARCHAR)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var input = factory(new object?[] { Date32.Parse("2026-05-19") });
+        // Date32.ToString uses ISO 8601 — round-trips with Date32.Parse.
+        var result = (Utf8String)Invoke(del!, input);
+        Assert.Equal(Date32.Parse(result.ToStringDecoded()), Date32.Parse("2026-05-19"));
+    }
+
+    [Fact]
+    public void Cast_DecimalToVarchar()
+    {
+        var (rowType, factory) = RowFor(("p", new SqlDecimalType(10, 2, false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (p DECIMAL(10, 2) NOT NULL)"], "CAST(p AS VARCHAR)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var result = (Utf8String)Invoke(del!, factory(new object?[]
+        {
+            new Clast.DatabaseDecimal.Values.Decimal128(12345),  // 123.45
+        }));
+        Assert.Equal(Utf8String.Of("123.45"), result);
+    }
+
+    [Fact]
+    public void Cast_VarcharToDecimal()
+    {
+        var (rowType, factory) = RowFor(("s", new SqlVarcharType(null, false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"], "CAST(s AS DECIMAL(10, 2))");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var result = (Clast.DatabaseDecimal.Values.Decimal128)Invoke(del!,
+            factory(new object?[] { Utf8String.Of("99.99") }));
+        Assert.Equal((Int128)9999, result.Mantissa);
+    }
+
+    [Fact]
+    public void Cast_NumericToVarchar()
+    {
+        // Phase 1.10: string/temporal casts are in scope.
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(false)));
         var expr = ResolveSelectExpression(
             ["CREATE TABLE t (a INT NOT NULL)"], "CAST(a AS VARCHAR)");
 
-        Assert.Null(TypedExpressionCompiler.TryCompile(expr, rowType));
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Equal(Utf8String.Of("42"), Invoke(del!, factory(new object?[] { 42 })));
     }
 }

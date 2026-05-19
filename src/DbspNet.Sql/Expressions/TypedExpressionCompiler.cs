@@ -369,8 +369,100 @@ public static class TypedExpressionCompiler
             return Expression.Convert(operand, dstClr);
         }
 
+        // String / temporal cast matrix. Mirrors the structural
+        // compiler's BuildCast minus the NULL-propagation conditional.
+        if (srcClr == typeof(bool) && dstClr == typeof(Utf8String))
+        {
+            return BuildBoolToUtf8(operand);
+        }
+
+        if (IsNumericNonDecimal(srcClr) && dstClr == typeof(Utf8String))
+        {
+            return BuildNumericToUtf8(operand, srcClr);
+        }
+
+        if (srcClr == typeof(Utf8String) && IsNumericNonDecimal(dstClr))
+        {
+            return BuildUtf8ToNumeric(operand, dstClr);
+        }
+
+        if (srcClr == typeof(Utf8String) && IsTemporal(dstClr))
+        {
+            return BuildUtf8ToTemporal(operand, dstClr);
+        }
+
+        if (IsTemporal(srcClr) && dstClr == typeof(Utf8String))
+        {
+            return BuildTemporalToUtf8(operand, srcClr);
+        }
+
         throw Unsupported();
     }
+
+    private static Expression BuildBoolToUtf8(Expression operand)
+    {
+        var toStr = Expression.Call(operand,
+            typeof(bool).GetMethod(nameof(object.ToString), Type.EmptyTypes)!);
+        return Expression.Call(
+            typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
+            toStr);
+    }
+
+    private static Expression BuildNumericToUtf8(Expression operand, Type srcClr)
+    {
+        // SqlCasts.NumericToString picks the int/long/float/double
+        // overload and uses invariant culture. Reuse the structural
+        // runtime helpers — they're already culture-stable.
+        var method = typeof(SqlCasts).GetMethod(nameof(SqlCasts.NumericToString), [srcClr])
+            ?? throw Unsupported();
+        return Expression.Call(
+            typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
+            Expression.Call(method, operand));
+    }
+
+    private static Expression BuildUtf8ToNumeric(Expression operand, Type dstClr)
+    {
+        var asString = Expression.Call(operand,
+            typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
+        var method = dstClr switch
+        {
+            var t when t == typeof(int) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt32))!,
+            var t when t == typeof(long) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt64))!,
+            var t when t == typeof(float) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseSingle))!,
+            var t when t == typeof(double) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDouble))!,
+            _ => throw Unsupported(),
+        };
+        return Expression.Call(method, asString);
+    }
+
+    private static Expression BuildUtf8ToTemporal(Expression operand, Type dstClr)
+    {
+        var asString = Expression.Call(operand,
+            typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
+        var method = dstClr switch
+        {
+            var t when t == typeof(Date32) =>
+                typeof(Date32).GetMethod(nameof(Date32.Parse), [typeof(string)])!,
+            var t when t == typeof(Time64) =>
+                typeof(Time64).GetMethod(nameof(Time64.Parse), [typeof(string)])!,
+            var t when t == typeof(Timestamp) =>
+                typeof(Timestamp).GetMethod(nameof(Timestamp.Parse), [typeof(string)])!,
+            _ => throw Unsupported(),
+        };
+        return Expression.Call(method, asString);
+    }
+
+    private static Expression BuildTemporalToUtf8(Expression operand, Type srcClr)
+    {
+        var toStr = Expression.Call(operand,
+            srcClr.GetMethod(nameof(object.ToString), Type.EmptyTypes)!);
+        return Expression.Call(
+            typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
+            toStr);
+    }
+
+    private static bool IsTemporal(Type t) =>
+        t == typeof(Date32) || t == typeof(Time64) || t == typeof(Timestamp);
 
     /// <summary>
     /// CAST any supported numeric source to <see cref="SqlDecimalType"/>.
@@ -409,20 +501,52 @@ public static class TypedExpressionCompiler
                 Expression.Constant((byte)target.Scale));
         }
 
-        // Decimal CAST from VARCHAR / temporal etc. lives in the
-        // structural cast matrix and isn't covered by Phase 1.8.
+        if (srcType is SqlVarcharType)
+        {
+            // CAST(string AS DECIMAL(p, s)) — parse with target's
+            // precision and scale via DecimalText.ParseDecimal128.
+            // Banker's rounding kicks in for over-scaled inputs.
+            var targetType = DecimalType.Numeric(target.Precision, target.Scale);
+            var asString = Expression.Call(operand,
+                typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
+            var asSpan = Expression.Call(
+                typeof(MemoryExtensions).GetMethod(nameof(MemoryExtensions.AsSpan), [typeof(string)])!,
+                asString);
+            return Expression.Call(
+                typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
+                    nameof(Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128),
+                    [typeof(ReadOnlySpan<char>), typeof(DecimalType)])!,
+                asSpan,
+                Expression.Constant(targetType));
+        }
+
         throw Unsupported();
     }
 
     /// <summary>
     /// CAST a <see cref="SqlDecimalType"/> source to a non-decimal
-    /// numeric target. Rescales the mantissa to scale 0, then
-    /// converts to the target CLR type.
+    /// target. Decimal → numeric rescales the mantissa to scale 0
+    /// and converts to the target CLR type; decimal → VARCHAR
+    /// formats via <see cref="Clast.DatabaseDecimal.Text.DecimalText.Format"/>.
     /// </summary>
     private static Expression BuildCastFromDecimal(
         Expression operand, SqlDecimalType src, SqlType dstType)
     {
         var dstClr = dstType.ClrType;
+        if (dstType is SqlVarcharType)
+        {
+            var sourceType = DecimalType.Numeric(src.Precision, src.Scale);
+            var format = Expression.Call(
+                typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
+                    nameof(Clast.DatabaseDecimal.Text.DecimalText.Format),
+                    [typeof(Decimal128), typeof(DecimalType)])!,
+                operand,
+                Expression.Constant(sourceType));
+            return Expression.Call(
+                typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
+                format);
+        }
+
         if (!IsNumericNonDecimal(dstClr)) throw Unsupported();
 
         var mantissa = Expression.Field(operand, nameof(Decimal128.Mantissa));

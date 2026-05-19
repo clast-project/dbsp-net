@@ -124,6 +124,31 @@ public class TypedRowEmitterTests
     }
 
     [Fact]
+    public void TemporalColumnsSupported()
+    {
+        // Date32 / Time64 / Timestamp are record structs, so they
+        // auto-generate op_Equality — the value-type fallback in
+        // EmitFieldEqualityCheck handles them with no IL changes.
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("d", new SqlDateType(false)),
+            new SchemaColumn("t", new SqlTimeType(false)),
+            new SchemaColumn("ts", new SqlTimestampType(false)),
+        });
+        var type = TypedRowEmitter.EmitRowType(schema);
+        Assert.NotNull(type);
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+
+        var a = factory(new object?[] { new Date32(100), new Time64(2_000_000), new Timestamp(3_000_000) });
+        var b = factory(new object?[] { new Date32(100), new Time64(2_000_000), new Timestamp(3_000_000) });
+        var c = factory(new object?[] { new Date32(101), new Time64(2_000_000), new Timestamp(3_000_000) });
+
+        Assert.True(a.Equals(b));
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+        Assert.False(a.Equals(c));
+    }
+
+    [Fact]
     public void Decimal128ColumnSupported()
     {
         // Decimal128 is a value type with op_Equality, so it picks up

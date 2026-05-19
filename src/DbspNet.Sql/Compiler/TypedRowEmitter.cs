@@ -146,7 +146,8 @@ public static class TypedRowEmitter
         t == typeof(int) || t == typeof(long) || t == typeof(double)
         || t == typeof(bool) || t == typeof(string)
         || t == typeof(Utf8String)
-        || t == typeof(Clast.DatabaseDecimal.Values.Decimal128);
+        || t == typeof(Clast.DatabaseDecimal.Values.Decimal128)
+        || t == typeof(Date32) || t == typeof(Time64) || t == typeof(Timestamp);
 
     private static Type BuildTypeFor(Fingerprint fp)
     {

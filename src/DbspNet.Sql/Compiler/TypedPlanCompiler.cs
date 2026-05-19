@@ -527,7 +527,15 @@ public static class TypedPlanCompiler
                 return BuildAvgAggregator(call, inputRowType);
 
             default:
-                // MIN / MAX deferred.
+                // MIN / MAX deliberately fall back to structural. The
+                // structural variant returns SQL NULL when a group has
+                // no positive-weight rows (a valid Z-set state during
+                // retractions), and the typed-row pipeline can't carry
+                // a NULL output column. TypedSqlMinMaxAggregator stays
+                // in the codebase ready for the day we have per-column
+                // nullability, but the dispatch keeps these on the
+                // structural path so the PBT's well-formed-equivalence
+                // property holds.
                 return null;
         }
     }
