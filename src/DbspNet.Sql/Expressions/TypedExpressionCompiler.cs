@@ -104,7 +104,17 @@ public static class TypedExpressionCompiler
 
     private static Expression Build(ResolvedExpression expr, ParameterExpression row, Type rowType)
     {
-        if (expr.Type.Nullable) throw Unsupported();
+        // Note: we don't gate on `expr.Type.Nullable`. In the typed
+        // pipeline every value on every stream is non-null by
+        // construction — the typed-row gate at the schema level
+        // enforces it. Resolver type inference may mark expression
+        // results as nullable in coarser cases (e.g. SQL aggregate
+        // outputs, which we know are non-null on the typed path
+        // because empty groups are dropped before the aggregator
+        // runs). Treating the resolver's nullability as advisory and
+        // operating on the underlying definite values is correct.
+        // Explicit null literals still reject below (BuildLiteral),
+        // so user-written NULL still falls back.
         if (expr.Type is SqlDecimalType) throw Unsupported();
 
         return expr switch

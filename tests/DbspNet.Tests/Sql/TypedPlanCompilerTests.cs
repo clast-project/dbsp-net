@@ -41,13 +41,16 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void TryCompile_RejectsPlansBeyondScanFilterProject()
+    public void TryCompile_RejectsUnsupportedPlanNodes()
     {
-        // GROUP BY introduces an AggregatePlan between scan and the
-        // top-level Project — still outside the Phase 1.3 plan shapes.
+        // UNION ALL is not yet supported by the typed path; it should
+        // bail out rather than partially compile.
         var plan = CompilePlan(
-            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
-            "SELECT a, COUNT(*) FROM t GROUP BY a");
+            [
+                "CREATE TABLE t (a INT NOT NULL)",
+                "CREATE TABLE u (a INT NOT NULL)",
+            ],
+            "SELECT a FROM t UNION ALL SELECT a FROM u");
 
         var ok = TypedPlanCompiler.TryCompile(plan, out var typed);
         Assert.False(ok);
@@ -389,6 +392,190 @@ public class TypedPlanCompilerTests
 
         Assert.Equal(0L, typed.WeightOf(99).Value);
         Assert.Equal(1L, typed.WeightOf(10).Value);
+    }
+
+    // ----- Aggregate -----
+
+    [Fact]
+    public void Aggregate_CountStar_SingleGroup()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a, COUNT(*) FROM t GROUP BY a");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Table("t").Insert(2, 30);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 2L).Value);
+        Assert.Equal(1L, typed.WeightOf(2, 1L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_SumLong()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, SUM(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Table("t").Insert(2, 7);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 30L).Value);
+        Assert.Equal(1L, typed.WeightOf(2, 7L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_SumDouble()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v DOUBLE PRECISION NOT NULL)"],
+            "SELECT k, SUM(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 1.5);
+        typed.Table("t").Insert(1, 2.5);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 4.0).Value);
+    }
+
+    [Fact]
+    public void Aggregate_Avg()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, AVG(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Table("t").Insert(1, 30);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 20.0).Value);
+    }
+
+    [Fact]
+    public void Aggregate_MultiAggregate()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, COUNT(*), SUM(v), AVG(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 2L, 30L, 15.0).Value);
+    }
+
+    [Fact]
+    public void Aggregate_MultiColumnGroupBy()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT NOT NULL)"],
+            "SELECT a, b, SUM(v) FROM t GROUP BY a, b");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 1, 100);
+        typed.Table("t").Insert(1, 1, 50);
+        typed.Table("t").Insert(1, 2, 200);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 1, 150L).Value);
+        Assert.Equal(1L, typed.WeightOf(1, 2, 200L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_RejectsMin()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, MIN(v) FROM t GROUP BY k");
+
+        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Null(typed);
+    }
+
+    [Fact]
+    public void Aggregate_RejectsDecimalSum()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v DECIMAL(10, 2) NOT NULL)"],
+            "SELECT k, SUM(v) FROM t GROUP BY k");
+
+        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Null(typed);
+    }
+
+    [Fact]
+    public void Aggregate_IncrementalRetraction()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, COUNT(*), SUM(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Step();
+        Assert.Equal(1L, typed.WeightOf(1, 2L, 30L).Value);
+
+        // Retract one row; the group should now show (1, 1, 10) and
+        // the previous (1, 2, 30) row should have been retracted.
+        typed.Table("t").Delete(1, 20);
+        typed.Step();
+        Assert.Equal(-1L, typed.WeightOf(1, 2L, 30L).Value);
+        Assert.Equal(1L, typed.WeightOf(1, 1L, 10L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT k, COUNT(*), SUM(v) FROM t GROUP BY k";
+        var ddl = new[] { "CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)" };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new[]
+        {
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 1, 20 }, 1L),
+            (new object?[] { 2, 30 }, 1L),
+            (new object?[] { 1, 10 }, -1L),
+            (new object?[] { 2, 30 }, 1L),
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            for (var k = 1; k <= 2; k++)
+            {
+                for (var cnt = 0L; cnt <= 5L; cnt++)
+                {
+                    for (var sum = 0L; sum <= 100L; sum += 10L)
+                    {
+                        Assert.Equal(
+                            structural.WeightOf(k, cnt, sum).Value,
+                            typed.WeightOf(k, cnt, sum).Value);
+                    }
+                }
+            }
+        }
     }
 
     // ----- Inner Join -----

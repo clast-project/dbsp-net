@@ -92,12 +92,45 @@ public static class TypedPlanCompiler
 
     private sealed class UnsupportedPlanException : Exception;
 
+    /// <summary>
+    /// Strip nullability from every column. Used as the canonical
+    /// schema for typed pipeline streams: in this pipeline every
+    /// value is non-null by construction, but the resolver's type
+    /// inference is sometimes coarser (e.g. SQL aggregate outputs
+    /// are marked nullable per spec even though our typed
+    /// aggregator only emits a row for non-empty groups). Treating
+    /// the metadata as advisory and operating on the underlying
+    /// definite values is correct on the typed path.
+    /// </summary>
+    private static Schema StripNullable(Schema schema)
+    {
+        var any = false;
+        for (var i = 0; i < schema.Count; i++)
+        {
+            if (schema[i].Type.Nullable) { any = true; break; }
+        }
+
+        if (!any) return schema;
+
+        var stripped = new SchemaColumn[schema.Count];
+        for (var i = 0; i < schema.Count; i++)
+        {
+            var c = schema[i];
+            stripped[i] = c.Type.Nullable
+                ? new SchemaColumn(c.Name, c.Type.WithNullable(false), c.Qualifier)
+                : c;
+        }
+
+        return new Schema(stripped);
+    }
+
     private static TypedNode? TryCompileNode(LogicalPlan plan, CompileContext ctx) => plan switch
     {
         ScanPlan s => CompileScan(s, ctx),
         FilterPlan f => CompileFilter(f, ctx),
         ProjectPlan p => CompileProject(p, ctx),
         JoinPlan { JoinType: AstJoinType.Inner } j => CompileInnerJoin(j, ctx),
+        AggregatePlan a => CompileAggregate(a, ctx),
         _ => null,
     };
 
@@ -105,6 +138,8 @@ public static class TypedPlanCompiler
 
     private static TypedNode? CompileScan(ScanPlan scan, CompileContext ctx)
     {
+        // Scans use the unmodified schema — NOT NULL columns are
+        // required at the scan level by TypedRowEmitter's gate.
         var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
         if (rowType is null) return null;
 
@@ -131,21 +166,22 @@ public static class TypedPlanCompiler
         var inner = TryCompileNode(project.Input, ctx);
         if (inner is null) return null;
 
-        if (IsIdentityProjection(project.Projections, inner.Schema, project.Schema))
+        var outputSchema = StripNullable(project.Schema);
+        if (IsIdentityProjection(project.Projections, inner.Schema, outputSchema))
         {
             return inner;
         }
 
-        var outputRowType = TypedRowEmitter.EmitRowType(project.Schema);
+        var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
         if (outputRowType is null) return null;
 
         var projDelegate = BuildTypedProjectionDelegate(
-            inner.RowType, outputRowType, project.Schema, project.Projections);
+            inner.RowType, outputRowType, outputSchema, project.Projections);
         if (projDelegate is null) return null;
 
         var stream = InvokeMapRows(
             ctx.Builder, inner.RowType, outputRowType, inner.Stream, projDelegate);
-        return new TypedNode(outputRowType, project.Schema, stream);
+        return new TypedNode(outputRowType, outputSchema, stream);
     }
 
     /// <summary>
@@ -194,12 +230,13 @@ public static class TypedPlanCompiler
             right.RowType, keyRowType, keySchema, rightIndices);
         if (leftKeyExtractor is null || rightKeyExtractor is null) return null;
 
-        var outputRowType = TypedRowEmitter.EmitRowType(plan.Schema);
+        var outputSchema = StripNullable(plan.Schema);
+        var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
         if (outputRowType is null) return null;
 
         var combineDelegate = BuildJoinCombineDelegate(
             keyRowType, left.RowType, right.RowType, outputRowType,
-            plan.Schema, left.Schema.Count, right.Schema.Count);
+            outputSchema, left.Schema.Count, right.Schema.Count);
 
         var leftIndexed = InvokeGroupProject(
             ctx.Builder, left.RowType, keyRowType, left.Stream, leftKeyExtractor);
@@ -210,17 +247,323 @@ public static class TypedPlanCompiler
             ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
             leftIndexed, rightIndexed, combineDelegate);
 
-        var node = new TypedNode(outputRowType, plan.Schema, joined);
+        var node = new TypedNode(outputRowType, outputSchema, joined);
 
         if (plan.Residual is not null)
         {
             var residual = BuildTypedPredicateDelegate(plan.Residual, outputRowType);
             if (residual is null) return null;
             var filtered = InvokeFilter(ctx.Builder, outputRowType, joined, residual);
-            node = new TypedNode(outputRowType, plan.Schema, filtered);
+            node = new TypedNode(outputRowType, outputSchema, filtered);
         }
 
         return node;
+    }
+
+    /// <summary>
+    /// Compiles an <see cref="AggregatePlan"/>. The output stream
+    /// carries a row schema of <c>[group-key cols..., agg-result cols...]</c>
+    /// (matching <see cref="AggregatePlan.Schema"/>); the typed path
+    /// supports COUNT(*) / COUNT(col) / SUM / AVG on int/long/float/double.
+    /// MIN/MAX and decimal-result aggregates fall back to structural.
+    /// </summary>
+    private static TypedNode? CompileAggregate(AggregatePlan plan, CompileContext ctx)
+    {
+        // Group-by keys must be ResolvedColumn (matches resolver
+        // restriction in v1) so we can index by typed field reads.
+        var groupIndices = new int[plan.GroupKeys.Count];
+        for (var i = 0; i < plan.GroupKeys.Count; i++)
+        {
+            if (plan.GroupKeys[i] is not ResolvedColumn rc) return null;
+            groupIndices[i] = rc.Index;
+        }
+
+        var inner = TryCompileNode(plan.Input, ctx);
+        if (inner is null) return null;
+
+        // TKey from the group-key columns. Same schema-fingerprint
+        // sharing as anywhere else.
+        var keySchema = inner.Schema.SubsetByIndex(groupIndices);
+        var keyRowType = TypedRowEmitter.EmitRowType(keySchema);
+        if (keyRowType is null) return null;
+
+        var keyExtractor = BuildKeyExtractorDelegate(inner.RowType, keyRowType, keySchema, groupIndices);
+        if (keyExtractor is null) return null;
+
+        // Per-aggregate-call schema for TAgg, parallel to plan.Aggregates.
+        // We use plan.Aggregates (not plan.Schema) because the resolver
+        // may collect more AggregateCalls than it surfaces in Schema
+        // when an aggregate is referenced from both SELECT and HAVING.
+        var aggColumns = new SchemaColumn[plan.Aggregates.Count];
+        for (var i = 0; i < plan.Aggregates.Count; i++)
+        {
+            // Typed pipeline can't carry nullable agg result columns;
+            // we know every group reaching here is non-empty (the
+            // operator drops empty groups) so SUM/COUNT/AVG are
+            // definitionally non-null. Strip the Nullable marker.
+            aggColumns[i] = new SchemaColumn(
+                "$agg" + i,
+                plan.Aggregates[i].ResultType.WithNullable(false));
+        }
+
+        var aggSchema = new Schema(aggColumns);
+        var aggRowType = TypedRowEmitter.EmitRowType(aggSchema);
+        if (aggRowType is null) return null;
+
+        // Build the per-aggregator typed objects.
+        var aggregators = new object[plan.Aggregates.Count];
+        for (var i = 0; i < plan.Aggregates.Count; i++)
+        {
+            var built = BuildTypedAggregator(plan.Aggregates[i], inner.RowType);
+            if (built is null) return null;
+            aggregators[i] = built;
+        }
+
+        var aggArray = CastAggregatorArray(inner.RowType, aggregators);
+
+        var packResults = TypedRowEmitter.BuildBoxedFactory(aggSchema)!;
+        // packResults returns object; wrap into a typed Func<object?[], TAgg>
+        // via Expression compilation.
+        var packParam = Expression.Parameter(typeof(object?[]), "vs");
+        var packCall = Expression.Convert(
+            Expression.Invoke(Expression.Constant(packResults), packParam),
+            aggRowType);
+        var packDelegateType = typeof(Func<,>).MakeGenericType(typeof(object?[]), aggRowType);
+        var typedPack = Expression.Lambda(packDelegateType, packCall, packParam).Compile();
+
+        // new TypedCompositeAggregator<TIn, TAgg>(aggArray, typedPack)
+        var compositeOpen = typeof(TypedCompositeAggregator<,>);
+        var compositeClosed = compositeOpen.MakeGenericType(inner.RowType, aggRowType);
+        var composite = Activator.CreateInstance(compositeClosed, aggArray, typedPack)!;
+
+        // GroupProject<TKey, TIn, TIn, Z64>(inner, keyExtractor, identity)
+        var indexed = InvokeGroupProject(
+            ctx.Builder, inner.RowType, keyRowType, inner.Stream, keyExtractor);
+
+        // IncrementalAggregate<TKey, TIn, TAgg>(indexed, composite)
+        // Output: Stream<ZSet<(TKey, TAgg), Z64>>
+        var aggregated = InvokeIncrementalAggregate(
+            ctx.Builder, keyRowType, inner.RowType, aggRowType, indexed, composite);
+
+        // Flatten (TKey, TAgg) -> TFinal: TFinal columns are
+        // [group-key columns..., agg columns...]. We rely on the
+        // resolver's plan.Schema for the final shape; any extra
+        // aggregator columns past plan.Schema's count are dropped by
+        // the caller's wrapping Project (the structural path does the
+        // same — see PlanToCircuit notes). Schema nullability is
+        // stripped because the typed pipeline carries only definite
+        // values.
+        var finalSchema = StripNullable(plan.Schema);
+        var finalRowType = TypedRowEmitter.EmitRowType(finalSchema);
+        if (finalRowType is null) return null;
+
+        var flattenDelegate = BuildAggregateFlattenDelegate(
+            keyRowType, aggRowType, finalRowType, finalSchema,
+            keySchema.Count, plan.Aggregates.Count);
+
+        var pairType = typeof(ValueTuple<,>).MakeGenericType(keyRowType, aggRowType);
+        var flatStream = InvokeMapRows(ctx.Builder, pairType, finalRowType, aggregated, flattenDelegate);
+
+        return new TypedNode(finalRowType, finalSchema, flatStream);
+    }
+
+    /// <summary>
+    /// Builds a typed <c>TypedSqlAggregator&lt;TIn&gt;</c> for one
+    /// <see cref="AggregateCall"/>. Returns <c>null</c> if the call
+    /// falls outside Phase 1.5's scope (MIN/MAX, decimal-typed result,
+    /// or an argument expression the typed expression compiler can't
+    /// lower).
+    /// </summary>
+    private static object? BuildTypedAggregator(AggregateCall call, Type inputRowType)
+    {
+        if (call.ResultType is SqlDecimalType) return null;
+
+        switch (call.Kind)
+        {
+            case AggregateKind.CountStar:
+                {
+                    var open = typeof(TypedCountStarAggregator<>);
+                    var closed = open.MakeGenericType(inputRowType);
+                    return Activator.CreateInstance(closed);
+                }
+
+            case AggregateKind.Count:
+                {
+                    // With non-null inputs (typed-row gate) COUNT(col)
+                    // reduces to COUNT(*). We still walk the argument
+                    // through the typed expression compiler to keep
+                    // the gate consistent — an unsupported argument
+                    // (e.g. a function call) is still a rejection.
+                    if (call.Argument is null) return null;
+                    var inParam = Expression.Parameter(inputRowType, "in");
+                    if (TypedExpressionCompiler.TryBuildInto(call.Argument, inParam) is null)
+                        return null;
+                    var open = typeof(TypedCountStarAggregator<>);
+                    var closed = open.MakeGenericType(inputRowType);
+                    return Activator.CreateInstance(closed);
+                }
+
+            case AggregateKind.Sum:
+                return BuildSumAggregator(call, inputRowType);
+
+            case AggregateKind.Avg:
+                return BuildAvgAggregator(call, inputRowType);
+
+            default:
+                // MIN / MAX deferred.
+                return null;
+        }
+    }
+
+    private static object? BuildSumAggregator(AggregateCall call, Type inputRowType)
+    {
+        if (call.Argument is null) return null;
+        var argExtract = BuildTypedScalarDelegate(call.Argument, inputRowType, out var resultClr);
+        if (argExtract is null) return null;
+
+        // Map the SQL result type to the running accumulator type.
+        if (call.ResultType is SqlBigintType)
+        {
+            // Widen int → long if necessary.
+            var widened = resultClr == typeof(long)
+                ? argExtract
+                : RecompileWidened(call.Argument, inputRowType, typeof(long));
+            var open = typeof(TypedSumLongAggregator<>);
+            var closed = open.MakeGenericType(inputRowType);
+            return Activator.CreateInstance(closed, widened);
+        }
+
+        if (call.ResultType is SqlDoubleType)
+        {
+            var widened = resultClr == typeof(double)
+                ? argExtract
+                : RecompileWidened(call.Argument, inputRowType, typeof(double));
+            var open = typeof(TypedSumDoubleAggregator<>);
+            var closed = open.MakeGenericType(inputRowType);
+            return Activator.CreateInstance(closed, widened);
+        }
+
+        return null;
+    }
+
+    private static object? BuildAvgAggregator(AggregateCall call, Type inputRowType)
+    {
+        if (call.Argument is null) return null;
+        // AVG always produces a double-running-total aggregator
+        // (decimal AVG is gated above). Recompile the arg expression
+        // widened to double.
+        var widened = RecompileWidened(call.Argument, inputRowType, typeof(double));
+        if (widened is null) return null;
+        var open = typeof(TypedAvgDoubleAggregator<>);
+        var closed = open.MakeGenericType(inputRowType);
+        return Activator.CreateInstance(closed, widened);
+    }
+
+    /// <summary>
+    /// Lowers <paramref name="expr"/> against an input row parameter
+    /// and returns the compiled <c>Func&lt;TIn, T&gt;</c>; also
+    /// reports the expression's CLR result type. Returns <c>null</c>
+    /// if the expression is outside scope.
+    /// </summary>
+    private static Delegate? BuildTypedScalarDelegate(
+        ResolvedExpression expr, Type inputRowType, out Type resultClr)
+    {
+        resultClr = null!;
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var built = TypedExpressionCompiler.TryBuildInto(expr, inParam);
+        if (built is null) return null;
+        resultClr = built.Type;
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, built.Type);
+        return Expression.Lambda(delegateType, built, inParam).Compile();
+    }
+
+    /// <summary>
+    /// Like <see cref="BuildTypedScalarDelegate"/> but widens the
+    /// compiled body to <paramref name="targetClr"/> via
+    /// <see cref="Expression.Convert(Expression, Type)"/>. Used for
+    /// SUM(INT)→long and AVG(*)→double accumulator widening.
+    /// </summary>
+    private static Delegate? RecompileWidened(
+        ResolvedExpression expr, Type inputRowType, Type targetClr)
+    {
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var built = TypedExpressionCompiler.TryBuildInto(expr, inParam);
+        if (built is null) return null;
+        var widened = built.Type == targetClr ? built : Expression.Convert(built, targetClr);
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, targetClr);
+        return Expression.Lambda(delegateType, widened, inParam).Compile();
+    }
+
+    /// <summary>
+    /// Repackage <c>object[]</c> of <c>TypedSqlAggregator&lt;TIn&gt;</c>
+    /// instances as a strongly-typed <c>TypedSqlAggregator&lt;TIn&gt;[]</c>
+    /// so the ctor's array reference is variance-safe.
+    /// </summary>
+    private static Array CastAggregatorArray(Type inputRowType, object[] aggregators)
+    {
+        var elementType = typeof(TypedSqlAggregator<>).MakeGenericType(inputRowType);
+        var arr = Array.CreateInstance(elementType, aggregators.Length);
+        for (var i = 0; i < aggregators.Length; i++)
+        {
+            arr.SetValue(aggregators[i], i);
+        }
+
+        return arr;
+    }
+
+    /// <summary>
+    /// Builds <c>(ValueTuple&lt;TKey, TAgg&gt; p) =&gt;
+    /// new TFinal(p.Item1.F0, ..., p.Item1.F{k-1}, p.Item2.F0, ..., p.Item2.F{a-1})</c>.
+    /// </summary>
+    private static Delegate BuildAggregateFlattenDelegate(
+        Type keyRowType, Type aggRowType, Type finalRowType, Schema finalSchema,
+        int keyCount, int aggCount)
+    {
+        var ctorParamTypes = new Type[finalSchema.Count];
+        for (var i = 0; i < finalSchema.Count; i++)
+        {
+            ctorParamTypes[i] = finalSchema[i].Type.ClrType;
+        }
+
+        var ctor = finalRowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException(
+                "emitted final aggregate row missing typed-fields ctor");
+
+        var pairType = typeof(ValueTuple<,>).MakeGenericType(keyRowType, aggRowType);
+        var pairParam = Expression.Parameter(pairType, "p");
+        var keyExpr = Expression.Field(pairParam, "Item1");
+        var aggExpr = Expression.Field(pairParam, "Item2");
+
+        var args = new Expression[finalSchema.Count];
+        var emittedSlots = Math.Min(finalSchema.Count, keyCount + aggCount);
+        for (var i = 0; i < emittedSlots; i++)
+        {
+            Expression source;
+            if (i < keyCount)
+            {
+                var field = keyRowType.GetField("F" + i)!;
+                source = Expression.Field(keyExpr, field);
+            }
+            else
+            {
+                var field = aggRowType.GetField("F" + (i - keyCount))!;
+                source = Expression.Field(aggExpr, field);
+            }
+
+            args[i] = source.Type == ctorParamTypes[i]
+                ? source
+                : Expression.Convert(source, ctorParamTypes[i]);
+        }
+
+        // Pad any extra slots (shouldn't happen with the resolver, but
+        // guard the ctor arity match).
+        for (var i = emittedSlots; i < finalSchema.Count; i++)
+        {
+            args[i] = Expression.Default(ctorParamTypes[i]);
+        }
+
+        var delegateType = typeof(Func<,>).MakeGenericType(pairType, finalRowType);
+        return Expression.Lambda(delegateType, Expression.New(ctor, args), pairParam).Compile();
     }
 
     // ---- Helpers: identity / projection / predicate ----
@@ -273,7 +616,12 @@ public static class TypedPlanCompiler
     private static Delegate? BuildTypedPredicateDelegate(
         ResolvedExpression predicate, Type inputRowType)
     {
-        if (predicate.Type is not SqlBooleanType { Nullable: false }) return null;
+        // Nullable BOOLEAN is accepted here for the same reason
+        // TypedExpressionCompiler accepts nullable subexpressions:
+        // in the typed pipeline every column is non-null, so the
+        // predicate's actual value is always a definite TRUE/FALSE
+        // regardless of the resolver's nullability annotation.
+        if (predicate.Type is not SqlBooleanType) return null;
 
         var inParam = Expression.Parameter(inputRowType, "in");
         var built = TypedExpressionCompiler.TryBuildInto(predicate, inParam);
@@ -442,6 +790,25 @@ public static class TypedPlanCompiler
         return closed.Invoke(null, new object?[]
         {
             builder, leftIndexed, rightIndexed, combine, null, null,
+        })!;
+    }
+
+    /// <summary>
+    /// <c>builder.IncrementalAggregate&lt;TKey, TValue, TOut&gt;(indexed, aggregator)</c>.
+    /// Output stream carries <c>ZSet&lt;(TKey, TOut), Z64&gt;</c>.
+    /// </summary>
+    private static object InvokeIncrementalAggregate(
+        CircuitBuilder builder, Type keyRowType, Type valueRowType, Type aggRowType,
+        object indexed, object aggregator)
+    {
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(StatefulOperators.IncrementalAggregate)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, valueRowType, aggRowType);
+        return closed.Invoke(null, new object?[]
+        {
+            builder, indexed, aggregator, null,  // trailing snapshot codec defaults to null
         })!;
     }
 
