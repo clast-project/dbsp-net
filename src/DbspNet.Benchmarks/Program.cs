@@ -8,6 +8,12 @@ using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
 
+// Profiling sub-command: `dotnet run -- profile {typed|structural|handwired} [seconds]`
+if (args.Length > 0 && args[0] == "profile")
+{
+    return DbspNet.Benchmarks.ProfileHotPath.Run(args);
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();
@@ -39,6 +45,7 @@ var outPath = args.Length > 0 ? args[0] : Path.Combine("..", "..", "docs", "benc
 File.WriteAllText(outPath, output.ToString());
 Console.WriteLine();
 Console.WriteLine($"Report written to {Path.GetFullPath(outPath)}");
+return 0;
 
 // ---------- Shared helpers ----------
 
