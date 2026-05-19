@@ -70,8 +70,32 @@ public static class PlanToCircuit
                 inputs[name] = new TableInput(handle, schema, codec);
             }
 
-            var ctx = new CompileContext(streams, tables, codec, snapshotCodecs);
-            var queryStream = CompilePlan(builder, plan, ctx);
+            // Fast path: try the typed-row pipeline first. When the
+            // plan and every subexpression are within scope, the
+            // internal operator stages run typed; only the input /
+            // output boundaries pay a structural↔typed conversion.
+            // Outside the typed pipeline's scope, fall back to the
+            // structural compile below.
+            //
+            // The typed path doesn't yet wire per-stateful-operator
+            // snapshot codecs, so it's disabled when snapshotting is
+            // requested — that route stays on the structural pipeline
+            // for now. Same for non-default row codecs: the
+            // structural compile is the only path that honours an
+            // alternative codec on every stage's output row.
+            Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
+            if (snapshotCodecs is null && ReferenceEquals(codec, StructuralRowCodec.Instance))
+            {
+                queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
+                    builder, plan, streams, codec);
+            }
+
+            if (queryStream is null)
+            {
+                var ctx = new CompileContext(streams, tables, codec, snapshotCodecs);
+                queryStream = CompilePlan(builder, plan, ctx);
+            }
+
             output = builder.Output(queryStream);
         });
 

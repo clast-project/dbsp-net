@@ -77,16 +77,82 @@ public static class TypedPlanCompiler
     /// </summary>
     private sealed record TypedNode(Type RowType, Schema Schema, object Stream);
 
+    /// <summary>
+    /// Boundary-adapter entry point: compile <paramref name="plan"/>
+    /// inside an existing <see cref="CircuitBuilder"/>, lifting each
+    /// scan from a caller-supplied structural-row input stream and
+    /// projecting the final typed stream back to
+    /// <c>ZSet&lt;StructuralRow, Z64&gt;</c>. Returns <c>null</c> if
+    /// the plan or any subexpression is outside the typed pipeline's
+    /// scope; the caller (PlanToCircuit) then falls back to its
+    /// existing structural compile path. The internal operator stages
+    /// run typed; only the input/output boundaries pay the conversion
+    /// cost.
+    /// </summary>
+    internal static Stream<ZSet<StructuralRow, Z64>>? TryCompileWithStructuralBoundary(
+        CircuitBuilder builder,
+        LogicalPlan plan,
+        IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans,
+        IRowCodec<StructuralRow> outputCodec)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(structuralScans);
+        ArgumentNullException.ThrowIfNull(outputCodec);
+
+        try
+        {
+            var ctx = new CompileContext(builder, structuralScans);
+            var topNode = TryCompileNode(plan, ctx)
+                ?? throw new UnsupportedPlanException();
+
+            return AdaptTypedToStructural(builder, topNode, outputCodec);
+        }
+        catch (UnsupportedPlanException)
+        {
+            return null;
+        }
+    }
+
     private sealed class CompileContext
     {
         public CircuitBuilder Builder { get; }
 
-        public Dictionary<string, TypedTableInput> Inputs { get; }
+        /// <summary>
+        /// Accumulator for the typed input handles when running in
+        /// standalone mode (called from <see cref="TryCompile"/>).
+        /// <c>null</c> in boundary-adapter mode, where scans are
+        /// lifted from caller-supplied structural-row streams instead.
+        /// </summary>
+        public Dictionary<string, TypedTableInput>? Inputs { get; }
+
+        /// <summary>
+        /// Per-table structural-row input streams in boundary-adapter
+        /// mode. <c>null</c> in standalone mode.
+        /// </summary>
+        public IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>>? StructuralScans { get; }
+
+        /// <summary>
+        /// Cache of structural-row scans already lifted to their typed
+        /// stream — repeat scans on the same table share the lifted
+        /// stream rather than re-emitting the MapRows.
+        /// </summary>
+        public Dictionary<string, TypedNode> LiftedScanCache { get; } = new(StringComparer.Ordinal);
 
         public CompileContext(CircuitBuilder builder, Dictionary<string, TypedTableInput> inputs)
         {
             Builder = builder;
             Inputs = inputs;
+            StructuralScans = null;
+        }
+
+        public CompileContext(
+            CircuitBuilder builder,
+            IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans)
+        {
+            Builder = builder;
+            Inputs = null;
+            StructuralScans = structuralScans;
         }
     }
 
@@ -143,9 +209,36 @@ public static class TypedPlanCompiler
         var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
         if (rowType is null) return null;
 
+        if (ctx.StructuralScans is not null)
+        {
+            // Boundary-adapter mode: lift each scan from the caller's
+            // structural-row stream into a typed stream. Cache by
+            // table name so repeat scans reuse the lifted stream.
+            if (ctx.LiftedScanCache.TryGetValue(scan.TableName, out var cached))
+            {
+                return cached;
+            }
+
+            if (!ctx.StructuralScans.TryGetValue(scan.TableName, out var structuralStream))
+            {
+                // The plan refers to a scan the caller didn't provide
+                // — shouldn't happen because CollectScans walks the
+                // plan first, but treat it as unsupported.
+                return null;
+            }
+
+            var lifter = BuildStructuralToTypedDelegate(scan.Schema, rowType);
+            var liftedStream = InvokeMapRows(
+                ctx.Builder, typeof(StructuralRow), rowType, structuralStream, lifter);
+            var node = new TypedNode(rowType, scan.Schema, liftedStream);
+            ctx.LiftedScanCache[scan.TableName] = node;
+            return node;
+        }
+
+        // Standalone mode: create a typed input handle directly.
         var factory = TypedRowEmitter.BuildBoxedFactory(scan.Schema)!;
         var (handle, stream) = InvokeZSetInput(ctx.Builder, rowType);
-        ctx.Inputs[scan.TableName] = new TypedTableInput(scan.Schema, rowType, factory, handle);
+        ctx.Inputs![scan.TableName] = new TypedTableInput(scan.Schema, rowType, factory, handle);
         return new TypedNode(rowType, scan.Schema, stream);
     }
 
@@ -712,6 +805,109 @@ public static class TypedPlanCompiler
             delegateType, Expression.New(ctor, args),
             keyParam, leftParam, rightParam).Compile();
     }
+
+    // ---- Boundary adapters (structural ↔ typed) ----
+
+    /// <summary>
+    /// Builds <c>(StructuralRow r) =&gt; new TRow((T0)r[0], (T1)r[1], ...)</c>
+    /// as a <see cref="Delegate"/> of type <c>Func&lt;StructuralRow, TRow&gt;</c>.
+    /// Used at the input boundary in adapter mode to lift the
+    /// caller's structural-row input streams into the typed pipeline.
+    /// </summary>
+    private static Delegate BuildStructuralToTypedDelegate(Schema schema, Type rowType)
+    {
+        var ctorParamTypes = new Type[schema.Count];
+        for (var i = 0; i < schema.Count; i++)
+        {
+            ctorParamTypes[i] = schema[i].Type.ClrType;
+        }
+
+        var ctor = rowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException(
+                "emitted row missing typed-fields ctor");
+
+        var rowParam = Expression.Parameter(typeof(StructuralRow), "r");
+        var indexer = typeof(StructuralRow).GetMethod("get_Item", [typeof(int)])!;
+
+        var args = new Expression[schema.Count];
+        for (var i = 0; i < schema.Count; i++)
+        {
+            var idx = Expression.Constant(i, typeof(int));
+            var boxed = Expression.Call(rowParam, indexer, idx);
+            // (Ti)r[i] — unbox or castclass per type
+            args[i] = ctorParamTypes[i].IsValueType
+                ? Expression.Unbox(boxed, ctorParamTypes[i])
+                : (Expression)Expression.Convert(boxed, ctorParamTypes[i]);
+            // Unbox returns a managed-pointer-style expression; widen
+            // to a value via Convert with the same target type when
+            // necessary (Expression.Unbox returns an expression of
+            // the same target type, so this is a no-op for primitive
+            // unboxing in practice).
+        }
+
+        var delegateType = typeof(Func<,>).MakeGenericType(typeof(StructuralRow), rowType);
+        return Expression.Lambda(delegateType, Expression.New(ctor, args), rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Adds a final <c>MapRows&lt;TRow, StructuralRow, Z64&gt;</c> that
+    /// projects each typed output row to a <see cref="StructuralRow"/>
+    /// (built via <paramref name="codec"/>). The typed pipeline's
+    /// internal stages keep their typed representation; only the
+    /// final emission pays this conversion.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> AdaptTypedToStructural(
+        CircuitBuilder builder, TypedNode top, IRowCodec<StructuralRow> codec)
+    {
+        var projection = BuildTypedToStructuralDelegate(top.RowType, top.Schema, codec);
+        var streamObj = InvokeMapRows(builder, top.RowType, typeof(StructuralRow), top.Stream, projection);
+        return (Stream<ZSet<StructuralRow, Z64>>)streamObj;
+    }
+
+    /// <summary>
+    /// Builds <c>(TRow r) =&gt; BuildStructuralRow(codec, schema, new object?[] { (object?)r.F0, ... })</c>.
+    /// Field reads are typed; one per-field box happens per output
+    /// row, plus one array allocation. Goes through a shim because
+    /// <see cref="IRowCodec{TRow}.BuildRow"/>'s second arg is a
+    /// <c>ReadOnlySpan</c> (ref struct), which can't be constructed
+    /// by an expression-tree <see cref="Expression.Call"/>.
+    /// </summary>
+    private static Delegate BuildTypedToStructuralDelegate(
+        Type rowType, Schema schema, IRowCodec<StructuralRow> codec)
+    {
+        var rowParam = Expression.Parameter(rowType, "r");
+
+        var arrInit = new Expression[schema.Count];
+        for (var i = 0; i < schema.Count; i++)
+        {
+            var field = rowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted row missing field F" + i);
+            arrInit[i] = Expression.Convert(Expression.Field(rowParam, field), typeof(object));
+        }
+
+        var newArray = Expression.NewArrayInit(typeof(object), arrInit);
+
+        var helper = typeof(TypedPlanCompiler).GetMethod(
+            nameof(BuildStructuralRowFromArray),
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var body = Expression.Call(
+            null, helper,
+            Expression.Constant(codec, typeof(IRowCodec<StructuralRow>)),
+            Expression.Constant(schema, typeof(Schema)),
+            newArray);
+
+        var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(StructuralRow));
+        return Expression.Lambda(delegateType, body, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Shim called from the compiled MapRows lambda — wraps the
+    /// boxed-field array as a span and dispatches to
+    /// <see cref="IRowCodec{TRow}.BuildRow"/>.
+    /// </summary>
+    private static StructuralRow BuildStructuralRowFromArray(
+        IRowCodec<StructuralRow> codec, Schema schema, object?[] values)
+        => codec.BuildRow(schema, values);
 
     // ---- Reflection-built generic calls ----
 
