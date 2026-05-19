@@ -37,7 +37,8 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
         ICompactionStrategy? compactionStrategy = null,
         IComparer<TKey>? keyComparer = null,
-        IComparer<TValue>? valueComparer = null)
+        IComparer<TValue>? valueComparer = null,
+        SpineIndexedSpillConfig<TKey, TValue, Z64>? spillConfig = null)
     {
         _input = input;
         _output = output;
@@ -45,7 +46,8 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         _trace = new SpineIndexedZSetTrace<TKey, TValue, Z64>(
             compactionStrategy ?? TieredCompactionStrategy.Default,
             keyComparer,
-            valueComparer);
+            valueComparer,
+            spillConfig);
         _snapshotCodec = snapshotCodec;
     }
 

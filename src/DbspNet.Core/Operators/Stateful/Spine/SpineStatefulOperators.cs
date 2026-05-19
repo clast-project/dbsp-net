@@ -40,7 +40,8 @@ public static class SpineStatefulOperators
         Stream<ZSet<TKey, TWeight>> input,
         ICompactionStrategy? compactionStrategy = null,
         IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
-        IComparer<TKey>? keyComparer = null)
+        IComparer<TKey>? keyComparer = null,
+        SpineSpillConfig<TKey, TWeight>? spillConfig = null)
         where TKey : notnull
         where TWeight : struct, IZRing<TWeight>
     {
@@ -49,7 +50,7 @@ public static class SpineStatefulOperators
 
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
         builder.AddRawOperator(
-            new SpineDistinctOp<TKey, TWeight>(input, output, compactionStrategy, snapshotCodec, keyComparer));
+            new SpineDistinctOp<TKey, TWeight>(input, output, compactionStrategy, snapshotCodec, keyComparer, spillConfig));
         return output;
     }
 
@@ -65,7 +66,8 @@ public static class SpineStatefulOperators
         IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
         ICompactionStrategy? compactionStrategy = null,
         IComparer<TKey>? keyComparer = null,
-        IComparer<TValue>? valueComparer = null)
+        IComparer<TValue>? valueComparer = null,
+        SpineIndexedSpillConfig<TKey, TValue, Z64>? spillConfig = null)
         where TKey : notnull
         where TValue : notnull
         where TOut : notnull
@@ -77,7 +79,7 @@ public static class SpineStatefulOperators
         var output = new Stream<ZSet<(TKey, TOut), Z64>>(ZSet<(TKey, TOut), Z64>.Empty);
         builder.AddRawOperator(
             new SpineIncrementalAggregateOp<TKey, TValue, TOut>(
-                input, output, aggregator, snapshotCodec, compactionStrategy, keyComparer, valueComparer));
+                input, output, aggregator, snapshotCodec, compactionStrategy, keyComparer, valueComparer, spillConfig));
         return output;
     }
 
@@ -95,7 +97,9 @@ public static class SpineStatefulOperators
         ICompactionStrategy? compactionStrategy = null,
         IComparer<TKey>? keyComparer = null,
         IComparer<TLeft>? leftValueComparer = null,
-        IComparer<TRight>? rightValueComparer = null)
+        IComparer<TRight>? rightValueComparer = null,
+        SpineIndexedSpillConfig<TKey, TLeft, TWeight>? leftSpillConfig = null,
+        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -112,7 +116,8 @@ public static class SpineStatefulOperators
             new SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
                 left, right, output, combine,
                 leftSnapshotCodec, rightSnapshotCodec,
-                compactionStrategy, keyComparer, leftValueComparer, rightValueComparer));
+                compactionStrategy, keyComparer, leftValueComparer, rightValueComparer,
+                leftSpillConfig, rightSpillConfig));
         return output;
     }
 
@@ -131,7 +136,9 @@ public static class SpineStatefulOperators
         ICompactionStrategy? compactionStrategy = null,
         IComparer<TKey>? keyComparer = null,
         IComparer<TLeft>? leftValueComparer = null,
-        IComparer<TRight>? rightValueComparer = null)
+        IComparer<TRight>? rightValueComparer = null,
+        SpineIndexedSpillConfig<TKey, TLeft, TWeight>? leftSpillConfig = null,
+        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -149,7 +156,8 @@ public static class SpineStatefulOperators
             new SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
                 left, right, output, joinCombine, nullPadCombine,
                 leftSnapshotCodec, rightSnapshotCodec,
-                compactionStrategy, keyComparer, leftValueComparer, rightValueComparer));
+                compactionStrategy, keyComparer, leftValueComparer, rightValueComparer,
+                leftSpillConfig, rightSpillConfig));
         return output;
     }
 }

@@ -25,6 +25,8 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     private readonly ICompactionStrategy _strategy;
     private readonly IComparer<TKey> _keyComparer;
     private readonly IComparer<TValue> _valueComparer;
+    private readonly SpineIndexedSpillConfig<TKey, TValue, TWeight>? _spillConfig;
+    private long _spillCounter;
 
     public SpineIndexedZSetTrace() : this(TieredCompactionStrategy.Default, keyComparer: null, valueComparer: null)
     {
@@ -33,12 +35,14 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     public SpineIndexedZSetTrace(
         ICompactionStrategy strategy,
         IComparer<TKey>? keyComparer = null,
-        IComparer<TValue>? valueComparer = null)
+        IComparer<TValue>? valueComparer = null,
+        SpineIndexedSpillConfig<TKey, TValue, TWeight>? spillConfig = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
         _keyComparer = keyComparer ?? Comparer<TKey>.Default;
         _valueComparer = valueComparer ?? Comparer<TValue>.Default;
+        _spillConfig = spillConfig;
     }
 
     /// <summary>
@@ -55,7 +59,7 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         }
 
         EnsureLevel(0);
-        _levels[0].Add(SpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
+        _levels[0].Add(ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
             delta, _keyComparer, _valueComparer));
         RunCompaction();
     }
@@ -252,10 +256,62 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
             toMerge, _keyComparer, _valueComparer);
         src.RemoveRange(0, action.BatchCount);
 
-        EnsureLevel(action.SourceLevel + 1);
+        foreach (var input in toMerge)
+        {
+            if (input is SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilled)
+            {
+                SyncDelete(spilled);
+            }
+        }
+
+        var destLevel = action.SourceLevel + 1;
+        EnsureLevel(destLevel);
         if (!merged.IsEmpty)
         {
-            _levels[action.SourceLevel + 1].Add(merged);
+            _levels[destLevel].Add(MaybeSpill(merged, destLevel));
+        }
+    }
+
+    private SpineIndexedBatch<TKey, TValue, TWeight> MaybeSpill(
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> batch, int destLevel)
+    {
+        if (_spillConfig is null || destLevel < _spillConfig.MinSpillLevel)
+        {
+            return batch;
+        }
+
+        var path = _spillConfig.Prefix + "/batch_" +
+            Interlocked.Increment(ref _spillCounter).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            ".arrows";
+
+        var iBuilder = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+        foreach (var (k, group) in batch.Entries())
+        {
+            foreach (var (v, w) in group)
+            {
+                iBuilder.Add(k, v, w);
+            }
+        }
+
+        var iz = iBuilder.Build();
+        var ctx = new SpillContext(_spillConfig.FileSystem);
+        var saveTask = _spillConfig.Codec.SaveAsync(ctx, path, iz, default);
+        if (!saveTask.IsCompletedSuccessfully)
+        {
+            saveTask.AsTask().GetAwaiter().GetResult();
+        }
+
+        return new SpilledSpineIndexedBatch<TKey, TValue, TWeight>(
+            _spillConfig.FileSystem, path, _spillConfig.Codec,
+            _keyComparer, _valueComparer, batch.Bloom, batch.GroupCount);
+    }
+
+    private static void SyncDelete(SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilled)
+    {
+        var t = spilled.DeleteAsync();
+        if (!t.IsCompletedSuccessfully)
+        {
+            t.AsTask().GetAwaiter().GetResult();
         }
     }
 

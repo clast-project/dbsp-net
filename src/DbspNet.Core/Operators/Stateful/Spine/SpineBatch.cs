@@ -1,38 +1,108 @@
 using Clast.BloomFilter;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Core.IO;
 
 namespace DbspNet.Core.Operators.Stateful.Spine;
 
 /// <summary>
-/// An immutable spine batch — sorted columnar key/weight arrays plus a
-/// per-batch <see cref="BloomFilter{TKey}"/>. Probes are
-/// definite-miss-skipped by the bloom, then resolved by binary search.
+/// A sealed spine batch. Conceptually a sorted columnar
+/// <see cref="ZSet{TKey,TWeight}"/> snapshot plus a per-batch bloom
+/// filter; concretely either fully resident in memory
+/// (<see cref="ResidentSpineBatch{TKey,TWeight}"/>) or spilled to
+/// disk with only the bloom retained
+/// (<see cref="SpilledSpineBatch{TKey,TWeight}"/>).
 /// </summary>
 /// <remarks>
-/// <para>Sorted columnar layout mirrors Differential Dataflow's
-/// <c>OrdKeyBatch</c>: a single sorted <typeparamref name="TKey"/>[]
-/// alongside a parallel weight column. Compaction is a linear-time
-/// k-way merge of sorted runs rather than a dict rebuild.</para>
-/// <para>The bloom is sized for the batch's actual entry count at 1%
-/// target FPP, capped at 64 KiB per batch. It still earns its keep on
-/// top of the binary search: a cache-line bloom probe is ~10 ns vs a
-/// log-N binary search that may cache-miss on larger batches.</para>
+/// The bloom always stays in RAM: cache-line probe (~10 ns), 1 % FPP,
+/// and it's the mechanism that lets spilled batches skip the disk
+/// entirely on most probes.
 /// </remarks>
-internal sealed class SpineBatch<TKey, TWeight>
+internal abstract class SpineBatch<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private const double TargetFpp = 0.01;
-    private const int MaxBloomBytes = 1 << 16;
+    protected const double TargetFpp = 0.01;
+    protected const int MaxBloomBytes = 1 << 16;
 
+    public BloomFilter<TKey>? Bloom { get; protected init; }
+
+    public bool IsEmpty => Count == 0;
+
+    public abstract int Count { get; }
+
+    public abstract TWeight WeightOf(TKey key);
+
+    /// <summary>Enumerates entries in sorted key order.</summary>
+    public abstract IEnumerable<KeyValuePair<TKey, TWeight>> Entries();
+
+    /// <summary>
+    /// Pairwise sorted merge of the supplied batches into a fresh
+    /// resident batch. Inputs may be resident or spilled — spilled
+    /// inputs are loaded transiently via their codec. Matching keys
+    /// have their weights summed and zero-sum entries dropped.
+    /// </summary>
+    public static ResidentSpineBatch<TKey, TWeight> Merge(
+        IReadOnlyList<SpineBatch<TKey, TWeight>> batches, IComparer<TKey> comparer)
+    {
+        if (batches.Count == 0)
+        {
+            return ResidentSpineBatch<TKey, TWeight>.Empty(comparer);
+        }
+
+        var result = batches[0].Materialise(comparer);
+        for (var i = 1; i < batches.Count; i++)
+        {
+            var next = batches[i].Materialise(comparer);
+            result = ResidentSpineBatch<TKey, TWeight>.MergePair(result, next, comparer);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Returns a resident form of this batch — the identity for
+    /// resident batches, a transient load for spilled ones.
+    /// </summary>
+    protected internal abstract ResidentSpineBatch<TKey, TWeight> Materialise(IComparer<TKey> comparer);
+
+    protected static BloomFilter<TKey>? BuildBloom(TKey[] keys)
+    {
+        if (keys.Length == 0)
+        {
+            return null;
+        }
+
+        var builder = BloomFilterBuilder<TKey>.WithCapacity(keys.Length, TargetFpp, MaxBloomBytes);
+        foreach (var k in keys)
+        {
+            builder.Add(k);
+        }
+
+        return builder.Build();
+    }
+}
+
+/// <summary>
+/// In-memory spine batch — the sorted columnar pair (keys, weights)
+/// plus the comparer used to maintain order. WeightOf is a
+/// bloom-gated binary search.
+/// </summary>
+internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
     private readonly TKey[] _keys;
     private readonly TWeight[] _weights;
     private readonly IComparer<TKey> _comparer;
 
-    public BloomFilter<TKey>? Bloom { get; }
+    internal TKey[] Keys => _keys;
 
-    private SpineBatch(TKey[] keys, TWeight[] weights, IComparer<TKey> comparer)
+    internal TWeight[] Weights => _weights;
+
+    internal IComparer<TKey> Comparer => _comparer;
+
+    private ResidentSpineBatch(TKey[] keys, TWeight[] weights, IComparer<TKey> comparer)
     {
         _keys = keys;
         _weights = weights;
@@ -40,11 +110,9 @@ internal sealed class SpineBatch<TKey, TWeight>
         Bloom = BuildBloom(keys);
     }
 
-    public bool IsEmpty => _keys.Length == 0;
+    public override int Count => _keys.Length;
 
-    public int Count => _keys.Length;
-
-    public TWeight WeightOf(TKey key)
+    public override TWeight WeightOf(TKey key)
     {
         if (Bloom is not null && !Bloom.MightContain(key))
         {
@@ -55,8 +123,7 @@ internal sealed class SpineBatch<TKey, TWeight>
         return idx >= 0 ? _weights[idx] : TWeight.Zero;
     }
 
-    /// <summary>Enumerates entries in sorted key order.</summary>
-    public IEnumerable<KeyValuePair<TKey, TWeight>> Entries()
+    public override IEnumerable<KeyValuePair<TKey, TWeight>> Entries()
     {
         for (var i = 0; i < _keys.Length; i++)
         {
@@ -64,12 +131,16 @@ internal sealed class SpineBatch<TKey, TWeight>
         }
     }
 
-    /// <summary>Builds a sorted batch from a Z-set delta.</summary>
-    public static SpineBatch<TKey, TWeight> FromZSet(ZSet<TKey, TWeight> data, IComparer<TKey> comparer)
+    protected internal override ResidentSpineBatch<TKey, TWeight> Materialise(IComparer<TKey> comparer) => this;
+
+    public static ResidentSpineBatch<TKey, TWeight> Empty(IComparer<TKey> comparer) =>
+        new(Array.Empty<TKey>(), Array.Empty<TWeight>(), comparer);
+
+    public static ResidentSpineBatch<TKey, TWeight> FromZSet(ZSet<TKey, TWeight> data, IComparer<TKey> comparer)
     {
         if (data.IsEmpty)
         {
-            return new SpineBatch<TKey, TWeight>(Array.Empty<TKey>(), Array.Empty<TWeight>(), comparer);
+            return Empty(comparer);
         }
 
         var n = data.Count;
@@ -84,41 +155,24 @@ internal sealed class SpineBatch<TKey, TWeight>
         }
 
         Array.Sort(keys, weights, comparer);
-        return new SpineBatch<TKey, TWeight>(keys, weights, comparer);
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer);
     }
 
-    /// <summary>
-    /// Merges <paramref name="batches"/> in order: matching keys have
-    /// their weights summed, zero-sum entries are dropped, output keys
-    /// remain sorted. Pairwise reduction — adequate for the small
-    /// fan-in (typically 4) the tiered compaction policy emits.
-    /// </summary>
-    public static SpineBatch<TKey, TWeight> Merge(
-        IReadOnlyList<SpineBatch<TKey, TWeight>> batches, IComparer<TKey> comparer)
+    /// <summary>Reconstructs a resident batch from its sorted columnar pair without re-sorting.</summary>
+    internal static ResidentSpineBatch<TKey, TWeight> FromSortedArrays(
+        TKey[] keys, TWeight[] weights, IComparer<TKey> comparer)
     {
-        if (batches.Count == 0)
-        {
-            return new SpineBatch<TKey, TWeight>(Array.Empty<TKey>(), Array.Empty<TWeight>(), comparer);
-        }
-
-        var result = batches[0];
-        for (var i = 1; i < batches.Count; i++)
-        {
-            result = MergePair(result, batches[i], comparer);
-        }
-
-        return result;
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer);
     }
 
-    private static SpineBatch<TKey, TWeight> MergePair(
-        SpineBatch<TKey, TWeight> a, SpineBatch<TKey, TWeight> b, IComparer<TKey> comparer)
+    internal static ResidentSpineBatch<TKey, TWeight> MergePair(
+        ResidentSpineBatch<TKey, TWeight> a, ResidentSpineBatch<TKey, TWeight> b, IComparer<TKey> comparer)
     {
         var aKeys = a._keys;
         var aWeights = a._weights;
         var bKeys = b._keys;
         var bWeights = b._weights;
 
-        // Upper bound: every entry survives. Trim at the end if cancellations shrank the output.
         var keys = new TKey[aKeys.Length + bKeys.Length];
         var weights = new TWeight[aKeys.Length + bKeys.Length];
         int ai = 0, bi = 0, oi = 0;
@@ -177,10 +231,125 @@ internal sealed class SpineBatch<TKey, TWeight>
             Array.Resize(ref weights, oi);
         }
 
-        return new SpineBatch<TKey, TWeight>(keys, weights, comparer);
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer);
+    }
+}
+
+/// <summary>
+/// Spilled spine batch — bloom + count retained in RAM, key/weight
+/// data lives on disk. Probes that pass the bloom (or methods that
+/// need the data: <see cref="Entries"/>, compaction) load the batch
+/// transiently via its codec and discard after use.
+/// </summary>
+internal sealed class SpilledSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    private readonly ITableFileSystem _fileSystem;
+    private readonly string _filePath;
+    private readonly IZSetTraceCodec<TKey, TWeight> _codec;
+    private readonly IComparer<TKey> _comparer;
+    private readonly int _count;
+
+    internal string FilePath => _filePath;
+
+    internal SpilledSpineBatch(
+        ITableFileSystem fileSystem,
+        string filePath,
+        IZSetTraceCodec<TKey, TWeight> codec,
+        IComparer<TKey> comparer,
+        BloomFilter<TKey>? bloom,
+        int count)
+    {
+        _fileSystem = fileSystem;
+        _filePath = filePath;
+        _codec = codec;
+        _comparer = comparer;
+        _count = count;
+        Bloom = bloom;
     }
 
-    private static BloomFilter<TKey>? BuildBloom(TKey[] keys)
+    public override int Count => _count;
+
+    public override TWeight WeightOf(TKey key)
+    {
+        if (Bloom is not null && !Bloom.MightContain(key))
+        {
+            return TWeight.Zero;
+        }
+
+        var resident = LoadResident();
+        return resident.WeightOf(key);
+    }
+
+    public override IEnumerable<KeyValuePair<TKey, TWeight>> Entries() => LoadResident().Entries();
+
+    protected internal override ResidentSpineBatch<TKey, TWeight> Materialise(IComparer<TKey> comparer) => LoadResident();
+
+    /// <summary>Deletes the on-disk file backing this batch.</summary>
+    public ValueTask DeleteAsync(CancellationToken cancellationToken = default) =>
+        _fileSystem.DeleteAsync(_filePath, cancellationToken);
+
+    private ResidentSpineBatch<TKey, TWeight> LoadResident()
+    {
+        // Sync block on the codec read. The InMemoryTableFileSystem
+        // path is synchronous internally; LocalTableFileSystem performs
+        // a single bounded disk read. If this turns into a hot path we
+        // can revisit by threading async through the trace.
+        var ctx = new SpillContext(_fileSystem);
+        var loadTask = _codec.LoadAsync(ctx, _filePath, default);
+        var loaded = loadTask.IsCompletedSuccessfully ? loadTask.Result : loadTask.AsTask().GetAwaiter().GetResult();
+        return ResidentSpineBatch<TKey, TWeight>.FromZSet(loaded, _comparer);
+    }
+}
+
+/// <summary>
+/// Indexed-trace counterpart of <see cref="SpineBatch{TKey,TWeight}"/>.
+/// </summary>
+internal abstract class SpineIndexedBatch<TKey, TValue, TWeight>
+    where TKey : notnull
+    where TValue : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    protected const double TargetFpp = 0.01;
+    protected const int MaxBloomBytes = 1 << 16;
+
+    public BloomFilter<TKey>? Bloom { get; protected init; }
+
+    public bool IsEmpty => GroupCount == 0;
+
+    public abstract int GroupCount { get; }
+
+    public abstract ZSet<TValue, TWeight> GroupFor(TKey key);
+
+    public bool MightContain(TKey key) => Bloom is null || Bloom.MightContain(key);
+
+    public abstract IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>> Entries();
+
+    public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> Merge(
+        IReadOnlyList<SpineIndexedBatch<TKey, TValue, TWeight>> batches,
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
+    {
+        if (batches.Count == 0)
+        {
+            return ResidentSpineIndexedBatch<TKey, TValue, TWeight>.Empty(keyComparer, valueComparer);
+        }
+
+        var result = batches[0].MaterialiseIndexed(keyComparer, valueComparer);
+        for (var i = 1; i < batches.Count; i++)
+        {
+            var next = batches[i].MaterialiseIndexed(keyComparer, valueComparer);
+            result = ResidentSpineIndexedBatch<TKey, TValue, TWeight>.MergePair(
+                result, next, keyComparer, valueComparer);
+        }
+
+        return result;
+    }
+
+    protected internal abstract ResidentSpineIndexedBatch<TKey, TValue, TWeight> MaterialiseIndexed(
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer);
+
+    protected static BloomFilter<TKey>? BuildBloom(TKey[] keys)
     {
         if (keys.Length == 0)
         {
@@ -197,30 +366,19 @@ internal sealed class SpineBatch<TKey, TWeight>
     }
 }
 
-/// <summary>
-/// Indexed-trace counterpart of <see cref="SpineBatch{TKey,TWeight}"/>.
-/// Sorted-columnar layout: outer keys are sorted; for each key, an
-/// offset range into parallel value / weight arrays describes the
-/// (also sorted) group.
-/// </summary>
-internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
+internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIndexedBatch<TKey, TValue, TWeight>
     where TKey : notnull
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private const double TargetFpp = 0.01;
-    private const int MaxBloomBytes = 1 << 16;
-
     private readonly TKey[] _keys;
-    private readonly int[] _offsets;        // length _keys.Length + 1
+    private readonly int[] _offsets;
     private readonly TValue[] _values;
     private readonly TWeight[] _weights;
     private readonly IComparer<TKey> _keyComparer;
     private readonly IComparer<TValue> _valueComparer;
 
-    public BloomFilter<TKey>? Bloom { get; }
-
-    private SpineIndexedBatch(
+    private ResidentSpineIndexedBatch(
         TKey[] keys, int[] offsets, TValue[] values, TWeight[] weights,
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
     {
@@ -233,23 +391,9 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
         Bloom = BuildBloom(keys);
     }
 
-    public bool IsEmpty => _keys.Length == 0;
+    public override int GroupCount => _keys.Length;
 
-    public int GroupCount => _keys.Length;
-
-    /// <summary>
-    /// Returns true if the bloom does not rule the key out — i.e. the
-    /// caller should proceed to a real lookup.
-    /// </summary>
-    public bool MightContain(TKey key) =>
-        Bloom is null || Bloom.MightContain(key);
-
-    /// <summary>
-    /// Returns the group for <paramref name="key"/> as a Z-set, or empty
-    /// if the key is absent. Caller must have already cleared the bloom
-    /// via <see cref="MightContain"/> for the bloom skip to apply.
-    /// </summary>
-    public ZSet<TValue, TWeight> GroupFor(TKey key)
+    public override ZSet<TValue, TWeight> GroupFor(TKey key)
     {
         if (Bloom is not null && !Bloom.MightContain(key))
         {
@@ -273,8 +417,7 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
         return b.Build();
     }
 
-    /// <summary>Enumerates each (key, group) pair in sorted key order.</summary>
-    public IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>> Entries()
+    public override IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>> Entries()
     {
         for (var ki = 0; ki < _keys.Length; ki++)
         {
@@ -290,19 +433,23 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
         }
     }
 
-    public static SpineIndexedBatch<TKey, TValue, TWeight> FromIndexed(
+    protected internal override ResidentSpineIndexedBatch<TKey, TValue, TWeight> MaterialiseIndexed(
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer) => this;
+
+    public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> Empty(
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer) =>
+        new(Array.Empty<TKey>(), new int[] { 0 }, Array.Empty<TValue>(), Array.Empty<TWeight>(),
+            keyComparer, valueComparer);
+
+    public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> FromIndexed(
         IndexedZSet<TKey, TValue, TWeight> data,
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
     {
         if (data.IsEmpty)
         {
-            return new SpineIndexedBatch<TKey, TValue, TWeight>(
-                Array.Empty<TKey>(), new int[] { 0 },
-                Array.Empty<TValue>(), Array.Empty<TWeight>(),
-                keyComparer, valueComparer);
+            return Empty(keyComparer, valueComparer);
         }
 
-        // Collect groups, sort outer keys, then within each group sort values.
         var groups = new List<(TKey Key, (TValue Value, TWeight Weight)[] Items)>(data.GroupCount);
         var totalItems = 0;
         foreach (var (k, group) in data)
@@ -341,40 +488,13 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
 
         offsets[groups.Count] = cursor;
 
-        return new SpineIndexedBatch<TKey, TValue, TWeight>(
+        return new ResidentSpineIndexedBatch<TKey, TValue, TWeight>(
             keys, offsets, values, weights, keyComparer, valueComparer);
     }
 
-    /// <summary>
-    /// Pairwise sorted merge. Matching outer keys merge their groups
-    /// (sum colliding (value) weights, drop zeros); the result remains
-    /// sorted in both dimensions. Outer keys with empty groups after
-    /// merge are dropped.
-    /// </summary>
-    public static SpineIndexedBatch<TKey, TValue, TWeight> Merge(
-        IReadOnlyList<SpineIndexedBatch<TKey, TValue, TWeight>> batches,
-        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
-    {
-        if (batches.Count == 0)
-        {
-            return new SpineIndexedBatch<TKey, TValue, TWeight>(
-                Array.Empty<TKey>(), new int[] { 0 },
-                Array.Empty<TValue>(), Array.Empty<TWeight>(),
-                keyComparer, valueComparer);
-        }
-
-        var result = batches[0];
-        for (var i = 1; i < batches.Count; i++)
-        {
-            result = MergePair(result, batches[i], keyComparer, valueComparer);
-        }
-
-        return result;
-    }
-
-    private static SpineIndexedBatch<TKey, TValue, TWeight> MergePair(
-        SpineIndexedBatch<TKey, TValue, TWeight> a,
-        SpineIndexedBatch<TKey, TValue, TWeight> b,
+    internal static ResidentSpineIndexedBatch<TKey, TValue, TWeight> MergePair(
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> a,
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> b,
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
     {
         var aKeys = a._keys;
@@ -420,7 +540,7 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
             bi++;
         }
 
-        return new SpineIndexedBatch<TKey, TValue, TWeight>(
+        return new ResidentSpineIndexedBatch<TKey, TValue, TWeight>(
             keysOut.ToArray(),
             offsetsOut.ToArray(),
             valuesOut.ToArray(),
@@ -429,7 +549,7 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
     }
 
     private static void AppendGroup(
-        SpineIndexedBatch<TKey, TValue, TWeight> src, int keyIndex,
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> src, int keyIndex,
         List<TKey> keys, List<int> offsets, List<TValue> values, List<TWeight> weights)
     {
         var start = src._offsets[keyIndex];
@@ -450,8 +570,8 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
     }
 
     private static void MergeGroupAndAppend(
-        SpineIndexedBatch<TKey, TValue, TWeight> a, int ai,
-        SpineIndexedBatch<TKey, TValue, TWeight> b, int bi,
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> a, int ai,
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> b, int bi,
         IComparer<TValue> valueComparer,
         List<TKey> keys, List<int> offsets, List<TValue> values, List<TWeight> weights)
     {
@@ -460,7 +580,6 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
         var bStart = b._offsets[bi];
         var bEnd = b._offsets[bi + 1];
 
-        // Sorted-merge the two value spans. Emit only non-zero sums.
         var emitted = 0;
         int p = aStart, q = bStart;
         var emittedStart = values.Count;
@@ -515,27 +634,95 @@ internal sealed class SpineIndexedBatch<TKey, TValue, TWeight>
 
         if (emitted == 0)
         {
-            // All values cancelled; rewind so this key is dropped.
             return;
         }
 
         keys.Add(a._keys[ai]);
         offsets.Add(emittedStart + emitted);
     }
+}
 
-    private static BloomFilter<TKey>? BuildBloom(TKey[] keys)
+internal sealed class SpilledSpineIndexedBatch<TKey, TValue, TWeight> : SpineIndexedBatch<TKey, TValue, TWeight>
+    where TKey : notnull
+    where TValue : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    private readonly ITableFileSystem _fileSystem;
+    private readonly string _filePath;
+    private readonly IIndexedZSetTraceCodec<TKey, TValue, TWeight> _codec;
+    private readonly IComparer<TKey> _keyComparer;
+    private readonly IComparer<TValue> _valueComparer;
+    private readonly int _groupCount;
+
+    internal string FilePath => _filePath;
+
+    internal SpilledSpineIndexedBatch(
+        ITableFileSystem fileSystem,
+        string filePath,
+        IIndexedZSetTraceCodec<TKey, TValue, TWeight> codec,
+        IComparer<TKey> keyComparer,
+        IComparer<TValue> valueComparer,
+        BloomFilter<TKey>? bloom,
+        int groupCount)
     {
-        if (keys.Length == 0)
-        {
-            return null;
-        }
-
-        var builder = BloomFilterBuilder<TKey>.WithCapacity(keys.Length, TargetFpp, MaxBloomBytes);
-        foreach (var k in keys)
-        {
-            builder.Add(k);
-        }
-
-        return builder.Build();
+        _fileSystem = fileSystem;
+        _filePath = filePath;
+        _codec = codec;
+        _keyComparer = keyComparer;
+        _valueComparer = valueComparer;
+        _groupCount = groupCount;
+        Bloom = bloom;
     }
+
+    public override int GroupCount => _groupCount;
+
+    public override ZSet<TValue, TWeight> GroupFor(TKey key)
+    {
+        if (Bloom is not null && !Bloom.MightContain(key))
+        {
+            return ZSet<TValue, TWeight>.Empty;
+        }
+
+        return LoadResident().GroupFor(key);
+    }
+
+    public override IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>> Entries() => LoadResident().Entries();
+
+    protected internal override ResidentSpineIndexedBatch<TKey, TValue, TWeight> MaterialiseIndexed(
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer) => LoadResident();
+
+    public ValueTask DeleteAsync(CancellationToken cancellationToken = default) =>
+        _fileSystem.DeleteAsync(_filePath, cancellationToken);
+
+    private ResidentSpineIndexedBatch<TKey, TValue, TWeight> LoadResident()
+    {
+        var ctx = new SpillContext(_fileSystem);
+        var loadTask = _codec.LoadAsync(ctx, _filePath, default);
+        var loaded = loadTask.IsCompletedSuccessfully ? loadTask.Result : loadTask.AsTask().GetAwaiter().GetResult();
+        return ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(loaded, _keyComparer, _valueComparer);
+    }
+}
+
+/// <summary>
+/// Thin <see cref="Circuit.ISnapshotWriter"/> +
+/// <see cref="Circuit.ISnapshotReader"/> adapter over an
+/// <see cref="ITableFileSystem"/>. Used both by spilled batches
+/// (reads) and by the trace's spill machinery (writes); the
+/// "filename" passed to a codec call is the full file-system path so
+/// no prefixing is applied.
+/// </summary>
+internal sealed class SpillContext : Circuit.ISnapshotWriter, Circuit.ISnapshotReader
+{
+    private readonly ITableFileSystem _fs;
+
+    public SpillContext(ITableFileSystem fs) { _fs = fs; }
+
+    public ValueTask<ISequentialFile> CreateAsync(string filename, CancellationToken cancellationToken = default)
+        => _fs.CreateAsync(filename, overwrite: true, cancellationToken);
+
+    public ValueTask<IRandomAccessFile> OpenReadAsync(string filename, CancellationToken cancellationToken = default)
+        => _fs.OpenReadAsync(filename, cancellationToken);
+
+    public ValueTask<bool> ExistsAsync(string filename, CancellationToken cancellationToken = default)
+        => _fs.ExistsAsync(filename, cancellationToken);
 }

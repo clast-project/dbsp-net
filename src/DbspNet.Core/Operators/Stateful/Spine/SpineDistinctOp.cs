@@ -48,13 +48,15 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         Stream<ZSet<TKey, TWeight>> output,
         ICompactionStrategy? compactionStrategy = null,
         IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
-        IComparer<TKey>? keyComparer = null)
+        IComparer<TKey>? keyComparer = null,
+        SpineSpillConfig<TKey, TWeight>? spillConfig = null)
     {
         _input = input;
         _output = output;
         _trace = new SpineZSetTrace<TKey, TWeight>(
             compactionStrategy ?? TieredCompactionStrategy.Default,
-            keyComparer);
+            keyComparer,
+            spillConfig);
         _snapshotCodec = snapshotCodec;
     }
 

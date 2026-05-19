@@ -29,6 +29,8 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     private readonly List<List<SpineBatch<TKey, TWeight>>> _levels = new();
     private readonly ICompactionStrategy _strategy;
     private readonly IComparer<TKey> _comparer;
+    private readonly SpineSpillConfig<TKey, TWeight>? _spillConfig;
+    private long _spillCounter;
 
     /// <summary>
     /// Creates an empty spine that uses
@@ -39,11 +41,15 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     {
     }
 
-    public SpineZSetTrace(ICompactionStrategy strategy, IComparer<TKey>? comparer = null)
+    public SpineZSetTrace(
+        ICompactionStrategy strategy,
+        IComparer<TKey>? comparer = null,
+        SpineSpillConfig<TKey, TWeight>? spillConfig = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
         _comparer = comparer ?? Comparer<TKey>.Default;
+        _spillConfig = spillConfig;
     }
 
     /// <summary>
@@ -60,7 +66,7 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         }
 
         EnsureLevel(0);
-        _levels[0].Add(SpineBatch<TKey, TWeight>.FromZSet(delta, _comparer));
+        _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(delta, _comparer));
         RunCompaction();
     }
 
@@ -250,10 +256,63 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         var merged = SpineBatch<TKey, TWeight>.Merge(toMerge, _comparer);
         src.RemoveRange(0, action.BatchCount);
 
-        EnsureLevel(action.SourceLevel + 1);
+        // Delete on-disk files for any spilled inputs — they have been
+        // consumed by the merge and would otherwise leak.
+        foreach (var input in toMerge)
+        {
+            if (input is SpilledSpineBatch<TKey, TWeight> spilled)
+            {
+                SyncDelete(spilled);
+            }
+        }
+
+        var destLevel = action.SourceLevel + 1;
+        EnsureLevel(destLevel);
         if (!merged.IsEmpty)
         {
-            _levels[action.SourceLevel + 1].Add(merged);
+            _levels[destLevel].Add(MaybeSpill(merged, destLevel));
+        }
+    }
+
+    private SpineBatch<TKey, TWeight> MaybeSpill(ResidentSpineBatch<TKey, TWeight> batch, int destLevel)
+    {
+        if (_spillConfig is null || destLevel < _spillConfig.MinSpillLevel)
+        {
+            return batch;
+        }
+
+        var path = _spillConfig.Prefix + "/batch_" +
+            Interlocked.Increment(ref _spillCounter).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            ".arrows";
+
+        // Materialise into a ZSet for the codec. Sync block on the
+        // SaveAsync: write paths are infrequent (one per compaction)
+        // and the underlying ITableFileSystem either completes inline
+        // (in-memory) or performs a bounded disk write.
+        var zsetBuilder = new ZSetBuilder<TKey, TWeight>();
+        foreach (var (k, w) in batch.Entries())
+        {
+            zsetBuilder.Add(k, w);
+        }
+
+        var zset = zsetBuilder.Build();
+        var ctx = new SpillContext(_spillConfig.FileSystem);
+        var saveTask = _spillConfig.Codec.SaveAsync(ctx, path, zset, default);
+        if (!saveTask.IsCompletedSuccessfully)
+        {
+            saveTask.AsTask().GetAwaiter().GetResult();
+        }
+
+        return new SpilledSpineBatch<TKey, TWeight>(
+            _spillConfig.FileSystem, path, _spillConfig.Codec, _comparer, batch.Bloom, batch.Count);
+    }
+
+    private static void SyncDelete(SpilledSpineBatch<TKey, TWeight> spilled)
+    {
+        var t = spilled.DeleteAsync();
+        if (!t.IsCompletedSuccessfully)
+        {
+            t.AsTask().GetAwaiter().GetResult();
         }
     }
 
