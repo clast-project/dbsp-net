@@ -226,13 +226,27 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void Project_RejectsExpressionsWithFunctionCalls()
+    public void Project_FunctionCalls()
     {
-        // ABS is a function call — outside TypedExpressionCompiler's scope.
+        // Phase 1.9: function calls land on the typed path.
         var plan = CompilePlan(
             ["CREATE TABLE t (a INT NOT NULL)"],
             "SELECT ABS(a) FROM t");
 
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(-7);
+        typed.Step();
+        Assert.Equal(1L, typed.WeightOf(7).Value);
+    }
+
+    [Fact]
+    public void Project_NullifStillRejected()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT NULLIF(a, b) FROM t");
+
+        // NULLIF can produce NULL — falls back to structural.
         Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
         Assert.Null(typed);
     }

@@ -126,6 +126,7 @@ public static class TypedExpressionCompiler
             ResolvedBinary bin => BuildBinary(bin, row, rowType),
             ResolvedIsNull isn => BuildIsNull(isn, row, rowType),
             ResolvedCast cast => BuildCast(cast, row, rowType),
+            ResolvedFunctionCall fn => BuildFunction(fn, row, rowType),
             _ => throw Unsupported(),
         };
     }
@@ -431,6 +432,24 @@ public static class TypedExpressionCompiler
             Expression.Constant(src.Scale),
             Expression.Constant(0));
         return Expression.Convert(rescaled, dstClr);
+    }
+
+    /// <summary>
+    /// Lowers a builtin scalar function call by recursively compiling
+    /// the args and delegating to <see cref="TypedBuiltinScalarFunctions.TryBuild"/>.
+    /// Functions outside the typed pipeline's scope (currently just
+    /// <c>NULLIF</c>) cause the whole compile to fall back.
+    /// </summary>
+    private static Expression BuildFunction(ResolvedFunctionCall fn, ParameterExpression row, Type rowType)
+    {
+        var args = new Expression[fn.Arguments.Count];
+        for (var i = 0; i < fn.Arguments.Count; i++)
+        {
+            args[i] = Build(fn.Arguments[i], row, rowType);
+        }
+
+        return TypedBuiltinScalarFunctions.TryBuild(fn, fn.Arguments, args)
+            ?? throw Unsupported();
     }
 
     private static bool IsNumericNonDecimal(Type t) =>

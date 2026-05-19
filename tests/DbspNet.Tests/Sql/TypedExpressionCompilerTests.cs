@@ -195,12 +195,121 @@ public class TypedExpressionCompilerTests
 
     // ----- Rejection cases -----
 
+    // ----- Functions -----
+
     [Fact]
-    public void Rejects_FunctionCalls()
+    public void Function_StringHelpers()
     {
-        var (rowType, _) = RowFor(("a", new SqlIntegerType(false)));
+        var (rowType, factory) = RowFor(("s", new SqlVarcharType(null, false)));
+        var ddl = new[] { "CREATE TABLE t (s VARCHAR NOT NULL)" };
+
+        var row = factory(new object?[] { Utf8String.Of("hello") });
+
+        var upper = TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "UPPER(s)"), rowType);
+        Assert.Equal(Utf8String.Of("HELLO"), Invoke(upper!, row));
+
+        var lower = TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "LOWER(s)"), rowType);
+        Assert.Equal(Utf8String.Of("hello"), Invoke(lower!, row));
+
+        var len = TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "LENGTH(s)"), rowType);
+        Assert.Equal(5, Invoke(len!, row));
+    }
+
+    [Fact]
+    public void Function_Concat()
+    {
+        var (rowType, factory) = RowFor(
+            ("a", new SqlVarcharType(null, false)),
+            ("b", new SqlVarcharType(null, false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (a VARCHAR NOT NULL, b VARCHAR NOT NULL)"],
+            "CONCAT(a, '-', b)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var row = factory(new object?[] { Utf8String.Of("foo"), Utf8String.Of("bar") });
+        Assert.Equal(Utf8String.Of("foo-bar"), Invoke(del!, row));
+    }
+
+    [Fact]
+    public void Function_Coalesce_CollapsesToFirstArg()
+    {
+        // On the typed path every value is non-null, so COALESCE
+        // collapses to its first arg.
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (a INT NOT NULL)"],
+            "COALESCE(a, 99)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Equal(7, Invoke(del!, factory(new object?[] { 7 })));
+    }
+
+    [Fact]
+    public void Function_GreatestLeast()
+    {
+        var (rowType, factory) = RowFor(
+            ("a", new SqlIntegerType(false)),
+            ("b", new SqlIntegerType(false)),
+            ("c", new SqlIntegerType(false)));
+        var ddl = new[] { "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c INT NOT NULL)" };
+
+        var row = factory(new object?[] { 3, 1, 5 });
+        Assert.Equal(5, Invoke(
+            TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "GREATEST(a, b, c)"), rowType)!,
+            row));
+        Assert.Equal(1, Invoke(
+            TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "LEAST(a, b, c)"), rowType)!,
+            row));
+    }
+
+    [Fact]
+    public void Function_NumericMath()
+    {
+        var (rowType, factory) = RowFor(
+            ("x", new SqlDoubleType(false)),
+            ("y", new SqlDoubleType(false)));
+        var ddl = new[] { "CREATE TABLE t (x DOUBLE PRECISION NOT NULL, y DOUBLE PRECISION NOT NULL)" };
+
+        var row = factory(new object?[] { 9.0, 2.0 });
+        Assert.Equal(3.0, Invoke(
+            TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "SQRT(x)"), rowType)!,
+            row));
+        Assert.Equal(81.0, Invoke(
+            TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "POWER(x, y)"), rowType)!,
+            row));
+        Assert.Equal(9.0, Invoke(
+            TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "FLOOR(x)"), rowType)!,
+            row));
+        Assert.Equal(9.0, Invoke(
+            TypedExpressionCompiler.TryCompile(ResolveSelectExpression(ddl, "CEIL(x)"), rowType)!,
+            row));
+    }
+
+    [Fact]
+    public void Function_AbsAccepted()
+    {
+        // Phase 1.9: function calls are in scope.
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(false)));
         var expr = ResolveSelectExpression(
             ["CREATE TABLE t (a INT NOT NULL)"], "ABS(a)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Equal(5, Invoke(del!, factory(new object?[] { -5 })));
+        Assert.Equal(5, Invoke(del!, factory(new object?[] { 5 })));
+    }
+
+    [Fact]
+    public void Rejects_Nullif()
+    {
+        // NULLIF can return NULL — typed-row pipeline can't carry that.
+        var (rowType, _) = RowFor(
+            ("a", new SqlIntegerType(false)),
+            ("b", new SqlIntegerType(false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"], "NULLIF(a, b)");
 
         Assert.Null(TypedExpressionCompiler.TryCompile(expr, rowType));
     }
