@@ -170,6 +170,7 @@ public static class TypedRowEmitter
         tb.AddInterfaceImplementation(iequatable);
 
         EmitCtor(tb, fp, fields);
+        EmitTypedFieldsCtor(tb, fp, fields);
         var typedEquals = EmitTypedEquals(tb, fp, fields, iequatable);
         EmitObjectEquals(tb, typedEquals);
         EmitGetHashCode(tb, fp, fields);
@@ -195,6 +196,31 @@ public static class TypedRowEmitter
             il.Emit(OpCodes.Ldc_I4, i);
             il.Emit(OpCodes.Ldelem_Ref);           // values[i] (boxed object)
             EmitCastTo(il, fp.Columns[i]);
+            il.Emit(OpCodes.Stfld, fields[i]);
+        }
+
+        il.Emit(OpCodes.Ret);
+    }
+
+    /// <summary>
+    /// Emits <c>ctor(T0, T1, ..., Tn)</c> taking typed args in field-
+    /// declaration order. Used by the typed pipeline (Project, Map) to
+    /// build an output row from individual typed values without going
+    /// through the <c>object?[]</c> boxing path.
+    /// </summary>
+    private static void EmitTypedFieldsCtor(TypeBuilder tb, Fingerprint fp, FieldBuilder[] fields)
+    {
+        var ctor = tb.DefineConstructor(
+            MethodAttributes.Public | MethodAttributes.HideBySig |
+            MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
+            CallingConventions.Standard,
+            fp.Columns);
+        var il = ctor.GetILGenerator();
+
+        for (var i = 0; i < fp.Columns.Length; i++)
+        {
+            il.Emit(OpCodes.Ldarg_0);                    // this (managed ptr)
+            il.Emit(OpCodes.Ldarg, (short)(i + 1));      // arg i (Ti)
             il.Emit(OpCodes.Stfld, fields[i]);
         }
 

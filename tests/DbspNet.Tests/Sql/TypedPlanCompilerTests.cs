@@ -125,6 +125,125 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Project_DropsColumns()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Equal(1, typed!.OutputSchema.Count);
+        typed.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(2, 20);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1).Value);
+        Assert.Equal(1L, typed.WeightOf(2).Value);
+    }
+
+    [Fact]
+    public void Project_ReordersColumns()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT b, a FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Step();
+
+        var rows = typed.Current.ToList();
+        Assert.Single(rows);
+        Assert.Equal(10, rows[0].Values[0]);
+        Assert.Equal(1, rows[0].Values[1]);
+        Assert.Equal(1L, typed.WeightOf(10, 1).Value);
+    }
+
+    [Fact]
+    public void Project_DuplicatesColumn()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL)"],
+            "SELECT a, a FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(5);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(5, 5).Value);
+    }
+
+    [Fact]
+    public void Project_CollapsedRowsSumWeights()
+    {
+        // Dropping a non-key column makes two source rows collide on
+        // the output. MapRows is linear, so the output weights sum.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Step();
+
+        Assert.Equal(2L, typed.WeightOf(1).Value);
+    }
+
+    [Fact]
+    public void Project_RejectsNonColumnProjection()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a + 1 FROM t");
+
+        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Null(typed);
+    }
+
+    [Fact]
+    public void Project_DifferentialAgainstStructural()
+    {
+        var planTyped = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT b, a FROM t");
+        var planStructural = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT b, a FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new[]
+        {
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 2, 20 }, 1L),
+            (new object?[] { 3, 30 }, 2L),
+            (new object?[] { 1, 10 }, -1L),
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            for (var a = 0; a <= 3; a++)
+            {
+                for (var b = 0; b <= 30; b += 10)
+                {
+                    // structural output schema is (b, a); look up
+                    // both with the same key order.
+                    Assert.Equal(
+                        structural.WeightOf(b, a).Value,
+                        typed.WeightOf(b, a).Value);
+                }
+            }
+        }
+    }
+
+    [Fact]
     public void Output_MatchesStructuralCompile_ForSupportedSchemas()
     {
         // Differential test: typed and structural compile paths should

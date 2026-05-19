@@ -9,13 +9,14 @@ using DbspNet.Sql.Plan;
 namespace DbspNet.Sql.Compiler;
 
 /// <summary>
-/// Phase 1.1 of the typed-row lift. Compiles a narrow subset of plans
-/// — currently just <c>SELECT * FROM t</c> (a bare
-/// <see cref="ScanPlan"/>) — into a circuit whose streams carry the
-/// per-schema emitted struct from <see cref="TypedRowEmitter"/>
-/// instead of <see cref="StructuralRow"/>. Demonstrates the typed
-/// pipeline mechanism end-to-end; subsequent phases extend the
-/// supported plan shapes.
+/// Typed-row compile path. Recognises a growing set of plan shapes —
+/// today: bare table scan (<c>SELECT * FROM t</c>) and column-only
+/// projections over a scan (<c>SELECT b, a, a FROM t</c>) — and builds
+/// a circuit whose streams carry per-schema emitted structs from
+/// <see cref="TypedRowEmitter"/> instead of
+/// <see cref="StructuralRow"/>. Plans outside the supported subset
+/// return <c>false</c>; callers fall back to
+/// <see cref="PlanToCircuit.Compile(LogicalPlan, ISqlSnapshotCodecs?)"/>.
 /// </summary>
 public static class TypedPlanCompiler
 {
@@ -23,64 +24,107 @@ public static class TypedPlanCompiler
     /// Attempts to compile <paramref name="plan"/> into a
     /// <see cref="TypedCompiledQuery"/>. Returns <c>false</c> if the
     /// plan shape isn't supported by this phase or if any referenced
-    /// schema falls outside <see cref="TypedRowEmitter"/>'s scope —
-    /// callers should fall back to
-    /// <see cref="PlanToCircuit.Compile(LogicalPlan, ISqlSnapshotCodecs?)"/>.
+    /// schema falls outside <see cref="TypedRowEmitter"/>'s scope.
     /// </summary>
     public static bool TryCompile(LogicalPlan plan, out TypedCompiledQuery? compiled)
     {
         ArgumentNullException.ThrowIfNull(plan);
 
-        if (!TryUnwrapBareScan(plan, out var scan))
+        if (!TryUnwrapColumnOnlyProject(plan, out var scan, out var columnIndices, out var outputSchema))
         {
             compiled = null;
             return false;
         }
 
-        var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
-        if (rowType is null)
+        var inputRowType = TypedRowEmitter.EmitRowType(scan.Schema);
+        if (inputRowType is null)
         {
             compiled = null;
             return false;
         }
 
-        compiled = BuildPassThrough(scan, rowType);
+        if (IsIdentity(columnIndices, scan.Schema, outputSchema))
+        {
+            compiled = BuildPassThrough(scan, inputRowType);
+            return true;
+        }
+
+        var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
+        if (outputRowType is null)
+        {
+            compiled = null;
+            return false;
+        }
+
+        compiled = BuildScanProject(scan, outputSchema, columnIndices, inputRowType, outputRowType);
         return true;
     }
 
     /// <summary>
-    /// Recognises plan shapes equivalent to a bare table scan: either a
-    /// <see cref="ScanPlan"/> directly, or a <see cref="ProjectPlan"/>
-    /// whose projections are an in-order identity over an underlying
-    /// <see cref="ScanPlan"/> (<c>SELECT * FROM t</c>).
+    /// Recognises plan shapes the typed compile path supports:
+    /// either a bare <see cref="ScanPlan"/> (treated as
+    /// <see cref="ProjectPlan"/> with an identity column list), or a
+    /// <see cref="ProjectPlan"/> over a <see cref="ScanPlan"/> whose
+    /// projections are all <see cref="ResolvedColumn"/> (no
+    /// expressions, literals, or casts — those land in the typed
+    /// expression compiler phase). The column indices array gives the
+    /// scan-column index for each output column.
     /// </summary>
-    private static bool TryUnwrapBareScan(LogicalPlan plan, out ScanPlan scan)
+    private static bool TryUnwrapColumnOnlyProject(
+        LogicalPlan plan, out ScanPlan scan, out int[] columnIndices, out Schema outputSchema)
     {
         if (plan is ScanPlan direct)
         {
             scan = direct;
+            columnIndices = Enumerable.Range(0, direct.Schema.Count).ToArray();
+            outputSchema = direct.Schema;
             return true;
         }
 
-        if (plan is ProjectPlan project
-            && project.Input is ScanPlan inner
-            && project.Projections.Count == inner.Schema.Count)
+        if (plan is ProjectPlan project && project.Input is ScanPlan inner)
         {
+            var indices = new int[project.Projections.Count];
             for (var i = 0; i < project.Projections.Count; i++)
             {
-                if (project.Projections[i].Expression is not ResolvedColumn rc || rc.Index != i)
+                if (project.Projections[i].Expression is not ResolvedColumn rc)
                 {
                     scan = null!;
+                    columnIndices = null!;
+                    outputSchema = null!;
                     return false;
                 }
+
+                indices[i] = rc.Index;
             }
 
             scan = inner;
+            columnIndices = indices;
+            outputSchema = project.Schema;
             return true;
         }
 
         scan = null!;
+        columnIndices = null!;
+        outputSchema = null!;
         return false;
+    }
+
+    private static bool IsIdentity(int[] columnIndices, Schema inputSchema, Schema outputSchema)
+    {
+        if (columnIndices.Length != inputSchema.Count) return false;
+        for (var i = 0; i < columnIndices.Length; i++)
+        {
+            if (columnIndices[i] != i) return false;
+        }
+
+        // Same column types are guaranteed by ResolvedColumn semantics,
+        // but the output schema's nullability could in theory differ
+        // (projections through a NULL-introducing context, e.g. outer
+        // join — not reachable from the ScanPlan path here). Belt and
+        // braces: confirm by column count, since type-level differences
+        // would already make the output row type emit a different
+        // struct that the pass-through path can't satisfy.
+        return outputSchema.Count == inputSchema.Count;
     }
 
     private static TypedCompiledQuery BuildPassThrough(ScanPlan scan, Type rowType)
@@ -111,11 +155,97 @@ public static class TypedPlanCompiler
 
         var currentGetter = BuildCurrentZSetGetter(rowType, outputHandle!);
         var currentReader = BuildBoxedEntriesReader(rowType);
-        var weightOf = BuildWeightOf(rowType, factory, currentGetter);
+        var outputFactory = factory;
+        var weightOf = BuildWeightOf(rowType, outputFactory, currentGetter);
 
         return new TypedCompiledQuery(
             circuit!, inputs, schema, rowType,
             currentGetter, currentReader, weightOf);
+    }
+
+    /// <summary>
+    /// Builds a circuit shape <c>typed-input → MapRows → typed-output</c>:
+    /// the input handle carries <typeparamref name="inputRowType"/>
+    /// rows, a typed projection delegate (<c>Func&lt;TIn, TOut&gt;</c>,
+    /// expression-tree-compiled, no boxing) projects them to
+    /// <typeparamref name="outputRowType"/>, and the output handle
+    /// carries those.
+    /// </summary>
+    private static TypedCompiledQuery BuildScanProject(
+        ScanPlan scan, Schema outputSchema, int[] columnIndices,
+        Type inputRowType, Type outputRowType)
+    {
+        var inputSchema = scan.Schema;
+        var inputFactory = TypedRowEmitter.BuildBoxedFactory(inputSchema)
+            ?? throw new InvalidOperationException(
+                "TypedRowEmitter accepted the input schema but produced no factory");
+        var outputFactory = TypedRowEmitter.BuildBoxedFactory(outputSchema)
+            ?? throw new InvalidOperationException(
+                "TypedRowEmitter accepted the output schema but produced no factory");
+
+        var projectionDelegate = BuildTypedProjectionDelegate(
+            inputRowType, outputRowType, outputSchema, columnIndices);
+
+        RootCircuit? circuit = null;
+        object? handle = null;
+        object? outputHandle = null;
+
+        circuit = RootCircuit.Build(builder =>
+        {
+            var (h, inputStream) = InvokeZSetInput(builder, inputRowType);
+            handle = h;
+            var outputStream = InvokeMapRows(
+                builder, inputRowType, outputRowType, inputStream, projectionDelegate);
+            outputHandle = InvokeOutput(builder, outputRowType, outputStream);
+        });
+
+        var inputs = new Dictionary<string, TypedTableInput>(StringComparer.Ordinal)
+        {
+            [scan.TableName] = new TypedTableInput(inputSchema, inputRowType, inputFactory, handle!),
+        };
+
+        var currentGetter = BuildCurrentZSetGetter(outputRowType, outputHandle!);
+        var currentReader = BuildBoxedEntriesReader(outputRowType);
+        var weightOf = BuildWeightOf(outputRowType, outputFactory, currentGetter);
+
+        return new TypedCompiledQuery(
+            circuit!, inputs, outputSchema, outputRowType,
+            currentGetter, currentReader, weightOf);
+    }
+
+    /// <summary>
+    /// Builds <c>(TIn in) =&gt; new TOut(in.F{idx[0]}, in.F{idx[1]}, ...)</c>
+    /// as a <see cref="Delegate"/> of type <c>Func&lt;TIn, TOut&gt;</c>.
+    /// Uses the typed-fields constructor emitted by
+    /// <see cref="TypedRowEmitter"/>; no boxing or array allocation on
+    /// the per-row path.
+    /// </summary>
+    private static Delegate BuildTypedProjectionDelegate(
+        Type inputRowType, Type outputRowType, Schema outputSchema, int[] columnIndices)
+    {
+        var ctorParamTypes = new Type[outputSchema.Count];
+        for (var i = 0; i < outputSchema.Count; i++)
+        {
+            ctorParamTypes[i] = outputSchema[i].Type.ClrType;
+        }
+
+        var ctor = outputRowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException(
+                "emitted output row missing typed-fields ctor");
+
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var args = new Expression[columnIndices.Length];
+        for (var i = 0; i < columnIndices.Length; i++)
+        {
+            var srcField = inputRowType.GetField("F" + columnIndices[i])
+                ?? throw new InvalidOperationException(
+                    "emitted input row missing field F" + columnIndices[i]);
+            args[i] = Expression.Field(inParam, srcField);
+        }
+
+        var body = Expression.New(ctor, args);
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, outputRowType);
+        return Expression.Lambda(delegateType, body, inParam).Compile();
     }
 
     // ---- Reflection-built generic calls ----
@@ -133,6 +263,20 @@ public static class TypedPlanCompiler
         var item1 = tupleType.GetField("Item1")!.GetValue(tuple)!;
         var item2 = tupleType.GetField("Item2")!.GetValue(tuple)!;
         return (item1, item2);
+    }
+
+    /// <summary>
+    /// <c>builder.MapRows&lt;TIn, TOut, Z64&gt;(inputStream, projection)</c>.
+    /// </summary>
+    private static object InvokeMapRows(
+        CircuitBuilder builder, Type inputRowType, Type outputRowType,
+        object inputStream, Delegate projection)
+    {
+        var openMethod = typeof(LinearOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(LinearOperators.MapRows) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(inputRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object[] { builder, inputStream, projection })!;
     }
 
     /// <summary>builder.Output(stream) — generic over ZSet&lt;TRow, Z64&gt;</summary>

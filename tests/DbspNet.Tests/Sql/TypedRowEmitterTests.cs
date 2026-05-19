@@ -124,6 +124,27 @@ public class TypedRowEmitterTests
     }
 
     [Fact]
+    public void TypedFieldsCtorBuildsEquivalentInstance()
+    {
+        // The typed-fields ctor (Ti, Tj, ...) feeds the Phase 1.2+ typed
+        // Map/Project: build an output row from individual typed values
+        // with no boxing through object?[]. Round-trip via reflection
+        // because the closed type isn't visible at compile time.
+        var type = TypedRowEmitter.EmitRowType(MixedSchema)!;
+        var typedCtor = type.GetConstructor(new[]
+        {
+            typeof(int), typeof(long), typeof(double), typeof(bool), typeof(Utf8String),
+        })!;
+
+        var fromTyped = typedCtor.Invoke(new object?[] { 1, 2L, 3.5, true, Utf8String.Of("hello") });
+        var fromBoxed = TypedRowEmitter.BuildBoxedFactory(MixedSchema)!(
+            new object?[] { 1, 2L, 3.5, true, Utf8String.Of("hello") });
+
+        Assert.Equal(fromBoxed, fromTyped);
+        Assert.Equal(fromBoxed.GetHashCode(), fromTyped.GetHashCode());
+    }
+
+    [Fact]
     public void WorksAsZSetKeyViaReflection()
     {
         // Confirms that the emitted struct plays nicely with the Core's
