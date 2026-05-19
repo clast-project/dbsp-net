@@ -218,6 +218,38 @@ public class PlanOptimizerTests
     // ---- Idempotence ----
 
     [Fact]
+    public void NarrowAggregateInput_FiresOnJoinedGroupBy()
+    {
+        // Direct test for the column-pruning rule: the JOIN output is
+        // [cust_id, amount, id, region] (4 cols) but the aggregate
+        // only uses {amount, region}. Optimizer should insert a
+        // narrowing Project between the AggregatePlan and the JoinPlan.
+        var plan = Plan(
+            [
+                "CREATE TABLE customers (id INT NOT NULL, region VARCHAR NOT NULL)",
+                "CREATE TABLE orders (cust_id INT NOT NULL, amount INT NOT NULL)",
+            ],
+            "SELECT c.region, SUM(o.amount) FROM orders o " +
+            "JOIN customers c ON o.cust_id = c.id " +
+            "GROUP BY c.region");
+
+        var opt = PlanOptimizer.Optimize(plan);
+
+        // Walk the optimized tree, find the AggregatePlan, check its input.
+        var agg = FindAggregate(opt);
+        Assert.NotNull(agg);
+        Assert.Equal(2, agg!.Input.Schema.Count);
+    }
+
+    private static AggregatePlan? FindAggregate(LogicalPlan p) => p switch
+    {
+        AggregatePlan a => a,
+        ProjectPlan proj => FindAggregate(proj.Input),
+        FilterPlan f => FindAggregate(f.Input),
+        _ => null,
+    };
+
+    [Fact]
     public void Optimizer_IsIdempotent()
     {
         var plan = Plan(

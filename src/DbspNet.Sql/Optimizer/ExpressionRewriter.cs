@@ -141,6 +141,53 @@ internal static class ExpressionRewriter
     }
 
     /// <summary>
+    /// Rewrite every <see cref="ResolvedColumn"/>(i) reference to
+    /// <see cref="ResolvedColumn"/>(<paramref name="remap"/>[i]).
+    /// Used when inserting a narrowing projection that re-indexes
+    /// its parent's input column space — every column index
+    /// referenced by the expression must be present in the remap
+    /// (no -1 sentinels).
+    /// </summary>
+    public static ResolvedExpression RemapColumnIndices(ResolvedExpression expr, int[] remap)
+    {
+        return expr switch
+        {
+            ResolvedColumn c => c.Index < 0 || c.Index >= remap.Length || remap[c.Index] < 0
+                ? throw new ArgumentException(
+                    $"RemapColumnIndices: column {c.Index} not covered by remap (length {remap.Length})",
+                    nameof(remap))
+                : new ResolvedColumn(remap[c.Index], c.Type),
+            ResolvedBinary b => new ResolvedBinary(
+                b.Operator,
+                RemapColumnIndices(b.Left, remap),
+                RemapColumnIndices(b.Right, remap),
+                b.Type),
+            ResolvedUnary u => new ResolvedUnary(
+                u.Operator, RemapColumnIndices(u.Operand, remap), u.Type),
+            ResolvedIsNull isn => new ResolvedIsNull(
+                RemapColumnIndices(isn.Operand, remap), isn.Negated, isn.Type),
+            ResolvedCast cast => new ResolvedCast(
+                RemapColumnIndices(cast.Operand, remap), cast.Type),
+            ResolvedFunctionCall fn => new ResolvedFunctionCall(
+                fn.FunctionName,
+                RemapArgs(fn.Arguments, remap),
+                fn.Type),
+            _ => expr,
+        };
+
+        static List<ResolvedExpression> RemapArgs(IReadOnlyList<ResolvedExpression> args, int[] remap)
+        {
+            var list = new List<ResolvedExpression>(args.Count);
+            foreach (var a in args)
+            {
+                list.Add(RemapColumnIndices(a, remap));
+            }
+
+            return list;
+        }
+    }
+
+    /// <summary>
     /// Substitute each <see cref="ResolvedColumn"/>(i) reference in
     /// <paramref name="expr"/> with the expression
     /// <paramref name="projection"/>[i]. Used to push a predicate past a

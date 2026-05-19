@@ -5,7 +5,7 @@ using DbspNet.Sql.Plan;
 namespace DbspNet.Sql.Optimizer;
 
 /// <summary>
-/// Rule-based <see cref="LogicalPlan"/> rewriter. Currently implements two
+/// Rule-based <see cref="LogicalPlan"/> rewriter. Implements three
 /// families of optimizations:
 /// <list type="bullet">
 /// <item>
@@ -21,9 +21,20 @@ namespace DbspNet.Sql.Optimizer;
 /// <see cref="ProjectPlan"/>s fuse via expression substitution, eliminating
 /// the intermediate <c>MapRows</c>.
 /// </item>
+/// <item>
+/// <b>Aggregate-input column pruning.</b> Inserts a narrowing
+/// <see cref="ProjectPlan"/> between an <see cref="AggregatePlan"/> and
+/// its input when the input has more columns than the aggregate
+/// references (group keys + aggregate arguments). Shrinks the
+/// per-group multiset that <c>IncrementalAggregateOp</c> integrates
+/// per step. Sound under the linear emission gate landed alongside
+/// <c>CompositeAggregator.SumWeights()</c>; without that, the
+/// narrowing could change which groups emit (see
+/// project_projection_pushdown_blocked memory note).
+/// </item>
 /// </list>
-/// Not applied here: projection pruning (top-down column liveness),
-/// constant folding, and join reordering. See <c>docs/skipped.md</c>.
+/// Not yet applied: general top-down column liveness across joins,
+/// constant folding, join reordering. See <c>docs/skipped.md</c>.
 /// </summary>
 /// <remarks>
 /// The optimizer is an explicit pass — <see cref="PlanToCircuit.Compile"/>
@@ -93,6 +104,7 @@ public static class PlanOptimizer
         {
             FilterPlan f => SimplifyFilter(f),
             ProjectPlan p => SimplifyProject(p),
+            AggregatePlan a => NarrowAggregateInput(a),
             _ => withOptChildren,
         };
     }
@@ -274,5 +286,112 @@ public static class PlanOptimizer
         }
 
         return plan;
+    }
+
+    // ---------- Aggregate-input column pruning ----------
+
+    /// <summary>
+    /// Insert a narrowing <see cref="ProjectPlan"/> between
+    /// <paramref name="agg"/> and its input when the input carries
+    /// more columns than the aggregate references (group keys +
+    /// aggregate arguments). The aggregate's per-group multiset is
+    /// then built over those narrower rows, shrinking the per-tick
+    /// cost in <c>IncrementalAggregateOp</c> at large N.
+    /// </summary>
+    /// <remarks>
+    /// Sound only when every aggregate in the call list is
+    /// <i>linear</i> in the Z-set weights: COUNT(*), COUNT(col),
+    /// SUM, AVG. <c>MIN</c> and <c>MAX</c> are non-linear — they
+    /// depend on which distinct values have positive weight, not on
+    /// the weight sum — so narrowing can drop value-presence (two
+    /// rows that share the kept columns but differ on dropped ones
+    /// and have cancelling weights project to a single zero-weight
+    /// entry, removing a value MIN/MAX would otherwise have seen).
+    /// We skip the rewrite when any aggregate is MIN/MAX to keep
+    /// optimizer-vs-batch parity.
+    /// </remarks>
+    private static LogicalPlan NarrowAggregateInput(AggregatePlan agg)
+    {
+        // Bail on MIN/MAX: narrowing can change which distinct
+        // values are visible to those aggregators.
+        foreach (var call in agg.Aggregates)
+        {
+            if (call.Kind is AggregateKind.Min or AggregateKind.Max)
+            {
+                return agg;
+            }
+        }
+
+        // Collect every input column the aggregate references.
+        var used = new HashSet<int>();
+        foreach (var g in agg.GroupKeys)
+        {
+            used.UnionWith(ExpressionRewriter.CollectColumnIndices(g));
+        }
+
+        foreach (var call in agg.Aggregates)
+        {
+            if (call.Argument is not null)
+            {
+                used.UnionWith(ExpressionRewriter.CollectColumnIndices(call.Argument));
+            }
+        }
+
+        var inputCount = agg.Input.Schema.Count;
+        if (used.Count >= inputCount)
+        {
+            // Aggregate already uses every input column.
+            return agg;
+        }
+
+        // Canonical kept-cols order: ascending by original index.
+        // Deterministic, easy to inspect.
+        var keepCols = used.OrderBy(i => i).ToList();
+
+        var remap = new int[inputCount];
+        for (var i = 0; i < remap.Length; i++)
+        {
+            remap[i] = -1;
+        }
+
+        for (var newIdx = 0; newIdx < keepCols.Count; newIdx++)
+        {
+            remap[keepCols[newIdx]] = newIdx;
+        }
+
+        // Build the narrowing projection: each kept column becomes
+        // an identity ResolvedColumn at its new index.
+        var keptColumns = new List<SchemaColumn>(keepCols.Count);
+        var projections = new List<ProjectionItem>(keepCols.Count);
+        foreach (var origIdx in keepCols)
+        {
+            var col = agg.Input.Schema[origIdx];
+            keptColumns.Add(col);
+            projections.Add(new ProjectionItem(
+                new ResolvedColumn(origIdx, col.Type), col.Name, col.Qualifier));
+        }
+
+        var narrowingProject = new ProjectPlan(agg.Input, projections, new Schema(keptColumns));
+
+        // Remap the aggregate's column references into the new
+        // input column space.
+        var newGroupKeys = new List<ResolvedExpression>(agg.GroupKeys.Count);
+        foreach (var g in agg.GroupKeys)
+        {
+            newGroupKeys.Add(ExpressionRewriter.RemapColumnIndices(g, remap));
+        }
+
+        var newAggregates = new List<AggregateCall>(agg.Aggregates.Count);
+        foreach (var call in agg.Aggregates)
+        {
+            var newArg = call.Argument is null
+                ? null
+                : ExpressionRewriter.RemapColumnIndices(call.Argument, remap);
+            newAggregates.Add(new AggregateCall(call.Kind, newArg, call.ResultType));
+        }
+
+        // The aggregate's output schema is unchanged — group-key
+        // and aggregate-result types are preserved by the remap.
+        return new AggregatePlan(narrowingProject, newGroupKeys, newAggregates, agg.Schema);
     }
 }
