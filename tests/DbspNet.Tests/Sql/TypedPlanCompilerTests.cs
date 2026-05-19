@@ -41,11 +41,13 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void TryCompile_RejectsPlansBeyondBareScan()
+    public void TryCompile_RejectsPlansBeyondScanFilterProject()
     {
+        // GROUP BY introduces an AggregatePlan between scan and the
+        // top-level Project — still outside the Phase 1.3 plan shapes.
         var plan = CompilePlan(
-            ["CREATE TABLE t (id INT NOT NULL, name VARCHAR NOT NULL)"],
-            "SELECT id FROM t WHERE id > 0");
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a, COUNT(*) FROM t GROUP BY a");
 
         var ok = TypedPlanCompiler.TryCompile(plan, out var typed);
         Assert.False(ok);
@@ -191,11 +193,42 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void Project_RejectsNonColumnProjection()
+    public void Project_Arithmetic_OnInt()
     {
         var plan = CompilePlan(
             ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
-            "SELECT a + 1 FROM t");
+            "SELECT a + b, a * 2 FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(3, 4);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(7, 6).Value);
+    }
+
+    [Fact]
+    public void Project_Comparison_ReturnsBool()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a > b FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(5, 3);
+        typed.Table("t").Insert(2, 7);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(true).Value);
+        Assert.Equal(1L, typed.WeightOf(false).Value);
+    }
+
+    [Fact]
+    public void Project_RejectsExpressionsWithFunctionCalls()
+    {
+        // ABS is a function call — outside TypedExpressionCompiler's scope.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL)"],
+            "SELECT ABS(a) FROM t");
 
         Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
         Assert.Null(typed);
@@ -278,6 +311,115 @@ public class TypedPlanCompilerTests
             for (var a = 0; a <= 3; a++)
             {
                 for (var b = 0; b <= 30; b += 10)
+                {
+                    Assert.Equal(
+                        structural.WeightOf(a, b).Value,
+                        typed.WeightOf(a, b).Value);
+                }
+            }
+        }
+    }
+
+    // ----- Filter -----
+
+    [Fact]
+    public void Filter_ColumnComparedToLiteral()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT * FROM t WHERE a > 5");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(3, 10);   // dropped
+        typed.Table("t").Insert(6, 20);    // kept
+        typed.Table("t").Insert(7, 30);    // kept
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(3, 10).Value);
+        Assert.Equal(1L, typed.WeightOf(6, 20).Value);
+        Assert.Equal(1L, typed.WeightOf(7, 30).Value);
+    }
+
+    [Fact]
+    public void Filter_AndOfTwoComparisons()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT * FROM t WHERE a > 0 AND b < 100");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(0, 50);    // a > 0 fails
+        typed.Table("t").Insert(5, 200);    // b < 100 fails
+        typed.Table("t").Insert(5, 50);     // both ok
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(0, 50).Value);
+        Assert.Equal(0L, typed.WeightOf(5, 200).Value);
+        Assert.Equal(1L, typed.WeightOf(5, 50).Value);
+    }
+
+    [Fact]
+    public void Filter_OnVarcharEquality()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (id INT NOT NULL, name VARCHAR NOT NULL)"],
+            "SELECT * FROM t WHERE name = 'alice'");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, "alice");
+        typed.Table("t").Insert(2, "bob");
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, "alice").Value);
+        Assert.Equal(0L, typed.WeightOf(2, "bob").Value);
+    }
+
+    [Fact]
+    public void Filter_WithProjection()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT b FROM t WHERE a > 0");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Equal(1, typed!.OutputSchema.Count);
+        typed.Table("t").Insert(0, 99);    // filtered out
+        typed.Table("t").Insert(1, 10);
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(99).Value);
+        Assert.Equal(1L, typed.WeightOf(10).Value);
+    }
+
+    [Fact]
+    public void Filter_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT a, b FROM t WHERE a > 0 AND b < 100";
+        var planTyped = CompilePlan(["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"], sql);
+        var planStructural = CompilePlan(["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"], sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new[]
+        {
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 0, 50 }, 1L),
+            (new object?[] { 5, 200 }, 1L),
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 1, 10 }, -1L),
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            foreach (var a in new[] { 0, 1, 5 })
+            {
+                foreach (var b in new[] { 10, 50, 200 })
                 {
                     Assert.Equal(
                         structural.WeightOf(a, b).Value,
