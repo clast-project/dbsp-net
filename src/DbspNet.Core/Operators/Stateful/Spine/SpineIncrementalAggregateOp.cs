@@ -122,6 +122,10 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
 
             var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
 
+            // Cache-pruning keyed on dict-shape IsEmpty (no trace
+            // entries) — see the matching comment in
+            // IncrementalAggregateOp.Step for why the linear gate
+            // can't be used here.
             if (afterGroup.IsEmpty)
             {
                 _aggCache.Remove(key);

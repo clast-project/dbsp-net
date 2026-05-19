@@ -112,6 +112,15 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
             var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
 
+            // Cache-pruning is keyed on "is there literally no trace
+            // entry?" (dict-shape IsEmpty), not on the aggregator's
+            // linear "group is present" gate. The aggregator's
+            // per-key state (e.g. SqlSumAggregator.DistinctNonNullRows)
+            // tracks weight transitions across ticks and must persist
+            // for cancelling-weight groups where the trace still has
+            // entries but the sum is zero. The emission decision
+            // (retract vs emit) is handled separately by the
+            // oldAgg/newAgg comparison below.
             if (afterGroup.IsEmpty)
             {
                 _aggCache.Remove(key);

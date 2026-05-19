@@ -604,7 +604,15 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
     public Optional<StructuralRow> Compute(ZSet<StructuralRow, Z64> multiset)
     {
         ArgumentNullException.ThrowIfNull(multiset);
-        if (multiset.IsEmpty)
+        // Linear-preserving emission gate (DBSP paper §7.2-7.4 plus
+        // Feldera's Aggregator trait contract: "return None if the
+        // total weight of each key is zero"). The dict-shape
+        // IsEmpty check that was here before broke linearity — two
+        // Z-sets equal under DBSP arithmetic could give different
+        // answers — blocking projection pushdown. See the memory
+        // note project_projection_pushdown_blocked for the full
+        // diagnosis.
+        if (Z64.IsZero(multiset.SumWeights()))
         {
             return Optional<StructuralRow>.None;
         }
@@ -626,11 +634,12 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
     {
         ArgumentNullException.ThrowIfNull(delta);
         ArgumentNullException.ThrowIfNull(afterMultiset);
-        if (afterMultiset.IsEmpty)
-        {
-            return Optional<StructuralRow>.None;
-        }
 
+        // Always advance the sub-aggregators' per-key state — they
+        // track weight transitions across ticks (e.g.
+        // SqlSumAggregator.DistinctNonNullRows) and would corrupt
+        // if we short-circuited on the linear emission gate. The
+        // gate is applied to the *output wrapping* below.
         var subStates = state as object?[] ?? new object?[_aggs.Count];
         var results = new object?[_aggs.Count];
         for (var i = 0; i < _aggs.Count; i++)
@@ -642,6 +651,16 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
         }
 
         state = subStates;
+
+        // Linear-preserving emission gate (DBSP paper §7.2-7.4 +
+        // Feldera's Aggregator trait: "return None if the total
+        // weight of each key is zero"). See the matching note in
+        // Compute above.
+        if (Z64.IsZero(afterMultiset.SumWeights()))
+        {
+            return Optional<StructuralRow>.None;
+        }
+
         return Optional<StructuralRow>.Some(_codec.BuildRow(_outputSchema, results));
     }
 }

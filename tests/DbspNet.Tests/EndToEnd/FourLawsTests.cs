@@ -79,14 +79,17 @@ public class FourLawsTests
 
     // Group-by oracle for SUM over a single numeric column.
     //
-    // DBSP aggregate semantics: the per-group multiset is keyed by FULL ROW
-    // (matching how the compiler wires GroupProject(row => row) into the
-    // IncrementalAggregate operator). A group is emitted whenever its
-    // sub-Z-set is non-empty — i.e. has at least one non-zero-weight row —
-    // NOT whenever the net row-count weight is positive. For example,
-    // joined rows {(1,6,1,"r"):-1, (2,6,2,"r"):+1} form a non-empty group
-    // whose SUM(amount) happens to be zero, and the circuit emits
-    // ("r", 0) as the correct Z-set-algebraic answer.
+    // DBSP aggregate emission: a group is emitted iff its per-group sum of
+    // weights is non-zero — the linear-preserving criterion. This matches
+    // the DBSP paper §7.2-7.4 ("aggregation function maps empty Z-sets to
+    // zeros") and Feldera's Aggregator trait contract ("return None if
+    // the total weight of each key is zero"). The criterion is needed
+    // because aggregate emission is a function of the Z-set's mathematical
+    // value, not its dictionary representation — without it, equal Z-sets
+    // produce different output, and projection pushdown breaks. (Earlier
+    // versions of this comment defended dict-shape IsEmpty as "the
+    // correct Z-set-algebraic answer"; that was wrong by reference to
+    // the paper authors' own implementation.)
     private static ZSet<StructuralRow, Z64> GroupBySumOracle(
         ZSet<StructuralRow, Z64> input, int groupIndex, int valueIndex)
     {
@@ -107,7 +110,7 @@ public class FourLawsTests
         foreach (var (g, builder) in groups)
         {
             var sub = builder.Build();
-            if (sub.IsEmpty)
+            if (Z64.IsZero(sub.SumWeights()))
             {
                 continue;
             }
@@ -442,12 +445,20 @@ public class FourLawsTests
             var netT = IncrementalOracle.NetTable(allEvents, "t");
             var netThresh = IncrementalOracle.NetTable(allEvents, "thresh");
 
-            // Oracle: compute MAX(v) over thresh (respecting Z-set weights for
-            // "row presence"), filter t by x > MAX. Empty thresh → MAX is NULL
-            // → comparison is NULL → row filtered out.
+            // Oracle: compute MAX(v) over thresh, filter t by x > MAX.
+            // Two gates per Feldera's Aggregator trait contract:
+            //   1. The outer linear gate: MAX returns NULL whenever the
+            //      thresh multiset's sum of weights is zero (even if
+            //      positive-weight rows exist there).
+            //   2. The inner per-row criterion: MAX considers only
+            //      positive-weight rows when the multiset does emit.
+            // Empty/zero-sum thresh → MAX is NULL → comparison is NULL →
+            // row filtered out.
+            var threshSum = 0L;
             int? batchMax = null;
             foreach (var (row, w) in netThresh)
             {
+                threshSum += w.Value;
                 if (!Z64.IsPositive(w))
                 {
                     continue;
@@ -458,6 +469,11 @@ public class FourLawsTests
                 {
                     batchMax = v;
                 }
+            }
+
+            if (threshSum == 0)
+            {
+                batchMax = null;
             }
 
             var b = new ZSetBuilder<StructuralRow, Z64>();

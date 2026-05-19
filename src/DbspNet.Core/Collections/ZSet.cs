@@ -28,6 +28,29 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IEnum
     public bool IsEmpty => _entries.Count == 0;
 
     /// <summary>
+    /// Sum of every entry's weight. Z-set-linear alternative to
+    /// <see cref="IsEmpty"/> when an operator needs a "group is
+    /// present" check that doesn't depend on the dictionary's
+    /// representation. <see cref="IsEmpty"/> (dict-shape) can
+    /// disagree with <c>SumWeights == Zero</c> (linear) when the
+    /// underlying multiset has cancelling entries — e.g.
+    /// <c>{r1:+1, r2:-1}</c> has 2 dict entries but sum 0. Linear
+    /// aggregators (per the DBSP paper §7.2-7.4 and Feldera's
+    /// <c>Aggregator</c> trait contract) suppress emission iff the
+    /// per-group sum of weights is zero.
+    /// </summary>
+    public TWeight SumWeights()
+    {
+        var sum = TWeight.Zero;
+        foreach (var (_, w) in _entries)
+        {
+            sum = TWeight.Add(sum, w);
+        }
+
+        return sum;
+    }
+
+    /// <summary>
     /// Returns the weight of <paramref name="key"/>, or <c>Zero</c> if absent.
     /// </summary>
     public TWeight WeightOf(TKey key) =>

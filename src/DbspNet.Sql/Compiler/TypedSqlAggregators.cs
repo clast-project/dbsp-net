@@ -18,12 +18,14 @@ namespace DbspNet.Sql.Compiler;
 /// aggregators' NULL-skip logic (e.g. <c>SqlSumAggregator</c>'s
 /// <c>DistinctNonNullRows</c> tracking) to nothing — Update state is
 /// just the running accumulator.</para>
-/// <para><b>Empty-group handling.</b> <see cref="IncrementalAggregateOp"/>
-/// already drops empty groups before the aggregator is consulted (via
-/// the <c>after.IsEmpty</c> short-circuit inside
-/// <see cref="TypedCompositeAggregator{TIn,TAgg}"/>), so SQL's "SUM
-/// over empty group = NULL" semantics never arise on the typed
-/// path.</para>
+/// <para><b>Empty-group handling.</b>
+/// <see cref="TypedCompositeAggregator{TIn,TAgg}"/> short-circuits to
+/// <see cref="Optional{TAgg}.None"/> whenever the per-group
+/// multiset's sum of weights is zero — the linear-preserving "group
+/// is present" gate per the DBSP paper §7.2-7.4 and Feldera's
+/// <c>Aggregator</c> trait contract. SQL's "SUM over empty group =
+/// NULL" semantics never reach the typed aggregators because the
+/// gate fires first.</para>
 /// </remarks>
 internal abstract class TypedSqlAggregator<TIn>
     where TIn : notnull
@@ -444,7 +446,7 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
 
     public Optional<TAgg> Compute(ZSet<TIn, Z64> multiset)
     {
-        if (multiset.IsEmpty)
+        if (Z64.IsZero(multiset.SumWeights()))
         {
             return Optional<TAgg>.None;
         }
@@ -464,11 +466,11 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
         ZSet<TIn, Z64> delta,
         ZSet<TIn, Z64> afterMultiset)
     {
-        if (afterMultiset.IsEmpty)
-        {
-            return Optional<TAgg>.None;
-        }
-
+        // Advance the sub-aggregators' state unconditionally — they
+        // track weight transitions across ticks; short-circuiting on
+        // the linear emission gate would corrupt that bookkeeping
+        // for cancelling-weight groups. The gate applies to the
+        // output wrapping below.
         var subStates = state as object?[] ?? new object?[_aggs.Length];
         var results = new object?[_aggs.Length];
         for (var i = 0; i < _aggs.Length; i++)
@@ -479,6 +481,12 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
         }
 
         state = subStates;
+
+        if (Z64.IsZero(afterMultiset.SumWeights()))
+        {
+            return Optional<TAgg>.None;
+        }
+
         return Optional<TAgg>.Some(_packResults(results));
     }
 }

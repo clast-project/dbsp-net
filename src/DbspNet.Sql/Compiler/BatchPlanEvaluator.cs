@@ -278,7 +278,10 @@ internal static class BatchPlanEvaluator
     {
         // Mirrors CompositeAggregator inside IncrementalAggregate: per-group
         // multiset keyed by FULL ROW, fresh aggregate evaluation per group.
-        // A group is emitted iff its row-multiset Z-set is non-empty.
+        // Linear-preserving emission gate (matches CompositeAggregator): a
+        // group is emitted iff the sum of weights in its row-multiset is
+        // non-zero, per the DBSP paper §7.2-7.4 and Feldera's Aggregator
+        // trait contract.
         var input = Evaluate(plan.Input, ctx);
 
         var groupIndices = new int[plan.GroupKeys.Count];
@@ -321,7 +324,7 @@ internal static class BatchPlanEvaluator
         foreach (var (key, gb) in groups)
         {
             var groupZSet = gb.Build();
-            if (groupZSet.IsEmpty)
+            if (Z64.IsZero(groupZSet.SumWeights()))
             {
                 continue;
             }
