@@ -505,14 +505,51 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void Aggregate_RejectsDecimalSum()
+    public void Aggregate_DecimalAvg()
     {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v DECIMAL(10, 2) NOT NULL)"],
+            "SELECT k, AVG(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, new Clast.DatabaseDecimal.Values.Decimal128(100));   // 1.00
+        typed.Table("t").Insert(1, new Clast.DatabaseDecimal.Values.Decimal128(200));   // 2.00
+        typed.Table("t").Insert(1, new Clast.DatabaseDecimal.Values.Decimal128(300));   // 3.00
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, new Clast.DatabaseDecimal.Values.Decimal128(200)).Value);
+    }
+
+    [Fact]
+    public void Filter_OnDecimalColumn()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (id INT NOT NULL, amt DECIMAL(10, 2) NOT NULL)"],
+            "SELECT id FROM t WHERE amt > CAST(5 AS DECIMAL(10, 2))");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, new Clast.DatabaseDecimal.Values.Decimal128(300));   // 3.00 — filtered
+        typed.Table("t").Insert(2, new Clast.DatabaseDecimal.Values.Decimal128(750));   // 7.50 — kept
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(1).Value);
+        Assert.Equal(1L, typed.WeightOf(2).Value);
+    }
+
+    [Fact]
+    public void Aggregate_DecimalSum()
+    {
+        // Phase 1.8: SUM(DECIMAL) is in scope.
         var plan = CompilePlan(
             ["CREATE TABLE t (k INT NOT NULL, v DECIMAL(10, 2) NOT NULL)"],
             "SELECT k, SUM(v) FROM t GROUP BY k");
 
-        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
-        Assert.Null(typed);
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, new Clast.DatabaseDecimal.Values.Decimal128(150));   // 1.50
+        typed.Table("t").Insert(1, new Clast.DatabaseDecimal.Values.Decimal128(250));    // 2.50
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, new Clast.DatabaseDecimal.Values.Decimal128(400)).Value);
     }
 
     [Fact]

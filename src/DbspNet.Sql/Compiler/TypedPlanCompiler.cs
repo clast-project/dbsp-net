@@ -492,8 +492,9 @@ public static class TypedPlanCompiler
     /// </summary>
     private static object? BuildTypedAggregator(AggregateCall call, Type inputRowType)
     {
-        if (call.ResultType is SqlDecimalType) return null;
-
+        // Decimal-typed results are now in scope (Phase 1.8) via the
+        // typed decimal aggregators. Per-Kind dispatch below decides
+        // whether the (kind, result-type) combination is supported.
         switch (call.Kind)
         {
             case AggregateKind.CountStar:
@@ -559,20 +560,41 @@ public static class TypedPlanCompiler
             return Activator.CreateInstance(closed, widened);
         }
 
+        if (call.ResultType is SqlDecimalType)
+        {
+            // Arg must already be Decimal128 — SUM only widens within
+            // the decimal family by adjusting precision, not by
+            // promoting non-decimal operands.
+            if (resultClr != typeof(Clast.DatabaseDecimal.Values.Decimal128)) return null;
+            var open = typeof(TypedSumDecimalAggregator<>);
+            var closed = open.MakeGenericType(inputRowType);
+            return Activator.CreateInstance(closed, argExtract);
+        }
+
         return null;
     }
 
     private static object? BuildAvgAggregator(AggregateCall call, Type inputRowType)
     {
         if (call.Argument is null) return null;
-        // AVG always produces a double-running-total aggregator
-        // (decimal AVG is gated above). Recompile the arg expression
-        // widened to double.
+        var argExtract = BuildTypedScalarDelegate(call.Argument, inputRowType, out var resultClr);
+        if (argExtract is null) return null;
+
+        if (call.ResultType is SqlDecimalType)
+        {
+            if (resultClr != typeof(Clast.DatabaseDecimal.Values.Decimal128)) return null;
+            var open = typeof(TypedAvgDecimalAggregator<>);
+            var closed = open.MakeGenericType(inputRowType);
+            return Activator.CreateInstance(closed, argExtract);
+        }
+
+        // Non-decimal AVG always produces a double-running-total
+        // aggregator. Recompile the arg expression widened to double.
         var widened = RecompileWidened(call.Argument, inputRowType, typeof(double));
         if (widened is null) return null;
-        var open = typeof(TypedAvgDoubleAggregator<>);
-        var closed = open.MakeGenericType(inputRowType);
-        return Activator.CreateInstance(closed, widened);
+        var avgOpen = typeof(TypedAvgDoubleAggregator<>);
+        var avgClosed = avgOpen.MakeGenericType(inputRowType);
+        return Activator.CreateInstance(avgClosed, widened);
     }
 
     /// <summary>

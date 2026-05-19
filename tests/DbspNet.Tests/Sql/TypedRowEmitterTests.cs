@@ -124,6 +124,33 @@ public class TypedRowEmitterTests
     }
 
     [Fact]
+    public void Decimal128ColumnSupported()
+    {
+        // Decimal128 is a value type with op_Equality, so it picks up
+        // the EmitFieldEqualityCheck value-type fallback automatically.
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("amt", new SqlDecimalType(10, 2, false)),
+        });
+        var type = TypedRowEmitter.EmitRowType(schema);
+        Assert.NotNull(type);
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+        var getters = TypedRowEmitter.BuildFieldGetters(schema)!;
+
+        var v = new Clast.DatabaseDecimal.Values.Decimal128(12345);
+        var row = factory(new object?[] { v });
+        Assert.Equal(v, getters[0](row));
+
+        // Equality by value, used as a HashSet key.
+        var a = factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(100) });
+        var b = factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(100) });
+        var c = factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(101) });
+        Assert.True(a.Equals(b));
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+        Assert.False(a.Equals(c));
+    }
+
+    [Fact]
     public void TypedFieldsCtorBuildsEquivalentInstance()
     {
         // The typed-fields ctor (Ti, Tj, ...) feeds the Phase 1.2+ typed

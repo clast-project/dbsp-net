@@ -1,6 +1,8 @@
+using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Aggregators;
+using DbspNet.Sql.Expressions;
 
 namespace DbspNet.Sql.Compiler;
 
@@ -143,6 +145,101 @@ internal sealed class TypedSumDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 
         state = s;
         return s;
+    }
+}
+
+/// <summary>
+/// <c>SUM</c>-of-non-null with a <see cref="Decimal128"/> running
+/// total. Like the structural variant, accumulates in <see cref="Int256"/>
+/// so per-row <c>mantissa × weight</c> can't silently wrap; narrows
+/// back to <see cref="Decimal128"/> at output via
+/// <see cref="DecimalRuntime.NarrowToDecimal128"/> (which throws
+/// <see cref="OverflowException"/> if the running total exceeds
+/// Int128 capacity).
+/// </summary>
+internal sealed class TypedSumDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, Decimal128> _argExtract;
+
+    public TypedSumDecimalAggregator(Func<TIn, Decimal128> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    public override Type ResultClrType => typeof(Decimal128);
+
+    public override object Compute(ZSet<TIn, Z64> rows)
+    {
+        Int256 sum = Int256.Zero;
+        foreach (var (row, w) in rows)
+        {
+            sum += (Int256)_argExtract(row).Mantissa * w.Value;
+        }
+
+        return DecimalRuntime.NarrowToDecimal128(sum);
+    }
+
+    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state is Int256 prior ? prior : Int256.Zero;
+        foreach (var (row, w) in delta)
+        {
+            s += (Int256)_argExtract(row).Mantissa * w.Value;
+        }
+
+        state = s;
+        return DecimalRuntime.NarrowToDecimal128(s);
+    }
+}
+
+/// <summary>
+/// <c>AVG</c>-of-non-null over a DECIMAL column. State is sum +
+/// count (in <see cref="Int256"/> to handle the same overflow case
+/// SUM does); result rescales to the column's scale at output.
+/// </summary>
+internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, Decimal128> _argExtract;
+
+    public TypedAvgDecimalAggregator(Func<TIn, Decimal128> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class AvgState
+    {
+        public Int256 Sum;
+        public long Count;
+    }
+
+    public override Type ResultClrType => typeof(Decimal128);
+
+    public override object Compute(ZSet<TIn, Z64> rows)
+    {
+        Int256 sum = Int256.Zero;
+        long count = 0;
+        foreach (var (row, w) in rows)
+        {
+            sum += (Int256)_argExtract(row).Mantissa * w.Value;
+            count += w.Value;
+        }
+
+        return DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
+    }
+
+    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as AvgState ?? new AvgState();
+        foreach (var (row, w) in delta)
+        {
+            s.Sum += (Int256)_argExtract(row).Mantissa * w.Value;
+            s.Count += w.Value;
+        }
+
+        state = s;
+        return DecimalRuntime.NarrowToDecimal128(s.Sum / (Int256)s.Count);
     }
 }
 

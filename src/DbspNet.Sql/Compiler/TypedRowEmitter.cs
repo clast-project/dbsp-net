@@ -145,7 +145,8 @@ public static class TypedRowEmitter
     private static bool IsSupportedClrType(Type t) =>
         t == typeof(int) || t == typeof(long) || t == typeof(double)
         || t == typeof(bool) || t == typeof(string)
-        || t == typeof(Utf8String);
+        || t == typeof(Utf8String)
+        || t == typeof(Clast.DatabaseDecimal.Values.Decimal128);
 
     private static Type BuildTypeFor(Fingerprint fp)
     {
