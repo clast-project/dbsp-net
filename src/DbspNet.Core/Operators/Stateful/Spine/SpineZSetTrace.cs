@@ -149,6 +149,39 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     public int LevelCount => _levels.Count;
 
     /// <summary>
+    /// Snapshots each non-empty batch's entries as a fresh
+    /// <see cref="ZSet{TKey,TWeight}"/>, level structure flattened.
+    /// Used by the per-batch snapshot path: each returned Z-set is
+    /// serialised as its own snapshot file, so on load the trace can
+    /// reconstitute by integrating one batch at a time rather than
+    /// flattening through <see cref="Materialize"/>.
+    /// </summary>
+    public IReadOnlyList<ZSet<TKey, TWeight>> GetBatches()
+    {
+        var result = new List<ZSet<TKey, TWeight>>(BatchCount);
+        foreach (var level in _levels)
+        {
+            foreach (var batch in level)
+            {
+                if (batch.IsEmpty)
+                {
+                    continue;
+                }
+
+                var b = new ZSetBuilder<TKey, TWeight>();
+                foreach (var (k, w) in batch.Entries())
+                {
+                    b.Add(k, w);
+                }
+
+                result.Add(b.Build());
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Read-only view of the current per-level batch sizes. Exposed for
     /// tests / benchmarks; not part of the trace's runtime contract.
     /// </summary>

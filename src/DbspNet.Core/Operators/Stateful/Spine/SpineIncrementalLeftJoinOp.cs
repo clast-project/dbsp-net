@@ -23,9 +23,6 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
     where TOut : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private const string LeftTraceFile = "left.arrows";
-    private const string RightTraceFile = "right.arrows";
-
     private readonly Stream<IndexedZSet<TKey, TLeft, TWeight>> _leftIn;
     private readonly Stream<IndexedZSet<TKey, TRight, TWeight>> _rightIn;
     private readonly Stream<ZSet<TOut, TWeight>> _output;
@@ -69,8 +66,17 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
                 "SpineIncrementalLeftJoinOp was constructed without snapshot codecs.");
         }
 
-        await _leftSnapshotCodec.SaveAsync(writer, LeftTraceFile, _leftTrace.Materialize(), cancellationToken).ConfigureAwait(false);
-        await _rightSnapshotCodec.SaveAsync(writer, RightTraceFile, _rightTrace.Materialize(), cancellationToken).ConfigureAwait(false);
+        await SpineSnapshot.SaveAsync(
+            writer, prefix: "left",
+            batches: _leftTrace.GetBatches(),
+            saveOne: (name, batch) => _leftSnapshotCodec.SaveAsync(writer, name, batch, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+
+        await SpineSnapshot.SaveAsync(
+            writer, prefix: "right",
+            batches: _rightTrace.GetBatches(),
+            saveOne: (name, batch) => _rightSnapshotCodec.SaveAsync(writer, name, batch, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -81,8 +87,23 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
                 "SpineIncrementalLeftJoinOp was constructed without snapshot codecs.");
         }
 
-        _leftTrace.Integrate(await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false));
-        _rightTrace.Integrate(await _rightSnapshotCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false));
+        await SpineSnapshot.LoadAsync(
+            reader, prefix: "left",
+            loadOne: async name =>
+            {
+                var batch = await _leftSnapshotCodec.LoadAsync(reader, name, cancellationToken).ConfigureAwait(false);
+                _leftTrace.Integrate(batch);
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        await SpineSnapshot.LoadAsync(
+            reader, prefix: "right",
+            loadOne: async name =>
+            {
+                var batch = await _rightSnapshotCodec.LoadAsync(reader, name, cancellationToken).ConfigureAwait(false);
+                _rightTrace.Integrate(batch);
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     public string SchemaFingerprint =>

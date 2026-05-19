@@ -67,13 +67,15 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
                 "to CircuitBuilder.SpineDistinct to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        // Spine snapshots flatten to a single ZSet at save time so the
-        // existing trace-codec contract is unchanged. Per-batch snapshot
-        // writes are a later phase.
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Materialize(), cancellationToken);
+        return SpineSnapshot.SaveAsync(
+            writer,
+            prefix: "trace",
+            batches: _trace.GetBatches(),
+            saveOne: (name, batch) => _snapshotCodec.SaveAsync(writer, name, batch, cancellationToken),
+            cancellationToken);
     }
 
-    public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
+    public ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
         {
@@ -81,8 +83,15 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
                 "SpineDistinctOp was constructed without a snapshot codec.");
         }
 
-        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
-        _trace.Integrate(loaded);
+        return SpineSnapshot.LoadAsync(
+            reader,
+            prefix: "trace",
+            loadOne: async name =>
+            {
+                var batch = await _snapshotCodec.LoadAsync(reader, name, cancellationToken).ConfigureAwait(false);
+                _trace.Integrate(batch);
+            },
+            cancellationToken);
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;

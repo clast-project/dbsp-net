@@ -57,7 +57,12 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
                 "SpineIncrementalAggregateOp was constructed without a snapshot codec.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Materialize(), cancellationToken);
+        return SpineSnapshot.SaveAsync(
+            writer,
+            prefix: "trace",
+            batches: _trace.GetBatches(),
+            saveOne: (name, batch) => _snapshotCodec.SaveAsync(writer, name, batch, cancellationToken),
+            cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -68,8 +73,15 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
                 "SpineIncrementalAggregateOp was constructed without a snapshot codec.");
         }
 
-        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
-        _trace.Integrate(loaded);
+        await SpineSnapshot.LoadAsync(
+            reader,
+            prefix: "trace",
+            loadOne: async name =>
+            {
+                var batch = await _snapshotCodec.LoadAsync(reader, name, cancellationToken).ConfigureAwait(false);
+                _trace.Integrate(batch);
+            },
+            cancellationToken).ConfigureAwait(false);
 
         // Rebuild the per-group caches from the restored trace. Same
         // logic as IncrementalAggregateOp.LoadAsync — see the flat op

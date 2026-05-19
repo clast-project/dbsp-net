@@ -157,6 +157,39 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     /// <summary>Number of levels currently allocated.</summary>
     public int LevelCount => _levels.Count;
 
+    /// <summary>
+    /// Snapshots each non-empty batch's entries as a fresh
+    /// <see cref="IndexedZSet{TKey,TValue,TWeight}"/>, level structure
+    /// flattened. Used by the per-batch snapshot path.
+    /// </summary>
+    public IReadOnlyList<IndexedZSet<TKey, TValue, TWeight>> GetBatches()
+    {
+        var result = new List<IndexedZSet<TKey, TValue, TWeight>>(BatchCount);
+        foreach (var level in _levels)
+        {
+            foreach (var batch in level)
+            {
+                if (batch.IsEmpty)
+                {
+                    continue;
+                }
+
+                var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+                foreach (var (k, group) in batch.Entries())
+                {
+                    foreach (var (v, w) in group)
+                    {
+                        b.Add(k, v, w);
+                    }
+                }
+
+                result.Add(b.Build());
+            }
+        }
+
+        return result;
+    }
+
     internal SpineState State => SnapshotState();
 
     private SpineState SnapshotState()
