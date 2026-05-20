@@ -167,6 +167,98 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Recursive_StandaloneTryCompileBails()
+    {
+        // Standalone mode doesn't have ctx.StructuralScans to feed
+        // the structural recursive op; only the boundary-adapter
+        // path (PlanToCircuit) supports it. TryCompile must fall
+        // back cleanly so PlanToCircuit can route to structural.
+        var plan = CompilePlan(
+            ["CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)"],
+            "WITH RECURSIVE reach AS (" +
+            "  SELECT src, dst FROM edges " +
+            "  UNION ALL " +
+            "  SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src) " +
+            "SELECT src, dst FROM reach");
+
+        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
+        Assert.Null(typed);
+    }
+
+    [Fact]
+    public void Recursive_BoundaryAdapter_TransitiveClosure_MatchesStructural()
+    {
+        // PlanToCircuit's typed fast path goes through
+        // TryCompileWithStructuralBoundary (which DOES have
+        // StructuralScans). The recursive op stays structural
+        // internally; output is MapRows-lifted to typed for the
+        // surrounding pipeline. End-to-end behavior should match
+        // a pure-structural compile.
+        const string sql =
+            "WITH RECURSIVE reach AS (" +
+            "  SELECT src, dst FROM edges " +
+            "  UNION ALL " +
+            "  SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src) " +
+            "SELECT src, dst FROM reach";
+        var ddl = new[] { "CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)" };
+
+        var qTyped = PlanToCircuit.Compile(CompilePlan(ddl, sql));
+        var qStruct = PlanToCircuit.Compile(
+            CompilePlan(ddl, sql),
+            DbspNet.Sql.Compiler.EmittedEqualityCodec.Instance);  // non-default codec → forces structural compile path
+
+        var edges = new[] { (1, 2), (2, 3), (3, 4), (2, 5) };
+        foreach (var (src, dst) in edges)
+        {
+            qTyped.Table("edges").Insert(src, dst);
+            qStruct.Table("edges").Insert(src, dst);
+        }
+        qTyped.Step();
+        qStruct.Step();
+
+        // Spot-check several known-reachable pairs.
+        object?[][] pairs = [[1, 2], [2, 3], [3, 4], [2, 5], [1, 3], [1, 4], [1, 5], [2, 4]];
+        foreach (var p in pairs)
+        {
+            Assert.Equal(qStruct.WeightOf(p).Value, qTyped.WeightOf(p).Value);
+        }
+        Assert.Equal(qStruct.Current.Count, qTyped.Current.Count);
+    }
+
+    [Fact]
+    public void Recursive_BoundaryAdapter_IncrementalDelta_MatchesStructural()
+    {
+        const string sql =
+            "WITH RECURSIVE reach AS (" +
+            "  SELECT src, dst FROM edges " +
+            "  UNION ALL " +
+            "  SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src) " +
+            "SELECT src, dst FROM reach";
+        var ddl = new[] { "CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)" };
+
+        var qTyped = PlanToCircuit.Compile(CompilePlan(ddl, sql));
+        var qStruct = PlanToCircuit.Compile(
+            CompilePlan(ddl, sql), DbspNet.Sql.Compiler.EmittedEqualityCodec.Instance);
+
+        // Tick 1: 1->2, 2->3 (chain)
+        qTyped.Table("edges").Insert(1, 2); qTyped.Table("edges").Insert(2, 3);
+        qStruct.Table("edges").Insert(1, 2); qStruct.Table("edges").Insert(2, 3);
+        qTyped.Step(); qStruct.Step();
+        Assert.Equal(qStruct.Current.Count, qTyped.Current.Count);
+
+        // Tick 2: add 3->4 (extends chain)
+        qTyped.Table("edges").Insert(3, 4);
+        qStruct.Table("edges").Insert(3, 4);
+        qTyped.Step(); qStruct.Step();
+
+        object?[][] pairs = [[1, 2], [2, 3], [1, 3], [3, 4], [2, 4], [1, 4]];
+        foreach (var p in pairs)
+        {
+            Assert.Equal(qStruct.WeightOf(p).Value, qTyped.WeightOf(p).Value);
+        }
+    }
+
+    [Fact]
     public void ScalarSubquery_AppendsColumn()
     {
         // SELECT-list scalar subquery becomes ScalarSubqueryJoinPlan

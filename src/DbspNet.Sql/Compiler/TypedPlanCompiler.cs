@@ -193,6 +193,7 @@ public static class TypedPlanCompiler
         DifferencePlan diff => CompileDifference(diff, ctx),
         CteScanPlan c => CompileCteScan(c, ctx),
         ScalarSubqueryJoinPlan s => CompileScalarSubqueryJoin(s, ctx),
+        RecursiveCtePlan r => CompileRecursiveCte(r, ctx),
         _ => null,
     };
 
@@ -460,6 +461,125 @@ public static class TypedPlanCompiler
         }
 
         return new TypedNode(first.RowType, plan.Schema, resultStream);
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="RecursiveCtePlan"/>: hybrid path that
+    /// keeps the operator structural-internal (it evaluates its
+    /// base / recursive subplans via <see cref="BatchPlanEvaluator"/>
+    /// over <see cref="StructuralRow"/> traces) and wraps the output
+    /// stream with a typed <see cref="LinearOperators.MapRows{TIn,TOut,TWeight}"/>
+    /// so the rest of the typed pipeline can compose with it.
+    /// <para>
+    /// Only available in boundary-adapter mode — relies on
+    /// <see cref="CompileContext.StructuralScans"/> for the external
+    /// table deltas the recursive op needs. Standalone mode bails
+    /// (its tests can use the structural-fallback path instead).
+    /// </para>
+    /// </summary>
+    private static TypedNode? CompileRecursiveCte(RecursiveCtePlan plan, CompileContext ctx)
+    {
+        if (ctx.StructuralScans is null) return null;
+
+        // The output schema must be typed-eligible for the
+        // downstream MapRows projection to succeed.
+        var outputRowType = TypedRowEmitter.EmitRowType(plan.Schema);
+        if (outputRowType is null) return null;
+
+        // Walk both subplans to collect (name, schema) for every
+        // external base table the body references. ScanPlan carries
+        // its own Schema, so no separate plumbing required.
+        // Unsupported plan shapes inside the body throw at runtime
+        // via BatchPlanEvaluator — same surface as structural.
+        var externalSchemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+        try
+        {
+            CollectExternalScans(plan.BasePlan, plan.SelfRef, externalSchemas);
+            CollectExternalScans(plan.RecursivePlan, plan.SelfRef, externalSchemas);
+        }
+        catch (InvalidOperationException)
+        {
+            // Body contains a shape we can't statically walk — let
+            // structural handle it.
+            return null;
+        }
+
+        // Wire the existing structural delta streams; bail if any
+        // referenced table isn't in the boundary's scan map.
+        var externalStreams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+        foreach (var (name, _) in externalSchemas)
+        {
+            if (!ctx.StructuralScans.TryGetValue(name, out var stream)) return null;
+            externalStreams[name] = stream;
+        }
+
+        // Per-table snapshot codecs + one for the result. Matches
+        // structural CompileRecursiveCte (PlanToCircuit.cs:601).
+        Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>? externalCodecs = null;
+        IZSetTraceCodec<StructuralRow, Z64>? resultCodec = null;
+        if (ctx.SnapshotCodecs is { } codecs)
+        {
+            externalCodecs = new Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>(StringComparer.Ordinal);
+            foreach (var (name, schema) in externalSchemas)
+            {
+                externalCodecs[name] = codecs.CreateZSetTraceCodec(schema);
+            }
+
+            resultCodec = codecs.CreateZSetTraceCodec(plan.Schema);
+        }
+
+        var structuralOutput = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        var op = new RecursiveCteOp(
+            externalStreams,
+            structuralOutput,
+            plan.BasePlan,
+            plan.RecursivePlan,
+            plan.SelfRef,
+            externalCodecs,
+            resultCodec);
+        ctx.Builder.AddRawOperator(op);
+
+        // Lift the structural output to typed via MapRows. Cost is
+        // paid only at the boundary between the recursive op and the
+        // surrounding typed pipeline — the recursive iteration loop
+        // inside the op stays all-structural.
+        var lifter = BuildStructuralToTypedDelegate(plan.Schema, outputRowType);
+        var typedOutput = InvokeMapRows(
+            ctx.Builder, typeof(StructuralRow), outputRowType, structuralOutput, lifter);
+        return new TypedNode(outputRowType, plan.Schema, typedOutput);
+    }
+
+    /// <summary>
+    /// Walks a recursive-CTE subplan and records every external base
+    /// table (ScanPlan) along with its declared schema. Mirrors the
+    /// structural <c>CollectRecursiveExternalTables</c> but captures
+    /// schemas too.
+    /// </summary>
+    private static void CollectExternalScans(
+        LogicalPlan plan, CteRef selfRef, Dictionary<string, Schema> result)
+    {
+        switch (plan)
+        {
+            case ScanPlan s:
+                if (!result.ContainsKey(s.TableName)) result[s.TableName] = s.Schema;
+                break;
+            case CteScanPlan c:
+                if (ReferenceEquals(c.Cte, selfRef)) return; // self-reference, skip
+                throw new InvalidOperationException(
+                    $"recursive CTE body cannot reference other CTE '{c.Cte.Name}' in v1");
+            case FilterPlan f:
+                CollectExternalScans(f.Input, selfRef, result); break;
+            case ProjectPlan p:
+                CollectExternalScans(p.Input, selfRef, result); break;
+            case JoinPlan j:
+                CollectExternalScans(j.Left, selfRef, result);
+                CollectExternalScans(j.Right, selfRef, result); break;
+            case UnionAllPlan u:
+                foreach (var b in u.Branches) CollectExternalScans(b, selfRef, result); break;
+            default:
+                throw new InvalidOperationException(
+                    $"{plan.GetType().Name} is not supported inside a recursive CTE body");
+        }
     }
 
     /// <summary>
