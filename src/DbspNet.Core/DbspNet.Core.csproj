@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
-    <ProjectReference Include="..\Clast.BloomFilter\Clast.BloomFilter.csproj" />
+    <PackageReference Include="Clast.BloomFilter" Version="0.1.0" />
   </ItemGroup>
   <ItemGroup>
     <!-- DbspNet.Sql implements its own IOperator for the recursive-CTE
