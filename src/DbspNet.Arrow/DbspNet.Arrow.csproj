@@ -18,6 +18,6 @@
     <InternalsVisibleTo Include="DbspNet.Persistence" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Apache.Arrow" Version="21.0.0" />
+    <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
 </Project>
