@@ -1,3 +1,5 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 using CsCheck;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;

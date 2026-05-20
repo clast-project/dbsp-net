@@ -1,3 +1,5 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Linq.Expressions;
 using System.Reflection;
 using DbspNet.Core.Algebra;

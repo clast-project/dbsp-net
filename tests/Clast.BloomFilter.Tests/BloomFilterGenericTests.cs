@@ -1,3 +1,5 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 namespace Clast.BloomFilter.Tests;
 
 public class BloomFilterGenericTests
