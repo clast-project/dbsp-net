@@ -234,13 +234,10 @@ public static class TypedPlanCompiler
         var inner = TryCompileNode(filter.Input, ctx);
         if (inner is null) return null;
 
-        // Phase N3 gate: WHERE-clause predicates that produce
-        // Nullable<bool> need NULL-as-FALSE coercion at the
-        // predicate boundary (per SQL semantics). Ships in a later
-        // phase; for now bail to structural when the predicate's
-        // result is nullable.
-        if (filter.Predicate.Type.Nullable) return null;
-
+        // Nullable<bool> WHERE predicates are coerced to plain
+        // bool inside BuildTypedPredicateDelegate via
+        // Nullable<bool>.GetValueOrDefault() — SQL WHERE semantics:
+        // TRUE keeps the row; FALSE and NULL both drop it.
         var predicate = BuildTypedPredicateDelegate(filter.Predicate, inner.RowType);
         if (predicate is null) return null;
 
@@ -912,19 +909,35 @@ public static class TypedPlanCompiler
     private static Delegate? BuildTypedPredicateDelegate(
         ResolvedExpression predicate, Type inputRowType)
     {
-        // Nullable BOOLEAN is accepted here for the same reason
-        // TypedExpressionCompiler accepts nullable subexpressions:
-        // in the typed pipeline every column is non-null, so the
-        // predicate's actual value is always a definite TRUE/FALSE
-        // regardless of the resolver's nullability annotation.
         if (predicate.Type is not SqlBooleanType) return null;
 
         var inParam = Expression.Parameter(inputRowType, "in");
         var built = TypedExpressionCompiler.TryBuildInto(predicate, inParam);
-        if (built is null || built.Type != typeof(bool)) return null;
+        if (built is null) return null;
+
+        Expression body;
+        if (built.Type == typeof(bool))
+        {
+            body = built;
+        }
+        else if (built.Type == typeof(bool?))
+        {
+            // SQL WHERE: TRUE → keep, FALSE → drop, NULL → drop.
+            // Nullable<bool>.GetValueOrDefault() returns the
+            // underlying value if HasValue and the default(bool)
+            // (= false) otherwise — exactly the coercion WHERE
+            // wants, with no HasValue branch in the IL.
+            var getValueOrDefault = typeof(bool?).GetMethod(
+                nameof(Nullable<bool>.GetValueOrDefault), Type.EmptyTypes)!;
+            body = Expression.Call(built, getValueOrDefault);
+        }
+        else
+        {
+            return null;
+        }
 
         var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, typeof(bool));
-        return Expression.Lambda(delegateType, built, inParam).Compile();
+        return Expression.Lambda(delegateType, body, inParam).Compile();
     }
 
     // ---- Helpers: join key extraction and row combine ----

@@ -424,6 +424,91 @@ public class TypedPlanCompilerTests
         Assert.Equal(1L, typed.WeightOf(10).Value);
     }
 
+    [Fact]
+    public void Filter_NullablePredicate_NullDropsRow()
+    {
+        // WHERE on a nullable column: "v > 5" evaluates to TRUE,
+        // FALSE, or NULL per 3VL. SQL WHERE keeps only TRUE rows;
+        // NULL and FALSE both drop. Inside the typed pipeline this
+        // is Nullable<bool>.GetValueOrDefault().
+        var plan = CompilePlan(
+            ["CREATE TABLE t (id INT NOT NULL, v INT)"],
+            "SELECT id FROM t WHERE v > 5");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);                  // TRUE  → keep
+        typed.Table("t").Insert(2, 3);                    // FALSE → drop
+        typed.Table("t").Insert(new object?[] { 3, null }); // NULL → drop
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1).Value);
+        Assert.Equal(0L, typed.WeightOf(2).Value);
+        Assert.Equal(0L, typed.WeightOf(3).Value);
+    }
+
+    [Fact]
+    public void Filter_NullablePredicate_IsNullKeepsNullRows()
+    {
+        // IS NULL on a nullable column returns a non-nullable bool
+        // (the value is definite TRUE/FALSE — never NULL), so the
+        // predicate's resolver type is plain bool and the
+        // bool-typed fast path handles it. Just pin the behavior.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (id INT NOT NULL, v INT)"],
+            "SELECT id FROM t WHERE v IS NULL");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(new object?[] { 2, null });
+        typed.Table("t").Insert(new object?[] { 3, null });
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(1).Value);
+        Assert.Equal(1L, typed.WeightOf(2).Value);
+        Assert.Equal(1L, typed.WeightOf(3).Value);
+    }
+
+    [Fact]
+    public void Filter_NullablePredicate_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT id, v FROM t WHERE v > 5 AND v < 50";
+        var ddl = new[] { "CREATE TABLE t (id INT NOT NULL, v INT)" };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (object?[], long)[]
+        {
+            (new object?[] { 1, 10 }, 1L),    // TRUE — kept
+            (new object?[] { 2, 3 }, 1L),     // FALSE — dropped
+            (new object?[] { 3, null }, 1L),  // NULL — dropped
+            (new object?[] { 4, 100 }, 1L),   // FALSE (v < 50 fails) — dropped
+            (new object?[] { 5, 20 }, 1L),    // TRUE — kept
+            (new object?[] { 1, 10 }, -1L),   // retract
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            object?[][] candidates =
+            [
+                [1, 10], [2, 3], [3, null], [4, 100], [5, 20],
+            ];
+            foreach (var cand in candidates)
+            {
+                Assert.Equal(
+                    structural.WeightOf(cand).Value,
+                    typed.WeightOf(cand).Value);
+            }
+        }
+    }
+
     // ----- Aggregate -----
 
     [Fact]
