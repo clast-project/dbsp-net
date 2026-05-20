@@ -167,6 +167,94 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void ScalarSubquery_AppendsColumn()
+    {
+        // SELECT-list scalar subquery becomes ScalarSubqueryJoinPlan
+        // — a LEFT JOIN on a unit key that broadcasts the
+        // subquery's single value over every outer row.
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE t (x INT NOT NULL)",
+                "CREATE TABLE u (y INT NOT NULL)",
+            ],
+            "SELECT x, (SELECT SUM(y) FROM u) AS total FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1);
+        typed.Table("t").Insert(2);
+        typed.Table("u").Insert(10);
+        typed.Table("u").Insert(20);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 30L).Value);
+        Assert.Equal(1L, typed.WeightOf(2, 30L).Value);
+    }
+
+    [Fact]
+    public void ScalarSubquery_EmptySubquery_NullPads()
+    {
+        // u is empty → SUM(y) yields NULL; every outer row carries
+        // NULL via the null-pad combine.
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE t (x INT NOT NULL)",
+                "CREATE TABLE u (y INT NOT NULL)",
+            ],
+            "SELECT x, (SELECT SUM(y) FROM u) AS total FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 1, null }).Value);
+    }
+
+    [Fact]
+    public void ScalarSubquery_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT x, (SELECT SUM(y) FROM u) AS total FROM t";
+        var ddl = new[]
+        {
+            "CREATE TABLE t (x INT NOT NULL)",
+            "CREATE TABLE u (y INT NOT NULL)",
+        };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (string Table, object?[] Values, long Weight)[]
+        {
+            ("t", [1], 1L), ("u", [10], 1L), ("t", [2], 1L),
+            ("u", [20], 1L), ("u", [10], -1L), ("t", [1], -1L),
+        };
+
+        foreach (var (table, vs, w) in deltas)
+        {
+            typed!.Table(table).Push(new[] { (vs, w) });
+            structural.Table(table).Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            // Sweep candidate (x, total) pairs across the possible
+            // outputs of this small workload.
+            object?[][] candidates =
+            [
+                [1, null], [2, null],
+                [1, 10L], [2, 10L], [1, 20L], [2, 20L],
+                [1, 30L], [2, 30L],
+            ];
+            foreach (var cand in candidates)
+            {
+                Assert.Equal(
+                    structural.WeightOf(cand).Value,
+                    typed.WeightOf(cand).Value);
+            }
+        }
+    }
+
+    [Fact]
     public void Cte_SingleReference()
     {
         // Non-recursive CTE referenced once. The CTE body is a

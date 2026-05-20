@@ -192,6 +192,7 @@ public static class TypedPlanCompiler
         DistinctPlan d => CompileDistinct(d, ctx),
         DifferencePlan diff => CompileDifference(diff, ctx),
         CteScanPlan c => CompileCteScan(c, ctx),
+        ScalarSubqueryJoinPlan s => CompileScalarSubqueryJoin(s, ctx),
         _ => null,
     };
 
@@ -482,6 +483,76 @@ public static class TypedPlanCompiler
         }
 
         return new TypedNode(cached.RowType, plan.Schema, cached.Stream);
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="ScalarSubqueryJoinPlan"/>: each
+    /// subquery contributes one nullable column to the outer plan
+    /// via an <see cref="StatefulOperators.IncrementalLeftJoin{TKey,TLeft,TRight,TOut,TWeight}"/>
+    /// on a constant zero-column unit key. Empty subquery → NULL
+    /// column for every outer row (the null-pad combine); 1-row
+    /// subquery → broadcast its single value; &gt;1-row at runtime
+    /// is undefined (resolver doesn't validate). Mirrors structural
+    /// <c>CompileScalarSubqueryJoin</c> at <c>PlanToCircuit.cs:687</c>.
+    /// </summary>
+    private static TypedNode? CompileScalarSubqueryJoin(ScalarSubqueryJoinPlan plan, CompileContext ctx)
+    {
+        var current = TryCompileNode(plan.Input, ctx);
+        if (current is null) return null;
+
+        // Unit key: zero-column emitted struct. Same emitted type
+        // every iteration (TypedRowEmitter caches by fingerprint, and
+        // the empty Type[] hashes uniformly), so all outer rows and
+        // all subquery rows land in the same bucket — broadcast.
+        var unitSchema = Schema.Empty;
+        var unitKeyType = TypedRowEmitter.EmitRowType(unitSchema);
+        if (unitKeyType is null) return null;
+        var noIndices = Array.Empty<int>();
+
+        var soFarSchema = plan.Input.Schema;
+
+        foreach (var subPlan in plan.Subqueries)
+        {
+            var sub = TryCompileNode(subPlan, ctx);
+            if (sub is null) return null;
+
+            var newSchema = soFarSchema.Concat(subPlan.Schema);
+            var newRowType = TypedRowEmitter.EmitRowType(newSchema);
+            if (newRowType is null) return null;
+
+            var outerExtractor = BuildKeyExtractorDelegate(
+                current.RowType, unitKeyType, unitSchema, noIndices);
+            var subExtractor = BuildKeyExtractorDelegate(
+                sub.RowType, unitKeyType, unitSchema, noIndices);
+            if (outerExtractor is null || subExtractor is null) return null;
+
+            var combine = BuildJoinCombineDelegate(
+                unitKeyType, current.RowType, sub.RowType, newRowType,
+                newSchema, leftCount: soFarSchema.Count, rightCount: subPlan.Schema.Count);
+            var nullPad = BuildNullPadCombineDelegate(
+                unitKeyType, current.RowType, newRowType,
+                newSchema, preservedSideOffset: 0, preservedSideCount: soFarSchema.Count);
+            if (nullPad is null) return null;
+
+            var outerIndexed = InvokeGroupProject(
+                ctx.Builder, current.RowType, unitKeyType, current.Stream, outerExtractor);
+            var subIndexed = InvokeGroupProject(
+                ctx.Builder, sub.RowType, unitKeyType, sub.Stream, subExtractor);
+
+            var outerCodec = BuildAdaptedIndexedCodec(
+                ctx.SnapshotCodecs, unitSchema, soFarSchema, unitKeyType, current.RowType);
+            var subCodec = BuildAdaptedIndexedCodec(
+                ctx.SnapshotCodecs, unitSchema, subPlan.Schema, unitKeyType, sub.RowType);
+
+            var joined = InvokeIncrementalLeftJoin(
+                ctx.Builder, unitKeyType, current.RowType, sub.RowType, newRowType,
+                outerIndexed, subIndexed, combine, nullPad, outerCodec, subCodec);
+
+            current = new TypedNode(newRowType, newSchema, joined);
+            soFarSchema = newSchema;
+        }
+
+        return new TypedNode(current.RowType, plan.Schema, current.Stream);
     }
 
     /// <summary>
