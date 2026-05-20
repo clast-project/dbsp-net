@@ -167,6 +167,81 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Cte_SingleReference()
+    {
+        // Non-recursive CTE referenced once. The CTE body is a
+        // typed-supported pipeline (Scan + Filter); the outer
+        // SELECT just reads from it.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT NOT NULL)"],
+            "WITH big AS (SELECT a FROM t WHERE a > 10) SELECT a FROM big");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(5);
+        typed.Table("t").Insert(15);
+        typed.Table("t").Insert(20);
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(5).Value);
+        Assert.Equal(1L, typed.WeightOf(15).Value);
+        Assert.Equal(1L, typed.WeightOf(20).Value);
+    }
+
+    [Fact]
+    public void Cte_ReferencedTwiceSharesStream()
+    {
+        // CTE referenced twice (self-join shape). The CTE body
+        // should compile once and both references share the cached
+        // typed stream — same operator graph, no duplicate state.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "WITH x AS (SELECT k, v FROM t WHERE v > 0) " +
+            "SELECT a.v, b.v FROM x AS a JOIN x AS b ON a.k = b.k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(2, 20);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(10, 10).Value);
+        Assert.Equal(1L, typed.WeightOf(20, 20).Value);
+        Assert.Equal(0L, typed.WeightOf(10, 20).Value);
+    }
+
+    [Fact]
+    public void Cte_DifferentialAgainstStructural()
+    {
+        const string sql =
+            "WITH x AS (SELECT a FROM t WHERE a > 0) " +
+            "SELECT a FROM x UNION ALL SELECT a FROM x";
+        var ddl = new[] { "CREATE TABLE t (a INT NOT NULL)" };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (object?[], long)[]
+        {
+            ([5], 1L), ([10], 1L), ([5], 1L), ([10], -1L),
+        };
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            for (var k = 0; k <= 12; k++)
+            {
+                Assert.Equal(
+                    structural.WeightOf(k).Value,
+                    typed.WeightOf(k).Value);
+            }
+        }
+    }
+
+    [Fact]
     public void SetOp_Except_MatchesStructural()
     {
         // EXCEPT decomposes to Distinct + Difference + Intersect in

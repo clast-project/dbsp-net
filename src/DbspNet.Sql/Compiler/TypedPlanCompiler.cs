@@ -141,6 +141,15 @@ public static class TypedPlanCompiler
         public Dictionary<string, TypedNode> LiftedScanCache { get; } = new(StringComparer.Ordinal);
 
         /// <summary>
+        /// Per-CTE compiled typed stream, keyed by
+        /// <see cref="CteRef"/> identity. The first
+        /// <see cref="CteScanPlan"/> referencing a CTE compiles its
+        /// underlying plan; subsequent scans share that stream.
+        /// Mirrors <see cref="PlanToCircuit.CompileContext.CteCache"/>.
+        /// </summary>
+        public Dictionary<CteRef, TypedNode> CteCache { get; } = new();
+
+        /// <summary>
         /// Snapshot codec factory threaded through from the SQL
         /// compiler entry point. Stateful operators (Join, Aggregate)
         /// build typed-adapted codecs from it via the
@@ -182,6 +191,7 @@ public static class TypedPlanCompiler
         UnionAllPlan u => CompileUnionAll(u, ctx),
         DistinctPlan d => CompileDistinct(d, ctx),
         DifferencePlan diff => CompileDifference(diff, ctx),
+        CteScanPlan c => CompileCteScan(c, ctx),
         _ => null,
     };
 
@@ -449,6 +459,29 @@ public static class TypedPlanCompiler
         }
 
         return new TypedNode(first.RowType, plan.Schema, resultStream);
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="CteScanPlan"/>: looks up the typed
+    /// stream for the referenced CTE in <see cref="CompileContext.CteCache"/>,
+    /// compiling the underlying plan on first reference. Schema
+    /// qualifiers may differ per scan but the row CLR fingerprint
+    /// matches (TypedRowEmitter ignores qualifier), so the cached
+    /// stream is reusable. Returns a fresh TypedNode that pairs the
+    /// cached stream with the CteScanPlan's own schema, matching the
+    /// structural behaviour at <c>PlanToCircuit.cs:243</c>.
+    /// </summary>
+    private static TypedNode? CompileCteScan(CteScanPlan plan, CompileContext ctx)
+    {
+        if (!ctx.CteCache.TryGetValue(plan.Cte, out var cached))
+        {
+            var compiled = TryCompileNode(plan.Cte.Plan, ctx);
+            if (compiled is null) return null;
+            cached = compiled;
+            ctx.CteCache[plan.Cte] = cached;
+        }
+
+        return new TypedNode(cached.RowType, plan.Schema, cached.Stream);
     }
 
     /// <summary>
