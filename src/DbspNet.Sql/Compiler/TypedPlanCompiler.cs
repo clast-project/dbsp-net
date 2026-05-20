@@ -179,6 +179,7 @@ public static class TypedPlanCompiler
         ProjectPlan p => CompileProject(p, ctx),
         JoinPlan j => CompileJoin(j, ctx),
         AggregatePlan a => CompileAggregate(a, ctx),
+        UnionAllPlan u => CompileUnionAll(u, ctx),
         _ => null,
     };
 
@@ -404,6 +405,36 @@ public static class TypedPlanCompiler
         }
 
         return node;
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="UnionAllPlan"/>: each branch is typed
+    /// recursively, then folded pairwise with
+    /// <see cref="LinearOperators.Union{TRow,TWeight}"/>. All branches
+    /// must share the same emitted row type (the resolver enforces
+    /// schema alignment, so this is a sanity check on the typed
+    /// fingerprint cache).
+    /// </summary>
+    private static TypedNode? CompileUnionAll(UnionAllPlan plan, CompileContext ctx)
+    {
+        if (plan.Branches.Count == 0) return null;
+
+        var first = TryCompileNode(plan.Branches[0], ctx);
+        if (first is null) return null;
+
+        var resultStream = first.Stream;
+        for (var i = 1; i < plan.Branches.Count; i++)
+        {
+            var branch = TryCompileNode(plan.Branches[i], ctx);
+            if (branch is null) return null;
+            // Same TRow on every branch — the resolver's schema
+            // alignment + TypedRowEmitter's fingerprint cache makes
+            // this the common case, but guard explicitly.
+            if (branch.RowType != first.RowType) return null;
+            resultStream = InvokeUnion(ctx.Builder, first.RowType, resultStream, branch.Stream);
+        }
+
+        return new TypedNode(first.RowType, plan.Schema, resultStream);
     }
 
     /// <summary>
@@ -1394,6 +1425,17 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(LinearOperators.Filter) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
         return closed.Invoke(null, new object[] { builder, stream, predicate })!;
+    }
+
+    /// <summary><c>builder.Union&lt;TRow, Z64&gt;(left, right)</c>.</summary>
+    private static object InvokeUnion(
+        CircuitBuilder builder, Type rowType, object left, object right)
+    {
+        var openMethod = typeof(LinearOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(LinearOperators.Union) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
+        return closed.Invoke(null, new object[] { builder, left, right })!;
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>

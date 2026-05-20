@@ -41,10 +41,11 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void TryCompile_RejectsUnsupportedPlanNodes()
+    public void UnionAll_TwoBranches_SumsWeights()
     {
-        // UNION ALL is not yet supported by the typed path; it should
-        // bail out rather than partially compile.
+        // UNION ALL is Z-set addition: matching rows on each side
+        // accumulate weight in the output. Non-matching rows pass
+        // through with their original weight.
         var plan = CompilePlan(
             [
                 "CREATE TABLE t (a INT NOT NULL)",
@@ -52,10 +53,86 @@ public class TypedPlanCompilerTests
             ],
             "SELECT a FROM t UNION ALL SELECT a FROM u");
 
-        var ok = TypedPlanCompiler.TryCompile(plan, out var typed);
-        Assert.False(ok);
-        Assert.Null(typed);
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1);
+        typed.Table("t").Insert(2);
+        typed.Table("u").Insert(2);   // appears in both → weight 2
+        typed.Table("u").Insert(3);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1).Value);
+        Assert.Equal(2L, typed.WeightOf(2).Value);
+        Assert.Equal(1L, typed.WeightOf(3).Value);
     }
+
+    [Fact]
+    public void UnionAll_ThreeBranches_OverFilter()
+    {
+        // Each branch is a typed Filter; UNION ALL stitches them.
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE a (v INT NOT NULL)",
+                "CREATE TABLE b (v INT NOT NULL)",
+                "CREATE TABLE c (v INT NOT NULL)",
+            ],
+            "SELECT v FROM a WHERE v > 0 UNION ALL " +
+            "SELECT v FROM b WHERE v > 10 UNION ALL " +
+            "SELECT v FROM c WHERE v > 100");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("a").Insert(5);   // kept
+        typed.Table("a").Insert(0);    // dropped
+        typed.Table("b").Insert(20);   // kept
+        typed.Table("b").Insert(5);    // dropped
+        typed.Table("c").Insert(200);  // kept
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(5).Value);
+        Assert.Equal(1L, typed.WeightOf(20).Value);
+        Assert.Equal(1L, typed.WeightOf(200).Value);
+        Assert.Equal(0L, typed.WeightOf(0).Value);
+    }
+
+    [Fact]
+    public void UnionAll_DifferentialAgainstStructural()
+    {
+        const string sql =
+            "SELECT a FROM t UNION ALL SELECT a FROM u UNION ALL SELECT a FROM v";
+        var ddl = new[]
+        {
+            "CREATE TABLE t (a INT NOT NULL)",
+            "CREATE TABLE u (a INT NOT NULL)",
+            "CREATE TABLE v (a INT NOT NULL)",
+        };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (string Table, object?[] Values, long Weight)[]
+        {
+            ("t", [1], 1L), ("t", [2], 1L), ("u", [2], 1L),
+            ("v", [2], 1L), ("u", [3], 1L), ("t", [1], -1L),
+            ("v", [2], -1L),
+        };
+
+        foreach (var (table, vs, w) in deltas)
+        {
+            typed!.Table(table).Push(new[] { (vs, w) });
+            structural.Table(table).Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            for (var k = 0; k <= 4; k++)
+            {
+                Assert.Equal(
+                    structural.WeightOf(k).Value,
+                    typed.WeightOf(k).Value);
+            }
+        }
+    }
+
 
     [Fact]
     public void TryCompile_AcceptsNullableSchema()
