@@ -533,7 +533,14 @@ public static class TypedPlanCompiler
             AggregateKind.Count => call.ResultType.WithNullable(false),
             AggregateKind.Sum => call.ResultType.WithNullable(argNullable),
             AggregateKind.Avg => call.ResultType.WithNullable(argNullable),
-            AggregateKind.Min or AggregateKind.Max => call.ResultType.WithNullable(argNullable),
+            // MIN/MAX is *always* nullable in the emitted slot, even on
+            // a non-null arg: the linear gate emits on net non-zero
+            // weight, which can be the negative-weight case (no
+            // positive-weight row, MIN/MAX returns NULL). Well-formed
+            // DBSP streams shouldn't reach that state, but the aggregator
+            // is correct under any Z-set input — the schema slot must
+            // match.
+            AggregateKind.Min or AggregateKind.Max => call.ResultType.WithNullable(true),
             _ => call.ResultType,
         };
     }
@@ -584,11 +591,46 @@ public static class TypedPlanCompiler
             case AggregateKind.Avg:
                 return BuildAvgAggregator(call, inputRowType);
 
+            case AggregateKind.Min:
+                return BuildMinMaxAggregator(call, inputRowType, wantMin: true);
+
+            case AggregateKind.Max:
+                return BuildMinMaxAggregator(call, inputRowType, wantMin: false);
+
             default:
-                // MIN / MAX deliberately fall back to structural in
-                // N4. Wiring is the N5 task.
                 return null;
         }
+    }
+
+    private static object? BuildMinMaxAggregator(AggregateCall call, Type inputRowType, bool wantMin)
+    {
+        if (call.Argument is null) return null;
+        var argExtract = BuildTypedScalarDelegate(call.Argument, inputRowType, out var resultClr);
+        if (argExtract is null) return null;
+
+        var argNullable = call.Argument.Type.Nullable;
+        var underlyingClr = TypedExpressionCompiler.IsNullable(resultClr)
+            ? TypedExpressionCompiler.UnderlyingType(resultClr)
+            : resultClr;
+
+        // T must be a value type (every numeric / Decimal128 /
+        // Utf8String / temporal we extract is a struct) and
+        // IComparable<T>. Fall back if either condition fails — the
+        // structural path still handles ref-type comparable args.
+        if (!underlyingClr.IsValueType) return null;
+        var icmp = typeof(IComparable<>).MakeGenericType(underlyingClr);
+        if (!icmp.IsAssignableFrom(underlyingClr)) return null;
+
+        if (argNullable)
+        {
+            var open = typeof(TypedSqlMinMaxNullableAggregator<,>);
+            var closed = open.MakeGenericType(inputRowType, underlyingClr);
+            return Activator.CreateInstance(closed, argExtract, wantMin);
+        }
+
+        var openNonNull = typeof(TypedSqlMinMaxAggregator<,>);
+        var closedNonNull = openNonNull.MakeGenericType(inputRowType, underlyingClr);
+        return Activator.CreateInstance(closedNonNull, argExtract, wantMin);
     }
 
     /// <summary>

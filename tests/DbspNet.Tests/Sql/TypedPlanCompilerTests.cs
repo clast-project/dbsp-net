@@ -524,14 +524,108 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void Aggregate_RejectsMin()
+    public void Aggregate_Min_NonNullArg()
     {
+        // Phase N5: MIN/MAX wired into the typed dispatch. Non-null
+        // arg variant tracks Active set of positive-weight values
+        // and returns the min in O(log n) on the distinct count.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, MIN(v), MAX(v) FROM t GROUP BY k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 3);
+        typed.Table("t").Insert(1, 7);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 3, 10).Value);
+    }
+
+    [Fact]
+    public void Aggregate_Min_RetractsShifts()
+    {
+        // Removing the current min shifts MIN to the next-smallest
+        // positive-weight value.
         var plan = CompilePlan(
             ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
             "SELECT k, MIN(v) FROM t GROUP BY k");
 
-        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
-        Assert.Null(typed);
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 5);
+        typed.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 15);
+        typed.Step();
+        Assert.Equal(1L, typed.WeightOf(1, 5).Value);
+
+        typed.Table("t").Delete(1, 5);
+        typed.Step();
+        Assert.Equal(-1L, typed.WeightOf(1, 5).Value);
+        Assert.Equal(1L, typed.WeightOf(1, 10).Value);
+    }
+
+    [Fact]
+    public void Aggregate_Min_NullableArg_SkipsNullsAndAllNullEmitsNull()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT NOT NULL, v INT)"],
+            "SELECT g, MIN(v), MAX(v) FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        // Mixed group: NULLs skipped.
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(new object?[] { 1, null });
+        typed.Table("t").Insert(1, 3);
+        // All-NULL group: MIN/MAX both NULL.
+        typed.Table("t").Insert(new object?[] { 2, null });
+        typed.Table("t").Insert(new object?[] { 2, null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 3, 10).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 2, null, null }).Value);
+    }
+
+    [Fact]
+    public void Aggregate_MinMaxDifferentialAgainstStructural()
+    {
+        const string sql = "SELECT g, MIN(v) AS mn, MAX(v) AS mx FROM t GROUP BY g";
+        var ddl = new[] { "CREATE TABLE t (g INT NOT NULL, v INT)" };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (object?[], long)[]
+        {
+            (new object?[] { 1, 5 }, 1L),
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 1, null }, 1L),
+            (new object?[] { 1, 5 }, -1L),
+            (new object?[] { 2, null }, 1L),
+            (new object?[] { 2, 3 }, 1L),
+            (new object?[] { 2, null }, -1L),
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            object?[][] candidates =
+            [
+                [1, 5, 5], [1, 5, 10], [1, 10, 10], [1, null, null],
+                [2, 3, 3], [2, null, null],
+            ];
+            foreach (var cand in candidates)
+            {
+                Assert.Equal(
+                    structural.WeightOf(cand).Value,
+                    typed.WeightOf(cand).Value);
+            }
+        }
     }
 
     [Fact]

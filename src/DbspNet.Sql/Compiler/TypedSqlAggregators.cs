@@ -624,14 +624,17 @@ internal sealed class TypedAvgDecimalNullableAggregator<TIn> : TypedSqlAggregato
 }
 
 /// <summary>
-/// Typed <c>MIN</c> / <c>MAX</c> over a per-group multiset. State
-/// mirrors the structural variant — <see cref="Counts"/> tracks how
-/// many distinct rows currently have positive net weight for each
-/// value, and <see cref="Active"/> is the sorted set of values with
-/// positive count, so MIN/MAX is O(log n) on the distinct-value
-/// count. The transition detection (was-positive vs is-positive)
-/// per delta row is identical to <c>SqlMinMaxAggregator.Update</c>;
-/// only the boxing through <c>object</c> is gone.
+/// Typed <c>MIN</c> / <c>MAX</c> over a per-group multiset with a
+/// non-null arg. State mirrors the structural variant —
+/// <see cref="Counts"/> tracks how many distinct rows currently have
+/// positive net weight for each value, and <see cref="Active"/> is
+/// the sorted set of values with positive count, so MIN/MAX is
+/// O(log n) on the distinct-value count. Returns <c>null</c> when
+/// the multiset has no positive-weight rows (the linear gate emits
+/// when net weight is non-zero, which can be the negative-weight
+/// case — well-formed DBSP streams shouldn't produce one, but it's
+/// still a valid Z-set state during retractions); the SQL output
+/// column is nullable accordingly.
 /// </summary>
 internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
     where TIn : notnull
@@ -680,18 +683,7 @@ internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
             }
         }
 
-        // The operator guarantees a non-empty multiset by the time
-        // Compute is called, but defensively guard against an
-        // all-non-positive-weight multiset (an ill-formed input —
-        // structural returns null here; we throw because the typed
-        // pipeline can't carry NULL).
-        if (!hasBest)
-        {
-            throw new InvalidOperationException(
-                "typed MIN/MAX on multiset with no positive-weight rows");
-        }
-
-        return best!;
+        return hasBest ? (object)best! : null;
     }
 
     public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
@@ -736,11 +728,103 @@ internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
         state = s;
         if (s.Active.Count == 0)
         {
-            throw new InvalidOperationException(
-                "typed MIN/MAX on multiset with no positive-weight rows");
+            return null;
         }
 
         return (_wantMin ? s.Active.Min : s.Active.Max)!;
+    }
+}
+
+/// <summary>
+/// Typed <c>MIN</c> / <c>MAX</c> with nullable-arg extraction (Phase
+/// N5). Skips rows whose extracted arg is <c>null</c> (SQL semantics)
+/// and tracks distinct positive-weight non-null values just like the
+/// non-null variant. Returns <c>null</c> for an all-NULL group or
+/// when no row has positive weight.
+/// </summary>
+internal sealed class TypedSqlMinMaxNullableAggregator<TIn, T> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+    where T : struct, IComparable<T>
+{
+    private readonly Func<TIn, T?> _argExtract;
+    private readonly bool _wantMin;
+
+    public TypedSqlMinMaxNullableAggregator(Func<TIn, T?> argExtract, bool wantMin)
+    {
+        _argExtract = argExtract;
+        _wantMin = wantMin;
+    }
+
+    private sealed class State
+    {
+        public Dictionary<T, long> Counts = new();
+        public SortedSet<T> Active = new();
+    }
+
+    public override Type ResultClrType => typeof(T);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        T best = default;
+        var hasBest = false;
+        foreach (var (row, w) in rows)
+        {
+            if (!Z64.IsPositive(w)) continue;
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            var raw = v.GetValueOrDefault();
+            if (!hasBest)
+            {
+                best = raw;
+                hasBest = true;
+                continue;
+            }
+
+            var cmp = raw.CompareTo(best);
+            if (_wantMin ? cmp < 0 : cmp > 0) best = raw;
+        }
+
+        return hasBest ? (object)best : null;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as State ?? new State();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            var raw = v.GetValueOrDefault();
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            var wasPositive = beforeW > 0;
+            var isPositive = afterW > 0;
+            if (wasPositive == isPositive) continue;
+
+            if (isPositive)
+            {
+                var c = s.Counts.GetValueOrDefault(raw, 0L) + 1;
+                s.Counts[raw] = c;
+                if (c == 1) s.Active.Add(raw);
+            }
+            else
+            {
+                var c = s.Counts[raw] - 1;
+                if (c == 0)
+                {
+                    s.Counts.Remove(raw);
+                    s.Active.Remove(raw);
+                }
+                else
+                {
+                    s.Counts[raw] = c;
+                }
+            }
+        }
+
+        state = s;
+        if (s.Active.Count == 0) return null;
+        return (_wantMin ? s.Active.Min : s.Active.Max);
     }
 }
 
