@@ -413,19 +413,14 @@ public static class TypedPlanCompiler
         var inner = TryCompileNode(plan.Input, ctx);
         if (inner is null) return null;
 
-        // Phase N3 gate: aggregator NULL semantics (e.g.
-        // DistinctNonNullRows bookkeeping for SUM, NULL-arg skipping
-        // for COUNT(col)) ship in Phase N4. For now bail when any
-        // group-key or aggregate-arg column is nullable so the
-        // structural path handles them.
+        // Phase N4 gate: nullable group-keys still bail (NULL=NULL
+        // equality in the indexed trace is its own concern, deferred
+        // to a later phase). Nullable aggregate-arg columns are now
+        // supported via the *Nullable aggregator variants built
+        // below.
         for (var i = 0; i < groupIndices.Length; i++)
         {
             if (inner.Schema[groupIndices[i]].Type.Nullable) return null;
-        }
-
-        foreach (var call in plan.Aggregates)
-        {
-            if (call.Argument is not null && call.Argument.Type.Nullable) return null;
         }
 
         // TKey from the group-key columns. Same schema-fingerprint
@@ -444,13 +439,9 @@ public static class TypedPlanCompiler
         var aggColumns = new SchemaColumn[plan.Aggregates.Count];
         for (var i = 0; i < plan.Aggregates.Count; i++)
         {
-            // Typed pipeline can't carry nullable agg result columns;
-            // we know every group reaching here is non-empty (the
-            // operator drops empty groups) so SUM/COUNT/AVG are
-            // definitionally non-null. Strip the Nullable marker.
             aggColumns[i] = new SchemaColumn(
                 "$agg" + i,
-                plan.Aggregates[i].ResultType.WithNullable(false));
+                TypedAggregateResultType(plan.Aggregates[i]));
         }
 
         var aggSchema = new Schema(aggColumns);
@@ -500,10 +491,14 @@ public static class TypedPlanCompiler
         // resolver's plan.Schema for the final shape; any extra
         // aggregator columns past plan.Schema's count are dropped by
         // the caller's wrapping Project (the structural path does the
-        // same — see PlanToCircuit notes). Schema nullability is
-        // stripped because the typed pipeline carries only definite
-        // values.
-        var finalSchema = StripNullable(plan.Schema);
+        // same — see PlanToCircuit notes). Phase N4: the per-call
+        // result nullability computed in TypedAggregateResultType
+        // already matches plan.Schema for the agg slots (resolver
+        // marks SUM/AVG nullable, we keep that iff arg is nullable);
+        // group-key cols carry through with their own nullability
+        // — which is non-null here because the group-key gate
+        // above rejects nullable keys.
+        var finalSchema = plan.Schema;
         var finalRowType = TypedRowEmitter.EmitRowType(finalSchema);
         if (finalRowType is null) return null;
 
@@ -518,17 +513,39 @@ public static class TypedPlanCompiler
     }
 
     /// <summary>
+    /// Per-call output nullability used to size the <c>TAgg</c>
+    /// schema slot. Independent of <see cref="AggregateCall.ResultType"/>
+    /// (which the resolver always marks nullable per SQL spec for
+    /// SUM/AVG/MIN/MAX) because the typed pipeline's linear-emission
+    /// gate guarantees every emitted row corresponds to a non-empty
+    /// group — so SUM/AVG/MIN/MAX over a non-null arg cannot be NULL
+    /// in the emitted row. For nullable args the nullable-arg
+    /// aggregator variants (<see cref="TypedSumLongNullableAggregator{TIn}"/>
+    /// etc.) can still emit NULL when every contributing row has a
+    /// NULL arg, so the slot stays nullable.
+    /// </summary>
+    private static SqlType TypedAggregateResultType(AggregateCall call)
+    {
+        var argNullable = call.Argument is not null && call.Argument.Type.Nullable;
+        return call.Kind switch
+        {
+            AggregateKind.CountStar => call.ResultType.WithNullable(false),
+            AggregateKind.Count => call.ResultType.WithNullable(false),
+            AggregateKind.Sum => call.ResultType.WithNullable(argNullable),
+            AggregateKind.Avg => call.ResultType.WithNullable(argNullable),
+            AggregateKind.Min or AggregateKind.Max => call.ResultType.WithNullable(argNullable),
+            _ => call.ResultType,
+        };
+    }
+
+    /// <summary>
     /// Builds a typed <c>TypedSqlAggregator&lt;TIn&gt;</c> for one
     /// <see cref="AggregateCall"/>. Returns <c>null</c> if the call
-    /// falls outside Phase 1.5's scope (MIN/MAX, decimal-typed result,
-    /// or an argument expression the typed expression compiler can't
-    /// lower).
+    /// falls outside scope (MIN/MAX, or an argument expression the
+    /// typed expression compiler can't lower).
     /// </summary>
     private static object? BuildTypedAggregator(AggregateCall call, Type inputRowType)
     {
-        // Decimal-typed results are now in scope (Phase 1.8) via the
-        // typed decimal aggregators. Per-Kind dispatch below decides
-        // whether the (kind, result-type) combination is supported.
         switch (call.Kind)
         {
             case AggregateKind.CountStar:
@@ -540,18 +557,25 @@ public static class TypedPlanCompiler
 
             case AggregateKind.Count:
                 {
-                    // With non-null inputs (typed-row gate) COUNT(col)
-                    // reduces to COUNT(*). We still walk the argument
-                    // through the typed expression compiler to keep
-                    // the gate consistent — an unsupported argument
-                    // (e.g. a function call) is still a rejection.
                     if (call.Argument is null) return null;
-                    var inParam = Expression.Parameter(inputRowType, "in");
-                    if (TypedExpressionCompiler.TryBuildInto(call.Argument, inParam) is null)
-                        return null;
-                    var open = typeof(TypedCountStarAggregator<>);
-                    var closed = open.MakeGenericType(inputRowType);
-                    return Activator.CreateInstance(closed);
+                    // For non-null arg, COUNT(col) reduces to COUNT(*).
+                    // For nullable arg, build a TypedCountNullableAggregator
+                    // with an isPresent extractor.
+                    if (!call.Argument.Type.Nullable)
+                    {
+                        var inParam = Expression.Parameter(inputRowType, "in");
+                        if (TypedExpressionCompiler.TryBuildInto(call.Argument, inParam) is null)
+                            return null;
+                        var open = typeof(TypedCountStarAggregator<>);
+                        var closed = open.MakeGenericType(inputRowType);
+                        return Activator.CreateInstance(closed);
+                    }
+
+                    var presence = BuildHasValueDelegate(call.Argument, inputRowType);
+                    if (presence is null) return null;
+                    var openNull = typeof(TypedCountNullableAggregator<>);
+                    var closedNull = openNull.MakeGenericType(inputRowType);
+                    return Activator.CreateInstance(closedNull, presence);
                 }
 
             case AggregateKind.Sum:
@@ -561,43 +585,85 @@ public static class TypedPlanCompiler
                 return BuildAvgAggregator(call, inputRowType);
 
             default:
-                // MIN / MAX deliberately fall back to structural. The
-                // structural variant returns SQL NULL when a group has
-                // no positive-weight rows (a valid Z-set state during
-                // retractions), and the typed-row pipeline can't carry
-                // a NULL output column. TypedSqlMinMaxAggregator stays
-                // in the codebase ready for the day we have per-column
-                // nullability, but the dispatch keeps these on the
-                // structural path so the PBT's well-formed-equivalence
-                // property holds.
+                // MIN / MAX deliberately fall back to structural in
+                // N4. Wiring is the N5 task.
                 return null;
         }
+    }
+
+    /// <summary>
+    /// Compiles an "is the extracted arg non-null?" predicate. The
+    /// arg expression is built through <see cref="TypedExpressionCompiler"/>
+    /// (which returns either <c>Nullable&lt;T&gt;</c> for nullable
+    /// value types or a reference type that can be <c>null</c>). The
+    /// returned delegate is <c>Func&lt;TIn, bool&gt;</c>; used by
+    /// COUNT(nullable col) and (later) by MIN/MAX. Returns
+    /// <c>null</c> if the arg is outside the expression compiler's
+    /// scope.
+    /// </summary>
+    private static Delegate? BuildHasValueDelegate(ResolvedExpression arg, Type inputRowType)
+    {
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var built = TypedExpressionCompiler.TryBuildInto(arg, inParam);
+        if (built is null) return null;
+
+        Expression body;
+        if (TypedExpressionCompiler.IsNullable(built.Type))
+        {
+            body = Expression.Property(built, nameof(Nullable<int>.HasValue));
+        }
+        else if (!built.Type.IsValueType)
+        {
+            body = Expression.NotEqual(built, Expression.Constant(null, built.Type));
+        }
+        else
+        {
+            // Definite-value arg (non-nullable struct) — always present.
+            body = Expression.Constant(true);
+        }
+
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, typeof(bool));
+        return Expression.Lambda(delegateType, body, inParam).Compile();
     }
 
     private static object? BuildSumAggregator(AggregateCall call, Type inputRowType)
     {
         if (call.Argument is null) return null;
+        var argNullable = call.Argument.Type.Nullable;
         var argExtract = BuildTypedScalarDelegate(call.Argument, inputRowType, out var resultClr);
         if (argExtract is null) return null;
+        var underlyingClr = TypedExpressionCompiler.IsNullable(resultClr)
+            ? TypedExpressionCompiler.UnderlyingType(resultClr)
+            : resultClr;
 
         // Map the SQL result type to the running accumulator type.
         if (call.ResultType is SqlBigintType)
         {
-            // Widen int → long if necessary.
-            var widened = resultClr == typeof(long)
+            // Widen int → long if necessary. For nullable args, widen
+            // inside the Nullable<T> envelope (T → long becomes
+            // Nullable<T> → Nullable<long>).
+            var targetClr = argNullable ? typeof(long?) : typeof(long);
+            var widened = resultClr == targetClr
                 ? argExtract
-                : RecompileWidened(call.Argument, inputRowType, typeof(long));
-            var open = typeof(TypedSumLongAggregator<>);
+                : RecompileWidened(call.Argument, inputRowType, targetClr);
+            if (widened is null) return null;
+            var open = argNullable
+                ? typeof(TypedSumLongNullableAggregator<>)
+                : typeof(TypedSumLongAggregator<>);
             var closed = open.MakeGenericType(inputRowType);
             return Activator.CreateInstance(closed, widened);
         }
 
         if (call.ResultType is SqlDoubleType)
         {
-            var widened = resultClr == typeof(double)
+            var targetClr = argNullable ? typeof(double?) : typeof(double);
+            var widened = resultClr == targetClr
                 ? argExtract
-                : RecompileWidened(call.Argument, inputRowType, typeof(double));
-            var open = typeof(TypedSumDoubleAggregator<>);
+                : RecompileWidened(call.Argument, inputRowType, targetClr);
+            if (widened is null) return null;
+            var open = argNullable
+                ? typeof(TypedSumDoubleNullableAggregator<>)
+                : typeof(TypedSumDoubleAggregator<>);
             var closed = open.MakeGenericType(inputRowType);
             return Activator.CreateInstance(closed, widened);
         }
@@ -607,8 +673,10 @@ public static class TypedPlanCompiler
             // Arg must already be Decimal128 — SUM only widens within
             // the decimal family by adjusting precision, not by
             // promoting non-decimal operands.
-            if (resultClr != typeof(Clast.DatabaseDecimal.Values.Decimal128)) return null;
-            var open = typeof(TypedSumDecimalAggregator<>);
+            if (underlyingClr != typeof(Clast.DatabaseDecimal.Values.Decimal128)) return null;
+            var open = argNullable
+                ? typeof(TypedSumDecimalNullableAggregator<>)
+                : typeof(TypedSumDecimalAggregator<>);
             var closed = open.MakeGenericType(inputRowType);
             return Activator.CreateInstance(closed, argExtract);
         }
@@ -619,22 +687,34 @@ public static class TypedPlanCompiler
     private static object? BuildAvgAggregator(AggregateCall call, Type inputRowType)
     {
         if (call.Argument is null) return null;
+        var argNullable = call.Argument.Type.Nullable;
         var argExtract = BuildTypedScalarDelegate(call.Argument, inputRowType, out var resultClr);
         if (argExtract is null) return null;
+        var underlyingClr = TypedExpressionCompiler.IsNullable(resultClr)
+            ? TypedExpressionCompiler.UnderlyingType(resultClr)
+            : resultClr;
 
         if (call.ResultType is SqlDecimalType)
         {
-            if (resultClr != typeof(Clast.DatabaseDecimal.Values.Decimal128)) return null;
-            var open = typeof(TypedAvgDecimalAggregator<>);
+            if (underlyingClr != typeof(Clast.DatabaseDecimal.Values.Decimal128)) return null;
+            var open = argNullable
+                ? typeof(TypedAvgDecimalNullableAggregator<>)
+                : typeof(TypedAvgDecimalAggregator<>);
             var closed = open.MakeGenericType(inputRowType);
             return Activator.CreateInstance(closed, argExtract);
         }
 
         // Non-decimal AVG always produces a double-running-total
-        // aggregator. Recompile the arg expression widened to double.
-        var widened = RecompileWidened(call.Argument, inputRowType, typeof(double));
+        // aggregator. Recompile the arg expression widened to double
+        // (or double? for nullable args).
+        var avgTargetClr = argNullable ? typeof(double?) : typeof(double);
+        var widened = resultClr == avgTargetClr
+            ? argExtract
+            : RecompileWidened(call.Argument, inputRowType, avgTargetClr);
         if (widened is null) return null;
-        var avgOpen = typeof(TypedAvgDoubleAggregator<>);
+        var avgOpen = argNullable
+            ? typeof(TypedAvgDoubleNullableAggregator<>)
+            : typeof(TypedAvgDoubleAggregator<>);
         var avgClosed = avgOpen.MakeGenericType(inputRowType);
         return Activator.CreateInstance(avgClosed, widened);
     }

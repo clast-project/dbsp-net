@@ -604,6 +604,148 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Aggregate_CountNullable_SkipsNulls()
+    {
+        // Phase N4: COUNT(nullable col) routes through typed and
+        // dispatches to the nullable-arg variant. COUNT(*) counts
+        // every row; COUNT(v) counts only rows where v is not NULL.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT NOT NULL, v INT)"],
+            "SELECT g, COUNT(*) AS cs, COUNT(v) AS cv FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, null);
+        typed.Table("t").Insert(1, 20);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 3L, 2L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_SumNullable_MixedGroup()
+    {
+        // Phase N4: SUM(nullable col) skips NULL contributions and
+        // returns Nullable<long>. With at least one non-null row
+        // present the result is a non-null long.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT NOT NULL, v INT)"],
+            "SELECT g, SUM(v) FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, null);
+        typed.Table("t").Insert(1, 20);
+        typed.Step();
+
+        // sum = 10 + 20 = 30 (NULL row skipped). Result column is
+        // nullable per resolver — assert by the wire shape.
+        Assert.Equal(1L, typed.WeightOf(1, 30L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_SumNullable_AllNullGroup_EmitsNull()
+    {
+        // Phase N4: a non-empty group whose every row has a NULL arg
+        // emits SUM = NULL. The linear gate emits the row (group is
+        // present); the nullable SUM aggregator returns null because
+        // DistinctNonNullRows = 0.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT NOT NULL, v INT)"],
+            "SELECT g, SUM(v) FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(new object?[] { 1, null });
+        typed.Table("t").Insert(new object?[] { 1, null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 1, null }).Value);
+    }
+
+    [Fact]
+    public void Aggregate_AvgNullable_AllNullGroup_EmitsNull()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT NOT NULL, v DOUBLE PRECISION)"],
+            "SELECT g, AVG(v) FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(new object?[] { 1, null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 1, null }).Value);
+    }
+
+    [Fact]
+    public void Aggregate_SumNullable_TransitionsToAllNull_OnRetraction()
+    {
+        // Retracting the only non-null row in a group leaves the
+        // group non-empty (still has NULL rows) so a row is emitted,
+        // but SUM transitions to NULL.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT NOT NULL, v INT)"],
+            "SELECT g, SUM(v) FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 5);
+        typed.Table("t").Insert(new object?[] { 1, null });
+        typed.Step();
+        Assert.Equal(1L, typed.WeightOf(1, 5L).Value);
+
+        typed.Table("t").Delete(1, 5);
+        typed.Step();
+        // The (1, 5) row is retracted; a new (1, NULL) row replaces it.
+        Assert.Equal(-1L, typed.WeightOf(1, 5L).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 1, null }).Value);
+    }
+
+    [Fact]
+    public void Aggregate_NullableDifferentialAgainstStructural()
+    {
+        const string sql = "SELECT g, COUNT(*) AS cs, COUNT(v) AS cv, SUM(v) AS sv FROM t GROUP BY g";
+        var ddl = new[] { "CREATE TABLE t (g INT NOT NULL, v INT)" };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (object?[], long)[]
+        {
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 1, null }, 1L),
+            (new object?[] { 1, 20 }, 1L),
+            (new object?[] { 2, null }, 1L),
+            (new object?[] { 1, 10 }, -1L),
+            (new object?[] { 2, null }, -1L),
+            (new object?[] { 2, 7 }, 1L),
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            // Compare a sweep that covers the values actually produced
+            // by the inputs (including NULL SUM results).
+            object?[][] candidates =
+            [
+                [1, 0L, 0L, null], [1, 1L, 0L, null], [1, 1L, 1L, 10L], [1, 1L, 1L, 20L],
+                [1, 2L, 1L, 10L], [1, 2L, 1L, 20L], [1, 2L, 2L, 30L], [1, 3L, 2L, 30L],
+                [2, 0L, 0L, null], [2, 1L, 0L, null], [2, 1L, 1L, 7L],
+            ];
+            foreach (var cand in candidates)
+            {
+                Assert.Equal(
+                    structural.WeightOf(cand).Value,
+                    typed.WeightOf(cand).Value);
+            }
+        }
+    }
+
+    [Fact]
     public void Aggregate_DifferentialAgainstStructural()
     {
         const string sql = "SELECT k, COUNT(*), SUM(v) FROM t GROUP BY k";

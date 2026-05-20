@@ -12,12 +12,15 @@ namespace DbspNet.Sql.Compiler;
 /// the per-schema emitted input row struct.
 /// </summary>
 /// <remarks>
-/// <para><b>NULL handling.</b> The typed-row pipeline rejects nullable
-/// columns at the schema gate, so every extracted argument is
-/// non-null by construction. That collapses the structural
-/// aggregators' NULL-skip logic (e.g. <c>SqlSumAggregator</c>'s
-/// <c>DistinctNonNullRows</c> tracking) to nothing — Update state is
-/// just the running accumulator.</para>
+/// <para><b>NULL handling (Phase N4).</b> Non-nullable arg variants
+/// (<see cref="TypedSumLongAggregator{TIn}"/> etc.) stay on the
+/// fast path — extractor is <c>Func&lt;TIn, T&gt;</c>, state is a
+/// plain accumulator. Nullable-arg variants
+/// (<see cref="TypedSumLongNullableAggregator{TIn}"/> etc.) take
+/// <c>Func&lt;TIn, T?&gt;</c>, skip rows whose extracted arg
+/// reports <c>HasValue == false</c>, and track DistinctNonNullRows
+/// parallel to the structural variant so they return <c>null</c>
+/// when every row in a (non-empty) group has a NULL arg.</para>
 /// <para><b>Empty-group handling.</b>
 /// <see cref="TypedCompositeAggregator{TIn,TAgg}"/> short-circuits to
 /// <see cref="Optional{TAgg}.None"/> whenever the per-group
@@ -25,16 +28,23 @@ namespace DbspNet.Sql.Compiler;
 /// is present" gate per the DBSP paper §7.2-7.4 and Feldera's
 /// <c>Aggregator</c> trait contract. SQL's "SUM over empty group =
 /// NULL" semantics never reach the typed aggregators because the
-/// gate fires first.</para>
+/// gate fires first. SQL's "SUM over all-NULL group = NULL" goes
+/// through the nullable variants' DistinctNonNullRows check above.</para>
 /// </remarks>
 internal abstract class TypedSqlAggregator<TIn>
     where TIn : notnull
 {
     public abstract Type ResultClrType { get; }
 
-    public abstract object Compute(ZSet<TIn, Z64> rows);
+    /// <summary>
+    /// Compute the aggregate value over the given multiset. Returns
+    /// <c>null</c> only for nullable-arg variants whose group has
+    /// no positive contributions (SQL NULL); non-nullable variants
+    /// always return a definite value.
+    /// </summary>
+    public abstract object? Compute(ZSet<TIn, Z64> rows);
 
-    public virtual object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public virtual object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
         => Compute(after);
 }
 
@@ -48,7 +58,7 @@ internal sealed class TypedCountStarAggregator<TIn> : TypedSqlAggregator<TIn>
 {
     public override Type ResultClrType => typeof(long);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         var total = 0L;
         foreach (var (_, w) in rows)
@@ -59,7 +69,7 @@ internal sealed class TypedCountStarAggregator<TIn> : TypedSqlAggregator<TIn>
         return total;
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state is long prior ? prior : 0L;
         foreach (var (_, w) in delta)
@@ -89,7 +99,7 @@ internal sealed class TypedSumLongAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(long);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         long sum = 0;
         foreach (var (row, w) in rows)
@@ -100,7 +110,7 @@ internal sealed class TypedSumLongAggregator<TIn> : TypedSqlAggregator<TIn>
         return sum;
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state is long prior ? prior : 0L;
         foreach (var (row, w) in delta)
@@ -126,7 +136,7 @@ internal sealed class TypedSumDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(double);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         double sum = 0;
         foreach (var (row, w) in rows)
@@ -137,7 +147,7 @@ internal sealed class TypedSumDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
         return sum;
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state is double prior ? prior : 0.0;
         foreach (var (row, w) in delta)
@@ -171,7 +181,7 @@ internal sealed class TypedSumDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(Decimal128);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         Int256 sum = Int256.Zero;
         foreach (var (row, w) in rows)
@@ -182,7 +192,7 @@ internal sealed class TypedSumDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
         return DecimalRuntime.NarrowToDecimal128(sum);
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state is Int256 prior ? prior : Int256.Zero;
         foreach (var (row, w) in delta)
@@ -218,7 +228,7 @@ internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(Decimal128);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         Int256 sum = Int256.Zero;
         long count = 0;
@@ -231,7 +241,7 @@ internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
         return DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state as AvgState ?? new AvgState();
         foreach (var (row, w) in delta)
@@ -268,7 +278,7 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(double);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         double sum = 0;
         long count = 0;
@@ -282,7 +292,7 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
         return sum / count;
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state as AvgState ?? new AvgState();
         foreach (var (row, w) in delta)
@@ -293,6 +303,323 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 
         state = s;
         return s.Sum / s.Count;
+    }
+}
+
+// ---- Nullable-arg variants (Phase N4) ----
+
+/// <summary>
+/// <c>COUNT(col)</c> over a nullable arg: counts the per-row weight
+/// for every row whose extracted arg has a value, skipping rows
+/// where it's NULL. Result is always non-null <c>long</c> (matches
+/// SQL <c>COUNT(col)</c> over an empty/all-null group: returns 0
+/// — but the linear-emission gate fires before that on a truly
+/// empty group; an all-null non-empty group still emits 0).
+/// </summary>
+internal sealed class TypedCountNullableAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, bool> _hasValue;
+
+    public TypedCountNullableAggregator(Func<TIn, bool> hasValue)
+    {
+        _hasValue = hasValue;
+    }
+
+    public override Type ResultClrType => typeof(long);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        var total = 0L;
+        foreach (var (row, w) in rows)
+        {
+            if (_hasValue(row)) total += w.Value;
+        }
+
+        return total;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state is long prior ? prior : 0L;
+        foreach (var (row, w) in delta)
+        {
+            if (_hasValue(row)) s += w.Value;
+        }
+
+        state = s;
+        return s;
+    }
+}
+
+/// <summary>
+/// <c>SUM</c>-of-non-null with <c>long</c> running total and
+/// nullable-arg extraction. Mirrors
+/// <see cref="SqlSumAggregator"/>'s DistinctNonNullRows tracking
+/// so the result is <c>null</c> iff no current row contributes a
+/// non-null arg.
+/// </summary>
+internal sealed class TypedSumLongNullableAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, long?> _argExtract;
+
+    public TypedSumLongNullableAggregator(Func<TIn, long?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class SumState
+    {
+        public long Sum;
+        public long DistinctNonNullRows;
+    }
+
+    public override Type ResultClrType => typeof(long);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        long sum = 0;
+        var any = false;
+        foreach (var (row, w) in rows)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            sum = checked(sum + v.GetValueOrDefault() * w.Value);
+            any = true;
+        }
+
+        return any ? (object)sum : null;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as SumState ?? new SumState();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            s.Sum = checked(s.Sum + v.GetValueOrDefault() * w.Value);
+            if (beforeW == 0 && afterW != 0) s.DistinctNonNullRows++;
+            else if (beforeW != 0 && afterW == 0) s.DistinctNonNullRows--;
+        }
+
+        state = s;
+        return s.DistinctNonNullRows > 0 ? (object)s.Sum : null;
+    }
+}
+
+/// <summary><c>SUM</c>-of-non-null with <c>double</c> running total and nullable-arg extraction.</summary>
+internal sealed class TypedSumDoubleNullableAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, double?> _argExtract;
+
+    public TypedSumDoubleNullableAggregator(Func<TIn, double?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class SumState
+    {
+        public double Sum;
+        public long DistinctNonNullRows;
+    }
+
+    public override Type ResultClrType => typeof(double);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        double sum = 0;
+        var any = false;
+        foreach (var (row, w) in rows)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            sum += v.GetValueOrDefault() * w.Value;
+            any = true;
+        }
+
+        return any ? (object)sum : null;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as SumState ?? new SumState();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            s.Sum += v.GetValueOrDefault() * w.Value;
+            if (beforeW == 0 && afterW != 0) s.DistinctNonNullRows++;
+            else if (beforeW != 0 && afterW == 0) s.DistinctNonNullRows--;
+        }
+
+        state = s;
+        return s.DistinctNonNullRows > 0 ? (object)s.Sum : null;
+    }
+}
+
+/// <summary><c>SUM</c>-of-non-null with <see cref="Decimal128"/> running total and nullable-arg extraction.</summary>
+internal sealed class TypedSumDecimalNullableAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, Decimal128?> _argExtract;
+
+    public TypedSumDecimalNullableAggregator(Func<TIn, Decimal128?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class SumState
+    {
+        public Int256 Sum;
+        public long DistinctNonNullRows;
+    }
+
+    public override Type ResultClrType => typeof(Decimal128);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        Int256 sum = Int256.Zero;
+        var any = false;
+        foreach (var (row, w) in rows)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            sum += (Int256)v.GetValueOrDefault().Mantissa * w.Value;
+            any = true;
+        }
+
+        return any ? (object)DecimalRuntime.NarrowToDecimal128(sum) : null;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as SumState ?? new SumState();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            s.Sum += (Int256)v.GetValueOrDefault().Mantissa * w.Value;
+            if (beforeW == 0 && afterW != 0) s.DistinctNonNullRows++;
+            else if (beforeW != 0 && afterW == 0) s.DistinctNonNullRows--;
+        }
+
+        state = s;
+        return s.DistinctNonNullRows > 0
+            ? (object)DecimalRuntime.NarrowToDecimal128(s.Sum)
+            : null;
+    }
+}
+
+/// <summary><c>AVG</c>-of-non-null over a numeric column with nullable-arg extraction. Returns <c>null</c> for an all-NULL group.</summary>
+internal sealed class TypedAvgDoubleNullableAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, double?> _argExtract;
+
+    public TypedAvgDoubleNullableAggregator(Func<TIn, double?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class AvgState
+    {
+        public double Sum;
+        public long NonNullCount;
+    }
+
+    public override Type ResultClrType => typeof(double);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        double sum = 0;
+        long count = 0;
+        foreach (var (row, w) in rows)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            sum += v.GetValueOrDefault() * w.Value;
+            count += w.Value;
+        }
+
+        return count == 0 ? null : (object)(sum / count);
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as AvgState ?? new AvgState();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            s.Sum += v.GetValueOrDefault() * w.Value;
+            s.NonNullCount += w.Value;
+        }
+
+        state = s;
+        return s.NonNullCount == 0 ? null : (object)(s.Sum / s.NonNullCount);
+    }
+}
+
+/// <summary><c>AVG</c>-of-non-null over a DECIMAL column with nullable-arg extraction.</summary>
+internal sealed class TypedAvgDecimalNullableAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, Decimal128?> _argExtract;
+
+    public TypedAvgDecimalNullableAggregator(Func<TIn, Decimal128?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class AvgState
+    {
+        public Int256 Sum;
+        public long NonNullCount;
+    }
+
+    public override Type ResultClrType => typeof(Decimal128);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        Int256 sum = Int256.Zero;
+        long count = 0;
+        foreach (var (row, w) in rows)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            sum += (Int256)v.GetValueOrDefault().Mantissa * w.Value;
+            count += w.Value;
+        }
+
+        return count == 0
+            ? null
+            : (object)DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var s = state as AvgState ?? new AvgState();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (!v.HasValue) continue;
+            s.Sum += (Int256)v.GetValueOrDefault().Mantissa * w.Value;
+            s.NonNullCount += w.Value;
+        }
+
+        state = s;
+        return s.NonNullCount == 0
+            ? null
+            : (object)DecimalRuntime.NarrowToDecimal128(s.Sum / (Int256)s.NonNullCount);
     }
 }
 
@@ -327,7 +654,7 @@ internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(T);
 
-    public override object Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(ZSet<TIn, Z64> rows)
     {
         T best = default!;
         var hasBest = false;
@@ -367,7 +694,7 @@ internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
         return best!;
     }
 
-    public override object Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var s = state as State ?? new State();
         foreach (var (row, w) in delta)
