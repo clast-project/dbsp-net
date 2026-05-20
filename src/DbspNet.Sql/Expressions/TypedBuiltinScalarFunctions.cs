@@ -34,21 +34,14 @@ internal static class TypedBuiltinScalarFunctions
     public static Expression? TryBuild(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] args)
     {
-        // Most function builders below assume non-null args (they
-        // produce IL that calls instance methods directly on the
-        // argument values). Phase N3 lifts the scan-level
-        // nullability gate, so nullable args can now reach these
-        // builders. Until per-function NULL handling ships, bail
-        // when any arg is nullable — except for the functions whose
-        // builders already handle nulls correctly (NULLIF, COALESCE).
-        if (fn.FunctionName is not ("nullif" or "coalesce"))
-        {
-            foreach (var arg in args)
-            {
-                if (TypedExpressionCompiler.IsNullable(arg.Type)) return null;
-            }
-        }
-
+        // Per-function NULL handling (Phase: per-function NULL
+        // propagation): each builder is responsible for handling
+        // nullable args either by wrapping in PropagateUnary /
+        // PropagateBinary (NULL-propagating functions) or by
+        // routing to a skip-null runtime helper (CONCAT, GREATEST,
+        // LEAST — PG semantics, matches structural). NULLIF and
+        // COALESCE produce NULL by design and have always handled
+        // nullable args themselves.
         return fn.FunctionName switch
         {
             "coalesce" => BuildCoalesce(args),
@@ -190,25 +183,51 @@ internal static class TypedBuiltinScalarFunctions
 
     private static Expression BuildUpperLower(Expression arg, bool isUpper)
     {
-        return Expression.Call(arg, isUpper ? Utf8ToUpperInvariant : Utf8ToLowerInvariant);
+        return TypedExpressionCompiler.PropagateUnary(arg, v =>
+            Expression.Call(v, isUpper ? Utf8ToUpperInvariant : Utf8ToLowerInvariant));
     }
 
     private static Expression BuildLength(Expression arg)
     {
         // PG semantics: LENGTH = number of code points.
-        return Expression.Call(arg, Utf8CodePointCount);
+        return TypedExpressionCompiler.PropagateUnary(arg, v =>
+            Expression.Call(v, Utf8CodePointCount));
     }
 
     private static readonly MethodInfo ConcatTyped =
         typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatTyped))!;
+    private static readonly MethodInfo ConcatTypedNullable =
+        typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatTypedNullable))!;
 
     private static Expression BuildConcat(Expression[] args)
     {
-        // Variadic — package as a typed Utf8String[] and dispatch to
-        // the typed runtime helper. (No null-skip needed: every arg
-        // on the typed path is a definite Utf8String.)
-        var argArray = Expression.NewArrayInit(typeof(Utf8String), args);
-        return Expression.Call(ConcatTyped, argArray);
+        // PG semantics: CONCAT skips NULL args, never returns NULL.
+        // Fast path (all args non-null): pack as Utf8String[].
+        // Slow path (any nullable): pack as Utf8String?[] and route
+        // to the null-skipping helper. Resolver always types CONCAT
+        // result as non-null.
+        var anyNullable = false;
+        foreach (var a in args)
+        {
+            if (TypedExpressionCompiler.IsNullable(a.Type)) { anyNullable = true; break; }
+        }
+
+        if (!anyNullable)
+        {
+            var argArray = Expression.NewArrayInit(typeof(Utf8String), args);
+            return Expression.Call(ConcatTyped, argArray);
+        }
+
+        var lifted = new Expression[args.Length];
+        for (var i = 0; i < args.Length; i++)
+        {
+            lifted[i] = TypedExpressionCompiler.IsNullable(args[i].Type)
+                ? args[i]
+                : Expression.Convert(args[i], typeof(Utf8String?));
+        }
+
+        var nullableArray = Expression.NewArrayInit(typeof(Utf8String?), lifted);
+        return Expression.Call(ConcatTypedNullable, nullableArray);
     }
 
     // ---- Numeric ----
@@ -217,37 +236,38 @@ internal static class TypedBuiltinScalarFunctions
     {
         if (argType is SqlDecimalType)
         {
-            return Expression.Call(
-                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.Abs))!,
-                arg);
+            var method = typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.Abs))!;
+            return TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(method, v));
         }
 
         var clr = argType.ClrType;
-        var method = typeof(Math).GetMethod(nameof(Math.Abs), new[] { clr })
+        var mathMethod = typeof(Math).GetMethod(nameof(Math.Abs), new[] { clr })
             ?? throw new InvalidOperationException($"no Math.Abs({clr.Name}) overload");
-        return Expression.Call(method, arg);
+        return TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(mathMethod, v));
     }
 
     private static Expression BuildFloorCeil(Expression arg, SqlType argType, bool floor)
     {
         if (argType is SqlIntegerType or SqlBigintType)
         {
+            // FLOOR(int) = int; nullable input → nullable output, the
+            // arg expression already has the right type.
             return arg;
         }
 
         if (argType is SqlDecimalType d)
         {
             var name = floor ? nameof(DecimalRuntime.Floor) : nameof(DecimalRuntime.Ceil);
-            return Expression.Call(
-                typeof(DecimalRuntime).GetMethod(name)!,
-                arg, Expression.Constant((byte)d.Scale));
+            var method = typeof(DecimalRuntime).GetMethod(name)!;
+            return TypedExpressionCompiler.PropagateUnary(arg, v =>
+                Expression.Call(method, v, Expression.Constant((byte)d.Scale)));
         }
 
         var clr = argType.ClrType;
         var runtimeName = floor ? nameof(SqlBuiltinRuntime.Floor) : nameof(SqlBuiltinRuntime.Ceil);
-        var method = typeof(SqlBuiltinRuntime).GetMethod(runtimeName, new[] { clr })
+        var runtimeMethod = typeof(SqlBuiltinRuntime).GetMethod(runtimeName, new[] { clr })
             ?? throw new InvalidOperationException($"no runtime {runtimeName} for {clr.Name}");
-        return Expression.Call(method, arg);
+        return TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(runtimeMethod, v));
     }
 
     private static Expression BuildRound(Expression[] args, IReadOnlyList<ResolvedExpression> astArgs)
@@ -264,11 +284,16 @@ internal static class TypedBuiltinScalarFunctions
             var scale = Expression.Constant((byte)decType.Scale);
             if (args.Length == 1)
             {
-                return Expression.Call(method, args[0], scale, Expression.Constant(0));
+                return TypedExpressionCompiler.PropagateUnary(args[0], v =>
+                    Expression.Call(method, v, scale, Expression.Constant(0)));
             }
 
-            var digits = WidenToInt(args[1]);
-            return Expression.Call(method, args[0], scale, digits);
+            // Two-arg: NULL on either propagates.
+            return TypedExpressionCompiler.PropagateBinary(args[0], args[1], (xv, dv) =>
+            {
+                var digits = dv.Type == typeof(int) ? dv : Expression.Convert(dv, typeof(int));
+                return Expression.Call(method, xv, scale, digits);
+            });
         }
 
         var clr = argType.ClrType;
@@ -278,40 +303,93 @@ internal static class TypedBuiltinScalarFunctions
 
         if (args.Length == 1)
         {
-            return Expression.Call(runtimeMethod, args[0], Expression.Constant(0));
+            return TypedExpressionCompiler.PropagateUnary(args[0], v =>
+                Expression.Call(runtimeMethod, v, Expression.Constant(0)));
         }
 
-        return Expression.Call(runtimeMethod, args[0], WidenToInt(args[1]));
+        return TypedExpressionCompiler.PropagateBinary(args[0], args[1], (xv, dv) =>
+        {
+            var digits = dv.Type == typeof(int) ? dv : Expression.Convert(dv, typeof(int));
+            return Expression.Call(runtimeMethod, xv, digits);
+        });
     }
 
     private static Expression BuildPower(Expression x, Expression y)
     {
-        // Both widen to double; Math.Pow returns double.
-        var xd = x.Type == typeof(double) ? x : Expression.Convert(x, typeof(double));
-        var yd = y.Type == typeof(double) ? y : Expression.Convert(y, typeof(double));
-        return Expression.Call(typeof(Math).GetMethod(nameof(Math.Pow))!, xd, yd);
+        // Both widen to double inside the propagate closure; result
+        // is Nullable<double> iff either operand is nullable.
+        return TypedExpressionCompiler.PropagateBinary(x, y, (xv, yv) =>
+        {
+            var xd = xv.Type == typeof(double) ? xv : Expression.Convert(xv, typeof(double));
+            var yd = yv.Type == typeof(double) ? yv : Expression.Convert(yv, typeof(double));
+            return Expression.Call(typeof(Math).GetMethod(nameof(Math.Pow))!, xd, yd);
+        });
     }
 
     private static Expression BuildSqrt(Expression arg)
     {
-        var x = arg.Type == typeof(double) ? arg : Expression.Convert(arg, typeof(double));
-        return Expression.Call(typeof(Math).GetMethod(nameof(Math.Sqrt))!, x);
+        return TypedExpressionCompiler.PropagateUnary(arg, v =>
+        {
+            var x = v.Type == typeof(double) ? v : Expression.Convert(v, typeof(double));
+            return Expression.Call(typeof(Math).GetMethod(nameof(Math.Sqrt))!, x);
+        });
     }
 
     // ---- GREATEST / LEAST ----
 
-    private static Expression BuildGreatestLeast(Expression[] args, bool greatest)
+    private static Expression? BuildGreatestLeast(Expression[] args, bool greatest)
     {
-        // Resolver casts every arg to a common comparable type.
-        // Reflect the element type from the first arg and dispatch
-        // to the typed runtime helper.
-        var elementType = args[0].Type;
-        var helperName = greatest ? nameof(TypedBuiltinRuntime.Greatest) : nameof(TypedBuiltinRuntime.Least);
-        var openHelper = typeof(TypedBuiltinRuntime).GetMethods(BindingFlags.Public | BindingFlags.Static)
-            .Single(m => m.Name == helperName && m.IsGenericMethodDefinition);
-        var closedHelper = openHelper.MakeGenericMethod(elementType);
-        var argArray = Expression.NewArrayInit(elementType, args);
-        return Expression.Call(closedHelper, argArray);
+        // Resolver casts every arg to a common comparable type and
+        // marks the result nullable iff any arg is nullable (all-NULL
+        // group → NULL). If any arg is nullable, route to the
+        // skip-null Nullable<T> variant; otherwise stay on the
+        // non-null fast path.
+        var anyNullable = false;
+        foreach (var a in args)
+        {
+            if (TypedExpressionCompiler.IsNullable(a.Type)) { anyNullable = true; break; }
+        }
+
+        if (!anyNullable)
+        {
+            var elementType = args[0].Type;
+            var helperName = greatest
+                ? nameof(TypedBuiltinRuntime.Greatest)
+                : nameof(TypedBuiltinRuntime.Least);
+            var openHelper = typeof(TypedBuiltinRuntime).GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Single(m => m.Name == helperName && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+            var closedHelper = openHelper.MakeGenericMethod(elementType);
+            var argArray = Expression.NewArrayInit(elementType, args);
+            return Expression.Call(closedHelper, argArray);
+        }
+
+        // Lift every arg to Nullable<T> (resolver guarantees a
+        // common underlying T; T must be a value type for the
+        // nullable variant to apply).
+        var underlying = TypedExpressionCompiler.IsNullable(args[0].Type)
+            ? TypedExpressionCompiler.UnderlyingType(args[0].Type)
+            : args[0].Type;
+        // Ref-type GREATEST/LEAST on nullable args is out of scope
+        // for the typed pipeline; fall back to structural.
+        if (!underlying.IsValueType) return null;
+
+        var nullableElement = typeof(Nullable<>).MakeGenericType(underlying);
+        var lifted = new Expression[args.Length];
+        for (var i = 0; i < args.Length; i++)
+        {
+            lifted[i] = TypedExpressionCompiler.IsNullable(args[i].Type)
+                ? args[i]
+                : Expression.Convert(args[i], nullableElement);
+        }
+
+        var nullHelperName = greatest
+            ? nameof(TypedBuiltinRuntime.GreatestNullable)
+            : nameof(TypedBuiltinRuntime.LeastNullable);
+        var openNullHelper = typeof(TypedBuiltinRuntime).GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nullHelperName && m.IsGenericMethodDefinition);
+        var closedNullHelper = openNullHelper.MakeGenericMethod(underlying);
+        var liftedArray = Expression.NewArrayInit(nullableElement, lifted);
+        return Expression.Call(closedNullHelper, liftedArray);
     }
 
     // ---- Helpers ----
@@ -387,5 +465,71 @@ internal static class TypedBuiltinRuntime
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// Variadic CONCAT with PG NULL semantics (matches structural):
+    /// skip args whose <see cref="Nullable{T}.HasValue"/> is false,
+    /// concatenate the rest. Never returns NULL — an all-NULL or empty
+    /// call returns <see cref="Utf8String.Empty"/>.
+    /// </summary>
+    public static Utf8String ConcatTypedNullable(Utf8String?[] args)
+    {
+        var totalBytes = 0;
+        foreach (var a in args)
+        {
+            if (a.HasValue) totalBytes += a.GetValueOrDefault().ByteLength;
+        }
+
+        if (totalBytes == 0)
+        {
+            return Utf8String.Empty;
+        }
+
+        var buf = new byte[totalBytes];
+        var offset = 0;
+        foreach (var a in args)
+        {
+            if (!a.HasValue) continue;
+            var u = a.GetValueOrDefault();
+            u.Span.CopyTo(buf.AsSpan(offset));
+            offset += u.ByteLength;
+        }
+
+        return Utf8String.FromBytes(buf);
+    }
+
+    /// <summary>
+    /// Typed GREATEST with PG NULL semantics: skip NULL args, return
+    /// <c>null</c> if every arg is NULL. Otherwise the maximum
+    /// non-null value.
+    /// </summary>
+    public static T? GreatestNullable<T>(T?[] args) where T : struct, IComparable<T>
+    {
+        T best = default;
+        var hasBest = false;
+        foreach (var a in args)
+        {
+            if (!a.HasValue) continue;
+            var v = a.GetValueOrDefault();
+            if (!hasBest || v.CompareTo(best) > 0) { best = v; hasBest = true; }
+        }
+
+        return hasBest ? best : null;
+    }
+
+    /// <summary>Typed LEAST with PG NULL semantics. See <see cref="GreatestNullable{T}"/>.</summary>
+    public static T? LeastNullable<T>(T?[] args) where T : struct, IComparable<T>
+    {
+        T best = default;
+        var hasBest = false;
+        foreach (var a in args)
+        {
+            if (!a.HasValue) continue;
+            var v = a.GetValueOrDefault();
+            if (!hasBest || v.CompareTo(best) < 0) { best = v; hasBest = true; }
+        }
+
+        return hasBest ? best : null;
     }
 }

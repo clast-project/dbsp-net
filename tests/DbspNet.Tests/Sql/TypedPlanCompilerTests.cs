@@ -425,6 +425,100 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Project_BuiltinUpper_NullablePropagatesNull()
+    {
+        // Per-function NULL propagation: UPPER(nullable_str) is now
+        // accepted on the typed path and propagates NULL.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (s VARCHAR)"],
+            "SELECT UPPER(s) FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert("hello");
+        typed.Table("t").Insert(new object?[] { null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(new object?[] { "HELLO" }).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null }).Value);
+    }
+
+    [Fact]
+    public void Project_BuiltinAbs_NullablePropagatesNull()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (v INT)"],
+            "SELECT ABS(v) FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(-5);
+        typed.Table("t").Insert(new object?[] { null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(5).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null }).Value);
+    }
+
+    [Fact]
+    public void Project_BuiltinPower_NullablePropagatesNull()
+    {
+        // POWER(nullable, nullable): NULL on either arg → NULL result.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (b INT, e INT)"],
+            "SELECT POWER(b, e) FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(2, 3);
+        typed.Table("t").Insert(new object?[] { null, 3 });
+        typed.Table("t").Insert(new object?[] { 2, null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(8.0).Value);
+        Assert.Equal(2L, typed.WeightOf(new object?[] { null }).Value);
+    }
+
+    [Fact]
+    public void Project_BuiltinConcat_SkipsNullsPgSemantics()
+    {
+        // CONCAT skips NULL args (matches structural's PG semantics).
+        // Result is never NULL even for all-NULL input.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a VARCHAR, b VARCHAR)"],
+            "SELECT CONCAT(a, '|', b) FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert("x", "y");
+        typed.Table("t").Insert(new object?[] { null, "y" });
+        typed.Table("t").Insert(new object?[] { "x", null });
+        typed.Table("t").Insert(new object?[] { null, null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf("x|y").Value);
+        Assert.Equal(1L, typed.WeightOf("|y").Value);
+        Assert.Equal(1L, typed.WeightOf("x|").Value);
+        Assert.Equal(1L, typed.WeightOf("|").Value);
+    }
+
+    [Fact]
+    public void Project_BuiltinGreatest_SkipsNullsPgSemantics()
+    {
+        var plan = CompilePlan(
+            ["CREATE TABLE t (a INT, b INT)"],
+            "SELECT GREATEST(a, b) FROM t");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(3, 7);                       // 7
+        typed.Table("t").Insert(new object?[] { null, 5 });   // 5 (null skipped)
+        typed.Table("t").Insert(new object?[] { 9, null });   // 9
+        typed.Table("t").Insert(new object?[] { null, null }); // NULL
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(7).Value);
+        Assert.Equal(1L, typed.WeightOf(5).Value);
+        Assert.Equal(1L, typed.WeightOf(9).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null }).Value);
+    }
+
+    [Fact]
     public void Filter_NullablePredicate_NullDropsRow()
     {
         // WHERE on a nullable column: "v > 5" evaluates to TRUE,

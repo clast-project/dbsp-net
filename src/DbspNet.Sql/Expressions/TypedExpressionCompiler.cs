@@ -157,7 +157,7 @@ public static class TypedExpressionCompiler
     /// the unwrapped <c>T</c> value and returns an Expression of result type
     /// (typically the same underlying type as the input).
     /// </summary>
-    private static Expression PropagateUnary(Expression operand, Func<Expression, Expression> compute)
+    internal static Expression PropagateUnary(Expression operand, Func<Expression, Expression> compute)
     {
         if (!IsNullable(operand.Type))
         {
@@ -186,7 +186,7 @@ public static class TypedExpressionCompiler
     /// types unchanged (Nullable&lt;T&gt; or T); <c>compute</c>
     /// receives the unwrapped underlying values.
     /// </summary>
-    private static Expression PropagateBinary(
+    internal static Expression PropagateBinary(
         Expression l, Expression r, Func<Expression, Expression, Expression> compute)
     {
         var lNullable = IsNullable(l.Type);
