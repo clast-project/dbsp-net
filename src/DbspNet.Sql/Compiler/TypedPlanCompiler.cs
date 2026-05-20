@@ -177,7 +177,7 @@ public static class TypedPlanCompiler
         ScanPlan s => CompileScan(s, ctx),
         FilterPlan f => CompileFilter(f, ctx),
         ProjectPlan p => CompileProject(p, ctx),
-        JoinPlan { JoinType: AstJoinType.Inner } j => CompileInnerJoin(j, ctx),
+        JoinPlan j => CompileJoin(j, ctx),
         AggregatePlan a => CompileAggregate(a, ctx),
         _ => null,
     };
@@ -276,20 +276,23 @@ public static class TypedPlanCompiler
     }
 
     /// <summary>
-    /// Compiles an <see cref="AstJoinType.Inner"/> equi-join. Both
-    /// sides are recursively typed; the equi-key columns become a
-    /// per-join emitted struct (<c>TKey</c>); the combined row is the
-    /// concatenation of the two sides' columns (left first, then
-    /// right). A residual is applied as a subsequent typed
-    /// <see cref="LinearOperators.Filter"/>.
+    /// Compiles a <see cref="JoinPlan"/> of any supported join type.
+    /// INNER joins emit the side-by-side concatenation of matching
+    /// rows. LEFT / RIGHT OUTER joins additionally emit a NULL-padded
+    /// row for each unmatched preserved-side row; the resolver marks
+    /// the unmatched side's columns as nullable on the output schema,
+    /// so the emitted output row carries <c>Nullable&lt;T&gt;</c>
+    /// fields on that side and the null-pad combine just leaves them
+    /// at their default. FULL OUTER and nullable equi-key columns are
+    /// out of scope — fall back to structural for those.
     /// </summary>
-    /// <remarks>
-    /// LEFT / RIGHT OUTER joins are out of scope: NULL-padding the
-    /// missing side requires nullable output columns, which the typed
-    /// row gate rejects.
-    /// </remarks>
-    private static TypedNode? CompileInnerJoin(JoinPlan plan, CompileContext ctx)
+    private static TypedNode? CompileJoin(JoinPlan plan, CompileContext ctx)
     {
+        if (plan.JoinType is not (AstJoinType.Inner or AstJoinType.LeftOuter or AstJoinType.RightOuter))
+        {
+            return null;
+        }
+
         if (plan.EquiKeys.Count == 0) return null;
 
         var left = TryCompileNode(plan.Left, ctx);
@@ -297,10 +300,14 @@ public static class TypedPlanCompiler
         var right = TryCompileNode(plan.Right, ctx);
         if (right is null) return null;
 
-        // Equi-key columns must be NOT NULL on both sides — the typed
-        // row gate enforces this at the scan level, but a key column
-        // could in principle come from a derived plan with a nullable
-        // result. Belt and braces: reject explicitly.
+        // Equi-key columns must be NOT NULL on both sides. For INNER
+        // this is correctness via "NULL ≠ anything"; for LEFT / RIGHT
+        // it's a scope restriction — handling nullable keys requires
+        // bypassing NULL-keyed preserved-side rows directly to the
+        // null-pad branch (parallel to PlanToCircuit's
+        // nullKeyLeft / nullKeyRight Filter+MapRows). That bypass is
+        // out of scope for the typed pipeline today; the structural
+        // fallback handles those queries.
         var leftIndices = new int[plan.EquiKeys.Count];
         var rightIndices = new int[plan.EquiKeys.Count];
         for (var i = 0; i < plan.EquiKeys.Count; i++)
@@ -321,10 +328,6 @@ public static class TypedPlanCompiler
             right.RowType, keyRowType, keySchema, rightIndices);
         if (leftKeyExtractor is null || rightKeyExtractor is null) return null;
 
-        // Preserve nullability on the join output. Each side's
-        // nullable non-key columns carry their Nullable<T> field
-        // type through to the output row; the join's equi-key gate
-        // above ensures key columns are non-null on both sides.
         var outputSchema = plan.Schema;
         var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
         if (outputRowType is null) return null;
@@ -343,15 +346,57 @@ public static class TypedPlanCompiler
         var rightSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, right.Schema, keyRowType, right.RowType);
 
-        var joined = InvokeIncrementalInnerJoin(
-            ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
-            leftIndexed, rightIndexed, combineDelegate,
-            leftSnapshotCodec, rightSnapshotCodec);
+        object joined;
+        if (plan.JoinType is AstJoinType.Inner)
+        {
+            joined = InvokeIncrementalInnerJoin(
+                ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
+                leftIndexed, rightIndexed, combineDelegate,
+                leftSnapshotCodec, rightSnapshotCodec);
+        }
+        else if (plan.JoinType is AstJoinType.LeftOuter)
+        {
+            // Resolver rejects residuals on outer joins (their
+            // failure-on-residual semantics don't compose with the
+            // null-pad branch); double-check here.
+            if (plan.Residual is not null) return null;
+            var nullPad = BuildNullPadCombineDelegate(
+                keyRowType, left.RowType, outputRowType, outputSchema,
+                preservedSideOffset: 0, preservedSideCount: left.Schema.Count);
+            if (nullPad is null) return null;
+            joined = InvokeIncrementalLeftJoin(
+                ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
+                leftIndexed, rightIndexed, combineDelegate, nullPad,
+                leftSnapshotCodec, rightSnapshotCodec);
+        }
+        else // RightOuter
+        {
+            if (plan.Residual is not null) return null;
+            // Swap sides: the right stream becomes the preserved side
+            // fed to IncrementalLeftJoin. Output column order stays
+            // [left cols, right cols], so the combine reverses its
+            // first two args back to (left, right) and the null-pad
+            // populates the right cols from the preserved row, leaving
+            // the left cols at default(Nullable<T>).
+            var swappedCombine = BuildSwappedJoinCombineDelegate(
+                keyRowType, left.RowType, right.RowType, outputRowType,
+                outputSchema, left.Schema.Count, right.Schema.Count);
+            var nullPad = BuildNullPadCombineDelegate(
+                keyRowType, right.RowType, outputRowType, outputSchema,
+                preservedSideOffset: left.Schema.Count,
+                preservedSideCount: right.Schema.Count);
+            if (nullPad is null) return null;
+            joined = InvokeIncrementalLeftJoin(
+                ctx.Builder, keyRowType, right.RowType, left.RowType, outputRowType,
+                rightIndexed, leftIndexed, swappedCombine, nullPad,
+                rightSnapshotCodec, leftSnapshotCodec);
+        }
 
         var node = new TypedNode(outputRowType, outputSchema, joined);
 
         if (plan.Residual is not null)
         {
+            // Only INNER reaches here (LEFT/RIGHT bail above).
             var residual = BuildTypedPredicateDelegate(plan.Residual, outputRowType);
             if (residual is null) return null;
             var filtered = InvokeFilter(ctx.Builder, outputRowType, joined, residual);
@@ -1029,6 +1074,134 @@ public static class TypedPlanCompiler
             keyParam, leftParam, rightParam).Compile();
     }
 
+    /// <summary>
+    /// Same as <see cref="BuildJoinCombineDelegate"/> but with the
+    /// physical preserved/probed sides swapped — used for RIGHT JOIN
+    /// where the right stream is fed to IncrementalLeftJoin as the
+    /// preserved side. The delegate's first arg is the preserved
+    /// (right-table) row and its second arg is the probed (left-table)
+    /// row, but the output column layout stays [left cols, right cols]
+    /// (user-written order), so the body pulls fields from the second
+    /// param for the left slots and from the first param for the right
+    /// slots.
+    /// </summary>
+    private static Delegate BuildSwappedJoinCombineDelegate(
+        Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
+        Schema outputSchema, int leftCount, int rightCount)
+    {
+        var ctorParamTypes = new Type[outputSchema.Count];
+        for (var i = 0; i < outputSchema.Count; i++)
+        {
+            var field = outputRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted output row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
+        }
+
+        var ctor = outputRowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException(
+                "emitted output row missing typed-fields ctor");
+
+        var keyParam = Expression.Parameter(keyRowType, "k");
+        // Preserved side (first non-key arg of IncrementalLeftJoin's
+        // combine) is the right-table row; probed is the left-table row.
+        var preservedRightParam = Expression.Parameter(rightRowType, "r");
+        var probedLeftParam = Expression.Parameter(leftRowType, "l");
+
+        var args = new Expression[leftCount + rightCount];
+        for (var i = 0; i < leftCount; i++)
+        {
+            var field = leftRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("missing left field F" + i);
+            args[i] = Expression.Field(probedLeftParam, field);
+            if (args[i].Type != ctorParamTypes[i])
+                args[i] = Expression.Convert(args[i], ctorParamTypes[i]);
+        }
+
+        for (var j = 0; j < rightCount; j++)
+        {
+            var field = rightRowType.GetField("F" + j)
+                ?? throw new InvalidOperationException("missing right field F" + j);
+            var arg = (Expression)Expression.Field(preservedRightParam, field);
+            if (arg.Type != ctorParamTypes[leftCount + j])
+                arg = Expression.Convert(arg, ctorParamTypes[leftCount + j]);
+            args[leftCount + j] = arg;
+        }
+
+        var delegateType = typeof(Func<,,,>).MakeGenericType(
+            keyRowType, rightRowType, leftRowType, outputRowType);
+        return Expression.Lambda(
+            delegateType, Expression.New(ctor, args),
+            keyParam, preservedRightParam, probedLeftParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds the LEFT-JOIN null-pad combine
+    /// <c>(TKey _, TPreserved p) =&gt; new TOut(...)</c> where output
+    /// slots in <c>[preservedSideOffset, preservedSideOffset + preservedSideCount)</c>
+    /// come from the preserved row's fields and every other output
+    /// slot is initialised to <c>default</c> (Nullable&lt;T&gt; with
+    /// HasValue=false, or null reference). The resolver marks every
+    /// non-preserved-side column as nullable on the output schema —
+    /// if some emitted output field doesn't accept the null padding
+    /// (i.e. its CLR type is a non-nullable value type), the build
+    /// fails and the caller falls back to structural.
+    /// </summary>
+    private static Delegate? BuildNullPadCombineDelegate(
+        Type keyRowType, Type preservedRowType, Type outputRowType,
+        Schema outputSchema, int preservedSideOffset, int preservedSideCount)
+    {
+        var ctorParamTypes = new Type[outputSchema.Count];
+        for (var i = 0; i < outputSchema.Count; i++)
+        {
+            var field = outputRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted output row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
+        }
+
+        var ctor = outputRowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException(
+                "emitted output row missing typed-fields ctor");
+
+        var keyParam = Expression.Parameter(keyRowType, "k");
+        var preservedParam = Expression.Parameter(preservedRowType, "p");
+
+        var args = new Expression[outputSchema.Count];
+        for (var i = 0; i < outputSchema.Count; i++)
+        {
+            var inPreservedRange = i >= preservedSideOffset
+                && i < preservedSideOffset + preservedSideCount;
+            if (inPreservedRange)
+            {
+                var field = preservedRowType.GetField("F" + (i - preservedSideOffset))
+                    ?? throw new InvalidOperationException(
+                        "missing preserved field F" + (i - preservedSideOffset));
+                args[i] = Expression.Field(preservedParam, field);
+                if (args[i].Type != ctorParamTypes[i])
+                    args[i] = Expression.Convert(args[i], ctorParamTypes[i]);
+            }
+            else
+            {
+                // Padding slot. Must be either Nullable<T> or a ref
+                // type — otherwise we can't represent SQL NULL here.
+                var target = ctorParamTypes[i];
+                if (target.IsValueType
+                    && !(target.IsGenericType
+                         && target.GetGenericTypeDefinition() == typeof(Nullable<>)))
+                {
+                    return null;
+                }
+
+                args[i] = Expression.Default(target);
+            }
+        }
+
+        var delegateType = typeof(Func<,,>).MakeGenericType(
+            keyRowType, preservedRowType, outputRowType);
+        return Expression.Lambda(
+            delegateType, Expression.New(ctor, args),
+            keyParam, preservedParam).Compile();
+    }
+
     // ---- Snapshot codec adapters ----
 
     /// <summary>
@@ -1273,6 +1446,31 @@ public static class TypedPlanCompiler
         return closed.Invoke(null, new object?[]
         {
             builder, leftIndexed, rightIndexed, combine,
+            leftSnapshotCodec, rightSnapshotCodec,
+        })!;
+    }
+
+    /// <summary>
+    /// <c>builder.IncrementalLeftJoin&lt;TKey, TLeft, TRight, TOut, Z64&gt;(...)</c>.
+    /// "Left" here is the preserved side regardless of caller's
+    /// physical left/right — RIGHT JOIN passes its right-table
+    /// stream as <paramref name="leftIndexed"/>.
+    /// </summary>
+    private static object InvokeIncrementalLeftJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        Type outputRowType, object leftIndexed, object rightIndexed,
+        Delegate joinCombine, Delegate nullPadCombine,
+        object? leftSnapshotCodec = null, object? rightSnapshotCodec = null)
+    {
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(StatefulOperators.IncrementalLeftJoin)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(
+            keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object?[]
+        {
+            builder, leftIndexed, rightIndexed, joinCombine, nullPadCombine,
             leftSnapshotCodec, rightSnapshotCodec,
         })!;
     }

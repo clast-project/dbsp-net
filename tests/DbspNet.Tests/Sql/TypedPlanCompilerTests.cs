@@ -1215,7 +1215,7 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void Join_RejectsLeftOuter()
+    public void Join_LeftOuter_NullPadsUnmatchedRight()
     {
         var plan = CompilePlan(
             [
@@ -1224,8 +1224,117 @@ public class TypedPlanCompilerTests
             ],
             "SELECT v, w FROM l LEFT JOIN r ON l.k = r.k");
 
-        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
-        Assert.Null(typed);
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("l").Insert(1, 10);
+        typed.Table("l").Insert(2, 20);          // no match in r → NULL-padded
+        typed.Table("r").Insert(1, 100);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(10, 100).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 20, null }).Value);
+    }
+
+    [Fact]
+    public void Join_RightOuter_NullPadsUnmatchedLeft()
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT v, w FROM l RIGHT JOIN r ON l.k = r.k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("l").Insert(1, 10);
+        typed.Table("r").Insert(1, 100);
+        typed.Table("r").Insert(2, 200);         // no match in l → NULL-padded
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(10, 100).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null, 200 }).Value);
+    }
+
+    [Fact]
+    public void Join_LeftOuter_RetractMatch_ShiftsToNullPadded()
+    {
+        // Insert a matching right row, then retract it — the matched
+        // row retracts and a NULL-padded row appears in its place.
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT v, w FROM l LEFT JOIN r ON l.k = r.k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("l").Insert(1, 10);
+        typed.Table("r").Insert(1, 100);
+        typed.Step();
+        Assert.Equal(1L, typed.WeightOf(10, 100).Value);
+        Assert.Equal(0L, typed.WeightOf(new object?[] { 10, null }).Value);
+
+        typed.Table("r").Delete(1, 100);
+        typed.Step();
+        Assert.Equal(-1L, typed.WeightOf(10, 100).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { 10, null }).Value);
+    }
+
+    [Fact]
+    public void Join_LeftOuter_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT v, w FROM l LEFT JOIN r ON l.k = r.k";
+        var ddl = new[]
+        {
+            "CREATE TABLE l (k INT NOT NULL, v INT NOT NULL)",
+            "CREATE TABLE r (k INT NOT NULL, w INT NOT NULL)",
+        };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var lDeltas = new (object?[], long)[]
+        {
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { 2, 20 }, 1L),
+            (new object?[] { 1, 11 }, 1L),
+            (new object?[] { 2, 20 }, -1L),
+        };
+        var rDeltas = new (object?[], long)[]
+        {
+            (new object?[] { 1, 100 }, 1L),
+            (new object?[] { 3, 300 }, 1L),
+            (new object?[] { 1, 100 }, -1L),
+        };
+
+        for (var step = 0; step < Math.Max(lDeltas.Length, rDeltas.Length); step++)
+        {
+            if (step < lDeltas.Length)
+            {
+                typed!.Table("l").Push(new[] { lDeltas[step] });
+                structural.Table("l").Push(new[] { lDeltas[step] });
+            }
+            if (step < rDeltas.Length)
+            {
+                typed!.Table("r").Push(new[] { rDeltas[step] });
+                structural.Table("r").Push(new[] { rDeltas[step] });
+            }
+            typed!.Step();
+            structural.Step();
+
+            object?[][] candidates =
+            [
+                [10, 100], [11, 100], [20, 100],
+                [10, null], [11, null], [20, null],
+            ];
+            foreach (var cand in candidates)
+            {
+                Assert.Equal(
+                    structural.WeightOf(cand).Value,
+                    typed.WeightOf(cand).Value);
+            }
+        }
     }
 
     [Fact]
