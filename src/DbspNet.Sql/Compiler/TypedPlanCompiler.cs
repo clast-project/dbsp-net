@@ -218,8 +218,18 @@ public static class TypedPlanCompiler
 
     private static TypedNode? CompileScan(ScanPlan scan, CompileContext ctx)
     {
-        // Scans use the unmodified schema — NOT NULL columns are
-        // required at the scan level by TypedRowEmitter's gate.
+        // SQL pipeline gate: scans must have all-NOT-NULL schemas
+        // for now. TypedRowEmitter itself (Phase N1.1) supports
+        // nullable columns — that foundation is in place — but the
+        // typed expression compiler and aggregators don't yet do
+        // NULL propagation. Lifting this gate is the unblock for
+        // phases N2-N4 (typed NULL semantics through expressions
+        // and aggregators).
+        for (var i = 0; i < scan.Schema.Count; i++)
+        {
+            if (scan.Schema[i].Type.Nullable) return null;
+        }
+
         var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
         if (rowType is null) return null;
 

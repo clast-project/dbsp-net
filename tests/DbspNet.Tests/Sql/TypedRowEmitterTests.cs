@@ -54,15 +54,110 @@ public class TypedRowEmitterTests
     }
 
     [Fact]
-    public void NullableColumnsAreUnsupported()
+    public void NullableColumnsSupported()
     {
+        // Phase N1.1: nullable value-type columns get a Nullable<T>
+        // field; nullable schemas no longer reject.
         var nullable = new Schema(new[]
         {
             new SchemaColumn("x", new SqlIntegerType(true)),
         });
 
-        Assert.Null(TypedRowEmitter.EmitRowType(nullable));
-        Assert.False(TypedRowEmitter.IsSupported(nullable));
+        var type = TypedRowEmitter.EmitRowType(nullable);
+        Assert.NotNull(type);
+        Assert.True(TypedRowEmitter.IsSupported(nullable));
+
+        // The single field is typed as int? (Nullable<int>).
+        var field = type!.GetField("F0");
+        Assert.NotNull(field);
+        Assert.Equal(typeof(int?), field!.FieldType);
+    }
+
+    [Fact]
+    public void NullableAndNonNullableSchemasGetDistinctEmittedTypes()
+    {
+        // The fingerprint must distinguish nullable from non-null —
+        // they have different field layouts.
+        var nn = new Schema(new[] { new SchemaColumn("x", new SqlIntegerType(false)) });
+        var nul = new Schema(new[] { new SchemaColumn("x", new SqlIntegerType(true)) });
+
+        var t1 = TypedRowEmitter.EmitRowType(nn);
+        var t2 = TypedRowEmitter.EmitRowType(nul);
+        Assert.NotNull(t1);
+        Assert.NotNull(t2);
+        Assert.NotSame(t1, t2);
+        Assert.Equal(typeof(int), t1!.GetField("F0")!.FieldType);
+        Assert.Equal(typeof(int?), t2!.GetField("F0")!.FieldType);
+    }
+
+    [Fact]
+    public void NullableFactoryRoundTripsNullAndValue()
+    {
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("id", new SqlIntegerType(false)),
+            new SchemaColumn("v", new SqlIntegerType(true)),
+            new SchemaColumn("name", new SqlVarcharType(null, true)),
+        });
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+        var getters = TypedRowEmitter.BuildFieldGetters(schema)!;
+
+        var withValues = factory(new object?[] { 1, 42, Utf8String.Of("alice") });
+        Assert.Equal(1, getters[0](withValues));
+        Assert.Equal(42, getters[1](withValues));            // boxed int via Nullable<int>
+        Assert.Equal(Utf8String.Of("alice"), getters[2](withValues));
+
+        var withNulls = factory(new object?[] { 2, null, null });
+        Assert.Equal(2, getters[0](withNulls));
+        Assert.Null(getters[1](withNulls));                  // Nullable<int> with HasValue=false → null
+        Assert.Null(getters[2](withNulls));                  // Utf8String? null
+    }
+
+    [Fact]
+    public void NullableEqualityAndHashByValue()
+    {
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("a", new SqlIntegerType(false)),
+            new SchemaColumn("b", new SqlIntegerType(true)),
+        });
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+
+        var aNull1 = factory(new object?[] { 1, null });
+        var aNull2 = factory(new object?[] { 1, null });   // equal
+        var bVal = factory(new object?[] { 1, 5 });        // differs (null vs 5)
+        var aDiff = factory(new object?[] { 2, null });    // differs (a differs)
+        var bSame = factory(new object?[] { 1, 5 });       // equal to bVal
+
+        Assert.True(aNull1.Equals(aNull2));
+        Assert.Equal(aNull1.GetHashCode(), aNull2.GetHashCode());
+        Assert.False(aNull1.Equals(bVal));
+        Assert.False(aNull1.Equals(aDiff));
+        Assert.True(bVal.Equals(bSame));
+        Assert.Equal(bVal.GetHashCode(), bSame.GetHashCode());
+    }
+
+    [Fact]
+    public void NullableWorksAsHashSetKey()
+    {
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("k", new SqlIntegerType(false)),
+            new SchemaColumn("v", new SqlIntegerType(true)),
+        });
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+
+        var set = new HashSet<object>
+        {
+            factory(new object?[] { 1, null }),
+            factory(new object?[] { 1, null }),   // duplicate (null v)
+            factory(new object?[] { 1, 5 }),
+            factory(new object?[] { 2, null }),
+        };
+
+        Assert.Equal(3, set.Count);
+        Assert.Contains(factory(new object?[] { 1, null }), set);
+        Assert.DoesNotContain(factory(new object?[] { 99, null }), set);
     }
 
     [Fact]

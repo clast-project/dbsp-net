@@ -15,23 +15,20 @@ namespace DbspNet.Sql.Compiler;
 /// <see cref="DbspNet.Core.Collections.StructuralRow"/>.
 /// </summary>
 /// <remarks>
-/// <para><b>Phase 1.0 infrastructure</b>. Standalone — nothing in the SQL
-/// compiler uses it yet; it's exercised by tests that build instances
-/// directly and confirm they work as
-/// <c>ZSet</c> keys, in <c>HashSet</c>, etc. Subsequent phases plumb
-/// typed rows through TableInput, the operator stages, and the
-/// expression compiler.</para>
 /// <para><b>Layout.</b> Each emitted type is a sealed struct with
 /// sequential layout. Public readonly fields <c>F0..Fn</c> mirror the
-/// schema columns. <see cref="IEquatable{T}"/> is implemented to
-/// avoid the reflective fallback in <see cref="ValueType.Equals(object)"/>;
+/// schema columns. Nullable value-type columns become
+/// <c>Nullable&lt;T&gt;</c> fields; nullable reference-type columns
+/// stay as the reference type (naturally nullable).
+/// <see cref="IEquatable{T}"/> is implemented to avoid the reflective
+/// fallback in <see cref="ValueType.Equals(object)"/>;
 /// <see cref="ValueType.GetHashCode"/> is overridden with a
 /// <see cref="HashCode"/> combine over field values.</para>
-/// <para><b>Scope gate.</b> Same as <see cref="EmittedEqualityCodec"/>:
-/// NOT NULL columns of int, long, double, bool, string, and the project's
-/// date/time/decimal value types. Schemas containing anything else
-/// return a <c>null</c> emitted type — callers must keep the
-/// <see cref="StructuralRow"/> fallback for those.</para>
+/// <para><b>Scope gate.</b> Columns of int, long, double, bool,
+/// string, and the project's date/time/decimal/Utf8 value types.
+/// Both NOT NULL and nullable variants of those types are supported;
+/// other types return a <c>null</c> emitted type and callers fall
+/// back to <see cref="StructuralRow"/>.</para>
 /// </remarks>
 public static class TypedRowEmitter
 {
@@ -125,21 +122,31 @@ public static class TypedRowEmitter
         for (var i = 0; i < schema.Count; i++)
         {
             var col = schema[i];
-            // NOT NULL primitives only in this phase. Nullable columns
-            // would need each field to be Nullable<T> for value types
-            // and the equality / hash IL would need to handle null
-            // sentinels — straightforward but deferred.
-            if (col.Type.Nullable || !IsSupportedClrType(col.Type.ClrType))
+            if (!IsSupportedClrType(col.Type.ClrType))
             {
                 fingerprint = default;
                 return false;
             }
 
-            arr[i] = col.Type.ClrType;
+            arr[i] = FieldTypeFor(col);
         }
 
         fingerprint = new Fingerprint(arr);
         return true;
+    }
+
+    /// <summary>
+    /// Derives the field's CLR type from the schema column. Nullable
+    /// value-type columns become <see cref="Nullable{T}"/> fields;
+    /// reference-type columns stay as the reference type (naturally
+    /// nullable). Non-nullable value types keep their raw type.
+    /// </summary>
+    private static Type FieldTypeFor(SchemaColumn col)
+    {
+        var t = col.Type.ClrType;
+        if (!col.Type.Nullable) return t;
+        if (!t.IsValueType) return t;
+        return typeof(Nullable<>).MakeGenericType(t);
     }
 
     private static bool IsSupportedClrType(Type t) =>
@@ -148,6 +155,10 @@ public static class TypedRowEmitter
         || t == typeof(Utf8String)
         || t == typeof(Clast.DatabaseDecimal.Values.Decimal128)
         || t == typeof(Date32) || t == typeof(Time64) || t == typeof(Timestamp);
+
+    /// <summary>Returns the underlying <c>T</c> for a <c>Nullable&lt;T&gt;</c>, or null if the type isn't nullable.</summary>
+    private static Type? UnderlyingNullable(Type t) =>
+        t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Nullable<>) ? t.GenericTypeArguments[0] : null;
 
     private static Type BuildTypeFor(Fingerprint fp)
     {
@@ -184,6 +195,9 @@ public static class TypedRowEmitter
     {
         // ctor(object?[] values):
         //   for each i: this.Fi = (FieldType_i)values[i];
+        // For Nullable<T> fields, a null array entry stores
+        // default(Nullable<T>) (HasValue=false); a non-null entry is
+        // unboxed to T and wrapped via the Nullable<T>(T) ctor.
         var ctor = tb.DefineConstructor(
             MethodAttributes.Public | MethodAttributes.HideBySig |
             MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
@@ -193,12 +207,49 @@ public static class TypedRowEmitter
 
         for (var i = 0; i < fp.Columns.Length; i++)
         {
-            il.Emit(OpCodes.Ldarg_0);              // this (managed pointer to struct)
-            il.Emit(OpCodes.Ldarg_1);              // values
-            il.Emit(OpCodes.Ldc_I4, i);
-            il.Emit(OpCodes.Ldelem_Ref);           // values[i] (boxed object)
-            EmitCastTo(il, fp.Columns[i]);
-            il.Emit(OpCodes.Stfld, fields[i]);
+            var fieldType = fp.Columns[i];
+            var underlying = UnderlyingNullable(fieldType);
+
+            if (underlying is not null)
+            {
+                // Nullable<T> field — branch on values[i] == null.
+                var storeNull = il.DefineLabel();
+                var afterStore = il.DefineLabel();
+                var nullableCtor = fieldType.GetConstructor([underlying])!;
+                var local = il.DeclareLocal(fieldType);
+
+                il.Emit(OpCodes.Ldarg_1);              // values
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldelem_Ref);
+                il.Emit(OpCodes.Dup);                  // [boxed, boxed]
+                il.Emit(OpCodes.Brfalse_S, storeNull); // if (boxed == null) goto storeNull
+
+                // Non-null path: unbox to T, wrap via Nullable<T> ctor.
+                il.Emit(OpCodes.Unbox_Any, underlying);
+                il.Emit(OpCodes.Newobj, nullableCtor);
+                il.Emit(OpCodes.Stloc, local);
+                il.Emit(OpCodes.Br_S, afterStore);
+
+                il.MarkLabel(storeNull);
+                il.Emit(OpCodes.Pop);                  // pop the boxed null
+                il.Emit(OpCodes.Ldloca_S, (byte)local.LocalIndex);
+                il.Emit(OpCodes.Initobj, fieldType);   // local = default(Nullable<T>)
+
+                il.MarkLabel(afterStore);
+                il.Emit(OpCodes.Ldarg_0);              // this
+                il.Emit(OpCodes.Ldloc, local);
+                il.Emit(OpCodes.Stfld, fields[i]);
+            }
+            else
+            {
+                // Non-nullable field — direct cast/unbox path.
+                il.Emit(OpCodes.Ldarg_0);              // this (managed pointer to struct)
+                il.Emit(OpCodes.Ldarg_1);              // values
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldelem_Ref);           // values[i] (boxed object)
+                EmitCastTo(il, fieldType);
+                il.Emit(OpCodes.Stfld, fields[i]);
+            }
         }
 
         il.Emit(OpCodes.Ret);
@@ -246,7 +297,8 @@ public static class TypedRowEmitter
     {
         // bool Equals(TSelf other) — typed field-by-field comparison.
         // 'other' arrives as a struct value (not a managed pointer) so
-        // field reads use Ldarga_S 1 + Ldfld.
+        // field reads use Ldarga_S 1 + Ldfld. Nullable<T> fields go
+        // through EmitNullableFieldEqualityCheck (HasValue + Value).
         var method = tb.DefineMethod(
             "Equals",
             MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig
@@ -258,11 +310,18 @@ public static class TypedRowEmitter
         var returnFalse = il.DefineLabel();
         for (var i = 0; i < fp.Columns.Length; i++)
         {
+            var fieldType = fp.Columns[i];
+            if (UnderlyingNullable(fieldType) is { } underlying)
+            {
+                EmitNullableFieldEqualityCheck(il, fields[i], fieldType, underlying, returnFalse);
+                continue;
+            }
+
             il.Emit(OpCodes.Ldarg_0);               // this (managed ptr to struct)
             il.Emit(OpCodes.Ldfld, fields[i]);
             il.Emit(OpCodes.Ldarga_S, (byte)1);     // &other (managed ptr to struct arg)
             il.Emit(OpCodes.Ldfld, fields[i]);
-            EmitFieldEqualityCheck(il, fp.Columns[i], returnFalse);
+            EmitFieldEqualityCheck(il, fieldType, returnFalse);
         }
 
         il.Emit(OpCodes.Ldc_I4_1);
@@ -280,6 +339,51 @@ public static class TypedRowEmitter
         tb.DefineMethodOverride(method, closedIeqEquals);
 
         return method;
+    }
+
+    /// <summary>
+    /// Emits a HasValue + Value equality check for a Nullable&lt;T&gt;
+    /// field. Branches to <paramref name="notEqual"/> if this.F differs
+    /// from other.F under Nullable equality semantics:
+    ///   HasValue must match, AND if both have values they must compare equal.
+    /// </summary>
+    private static void EmitNullableFieldEqualityCheck(
+        ILGenerator il, FieldInfo field, Type fieldType, Type underlying, Label notEqual)
+    {
+        var hasValueGet = fieldType.GetProperty(nameof(Nullable<int>.HasValue))!.GetGetMethod()!;
+        var valueGet = fieldType.GetProperty(nameof(Nullable<int>.Value))!.GetGetMethod()!;
+
+        // Stash other.F into a local so we can take its address.
+        var otherLocal = il.DeclareLocal(fieldType);
+        il.Emit(OpCodes.Ldarga_S, (byte)1);
+        il.Emit(OpCodes.Ldfld, field);
+        il.Emit(OpCodes.Stloc, otherLocal);
+
+        // First gate: HasValue must agree.
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldflda, field);
+        il.Emit(OpCodes.Call, hasValueGet);
+        il.Emit(OpCodes.Ldloca_S, (byte)otherLocal.LocalIndex);
+        il.Emit(OpCodes.Call, hasValueGet);
+        il.Emit(OpCodes.Ceq);
+        il.Emit(OpCodes.Brfalse, notEqual);
+
+        // HasValue is equal. If both false, skip value compare.
+        var afterValueCompare = il.DefineLabel();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldflda, field);
+        il.Emit(OpCodes.Call, hasValueGet);
+        il.Emit(OpCodes.Brfalse, afterValueCompare);
+
+        // Both have values — compare the unwrapped underlying type.
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldflda, field);
+        il.Emit(OpCodes.Call, valueGet);
+        il.Emit(OpCodes.Ldloca_S, (byte)otherLocal.LocalIndex);
+        il.Emit(OpCodes.Call, valueGet);
+        EmitFieldEqualityCheck(il, underlying, notEqual);
+
+        il.MarkLabel(afterValueCompare);
     }
 
     /// <summary>Stack: [a, b]. Branches to <paramref name="notEqual"/> if a != b.</summary>
