@@ -180,25 +180,19 @@ reflect that shape, not a backlog.
   `__weight : Int64` column on the wire schema; readers that don't
   expect weights see a well-formed Arrow stream and can ignore the
   extra column.
-- Persistence (approach A — input WAL): `DbspNet.Persistence.WalRecorder`
-  captures every per-tick input delta to a directory of Arrow IPC
-  segments + a JSON manifest. Reopening with the same input table
-  schemas replays existing segments through the engine to reach the
-  recorded post-state, then opens a fresh segment for further appends.
-  Plan fingerprint guards against schema drift but ignores SELECT body
-  changes — the WAL stays valid across query refactors.
-- Persistence (approach B — state snapshots, partial): the foundation
-  is in place — `ISnapshotable` contract on operators, file-backed
-  `Snapshot.Write` / `Snapshot.Read` orchestration, manifest with
-  plan-structure fingerprint that hashes the operator type sequence.
-  `DistinctOp` round-trips its trace as Arrow IPC end-to-end via the
-  `ArrowSqlSnapshotCodecs` registry passed to `PlanToCircuit.Compile`.
-  **Still to do for B:** `IncrementalAggregateOp` (trace + per-key
-  aggregator state — needs `SqlAggregator.SaveState`/`LoadState` per
-  subclass), `IncrementalJoinOp` / `IncrementalLeftJoinOp` (two
-  per-side traces), `RecursiveCteOp`. **Deferred:** snapshot+WAL
-  hybrid (C — falls out of A+B with ~50 LOC of coordination once B
-  is complete), the spine/log-structured trace (D).
+- Persistence (approaches A, B, C — input WAL, end-of-tick snapshot,
+  and snapshot+WAL hybrid): all three are shipped under
+  `DbspNet.Persistence`, layered on an `IBlobStore` abstraction
+  modelled on cloud object stores (S3 / GCS / Azure Blob) with a
+  built-in `LocalFileBlobStore` and `InMemoryBlobStore`. Every
+  stateful SQL operator — `DistinctOp`, `IncrementalAggregateOp`,
+  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `RecursiveCteOp` —
+  implements `ISnapshotable` and round-trips its trace(s) as Arrow IPC
+  via the `ArrowSqlSnapshotCodecs` registry. Snapshot manifests carry
+  both a plan fingerprint (operator-type sequence with generic args)
+  and a schema fingerprint (per-op column names + `SqlType.Display`)
+  so VARCHAR-length / DECIMAL-precision / NULLability drift is
+  detected on `Load`. See `docs/persistence.md` for the full design.
 - DECIMAL is stored as `Decimal128` (Arrow-aligned `Int128` mantissa with
   scale-in-type) via the cross-repo `Clast.DatabaseDecimal` library.
   Native arithmetic (`AddKernel` / `MultiplyKernel` / `DivideKernel`)
@@ -306,33 +300,64 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
 
 - **[P1]** Nested / child circuits. Needed for recursive CTEs and some
   aggregate implementations. Explicit `TODO` in `Circuit/RootCircuit.cs`.
-- **[P2]** Persistent storage backends for Trace. v1 is in-memory only.
-- **[P2]** Trace compaction / waterline. v1 keeps every batch until the
-  circuit is torn down.
+- Spine-backed Trace (layered LSM-style). Implemented in
+  `DbspNet.Core.Operators.Stateful.Spine` —
+  `SpineZSetTrace<TKey,TWeight>` and
+  `SpineIndexedZSetTrace<TKey,TValue,TWeight>` hold the integral as a
+  tiered sequence of immutable sorted-columnar batches, with
+  configurable compaction (`ICompactionStrategy`,
+  `TieredCompactionStrategy`). Every flat-trace operator has a
+  spine-backed sibling: `SpineDistinctOp`,
+  `SpineIncrementalAggregateOp`, `SpineIncrementalJoinOp`,
+  `SpineIncrementalLeftJoinOp`. Per-batch Arrow IPC snapshot via
+  `SpineSnapshot`; optional disk spill via `SpineSpillConfig` /
+  `SpineIndexedSpillConfig` with per-batch bloom filters so probes
+  typically don't touch disk. Exercised by unit tests and the trace
+  microbenchmarks (`PureTraceBenchmark`, `DistinctBenchmark`).
+  **[P1]** SQL compiler integration. `PlanToCircuit.Compile` still
+  emits the flat-trace operator family. The natural next step is a
+  compiler-side toggle (or per-operator decision driven by trace-size
+  heuristics) that selects the spine family for stateful operators.
+  See `docs/persistence.md` "What ships in (D) — spine".
+- **[P2]** Trace compaction / waterline (since-frontier
+  advancement that lets multiple updates at the same (key, value)
+  collapse into one row). The spine has the right shape for this —
+  consolidation runs naturally inside compaction — but no frontier is
+  advertised today, so traces still retain every update.
 - **[P2]** Multi-threaded circuit execution. v1 is single-threaded per
   `step()` call.
-- **[P2]** Spine-backed Trace (layered LSM-style). v1 is flat.
 - **[P3]** Dynamic / polymorphic operators (Feldera's `dynamic` module).
 
 ## Compiler
 
 - **[P1]** Logical-plan optimizer — partial. <c>DbspNet.Sql.Optimizer.PlanOptimizer</c>
   does predicate pushdown (through Project, InnerJoin + outer-join-safe,
-  UnionAll, Distinct, Difference; adjacent-filter merging) and
-  projection composition. Still deferred: <b>projection pruning</b>
-  (top-down column-liveness — would reduce state in stateful operators),
-  <b>constant folding</b>, and <b>join reordering</b> (needs statistics).
-  The optimizer is not invoked automatically from <c>PlanToCircuit.Compile</c> —
-  callers opt in with <c>Compile(Optimize(plan))</c>.
+  UnionAll, Distinct, Difference; adjacent-filter merging), projection
+  composition, and aggregate-input column pruning (inserts a narrowing
+  <c>ProjectPlan</c> between <c>AggregatePlan</c> and its input when
+  the input carries more columns than the aggregate references). Still
+  deferred: <b>general top-down column liveness</b> across joins,
+  <b>constant folding</b>, and <b>join reordering</b> (needs
+  statistics). The optimizer is not invoked automatically from
+  <c>PlanToCircuit.Compile</c> — callers opt in with
+  <c>Compile(Optimize(plan))</c>.
 - **[P1]** Subquery decorrelation.
 - **[P2]** Common subexpression elimination.
 - **[P2]** Circuit-level optimizer (Feldera's `CircuitOptimizer`).
 - **[P3]** Calcite's ~200 RBO rules. v1 performs none of them.
-- **[P2]** Row layout. Every row at every stream is a `StructuralRow`
-  backed by `object?[]` of boxed values. Feldera generates per-schema
-  struct layouts (via the `dynamic` module) that avoid boxing in the hot
-  path. A per-schema row codegen pass would be the single biggest
-  throughput lever in DbspNet.
+- Row layout — typed fast path landed. `TypedPlanCompiler` walks a
+  `LogicalPlan` and builds a circuit whose streams carry per-schema
+  emitted structs from `TypedRowEmitter` instead of `StructuralRow`.
+  `PlanToCircuit.Compile` tries the typed path first and falls back to
+  the structural compile when the plan or any subexpression is outside
+  the typed pipeline's scope; only the input / output boundaries pay a
+  structural↔typed conversion. Snapshot codecs flow through via a
+  typed adapter so the on-disk format stays compatible across the two
+  paths. Remaining work — extending the typed-supported plan / scalar
+  surface so the structural fallback fires less often (currently
+  supports `ScanPlan`, `FilterPlan`, `ProjectPlan`, INNER `JoinPlan`,
+  and via a hybrid lift: aggregates, set ops, CTEs, recursive CTE,
+  scalar subqueries).
 - **[P2]** Expression-compiler CAST matrix. v1 supports numeric↔numeric,
   numeric↔string, and bool→string. Missing: string→bool (`'t'`/`'f'`),
   decimal-precision-aware numeric narrowing, and anything involving the

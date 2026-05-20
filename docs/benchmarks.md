@@ -1,6 +1,6 @@
 # DbspNet — benchmarks
 
-Cold-batch vs. steady-state incremental latency across four query shapes.
+Cold-batch vs. steady-state incremental latency. The query shapes below cover the canonical SQL surface (filter, joined group-by, transitive closure via `WITH RECURSIVE`) plus row-layout variants (nullable column, emitted-equality codec, hand-wired typed rows) and pure-trace microbenchmarks against the spine.
 Each row: load the circuit fresh, measure the full compile-load-step time ("batch"); separately, load the circuit once, push one additional row and measure just `Step()` ("incremental"). Both are medians of multiple runs with a warmup pass.
 
 Every measurement uses the plan optimizer (`PlanOptimizer.Optimize`).

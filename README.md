@@ -16,18 +16,32 @@ join, group-by aggregates). It is not a production system and makes no
 attempt at feature parity with Feldera. Features deferred from v1 are tracked
 in [`docs/skipped.md`](docs/skipped.md) against Feldera's real surface.
 
+For a map of the codebase — how a SQL query flows through the system,
+what each operator does, where to plug in — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Layout
 
 ```
 src/
-  DbspNet.Core     algebra, Z-sets, circuit runtime, operators
-  DbspNet.Sql      SQL parser, logical plan, plan→circuit compiler
-  DbspNet.Demo     runnable end-to-end scenarios
+  DbspNet.Core         algebra, Z-sets, circuit runtime, operators
+                       (both flat and spine/LSM trace families)
+  DbspNet.Sql          SQL parser, logical plan, plan→circuit compiler
+                       (structural + typed-row fast path),
+                       expression compiler, plan optimizer
+  DbspNet.Arrow        Arrow IPC boundary (RecordBatch ↔ Z-set delta)
+  DbspNet.Persistence  WAL, end-of-tick snapshots, snapshot+WAL hybrid
+                       over an IBlobStore abstraction
+  DbspNet.Demo         runnable end-to-end scenarios
+  DbspNet.Benchmarks   regenerates docs/benchmarks.md
 tests/
-  DbspNet.Tests    unit + property-based tests
+  DbspNet.Tests        unit + property-based tests
+ARCHITECTURE.md        codebase map: pipeline, operators, extension points
 docs/
-  design-notes.md  DBSP primer and implementation notes
-  skipped.md       deferred features tracked against Feldera
+  design-notes.md      DBSP primer and implementation notes
+  persistence.md       persistence/recovery design and what shipped
+  benchmarks.md        regenerated; cold-batch vs incremental latency
+  skipped.md           deferred features tracked against Feldera
 ```
 
 ## Build & test
@@ -99,7 +113,14 @@ batch re-computation.
 ## What works today
 
 - DDL: `CREATE TABLE` (with `NOT NULL`/`NULL`; `PRIMARY KEY` parsed but ignored), `CREATE VIEW`.
-- Types: `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `DECIMAL(p,s)`, `VARCHAR`, `BOOLEAN`.
+- Types: `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `DECIMAL(p,s)`,
+  `VARCHAR`, `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP`. `DECIMAL` is Arrow-
+  aligned `Decimal128` (Int128 mantissa) via `Clast.DatabaseDecimal` with
+  native arithmetic and SQL-Server/Substrait result-type promotion;
+  `VARCHAR` is `Utf8String` (Arrow-aligned `ReadOnlyMemory<byte>`) with
+  native UTF-8 equality, ordering, hashing, code-point `LENGTH`, and
+  `Rune`-based invariant `UPPER`/`LOWER`. Temporal types use Arrow's
+  `Date32` / `Time64[microsecond]` / `Timestamp[microsecond]` (naive).
 - Queries: `SELECT` (list or `*`) with aliases and scalar expressions, `FROM`
   (single table, derived tables `(SELECT …) AS x`, `INNER JOIN … ON …`, or
   `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN … ON …`), `WHERE`, `GROUP BY`,
@@ -124,11 +145,46 @@ batch re-computation.
   skipping per SQL semantics; `COUNT(*)` counts all.
 - Plan optimizer (`DbspNet.Sql.Optimizer.PlanOptimizer`, explicit pass):
   predicate pushdown (through Project / Join / UnionAll / Distinct /
-  Difference, respecting outer-join restrictions) and projection
-  composition. Apply with `Compile(Optimize(plan))`.
-- Correctness: 370+ unit tests plus property-based tests (≥3000 CsCheck
+  Difference, respecting outer-join restrictions), projection
+  composition, and aggregate-input column pruning. Apply with
+  `Compile(Optimize(plan))`.
+- Typed-row fast path: `PlanToCircuit.Compile` tries `TypedPlanCompiler`
+  first — when in scope, every stage's stream carries a per-schema
+  emitted struct rather than a boxed `StructuralRow`, with only the
+  input/output boundary paying a structural↔typed conversion. Falls back
+  to the structural compile transparently on anything out of scope.
+- Arrow boundary (`DbspNet.Arrow`): `CompiledQuery.ToArrowDelta()` and
+  `TableInput.PushArrow(RecordBatch[, weights])` for column-major,
+  type-dispatched I/O; opt-in `PushArrowZeroCopy` aliases Arrow buffers
+  without copying. Z-set weights ride on the wire as a trailing
+  `__weight : Int64` column. IPC streaming via `WriteArrowStream` /
+  `ReadArrowStream` (one-shot snapshots) and `OpenArrowDeltaWriter` /
+  `ReadArrowStreamBatches` (multi-batch pipelines).
+- Persistence (`DbspNet.Persistence`): WAL of input deltas (approach A),
+  end-of-tick snapshots (B), and snapshot+WAL hybrid (C) — all layered
+  on an `IBlobStore` abstraction modelled on S3 / GCS / Azure Blob, with
+  built-in `LocalFileBlobStore` and `InMemoryBlobStore`. Every stateful
+  SQL operator (`DistinctOp`, `IncrementalAggregateOp`,
+  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `RecursiveCteOp`)
+  round-trips its trace as Arrow IPC; manifests carry plan + schema
+  fingerprints so drift is caught on `Load`. See
+  [`docs/persistence.md`](docs/persistence.md).
+- Spine (`DbspNet.Core.Operators.Stateful.Spine`): LSM-style sibling
+  trace family — `SpineZSetTrace` / `SpineIndexedZSetTrace` hold the
+  integral as a tiered sequence of immutable sorted-columnar batches
+  with configurable compaction, per-batch Arrow IPC snapshot, and
+  optional disk spill via `SpineSpillConfig`. Every flat operator has
+  a spine-backed counterpart (`SpineDistinctOp`,
+  `SpineIncrementalAggregateOp`, `SpineIncrementalJoinOp`,
+  `SpineIncrementalLeftJoinOp`). Exercised today by Core tests and
+  the trace microbenchmarks; **not yet** emitted by the SQL compiler
+  by default (the natural next step — see [What's next](#whats-next)).
+- Correctness: 770+ unit tests plus property-based tests (≥3000 CsCheck
   iterations) across 40 query templates, run both with and without the
-  optimizer — semantic equivalence is continuously verified.
+  optimizer — semantic equivalence is continuously verified. Persistence
+  has end-to-end snapshot round-trip coverage for every stateful
+  operator (in isolation and in compositions), plus crash-point
+  coverage for the atomic-write protocol.
 
 ## What's deferred
 
@@ -148,10 +204,39 @@ beyond "Feldera is much bigger":
   outer joins, or nested recursion inside the body.
 - Set ops: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` all supported;
   `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
-- `FULL OUTER JOIN` and window functions are deferred.
-- Scalar function library is `COALESCE` and `CAST` only.
+- `FULL OUTER JOIN`, window functions, `ORDER BY` / `LIMIT`,
+  `CASE WHEN`, `LIKE` / `SIMILAR TO`, `||` concatenation, and
+  `IS [NOT] DISTINCT FROM` are deferred.
+- Scalar function library covers the common arithmetic / string set
+  listed above; missing pieces include `SUBSTRING`, `TRIM`, `REPLACE`,
+  `POSITION`, `SIGN` / `LN` / `LOG` / `EXP`, and anything involving
+  dates/times.
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
   polymorphic "unknown" of PostgreSQL.
+- `INTERVAL` type and date/time arithmetic are deferred.
+
+## What's next
+
+The biggest tracked-but-not-yet-shipped pieces:
+
+- **Spine integration into the SQL compiler.** The spine operator
+  family (with snapshot and disk spill) exists in `DbspNet.Core` but
+  `PlanToCircuit` still emits the flat-trace variants. The natural
+  step is a compiler-side toggle that selects the spine family — at
+  which point the snapshot story already lines up because both speak
+  the same trace-codec interface.
+- **Trace compaction / waterline.** The spine has the right shape for
+  consolidation-on-frontier-advance, but no frontier is advertised
+  today, so traces still retain every update.
+- **`LATENESS` (or equivalent retain-keys story).** Without bounded-
+  history trace GC driven by a monotonicity analysis, long-running
+  pipelines grow without bound — this caps DbspNet to bounded
+  workloads.
+- **DRED-style retraction propagation for recursive CTEs**, so the
+  full recomputation fallback on retraction-containing ticks goes
+  away.
+- **Subquery decorrelation** and **`IN` / `EXISTS`** as
+  semi-join-based operators.
 
 ## License
 

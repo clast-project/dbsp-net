@@ -1,9 +1,13 @@
 # Persistence and recovery — design sketch
 
-Approaches (A), (B), and (C) below are now implemented in
-`DbspNet.Persistence`. (D) — log-structured trace — remains a future
-direction. The historical design discussion follows; see "Current
-state" at the bottom for what shipped.
+Approaches (A), (B), and (C) below are implemented in
+`DbspNet.Persistence`. (D) — the log-structured trace itself — also
+ships, in `DbspNet.Core.Operators.Stateful.Spine`, with per-batch
+snapshotting and optional disk spill; what's *not* yet wired up is the
+path that lets the SQL compiler emit spine-backed operators by default
+(it still emits the flat-trace family). The historical design
+discussion follows; see "Current state" at the bottom for what
+shipped.
 
 The natural checkpoint point is a **step boundary**: between ticks every
 operator is in a consistent "end-of-tick T" state.
@@ -73,9 +77,13 @@ sequence of immutable batches in order of age/size.
   `IncrementalAggregateOp`, `IncrementalLeftJoinOp`, `DistinctOp`,
   `RecursiveCteOp`) reads traces, so all of them would move onto the
   new abstraction.
-- `docs/skipped.md` already flags "[P2] Spine-backed Trace" and
-  "[P2] Persistent storage backends for Trace" as gestures in this
-  direction.
+
+The Core-side rewrite of (D) has landed (see "What ships in (D) —
+spine" below): every flat operator has a spine-backed sibling, with
+per-batch snapshot and optional disk spill. The remaining piece is
+making the SQL compiler emit them — i.e. a `PlanToCircuit` toggle
+that builds a spine circuit instead of the flat one. Until then the
+SQL persistence layer (A/B/C) snapshots the flat traces.
 
 ## Could we build the spine on a generic LSM (RocksDB, etc.)?
 
@@ -129,6 +137,10 @@ cuts.
 
 ## Recommended staging
 
+This was the original plan; (A), (B), (C), and the Core half of (D)
+have all landed. The remaining step is wiring (D) into the SQL
+compiler — see the "Spine" section below.
+
 1. **(A) input replay.** Honest, mechanical proof of concept. Persist
    every input delta with tick number; implement replay. Validates the
    determinism / offset / plan-fingerprint plumbing.
@@ -148,7 +160,7 @@ out of (A) + (B) naturally.
 | (A) input replay | Shipped | `WalRecorder(query, walStore)` |
 | (B) end-of-tick snapshot | Shipped | `Snapshot.Write` / `Snapshot.Read` |
 | (C) snapshot + WAL hybrid | Shipped | `WalRecorder(query, walStore, snapshotStore)` + `WalRecorder.WriteSnapshot()` |
-| (D) log-structured trace | Future | — |
+| (D) log-structured trace | Shipped in Core; not yet emitted by the SQL compiler | `DbspNet.Core.Operators.Stateful.Spine.*` (`SpineDistinct`, `SpineIncrementalAggregate`, `SpineIncrementalJoin`, `SpineIncrementalLeftJoin`); see "Spine" below |
 
 ### Storage abstraction
 
@@ -302,6 +314,40 @@ tick so absolute tick numbers stay consistent across the
 snapshot/WAL boundary. The recorder validates the pairing on open:
 if the snapshot's tick exceeds the WAL's coverage, it throws
 `InvalidDataException` rather than silently producing wrong state.
+
+### What ships in (D) — spine
+
+The flat trace abstraction now has an LSM-style sibling in
+`DbspNet.Core.Operators.Stateful.Spine`: `SpineZSetTrace<TKey,TWeight>`
+and `SpineIndexedZSetTrace<TKey,TValue,TWeight>` hold the running
+integral as a tiered sequence of immutable sorted-columnar batches
+(`SpineBatch`) instead of a single consolidated dictionary, with
+compaction driven by an `ICompactionStrategy` (default:
+`TieredCompactionStrategy` at 4 batches per level). Every stateful
+operator has a spine-backed variant exposed through
+`SpineStatefulOperators` extensions: `SpineDistinct`,
+`SpineIncrementalAggregate`, `SpineIncrementalJoin`,
+`SpineIncrementalLeftJoin`. Snapshot is per-batch and uses the same
+Arrow IPC codec contract as the flat path, via the `SpineSnapshot`
+helper — each batch lives in its own `prefix.batch_i.arrows` file,
+with a tiny `prefix.manifest` recording the count. Optional disk
+spill: `SpineSpillConfig` lets levels at or below a configurable
+threshold stay resident while deeper batches serialise to an
+`ITableFileSystem`, with a per-batch bloom filter so probes typically
+don't touch disk.
+
+What is **not** yet integrated: the SQL compiler
+(`PlanToCircuit.Compile`) still emits the flat-trace operator family
+(`DistinctOp`, `IncrementalAggregateOp`, `IncrementalJoinOp`,
+`IncrementalLeftJoinOp`, `RecursiveCteOp`). The spine variants are
+exercised today by unit tests and the trace microbenchmarks in
+`PureTraceBenchmark` / `DistinctBenchmark`. The natural next step is a
+compiler-side toggle that selects the spine family — at which point
+the `DistinctOp` ↔ `SpineDistinctOp` snapshot story already lines up
+because both speak the same `IZSetTraceCodec` / `IIndexedZSetTraceCodec`
+interface. The bigger architectural win flagged in the original (D)
+sketch — *cheap* checkpointing because each batch is already a file —
+follows naturally once that toggle exists.
 
 ### Test coverage
 

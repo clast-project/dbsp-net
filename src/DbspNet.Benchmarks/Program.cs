@@ -20,7 +20,11 @@ var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();
 output.AppendLine(
-    "Cold-batch vs. steady-state incremental latency across four query shapes.");
+    "Cold-batch vs. steady-state incremental latency. The query shapes below cover " +
+    "the canonical SQL surface (filter, joined group-by, transitive closure via " +
+    "`WITH RECURSIVE`) plus row-layout variants (nullable column, emitted-equality " +
+    "codec, hand-wired typed rows) and pure-trace microbenchmarks against the " +
+    "spine.");
 output.AppendLine(
     "Each row: load the circuit fresh, measure the full compile-load-step time " +
     "(\"batch\"); separately, load the circuit once, push one additional row and " +
