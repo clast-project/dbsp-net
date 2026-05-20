@@ -167,6 +167,48 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void SetOp_Except_MatchesStructural()
+    {
+        // EXCEPT decomposes to Distinct + Difference + Intersect in
+        // the resolver. Differential against structural so we don't
+        // assert against a hand-derived expectation that might
+        // mismatch the operator's actual semantics.
+        const string sql = "SELECT a FROM t EXCEPT SELECT a FROM u";
+        var ddl = new[]
+        {
+            "CREATE TABLE t (a INT NOT NULL)",
+            "CREATE TABLE u (a INT NOT NULL)",
+        };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (string Table, object?[] Values, long Weight)[]
+        {
+            ("t", [1], 1L), ("t", [2], 1L), ("t", [3], 1L),
+            ("u", [2], 1L), ("u", [4], 1L),
+            ("t", [3], -1L), ("u", [2], -1L), ("t", [5], 1L),
+        };
+
+        foreach (var (table, vs, w) in deltas)
+        {
+            typed!.Table(table).Push(new[] { (vs, w) });
+            structural.Table(table).Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            for (var k = 0; k <= 6; k++)
+            {
+                Assert.Equal(
+                    structural.WeightOf(k).Value,
+                    typed.WeightOf(k).Value);
+            }
+        }
+    }
+
+    [Fact]
     public void Distinct_DifferentialAgainstStructural()
     {
         const string sql = "SELECT a FROM t UNION SELECT a FROM u";
