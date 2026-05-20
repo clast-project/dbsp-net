@@ -385,15 +385,14 @@ public static class TypedPlanCompiler
         var inner = TryCompileNode(plan.Input, ctx);
         if (inner is null) return null;
 
-        // Phase N4 gate: nullable group-keys still bail (NULL=NULL
-        // equality in the indexed trace is its own concern, deferred
-        // to a later phase). Nullable aggregate-arg columns are now
-        // supported via the *Nullable aggregator variants built
-        // below.
-        for (var i = 0; i < groupIndices.Length; i++)
-        {
-            if (inner.Schema[groupIndices[i]].Type.Nullable) return null;
-        }
+        // Nullable group-key columns flow through naturally: the
+        // emitted TKey carries Nullable<T> fields for nullable key
+        // cols (TypedRowEmitter, N1.1), and its IEquatable<TKey> /
+        // GetHashCode implementations use Nullable<T>'s HasValue +
+        // Value comparison + HashCode.Add<Nullable<T>> — which
+        // gives the SQL GROUP BY semantics SQL wants (one bucket
+        // for NULL, distinct from any non-null value). No special
+        // handling needed at this layer.
 
         // TKey from the group-key columns. Same schema-fingerprint
         // sharing as anywhere else.

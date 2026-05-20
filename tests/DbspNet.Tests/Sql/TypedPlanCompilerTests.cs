@@ -698,6 +698,74 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Aggregate_NullableGroupKey_NullIsOneBucket()
+    {
+        // Nullable group-key column flows through typed: TKey
+        // carries a Nullable<int> field, and SQL GROUP BY semantics
+        // (one bucket for NULL, distinct from any non-null value)
+        // come from the emitted struct's IEquatable / GetHashCode.
+        var plan = CompilePlan(
+            ["CREATE TABLE t (g INT, v INT NOT NULL)"],
+            "SELECT g, SUM(v) FROM t GROUP BY g");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1, 10);
+        typed.Table("t").Insert(1, 20);
+        typed.Table("t").Insert(new object?[] { null, 5 });
+        typed.Table("t").Insert(new object?[] { null, 7 });
+        typed.Table("t").Insert(2, 100);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1, 30L).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null, 12L }).Value);
+        Assert.Equal(1L, typed.WeightOf(2, 100L).Value);
+    }
+
+    [Fact]
+    public void Aggregate_NullableGroupKey_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT g, COUNT(*) AS cs, SUM(v) AS sv FROM t GROUP BY g";
+        var ddl = new[] { "CREATE TABLE t (g INT, v INT NOT NULL)" };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (object?[], long)[]
+        {
+            (new object?[] { 1, 10 }, 1L),
+            (new object?[] { null, 5 }, 1L),
+            (new object?[] { 1, 20 }, 1L),
+            (new object?[] { null, 7 }, 1L),
+            (new object?[] { 2, 100 }, 1L),
+            (new object?[] { null, 5 }, -1L),   // retract one null-group row
+            (new object?[] { 1, 10 }, -1L),
+        };
+
+        foreach (var (vs, w) in deltas)
+        {
+            typed!.Table("t").Push(new[] { (vs, w) });
+            structural.Table("t").Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            object?[][] candidates =
+            [
+                [1, 1L, 10L], [1, 1L, 20L], [1, 2L, 30L],
+                [null, 1L, 5L], [null, 1L, 7L], [null, 2L, 12L],
+                [2, 1L, 100L],
+            ];
+            foreach (var cand in candidates)
+            {
+                Assert.Equal(
+                    structural.WeightOf(cand).Value,
+                    typed.WeightOf(cand).Value);
+            }
+        }
+    }
+
+    [Fact]
     public void Aggregate_CountNullable_SkipsNulls()
     {
         // Phase N4: COUNT(nullable col) routes through typed and
