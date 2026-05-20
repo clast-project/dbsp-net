@@ -36,7 +36,7 @@ computation over relational data. The central objects are:
 See Budiu et al., *DBSP: Automatic Incremental View Maintenance for Rich Query
 Languages*, VLDB 2023, for the full theory.
 
-## Implementation choices in this port
+## Implementation choices
 
 ### Weight algebra via `INumber<T>`
 

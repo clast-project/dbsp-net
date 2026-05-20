@@ -1,13 +1,14 @@
 # DbspNet
 
-A research-grade C# / .NET 10 port of [Feldera](https://github.com/feldera/feldera)'s
-DBSP (Database Stream Processor) engine.
+A research-grade C# / .NET 10 reimplementation of the DBSP (Database Stream
+Processor) incremental-computation model, as described in Budiu et al.,
+*DBSP: Automatic Incremental View Maintenance for Rich Query Languages*
+(VLDB 2023), and as exhibited in [Feldera](https://github.com/feldera/feldera)'s
+Rust runtime. The code is written from the paper, not translated from Rust.
 
-DBSP is an incremental data-computation model that turns SQL queries into
-circuits that process input *changes* and emit output *changes* — so a view
-can be kept up-to-date at a cost proportional to the size of the change,
-not the size of the data. See Budiu et al., *DBSP: Automatic Incremental View
-Maintenance for Rich Query Languages*, VLDB 2023.
+DBSP turns SQL queries into circuits that process input *changes* and emit
+output *changes* — so a view can be kept up-to-date at a cost proportional
+to the size of the change, not the size of the data.
 
 This repository is a **prototype**: it targets a small, honest slice of SQL
 end-to-end (CREATE TABLE / CREATE VIEW, SELECT with projection, filter, inner
