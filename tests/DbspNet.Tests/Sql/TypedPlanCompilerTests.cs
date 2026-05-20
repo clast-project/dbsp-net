@@ -94,6 +94,117 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
+    public void Distinct_ViaUnionSetSemantics()
+    {
+        // UNION (without ALL) is UnionAll + Distinct: rows present on
+        // either side appear once in the output, regardless of input
+        // multiplicity.
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE t (a INT NOT NULL)",
+                "CREATE TABLE u (a INT NOT NULL)",
+            ],
+            "SELECT a FROM t UNION SELECT a FROM u");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1);
+        typed.Table("t").Insert(1);    // duplicate → DISTINCT collapses
+        typed.Table("t").Insert(2);
+        typed.Table("u").Insert(2);    // appears in both → still weight 1
+        typed.Table("u").Insert(3);
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(1).Value);
+        Assert.Equal(1L, typed.WeightOf(2).Value);
+        Assert.Equal(1L, typed.WeightOf(3).Value);
+    }
+
+    [Fact]
+    public void Distinct_ViaIntersect()
+    {
+        // INTERSECT decomposes through Distinct+join in the resolver;
+        // exercises the typed Distinct path on both operands.
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE t (a INT NOT NULL)",
+                "CREATE TABLE u (a INT NOT NULL)",
+            ],
+            "SELECT a FROM t INTERSECT SELECT a FROM u");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(1);
+        typed.Table("t").Insert(2);
+        typed.Table("t").Insert(3);
+        typed.Table("u").Insert(2);
+        typed.Table("u").Insert(3);
+        typed.Table("u").Insert(4);
+        typed.Step();
+
+        Assert.Equal(0L, typed.WeightOf(1).Value);     // only in t
+        Assert.Equal(1L, typed.WeightOf(2).Value);     // in both
+        Assert.Equal(1L, typed.WeightOf(3).Value);     // in both
+        Assert.Equal(0L, typed.WeightOf(4).Value);     // only in u
+    }
+
+    [Fact]
+    public void Distinct_FreshInsertEmitsWeightOne()
+    {
+        // Fresh insert of multiplicity 3 produces a DISTINCT output
+        // row at weight 1 (set semantics).
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE t (a INT NOT NULL)",
+                "CREATE TABLE u (a INT NOT NULL)",
+            ],
+            "SELECT a FROM t UNION SELECT a FROM u");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(7);
+        typed.Table("t").Insert(7);
+        typed.Table("t").Insert(7);
+        typed.Step();
+        Assert.Equal(1L, typed.WeightOf(7).Value);
+    }
+
+    [Fact]
+    public void Distinct_DifferentialAgainstStructural()
+    {
+        const string sql = "SELECT a FROM t UNION SELECT a FROM u";
+        var ddl = new[]
+        {
+            "CREATE TABLE t (a INT NOT NULL)",
+            "CREATE TABLE u (a INT NOT NULL)",
+        };
+        var planTyped = CompilePlan(ddl, sql);
+        var planStructural = CompilePlan(ddl, sql);
+
+        Assert.True(TypedPlanCompiler.TryCompile(planTyped, out var typed));
+        var structural = PlanToCircuit.Compile(planStructural);
+
+        var deltas = new (string Table, object?[] Values, long Weight)[]
+        {
+            ("t", [1], 1L), ("t", [1], 1L), ("u", [2], 1L),
+            ("t", [1], -1L), ("u", [3], 1L), ("t", [1], -1L),
+            ("u", [2], -1L),
+        };
+
+        foreach (var (table, vs, w) in deltas)
+        {
+            typed!.Table(table).Push(new[] { (vs, w) });
+            structural.Table(table).Push(new[] { (vs, w) });
+            typed.Step();
+            structural.Step();
+
+            for (var k = 0; k <= 4; k++)
+            {
+                Assert.Equal(
+                    structural.WeightOf(k).Value,
+                    typed.WeightOf(k).Value);
+            }
+        }
+    }
+
+    [Fact]
     public void UnionAll_DifferentialAgainstStructural()
     {
         const string sql =

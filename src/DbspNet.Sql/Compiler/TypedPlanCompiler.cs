@@ -180,6 +180,7 @@ public static class TypedPlanCompiler
         JoinPlan j => CompileJoin(j, ctx),
         AggregatePlan a => CompileAggregate(a, ctx),
         UnionAllPlan u => CompileUnionAll(u, ctx),
+        DistinctPlan d => CompileDistinct(d, ctx),
         _ => null,
     };
 
@@ -435,6 +436,26 @@ public static class TypedPlanCompiler
         }
 
         return new TypedNode(first.RowType, plan.Schema, resultStream);
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="DistinctPlan"/>: dedup the input Z-set
+    /// to set semantics via the stateful
+    /// <see cref="StatefulOperators.Distinct{TKey,TWeight}"/>. The
+    /// typed-key snapshot codec adapter mirrors the join/aggregate
+    /// codec wiring so on-disk snapshots stay byte-compatible with
+    /// the structural path.
+    /// </summary>
+    private static TypedNode? CompileDistinct(DistinctPlan plan, CompileContext ctx)
+    {
+        var inner = TryCompileNode(plan.Input, ctx);
+        if (inner is null) return null;
+
+        var snapshotCodec = BuildAdaptedZSetCodec(
+            ctx.SnapshotCodecs, plan.Schema, inner.RowType);
+
+        var output = InvokeDistinct(ctx.Builder, inner.RowType, inner.Stream, snapshotCodec);
+        return new TypedNode(inner.RowType, plan.Schema, output);
     }
 
     /// <summary>
@@ -1266,6 +1287,31 @@ public static class TypedPlanCompiler
             structuralCodec, keyToStruct, valToStruct, structToKey, structToVal)!;
     }
 
+    /// <summary>
+    /// Builds an <c>IZSetTraceCodec&lt;TKey, Z64&gt;</c> for the
+    /// typed pipeline, wrapping the structural
+    /// <see cref="ISqlSnapshotCodecs.CreateZSetTraceCodec"/> in a
+    /// <see cref="TypedZSetTraceCodecAdapter{TKey}"/>. Single-key
+    /// counterpart to <see cref="BuildAdaptedIndexedCodec"/>; used
+    /// by the typed DISTINCT operator.
+    /// </summary>
+    private static object? BuildAdaptedZSetCodec(
+        ISqlSnapshotCodecs? snapshotCodecs,
+        Schema keySchema, Type keyRowType)
+    {
+        if (snapshotCodecs is null) return null;
+
+        var structuralCodec = snapshotCodecs.CreateZSetTraceCodec(keySchema);
+        var keyToStruct = BuildTypedToStructuralDelegate(
+            keyRowType, keySchema, StructuralRowCodec.Instance);
+        var structToKey = BuildStructuralToTypedDelegate(keySchema, keyRowType);
+
+        var adapterOpen = typeof(TypedZSetTraceCodecAdapter<>);
+        var adapterClosed = adapterOpen.MakeGenericType(keyRowType);
+        return Activator.CreateInstance(adapterClosed,
+            structuralCodec, keyToStruct, structToKey)!;
+    }
+
     // ---- Boundary adapters (structural ↔ typed) ----
 
     /// <summary>
@@ -1436,6 +1482,17 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(LinearOperators.Union) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
         return closed.Invoke(null, new object[] { builder, left, right })!;
+    }
+
+    /// <summary><c>builder.Distinct&lt;TRow, Z64&gt;(input, snapshotCodec)</c>.</summary>
+    private static object InvokeDistinct(
+        CircuitBuilder builder, Type rowType, object input, object? snapshotCodec)
+    {
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(StatefulOperators.Distinct) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
+        return closed.Invoke(null, new object?[] { builder, input, snapshotCodec })!;
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>
