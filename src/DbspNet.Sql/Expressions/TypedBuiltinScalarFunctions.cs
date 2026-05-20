@@ -49,12 +49,60 @@ internal static class TypedBuiltinScalarFunctions
             "sqrt" => BuildSqrt(args[0]),
             "greatest" => BuildGreatestLeast(args, greatest: true),
             "least" => BuildGreatestLeast(args, greatest: false),
-            // NULLIF can return NULL on a definite-equal match, which
-            // the typed-row pipeline can't carry. Always falls back to
-            // the structural compile.
-            "nullif" => null,
+            "nullif" => BuildNullIf(args[0], args[1]),
             _ => null,
         };
+    }
+
+    /// <summary>
+    /// NULLIF(x, y): returns NULL when x is non-null and equals y;
+    /// otherwise returns x. Result is always nullable. Unblocked by
+    /// Phase N2's NULL-aware typed expression compiler.
+    /// </summary>
+    private static Expression BuildNullIf(Expression x, Expression y)
+    {
+        // Lift both args to nullable to share a single result type.
+        var xN = TypedExpressionCompiler.IsNullable(x.Type) || !x.Type.IsValueType
+            ? x : TypedExpressionCompiler.LiftToNullable(x);
+        var yN = TypedExpressionCompiler.IsNullable(y.Type) || !y.Type.IsValueType
+            ? y : TypedExpressionCompiler.LiftToNullable(y);
+
+        var resultType = xN.Type;
+        var nullConst = Expression.Constant(null, resultType);
+
+        // Stash into locals so we don't re-evaluate.
+        var xLocal = Expression.Variable(xN.Type, "x");
+        var yLocal = Expression.Variable(yN.Type, "y");
+
+        // Compute equality at the underlying type. If either is null,
+        // not-equal (NULLIF returns x). If both non-null and equal,
+        // return null.
+        Expression xVal = TypedExpressionCompiler.IsNullable(xN.Type)
+            ? Expression.Property(xLocal, nameof(Nullable<int>.Value))
+            : xLocal;
+        Expression yVal = TypedExpressionCompiler.IsNullable(yN.Type)
+            ? Expression.Property(yLocal, nameof(Nullable<int>.Value))
+            : yLocal;
+        var equal = Expression.Equal(xVal, yVal);
+
+        // bothHaveValue: x is non-null and y is non-null.
+        Expression xHasValue = TypedExpressionCompiler.IsNullable(xN.Type)
+            ? Expression.Property(xLocal, nameof(Nullable<int>.HasValue))
+            : (Expression)Expression.Constant(true);
+        Expression yHasValue = TypedExpressionCompiler.IsNullable(yN.Type)
+            ? Expression.Property(yLocal, nameof(Nullable<int>.HasValue))
+            : (Expression)Expression.Constant(true);
+        var bothHaveValue = Expression.AndAlso(xHasValue, yHasValue);
+
+        // If both non-null AND equal → NULL; else → x.
+        return Expression.Block(
+            new[] { xLocal, yLocal },
+            Expression.Assign(xLocal, xN),
+            Expression.Assign(yLocal, yN),
+            Expression.Condition(
+                Expression.AndAlso(bothHaveValue, equal),
+                nullConst,
+                xLocal));
     }
 
     // ---- COALESCE ----

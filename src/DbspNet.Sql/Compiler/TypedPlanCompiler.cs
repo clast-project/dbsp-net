@@ -744,10 +744,14 @@ public static class TypedPlanCompiler
         Type inputRowType, Type outputRowType, Schema outputSchema,
         IReadOnlyList<ProjectionItem> projections)
     {
+        // Param types come from the emitted typed row's fields so they
+        // match Nullable<T> vs T correctly per N1.1's emitter.
         var ctorParamTypes = new Type[outputSchema.Count];
         for (var i = 0; i < outputSchema.Count; i++)
         {
-            ctorParamTypes[i] = outputSchema[i].Type.ClrType;
+            var field = outputRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted output row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
         }
 
         var ctor = outputRowType.GetConstructor(ctorParamTypes)
@@ -760,6 +764,19 @@ public static class TypedPlanCompiler
         {
             var built = TypedExpressionCompiler.TryBuildInto(projections[i].Expression, inParam);
             if (built is null) return null;
+
+            // Phase N2 gate: SQL pipeline still bails if a projection
+            // expression produces a genuinely nullable result
+            // (Nullable<T>) but the target output field is non-nullable
+            // (T) — i.e. StripNullable thinks the column is non-null
+            // but the expression compiler can't agree. Lifting this is
+            // Phase N3 (Nullable<T> propagation through output adapters).
+            if (TypedExpressionCompiler.IsNullable(built.Type)
+                && !TypedExpressionCompiler.IsNullable(ctorParamTypes[i]))
+            {
+                return null;
+            }
+
             args[i] = built.Type == ctorParamTypes[i]
                 ? built
                 : Expression.Convert(built, ctorParamTypes[i]);

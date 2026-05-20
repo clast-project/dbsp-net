@@ -43,6 +43,154 @@ public class TypedExpressionCompilerTests
         return del.DynamicInvoke(row)!;
     }
 
+    private static object? InvokeMaybeNull(Delegate del, object row) => del.DynamicInvoke(row);
+
+    private static ResolvedExpression ResolveOnDdl(string ddl, string selectExpr) =>
+        ResolveSelectExpression(new[] { ddl }, selectExpr);
+
+    // ---- Phase N2: nullability ----
+
+    [Fact]
+    public void NullableColumn_Read_ReturnsNullableValue()
+    {
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(true)));
+        var expr = ResolveOnDdl("CREATE TABLE t (a INT)", "a");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Equal(typeof(int?), del!.Method.ReturnType);
+
+        Assert.Equal(7, InvokeMaybeNull(del, factory(new object?[] { 7 })));
+        Assert.Null(InvokeMaybeNull(del, factory(new object?[] { null })));
+    }
+
+    [Fact]
+    public void NullableArithmetic_PropagatesNull()
+    {
+        var (rowType, factory) = RowFor(
+            ("a", new SqlIntegerType(true)),
+            ("b", new SqlIntegerType(true)));
+        var expr = ResolveOnDdl("CREATE TABLE t (a INT, b INT)", "a + b");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+
+        Assert.Equal(7, InvokeMaybeNull(del!, factory(new object?[] { 3, 4 })));
+        Assert.Null(InvokeMaybeNull(del!, factory(new object?[] { 3, null })));
+        Assert.Null(InvokeMaybeNull(del!, factory(new object?[] { null, 4 })));
+        Assert.Null(InvokeMaybeNull(del!, factory(new object?[] { null, null })));
+    }
+
+    [Fact]
+    public void NullableComparison_PropagatesNull()
+    {
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(true)));
+        var expr = ResolveOnDdl("CREATE TABLE t (a INT)", "a > 5");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+
+        Assert.Equal(true, InvokeMaybeNull(del!, factory(new object?[] { 10 })));
+        Assert.Equal(false, InvokeMaybeNull(del!, factory(new object?[] { 3 })));
+        Assert.Null(InvokeMaybeNull(del!, factory(new object?[] { null })));
+    }
+
+    [Fact]
+    public void NullableAndOr_ThreeValuedLogic()
+    {
+        var (rowType, factory) = RowFor(
+            ("a", new SqlBooleanType(true)),
+            ("b", new SqlBooleanType(true)));
+        var ddl = "CREATE TABLE t (a BOOLEAN, b BOOLEAN)";
+
+        var andDel = TypedExpressionCompiler.TryCompile(
+            ResolveOnDdl(ddl, "a AND b"), rowType)!;
+        var orDel = TypedExpressionCompiler.TryCompile(
+            ResolveOnDdl(ddl, "a OR b"), rowType)!;
+
+        // AND truth table — SQL 3VL.
+        Assert.Equal(true, InvokeMaybeNull(andDel, factory(new object?[] { true, true })));
+        Assert.Equal(false, InvokeMaybeNull(andDel, factory(new object?[] { true, false })));
+        Assert.Null(InvokeMaybeNull(andDel, factory(new object?[] { true, null })));
+        // false-short-circuit even with NULL.
+        Assert.Equal(false, InvokeMaybeNull(andDel, factory(new object?[] { false, null })));
+        Assert.Null(InvokeMaybeNull(andDel, factory(new object?[] { null, null })));
+
+        // OR truth table.
+        Assert.Equal(true, InvokeMaybeNull(orDel, factory(new object?[] { true, null })));
+        Assert.Equal(false, InvokeMaybeNull(orDel, factory(new object?[] { false, false })));
+        Assert.Null(InvokeMaybeNull(orDel, factory(new object?[] { false, null })));
+    }
+
+    [Fact]
+    public void NullableIsNull_ActualHasValueCheck()
+    {
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(true)));
+        var isNullExpr = ResolveOnDdl("CREATE TABLE t (a INT)", "a IS NULL");
+        var isNotNullExpr = ResolveOnDdl("CREATE TABLE t (a INT)", "a IS NOT NULL");
+
+        var isNullDel = TypedExpressionCompiler.TryCompile(isNullExpr, rowType)!;
+        var isNotNullDel = TypedExpressionCompiler.TryCompile(isNotNullExpr, rowType)!;
+
+        Assert.Equal(true, InvokeMaybeNull(isNullDel, factory(new object?[] { null })));
+        Assert.Equal(false, InvokeMaybeNull(isNullDel, factory(new object?[] { 5 })));
+        Assert.Equal(false, InvokeMaybeNull(isNotNullDel, factory(new object?[] { null })));
+        Assert.Equal(true, InvokeMaybeNull(isNotNullDel, factory(new object?[] { 5 })));
+    }
+
+    [Fact]
+    public void NullableNot_ThreeValuedLogic()
+    {
+        var (rowType, factory) = RowFor(("a", new SqlBooleanType(true)));
+        var expr = ResolveOnDdl("CREATE TABLE t (a BOOLEAN)", "NOT a");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType)!;
+        Assert.Equal(false, InvokeMaybeNull(del, factory(new object?[] { true })));
+        Assert.Equal(true, InvokeMaybeNull(del, factory(new object?[] { false })));
+        Assert.Null(InvokeMaybeNull(del, factory(new object?[] { null })));
+    }
+
+    [Fact]
+    public void NullLiteral_TypedAsNullable()
+    {
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(false)));
+        var expr = ResolveOnDdl("CREATE TABLE t (a INT NOT NULL)", "NULL");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        Assert.Null(InvokeMaybeNull(del!, factory(new object?[] { 99 })));
+    }
+
+    [Fact]
+    public void Nullif_NowSupported()
+    {
+        // Phase 1.9 rejected NULLIF because it can return NULL.
+        // Phase N2: NULL handling lets it compile.
+        var (rowType, factory) = RowFor(
+            ("a", new SqlIntegerType(false)),
+            ("b", new SqlIntegerType(false)));
+        var expr = ResolveOnDdl(
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+            "NULLIF(a, b)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+
+        Assert.Null(InvokeMaybeNull(del!, factory(new object?[] { 5, 5 })));        // equal → NULL
+        Assert.Equal(3, InvokeMaybeNull(del!, factory(new object?[] { 3, 7 })));    // differ → first arg
+    }
+
+    [Fact]
+    public void NullableArithmetic_MixedWithNonNullLifts()
+    {
+        var (rowType, factory) = RowFor(("a", new SqlIntegerType(true)));
+        var expr = ResolveOnDdl("CREATE TABLE t (a INT)", "a + 1");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType)!;
+        Assert.Equal(6, InvokeMaybeNull(del, factory(new object?[] { 5 })));
+        Assert.Null(InvokeMaybeNull(del, factory(new object?[] { null })));
+    }
+
     [Fact]
     public void ColumnRead_Int()
     {
@@ -301,18 +449,8 @@ public class TypedExpressionCompilerTests
         Assert.Equal(5, Invoke(del!, factory(new object?[] { 5 })));
     }
 
-    [Fact]
-    public void Rejects_Nullif()
-    {
-        // NULLIF can return NULL — typed-row pipeline can't carry that.
-        var (rowType, _) = RowFor(
-            ("a", new SqlIntegerType(false)),
-            ("b", new SqlIntegerType(false)));
-        var expr = ResolveSelectExpression(
-            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"], "NULLIF(a, b)");
-
-        Assert.Null(TypedExpressionCompiler.TryCompile(expr, rowType));
-    }
+    // Note: Phase 1.9 rejected NULLIF; Phase N2 unblocks it via
+    // Nullif_NowSupported above.
 
     [Fact]
     public void Decimal_AddSameScale()
