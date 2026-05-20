@@ -33,6 +33,7 @@ output.AppendLine();
 RunFilterBenchmark(output);
 RunMultiAggregateBenchmark(output);
 RunJoinedGroupByBenchmark(output);
+RunJoinedGroupByNullableBenchmark(output);
 RunJoinedGroupByEmittedCodecBenchmark(output);
 RunJoinedGroupByTypedBenchmark(output);
 RunTransitiveClosureBenchmark(output);
@@ -293,6 +294,90 @@ static void RunJoinedGroupByBenchmark(StringBuilder output)
         "Inner join feeding a SUM aggregator. Per-update cost = probing the " +
         "fixed customers trace + folding the one new order's amount into the " +
         "per-region running sum.",
+        rows);
+}
+
+// ---------- Benchmark 3.5: Joined GROUP BY, nullable amount ----------
+
+static void RunJoinedGroupByNullableBenchmark(StringBuilder output)
+{
+    PrintHeader("Joined GROUP BY (nullable amount)");
+    const string sql =
+        "SELECT c.region, SUM(o.amount) AS total " +
+        "FROM orders o JOIN customers c ON o.cust_id = c.id " +
+        "GROUP BY c.region";
+    // Same shape as Benchmark 3, but `orders.amount` is nullable —
+    // exercises the per-column nullability (N4) path: typed SUM
+    // routes through TypedSumLongNullableAggregator with HasValue
+    // checks and DistinctNonNullRows bookkeeping. Join key
+    // (cust_id) and group key (region) stay NOT NULL because
+    // those gates are still on (deferred to a later phase).
+    var ddl = new[]
+    {
+        "CREATE TABLE customers (id INT NOT NULL, region VARCHAR NOT NULL)",
+        "CREATE TABLE orders (cust_id INT NOT NULL, amount INT)",
+    };
+
+    var rows = new List<(int, double, double)>();
+    foreach (var n in new[] { 100, 1_000, 10_000, 100_000 })
+    {
+        var rng = new Random(13);
+        var custCount = Math.Min(100, n / 4 + 1);
+        var regionCount = Math.Min(10, custCount);
+        var customers = new List<(int Id, string Region)>(custCount);
+        for (var i = 0; i < custCount; i++)
+        {
+            customers.Add((i, "r" + (i % regionCount)));
+        }
+
+        // ~10% of orders carry NULL amount.
+        var orders = new List<(int CustId, int? Amount)>(n);
+        for (var i = 0; i < n; i++)
+        {
+            int? amt = rng.Next(10) == 0 ? null : rng.Next(1, 1_000);
+            orders.Add((rng.Next(custCount), amt));
+        }
+
+        var customersDelta = customers.Select(c => (Values: new object?[] { c.Id, c.Region }, Weight: 1L)).ToList();
+        var ordersDelta = orders.Select(o => (Values: new object?[] { o.CustId, o.Amount }, Weight: 1L)).ToList();
+
+        var batchMs = BenchmarkHarness.MedianColdMs(
+            setup: () => Compile(ddl, sql),
+            run: q =>
+            {
+                q.Table("customers").Push(customersDelta);
+                q.Table("orders").Push(ordersDelta);
+                q.Step();
+            });
+
+        var incrUs = BenchmarkHarness.MedianPerStepMicros(
+            setup: () =>
+            {
+                var q = Compile(ddl, sql);
+                q.Table("customers").Push(customersDelta);
+                q.Table("orders").Push(ordersDelta);
+                q.Step();
+                return (Query: q, Rng: new Random(99), CustCount: custCount);
+            },
+            oneStep: state =>
+            {
+                int? amt = state.Rng.Next(10) == 0 ? null : state.Rng.Next(1, 1_000);
+                state.Query.Table("orders").Insert(state.Rng.Next(state.CustCount), amt);
+                state.Query.Step();
+            });
+
+        PrintRow(n, batchMs, incrUs);
+        rows.Add((n, batchMs, incrUs));
+    }
+
+    AppendTable(output, "Joined GROUP BY (nullable `amount`) — same query shape",
+        "Identical query to Benchmark 3, but `orders.amount` is nullable " +
+        "and ~10% of input rows have `NULL amount`. Exercises the typed " +
+        "pipeline's nullable-arg SUM path (Phase N4): per-row `HasValue` " +
+        "check, `DistinctNonNullRows` bookkeeping for the linear gate, " +
+        "and `Nullable<long>`-typed aggregate output slot. Compare to " +
+        "Benchmark 3 to read off the per-row overhead of the nullable " +
+        "wrapper versus the non-null fast path.",
         rows);
 }
 

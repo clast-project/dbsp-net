@@ -172,38 +172,6 @@ public static class TypedPlanCompiler
 
     private sealed class UnsupportedPlanException : Exception;
 
-    /// <summary>
-    /// Strip nullability from every column. Used as the canonical
-    /// schema for typed pipeline streams: in this pipeline every
-    /// value is non-null by construction, but the resolver's type
-    /// inference is sometimes coarser (e.g. SQL aggregate outputs
-    /// are marked nullable per spec even though our typed
-    /// aggregator only emits a row for non-empty groups). Treating
-    /// the metadata as advisory and operating on the underlying
-    /// definite values is correct on the typed path.
-    /// </summary>
-    private static Schema StripNullable(Schema schema)
-    {
-        var any = false;
-        for (var i = 0; i < schema.Count; i++)
-        {
-            if (schema[i].Type.Nullable) { any = true; break; }
-        }
-
-        if (!any) return schema;
-
-        var stripped = new SchemaColumn[schema.Count];
-        for (var i = 0; i < schema.Count; i++)
-        {
-            var c = schema[i];
-            stripped[i] = c.Type.Nullable
-                ? new SchemaColumn(c.Name, c.Type.WithNullable(false), c.Qualifier)
-                : c;
-        }
-
-        return new Schema(stripped);
-    }
-
     private static TypedNode? TryCompileNode(LogicalPlan plan, CompileContext ctx) => plan switch
     {
         ScanPlan s => CompileScan(s, ctx),
@@ -356,7 +324,11 @@ public static class TypedPlanCompiler
             right.RowType, keyRowType, keySchema, rightIndices);
         if (leftKeyExtractor is null || rightKeyExtractor is null) return null;
 
-        var outputSchema = StripNullable(plan.Schema);
+        // Preserve nullability on the join output. Each side's
+        // nullable non-key columns carry their Nullable<T> field
+        // type through to the output row; the join's equi-key gate
+        // above ensures key columns are non-null on both sides.
+        var outputSchema = plan.Schema;
         var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
         if (outputRowType is null) return null;
 
