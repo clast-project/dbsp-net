@@ -34,6 +34,21 @@ internal static class TypedBuiltinScalarFunctions
     public static Expression? TryBuild(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] args)
     {
+        // Most function builders below assume non-null args (they
+        // produce IL that calls instance methods directly on the
+        // argument values). Phase N3 lifts the scan-level
+        // nullability gate, so nullable args can now reach these
+        // builders. Until per-function NULL handling ships, bail
+        // when any arg is nullable — except for the functions whose
+        // builders already handle nulls correctly (NULLIF, COALESCE).
+        if (fn.FunctionName is not ("nullif" or "coalesce"))
+        {
+            foreach (var arg in args)
+            {
+                if (TypedExpressionCompiler.IsNullable(arg.Type)) return null;
+            }
+        }
+
         return fn.FunctionName switch
         {
             "coalesce" => BuildCoalesce(args),
@@ -109,11 +124,59 @@ internal static class TypedBuiltinScalarFunctions
 
     private static Expression BuildCoalesce(Expression[] args)
     {
-        // On the typed path every value is non-null. COALESCE's
-        // semantics ("first non-null arg") therefore reduce to "first
-        // arg". The resolver has already cast every arg to the common
-        // result type, so a direct return is well-typed.
-        return args[0];
+        // Right-to-left fold: COALESCE(a, b, c) ≡ a ?? (b ?? c). For
+        // non-null args, collapses to args[0]. For nullable args,
+        // emits a HasValue check on each and falls through to the
+        // next on null. Returns Nullable<T> only if every arg is
+        // nullable; if any arg is non-null, the result is that
+        // arg's underlying type T (which is what the resolver tagged
+        // the COALESCE result, since COALESCE is non-null when any
+        // arg is non-null).
+        Expression result = args[args.Length - 1];
+        for (var i = args.Length - 2; i >= 0; i--)
+        {
+            result = CoalesceTwo(args[i], result);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Builds <c>x ?? fallback</c>. If x is non-nullable, returns x.
+    /// If x is nullable, returns
+    /// <c>x.HasValue ? x.Value : fallback</c> (or
+    /// <c>x.HasValue ? x : fallback</c> when fallback is nullable
+    /// and we want to keep the nullable wrapper).
+    /// </summary>
+    private static Expression CoalesceTwo(Expression x, Expression fallback)
+    {
+        if (!TypedExpressionCompiler.IsNullable(x.Type))
+        {
+            // x is non-null → COALESCE short-circuits to x.
+            return x;
+        }
+
+        var underlying = TypedExpressionCompiler.UnderlyingType(x.Type);
+        var fallbackIsNullable = TypedExpressionCompiler.IsNullable(fallback.Type);
+        var resultType = fallbackIsNullable || !fallback.Type.IsValueType
+            ? fallback.Type
+            : underlying;
+
+        var local = Expression.Variable(x.Type, "x");
+        Expression xResult = resultType == x.Type
+            ? local
+            : Expression.Property(local, nameof(Nullable<int>.Value));
+        Expression fallbackResult = fallback.Type == resultType
+            ? fallback
+            : Expression.Convert(fallback, resultType);
+
+        return Expression.Block(
+            new[] { local },
+            Expression.Assign(local, x),
+            Expression.Condition(
+                Expression.Property(local, nameof(Nullable<int>.HasValue)),
+                xResult,
+                fallbackResult));
     }
 
     // ---- String ----

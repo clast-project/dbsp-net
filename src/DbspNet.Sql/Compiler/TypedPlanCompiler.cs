@@ -218,18 +218,13 @@ public static class TypedPlanCompiler
 
     private static TypedNode? CompileScan(ScanPlan scan, CompileContext ctx)
     {
-        // SQL pipeline gate: scans must have all-NOT-NULL schemas
-        // for now. TypedRowEmitter itself (Phase N1.1) supports
-        // nullable columns — that foundation is in place — but the
-        // typed expression compiler and aggregators don't yet do
-        // NULL propagation. Lifting this gate is the unblock for
-        // phases N2-N4 (typed NULL semantics through expressions
-        // and aggregators).
-        for (var i = 0; i < scan.Schema.Count; i++)
-        {
-            if (scan.Schema[i].Type.Nullable) return null;
-        }
-
+        // Phase N3: scan-level nullable gate lifted. TypedRowEmitter
+        // (N1.1) emits Nullable<T> fields, the expression compiler
+        // (N2) does NULL propagation, and BuildStructuralToTypedDelegate
+        // (this phase) handles null entries at the input boundary.
+        // Downstream operators (Filter, Join, Aggregate) keep their
+        // own gates that bail when they receive a nullable stream
+        // until their respective NULL semantics ship in later phases.
         var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
         if (rowType is null) return null;
 
@@ -271,6 +266,13 @@ public static class TypedPlanCompiler
         var inner = TryCompileNode(filter.Input, ctx);
         if (inner is null) return null;
 
+        // Phase N3 gate: WHERE-clause predicates that produce
+        // Nullable<bool> need NULL-as-FALSE coercion at the
+        // predicate boundary (per SQL semantics). Ships in a later
+        // phase; for now bail to structural when the predicate's
+        // result is nullable.
+        if (filter.Predicate.Type.Nullable) return null;
+
         var predicate = BuildTypedPredicateDelegate(filter.Predicate, inner.RowType);
         if (predicate is null) return null;
 
@@ -283,7 +285,14 @@ public static class TypedPlanCompiler
         var inner = TryCompileNode(project.Input, ctx);
         if (inner is null) return null;
 
-        var outputSchema = StripNullable(project.Schema);
+        // Respect the resolver's per-column nullability on the
+        // projection's output schema so genuinely-nullable
+        // expressions (NULLIF, NULL literal) can be carried as
+        // Nullable<T> fields downstream. Aggregate output schemas
+        // continue to be stripped inside CompileAggregate where the
+        // operator's linear-emission gate guarantees non-null
+        // values.
+        var outputSchema = project.Schema;
         if (IsIdentityProjection(project.Projections, inner.Schema, outputSchema))
         {
             return inner;
@@ -403,6 +412,21 @@ public static class TypedPlanCompiler
 
         var inner = TryCompileNode(plan.Input, ctx);
         if (inner is null) return null;
+
+        // Phase N3 gate: aggregator NULL semantics (e.g.
+        // DistinctNonNullRows bookkeeping for SUM, NULL-arg skipping
+        // for COUNT(col)) ship in Phase N4. For now bail when any
+        // group-key or aggregate-arg column is nullable so the
+        // structural path handles them.
+        for (var i = 0; i < groupIndices.Length; i++)
+        {
+            if (inner.Schema[groupIndices[i]].Type.Nullable) return null;
+        }
+
+        foreach (var call in plan.Aggregates)
+        {
+            if (call.Argument is not null && call.Argument.Type.Nullable) return null;
+        }
 
         // TKey from the group-key columns. Same schema-fingerprint
         // sharing as anywhere else.
@@ -678,7 +702,9 @@ public static class TypedPlanCompiler
         var ctorParamTypes = new Type[finalSchema.Count];
         for (var i = 0; i < finalSchema.Count; i++)
         {
-            ctorParamTypes[i] = finalSchema[i].Type.ClrType;
+            var field = finalRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted final aggregate row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
         }
 
         var ctor = finalRowType.GetConstructor(ctorParamTypes)
@@ -765,12 +791,16 @@ public static class TypedPlanCompiler
             var built = TypedExpressionCompiler.TryBuildInto(projections[i].Expression, inParam);
             if (built is null) return null;
 
-            // Phase N2 gate: SQL pipeline still bails if a projection
-            // expression produces a genuinely nullable result
-            // (Nullable<T>) but the target output field is non-nullable
-            // (T) — i.e. StripNullable thinks the column is non-null
-            // but the expression compiler can't agree. Lifting this is
-            // Phase N3 (Nullable<T> propagation through output adapters).
+            // Phase N3: the projection's output column may be
+            // nullable (Nullable<T>) while the expression result is
+            // raw T — e.g. a ResolvedColumn read from an
+            // aggregate's stripped-non-nullable output that flows
+            // into a wrapping projection whose resolver-marked
+            // column type is nullable. Convert(T, Nullable<T>) does
+            // the implicit lift. The opposite direction
+            // (Convert(Nullable<T>, T)) is an unsafe unwrap; we
+            // refuse to compile it here since a runtime null would
+            // throw, and instead fall back to structural.
             if (TypedExpressionCompiler.IsNullable(built.Type)
                 && !TypedExpressionCompiler.IsNullable(ctorParamTypes[i]))
             {
@@ -815,7 +845,9 @@ public static class TypedPlanCompiler
         var ctorParamTypes = new Type[keySchema.Count];
         for (var i = 0; i < keySchema.Count; i++)
         {
-            ctorParamTypes[i] = keySchema[i].Type.ClrType;
+            var field = keyRowType.GetField("F" + i);
+            if (field is null) return null;
+            ctorParamTypes[i] = field.FieldType;
         }
 
         var ctor = keyRowType.GetConstructor(ctorParamTypes);
@@ -845,10 +877,15 @@ public static class TypedPlanCompiler
         Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
         Schema outputSchema, int leftCount, int rightCount)
     {
+        // Ctor param types come from the emitted typed row's fields so
+        // Nullable<T> vs T match per N1.1's emitter (same fix as in
+        // BuildTypedProjectionDelegate / BuildStructuralToTypedDelegate).
         var ctorParamTypes = new Type[outputSchema.Count];
         for (var i = 0; i < outputSchema.Count; i++)
         {
-            ctorParamTypes[i] = outputSchema[i].Type.ClrType;
+            var field = outputRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted output row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
         }
 
         var ctor = outputRowType.GetConstructor(ctorParamTypes)
@@ -929,10 +966,15 @@ public static class TypedPlanCompiler
     /// </summary>
     private static Delegate BuildStructuralToTypedDelegate(Schema schema, Type rowType)
     {
+        // Param types come from the emitted typed row's fields so
+        // Nullable<T> vs T match per N1.1's emitter — same fix as in
+        // BuildTypedProjectionDelegate.
         var ctorParamTypes = new Type[schema.Count];
         for (var i = 0; i < schema.Count; i++)
         {
-            ctorParamTypes[i] = schema[i].Type.ClrType;
+            var field = rowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
         }
 
         var ctor = rowType.GetConstructor(ctorParamTypes)
@@ -947,19 +989,45 @@ public static class TypedPlanCompiler
         {
             var idx = Expression.Constant(i, typeof(int));
             var boxed = Expression.Call(rowParam, indexer, idx);
-            // (Ti)r[i] — unbox or castclass per type
-            args[i] = ctorParamTypes[i].IsValueType
-                ? Expression.Unbox(boxed, ctorParamTypes[i])
-                : (Expression)Expression.Convert(boxed, ctorParamTypes[i]);
-            // Unbox returns a managed-pointer-style expression; widen
-            // to a value via Convert with the same target type when
-            // necessary (Expression.Unbox returns an expression of
-            // the same target type, so this is a no-op for primitive
-            // unboxing in practice).
+            args[i] = BuildCastFromBoxed(boxed, ctorParamTypes[i]);
         }
 
         var delegateType = typeof(Func<,>).MakeGenericType(typeof(StructuralRow), rowType);
         return Expression.Lambda(delegateType, Expression.New(ctor, args), rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds <c>(targetType)boxed</c> with appropriate handling of
+    /// Nullable&lt;T&gt; and null reference values:
+    /// <list type="bullet">
+    /// <item>For value-type T (non-nullable): direct
+    /// <see cref="Expression.Unbox"/>.</item>
+    /// <item>For <c>Nullable&lt;T&gt;</c>: branch on boxed == null,
+    /// returning <c>default(Nullable&lt;T&gt;)</c> for null and
+    /// <c>new Nullable&lt;T&gt;((T)boxed)</c> otherwise.</item>
+    /// <item>For reference type T: <see cref="Expression.Convert"/>
+    /// (handles null naturally).</item>
+    /// </list>
+    /// </summary>
+    private static Expression BuildCastFromBoxed(Expression boxed, Type targetType)
+    {
+        if (TypedExpressionCompiler.IsNullable(targetType))
+        {
+            var underlying = TypedExpressionCompiler.UnderlyingType(targetType);
+            var nullableCtor = targetType.GetConstructor([underlying])!;
+            // boxed == null ? default(Nullable<T>) : new Nullable<T>((T)boxed)
+            return Expression.Condition(
+                Expression.Equal(boxed, Expression.Constant(null, typeof(object))),
+                Expression.Default(targetType),
+                Expression.New(nullableCtor, Expression.Unbox(boxed, underlying)));
+        }
+
+        if (targetType.IsValueType)
+        {
+            return Expression.Unbox(boxed, targetType);
+        }
+
+        return Expression.Convert(boxed, targetType);
     }
 
     /// <summary>

@@ -58,14 +58,24 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void TryCompile_RejectsNullableSchema()
+    public void TryCompile_AcceptsNullableSchema()
     {
+        // Phase N3: scan-level nullable gate lifted. Scan + bare
+        // projection of nullable columns round-trips through the
+        // typed pipeline.
         var plan = CompilePlan(
             ["CREATE TABLE t (id INT)"],   // nullable
             "SELECT * FROM t");
 
-        var ok = TypedPlanCompiler.TryCompile(plan, out _);
-        Assert.False(ok);
+        var ok = TypedPlanCompiler.TryCompile(plan, out var typed);
+        Assert.True(ok);
+        Assert.NotNull(typed);
+        typed!.Table("t").Insert(new object?[] { 7 });
+        typed.Table("t").Insert(new object?[] { null });
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(7).Value);
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null }).Value);
     }
 
     [Fact]
@@ -240,15 +250,21 @@ public class TypedPlanCompilerTests
     }
 
     [Fact]
-    public void Project_NullifStillRejected()
+    public void Project_Nullif_NowSupported()
     {
+        // Phase N3: NULLIF flows end-to-end through the typed
+        // pipeline. The output column is Nullable<int>.
         var plan = CompilePlan(
             ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
             "SELECT NULLIF(a, b) FROM t");
 
-        // NULLIF can produce NULL — falls back to structural.
-        Assert.False(TypedPlanCompiler.TryCompile(plan, out var typed));
-        Assert.Null(typed);
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var typed));
+        typed!.Table("t").Insert(5, 5);    // NULLIF → NULL
+        typed.Table("t").Insert(3, 7);     // NULLIF → 3
+        typed.Step();
+
+        Assert.Equal(1L, typed.WeightOf(new object?[] { null }).Value);
+        Assert.Equal(1L, typed.WeightOf(3).Value);
     }
 
     [Fact]
