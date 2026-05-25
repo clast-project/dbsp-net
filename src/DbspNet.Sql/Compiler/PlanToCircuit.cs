@@ -208,11 +208,15 @@ public static class PlanToCircuit
         CircuitBuilder builder,
         CompileContext ctx,
         Stream<ZSet<StructuralRow, Z64>> input,
-        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec)
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier = null,
+        Func<StructuralRow, long>? monotoneKey = null)
     {
         return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineDistinct(input, ctx.Options.Compaction, snapshotCodec, StructuralRowComparer.Instance)
-            : builder.Distinct(input, snapshotCodec);
+            ? builder.SpineDistinct(
+                input, ctx.Options.Compaction, snapshotCodec, StructuralRowComparer.Instance,
+                frontier: frontier, monotoneKey: monotoneKey)
+            : builder.Distinct(input, snapshotCodec, frontier, monotoneKey);
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoin(
@@ -318,6 +322,48 @@ public static class PlanToCircuit
             var keyIndex = g;
             IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
             return (frontier, keyRow => MonotoneKey.Extract(keyRow[keyIndex]));
+        }
+
+        return (null, null);
+    }
+
+    /// <summary>
+    /// If the DISTINCT's row carries a monotone column (per the analyzer, which
+    /// passes monotonicity through DISTINCT), returns the frontier to GC against
+    /// and an extractor for the monotone value from the row. As with the other
+    /// GC sites, fires only when every source bounding that column has a frontier
+    /// (a partial set would be unsound). GC is safe because the input late-drop
+    /// removes sub-frontier rows, so no future delta can resurrect a collected
+    /// row (which would otherwise re-emit a spurious +1).
+    /// </summary>
+    private static (IFrontier? Frontier, Func<StructuralRow, long>? MonotoneKey) ResolveDistinctFrontier(
+        DistinctPlan plan, CompileContext ctx)
+    {
+        for (var c = 0; c < plan.Schema.Count; c++)
+        {
+            var sources = ctx.Monotonicity.Sources(plan, c);
+            if (sources is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            var frontiers = new List<IFrontier>(sources.Count);
+            foreach (var source in sources)
+            {
+                if (ctx.Frontiers.TryGetValue(source, out var f))
+                {
+                    frontiers.Add(f);
+                }
+            }
+
+            if (frontiers.Count != sources.Count)
+            {
+                continue;
+            }
+
+            var colIndex = c;
+            IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
+            return (frontier, row => MonotoneKey.Extract(row[colIndex]));
         }
 
         return (null, null);
@@ -514,8 +560,10 @@ public static class PlanToCircuit
             case DistinctPlan d:
                 {
                     var distinctCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(d.Schema);
+                    var (gcFrontier, gcMonotoneKey) = ResolveDistinctFrontier(d, ctx);
                     return EmitDistinct(
-                        builder, ctx, CompilePlan(builder, d.Input, ctx), distinctCodec);
+                        builder, ctx, CompilePlan(builder, d.Input, ctx), distinctCodec,
+                        gcFrontier, gcMonotoneKey);
                 }
 
             case DifferencePlan diff:

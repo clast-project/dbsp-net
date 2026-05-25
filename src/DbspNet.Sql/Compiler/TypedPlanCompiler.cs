@@ -1761,7 +1761,11 @@ public static class TypedPlanCompiler
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
             .Single(m => m.Name == nameof(StatefulOperators.Distinct) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
-        return closed.Invoke(null, new object?[] { builder, input, snapshotCodec })!;
+        // Reflection ignores optional-parameter defaults — every parameter must
+        // be supplied. The trailing nulls are the LATENESS GC hooks
+        // (frontier, monotoneKey); the typed path does not GC (LATENESS forces
+        // the structural compile).
+        return closed.Invoke(null, new object?[] { builder, input, snapshotCodec, null, null })!;
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>

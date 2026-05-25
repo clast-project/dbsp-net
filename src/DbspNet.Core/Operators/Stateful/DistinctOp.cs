@@ -22,16 +22,26 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable
     private readonly Stream<ZSet<TKey, TWeight>> _output;
     private readonly ZSetTrace<TKey, TWeight> _trace = new();
     private readonly IZSetTraceCodec<TKey, TWeight>? _snapshotCodec;
+    private readonly IFrontier? _frontier;
+    private readonly Func<TKey, long>? _monotoneKey;
+    private long _lastGcFrontier = long.MinValue;
 
     public DistinctOp(
         Stream<ZSet<TKey, TWeight>> input,
         Stream<ZSet<TKey, TWeight>> output,
-        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null)
+        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         _input = input;
         _output = output;
         _snapshotCodec = snapshotCodec;
+        _frontier = frontier;
+        _monotoneKey = monotoneKey;
     }
+
+    /// <summary>Distinct keys retained in the trace. Exposed for GC-bound tests.</summary>
+    internal int RetainedKeyCount => _trace.Current.Count;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -65,6 +75,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         if (delta.IsEmpty)
         {
             _output.SetCurrent(ZSet<TKey, TWeight>.Empty);
+            CollectGarbage();
             return;
         }
 
@@ -89,5 +100,28 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable
 
         _output.SetCurrent(outputBuilder.Build());
         _trace.Integrate(delta);
+        CollectGarbage();
+    }
+
+    // Frontier-driven GC: when the row carries a monotone column (so no future
+    // delta arrives below the frontier — the input late-drop enforces this), drop
+    // sub-frontier rows from the trace. Emits nothing; the already-emitted +1 for
+    // a collected row is final, and no future delta can resurrect it (which would
+    // otherwise re-emit a spurious +1, since the trace would read before=0).
+    private void CollectGarbage()
+    {
+        if (_frontier is null || _monotoneKey is null)
+        {
+            return;
+        }
+
+        var frontier = _frontier.Value;
+        if (frontier == long.MinValue || frontier <= _lastGcFrontier)
+        {
+            return;
+        }
+
+        _lastGcFrontier = frontier;
+        _trace.DropKeysBelow(frontier, _monotoneKey);
     }
 }

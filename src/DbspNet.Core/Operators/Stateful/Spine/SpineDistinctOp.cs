@@ -44,6 +44,9 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
     private readonly Stream<ZSet<TKey, TWeight>> _output;
     private readonly SpineZSetTrace<TKey, TWeight> _trace;
     private readonly IZSetTraceCodec<TKey, TWeight>? _snapshotCodec;
+    private readonly IFrontier? _frontier;
+    private readonly Func<TKey, long>? _monotoneKey;
+    private long _lastGcFrontier = long.MinValue;
 
     public SpineDistinctOp(
         Stream<ZSet<TKey, TWeight>> input,
@@ -51,7 +54,9 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         ICompactionStrategy? compactionStrategy = null,
         IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
         IComparer<TKey>? keyComparer = null,
-        SpineSpillConfig<TKey, TWeight>? spillConfig = null)
+        SpineSpillConfig<TKey, TWeight>? spillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         _input = input;
         _output = output;
@@ -60,7 +65,12 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
             keyComparer,
             spillConfig);
         _snapshotCodec = snapshotCodec;
+        _frontier = frontier;
+        _monotoneKey = monotoneKey;
     }
+
+    /// <summary>Distinct keys retained in the trace. Exposed for GC-bound tests.</summary>
+    internal int RetainedKeyCount => _trace.KeyCount;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -106,6 +116,7 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         if (delta.IsEmpty)
         {
             _output.SetCurrent(ZSet<TKey, TWeight>.Empty);
+            CollectGarbage();
             return;
         }
 
@@ -130,5 +141,26 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
 
         _output.SetCurrent(outputBuilder.Build());
         _trace.Integrate(delta);
+        CollectGarbage();
+    }
+
+    // Frontier-driven GC mirroring DistinctOp.CollectGarbage: drop sub-frontier
+    // rows from the trace (filter-rebuild). Emits nothing. See the flat op for
+    // the correctness argument (no future delta resurrects a collected row).
+    private void CollectGarbage()
+    {
+        if (_frontier is null || _monotoneKey is null)
+        {
+            return;
+        }
+
+        var frontier = _frontier.Value;
+        if (frontier == long.MinValue || frontier <= _lastGcFrontier)
+        {
+            return;
+        }
+
+        _lastGcFrontier = frontier;
+        _trace.DropKeysBelow(frontier, _monotoneKey);
     }
 }

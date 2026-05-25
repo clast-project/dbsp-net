@@ -181,6 +181,40 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IEnum
     }
 
     /// <summary>
+    /// Removes every key whose <paramref name="monotoneKey"/> projection is
+    /// strictly below <paramref name="threshold"/>, mutating the backing
+    /// dictionary in place, and returns the number removed. The non-indexed
+    /// counterpart of <see cref="IndexedZSet{TKey,TValue,TWeight}"/>'s
+    /// <c>RemoveKeysBelow</c>, used by DISTINCT's frontier-driven trace GC
+    /// (where the key is the whole row). A key exactly at the threshold is
+    /// retained — a future input may still carry that value.
+    /// </summary>
+    internal int RemoveKeysBelow(long threshold, Func<TKey, long> monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(monotoneKey);
+        List<TKey>? removed = null;
+        foreach (var key in _entries.Keys)
+        {
+            if (monotoneKey(key) < threshold)
+            {
+                (removed ??= new List<TKey>()).Add(key);
+            }
+        }
+
+        if (removed is null)
+        {
+            return 0;
+        }
+
+        foreach (var key in removed)
+        {
+            _entries.Remove(key);
+        }
+
+        return removed.Count;
+    }
+
+    /// <summary>
     /// Returns a shallow copy with its own backing dictionary. Used by
     /// in-place merges on <c>IndexedZSet</c> to avoid aliasing the caller's
     /// inner Z-sets.

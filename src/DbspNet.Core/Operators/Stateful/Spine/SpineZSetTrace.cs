@@ -73,6 +73,60 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     }
 
     /// <summary>
+    /// Drops every key whose <paramref name="monotoneKey"/> projection is
+    /// strictly below <paramref name="threshold"/> (frontier-driven GC),
+    /// returning the number of keys removed. A key exactly at the threshold is
+    /// retained. Rebuilds the spine from the surviving (≥ threshold) state —
+    /// O(retained), which stays window-bounded as the frontier advances; spill
+    /// files for discarded batches are deleted. The non-indexed analogue of
+    /// <see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}.DropKeysBelow"/>,
+    /// used by DISTINCT (where the key is the whole row).
+    /// </summary>
+    public int DropKeysBelow(long threshold, Func<TKey, long> monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(monotoneKey);
+
+        var removed = 0;
+        var survivors = new ZSetBuilder<TKey, TWeight>();
+        foreach (var (key, w) in MergeEntries())
+        {
+            if (monotoneKey(key) < threshold)
+            {
+                removed++;
+            }
+            else
+            {
+                survivors.Add(key, w);
+            }
+        }
+
+        if (removed == 0)
+        {
+            return 0;
+        }
+
+        foreach (var level in _levels)
+        {
+            foreach (var batch in level)
+            {
+                if (batch is SpilledSpineBatch<TKey, TWeight> spilled)
+                {
+                    SyncDelete(spilled);
+                }
+            }
+        }
+
+        _levels.Clear();
+        var surviving = survivors.Build();
+        if (!surviving.IsEmpty)
+        {
+            Integrate(surviving);
+        }
+
+        return removed;
+    }
+
+    /// <summary>
     /// Returns the integrated weight of <paramref name="key"/> by
     /// summing across every batch. Per batch: a cache-line bloom probe;
     /// only batches that pay the bloom go to binary search.
@@ -155,6 +209,12 @@ public sealed class SpineZSetTrace<TKey, TWeight>
 
     /// <summary>Number of levels currently allocated (some may be empty).</summary>
     public int LevelCount => _levels.Count;
+
+    /// <summary>
+    /// Number of distinct keys with a non-zero integrated weight. Materialises
+    /// the merged view — O(total batch entries). Exposed for GC-bound tests.
+    /// </summary>
+    public int KeyCount => MergeEntries().Count;
 
     /// <summary>
     /// Snapshots each non-empty batch's entries as a fresh

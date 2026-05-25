@@ -349,6 +349,86 @@ public class LatenessSqlTests
         Assert.Equal(102, LeftJoinRetainedKeys(q)); // 51 keys per trace, no GC
     }
 
+    private static int DistinctRetainedKeys(CompiledQuery q) =>
+        q.Circuit.Operators
+            .OfType<DistinctOp<StructuralRow, Z64>>()
+            .Single()
+            .RetainedKeyCount;
+
+    // UNION compiles to Distinct(UnionAll(...)); the parser has no SELECT DISTINCT.
+    [Fact]
+    public void DistinctOnMonotoneColumn_BoundsState()
+    {
+        // UNION's DISTINCT row carries a monotone column (ts is monotone in BOTH
+        // branches, so the union column is monotone). DISTINCT GCs sub-frontier
+        // rows from its trace. The input late-drop guarantees no future delta
+        // carries a collected row, so no spurious re-emission of the +1.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10)",
+            ],
+            "SELECT ts FROM a UNION SELECT ts FROM b");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t);
+            q.Table("b").Insert(t); // same ts — UNION collapses to one row
+            q.Step();
+        }
+
+        // 201 distinct ts streamed; frontier min(a,b) = max − 10 keeps [190, 200] = 11.
+        Assert.Equal(11, DistinctRetainedKeys(q));
+        Assert.Equal(1, q.WeightOf(200L).Value); // ts=200 present exactly once
+    }
+
+    [Fact]
+    public void DistinctOnMonotoneColumn_BoundsState_Spine()
+    {
+        var q = CompileSpine(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10)",
+            ],
+            "SELECT ts FROM a UNION SELECT ts FROM b");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t);
+            q.Table("b").Insert(t);
+            q.Step();
+        }
+
+        var op = q.Circuit.Operators
+            .OfType<SpineDistinctOp<StructuralRow, Z64>>()
+            .Single();
+        Assert.Equal(11, op.RetainedKeyCount);
+        Assert.Equal(1, q.WeightOf(200L).Value);
+    }
+
+    [Fact]
+    public void DistinctOnNonMonotoneColumn_DoesNotGc()
+    {
+        // The tables have a LATENESS column (ts), but the UNION is on v, which is
+        // not monotone — no monotone column in the DISTINCT's row, so no frontier
+        // and no GC. State grows with the number of distinct v values.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, v INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, v INT NOT NULL)",
+            ],
+            "SELECT v FROM a UNION SELECT v FROM b");
+
+        for (long t = 0; t <= 50; t++)
+        {
+            q.Table("a").Insert(t, (int)t); // each v distinct
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        Assert.Equal(51, DistinctRetainedKeys(q)); // no GC
+    }
+
     [Fact]
     public void Lateness_OnNullableColumn_Rejected()
     {

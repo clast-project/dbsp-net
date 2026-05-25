@@ -43,7 +43,9 @@ public static class SpineStatefulOperators
         ICompactionStrategy? compactionStrategy = null,
         IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
         IComparer<TKey>? keyComparer = null,
-        SpineSpillConfig<TKey, TWeight>? spillConfig = null)
+        SpineSpillConfig<TKey, TWeight>? spillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TWeight : struct, IZRing<TWeight>
     {
@@ -52,7 +54,8 @@ public static class SpineStatefulOperators
 
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
         builder.AddRawOperator(
-            new SpineDistinctOp<TKey, TWeight>(input, output, compactionStrategy, snapshotCodec, keyComparer, spillConfig));
+            new SpineDistinctOp<TKey, TWeight>(
+                input, output, compactionStrategy, snapshotCodec, keyComparer, spillConfig, frontier, monotoneKey));
         return output;
     }
 

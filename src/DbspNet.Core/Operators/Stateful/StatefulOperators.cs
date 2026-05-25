@@ -42,7 +42,9 @@ public static class StatefulOperators
     public static Stream<ZSet<TKey, TWeight>> Distinct<TKey, TWeight>(
         this CircuitBuilder builder,
         Stream<ZSet<TKey, TWeight>> input,
-        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null)
+        IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TWeight : struct, IZRing<TWeight>
     {
@@ -50,7 +52,7 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(input);
 
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
-        builder.AddRawOperator(new DistinctOp<TKey, TWeight>(input, output, snapshotCodec));
+        builder.AddRawOperator(new DistinctOp<TKey, TWeight>(input, output, snapshotCodec, frontier, monotoneKey));
         return output;
     }
 
