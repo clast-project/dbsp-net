@@ -218,8 +218,13 @@ external behaviour, but backed by `SpineZSetTrace` /
 configurable compaction) instead of a flat dictionary. Per-batch
 Arrow IPC snapshot via `SpineSnapshot`; optional disk spill via
 `SpineSpillConfig`. Exposed through `SpineStatefulOperators`
-extensions, but the SQL compiler doesn't emit them today — see
-[`docs/persistence.md`](docs/persistence.md).
+extensions, and emitted by the SQL compiler when
+`PlanToCircuit.Compile` is given `CompileOptions { TraceFamily =
+TraceFamily.Spine }` — the structural compile routes the four stateful
+sites through the spine builders and supplies a `StructuralRowComparer`
+(`Core/Collections/`) for the sorted batches. The typed-row fast path
+still emits the flat family, so a spine-mode query compiles
+structurally. See [`docs/persistence.md`](docs/persistence.md).
 
 ### Aggregators
 

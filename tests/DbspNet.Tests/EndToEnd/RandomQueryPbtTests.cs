@@ -49,7 +49,31 @@ public class RandomQueryPbtTests
             .Sample((sql, ticks) => CheckOne(sql, ticks, optimize: true), iter: 3000);
     }
 
-    private static bool CheckOne(string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks, bool optimize)
+    /// <summary>
+    /// The same PBT, but compiling stateful operators onto the spine
+    /// (LSM-style) trace family instead of the flat dictionary traces.
+    /// The batch oracle is unchanged, so any divergence is a spine bug:
+    /// the spine operators claim observational equivalence to their flat
+    /// counterparts, and this is the sweep that proves it across the
+    /// random query surface (including the StructuralRowComparer ordering
+    /// the spine relies on).
+    /// </summary>
+    [Fact]
+    public void RandomQuery_SpineCircuitEqualsBatch()
+    {
+        Gen.Select(RandomQuery.GenQuery, RandomQuery.GenTicks)
+            .Sample(
+                (sql, ticks) => CheckOne(
+                    sql, ticks, optimize: false,
+                    compileOptions: new CompileOptions { TraceFamily = TraceFamily.Spine }),
+                iter: 3000);
+    }
+
+    private static bool CheckOne(
+        string sql,
+        IReadOnlyList<IReadOnlyList<InputEvent>> ticks,
+        bool optimize,
+        CompileOptions? compileOptions = null)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
@@ -61,7 +85,7 @@ public class RandomQueryPbtTests
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
 
         var planForCircuit = optimize ? PlanOptimizer.Optimize(plan) : plan;
-        var compiled = PlanToCircuit.Compile(planForCircuit);
+        var compiled = PlanToCircuit.Compile(planForCircuit, snapshotCodecs: null, compileOptions);
 
         // The compiler only declares inputs for tables the query references
         // — filter out events targeting unreferenced tables.
@@ -88,7 +112,8 @@ public class RandomQueryPbtTests
 
         if (!accumulated.Equals(batch))
         {
-            Console.Error.WriteLine($"SQL (optimize={optimize}): {sql}");
+            var family = compileOptions?.TraceFamily ?? TraceFamily.Flat;
+            Console.Error.WriteLine($"SQL (optimize={optimize}, trace={family}): {sql}");
             Console.Error.WriteLine("ticks: " + DescribeTicks(ticks));
             Console.Error.WriteLine("accumulated (circuit): " + accumulated);
             Console.Error.WriteLine("batch       (oracle):  " + batch);

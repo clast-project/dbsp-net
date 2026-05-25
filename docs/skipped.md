@@ -314,11 +314,20 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   `SpineIndexedSpillConfig` with per-batch bloom filters so probes
   typically don't touch disk. Exercised by unit tests and the trace
   microbenchmarks (`PureTraceBenchmark`, `DistinctBenchmark`).
-  **[P1]** SQL compiler integration. `PlanToCircuit.Compile` still
-  emits the flat-trace operator family. The natural next step is a
-  compiler-side toggle (or per-operator decision driven by trace-size
-  heuristics) that selects the spine family for stateful operators.
-  See `docs/persistence.md` "What ships in (D) — spine".
+  SQL compiler integration has landed: `PlanToCircuit.Compile(plan,
+  snapshotCodecs, new CompileOptions { TraceFamily = TraceFamily.Spine })`
+  routes the structural compile's stateful sites through the spine
+  builders (supplying a `StructuralRowComparer` for the sorted
+  batches), validated by a spine pass of the random-query PBT and by
+  spine snapshot round-trip tests. See `docs/persistence.md` "What
+  ships in (D) — spine".
+  - **[P1]** Spine on the typed-row fast path. The typed compiler
+    still emits the flat family, so a spine-mode query compiles via the
+    structural path. Extending it needs generated per-schema comparers
+    for the emitted structs. `RecursiveCteOp` also has no spine sibling
+    (recursive CTEs always use a flat trace), and a trace-size-driven
+    automatic flat/spine decision is future work — today it's an
+    explicit caller toggle.
 - **[P2]** Trace compaction / waterline (since-frontier
   advancement that lets multiple updates at the same (key, value)
   collapse into one row). The spine has the right shape for this —

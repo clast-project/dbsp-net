@@ -6,6 +6,8 @@ using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Linear;
 using DbspNet.Core.Operators.Stateful;
+using DbspNet.Core.Operators.Stateful.Aggregators;
+using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
 
@@ -24,10 +26,13 @@ namespace DbspNet.Sql.Compiler;
 /// </remarks>
 public static class PlanToCircuit
 {
-    public static CompiledQuery Compile(LogicalPlan plan, ISqlSnapshotCodecs? snapshotCodecs = null)
+    public static CompiledQuery Compile(
+        LogicalPlan plan,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
+        CompileOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        return CompileCore(plan, StructuralRowCodec.Instance, snapshotCodecs);
+        return CompileCore(plan, StructuralRowCodec.Instance, snapshotCodecs, options ?? CompileOptions.Default);
     }
 
     /// <summary>
@@ -40,19 +45,20 @@ public static class PlanToCircuit
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(codec);
-        return CompileCore(plan, codec, snapshotCodecs: null);
+        return CompileCore(plan, codec, snapshotCodecs: null, CompileOptions.Default);
     }
 
     public static CompiledQuery Compile(CreateViewPlan view)
     {
         ArgumentNullException.ThrowIfNull(view);
-        return CompileCore(view.Query, StructuralRowCodec.Instance, snapshotCodecs: null);
+        return CompileCore(view.Query, StructuralRowCodec.Instance, snapshotCodecs: null, CompileOptions.Default);
     }
 
     private static CompiledQuery CompileCore(
         LogicalPlan plan,
         IRowCodec<StructuralRow> codec,
-        ISqlSnapshotCodecs? snapshotCodecs)
+        ISqlSnapshotCodecs? snapshotCodecs,
+        CompileOptions options)
     {
         // Walk the plan to find every scanned table; each becomes a circuit input.
         var tables = CollectScans(plan);
@@ -84,8 +90,10 @@ public static class PlanToCircuit
             // Disabled when a non-default IRowCodec<StructuralRow> is
             // supplied — the structural compile is the only path that
             // honours an alternative codec on every stage's output row.
+            // Also disabled in spine mode: the typed compiler emits the flat
+            // operator family, so the spine toggle compiles structurally.
             Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
-            if (ReferenceEquals(codec, StructuralRowCodec.Instance))
+            if (options.TraceFamily == TraceFamily.Flat && ReferenceEquals(codec, StructuralRowCodec.Instance))
             {
                 queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
                     builder, plan, streams, codec, snapshotCodecs);
@@ -93,7 +101,7 @@ public static class PlanToCircuit
 
             if (queryStream is null)
             {
-                var ctx = new CompileContext(streams, tables, codec, snapshotCodecs);
+                var ctx = new CompileContext(streams, tables, codec, snapshotCodecs, options);
                 queryStream = CompilePlan(builder, plan, ctx);
             }
 
@@ -109,12 +117,14 @@ public static class PlanToCircuit
             IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> scans,
             IReadOnlyDictionary<string, Schema> tableSchemas,
             IRowCodec<StructuralRow> codec,
-            ISqlSnapshotCodecs? snapshotCodecs)
+            ISqlSnapshotCodecs? snapshotCodecs,
+            CompileOptions options)
         {
             Scans = scans;
             TableSchemas = tableSchemas;
             Codec = codec;
             SnapshotCodecs = snapshotCodecs;
+            Options = options;
         }
 
         /// <summary>Stream per declared table — the circuit's inputs.</summary>
@@ -146,6 +156,82 @@ public static class PlanToCircuit
         /// via <c>DbspNet.Persistence.Snapshot</c>.
         /// </summary>
         public ISqlSnapshotCodecs? SnapshotCodecs { get; }
+
+        /// <summary>Compile-time knobs — currently the flat/spine trace toggle.</summary>
+        public CompileOptions Options { get; }
+    }
+
+    // ---- Stateful operator emission: flat vs spine trace family ----
+    //
+    // Every SQL stateful operator keys / values on StructuralRow with a Z64
+    // weight. The spine trace requires a total order over keys and values,
+    // supplied by StructuralRowComparer; the flat trace ignores ordering.
+    // These helpers are the single place the trace family is selected.
+
+    private static Stream<ZSet<StructuralRow, Z64>> EmitDistinct(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineDistinct(input, ctx.Options.Compaction, snapshotCodec, StructuralRowComparer.Instance)
+            : builder.Distinct(input, snapshotCodec);
+    }
+
+    private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoin(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> combine,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineIncrementalInnerJoin(
+                left, right, combine, leftCodec, rightCodec,
+                ctx.Options.Compaction,
+                keyComparer: StructuralRowComparer.Instance,
+                leftValueComparer: StructuralRowComparer.Instance,
+                rightValueComparer: StructuralRowComparer.Instance)
+            : builder.IncrementalInnerJoin(left, right, combine, leftCodec, rightCodec);
+    }
+
+    private static Stream<ZSet<StructuralRow, Z64>> EmitLeftJoin(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadCombine,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineIncrementalLeftJoin(
+                left, right, joinCombine, nullPadCombine, leftCodec, rightCodec,
+                ctx.Options.Compaction,
+                keyComparer: StructuralRowComparer.Instance,
+                leftValueComparer: StructuralRowComparer.Instance,
+                rightValueComparer: StructuralRowComparer.Instance)
+            : builder.IncrementalLeftJoin(left, right, joinCombine, nullPadCombine, leftCodec, rightCodec);
+    }
+
+    private static Stream<ZSet<(StructuralRow Key, StructuralRow Value), Z64>> EmitAggregate(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> input,
+        IAggregator<StructuralRow, StructuralRow> aggregator,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineIncrementalAggregate(
+                input, aggregator, snapshotCodec,
+                ctx.Options.Compaction,
+                keyComparer: StructuralRowComparer.Instance,
+                valueComparer: StructuralRowComparer.Instance)
+            : builder.IncrementalAggregate(input, aggregator, snapshotCodec);
     }
 
     // ---- Scan collection ----
@@ -291,8 +377,8 @@ public static class PlanToCircuit
             case DistinctPlan d:
                 {
                     var distinctCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(d.Schema);
-                    return builder.Distinct(
-                        CompilePlan(builder, d.Input, ctx), distinctCodec);
+                    return EmitDistinct(
+                        builder, ctx, CompilePlan(builder, d.Input, ctx), distinctCodec);
                 }
 
             case DifferencePlan diff:
@@ -413,7 +499,8 @@ public static class PlanToCircuit
         var rightCount = plan.Right.Schema.Count;
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
-        var joined = builder.IncrementalInnerJoin(
+        var joined = EmitInnerJoin(
+            builder, ctx,
             leftIndexed,
             rightIndexed,
             (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
@@ -471,7 +558,8 @@ public static class PlanToCircuit
 
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
-        var joined = builder.IncrementalLeftJoin(
+        var joined = EmitLeftJoin(
+            builder, ctx,
             leftIndexed,
             rightIndexed,
             joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
@@ -536,7 +624,8 @@ public static class PlanToCircuit
         // right rows, "right trace" carries left rows.
         var preservedCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
         var probedCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
-        var joined = builder.IncrementalLeftJoin(
+        var joined = EmitLeftJoin(
+            builder, ctx,
             rightIndexed,
             leftIndexed,
             joinCombine: (_, rrow, lrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
@@ -699,7 +788,7 @@ public static class PlanToCircuit
             // Project subquery rows to their single column wrapped in a 1-col StructuralRow.
             // (The subquery plan's output schema already has Count=1, so row[0] is the scalar.)
             current = AttachScalarColumn(
-                builder, current, subStream, ctx.Codec, currentSchema, subPlan.Schema, ctx.SnapshotCodecs);
+                builder, ctx, current, subStream, currentSchema, subPlan.Schema);
             // Output of AttachScalarColumn appends the subquery's single column.
             currentSchema = currentSchema.Concat(subPlan.Schema);
         }
@@ -709,13 +798,14 @@ public static class PlanToCircuit
 
     private static Stream<ZSet<StructuralRow, Z64>> AttachScalarColumn(
         CircuitBuilder builder,
+        CompileContext ctx,
         Stream<ZSet<StructuralRow, Z64>> outer,
         Stream<ZSet<StructuralRow, Z64>> subq,
-        IRowCodec<StructuralRow> codec,
         Schema outerSchema,
-        Schema subqSchema,
-        ISqlSnapshotCodecs? snapshotCodecs)
+        Schema subqSchema)
     {
+        var codec = ctx.Codec;
+        var snapshotCodecs = ctx.SnapshotCodecs;
         // Unit-key rekey of both sides: all outer rows under the same
         // 0-column key, and the subquery's (expected) single row under the
         // same key. LEFT JOIN ensures outer rows survive when the subquery
@@ -733,7 +823,8 @@ public static class PlanToCircuit
         // ScalarSubqueryJoin appends one column per subquery; the per-iteration
         // schema isn't readily available here, so we let the codec fall back to
         // its untyped path (passing null). Not on the Joined GROUP BY hot path.
-        return builder.IncrementalLeftJoin(
+        return EmitLeftJoin(
+            builder, ctx,
             outerIndexed,
             subqIndexed,
             joinCombine: (_, outerRow, scalarRow) => AppendColumn(codec, null, outerRow, scalarRow[0]),
@@ -875,7 +966,7 @@ public static class PlanToCircuit
         // the trace itself is round-tripped.
         var aggCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(
             groupKeySchema, plan.Input.Schema);
-        var aggregated = builder.IncrementalAggregate(indexed, composite, aggCodec);
+        var aggregated = EmitAggregate(builder, ctx, indexed, composite, aggCodec);
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;

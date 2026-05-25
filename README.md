@@ -176,9 +176,13 @@ batch re-computation.
   optional disk spill via `SpineSpillConfig`. Every flat operator has
   a spine-backed counterpart (`SpineDistinctOp`,
   `SpineIncrementalAggregateOp`, `SpineIncrementalJoinOp`,
-  `SpineIncrementalLeftJoinOp`). Exercised today by Core tests and
-  the trace microbenchmarks; **not yet** emitted by the SQL compiler
-  by default (the natural next step — see [What's next](#whats-next)).
+  `SpineIncrementalLeftJoinOp`). Emitted by the SQL compiler via
+  `PlanToCircuit.Compile(plan, snapshotCodecs, new CompileOptions {
+  TraceFamily = TraceFamily.Spine })` — the structural compile selects
+  the spine family and supplies a `StructuralRowComparer` for the
+  sorted batches. Snapshot round-trips and the random-query
+  equivalence PBT both run green on the spine path; the typed-row fast
+  path still emits the flat family (see [What's next](#whats-next)).
 - Correctness: 770+ unit tests plus property-based tests (≥3000 CsCheck
   iterations) across 40 query templates, run both with and without the
   optimizer — semantic equivalence is continuously verified. Persistence
@@ -219,12 +223,13 @@ beyond "Feldera is much bigger":
 
 The biggest tracked-but-not-yet-shipped pieces:
 
-- **Spine integration into the SQL compiler.** The spine operator
-  family (with snapshot and disk spill) exists in `DbspNet.Core` but
-  `PlanToCircuit` still emits the flat-trace variants. The natural
-  step is a compiler-side toggle that selects the spine family — at
-  which point the snapshot story already lines up because both speak
-  the same trace-codec interface.
+- **Spine on the typed-row fast path.** The spine family is now
+  emitted by the structural compile via `CompileOptions { TraceFamily
+  = TraceFamily.Spine }`; the typed-row pipeline still emits the flat
+  operators, so a spine-mode query compiles structurally. Extending
+  the typed compiler to spine-backed operators (generated per-schema
+  comparers for the emitted structs) is the remaining integration
+  step. `RecursiveCteOp` likewise has no spine sibling and stays flat.
 - **Trace compaction / waterline.** The spine has the right shape for
   consolidation-on-frontier-advance, but no frontier is advertised
   today, so traces still retain every update.

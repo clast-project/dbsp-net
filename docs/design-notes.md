@@ -133,10 +133,16 @@ Two payoffs the flat trace can't easily match:
   through an `ITableFileSystem`. The per-batch bloom filter stays in
   memory, so most probes never touch disk.
 
-The SQL compiler still emits the flat operator family by default;
-wiring the spine through `PlanToCircuit` (so SQL queries pick it up
-without a Core-API rewrite) is the natural next step. See
-`docs/persistence.md` for the snapshot story.
+The SQL compiler emits the flat operator family by default and the
+spine family when `PlanToCircuit.Compile` is given
+`CompileOptions { TraceFamily = TraceFamily.Spine }`. The spine traces
+sort their keys and values, which the flat dictionary traces don't —
+so the structural compile supplies a `StructuralRowComparer` (a total
+order over `StructuralRow`: lexicographic, NULL-first, element compare
+via the same non-generic `IComparable` the MIN/MAX path uses). The
+typed-row fast path still emits the flat family, so a spine-mode query
+compiles structurally; extending the typed pipeline to the spine is
+the remaining step. See `docs/persistence.md` for the snapshot story.
 
 ### Arrow boundary
 

@@ -3,11 +3,11 @@
 Approaches (A), (B), and (C) below are implemented in
 `DbspNet.Persistence`. (D) — the log-structured trace itself — also
 ships, in `DbspNet.Core.Operators.Stateful.Spine`, with per-batch
-snapshotting and optional disk spill; what's *not* yet wired up is the
-path that lets the SQL compiler emit spine-backed operators by default
-(it still emits the flat-trace family). The historical design
-discussion follows; see "Current state" at the bottom for what
-shipped.
+snapshotting and optional disk spill, and is now emitted by the SQL
+compiler on demand via `CompileOptions { TraceFamily = TraceFamily.Spine }`
+(the structural compile path; the typed-row fast path still emits the
+flat family). The historical design discussion follows; see "Current
+state" at the bottom for what shipped.
 
 The natural checkpoint point is a **step boundary**: between ticks every
 operator is in a consistent "end-of-tick T" state.
@@ -137,9 +137,9 @@ cuts.
 
 ## Recommended staging
 
-This was the original plan; (A), (B), (C), and the Core half of (D)
-have all landed. The remaining step is wiring (D) into the SQL
-compiler — see the "Spine" section below.
+This was the original plan; (A), (B), (C), and (D) — including wiring
+the spine into the SQL compiler — have all landed. See the "Spine"
+section below.
 
 1. **(A) input replay.** Honest, mechanical proof of concept. Persist
    every input delta with tick number; implement replay. Validates the
@@ -160,7 +160,7 @@ out of (A) + (B) naturally.
 | (A) input replay | Shipped | `WalRecorder(query, walStore)` |
 | (B) end-of-tick snapshot | Shipped | `Snapshot.Write` / `Snapshot.Read` |
 | (C) snapshot + WAL hybrid | Shipped | `WalRecorder(query, walStore, snapshotStore)` + `WalRecorder.WriteSnapshot()` |
-| (D) log-structured trace | Shipped in Core; not yet emitted by the SQL compiler | `DbspNet.Core.Operators.Stateful.Spine.*` (`SpineDistinct`, `SpineIncrementalAggregate`, `SpineIncrementalJoin`, `SpineIncrementalLeftJoin`); see "Spine" below |
+| (D) log-structured trace | Shipped in Core and emitted by the SQL compiler via `CompileOptions { TraceFamily = TraceFamily.Spine }` | `DbspNet.Core.Operators.Stateful.Spine.*` (`SpineDistinct`, `SpineIncrementalAggregate`, `SpineIncrementalJoin`, `SpineIncrementalLeftJoin`); see "Spine" below |
 
 ### Storage abstraction
 
@@ -336,18 +336,30 @@ threshold stay resident while deeper batches serialise to an
 `ITableFileSystem`, with a per-batch bloom filter so probes typically
 don't touch disk.
 
-What is **not** yet integrated: the SQL compiler
-(`PlanToCircuit.Compile`) still emits the flat-trace operator family
+**SQL compiler integration.** `PlanToCircuit.Compile(plan,
+snapshotCodecs, new CompileOptions { TraceFamily = TraceFamily.Spine })`
+emits the spine operator family in place of the flat one
 (`DistinctOp`, `IncrementalAggregateOp`, `IncrementalJoinOp`,
-`IncrementalLeftJoinOp`, `RecursiveCteOp`). The spine variants are
-exercised today by unit tests and the trace microbenchmarks in
-`PureTraceBenchmark` / `DistinctBenchmark`. The natural next step is a
-compiler-side toggle that selects the spine family — at which point
-the `DistinctOp` ↔ `SpineDistinctOp` snapshot story already lines up
-because both speak the same `IZSetTraceCodec` / `IIndexedZSetTraceCodec`
-interface. The bigger architectural win flagged in the original (D)
-sketch — *cheap* checkpointing because each batch is already a file —
-follows naturally once that toggle exists.
+`IncrementalLeftJoinOp`). The structural compile routes its four
+stateful sites through `EmitDistinct` / `EmitInnerJoin` /
+`EmitLeftJoin` / `EmitAggregate` helpers that select flat vs spine and
+supply a `StructuralRowComparer` for the sorted batches; the snapshot
+story lined up for free because `DistinctOp` ↔ `SpineDistinctOp` etc.
+speak the same `IZSetTraceCodec` / `IIndexedZSetTraceCodec` interface.
+A flat snapshot and a spine snapshot are not cross-loadable — the
+operator-type plan fingerprint differs, so a mismatched load is
+rejected. Validation: the random-query equivalence PBT runs a spine
+pass against the batch oracle, and the persistence suite covers spine
+snapshot round-trips for distinct / aggregate / inner / left-join
+compositions (`tests/.../Persistence/SpineSnapshotTests.cs`).
+
+Two limits remain. `RecursiveCteOp` has no spine sibling, so recursive
+CTEs always use a flat trace. And the typed-row fast path still emits
+the flat family, so a spine-mode query compiles structurally — pushing
+the spine onto the typed pipeline (per-schema comparers for the emitted
+structs) is the remaining integration step. The bigger architectural
+win flagged in the original (D) sketch — *cheap* checkpointing because
+each batch is already a file — is now reachable from SQL.
 
 ### Test coverage
 
