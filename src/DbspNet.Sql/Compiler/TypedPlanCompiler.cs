@@ -1856,9 +1856,12 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(StatefulOperators.IncrementalAggregate)
                 && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(keyRowType, valueRowType, aggRowType);
+        // Reflection does not apply C# optional-parameter defaults, so every
+        // parameter must be supplied explicitly. frontier / monotoneKey are the
+        // LATENESS GC hooks — null here; the typed path does not GC yet.
         return closed.Invoke(null, new object?[]
         {
-            builder, indexed, aggregator, snapshotCodec,
+            builder, indexed, aggregator, snapshotCodec, null, null,
         })!;
     }
 

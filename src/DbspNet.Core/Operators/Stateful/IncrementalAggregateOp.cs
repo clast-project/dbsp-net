@@ -34,18 +34,31 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
     private readonly IIndexedZSetTraceCodec<TKey, TValue, Z64>? _snapshotCodec;
+    private readonly IFrontier? _frontier;
+    private readonly Func<TKey, long>? _monotoneKey;
+    private long _lastGcFrontier = long.MinValue;
 
     public IncrementalAggregateOp(
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
         Stream<ZSet<(TKey Key, TOut Value), Z64>> output,
         IAggregator<TValue, TOut> aggregator,
-        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null)
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         _input = input;
         _output = output;
         _aggregator = aggregator;
         _snapshotCodec = snapshotCodec;
+        _frontier = frontier;
+        _monotoneKey = monotoneKey;
     }
+
+    /// <summary>
+    /// Number of group keys currently retained in the trace. Exposed for tests
+    /// that assert frontier-driven GC keeps state bounded.
+    /// </summary>
+    internal int RetainedGroupCount => _trace.Current.GroupCount;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -152,5 +165,35 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         _output.SetCurrent(builder.Build());
         _trace.Integrate(delta);
+        CollectGarbage();
+    }
+
+    /// <summary>
+    /// Frontier-driven GC: once the advertised frontier advances, drop every
+    /// group whose key is strictly below it — those groups can never be touched
+    /// by future input, so their already-emitted aggregate stays in the
+    /// downstream view while their trace and cache state is reclaimed. Emits
+    /// nothing (GC reduces state, never output). No-op unless both a frontier
+    /// and a monotone-key extractor were supplied.
+    /// </summary>
+    private void CollectGarbage()
+    {
+        if (_frontier is null || _monotoneKey is null)
+        {
+            return;
+        }
+
+        var frontier = _frontier.Value;
+        if (frontier == long.MinValue || frontier <= _lastGcFrontier)
+        {
+            return;
+        }
+
+        _lastGcFrontier = frontier;
+        foreach (var key in _trace.DropKeysBelow(frontier, _monotoneKey))
+        {
+            _aggCache.Remove(key);
+            _stateCache.Remove(key);
+        }
     }
 }

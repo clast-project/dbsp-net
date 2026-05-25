@@ -154,7 +154,9 @@ public static class StatefulOperators
         this CircuitBuilder builder,
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
         IAggregator<TValue, TOut> aggregator,
-        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null)
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TValue : notnull
         where TOut : notnull
@@ -165,7 +167,8 @@ public static class StatefulOperators
 
         var output = new Stream<ZSet<(TKey, TOut), Z64>>(ZSet<(TKey, TOut), Z64>.Empty);
         builder.AddRawOperator(
-            new IncrementalAggregateOp<TKey, TValue, TOut>(input, output, aggregator, snapshotCodec));
+            new IncrementalAggregateOp<TKey, TValue, TOut>(
+                input, output, aggregator, snapshotCodec, frontier, monotoneKey));
         return output;
     }
 }

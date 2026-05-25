@@ -186,6 +186,39 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
         }
     }
 
+    /// <summary>
+    /// Removes every key whose <paramref name="monotoneKey"/> projection is
+    /// strictly below <paramref name="threshold"/>, mutating the backing
+    /// dictionary in place, and returns the removed keys (so the caller can
+    /// drop any parallel per-key state). Used by frontier-driven trace GC; a
+    /// key exactly at the threshold is retained, since a future input may still
+    /// carry that value.
+    /// </summary>
+    internal IReadOnlyList<TKey> RemoveKeysBelow(long threshold, Func<TKey, long> monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(monotoneKey);
+        List<TKey>? removed = null;
+        foreach (var key in _groups.Keys)
+        {
+            if (monotoneKey(key) < threshold)
+            {
+                (removed ??= new List<TKey>()).Add(key);
+            }
+        }
+
+        if (removed is null)
+        {
+            return Array.Empty<TKey>();
+        }
+
+        foreach (var key in removed)
+        {
+            _groups.Remove(key);
+        }
+
+        return removed;
+    }
+
     public static IndexedZSet<TKey, TValue, TWeight> operator +(
         IndexedZSet<TKey, TValue, TWeight> a,
         IndexedZSet<TKey, TValue, TWeight> b) => a.Plus(b);

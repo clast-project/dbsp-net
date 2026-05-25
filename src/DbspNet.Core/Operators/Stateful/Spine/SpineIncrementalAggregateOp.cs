@@ -31,6 +31,9 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
     private readonly IIndexedZSetTraceCodec<TKey, TValue, Z64>? _snapshotCodec;
+    private readonly IFrontier? _frontier;
+    private readonly Func<TKey, long>? _monotoneKey;
+    private long _lastGcFrontier = long.MinValue;
 
     public SpineIncrementalAggregateOp(
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
@@ -40,7 +43,9 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         ICompactionStrategy? compactionStrategy = null,
         IComparer<TKey>? keyComparer = null,
         IComparer<TValue>? valueComparer = null,
-        SpineIndexedSpillConfig<TKey, TValue, Z64>? spillConfig = null)
+        SpineIndexedSpillConfig<TKey, TValue, Z64>? spillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         _input = input;
         _output = output;
@@ -51,7 +56,15 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
             valueComparer,
             spillConfig);
         _snapshotCodec = snapshotCodec;
+        _frontier = frontier;
+        _monotoneKey = monotoneKey;
     }
+
+    /// <summary>
+    /// Distinct group keys currently retained in the trace. Exposed for tests
+    /// that assert frontier-driven GC keeps state bounded.
+    /// </summary>
+    internal int RetainedGroupCount => _trace.GroupCount;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -157,5 +170,34 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
 
         _output.SetCurrent(builder.Build());
         _trace.Integrate(delta);
+        CollectGarbage();
+    }
+
+    /// <summary>
+    /// Frontier-driven GC: once the advertised frontier advances, drop every
+    /// group whose key is strictly below it (those groups are unreachable by
+    /// future input). Reclaims trace and cache state without emitting — the
+    /// group's already-emitted aggregate stays in the downstream view. No-op
+    /// unless both a frontier and a monotone-key extractor were supplied.
+    /// </summary>
+    private void CollectGarbage()
+    {
+        if (_frontier is null || _monotoneKey is null)
+        {
+            return;
+        }
+
+        var frontier = _frontier.Value;
+        if (frontier == long.MinValue || frontier <= _lastGcFrontier)
+        {
+            return;
+        }
+
+        _lastGcFrontier = frontier;
+        foreach (var key in _trace.DropKeysBelow(frontier, _monotoneKey))
+        {
+            _aggCache.Remove(key);
+            _stateCache.Remove(key);
+        }
     }
 }

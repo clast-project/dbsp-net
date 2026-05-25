@@ -59,4 +59,14 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight>
 
         Current.MergeInPlace(delta);
     }
+
+    /// <summary>
+    /// Drops every key whose <paramref name="monotoneKey"/> projection is
+    /// strictly below <paramref name="threshold"/> (frontier-driven GC),
+    /// returning the removed keys so the owning operator can drop any parallel
+    /// per-key caches. Scans the whole trace, so callers should only invoke it
+    /// when the frontier has actually advanced.
+    /// </summary>
+    public IReadOnlyList<TKey> DropKeysBelow(long threshold, Func<TKey, long> monotoneKey) =>
+        Current.RemoveKeysBelow(threshold, monotoneKey);
 }

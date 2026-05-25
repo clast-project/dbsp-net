@@ -69,7 +69,9 @@ public static class SpineStatefulOperators
         ICompactionStrategy? compactionStrategy = null,
         IComparer<TKey>? keyComparer = null,
         IComparer<TValue>? valueComparer = null,
-        SpineIndexedSpillConfig<TKey, TValue, Z64>? spillConfig = null)
+        SpineIndexedSpillConfig<TKey, TValue, Z64>? spillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TValue : notnull
         where TOut : notnull
@@ -81,7 +83,8 @@ public static class SpineStatefulOperators
         var output = new Stream<ZSet<(TKey, TOut), Z64>>(ZSet<(TKey, TOut), Z64>.Empty);
         builder.AddRawOperator(
             new SpineIncrementalAggregateOp<TKey, TValue, TOut>(
-                input, output, aggregator, snapshotCodec, compactionStrategy, keyComparer, valueComparer, spillConfig));
+                input, output, aggregator, snapshotCodec, compactionStrategy,
+                keyComparer, valueComparer, spillConfig, frontier, monotoneKey));
         return output;
     }
 

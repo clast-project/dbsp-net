@@ -67,6 +67,65 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     }
 
     /// <summary>
+    /// Frontier-driven GC: drops every key whose <paramref name="monotoneKey"/>
+    /// projection is strictly below <paramref name="threshold"/>, returning the
+    /// removed keys so the owning operator can drop parallel per-key caches.
+    /// </summary>
+    /// <remarks>
+    /// Rebuilds the spine from the surviving (≥ threshold) state — O(retained
+    /// state), which stays window-bounded as the frontier advances. Spill files
+    /// for discarded batches are deleted. Folding the drop into compaction (so
+    /// it costs O(dropped) and preserves batch structure) is a future
+    /// optimisation; this correct first cut bounds memory, which is the point.
+    /// </remarks>
+    public IReadOnlyList<TKey> DropKeysBelow(long threshold, Func<TKey, long> monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(monotoneKey);
+
+        List<TKey>? removed = null;
+        var survivors = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+        foreach (var (key, group) in MaterialiseGroups())
+        {
+            if (monotoneKey(key) < threshold)
+            {
+                (removed ??= new List<TKey>()).Add(key);
+            }
+            else
+            {
+                foreach (var (v, w) in group)
+                {
+                    survivors.Add(key, v, w);
+                }
+            }
+        }
+
+        if (removed is null)
+        {
+            return Array.Empty<TKey>();
+        }
+
+        foreach (var level in _levels)
+        {
+            foreach (var batch in level)
+            {
+                if (batch is SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilled)
+                {
+                    SyncDelete(spilled);
+                }
+            }
+        }
+
+        _levels.Clear();
+        var surviving = survivors.Build();
+        if (!surviving.IsEmpty)
+        {
+            Integrate(surviving);
+        }
+
+        return removed;
+    }
+
+    /// <summary>
     /// Returns the integrated group for <paramref name="key"/> — the
     /// union of every batch's group for that key, with weights summed
     /// per value. Zero-weight values are filtered. Bloom-gated per
@@ -162,6 +221,12 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
 
     /// <summary>Number of levels currently allocated.</summary>
     public int LevelCount => _levels.Count;
+
+    /// <summary>
+    /// Distinct keys with a non-empty integrated group. O(total batch
+    /// entries) — for tests asserting frontier-driven GC bounds the state.
+    /// </summary>
+    public int GroupCount => MaterialiseGroups().Count;
 
     /// <summary>
     /// Snapshots each non-empty batch's entries as a fresh
