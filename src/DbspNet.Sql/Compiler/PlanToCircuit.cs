@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
+using System.Linq;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
@@ -62,6 +63,8 @@ public static class PlanToCircuit
     {
         // Walk the plan to find every scanned table; each becomes a circuit input.
         var tables = CollectScans(plan);
+        var hasLateness = tables.Values.Any(t => t.Lateness is { Count: > 0 });
+        var monotonicity = MonotonicityAnalyzer.Analyze(plan);
 
         RootCircuit? circuit = null;
         Dictionary<string, TableInput>? inputs = null;
@@ -71,11 +74,28 @@ public static class PlanToCircuit
         {
             var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
             inputs = new Dictionary<string, TableInput>(StringComparer.Ordinal);
-            foreach (var (name, schema) in tables)
+            var frontiers = new Dictionary<LatenessSource, MutableFrontier>();
+            foreach (var (name, info) in tables)
             {
                 var (handle, stream) = builder.ZSetInput<StructuralRow, Z64>();
+                inputs[name] = new TableInput(handle, info.Schema, codec);
+
+                // For each declared-LATENESS column, interpose an EnforceLateness
+                // operator that drops late rows and advances a frontier the
+                // downstream stateful operators GC against.
+                if (info.Lateness is { } lateness)
+                {
+                    foreach (var (column, bound) in lateness)
+                    {
+                        var index = column;
+                        var frontier = new MutableFrontier();
+                        stream = builder.EnforceLateness(
+                            stream, row => MonotoneKey.Extract(row[index]), bound, frontier);
+                        frontiers[new LatenessSource(name, column)] = frontier;
+                    }
+                }
+
                 streams[name] = stream;
-                inputs[name] = new TableInput(handle, schema, codec);
             }
 
             // Fast path: try the typed-row pipeline first. When the
@@ -90,10 +110,14 @@ public static class PlanToCircuit
             // Disabled when a non-default IRowCodec<StructuralRow> is
             // supplied — the structural compile is the only path that
             // honours an alternative codec on every stage's output row.
-            // Also disabled in spine mode: the typed compiler emits the flat
-            // operator family, so the spine toggle compiles structurally.
+            // Also disabled in spine mode (the typed compiler emits the flat
+            // operator family) and when LATENESS is present (GC is wired only on
+            // the structural path — long-running bounded pipelines use spine +
+            // LATENESS structurally; the typed fast path is for short queries).
             Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
-            if (options.TraceFamily == TraceFamily.Flat && ReferenceEquals(codec, StructuralRowCodec.Instance))
+            if (options.TraceFamily == TraceFamily.Flat
+                && ReferenceEquals(codec, StructuralRowCodec.Instance)
+                && !hasLateness)
             {
                 queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
                     builder, plan, streams, codec, snapshotCodecs);
@@ -101,7 +125,9 @@ public static class PlanToCircuit
 
             if (queryStream is null)
             {
-                var ctx = new CompileContext(streams, tables, codec, snapshotCodecs, options);
+                var tableSchemas = tables.ToDictionary(kv => kv.Key, kv => kv.Value.Schema, StringComparer.Ordinal);
+                var ctx = new CompileContext(
+                    streams, tableSchemas, codec, snapshotCodecs, options, monotonicity, frontiers);
                 queryStream = CompilePlan(builder, plan, ctx);
             }
 
@@ -118,13 +144,17 @@ public static class PlanToCircuit
             IReadOnlyDictionary<string, Schema> tableSchemas,
             IRowCodec<StructuralRow> codec,
             ISqlSnapshotCodecs? snapshotCodecs,
-            CompileOptions options)
+            CompileOptions options,
+            MonotonicityInfo monotonicity,
+            IReadOnlyDictionary<LatenessSource, MutableFrontier> frontiers)
         {
             Scans = scans;
             TableSchemas = tableSchemas;
             Codec = codec;
             SnapshotCodecs = snapshotCodecs;
             Options = options;
+            Monotonicity = monotonicity;
+            Frontiers = frontiers;
         }
 
         /// <summary>Stream per declared table — the circuit's inputs.</summary>
@@ -159,6 +189,12 @@ public static class PlanToCircuit
 
         /// <summary>Compile-time knobs — currently the flat/spine trace toggle.</summary>
         public CompileOptions Options { get; }
+
+        /// <summary>Per-node, per-column monotonicity verdicts for LATENESS GC.</summary>
+        public MonotonicityInfo Monotonicity { get; }
+
+        /// <summary>One frontier per declared LATENESS source, advanced by its input operator.</summary>
+        public IReadOnlyDictionary<LatenessSource, MutableFrontier> Frontiers { get; }
     }
 
     // ---- Stateful operator emission: flat vs spine trace family ----
@@ -223,22 +259,69 @@ public static class PlanToCircuit
         CompileContext ctx,
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> input,
         IAggregator<StructuralRow, StructuralRow> aggregator,
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec)
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier = null,
+        Func<StructuralRow, long>? monotoneKey = null)
     {
         return ctx.Options.TraceFamily == TraceFamily.Spine
             ? builder.SpineIncrementalAggregate(
                 input, aggregator, snapshotCodec,
                 ctx.Options.Compaction,
                 keyComparer: StructuralRowComparer.Instance,
-                valueComparer: StructuralRowComparer.Instance)
-            : builder.IncrementalAggregate(input, aggregator, snapshotCodec);
+                valueComparer: StructuralRowComparer.Instance,
+                frontier: frontier,
+                monotoneKey: monotoneKey)
+            : builder.IncrementalAggregate(input, aggregator, snapshotCodec, frontier, monotoneKey);
+    }
+
+    /// <summary>
+    /// If an aggregate's group key has a monotone column (per the monotonicity
+    /// analyzer), returns the frontier to GC against and an extractor for the
+    /// monotone value from the group-key row. The frontier is the min across all
+    /// LATENESS sources bounding that column; GC only fires when every source
+    /// has a frontier (a partial set would be unsound).
+    /// </summary>
+    private static (IFrontier? Frontier, Func<StructuralRow, long>? MonotoneKey) ResolveGroupKeyFrontier(
+        AggregatePlan plan, CompileContext ctx)
+    {
+        for (var g = 0; g < plan.GroupKeys.Count; g++)
+        {
+            var sources = ctx.Monotonicity.Sources(plan, g);
+            if (sources is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            var frontiers = new List<IFrontier>(sources.Count);
+            foreach (var source in sources)
+            {
+                if (ctx.Frontiers.TryGetValue(source, out var f))
+                {
+                    frontiers.Add(f);
+                }
+            }
+
+            if (frontiers.Count != sources.Count)
+            {
+                continue;
+            }
+
+            var keyIndex = g;
+            IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
+            return (frontier, keyRow => MonotoneKey.Extract(keyRow[keyIndex]));
+        }
+
+        return (null, null);
     }
 
     // ---- Scan collection ----
 
-    private static Dictionary<string, Schema> CollectScans(LogicalPlan plan)
+    /// <summary>A scanned base table's declared schema and per-column LATENESS bounds.</summary>
+    private sealed record ScanInfo(Schema Schema, IReadOnlyDictionary<int, long>? Lateness);
+
+    private static Dictionary<string, ScanInfo> CollectScans(LogicalPlan plan)
     {
-        var result = new Dictionary<string, Schema>(StringComparer.Ordinal);
+        var result = new Dictionary<string, ScanInfo>(StringComparer.Ordinal);
         var visitedCtes = new HashSet<CteRef>();
         Walk(plan);
         return result;
@@ -250,9 +333,10 @@ public static class PlanToCircuit
                 case ScanPlan s:
                     if (!result.ContainsKey(s.TableName))
                     {
-                        // Register the table's *declared* schema (sans alias qualifier).
-                        // We rebuild rows without the qualifier in TableInput.
-                        result[s.TableName] = s.Schema;
+                        // Register the table's *declared* schema (sans alias qualifier)
+                        // plus any LATENESS bounds. We rebuild rows without the
+                        // qualifier in TableInput.
+                        result[s.TableName] = new ScanInfo(s.Schema, s.ColumnLateness);
                     }
 
                     break;
@@ -966,7 +1050,12 @@ public static class PlanToCircuit
         // the trace itself is round-tripped.
         var aggCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(
             groupKeySchema, plan.Input.Schema);
-        var aggregated = EmitAggregate(builder, ctx, indexed, composite, aggCodec);
+
+        // LATENESS GC: if a group-key column is monotone, drop groups below its
+        // frontier. The group-key row stores keys in GROUP BY order, so the
+        // monotone column sits at its group-key index.
+        var (gcFrontier, gcMonotoneKey) = ResolveGroupKeyFrontier(plan, ctx);
+        var aggregated = EmitAggregate(builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey);
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;

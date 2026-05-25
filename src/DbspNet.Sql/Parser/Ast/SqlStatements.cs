@@ -21,7 +21,8 @@ public sealed record ColumnDefinition(
     string Name,
     SqlTypeSpec Type,
     bool NotNull,
-    bool PrimaryKey);
+    bool PrimaryKey,
+    long? Lateness = null);
 
 /// <summary>
 /// The unresolved, parser-level spelling of a type. The resolver converts

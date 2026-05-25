@@ -11,7 +11,13 @@ namespace DbspNet.Sql.Plan;
 /// that produced the column; it lets <c>t.c</c>-style references disambiguate
 /// joined schemas.
 /// </summary>
-public sealed record SchemaColumn(string Name, SqlType Type, string? Qualifier = null);
+/// <param name="Lateness">
+/// Declared <c>LATENESS</c> bound in the column's native units, for base-table
+/// columns only (null elsewhere). Carries the bound from <c>CREATE TABLE</c>
+/// through the catalog to <c>ScanPlan.ColumnLateness</c>; not part of the
+/// schema fingerprint.
+/// </param>
+public sealed record SchemaColumn(string Name, SqlType Type, string? Qualifier = null, long? Lateness = null);
 
 /// <summary>
 /// An ordered positional tuple of <see cref="SchemaColumn"/>s. Two schemas

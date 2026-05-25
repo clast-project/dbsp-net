@@ -1,5 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Collections.Generic;
+
 namespace DbspNet.Core.Operators.Stateful;
 
 /// <summary>
@@ -46,6 +48,46 @@ public sealed class MutableFrontier : IFrontier
         if (value > Value)
         {
             Value = value;
+        }
+    }
+}
+
+/// <summary>
+/// The minimum of several frontiers — the GC bound for a column fed by multiple
+/// <c>LATENESS</c> sources (e.g. a join or union of differently-late inputs). A
+/// key is collectable only when it is below <em>every</em> contributing
+/// frontier, so the combined bound is the min; if any source has not advanced
+/// (<see cref="long.MinValue"/>), nothing is collected.
+/// </summary>
+public sealed class MinFrontier : IFrontier
+{
+    private readonly IReadOnlyList<IFrontier> _sources;
+
+    public MinFrontier(IReadOnlyList<IFrontier> sources)
+    {
+        ArgumentNullException.ThrowIfNull(sources);
+        _sources = sources;
+    }
+
+    public long Value
+    {
+        get
+        {
+            if (_sources.Count == 0)
+            {
+                return long.MinValue;
+            }
+
+            var min = long.MaxValue;
+            foreach (var f in _sources)
+            {
+                if (f.Value < min)
+                {
+                    min = f.Value;
+                }
+            }
+
+            return min;
         }
     }
 }

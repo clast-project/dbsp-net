@@ -64,13 +64,37 @@ public sealed class Resolver
             }
 
             var type = TypeInference.FromSpec(c.Type, nullable: !c.NotNull);
-            cols.Add(new SchemaColumn(c.Name, type, Qualifier: stmt.TableName));
+            if (c.Lateness is { } bound)
+            {
+                if (!c.NotNull)
+                {
+                    throw new ResolveException($"LATENESS column '{c.Name}' must be NOT NULL");
+                }
+
+                if (bound < 0)
+                {
+                    throw new ResolveException($"LATENESS for column '{c.Name}' must be non-negative");
+                }
+
+                if (!IsLatenessOrderedType(type))
+                {
+                    throw new ResolveException(
+                        $"LATENESS column '{c.Name}' must be an integer or temporal type");
+                }
+            }
+
+            cols.Add(new SchemaColumn(c.Name, type, Qualifier: stmt.TableName, Lateness: c.Lateness));
         }
 
         var schema = new Schema(cols);
         _catalog.Register(stmt.TableName, schema);
         return new CreateTablePlan(stmt.TableName, schema);
     }
+
+    // LATENESS requires a totally-ordered column whose values map to an Int64
+    // frontier key: the integer and temporal types.
+    private static bool IsLatenessOrderedType(SqlType type) =>
+        type is SqlIntegerType or SqlBigintType or SqlTimestampType or SqlDateType or SqlTimeType;
 
     private CreateViewPlan ResolveCreateView(CreateViewStatement stmt)
     {
@@ -673,14 +697,21 @@ public sealed class Resolver
 
         var baseSchema = _catalog.Get(tr.TableName);
         var tblQualifier = tr.Alias ?? tr.TableName;
-        // Rewrite schema columns to carry the (alias-or-table) as qualifier.
+        // Rewrite schema columns to carry the (alias-or-table) as qualifier, and
+        // lift any declared LATENESS bounds into the scan's ColumnLateness map.
         var cols = new List<SchemaColumn>(baseSchema.Count);
-        foreach (var c in baseSchema.Columns)
+        Dictionary<int, long>? lateness = null;
+        for (var i = 0; i < baseSchema.Count; i++)
         {
+            var c = baseSchema.Columns[i];
             cols.Add(new SchemaColumn(c.Name, c.Type, tblQualifier));
+            if (c.Lateness is { } bound)
+            {
+                (lateness ??= new Dictionary<int, long>())[i] = bound;
+            }
         }
 
-        return new ScanPlan(tr.TableName, new Schema(cols));
+        return new ScanPlan(tr.TableName, new Schema(cols), lateness);
     }
 
     private JoinPlan ResolveJoin(JoinClause join, IReadOnlyDictionary<string, CteRef> cteScope)

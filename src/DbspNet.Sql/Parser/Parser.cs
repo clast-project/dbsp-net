@@ -112,6 +112,7 @@ public sealed class Parser
         var type = ParseTypeSpec();
         bool? explicitNullability = null;
         var primaryKey = false;
+        long? lateness = null;
         while (true)
         {
             var t = Peek();
@@ -132,6 +133,14 @@ public sealed class Parser
                 Expect(TokenKind.Key);
                 primaryKey = true;
             }
+            else if (t.Kind == TokenKind.Lateness)
+            {
+                Advance();
+                // Bound is an integer in the column's native units (microseconds
+                // for temporal columns, a raw offset for integer logical-time
+                // columns). Duration-literal sugar (INTERVAL '1' HOUR) is deferred.
+                lateness = ExpectLongLiteral("LATENESS bound");
+            }
             else
             {
                 break;
@@ -139,7 +148,7 @@ public sealed class Parser
         }
 
         var notNull = explicitNullability == false;
-        return new ColumnDefinition(name, type, notNull, primaryKey);
+        return new ColumnDefinition(name, type, notNull, primaryKey, lateness);
     }
 
     private SqlTypeSpec ParseTypeSpec()
@@ -914,6 +923,18 @@ public sealed class Parser
 
         Advance();
         return (int)t.IntegerValue;
+    }
+
+    private long ExpectLongLiteral(string what)
+    {
+        var t = Peek();
+        if (t.Kind != TokenKind.IntegerLiteral)
+        {
+            throw Error(t, $"expected integer {what}, got {Describe(t)}");
+        }
+
+        Advance();
+        return t.IntegerValue;
     }
 
     private static string Describe(Token t) =>

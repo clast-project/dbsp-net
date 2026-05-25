@@ -49,6 +49,7 @@ public sealed class Lexer
         ["coalesce"] = TokenKind.Coalesce,
         ["primary"] = TokenKind.Primary,
         ["key"] = TokenKind.Key,
+        ["lateness"] = TokenKind.Lateness,
         ["int"] = TokenKind.Int,
         ["integer"] = TokenKind.Integer,
         ["bigint"] = TokenKind.BigInt,

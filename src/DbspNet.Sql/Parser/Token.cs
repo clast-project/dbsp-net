@@ -33,7 +33,7 @@ public enum TokenKind
     And, Or, Not, Is, Null, True, False,
 
     // Functional keywords
-    Cast, Coalesce, Primary, Key,
+    Cast, Coalesce, Primary, Key, Lateness,
 
     // Type keywords
     Int, Integer, BigInt, Real, Double, Precision,
