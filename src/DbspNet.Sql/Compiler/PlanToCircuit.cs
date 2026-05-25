@@ -222,7 +222,9 @@ public static class PlanToCircuit
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
         Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> combine,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec)
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
+        IFrontier? frontier = null,
+        Func<StructuralRow, long>? monotoneKey = null)
     {
         return ctx.Options.TraceFamily == TraceFamily.Spine
             ? builder.SpineIncrementalInnerJoin(
@@ -230,8 +232,10 @@ public static class PlanToCircuit
                 ctx.Options.Compaction,
                 keyComparer: StructuralRowComparer.Instance,
                 leftValueComparer: StructuralRowComparer.Instance,
-                rightValueComparer: StructuralRowComparer.Instance)
-            : builder.IncrementalInnerJoin(left, right, combine, leftCodec, rightCodec);
+                rightValueComparer: StructuralRowComparer.Instance,
+                frontier: frontier,
+                monotoneKey: monotoneKey)
+            : builder.IncrementalInnerJoin(left, right, combine, leftCodec, rightCodec, frontier, monotoneKey);
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitLeftJoin(
@@ -307,6 +311,50 @@ public static class PlanToCircuit
             }
 
             var keyIndex = g;
+            IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
+            return (frontier, keyRow => MonotoneKey.Extract(keyRow[keyIndex]));
+        }
+
+        return (null, null);
+    }
+
+    /// <summary>
+    /// If an equi-key is monotone on <em>both</em> input sides — the condition
+    /// for a join to safely GC (no future delta arrives below the frontier on
+    /// either input) — returns the min frontier over its sources and an
+    /// extractor for the monotone value from the join-key row (which stores the
+    /// equi-key columns in EquiKeys order). Stricter than the analyzer's output
+    /// marking, which for outer joins flags only the preserved side.
+    /// </summary>
+    private static (IFrontier? Frontier, Func<StructuralRow, long>? MonotoneKey) ResolveJoinKeyFrontier(
+        JoinPlan plan, CompileContext ctx)
+    {
+        for (var i = 0; i < plan.EquiKeys.Count; i++)
+        {
+            var eq = plan.EquiKeys[i];
+            var leftSources = ctx.Monotonicity.Sources(plan.Left, eq.LeftIndex);
+            var rightSources = ctx.Monotonicity.Sources(plan.Right, eq.RightIndex);
+            if (leftSources is not { Count: > 0 } || rightSources is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            var allSources = leftSources.Concat(rightSources).Distinct().ToList();
+            var frontiers = new List<IFrontier>(allSources.Count);
+            foreach (var source in allSources)
+            {
+                if (ctx.Frontiers.TryGetValue(source, out var f))
+                {
+                    frontiers.Add(f);
+                }
+            }
+
+            if (frontiers.Count != allSources.Count)
+            {
+                continue;
+            }
+
+            var keyIndex = i;
             IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
             return (frontier, keyRow => MonotoneKey.Extract(keyRow[keyIndex]));
         }
@@ -583,12 +631,13 @@ public static class PlanToCircuit
         var rightCount = plan.Right.Schema.Count;
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
+        var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
         var joined = EmitInnerJoin(
             builder, ctx,
             leftIndexed,
             rightIndexed,
             (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
-            leftCodec, rightCodec);
+            leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
 
         if (plan.Residual is { } residual)
         {

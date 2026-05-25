@@ -104,7 +104,9 @@ public static class SpineStatefulOperators
         IComparer<TLeft>? leftValueComparer = null,
         IComparer<TRight>? rightValueComparer = null,
         SpineIndexedSpillConfig<TKey, TLeft, TWeight>? leftSpillConfig = null,
-        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null)
+        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -122,7 +124,7 @@ public static class SpineStatefulOperators
                 left, right, output, combine,
                 leftSnapshotCodec, rightSnapshotCodec,
                 compactionStrategy, keyComparer, leftValueComparer, rightValueComparer,
-                leftSpillConfig, rightSpillConfig));
+                leftSpillConfig, rightSpillConfig, frontier, monotoneKey));
         return output;
     }
 

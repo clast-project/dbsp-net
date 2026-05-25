@@ -116,7 +116,9 @@ public static class StatefulOperators
         Stream<IndexedZSet<TKey, TRight, TWeight>> right,
         Func<TKey, TLeft, TRight, TOut> combine,
         IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
-        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null)
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -131,7 +133,7 @@ public static class StatefulOperators
         var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
         builder.AddRawOperator(
             new IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
-                left, right, output, combine, leftSnapshotCodec, rightSnapshotCodec));
+                left, right, output, combine, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey));
         return output;
     }
 

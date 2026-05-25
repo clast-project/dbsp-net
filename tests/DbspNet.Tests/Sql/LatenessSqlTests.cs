@@ -4,6 +4,7 @@ using System.Linq;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful;
+using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
@@ -31,6 +32,19 @@ public class LatenessSqlTests
 
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(query))).Query;
         return PlanToCircuit.Compile(plan);
+    }
+
+    private static CompiledQuery CompileSpine(string[] ddl, string query)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        foreach (var s in ddl)
+        {
+            resolver.Resolve(Parser.ParseStatement(s));
+        }
+
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(query))).Query;
+        return PlanToCircuit.Compile(plan, snapshotCodecs: null, new CompileOptions { TraceFamily = TraceFamily.Spine });
     }
 
     // Structural compile is forced by LATENESS, so the aggregate is the
@@ -119,6 +133,83 @@ public class LatenessSqlTests
         q.Step();
         Assert.True(q.Current.IsEmpty);
         Assert.Equal(11, RetainedGroups(q));
+    }
+
+    private static int JoinRetainedKeys(CompiledQuery q) =>
+        q.Circuit.Operators
+            .OfType<IncrementalJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>()
+            .Single()
+            .RetainedKeyCount;
+
+    [Fact]
+    public void InnerJoinOnMonotoneKey_BoundsBothTraces()
+    {
+        // Both join inputs declare LATENESS on the equi-key, so the join may GC
+        // both traces (no future delta arrives below the frontier on either side).
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        // Both traces keep only the trailing window [190, 200] = 11 keys each.
+        Assert.Equal(22, JoinRetainedKeys(q));
+        Assert.Equal(1, q.WeightOf(200, 200).Value);
+    }
+
+    [Fact]
+    public void InnerJoinOnMonotoneKey_BoundsBothTraces_Spine()
+    {
+        var q = CompileSpine(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        var op = q.Circuit.Operators
+            .OfType<SpineIncrementalJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>()
+            .Single();
+        Assert.Equal(22, op.RetainedKeyCount);
+        Assert.Equal(1, q.WeightOf(200, 200).Value);
+    }
+
+    [Fact]
+    public void InnerJoin_OneSideNotMonotone_DoesNotGc()
+    {
+        // Only a.ts declares LATENESS; b.ts does not. A future b row could arrive
+        // at any key, so neither trace can be collected — state grows with input.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 50; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        // No GC: both traces retain all 51 keys (102 total).
+        Assert.Equal(102, JoinRetainedKeys(q));
     }
 
     [Fact]

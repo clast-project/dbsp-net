@@ -1811,10 +1811,14 @@ public static class TypedPlanCompiler
                 && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(
             keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        // Reflection ignores optional-parameter defaults — every parameter must
+        // be supplied. The trailing nulls are the LATENESS GC hooks
+        // (frontier, monotoneKey); the typed path does not GC (LATENESS forces
+        // the structural compile).
         return closed.Invoke(null, new object?[]
         {
             builder, leftIndexed, rightIndexed, combine,
-            leftSnapshotCodec, rightSnapshotCodec,
+            leftSnapshotCodec, rightSnapshotCodec, null, null,
         })!;
     }
 

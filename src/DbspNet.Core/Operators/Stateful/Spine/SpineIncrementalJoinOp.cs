@@ -39,6 +39,9 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
     private readonly SpineIndexedZSetTrace<TKey, TRight, TWeight> _rightTrace;
     private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
     private readonly IIndexedZSetTraceCodec<TKey, TRight, TWeight>? _rightSnapshotCodec;
+    private readonly IFrontier? _frontier;
+    private readonly Func<TKey, long>? _monotoneKey;
+    private long _lastGcFrontier = long.MinValue;
 
     public SpineIncrementalJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
@@ -52,7 +55,9 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
         IComparer<TLeft>? leftValueComparer = null,
         IComparer<TRight>? rightValueComparer = null,
         SpineIndexedSpillConfig<TKey, TLeft, TWeight>? leftSpillConfig = null,
-        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null)
+        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         _leftIn = leftIn;
         _rightIn = rightIn;
@@ -63,7 +68,12 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
         _rightTrace = new SpineIndexedZSetTrace<TKey, TRight, TWeight>(strategy, keyComparer, rightValueComparer, rightSpillConfig);
         _leftSnapshotCodec = leftSnapshotCodec;
         _rightSnapshotCodec = rightSnapshotCodec;
+        _frontier = frontier;
+        _monotoneKey = monotoneKey;
     }
+
+    /// <summary>Total keys retained across both traces. Exposed for GC-bound tests.</summary>
+    internal int RetainedKeyCount => _leftTrace.GroupCount + _rightTrace.GroupCount;
 
     public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -173,5 +183,26 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
         _output.SetCurrent(builder.Build());
 
         _leftTrace.Integrate(dl);
+        CollectGarbage();
+    }
+
+    // Frontier-driven GC: when the join key is monotone on BOTH sides, drop
+    // sub-frontier keys from both traces (filter-rebuild). Emits nothing.
+    private void CollectGarbage()
+    {
+        if (_frontier is null || _monotoneKey is null)
+        {
+            return;
+        }
+
+        var frontier = _frontier.Value;
+        if (frontier == long.MinValue || frontier <= _lastGcFrontier)
+        {
+            return;
+        }
+
+        _lastGcFrontier = frontier;
+        _leftTrace.DropKeysBelow(frontier, _monotoneKey);
+        _rightTrace.DropKeysBelow(frontier, _monotoneKey);
     }
 }
