@@ -246,7 +246,9 @@ public static class PlanToCircuit
         Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
         Func<StructuralRow, StructuralRow, StructuralRow> nullPadCombine,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec)
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
+        IFrontier? frontier = null,
+        Func<StructuralRow, long>? monotoneKey = null)
     {
         return ctx.Options.TraceFamily == TraceFamily.Spine
             ? builder.SpineIncrementalLeftJoin(
@@ -254,8 +256,11 @@ public static class PlanToCircuit
                 ctx.Options.Compaction,
                 keyComparer: StructuralRowComparer.Instance,
                 leftValueComparer: StructuralRowComparer.Instance,
-                rightValueComparer: StructuralRowComparer.Instance)
-            : builder.IncrementalLeftJoin(left, right, joinCombine, nullPadCombine, leftCodec, rightCodec);
+                rightValueComparer: StructuralRowComparer.Instance,
+                frontier: frontier,
+                monotoneKey: monotoneKey)
+            : builder.IncrementalLeftJoin(
+                left, right, joinCombine, nullPadCombine, leftCodec, rightCodec, frontier, monotoneKey);
     }
 
     private static Stream<ZSet<(StructuralRow Key, StructuralRow Value), Z64>> EmitAggregate(
@@ -691,13 +696,17 @@ public static class PlanToCircuit
 
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
+        // GC license requires the equi-key be monotone on BOTH sides (not just
+        // the preserved left side): a future row on the non-monotone right side
+        // could still flip a left key from unmatched to matched below the frontier.
+        var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
         var joined = EmitLeftJoin(
             builder, ctx,
             leftIndexed,
             rightIndexed,
             joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
-            leftCodec, rightCodec);
+            leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
@@ -757,13 +766,17 @@ public static class PlanToCircuit
         // right rows, "right trace" carries left rows.
         var preservedCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
         var probedCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
+        // Both-sides-monotone GC license, as for LEFT JOIN. ResolveJoinKeyFrontier
+        // keys off the EquiKeys position, which the join-key row carries on both
+        // physical sides — so the same extractor is correct despite the swap.
+        var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
         var joined = EmitLeftJoin(
             builder, ctx,
             rightIndexed,
             leftIndexed,
             joinCombine: (_, rrow, lrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             nullPadCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
-            preservedCodec, probedCodec);
+            preservedCodec, probedCodec, gcFrontier, gcMonotoneKey);
 
         var nullKeyPadded = builder.MapRows(
             nullKeyRight,

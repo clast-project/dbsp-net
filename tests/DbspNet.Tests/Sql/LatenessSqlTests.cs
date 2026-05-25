@@ -212,6 +212,143 @@ public class LatenessSqlTests
         Assert.Equal(102, JoinRetainedKeys(q));
     }
 
+    private static int LeftJoinRetainedKeys(CompiledQuery q) =>
+        q.Circuit.Operators
+            .OfType<IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>()
+            .Single()
+            .RetainedKeyCount;
+
+    [Fact]
+    public void LeftJoinOnMonotoneKey_BoundsBothTraces()
+    {
+        // Both sides declare LATENESS on the equi-key. For an OUTER join GC needs
+        // BOTH sides monotone (not just the preserved left side): a future row on
+        // a non-monotone right side could still flip a left key from unmatched to
+        // matched below the frontier. With both bounded, the join GCs both traces.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a LEFT JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        // Trailing window [190, 200] = 11 keys per trace.
+        Assert.Equal(22, LeftJoinRetainedKeys(q));
+        Assert.Equal(1, q.WeightOf(200, 200).Value); // matched row in the final delta
+    }
+
+    [Fact]
+    public void LeftJoinOnMonotoneKey_BoundsBothTraces_Spine()
+    {
+        var q = CompileSpine(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a LEFT JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        var op = q.Circuit.Operators
+            .OfType<SpineIncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>()
+            .Single();
+        Assert.Equal(22, op.RetainedKeyCount);
+        Assert.Equal(1, q.WeightOf(200, 200).Value);
+    }
+
+    [Fact]
+    public void LeftJoin_UnmatchedRowsEmittedNullPadded_StateStillBounded()
+    {
+        // a keys are even, b keys are odd — they never match, so every left row is
+        // emitted NULL-padded. b still receives rows, so its frontier advances and
+        // the both-sides license holds. Each NULL-padded row, once below the
+        // frontier, is final; GC drops its key from the left trace and emits
+        // nothing — the already-emitted NULL-pad survives downstream.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a LEFT JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 25; t++)
+        {
+            q.Table("a").Insert(2 * t, (int)(2 * t));     // even key
+            q.Table("b").Insert(2 * t + 1, (int)(2 * t)); // odd key — never matches a
+            q.Step();
+        }
+
+        // Final tick (t=25): a.ts=50, b.ts=51, frontier = min(50,51) − 10 = 40.
+        // Left trace keeps even keys ≥ 40: {40,42,44,46,48,50} = 6; right trace
+        // keeps odd keys ≥ 40: {41,43,45,47,49,51} = 6. Total 12 (vs 52 ungc'd).
+        Assert.Equal(12, LeftJoinRetainedKeys(q));
+
+        // The final left row (x=50) is unmatched → NULL-padded, with no spurious
+        // matched row. The GC of older keys emits no retraction into this delta.
+        Assert.Equal(1, q.WeightOf(50, null).Value);
+        Assert.Equal(1, q.Current.Count);
+    }
+
+    [Fact]
+    public void RightJoinOnMonotoneKey_BoundsBothTraces()
+    {
+        // RIGHT JOIN compiles to IncrementalLeftJoinOp with the physical sides
+        // swapped; the both-sides-monotone license and join-key frontier apply
+        // identically. The same operator GCs both (swapped) traces.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 10, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a RIGHT JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 200; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        Assert.Equal(22, LeftJoinRetainedKeys(q));
+        Assert.Equal(1, q.WeightOf(200, 200).Value);
+    }
+
+    [Fact]
+    public void LeftJoin_OneSideNotMonotone_DoesNotGc()
+    {
+        // Only the preserved (left) side declares LATENESS. The analyzer would
+        // mark the left key monotone, but the stricter join license needs BOTH
+        // sides — a future b row could flip an old left key from unmatched to
+        // matched — so neither trace is collected and state grows with input.
+        var q = Compile(
+            [
+                "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)",
+                "CREATE TABLE b (ts BIGINT NOT NULL, y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a LEFT JOIN b ON a.ts = b.ts");
+
+        for (long t = 0; t <= 50; t++)
+        {
+            q.Table("a").Insert(t, (int)t);
+            q.Table("b").Insert(t, (int)t);
+            q.Step();
+        }
+
+        Assert.Equal(102, LeftJoinRetainedKeys(q)); // 51 keys per trace, no GC
+    }
+
     [Fact]
     public void Lateness_OnNullableColumn_Rejected()
     {

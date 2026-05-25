@@ -152,7 +152,9 @@ public static class StatefulOperators
         Func<TKey, TLeft, TRight, TOut> joinCombine,
         Func<TKey, TLeft, TOut> nullPadCombine,
         IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
-        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null)
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
         where TKey : notnull
         where TLeft : notnull
         where TRight : notnull
@@ -169,7 +171,7 @@ public static class StatefulOperators
         builder.AddRawOperator(
             new IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
                 left, right, output, joinCombine, nullPadCombine,
-                leftSnapshotCodec, rightSnapshotCodec));
+                leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey));
         return output;
     }
 
