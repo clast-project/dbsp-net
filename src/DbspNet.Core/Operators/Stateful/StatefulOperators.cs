@@ -13,6 +13,32 @@ namespace DbspNet.Core.Operators.Stateful;
 /// </summary>
 public static class StatefulOperators
 {
+    /// <summary>
+    /// Input-side lateness enforcement: drops rows whose <paramref name="monotone"/>
+    /// value is strictly below the current frontier, and advances
+    /// <paramref name="frontier"/> to <c>maxSeen − lateness</c>. Returns the
+    /// filtered stream. Wire the same <paramref name="frontier"/> into
+    /// downstream stateful operators (e.g. <see cref="IncrementalAggregate"/>)
+    /// so they GC unreachable state.
+    /// </summary>
+    public static Stream<ZSet<TRow, Z64>> EnforceLateness<TRow>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TRow, Z64>> input,
+        Func<TRow, long> monotone,
+        long lateness,
+        MutableFrontier frontier)
+        where TRow : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(monotone);
+        ArgumentNullException.ThrowIfNull(frontier);
+
+        var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
+        builder.AddRawOperator(new LatenessOperator<TRow>(input, output, monotone, lateness, frontier));
+        return output;
+    }
+
     public static Stream<ZSet<TKey, TWeight>> Distinct<TKey, TWeight>(
         this CircuitBuilder builder,
         Stream<ZSet<TKey, TWeight>> input,
