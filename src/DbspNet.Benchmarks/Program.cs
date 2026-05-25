@@ -39,6 +39,7 @@ output.AppendLine();
 RunFilterBenchmark(output);
 RunMultiAggregateBenchmark(output);
 RunJoinedGroupByBenchmark(output);
+RunJoinedGroupBySpineBenchmark(output);
 RunJoinedGroupByNullableBenchmark(output);
 RunJoinedGroupByEmittedCodecBenchmark(output);
 RunJoinedGroupByTypedBenchmark(output);
@@ -80,6 +81,22 @@ static CompiledQuery CompileWithEmittedCodec(string[] ddl, string sql)
 
     var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
     return PlanToCircuit.Compile(PlanOptimizer.Optimize(plan), EmittedEqualityCodec.Instance);
+}
+
+static CompiledQuery CompileSpine(string[] ddl, string sql)
+{
+    var catalog = new Catalog();
+    var resolver = new Resolver(catalog);
+    foreach (var s in ddl)
+    {
+        resolver.Resolve(Parser.ParseStatement(s));
+    }
+
+    var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
+    return PlanToCircuit.Compile(
+        PlanOptimizer.Optimize(plan),
+        snapshotCodecs: null,
+        new CompileOptions { TraceFamily = TraceFamily.Spine });
 }
 
 static void PrintHeader(string name)
@@ -301,6 +318,107 @@ static void RunJoinedGroupByBenchmark(StringBuilder output)
         "fixed customers trace + folding the one new order's amount into the " +
         "per-region running sum.",
         rows);
+}
+
+// ---------- Benchmark 3c: Joined GROUP BY, flat vs spine trace family ----------
+
+static void RunJoinedGroupBySpineBenchmark(StringBuilder output)
+{
+    PrintHeader("Joined GROUP BY (flat vs spine)");
+    const string sql =
+        "SELECT c.region, SUM(o.amount) AS total " +
+        "FROM orders o JOIN customers c ON o.cust_id = c.id " +
+        "GROUP BY c.region";
+    var ddl = new[]
+    {
+        "CREATE TABLE customers (id INT NOT NULL, region VARCHAR NOT NULL)",
+        "CREATE TABLE orders (cust_id INT NOT NULL, amount INT NOT NULL)",
+    };
+
+    output.AppendLine("## Joined GROUP BY — flat vs spine trace family");
+    output.AppendLine();
+    output.AppendLine(
+        "The same query and data as the Joined GROUP BY benchmark above, " +
+        "compiled once onto the flat dictionary traces and once onto the spine " +
+        "(LSM) traces via `CompileOptions { TraceFamily = TraceFamily.Spine }`. " +
+        "Both run through the structural compile (spine mode skips the typed " +
+        "fast path), so the delta is the trace family alone: the spine pays a " +
+        "per-batch bloom + binary search on each probe where the flat trace does " +
+        "one dictionary lookup, in exchange for immutable batches that snapshot " +
+        "per-file and spill to disk. Operators: `IncrementalJoinOp` + " +
+        "`IncrementalAggregateOp` (flat) vs `SpineIncrementalJoinOp` + " +
+        "`SpineIncrementalAggregateOp`.");
+    output.AppendLine();
+    output.AppendLine("| N          | Flat batch    | Flat incr      | Spine batch   | Spine incr     | Spine incr vs flat |");
+    output.AppendLine("|-----------:|--------------:|---------------:|--------------:|---------------:|-------------------:|");
+
+    foreach (var n in new[] { 100, 1_000, 10_000, 100_000 })
+    {
+        var rng = new Random(13);
+        var custCount = Math.Min(100, n / 4 + 1);
+        var regionCount = Math.Min(10, custCount);
+        var customers = new List<(int Id, string Region)>(custCount);
+        for (var i = 0; i < custCount; i++)
+        {
+            customers.Add((i, "r" + (i % regionCount)));
+        }
+
+        var orders = new List<(int CustId, int Amount)>(n);
+        for (var i = 0; i < n; i++)
+        {
+            orders.Add((rng.Next(custCount), rng.Next(1, 1_000)));
+        }
+
+        var customersDelta = customers.Select(c => (Values: new object?[] { c.Id, c.Region }, Weight: 1L)).ToList();
+        var ordersDelta = orders.Select(o => (Values: new object?[] { o.CustId, o.Amount }, Weight: 1L)).ToList();
+
+        var (flatBatch, flatIncr) = MeasureGroupByFamily(() => Compile(ddl, sql), customersDelta, ordersDelta, custCount);
+        var (spineBatch, spineIncr) = MeasureGroupByFamily(() => CompileSpine(ddl, sql), customersDelta, ordersDelta, custCount);
+
+        var ratio = flatIncr > 0 ? spineIncr / flatIncr : 0.0;
+        Console.WriteLine(
+            $"  N={n,-7} flat batch={BenchmarkHarness.FormatMs(flatBatch)} incr={BenchmarkHarness.FormatMicros(flatIncr)}" +
+            $"  spine batch={BenchmarkHarness.FormatMs(spineBatch)} incr={BenchmarkHarness.FormatMicros(spineIncr)}");
+        output.AppendLine(
+            $"| {n,10} | {BenchmarkHarness.FormatMs(flatBatch).Trim()} | {BenchmarkHarness.FormatMicros(flatIncr).Trim()} | " +
+            $"{BenchmarkHarness.FormatMs(spineBatch).Trim()} | {BenchmarkHarness.FormatMicros(spineIncr).Trim()} | " +
+            $"{BenchmarkHarness.FormatRatio(ratio).Trim()} |");
+    }
+
+    output.AppendLine();
+}
+
+static (double BatchMs, double IncrUs) MeasureGroupByFamily(
+    Func<CompiledQuery> compile,
+    List<(object?[] Values, long Weight)> customersDelta,
+    List<(object?[] Values, long Weight)> ordersDelta,
+    int custCount)
+{
+    var batchMs = BenchmarkHarness.MedianColdMs(
+        setup: compile,
+        run: q =>
+        {
+            q.Table("customers").Push(customersDelta);
+            q.Table("orders").Push(ordersDelta);
+            q.Step();
+        });
+
+    var incrUs = BenchmarkHarness.MedianPerStepMicros(
+        setup: () =>
+        {
+            var q = compile();
+            q.Table("customers").Push(customersDelta);
+            q.Table("orders").Push(ordersDelta);
+            q.Step();
+            return (Query: q, Rng: new Random(99), CustCount: custCount);
+        },
+        oneStep: state =>
+        {
+            state.Query.Table("orders").Insert(state.Rng.Next(state.CustCount), state.Rng.Next(1, 1_000));
+            state.Query.Step();
+        });
+
+    return (batchMs, incrUs);
 }
 
 // ---------- Benchmark 3.5: Joined GROUP BY, nullable amount ----------
