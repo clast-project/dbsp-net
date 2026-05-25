@@ -13,7 +13,17 @@ namespace DbspNet.Sql.Plan;
 /// </summary>
 public abstract record LogicalPlan(Schema Schema);
 
-public sealed record ScanPlan(string TableName, Schema Schema) : LogicalPlan(Schema);
+/// <summary>
+/// Scan of a base table. <see cref="ColumnLateness"/> maps a column index to
+/// its declared <c>LATENESS</c> bound in the column's native units (microseconds
+/// for temporal columns, a raw offset for integer logical-time columns); absent
+/// keys carry no lateness. The monotonicity analyzer seeds from these, and the
+/// compiler uses the bound to build the column's frontier.
+/// </summary>
+public sealed record ScanPlan(
+    string TableName,
+    Schema Schema,
+    IReadOnlyDictionary<int, long>? ColumnLateness = null) : LogicalPlan(Schema);
 
 /// <summary>
 /// Reference to a <c>WITH name AS (...)</c> CTE definition. Reference
