@@ -143,6 +143,21 @@ batch re-computation.
   `CONCAT`/`GREATEST`/`LEAST` skip NULLs).
 - Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`. NULL
   skipping per SQL semantics; `COUNT(*)` counts all.
+- `LATENESS` bounded-history GC: a column declared `LATENESS d` in
+  `CREATE TABLE` (e.g. `ts TIMESTAMP NOT NULL LATENESS 10000000`) promises no
+  future row's value falls more than `d` below the running maximum. The engine
+  drops late rows at the input and advertises a monotone frontier
+  (`max_seen − d`); a monotonicity analysis (`MonotonicityAnalyzer`) propagates
+  it through filters, projections, joins, aggregates, and set ops, and every
+  keyed stateful operator — `IncrementalAggregateOp`, inner / `LEFT` / `RIGHT`
+  join, `DistinctOp`, and their spine siblings — garbage-collects trace state
+  below the frontier. GC reduces *state*, never *output*: the last value of a
+  collected group stays downstream. The frontier source (`max_seen`) is
+  persisted, so a restored circuit resumes its late-drop consistently with the
+  GC'd traces. This is what keeps long-running, append-mostly pipelines
+  bounded-memory. The bound is written in native units (µs for `TIMESTAMP`,
+  days for `DATE`, the integer itself for `BIGINT`); duration-literal sugar
+  (`'1' HOUR`) and a first-class `INTERVAL` type are deferred.
 - Plan optimizer (`DbspNet.Sql.Optimizer.PlanOptimizer`, explicit pass):
   predicate pushdown (through Project / Join / UnionAll / Distinct /
   Difference, respecting outer-join restrictions), projection
@@ -183,12 +198,15 @@ batch re-computation.
   sorted batches. Snapshot round-trips and the random-query
   equivalence PBT both run green on the spine path; the typed-row fast
   path still emits the flat family (see [What's next](#whats-next)).
-- Correctness: 770+ unit tests plus property-based tests (≥3000 CsCheck
+- Correctness: 840+ unit tests plus property-based tests (≥3000 CsCheck
   iterations) across 40 query templates, run both with and without the
-  optimizer — semantic equivalence is continuously verified. Persistence
-  has end-to-end snapshot round-trip coverage for every stateful
-  operator (in isolation and in compositions), plus crash-point
-  coverage for the atomic-write protocol.
+  optimizer and on both trace families — semantic equivalence is
+  continuously verified. A dedicated `LATENESS` property test checks that
+  the incremental run with trace GC equals a batch evaluation over the
+  non-late input. Persistence has end-to-end snapshot round-trip coverage
+  for every stateful operator (in isolation and in compositions, including
+  the `LATENESS` frontier), plus crash-point coverage for the atomic-write
+  protocol.
 
 ## What's deferred
 
@@ -230,13 +248,10 @@ The biggest tracked-but-not-yet-shipped pieces:
   the typed compiler to spine-backed operators (generated per-schema
   comparers for the emitted structs) is the remaining integration
   step. `RecursiveCteOp` likewise has no spine sibling and stays flat.
-- **Trace compaction / waterline.** The spine has the right shape for
-  consolidation-on-frontier-advance, but no frontier is advertised
-  today, so traces still retain every update.
-- **`LATENESS` (or equivalent retain-keys story).** Without bounded-
-  history trace GC driven by a monotonicity analysis, long-running
-  pipelines grow without bound — this caps DbspNet to bounded
-  workloads.
+- **Trace compaction / waterline.** The `LATENESS` frontier now drives
+  whole-key trace GC (dropping state below the frontier), but the spine
+  doesn't yet *consolidate* same-`(key, value)` update histories into one
+  row at compaction time as the frontier advances — that is still future.
 - **DRED-style retraction propagation for recursive CTEs**, so the
   full recomputation fallback on retraction-containing ticks goes
   away.

@@ -219,17 +219,25 @@ reflect that shape, not a backlog.
 - **[P3]** CHAR(n) with space-padding semantics.
 
 ### Streaming extensions
-- **[P1]** `LATENESS` bounds — or any equivalent retain-keys story. The
-  `LATENESS` syntax is Feldera-specific, but the underlying capability
-  (bounded-history trace GC driven by a monotonicity analysis) is the
-  standard answer in every long-running IVM engine surveyed: Feldera's
-  `MonotoneAnalyzer` + `IntegrateTraceRetainKeysOperator`, Materialize's
-  temporal filters, Flink's watermark-driven state expiry. Without some
-  form of retain-keys analysis, `_leftTrace` / `_rightTrace` /
-  `RecursiveCteOp._r` grow without bound — that caps DbspNet to
-  bounded workloads. A minimal user-declared `LATENESS` annotation +
-  insert-limiter is small and unlocks long-running pipelines; the
-  full Calcite-style monotonicity analyser is heavier.
+- `LATENESS` bounds — **implemented** (bounded-history trace GC driven by a
+  monotonicity analysis, the standard answer across long-running IVM engines:
+  Feldera's `MonotoneAnalyzer` + `IntegrateTraceRetainKeysOperator`,
+  Materialize's temporal filters, Flink's watermark-driven state expiry). A
+  column declared `LATENESS d` in `CREATE TABLE` is lifted to
+  `ScanPlan.ColumnLateness`; `MonotonicityAnalyzer`
+  (`DbspNet.Sql/Plan/MonotonicityAnalyzer.cs`) propagates monotonicity through
+  filters / projections / equi-joins / group keys / set ops; a per-column
+  `LatenessOperator` drops late rows at the input and advertises a
+  `max_seen − d` frontier; and the keyed stateful operators
+  (`IncrementalAggregateOp`, inner / `LEFT` / `RIGHT` join, `DistinctOp`, and
+  their spine siblings) garbage-collect sub-frontier trace state. GC reduces
+  state, never output. The frontier source is persisted across snapshot. See
+  ARCHITECTURE.md *LATENESS / bounded-history trace GC* and `README.md`.
+  Deferred follow-ons: duration-literal sugar (`'1' HOUR`) and a first-class
+  `INTERVAL` type (the bound is written today as a plain integer in native
+  units); GC on the typed-row fast path (`LATENESS` forces the structural
+  compile); and a `RecursiveCteOp` retain-keys story (its `_r` still grows
+  unbounded — only joins / aggregates / distinct are bounded so far).
 - **[P3]** `WATERMARK` (experimental in Feldera).
 - **[P2]** `append_only` table annotation. Feldera-specific.
 - **[P2]** `emit_final` view annotation. Feldera-specific.
@@ -330,9 +338,12 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
     explicit caller toggle.
 - **[P2]** Trace compaction / waterline (since-frontier
   advancement that lets multiple updates at the same (key, value)
-  collapse into one row). The spine has the right shape for this —
-  consolidation runs naturally inside compaction — but no frontier is
-  advertised today, so traces still retain every update.
+  collapse into one row). A data-derived frontier *is* now advertised via
+  `LATENESS` (see *Streaming extensions*), and drives whole-key trace GC —
+  but it drops keys strictly below the frontier rather than *consolidating*
+  same-(key, value) update histories at compaction time. The spine has the
+  right shape for that consolidation; wiring it to the frontier is the
+  remaining work.
 - **[P2]** Multi-threaded circuit execution. v1 is single-threaded per
   `step()` call.
 - **[P3]** Dynamic / polymorphic operators (Feldera's `dynamic` module).

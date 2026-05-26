@@ -214,11 +214,16 @@ layer end-to-end.
 
 ### What ships in (B)
 
-Five stateful operators implement `ISnapshotable`: `DistinctOp`,
+Six stateful operators implement `ISnapshotable`: `DistinctOp`,
 `IncrementalAggregateOp`, `IncrementalJoinOp`,
-`IncrementalLeftJoinOp`, `RecursiveCteOp`. Each owns Z-set / indexed-
-Z-set traces (and, for the aggregate, per-group caches that bootstrap
-from the trace on `Load`). Codecs are wired via
+`IncrementalLeftJoinOp`, `RecursiveCteOp`, and `LatenessOperator`. The
+first five own Z-set / indexed-Z-set traces (and, for the aggregate,
+per-group caches that bootstrap from the trace on `Load`); the
+`LatenessOperator` is the odd one out — it serialises only its scalar
+`max_seen` watermark (9 bytes in `frontier.bin`, a schemaless `""`
+fingerprint), and on `Load` re-advances the shared `MutableFrontier` to
+`max_seen − d` so the input-side late-drop resumes consistently with the
+sub-frontier trace state the other operators GC'd away. Codecs are wired via
 `PlanToCircuit.Compile(plan, ArrowSqlSnapshotCodecs.Instance)`; on-disk
 format is Arrow IPC under per-operator `op-{i}/` subdirectories with a
 top-level `manifest.json` recording schema version, plan fingerprint

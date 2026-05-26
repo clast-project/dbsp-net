@@ -137,7 +137,10 @@ logical plan and builds a `RootCircuit`. Two parallel paths:
   `EmittedEqualityCodec`).
 
 Both paths share the same operator catalog below and the same
-snapshot/codec interfaces.
+snapshot/codec interfaces. When any scanned table declares `LATENESS`, the
+typed path is skipped and the structural compile runs — the frontier-driven
+trace GC is wired only there (see [*LATENESS*](#lateness--bounded-history-trace-gc)
+below).
 
 ## Runtime mechanics
 
@@ -207,6 +210,7 @@ the persistence layer.
 | `IncrementalJoinOp` | `IncrementalJoinOp.cs` | two indexed `Trace`s (one per side) | Bilinear inner-join factoring: `delta = dl ⋈ R + L ⋈ dr + dl ⋈ dr` against the *prior* integrated states, then both traces integrate the new deltas. |
 | `IncrementalLeftJoinOp` | `IncrementalLeftJoinOp.cs` | two indexed `Trace`s | LEFT OUTER per-key case analysis on match-presence transitions (stayed-matched / stayed-unmatched / gained-match / lost-match). NULL-padded rows ride the same Z-set. `RIGHT JOIN` is a swap-wrapper at the SQL layer. |
 | `RecursiveCteOp` | `DbspNet.Sql/Compiler/RecursiveCteOp.cs` | materialised CTE result `R`, last per-tick base inputs, last full closure | Semi-naïve incremental recursion: preserves `R` across outer ticks; for an insert-only tick, propagates only newly-derivable rows through the recursive body to fixed-point. On any retraction-containing tick, falls back to full batch recomputation. |
+| `LatenessOperator` | `LatenessOperator.cs` | scalar `max_seen` + a shared `MutableFrontier` | Input-side `LATENESS` enforcement: drops rows whose monotone value is below the start-of-tick frontier (late rows), and advances the frontier to `max_seen − d` — the watermark downstream operators GC against. See *LATENESS* below. |
 
 ### Spine variants
 
@@ -225,6 +229,43 @@ sites through the spine builders and supplies a `StructuralRowComparer`
 (`Core/Collections/`) for the sorted batches. The typed-row fast path
 still emits the flat family, so a spine-mode query compiles
 structurally. See [`docs/persistence.md`](docs/persistence.md).
+
+### LATENESS / bounded-history trace GC
+
+A column declared `LATENESS d` in `CREATE TABLE` bounds the state of every
+operator keyed (transitively) on that column, so long-running pipelines stay
+bounded-memory. The mechanism spans the plan and the runtime:
+
+- **Plan.** `ScanPlan.ColumnLateness` carries the per-column bound (native
+  units) from the catalog. `MonotonicityAnalyzer` (`DbspNet.Sql/Plan/`) walks
+  the plan and records, per node/column, which `LatenessSource`s prove it
+  monotone — propagating through filters, bare-column projections, equi-joins,
+  group-key inheritance, and set ops (monotone iff monotone in *every* branch).
+  Soundness over completeness: anything unproven is non-monotone, so GC just
+  doesn't engage.
+- **Input side.** `PlanToCircuit` interposes a `LatenessOperator` per
+  declared-lateness column. It drops rows below the frontier as of the *start*
+  of the tick (late rows — a contract violation that would touch
+  already-collected state), tracks `max_seen`, and advances a shared
+  `MutableFrontier` to `max_seen − d`.
+- **State side.** Each keyed stateful operator takes opt-in
+  `(IFrontier, monotoneKey)` constructor parameters; after integrating a tick
+  it drops trace keys strictly below the frontier. **GC reduces *state*, never
+  *output*** — the last-emitted value of a collected group stays downstream,
+  and the input-side drop guarantees no future delta can resurrect it.
+  `IncrementalAggregateOp` GCs on a monotone group key; `DistinctOp` on a
+  monotone column of the row; the joins on the equi-key, but only when it is
+  monotone on *both* sides (a future row on a non-monotone side could still
+  flip a match below the frontier). Multiple sources combine via `MinFrontier`.
+- **Persistence.** `LatenessOperator` snapshots `max_seen`; on restore it
+  re-advances the frontier so the late-drop stays consistent with the GC'd
+  traces restored alongside it.
+
+The frontier carrier is a generic `Int64` (`Timestamp` µs, `Date32` days, or
+`BIGINT` directly, via `MonotoneKey.Extract`). `LATENESS` forces the structural
+compile — GC is wired only there. Equivalence is held by a property test: the
+incremental run with GC equals a batch evaluation over the non-late input,
+across both trace families.
 
 ### Aggregators
 
