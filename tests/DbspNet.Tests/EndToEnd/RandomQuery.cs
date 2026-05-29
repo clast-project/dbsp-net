@@ -249,7 +249,18 @@ internal static class RandomQuery
 
         // 51. DECODE in projection (over the nullable table — exercises the
         // NULL-safe equality desugar against NULL keys).
-        Gen.Const("SELECT k, DECODE(k, 0, 100, 1, 200, -1) AS d FROM n"));
+        Gen.Const("SELECT k, DECODE(k, 0, 100, 1, 200, -1) AS d FROM n"),
+
+        // ---- BETWEEN (parse-time comparison-conjunction desugar) ----
+
+        // 52. BETWEEN as a WHERE range filter.
+        Gen.Select(GenTable, GenLiteral, GenLiteral)
+            .Select(p => $"SELECT k, v FROM {p.Item1} WHERE v BETWEEN {p.Item2} AND {p.Item3}"),
+
+        // 53. NOT BETWEEN as a boolean projection over the nullable table
+        // (3VL: a NULL probe yields NULL).
+        Gen.Select(GenLiteral, GenLiteral)
+            .Select(p => $"SELECT k, v NOT BETWEEN {p.Item1} AND {p.Item2} AS r FROM n"));
 
     // ---- Data generator ----
 

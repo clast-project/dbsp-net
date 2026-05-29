@@ -657,6 +657,26 @@ public sealed class Parser
                 continue;
             }
 
+            // [NOT] BETWEEN lo AND hi — same precedence level as IN /
+            // comparison. The `AND` between the bounds is consumed by
+            // ParseBetweenRhs, so it never reaches the boolean-AND level.
+            if (t.Kind == TokenKind.Between)
+            {
+                Advance();
+                left = ParseBetweenRhs(left, isNegated: false);
+                continue;
+            }
+
+            if (t.Kind == TokenKind.Not
+                && _pos + 1 < _tokens.Count
+                && _tokens[_pos + 1].Kind == TokenKind.Between)
+            {
+                Advance(); // NOT
+                Advance(); // BETWEEN
+                left = ParseBetweenRhs(left, isNegated: true);
+                continue;
+            }
+
             BinaryOperator op;
             switch (t.Kind)
             {
@@ -673,6 +693,41 @@ public sealed class Parser
             var right = ParseIsNull();
             left = new BinaryExpression(op, left, right);
         }
+    }
+
+    /// <summary>
+    /// <c>probe [NOT] BETWEEN lo AND hi</c> — desugared to a comparison
+    /// conjunction. <c>BETWEEN</c> ≡ <c>probe &gt;= lo AND probe &lt;= hi</c>;
+    /// <c>NOT BETWEEN</c> ≡ <c>probe &lt; lo OR probe &gt; hi</c> (the De Morgan
+    /// dual, which agrees under SQL three-valued logic). The bounds are parsed
+    /// at <see cref="ParseIsNull"/> level so the separating <c>AND</c> binds to
+    /// BETWEEN rather than the boolean-AND above this precedence level.
+    /// </summary>
+    private Expression ParseBetweenRhs(Expression probe, bool isNegated)
+    {
+        // The probe is fanned out across both bounds, so a subquery there
+        // would be reference-duplicated — reject it, as simple CASE / DECODE do.
+        if (probe is SubqueryExpression)
+        {
+            throw Error(Peek(), "a scalar subquery is not supported as a BETWEEN operand");
+        }
+
+        var lo = ParseIsNull();
+        Expect(TokenKind.And);
+        var hi = ParseIsNull();
+
+        if (!isNegated)
+        {
+            return new BinaryExpression(
+                BinaryOperator.And,
+                new BinaryExpression(BinaryOperator.GreaterEqual, probe, lo),
+                new BinaryExpression(BinaryOperator.LessEqual, probe, hi));
+        }
+
+        return new BinaryExpression(
+            BinaryOperator.Or,
+            new BinaryExpression(BinaryOperator.Less, probe, lo),
+            new BinaryExpression(BinaryOperator.Greater, probe, hi));
     }
 
     private Expression ParseInRhs(Expression probe, bool isNegated, SourcePosition inPos)

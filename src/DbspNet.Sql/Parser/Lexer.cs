@@ -46,6 +46,7 @@ public sealed class Lexer
         ["true"] = TokenKind.True,
         ["false"] = TokenKind.False,
         ["in"] = TokenKind.In,
+        ["between"] = TokenKind.Between,
         ["exists"] = TokenKind.Exists,
         ["cast"] = TokenKind.Cast,
         ["coalesce"] = TokenKind.Coalesce,

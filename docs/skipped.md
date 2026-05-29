@@ -178,8 +178,11 @@ reflect that shape, not a backlog.
   **implemented** too — desugared to a `CaseExpression` in the parser
   (`DECODE` uses NULL-safe equality per arm, since Oracle DECODE matches
   `NULL = NULL` unlike `=`), so they need no resolver/compiler support.
-- **[P1]** `BETWEEN x AND y` / `NOT BETWEEN`. Desugars at parse time
-  to `x >= a AND x <= b`; no runtime work needed.
+- `BETWEEN x AND y` / `NOT BETWEEN` — **implemented**. Parse-time desugar
+  to `x >= a AND x <= b` (and `x < a OR x > b` for `NOT BETWEEN`, the De
+  Morgan dual that agrees under 3VL); no new AST node or runtime work. A
+  subquery as the test operand is rejected (it would be reference-
+  duplicated across the two bounds).
 - **[P1]** `LIKE`, `ILIKE`, `SIMILAR TO`. No keyword. Runtime story
   ties into the Utf8String roadmap noted under Type system.
 - `IN (literal_list)` / `NOT IN (literal_list)` — **implemented**.

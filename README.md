@@ -140,7 +140,8 @@ batch re-computation.
   searched and the simple `CASE x WHEN v ...` form). CASE branches evaluate
   lazily and an arm is taken only on a definite TRUE (NULL/FALSE fall through).
   The conditional functions `IIF(c, a, b)` and `DECODE(...)` desugar to CASE
-  (DECODE matches `NULL = NULL`, per Oracle).
+  (DECODE matches `NULL = NULL`, per Oracle). `[NOT] BETWEEN` desugars to a
+  comparison conjunction.
 - Scalar functions: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `UPPER`,
   `LOWER`, `LENGTH`, `CONCAT`, `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`,
   `POWER`, `SQRT`. NULL semantics follow PostgreSQL (most propagate;
