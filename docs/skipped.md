@@ -159,9 +159,18 @@ reflect that shape, not a backlog.
   aggregates is listed separately under Aggregate functions; the
   list form (`SELECT DISTINCT a, b FROM t`) reduces to a `DistinctOp`
   over the projection.
-- **[P1]** `CASE WHEN ... THEN ... [ELSE ...] END` and the function-
-  form variants (`IIF`, `DECODE`). No keyword, no AST node, no
-  expression-compiler support. Fundamental conditional.
+- `CASE WHEN ... THEN ... [ELSE ...] END` (searched form) and
+  `CASE x WHEN v THEN ... END` (simple form) — **implemented**. Modeled
+  as a flat `CaseExpression(whens, elseResult)` AST node so the recursive
+  walkers stay shallow regardless of arm count; the simple form desugars
+  to the searched shape at parse time (each arm becomes `x = v`). Branch
+  evaluation is lazy (non-taken THEN/ELSE never evaluated) and an arm is
+  taken iff its condition is a definite TRUE — NULL/FALSE fall through
+  (SQL three-valued semantics). Result type unifies all branches +ELSE
+  via `CommonComparableType`; nullable when ELSE is absent. Supported on
+  both the typed fast path and the structural compiler. **[P2]** the
+  function-form variants (`IIF`, `DECODE`) are still deferred — both
+  reduce to a `CaseExpression` desugar.
 - **[P1]** `BETWEEN x AND y` / `NOT BETWEEN`. Desugars at parse time
   to `x >= a AND x <= b`; no runtime work needed.
 - **[P1]** `LIKE`, `ILIKE`, `SIMILAR TO`. No keyword. Runtime story

@@ -104,6 +104,19 @@ internal static class ExpressionRewriter
                     }
 
                     break;
+                case ResolvedCaseWhen ce:
+                    foreach (var w in ce.Whens)
+                    {
+                        Walk(w.Condition, acc);
+                        Walk(w.Result, acc);
+                    }
+
+                    if (ce.ElseResult is not null)
+                    {
+                        Walk(ce.ElseResult, acc);
+                    }
+
+                    break;
                 case ResolvedCorrelationRef:
                     // Correlation refs aren't local-column refs — they index
                     // into the OUTER schema. The decorrelator walks them
@@ -161,6 +174,19 @@ internal static class ExpressionRewriter
                     }
 
                     break;
+                case ResolvedCaseWhen ce:
+                    foreach (var w in ce.Whens)
+                    {
+                        Walk(w.Condition, acc);
+                        Walk(w.Result, acc);
+                    }
+
+                    if (ce.ElseResult is not null)
+                    {
+                        Walk(ce.ElseResult, acc);
+                    }
+
+                    break;
             }
         }
     }
@@ -196,6 +222,10 @@ internal static class ExpressionRewriter
                 ShiftArgs(il.Values, delta),
                 il.IsNegated,
                 il.Type),
+            ResolvedCaseWhen ce => new ResolvedCaseWhen(
+                ShiftClauses(ce.Whens, delta),
+                ce.ElseResult is null ? null : ShiftColumnIndices(ce.ElseResult, delta),
+                ce.Type),
             // Correlation refs index OUTER columns, not local ones — shifting
             // a local-column delta past them is a no-op.
             ResolvedCorrelationRef => expr,
@@ -208,6 +238,19 @@ internal static class ExpressionRewriter
             foreach (var a in args)
             {
                 list.Add(ShiftColumnIndices(a, d));
+            }
+
+            return list;
+        }
+
+        static List<ResolvedCaseClause> ShiftClauses(IReadOnlyList<ResolvedCaseClause> whens, int d)
+        {
+            var list = new List<ResolvedCaseClause>(whens.Count);
+            foreach (var w in whens)
+            {
+                list.Add(new ResolvedCaseClause(
+                    ShiftColumnIndices(w.Condition, d),
+                    ShiftColumnIndices(w.Result, d)));
             }
 
             return list;
@@ -251,6 +294,10 @@ internal static class ExpressionRewriter
                 RemapArgs(il.Values, remap),
                 il.IsNegated,
                 il.Type),
+            ResolvedCaseWhen ce => new ResolvedCaseWhen(
+                RemapClauses(ce.Whens, remap),
+                ce.ElseResult is null ? null : RemapColumnIndices(ce.ElseResult, remap),
+                ce.Type),
             ResolvedCorrelationRef => expr,
             _ => expr,
         };
@@ -261,6 +308,19 @@ internal static class ExpressionRewriter
             foreach (var a in args)
             {
                 list.Add(RemapColumnIndices(a, remap));
+            }
+
+            return list;
+        }
+
+        static List<ResolvedCaseClause> RemapClauses(IReadOnlyList<ResolvedCaseClause> whens, int[] remap)
+        {
+            var list = new List<ResolvedCaseClause>(whens.Count);
+            foreach (var w in whens)
+            {
+                list.Add(new ResolvedCaseClause(
+                    RemapColumnIndices(w.Condition, remap),
+                    RemapColumnIndices(w.Result, remap)));
             }
 
             return list;
@@ -301,6 +361,10 @@ internal static class ExpressionRewriter
                 SubstituteArgs(il.Values, projection),
                 il.IsNegated,
                 il.Type),
+            ResolvedCaseWhen ce => new ResolvedCaseWhen(
+                SubstituteClauses(ce.Whens, projection),
+                ce.ElseResult is null ? null : SubstituteViaProjection(ce.ElseResult, projection),
+                ce.Type),
             ResolvedCorrelationRef => expr,
             _ => expr,
         };
@@ -313,6 +377,21 @@ internal static class ExpressionRewriter
             foreach (var a in args)
             {
                 list.Add(SubstituteViaProjection(a, p));
+            }
+
+            return list;
+        }
+
+        static List<ResolvedCaseClause> SubstituteClauses(
+            IReadOnlyList<ResolvedCaseClause> whens,
+            IReadOnlyList<ProjectionItem> p)
+        {
+            var list = new List<ResolvedCaseClause>(whens.Count);
+            foreach (var w in whens)
+            {
+                list.Add(new ResolvedCaseClause(
+                    SubstituteViaProjection(w.Condition, p),
+                    SubstituteViaProjection(w.Result, p)));
             }
 
             return list;

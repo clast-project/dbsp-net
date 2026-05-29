@@ -187,7 +187,44 @@ internal static class RandomQuery
 
         // 40. Precedence composition: UNION + INTERSECT
         Gen.Const(
-            "SELECT v FROM t UNION SELECT v FROM u INTERSECT SELECT k FROM t"));
+            "SELECT v FROM t UNION SELECT v FROM u INTERSECT SELECT k FROM t"),
+
+        // ---- CASE WHEN templates ----
+
+        // 41. Searched CASE in projection — three-way bucketing, ELSE present
+        // (non-nullable INT result).
+        Gen.Select(GenTable, GenLiteral, GenLiteral)
+            .Select(p =>
+                $"SELECT k, CASE WHEN v > {p.Item2} THEN 1 WHEN v < {p.Item3} THEN -1 ELSE 0 END AS c " +
+                $"FROM {p.Item1}"),
+
+        // 42. Searched CASE with NO ELSE — unmatched rows yield NULL, so the
+        // result column is nullable even though every branch is non-null.
+        Gen.Select(GenTable, GenLiteral)
+            .Select(p => $"SELECT k, CASE WHEN v > {p.Item2} THEN v END AS c FROM {p.Item1}"),
+
+        // 43. Simple CASE (CASE operand WHEN val …) — desugars to `operand = val`
+        // arms at parse time; ELSE references a column.
+        GenTable.Select(t =>
+            $"SELECT CASE k WHEN 0 THEN 100 WHEN 1 THEN 200 ELSE v END AS c FROM {t}"),
+
+        // 44. Boolean-result CASE used as a WHERE predicate — exercises the
+        // CompilePredicate (NULL→FALSE) edge over a CASE.
+        Gen.Select(GenTable, GenLiteral, GenLiteral)
+            .Select(p =>
+                $"SELECT k, v FROM {p.Item1} " +
+                $"WHERE CASE WHEN v > {p.Item2} THEN k < {p.Item3} ELSE k >= {p.Item3} END"),
+
+        // 45. Conditional aggregation: CASE inside SUM — the classic pattern,
+        // exercises aggregate roll-up through a CASE branch.
+        Gen.Select(GenTable, GenLiteral)
+            .Select(p =>
+                $"SELECT k, SUM(CASE WHEN v > {p.Item2} THEN v ELSE 0 END) AS s " +
+                $"FROM {p.Item1} GROUP BY k"),
+
+        // 46. CASE over the nullable table — a NULL condition (v > lit when v is
+        // NULL) must fall through to ELSE (SQL three-valued semantics).
+        GenLiteral.Select(p => $"SELECT k, CASE WHEN v > {p} THEN 1 ELSE 0 END AS c FROM n"));
 
     // ---- Data generator ----
 

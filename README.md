@@ -136,7 +136,9 @@ batch re-computation.
   value correctly retracts and re-emits outer rows.
 - Expressions: literals, column refs, arithmetic (`+ - * / %`), comparison
   (`= <> < <= > >= IS [NOT] NULL`), boolean (`AND OR NOT`) with SQL three-valued
-  logic, `CAST`.
+  logic, `CAST`, and `CASE WHEN ... THEN ... [ELSE ...] END` (both the
+  searched and the simple `CASE x WHEN v ...` form). CASE branches evaluate
+  lazily and an arm is taken only on a definite TRUE (NULL/FALSE fall through).
 - Scalar functions: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `UPPER`,
   `LOWER`, `LENGTH`, `CONCAT`, `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`,
   `POWER`, `SQRT`. NULL semantics follow PostgreSQL (most propagate;
@@ -242,7 +244,8 @@ beyond "Feldera is much bigger":
   per-correlation-group `COUNT(*)` column layered via
   `CorrelatedScalarSubqueryJoinPlan`; the bound AST node rewrites to
   `COALESCE(count, 0) > 0` (or `= 0` when negated). NOT NULL operands
-  only — nullable non-WHERE IN/NOT IN needs `CASE WHEN` (deferred).
+  only — nullable non-WHERE IN/NOT IN would rewrite through `CASE WHEN`
+  (now available) but that wiring isn't done yet.
   **Deferred**: nested correlation (subquery-inside-subquery
   referencing grand-outer columns).
 - `WITH RECURSIVE` evaluates semi-naïvely on pure-insert ticks (preserves
@@ -253,7 +256,7 @@ beyond "Feldera is much bigger":
 - Set ops: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` all supported;
   `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
 - `FULL OUTER JOIN`, window functions, `ORDER BY` / `LIMIT`,
-  `CASE WHEN`, `LIKE` / `SIMILAR TO`, `||` concatenation, and
+  `LIKE` / `SIMILAR TO`, `||` concatenation, and
   `IS [NOT] DISTINCT FROM` are deferred.
 - Scalar function library covers the common arithmetic / string set
   listed above; missing pieces include `SUBSTRING`, `TRIM`, `REPLACE`,
@@ -277,8 +280,6 @@ The biggest tracked-but-not-yet-shipped pieces:
 - **DRED-style retraction propagation for recursive CTEs**, so the
   full recomputation fallback on retraction-containing ticks goes
   away.
-- **`CASE WHEN`** — needed for several deferred shapes (nullable
-  non-WHERE `IN` / `NOT IN`, NULL-safe equality, NULLIF, etc.).
 
 ## License
 

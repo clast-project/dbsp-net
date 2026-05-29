@@ -1152,6 +1152,19 @@ public sealed class Resolver
                 // correlated EXISTS the path skips this walker entirely.
                 acc.Add(existsE.CountSubquery);
                 break;
+            case CaseExpression ce:
+                foreach (var w in ce.Whens)
+                {
+                    CollectSubqueriesInto(w.Condition, acc);
+                    CollectSubqueriesInto(w.Result, acc);
+                }
+
+                if (ce.ElseResult is not null)
+                {
+                    CollectSubqueriesInto(ce.ElseResult, acc);
+                }
+
+                break;
             // Literals, column refs: no subqueries possible.
         }
     }
@@ -1211,6 +1224,19 @@ public sealed class Resolver
                 break;
             case ExistsExpression existsE:
                 acc.Add(existsE.CountSubquery);
+                break;
+            case CaseExpression ce:
+                foreach (var w in ce.Whens)
+                {
+                    CollectSubqueriesIntoExcludingBound(w.Condition, acc, boundExists, boundIn);
+                    CollectSubqueriesIntoExcludingBound(w.Result, acc, boundExists, boundIn);
+                }
+
+                if (ce.ElseResult is not null)
+                {
+                    CollectSubqueriesIntoExcludingBound(ce.ElseResult, acc, boundExists, boundIn);
+                }
+
                 break;
         }
     }
@@ -2021,6 +2047,19 @@ public sealed class Resolver
                 }
 
                 break;
+            case CaseExpression ce:
+                foreach (var w in ce.Whens)
+                {
+                    CollectNonWhereBooleanSubqueries(w.Condition, existsAcc, inAcc);
+                    CollectNonWhereBooleanSubqueries(w.Result, existsAcc, inAcc);
+                }
+
+                if (ce.ElseResult is not null)
+                {
+                    CollectNonWhereBooleanSubqueries(ce.ElseResult, existsAcc, inAcc);
+                }
+
+                break;
         }
     }
 
@@ -2405,6 +2444,19 @@ public sealed class Resolver
                 }
 
                 break;
+            case CaseExpression ce:
+                foreach (var w in ce.Whens)
+                {
+                    CollectAggregatesInto(w.Condition, preSchema, groupKeys, aggregates, aggIndex);
+                    CollectAggregatesInto(w.Result, preSchema, groupKeys, aggregates, aggIndex);
+                }
+
+                if (ce.ElseResult is not null)
+                {
+                    CollectAggregatesInto(ce.ElseResult, preSchema, groupKeys, aggregates, aggIndex);
+                }
+
+                break;
             case ExistsExpression:
                 // EXISTS's inner subquery lives in its own scope; its
                 // aggregates don't roll up to the outer SELECT.
@@ -2440,6 +2492,7 @@ public sealed class Resolver
                 $"aggregate function '{fn.FunctionName}' is not allowed here"),
             SubqueryExpression sq => ResolveSubqueryReference(sq, subqueryMap),
             InListExpression il => ResolveInList(il, schema, subqueryMap, outerSchema, preBound),
+            CaseExpression ce => ResolveCaseWhen(ce, schema, subqueryMap, outerSchema, preBound),
             InSubqueryExpression => throw new ResolveException(
                 "IN (subquery) is only supported as a top-level conjunct of WHERE, " +
                 "or in SELECT/HAVING with NOT NULL probe and subquery column"),
@@ -2509,6 +2562,65 @@ public sealed class Resolver
         }
 
         return new ResolvedInList(probe, values, il.IsNegated, new SqlBooleanType(nullable));
+    }
+
+    private static ResolvedExpression ResolveCaseWhen(
+        CaseExpression ce,
+        Schema schema,
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
+    {
+        if (ce.Whens.Count == 0)
+        {
+            throw new ResolveException("CASE requires at least one WHEN branch");
+        }
+
+        // Resolve every condition (must be BOOLEAN) and every result. Fold a
+        // common result type across all THEN branches and the ELSE — same
+        // unification used for UNION branches and COALESCE.
+        var conditions = new List<ResolvedExpression>(ce.Whens.Count);
+        var results = new List<ResolvedExpression>(ce.Whens.Count);
+        foreach (var clause in ce.Whens)
+        {
+            var cond = ResolveScalarExpression(clause.Condition, schema, subqueryMap, outerSchema, preBound);
+            if (cond.Type is not SqlBooleanType)
+            {
+                throw new ResolveException(
+                    $"CASE WHEN condition must be BOOLEAN, got {cond.Type.Display}");
+            }
+
+            conditions.Add(cond);
+            results.Add(ResolveScalarExpression(clause.Result, schema, subqueryMap, outerSchema, preBound));
+        }
+
+        ResolvedExpression? elseResult = ce.ElseResult is null
+            ? null
+            : ResolveScalarExpression(ce.ElseResult, schema, subqueryMap, outerSchema, preBound);
+
+        var common = results[0].Type;
+        for (var i = 1; i < results.Count; i++)
+        {
+            common = TypeInference.CommonComparableType(common, results[i].Type);
+        }
+
+        if (elseResult is not null)
+        {
+            common = TypeInference.CommonComparableType(common, elseResult.Type);
+        }
+
+        // Result is nullable if any branch is nullable (CommonComparableType
+        // already ORs that in) OR if there's no ELSE (unmatched → NULL).
+        common = common.WithNullable(common.Nullable || elseResult is null);
+
+        var clauses = new List<ResolvedCaseClause>(ce.Whens.Count);
+        for (var i = 0; i < conditions.Count; i++)
+        {
+            clauses.Add(new ResolvedCaseClause(conditions[i], MaybeCast(results[i], common)));
+        }
+
+        var resolvedElse = elseResult is null ? null : MaybeCast(elseResult, common);
+        return new ResolvedCaseWhen(clauses, resolvedElse, common);
     }
 
     private static ResolvedColumn ResolveSubqueryReference(

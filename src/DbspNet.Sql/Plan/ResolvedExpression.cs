@@ -71,3 +71,27 @@ public sealed record ResolvedInList(
     IReadOnlyList<ResolvedExpression> Values,
     bool IsNegated,
     SqlType Type) : ResolvedExpression(Type);
+
+/// <summary>
+/// A single resolved <c>WHEN <see cref="Condition"/> THEN <see cref="Result"/></c>
+/// arm. <see cref="Condition"/> is always BOOLEAN; <see cref="Result"/> has
+/// been cast to the CASE expression's common result type.
+/// </summary>
+public sealed record ResolvedCaseClause(ResolvedExpression Condition, ResolvedExpression Result);
+
+/// <summary>
+/// <c>CASE WHEN … THEN … [ELSE …] END</c> — searched form (the resolver
+/// only ever sees the searched shape; see
+/// <see cref="DbspNet.Sql.Parser.Ast.CaseExpression"/>). Every
+/// <see cref="ResolvedCaseClause.Result"/> and the
+/// <see cref="ElseResult"/> have been promoted to the same
+/// <see cref="ResolvedExpression.Type"/> via
+/// <see cref="TypeInference.CommonComparableType"/>. The type is nullable
+/// when <see cref="ElseResult"/> is absent (an unmatched CASE yields NULL)
+/// or when any branch is nullable. An arm is taken iff its condition is a
+/// definite TRUE; evaluation is lazy and left-to-right.
+/// </summary>
+public sealed record ResolvedCaseWhen(
+    IReadOnlyList<ResolvedCaseClause> Whens,
+    ResolvedExpression? ElseResult,
+    SqlType Type) : ResolvedExpression(Type);

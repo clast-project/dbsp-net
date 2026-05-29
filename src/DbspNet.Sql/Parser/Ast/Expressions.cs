@@ -131,3 +131,34 @@ public sealed record InSubqueryExpression(
 public sealed record ExistsExpression(
     SubqueryExpression Subquery,
     SubqueryExpression CountSubquery) : Expression;
+
+/// <summary>
+/// A single <c>WHEN <see cref="Condition"/> THEN <see cref="Result"/></c>
+/// arm of a <see cref="CaseExpression"/>. Not an <see cref="Expression"/>
+/// itself — just a pair the recursive walkers descend into.
+/// </summary>
+public sealed record CaseWhenClause(Expression Condition, Expression Result);
+
+/// <summary>
+/// <c>CASE WHEN c1 THEN r1 [WHEN c2 THEN r2 …] [ELSE rN] END</c> — the
+/// searched form. The <i>simple</i> form
+/// (<c>CASE operand WHEN v1 THEN r1 …</c>) is desugared by the parser into
+/// this node, with each arm's condition rewritten to
+/// <c>operand = vK</c>, so the resolver and compilers only ever see the
+/// searched shape.
+/// </summary>
+/// <remarks>
+/// Modeled as a flat list of <see cref="CaseWhenClause"/>s (not a nested
+/// chain) so every recursive walker — resolver, expression compilers,
+/// optimizer rewriters — contributes constant stack depth regardless of
+/// the arm count. A WHEN arm is taken iff its condition evaluates to a
+/// <i>definite</i> TRUE; NULL or FALSE falls through (SQL three-valued
+/// semantics). An absent <see cref="ElseResult"/> yields NULL when no arm
+/// matches, so the result type is then nullable. Branch evaluation is
+/// lazy: a non-taken arm's <see cref="CaseWhenClause.Result"/> is never
+/// evaluated, so e.g. <c>CASE WHEN x &lt;&gt; 0 THEN 1/x ELSE 0 END</c> is
+/// safe.
+/// </remarks>
+public sealed record CaseExpression(
+    IReadOnlyList<CaseWhenClause> Whens,
+    Expression? ElseResult) : Expression;

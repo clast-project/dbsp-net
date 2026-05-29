@@ -85,6 +85,7 @@ public static class ExpressionCompiler
         ResolvedCast cast => BuildCast(cast, row),
         ResolvedFunctionCall fn => BuildFunction(fn, row),
         ResolvedInList il => BuildInList(il, row),
+        ResolvedCaseWhen ce => BuildCaseWhen(ce, row),
         ResolvedCorrelationRef => throw new InvalidOperationException(
             "internal: ResolvedCorrelationRef reached ExpressionCompiler — " +
             "decorrelator should have rewritten every correlation reference"),
@@ -112,6 +113,29 @@ public static class ExpressionCompiler
             probeExpr,
             valuesArr,
             Expression.Constant(il.IsNegated));
+    }
+
+    private static readonly MethodInfo CaseConditionIsTrueMethod =
+        typeof(CaseRuntime).GetMethod(nameof(CaseRuntime.ConditionIsTrue))!;
+
+    private static Expression BuildCaseWhen(ResolvedCaseWhen ce, ParameterExpression row)
+    {
+        // Right-to-left fold into a nested conditional. Lazy by construction:
+        // a non-taken arm's result subexpression sits in the false branch and
+        // is never evaluated. An arm is taken iff its condition is a definite
+        // TRUE (NULL / FALSE fall through — SQL three-valued semantics). Each
+        // result has already been cast to the common type by the resolver, so
+        // every branch of the conditional is typeof(object).
+        Expression result = ce.ElseResult is null ? NullObject : Build(ce.ElseResult, row);
+        for (var i = ce.Whens.Count - 1; i >= 0; i--)
+        {
+            var cond = Build(ce.Whens[i].Condition, row);
+            var taken = Expression.Call(CaseConditionIsTrueMethod, cond);
+            var branch = Build(ce.Whens[i].Result, row);
+            result = Expression.Condition(taken, branch, result);
+        }
+
+        return result;
     }
 
     private static Expression BuildLiteral(ResolvedLiteral lit)
@@ -677,6 +701,16 @@ internal static class SqlCasts
 /// The resolver has cast probe and every value to the same comparable CLR
 /// type, so <see cref="object.Equals(object)"/> performs value equality.
 /// </remarks>
+internal static class CaseRuntime
+{
+    /// <summary>
+    /// A CASE WHEN arm is taken iff its condition evaluates to a definite
+    /// TRUE. A NULL (SQL UNKNOWN) or FALSE condition falls through to the
+    /// next arm / ELSE — matching SQL three-valued semantics.
+    /// </summary>
+    public static bool ConditionIsTrue(object? condition) => condition is bool b && b;
+}
+
 internal static class InListRuntime
 {
     public static object? Evaluate(object? probe, object?[] values, bool isNegated)

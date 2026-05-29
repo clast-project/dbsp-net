@@ -35,6 +35,9 @@ public enum TokenKind
     // Functional keywords
     Cast, Coalesce, Primary, Key, Lateness,
 
+    // Conditional keywords
+    Case, When, Then, Else, End,
+
     // Type keywords
     Int, Integer, BigInt, Real, Double, Precision,
     Decimal, Numeric, Varchar, Char, Text, Boolean, Bool,

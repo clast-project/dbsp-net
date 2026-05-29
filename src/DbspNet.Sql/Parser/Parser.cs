@@ -841,6 +841,8 @@ public sealed class Parser
                 return ParseCastExpression();
             case TokenKind.Coalesce:
                 return ParseCoalesceExpression();
+            case TokenKind.Case:
+                return ParseCaseExpression();
             case TokenKind.Exists:
                 return ParseExistsExpression();
             case TokenKind.Identifier:
@@ -886,6 +888,63 @@ public sealed class Parser
             Ctes: Array.Empty<CteDefinition>());
         var countSubquery = new SubqueryExpression(countSelect);
         return new ExistsExpression(original, countSubquery);
+    }
+
+    /// <summary>
+    /// Parse a <c>CASE … END</c> expression. Both the searched form
+    /// (<c>CASE WHEN cond THEN r …</c>) and the simple form
+    /// (<c>CASE operand WHEN val THEN r …</c>) are accepted; the simple form
+    /// is desugared here into the searched <see cref="CaseExpression"/> by
+    /// rewriting each arm's test to <c>operand = val</c>.
+    /// </summary>
+    private CaseExpression ParseCaseExpression()
+    {
+        Expect(TokenKind.Case);
+
+        // Simple form: a comparand sits between CASE and the first WHEN.
+        Expression? operand = null;
+        if (Peek().Kind != TokenKind.When)
+        {
+            operand = ParseExpression();
+
+            // The simple form fans the operand out across every arm
+            // (operand = vK). Re-referencing a subquery operand would
+            // double-count it in the resolver's reference-keyed subquery
+            // map, so reject that narrow case rather than miscompile it.
+            if (operand is SubqueryExpression)
+            {
+                throw Error(Peek(), "a scalar subquery is not supported as a simple CASE operand");
+            }
+        }
+
+        var whens = new List<CaseWhenClause>();
+        while (Peek().Kind == TokenKind.When)
+        {
+            Advance();
+            var test = ParseExpression();
+            Expect(TokenKind.Then);
+            var result = ParseExpression();
+
+            var condition = operand is null
+                ? test
+                : new BinaryExpression(BinaryOperator.Equal, operand, test);
+            whens.Add(new CaseWhenClause(condition, result));
+        }
+
+        if (whens.Count == 0)
+        {
+            throw Error(Peek(), "CASE requires at least one WHEN branch");
+        }
+
+        Expression? elseResult = null;
+        if (Peek().Kind == TokenKind.Else)
+        {
+            Advance();
+            elseResult = ParseExpression();
+        }
+
+        Expect(TokenKind.End);
+        return new CaseExpression(whens, elseResult);
     }
 
     private CastExpression ParseCastExpression()

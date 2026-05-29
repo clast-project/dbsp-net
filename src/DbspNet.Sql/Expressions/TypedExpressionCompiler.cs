@@ -123,8 +123,67 @@ public static class TypedExpressionCompiler
             ResolvedIsNull isn => BuildIsNull(isn, row, rowType),
             ResolvedCast cast => BuildCast(cast, row, rowType),
             ResolvedFunctionCall fn => BuildFunction(fn, row, rowType),
+            ResolvedCaseWhen ce => BuildCaseWhen(ce, row, rowType),
             _ => throw Unsupported(),
         };
+    }
+
+    /// <summary>
+    /// Lowers a searched <c>CASE</c> to a right-to-left nested conditional.
+    /// Every branch (and the ELSE / implicit NULL) is coerced to the
+    /// expression's resolved result CLR type — lifting non-nullable value
+    /// branches to <c>Nullable&lt;T&gt;</c> when the overall result is
+    /// nullable. An arm is taken iff its BOOLEAN condition is a definite
+    /// TRUE; a nullable condition reads <c>GetValueOrDefault()</c> so NULL
+    /// falls through. Evaluation stays lazy: non-taken branches sit in the
+    /// false arm and are never run.
+    /// </summary>
+    private static Expression BuildCaseWhen(ResolvedCaseWhen ce, ParameterExpression row, Type rowType)
+    {
+        var underlying = ce.Type.ClrType;
+        var targetType = ce.Type.Nullable && underlying.IsValueType
+            ? typeof(Nullable<>).MakeGenericType(underlying)
+            : underlying;
+
+        // An ELSE-less CASE must have a nullable result type to carry the
+        // unmatched-NULL. The resolver guarantees this; bail to the
+        // structural path defensively if it ever doesn't hold.
+        if (ce.ElseResult is null && targetType.IsValueType && !IsNullable(targetType))
+        {
+            throw Unsupported();
+        }
+
+        Expression Coerce(Expression e)
+        {
+            if (e.Type == targetType) return e;
+            if (IsNullable(targetType) && !IsNullable(e.Type) && e.Type.IsValueType)
+            {
+                return Expression.Convert(e, targetType);
+            }
+
+            if (!targetType.IsValueType && !e.Type.IsValueType) return e;
+            return Expression.Convert(e, targetType);
+        }
+
+        Expression result = ce.ElseResult is null
+            ? Expression.Constant(null, targetType)
+            : Coerce(Build(ce.ElseResult, row, rowType));
+
+        var getValueOrDefault = typeof(bool?).GetMethod(
+            nameof(Nullable<bool>.GetValueOrDefault), Type.EmptyTypes)!;
+
+        for (var i = ce.Whens.Count - 1; i >= 0; i--)
+        {
+            var cond = Build(ce.Whens[i].Condition, row, rowType);
+            if (UnderlyingType(cond.Type) != typeof(bool)) throw Unsupported();
+            var taken = IsNullable(cond.Type)
+                ? (Expression)Expression.Call(cond, getValueOrDefault)
+                : cond;
+            var branch = Coerce(Build(ce.Whens[i].Result, row, rowType));
+            result = Expression.Condition(taken, branch, result);
+        }
+
+        return result;
     }
 
     // ---- Nullability helpers ----
