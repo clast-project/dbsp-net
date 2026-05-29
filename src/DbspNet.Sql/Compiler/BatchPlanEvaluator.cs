@@ -368,13 +368,26 @@ internal static class BatchPlanEvaluator
 
     private static ZSet<StructuralRow, Z64> BatchSemiJoin(SemiJoinPlan plan, BatchEvalContext ctx)
     {
-        // Mirrors CompileSemiJoin: keep outer rows whose probe is non-null
-        // and matches at least one non-null distinct value in the subquery.
-        // Output schema = outer schema, weights preserved.
+        // Mirrors CompileSemiJoin: keep outer rows whose composite probe
+        // matches at least one inner row's composite key. The key is a tuple
+        // of every EquiKeys entry — one for the IN-probe plus one per
+        // correlation column. Any NULL component drops the row (NULL = anything
+        // is NULL, never TRUE in WHERE).
+        if (plan.EquiKeys.Count == 0)
+        {
+            throw new InvalidOperationException("internal: SemiJoinPlan with no equi-keys");
+        }
+
         var outer = Evaluate(plan.Input, ctx);
         var subquery = Evaluate(plan.Subquery, ctx);
 
-        var matchSet = new HashSet<object>();
+        var innerIndices = new int[plan.EquiKeys.Count];
+        for (var i = 0; i < plan.EquiKeys.Count; i++)
+        {
+            innerIndices[i] = plan.EquiKeys[i].InnerColumnIndex;
+        }
+
+        var matchSet = new HashSet<TupleKey>();
         foreach (var (row, w) in subquery)
         {
             if (!Z64.IsPositive(w))
@@ -382,30 +395,97 @@ internal static class BatchPlanEvaluator
                 continue;
             }
 
-            var v = row[0];
-            if (v is not null)
+            var key = BuildTupleKey(row, innerIndices);
+            if (key is not null)
             {
-                matchSet.Add(v);
+                matchSet.Add(key.Value);
             }
         }
 
-        var probeFn = ExpressionCompiler.CompileScalar(plan.OuterKey);
+        var probeFns = new Func<IReadOnlyList<object?>, object?>[plan.EquiKeys.Count];
+        for (var i = 0; i < plan.EquiKeys.Count; i++)
+        {
+            probeFns[i] = ExpressionCompiler.CompileScalar(plan.EquiKeys[i].OuterKey);
+        }
+
         var builder = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (row, w) in outer)
         {
-            var key = probeFn(row);
-            if (key is null)
+            var probeVals = new object?[probeFns.Length];
+            var hasNull = false;
+            for (var i = 0; i < probeFns.Length; i++)
+            {
+                var v = probeFns[i](row);
+                if (v is null)
+                {
+                    hasNull = true;
+                    break;
+                }
+
+                probeVals[i] = v;
+            }
+
+            if (hasNull)
             {
                 continue;
             }
 
-            if (matchSet.Contains(key))
+            if (matchSet.Contains(new TupleKey(probeVals)))
             {
                 builder.Add(row, w);
             }
         }
 
         return builder.Build();
+    }
+
+    private static TupleKey? BuildTupleKey(StructuralRow row, int[] indices)
+    {
+        var vs = new object?[indices.Length];
+        for (var i = 0; i < indices.Length; i++)
+        {
+            var v = row[indices[i]];
+            if (v is null)
+            {
+                return null;
+            }
+
+            vs[i] = v;
+        }
+
+        return new TupleKey(vs);
+    }
+
+    /// <summary>Structural-equality tuple key for the batch semi-join's match set.</summary>
+    private readonly struct TupleKey : IEquatable<TupleKey>
+    {
+        private readonly object?[] _vs;
+
+        public TupleKey(object?[] vs) { _vs = vs; }
+
+        public bool Equals(TupleKey other)
+        {
+            if (_vs.Length != other._vs.Length) return false;
+            for (var i = 0; i < _vs.Length; i++)
+            {
+                if (!object.Equals(_vs[i], other._vs[i])) return false;
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is TupleKey t && Equals(t);
+
+        public override int GetHashCode()
+        {
+            var h = 17;
+            for (var i = 0; i < _vs.Length; i++)
+            {
+                h = unchecked(h * 31 + (_vs[i]?.GetHashCode() ?? 0));
+            }
+
+            return h;
+        }
     }
 
     // ---- Scalar subquery cross-join ----

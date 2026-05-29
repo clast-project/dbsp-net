@@ -75,6 +75,24 @@ public sealed class Schema
     /// </summary>
     public int Resolve(string? qualifier, string name)
     {
+        var idx = TryResolve(qualifier, name);
+        if (idx == -1)
+        {
+            throw new ResolveException($"unknown column '{Format(qualifier, name)}'");
+        }
+
+        return idx;
+    }
+
+    /// <summary>
+    /// Like <see cref="Resolve"/> but returns -1 on a miss instead of throwing.
+    /// Ambiguous matches still throw (the call site can't recover from that).
+    /// Used by the resolver's correlated-subquery path to look up an identifier
+    /// in an inner scope and then fall through to the outer scope on a miss
+    /// without paying the exception cost.
+    /// </summary>
+    public int TryResolve(string? qualifier, string name)
+    {
         var found = -1;
         for (var i = 0; i < _columns.Count; i++)
         {
@@ -95,11 +113,6 @@ public sealed class Schema
             }
 
             found = i;
-        }
-
-        if (found == -1)
-        {
-            throw new ResolveException($"unknown column '{Format(qualifier, name)}'");
         }
 
         return found;

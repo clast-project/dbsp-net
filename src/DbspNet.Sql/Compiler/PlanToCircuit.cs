@@ -977,13 +977,13 @@ public static class PlanToCircuit
     private static readonly StructuralRow s_unitKey = new(Array.Empty<object?>());
 
     /// <summary>
-    /// Compile <c>WHERE probe IN (subquery)</c>: dedup the subquery's column,
-    /// equi-join with the outer rows on <c>probe = subqueryCol</c>, project
-    /// the outer columns. Output preserves outer schema and weights — every
-    /// matching outer row stays once even if the subquery has duplicates
-    /// (the Distinct collapses them). NULL outer-keys and NULL subquery
-    /// values are dropped by the inner-join's NULL-key filter, matching
-    /// SQL three-valued logic at the WHERE boundary.
+    /// Compile <c>WHERE probe IN (subquery)</c>: dedup the subquery's
+    /// projection on the join key, equi-join with the outer rows on the
+    /// composite key, project the outer columns. The composite key carries
+    /// every <see cref="SemiJoinPlan.EquiKeys"/> entry — one for the IN-probe
+    /// plus one per correlated reference (for the correlated-IN decorrelation).
+    /// Output preserves outer schema and weights; the inner join's NULL-key
+    /// filter gives SQL three-valued semantics at the WHERE boundary.
     /// </summary>
     private static Stream<ZSet<StructuralRow, Z64>> CompileSemiJoin(
         CircuitBuilder builder,
@@ -996,48 +996,111 @@ public static class PlanToCircuit
                 "internal: NOT IN (subquery) reached PlanToCircuit; resolver should have rejected");
         }
 
+        if (plan.EquiKeys.Count == 0)
+        {
+            throw new InvalidOperationException("internal: SemiJoinPlan with no equi-keys");
+        }
+
         var outer = CompilePlan(builder, plan.Input, ctx);
         var subqueryStream = CompilePlan(builder, plan.Subquery, ctx);
-
-        // Distinct the subquery so duplicate target values don't multiply
-        // outer rows on the join. No GC frontier — the subquery's monotonicity
-        // (if any) would need a separate analysis pass.
-        var subqueryDistinct = EmitDistinct(
-            builder, ctx, subqueryStream,
-            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Subquery.Schema));
-
-        // Build the outer-side key as a 1-column StructuralRow holding the
-        // probe expression's value. The compiled scalar may return null
-        // (NULL probe), which we filter out below.
         var codec = ctx.Codec;
-        var probeFn = ExpressionCompiler.CompileScalar(plan.OuterKey);
-        var keySchema = new Schema([new SchemaColumn("__semi_key", plan.OuterKey.Type, null)]);
+
+        // Compile every outer-side key expression once.
+        var probeFns = new Func<IReadOnlyList<object?>, object?>[plan.EquiKeys.Count];
+        for (var i = 0; i < plan.EquiKeys.Count; i++)
+        {
+            probeFns[i] = ExpressionCompiler.CompileScalar(plan.EquiKeys[i].OuterKey);
+        }
+
+        var innerIndices = new int[plan.EquiKeys.Count];
+        var keySchemaCols = new SchemaColumn[plan.EquiKeys.Count];
+        for (var i = 0; i < plan.EquiKeys.Count; i++)
+        {
+            innerIndices[i] = plan.EquiKeys[i].InnerColumnIndex;
+            keySchemaCols[i] = new SchemaColumn("__semi_key_" + i, plan.EquiKeys[i].Type, null);
+        }
+
+        var keySchema = new Schema(keySchemaCols);
+
+        // Drop the subquery columns we don't need on the join — keep only the
+        // inner-key columns. This dedup-narrows the right side before Distinct.
+        var subqueryProjected = builder.MapRows<StructuralRow, StructuralRow, Z64>(
+            subqueryStream,
+            row =>
+            {
+                var vs = new object?[innerIndices.Length];
+                for (var i = 0; i < innerIndices.Length; i++)
+                {
+                    vs[i] = row[innerIndices[i]];
+                }
+
+                return codec.BuildRow(keySchema, vs);
+            });
+
+        var subqueryDistinct = EmitDistinct(
+            builder, ctx, subqueryProjected,
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(keySchema));
 
         // Filter NULL probes (NULL = anything is NULL, never TRUE in WHERE)
-        // and NULL subquery values (same reason).
-        var outerNonNull = builder.Filter(outer, row => probeFn(row) is not null);
-        var subqNonNull = builder.Filter(subqueryDistinct, row => row[0] is not null);
+        // and NULL inner-key tuples (same reason).
+        var outerNonNull = builder.Filter(outer, row => HasNoNullProbe(probeFns, row));
+        var subqNonNull = builder.Filter(subqueryDistinct, row => HasNoNullKeyRow(row));
 
         var outerIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
             outerNonNull,
-            row => codec.BuildRow(keySchema, new object?[] { probeFn(row) }),
+            row =>
+            {
+                var vs = new object?[probeFns.Length];
+                for (var i = 0; i < probeFns.Length; i++)
+                {
+                    vs[i] = probeFns[i](row);
+                }
+
+                return codec.BuildRow(keySchema, vs);
+            },
             row => row);
         var subqIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
             subqNonNull,
-            row => codec.BuildRow(keySchema, new object?[] { row[0] }),
+            row => row,
             row => row);
 
         var leftJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, plan.Input.Schema);
-        var rightJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, plan.Subquery.Schema);
+        var rightJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, keySchema);
 
-        // Combine emits ONLY the outer row — semi-join semantics. The
-        // subquery row is consumed by the match check.
+        // Combine emits ONLY the outer row — semi-join semantics.
         return EmitInnerJoin(
             builder, ctx,
             outerIndexed,
             subqIndexed,
             (_, outerRow, _) => outerRow,
             leftJoinCodec, rightJoinCodec);
+    }
+
+    private static bool HasNoNullProbe(
+        Func<IReadOnlyList<object?>, object?>[] probeFns, StructuralRow row)
+    {
+        for (var i = 0; i < probeFns.Length; i++)
+        {
+            if (probeFns[i](row) is null)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool HasNoNullKeyRow(StructuralRow row)
+    {
+        for (var i = 0; i < row.Count; i++)
+        {
+            if (row[i] is null)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompileScalarSubqueryJoin(

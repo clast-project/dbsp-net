@@ -140,13 +140,24 @@ public sealed record JoinPlan(
     Schema Schema,
     bool AllowNullKeys = false) : LogicalPlan(Schema);
 
+/// <summary>One equi-join key for a <see cref="SemiJoinPlan"/>: an
+/// outer-side expression matched against a fixed inner-side column index.</summary>
+public sealed record SemiJoinEqui(
+    ResolvedExpression OuterKey,
+    int InnerColumnIndex,
+    SqlType Type);
+
 /// <summary>
 /// Semi-join (equi-keyed): keep every row of <see cref="Input"/> whose
-/// <see cref="OuterKey"/> projection matches at least one value in the
-/// single-column <see cref="Subquery"/>. Output schema is <see cref="Input"/>'s
-/// schema unchanged (the subquery side is consumed by the match check).
-/// Compiles to <c>Distinct(Subquery) ⋈ Input</c> on the equi-key + project
-/// outer columns. Used for the WHERE-level <c>x IN (subquery)</c> rewrite.
+/// projection of <see cref="EquiKeys"/>' outer-side expressions matches at
+/// least one row in <see cref="Subquery"/> on the corresponding inner-column
+/// indices. Output schema is <see cref="Input"/>'s schema unchanged (the
+/// subquery side is consumed by the match check). Compiles to
+/// <c>Distinct(Subquery) ⋈ Input</c> on the equi-key tuple + project outer
+/// columns. Used for both the WHERE-level <c>x IN (subquery)</c> rewrite
+/// (uncorrelated → one equi-key) and the correlated-IN decorrelation
+/// (correlated → N+1 equi-keys covering the IN-probe plus each correlation
+/// column).
 /// </summary>
 /// <remarks>
 /// <para>NULL semantics match the SQL WHERE shape: <c>NULL</c> outer-key
@@ -159,7 +170,7 @@ public sealed record JoinPlan(
 public sealed record SemiJoinPlan(
     LogicalPlan Input,
     LogicalPlan Subquery,
-    ResolvedExpression OuterKey,
+    IReadOnlyList<SemiJoinEqui> EquiKeys,
     bool IsAnti = false) : LogicalPlan(Input.Schema);
 
 /// <summary>One equi-join conjunct: <c>left[LeftIndex] = right[RightIndex]</c>.</summary>

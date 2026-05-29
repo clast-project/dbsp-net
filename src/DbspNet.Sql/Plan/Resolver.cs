@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
 using DbspNet.Sql.Expressions;
+using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser.Ast;
 using DbspNet.Sql.TypeSystem;
 
@@ -32,9 +33,12 @@ public sealed class Resolver
         _ => throw new ResolveException($"unsupported statement kind: {statement.GetType().Name}"),
     };
 
-    private LogicalPlan ResolveQuery(SqlQuery query, IReadOnlyDictionary<string, CteRef> outerCteScope) => query switch
+    private LogicalPlan ResolveQuery(
+        SqlQuery query,
+        IReadOnlyDictionary<string, CteRef> outerCteScope,
+        Schema? outerSchema = null) => query switch
     {
-        SelectStatement s => ResolveSelect(s, outerCteScope),
+        SelectStatement s => ResolveSelect(s, outerCteScope, outerSchema),
         SetOpQuery u => ResolveSetOp(u, outerCteScope),
         _ => throw new ResolveException($"unsupported query kind: {query.GetType().Name}"),
     };
@@ -106,7 +110,8 @@ public sealed class Resolver
 
     private LogicalPlan ResolveSelect(
         SelectStatement stmt,
-        IReadOnlyDictionary<string, CteRef> outerCteScope)
+        IReadOnlyDictionary<string, CteRef> outerCteScope,
+        Schema? outerSchema = null)
     {
         // Build the local CTE scope — inherits from the outer scope and adds
         // any WITH-defined CTEs on this SELECT. CTEs are non-recursive in v1
@@ -170,7 +175,7 @@ public sealed class Resolver
             {
                 var remaining = JoinAnd(scalarConjuncts);
                 plan = WrapWithScalarSubqueries(plan, scope, CollectSubqueries(remaining), out var whereSubMap);
-                var pred = ResolveScalarExpression(remaining, plan.Schema, whereSubMap);
+                var pred = ResolveScalarExpression(remaining, plan.Schema, whereSubMap, outerSchema);
                 EnsureBooleanCoercible(pred, "WHERE");
                 plan = new FilterPlan(plan, pred);
             }
@@ -1101,9 +1106,10 @@ public sealed class Resolver
     /// <summary>
     /// Lift a single <c>probe IN (subquery)</c> conjunct into a
     /// <see cref="SemiJoinPlan"/> over <paramref name="plan"/>. The subquery
-    /// is resolved with CTE-only scope (no outer-column access — correlation
-    /// falls out as "column not found" the same way uncorrelated scalar
-    /// subqueries do today).
+    /// is resolved with the outer plan's schema available; any
+    /// <see cref="ResolvedCorrelationRef"/> the inner produces is then
+    /// decorrelated into additional equi-keys against the corresponding
+    /// outer columns (see <see cref="DecorrelateSubqueryPlan"/>).
     /// </summary>
     private LogicalPlan LiftInSubqueryToSemiJoin(
         LogicalPlan plan,
@@ -1111,26 +1117,355 @@ public sealed class Resolver
         IReadOnlyDictionary<string, CteRef> cteScope)
     {
         var probe = ResolveScalarExpression(isq.Probe, plan.Schema);
-        var subPlan = ResolveQuery(isq.Subquery.Query, cteScope);
+        var subPlan = ResolveQuery(isq.Subquery.Query, cteScope, outerSchema: plan.Schema);
         if (subPlan.Schema.Count != 1)
         {
             throw new ResolveException(
                 $"IN-subquery must return exactly 1 column; got {subPlan.Schema.Count}");
         }
 
-        // Promote probe and subquery column to a common comparable type so
-        // the downstream join's equi-key compare is well-defined.
-        var common = TypeInference.CommonComparableType(probe.Type, subPlan.Schema[0].Type);
+        // Detect correlations introduced via ResolvedCorrelationRef and
+        // decorrelate: returns the rewritten subquery plan with the
+        // correlation columns appended to its schema, plus the per-outer-index
+        // equi-key list. The original SELECT column moves to the LAST inner
+        // column (after the projected correlation columns); the probe pairs
+        // with that index.
+        var (decorrelated, correlationKeys) = DecorrelateSubqueryPlan(subPlan, plan.Schema);
+
+        var probeInnerIndex = decorrelated.Schema.Count - 1;
+        var probeInnerType = decorrelated.Schema[probeInnerIndex].Type;
+        var common = TypeInference.CommonComparableType(probe.Type, probeInnerType);
         probe = MaybeCast(probe, common);
-        if (!SameTypeIgnoringNullable(subPlan.Schema[0].Type, common))
+        if (!SameTypeIgnoringNullable(probeInnerType, common))
         {
-            // Project the subquery's single column to the common type.
-            var projected = new ResolvedCast(new ResolvedColumn(0, subPlan.Schema[0].Type), common);
-            var col = new ProjectionItem(projected, subPlan.Schema[0].Name, subPlan.Schema[0].Qualifier);
-            subPlan = new ProjectPlan(subPlan, [col], new Schema([new SchemaColumn(col.Name, common, col.Qualifier)]));
+            // Cast the last column (the original SELECT) to the common type
+            // via a narrowing ProjectPlan that preserves the correlation
+            // columns ahead of it.
+            var projItems = new List<ProjectionItem>(decorrelated.Schema.Count);
+            var newCols = new List<SchemaColumn>(decorrelated.Schema.Count);
+            for (var i = 0; i < decorrelated.Schema.Count - 1; i++)
+            {
+                projItems.Add(new ProjectionItem(
+                    new ResolvedColumn(i, decorrelated.Schema[i].Type),
+                    decorrelated.Schema[i].Name,
+                    decorrelated.Schema[i].Qualifier));
+                newCols.Add(decorrelated.Schema[i]);
+            }
+
+            var probeCol = decorrelated.Schema[probeInnerIndex];
+            var castedProbe = new ResolvedCast(
+                new ResolvedColumn(probeInnerIndex, probeInnerType), common);
+            projItems.Add(new ProjectionItem(castedProbe, probeCol.Name, probeCol.Qualifier));
+            newCols.Add(new SchemaColumn(probeCol.Name, common, probeCol.Qualifier));
+            decorrelated = new ProjectPlan(decorrelated, projItems, new Schema(newCols));
         }
 
-        return new SemiJoinPlan(plan, subPlan, probe, IsAnti: false);
+        var equiKeys = new List<SemiJoinEqui>(correlationKeys.Count + 1)
+        {
+            new SemiJoinEqui(probe, probeInnerIndex, common),
+        };
+        equiKeys.AddRange(correlationKeys);
+
+        return new SemiJoinPlan(plan, decorrelated, equiKeys, IsAnti: false);
+    }
+
+    /// <summary>
+    /// Detect correlation references in <paramref name="subPlan"/> (produced by
+    /// <see cref="ResolvedCorrelationRef"/> during inner resolution) and rewrite
+    /// the plan so that each correlation is lifted into an equi-key against an
+    /// outer column. For each unique outer index referenced, the subquery's
+    /// WHERE must contain an equality <c>ResolvedCorrelationRef(i) =
+    /// ResolvedColumn(j)</c> (in either order); that conjunct is removed from
+    /// the WHERE, and column <c>j</c> is projected into the subquery's schema
+    /// as a new prepended column. Anything else (correlation in JOIN ON / HAVING
+    /// / GROUP BY / aggregates, or non-equi correlation comparison) rejects.
+    /// </summary>
+    private (LogicalPlan Plan, IReadOnlyList<SemiJoinEqui> CorrelationKeys) DecorrelateSubqueryPlan(
+        LogicalPlan subPlan, Schema outerSchema)
+    {
+        // Walk the plan to surface any FilterPlans and detect correlation
+        // refs. v1 supports correlation only in the OUTERMOST FilterPlan
+        // (which corresponds to the inner SELECT's WHERE clause after
+        // resolution); deeper / nested-join correlation rejects.
+        var correlationsInSubPlan = FindAllCorrelations(subPlan);
+        if (correlationsInSubPlan.Count == 0)
+        {
+            return (subPlan, Array.Empty<SemiJoinEqui>());
+        }
+
+        // Find a FilterPlan in the subquery — must be the outermost wrapper
+        // (or one wrapped by a single ProjectPlan, which the resolver always
+        // emits at the SELECT boundary).
+        var (filter, rebuild) = LocateOuterFilter(subPlan);
+        if (filter is null)
+        {
+            throw new ResolveException(
+                "correlated IN-subquery must have a WHERE clause containing the correlation equality");
+        }
+
+        var conjuncts = ExpressionRewriter.SplitAnd(filter.Predicate);
+        var matchedOuterIndices = new Dictionary<int, int>(); // outer-index → inner-column-index
+        var remainingConjuncts = new List<ResolvedExpression>();
+
+        foreach (var c in conjuncts)
+        {
+            if (TryMatchEquiCorrelation(c, out var outerIdx, out var innerIdx))
+            {
+                if (matchedOuterIndices.ContainsKey(outerIdx))
+                {
+                    throw new ResolveException(
+                        "correlated IN-subquery references the same outer column from multiple equi-predicates");
+                }
+
+                matchedOuterIndices[outerIdx] = innerIdx;
+            }
+            else if (ExpressionRewriter.CollectCorrelationIndices(c).Count > 0)
+            {
+                throw new ResolveException(
+                    "only equi-correlation predicates (outer.col = inner.col) are supported in v1");
+            }
+            else
+            {
+                remainingConjuncts.Add(c);
+            }
+        }
+
+        // Sanity-check every detected correlation was covered.
+        foreach (var idx in correlationsInSubPlan)
+        {
+            if (!matchedOuterIndices.ContainsKey(idx))
+            {
+                throw new ResolveException(
+                    "every correlated outer reference must appear in an equi-predicate (outer.col = inner.col) in v1");
+            }
+        }
+
+        // Rebuild the FilterPlan with the correlation conjuncts removed. If
+        // nothing's left, drop the filter entirely.
+        LogicalPlan filterInput = filter.Input;
+        LogicalPlan filtered = remainingConjuncts.Count == 0
+            ? filterInput
+            : new FilterPlan(filterInput, ExpressionRewriter.AndAll(remainingConjuncts));
+
+        // We replace the outer Project (if any) entirely: the new subquery
+        // schema is [corr_col_1, ..., corr_col_N, original_select_outputs...].
+        // The original outer-Project's projections referenced the filter's
+        // schema (Scan-relative indices); they still do, since the filter's
+        // schema is unchanged. We just compose them with the correlation
+        // projections.
+        var (outerProjections, _) = GetOuterProjections(rebuild);
+        var orderedOuter = matchedOuterIndices.Keys.ToList();
+        orderedOuter.Sort();
+        var projCols = new List<ProjectionItem>(orderedOuter.Count + outerProjections.Count);
+        var newSchemaCols = new List<SchemaColumn>(orderedOuter.Count + outerProjections.Count);
+        var keys = new List<SemiJoinEqui>(orderedOuter.Count);
+        for (var i = 0; i < orderedOuter.Count; i++)
+        {
+            var outerIdx = orderedOuter[i];
+            var innerIdx = matchedOuterIndices[outerIdx];
+            var innerType = filtered.Schema[innerIdx].Type;
+            var common = TypeInference.CommonComparableType(outerSchema[outerIdx].Type, innerType);
+            ResolvedExpression projected = new ResolvedColumn(innerIdx, innerType);
+            if (!SameTypeIgnoringNullable(innerType, common))
+            {
+                projected = new ResolvedCast(projected, common);
+            }
+
+            projCols.Add(new ProjectionItem(projected, "__corr_" + i, null));
+            newSchemaCols.Add(new SchemaColumn("__corr_" + i, common, null));
+            keys.Add(new SemiJoinEqui(
+                new ResolvedColumn(outerIdx, outerSchema[outerIdx].Type),
+                InnerColumnIndex: i,
+                Type: common));
+        }
+
+        // Append the original outer-Project's projections (which targeted the
+        // filter's schema). If there was no outer Project (subPlan is just a
+        // FilterPlan), default to passing every column of the filtered plan
+        // through.
+        if (outerProjections.Count == 0)
+        {
+            for (var i = 0; i < filtered.Schema.Count; i++)
+            {
+                projCols.Add(new ProjectionItem(
+                    new ResolvedColumn(i, filtered.Schema[i].Type),
+                    filtered.Schema[i].Name,
+                    filtered.Schema[i].Qualifier));
+                newSchemaCols.Add(filtered.Schema[i]);
+            }
+        }
+        else
+        {
+            foreach (var pi in outerProjections)
+            {
+                projCols.Add(pi);
+                newSchemaCols.Add(new SchemaColumn(pi.Name, pi.Expression.Type, pi.Qualifier));
+            }
+        }
+
+        LogicalPlan result = new ProjectPlan(filtered, projCols, new Schema(newSchemaCols));
+        return (result, keys);
+    }
+
+    /// <summary>
+    /// Inspect the rebuild callback returned by <see cref="LocateOuterFilter"/>
+    /// to extract the outer ProjectPlan's projections (if any). The callback
+    /// either returns its argument unchanged (FilterPlan was the root — no
+    /// outer Project) or wraps it in a captured ProjectPlan. We probe by
+    /// invoking with a sentinel input and reading off any ProjectPlan
+    /// the rebuild wraps around it.
+    /// </summary>
+    private static (IReadOnlyList<ProjectionItem> Projections, Schema? Schema) GetOuterProjections(
+        Func<LogicalPlan, LogicalPlan> rebuild)
+    {
+        var sentinel = SentinelPlan.Instance;
+        var probed = rebuild(sentinel);
+        if (probed is ProjectPlan p && ReferenceEquals(p.Input, sentinel))
+        {
+            return (p.Projections, p.Schema);
+        }
+
+        return (Array.Empty<ProjectionItem>(), null);
+    }
+
+    /// <summary>Probe sentinel plan used only by <see cref="GetOuterProjections"/>.</summary>
+    private sealed record SentinelPlan() : LogicalPlan(Schema.Empty)
+    {
+        public static readonly SentinelPlan Instance = new();
+    }
+
+    /// <summary>
+    /// Try to match <c>expr</c> as a correlated equi-predicate of the form
+    /// <c>ResolvedCorrelationRef(i) = ResolvedColumn(j)</c> (in either order).
+    /// </summary>
+    private static bool TryMatchEquiCorrelation(
+        ResolvedExpression expr, out int outerIdx, out int innerIdx)
+    {
+        outerIdx = -1;
+        innerIdx = -1;
+        if (expr is not ResolvedBinary { Operator: BinaryOperator.Equal } bin)
+        {
+            return false;
+        }
+
+        if (TryUnwrapCast(bin.Left) is ResolvedCorrelationRef cl
+            && TryUnwrapCast(bin.Right) is ResolvedColumn cr)
+        {
+            outerIdx = cl.OuterIndex;
+            innerIdx = cr.Index;
+            return true;
+        }
+
+        if (TryUnwrapCast(bin.Right) is ResolvedCorrelationRef cl2
+            && TryUnwrapCast(bin.Left) is ResolvedColumn cr2)
+        {
+            outerIdx = cl2.OuterIndex;
+            innerIdx = cr2.Index;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static ResolvedExpression TryUnwrapCast(ResolvedExpression e) =>
+        e is ResolvedCast c ? c.Operand : e;
+
+    /// <summary>
+    /// Walk <paramref name="plan"/> to collect every outer-column index
+    /// referenced by a <see cref="ResolvedCorrelationRef"/>. v1 only supports
+    /// correlation in the inner SELECT's WHERE; correlation in JOIN ON /
+    /// HAVING / GROUP BY / projections rejects elsewhere in
+    /// <see cref="DecorrelateSubqueryPlan"/>.
+    /// </summary>
+    /// <summary>
+    /// Collect every outer-column index referenced by a
+    /// <see cref="ResolvedCorrelationRef"/> anywhere in the plan tree.
+    /// </summary>
+    private static HashSet<int> FindAllCorrelations(LogicalPlan plan)
+    {
+        var result = new HashSet<int>();
+        WalkResolvedExpressions(plan, expr =>
+        {
+            foreach (var idx in ExpressionRewriter.CollectCorrelationIndices(expr))
+            {
+                result.Add(idx);
+            }
+        });
+        return result;
+    }
+
+    /// <summary>
+    /// Walk every <see cref="ResolvedExpression"/> contained in
+    /// <paramref name="plan"/>'s tree (predicates, projections, equi-keys,
+    /// aggregate args, etc.) and invoke <paramref name="action"/> on each.
+    /// </summary>
+    private static void WalkResolvedExpressions(LogicalPlan plan, Action<ResolvedExpression> action)
+    {
+        switch (plan)
+        {
+            case FilterPlan f:
+                action(f.Predicate);
+                WalkResolvedExpressions(f.Input, action);
+                break;
+            case ProjectPlan p:
+                foreach (var it in p.Projections) action(it.Expression);
+                WalkResolvedExpressions(p.Input, action);
+                break;
+            case JoinPlan j:
+                if (j.Residual is { } res) action(res);
+                WalkResolvedExpressions(j.Left, action);
+                WalkResolvedExpressions(j.Right, action);
+                break;
+            case AggregatePlan a:
+                foreach (var k in a.GroupKeys) action(k);
+                foreach (var c in a.Aggregates)
+                {
+                    if (c.Argument is { } arg) action(arg);
+                }
+
+                WalkResolvedExpressions(a.Input, action);
+                break;
+            case DistinctPlan d:
+                WalkResolvedExpressions(d.Input, action);
+                break;
+            case UnionAllPlan u:
+                foreach (var b in u.Branches) WalkResolvedExpressions(b, action);
+                break;
+            case DifferencePlan diff:
+                WalkResolvedExpressions(diff.Left, action);
+                WalkResolvedExpressions(diff.Right, action);
+                break;
+            case ScalarSubqueryJoinPlan ss:
+                WalkResolvedExpressions(ss.Input, action);
+                foreach (var sq in ss.Subqueries) WalkResolvedExpressions(sq, action);
+                break;
+            case SemiJoinPlan sj:
+                foreach (var k in sj.EquiKeys) action(k.OuterKey);
+                WalkResolvedExpressions(sj.Input, action);
+                WalkResolvedExpressions(sj.Subquery, action);
+                break;
+            // Scan / CteScan / RecursiveCte: no resolved expressions to walk
+            // (they're handled by their own machinery).
+        }
+    }
+
+    /// <summary>
+    /// Locate the outermost <see cref="FilterPlan"/> in a sub-plan tree
+    /// shaped like <c>Project(Filter(Input))</c> (the standard SELECT...
+    /// WHERE shape after resolution). Returns the filter plus a callback that
+    /// rebuilds the surrounding tree with a replacement child.
+    /// </summary>
+    private static (FilterPlan? Filter, Func<LogicalPlan, LogicalPlan> Rebuild) LocateOuterFilter(LogicalPlan plan)
+    {
+        switch (plan)
+        {
+            case FilterPlan f:
+                return (f, replacement => replacement);
+            case ProjectPlan p when p.Input is FilterPlan f2:
+                return (f2, replacement => p with { Input = replacement });
+            default:
+                return (null, x => x);
+        }
     }
 
     /// <summary>
@@ -1272,19 +1607,20 @@ public sealed class Resolver
     private static ResolvedExpression ResolveScalarExpression(
         Expression expr,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null) => expr switch
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null,
+        Schema? outerSchema = null) => expr switch
     {
         LiteralExpression lit => ResolveLiteral(lit),
-        ColumnReference cr => ResolveColumn(cr, schema),
-        UnaryExpression un => ResolveUnary(un, schema, subqueryMap),
-        BinaryExpression bin => ResolveBinary(bin, schema, subqueryMap),
-        IsNullExpression isn => ResolveIsNull(isn, schema, subqueryMap),
-        CastExpression cast => ResolveCast(cast, schema, subqueryMap),
-        FunctionCallExpression fn when !IsAggregateName(fn.FunctionName, fn.IsStar) => ResolveScalarFunction(fn, schema, subqueryMap),
+        ColumnReference cr => ResolveColumn(cr, schema, outerSchema),
+        UnaryExpression un => ResolveUnary(un, schema, subqueryMap, outerSchema),
+        BinaryExpression bin => ResolveBinary(bin, schema, subqueryMap, outerSchema),
+        IsNullExpression isn => ResolveIsNull(isn, schema, subqueryMap, outerSchema),
+        CastExpression cast => ResolveCast(cast, schema, subqueryMap, outerSchema),
+        FunctionCallExpression fn when !IsAggregateName(fn.FunctionName, fn.IsStar) => ResolveScalarFunction(fn, schema, subqueryMap, outerSchema),
         FunctionCallExpression fn => throw new ResolveException(
             $"aggregate function '{fn.FunctionName}' is not allowed here"),
         SubqueryExpression sq => ResolveSubqueryReference(sq, subqueryMap),
-        InListExpression il => ResolveInList(il, schema, subqueryMap),
+        InListExpression il => ResolveInList(il, schema, subqueryMap, outerSchema),
         InSubqueryExpression => throw new ResolveException(
             "IN (subquery) is only supported as a top-level conjunct of WHERE in v1 " +
             "(SELECT / HAVING / nested boolean uses are deferred)"),
@@ -1294,18 +1630,19 @@ public sealed class Resolver
     private static ResolvedExpression ResolveInList(
         InListExpression il,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null)
     {
         if (il.Values.Count == 0)
         {
             throw new ResolveException("IN (...) requires at least one value");
         }
 
-        var probe = ResolveScalarExpression(il.Probe, schema, subqueryMap);
+        var probe = ResolveScalarExpression(il.Probe, schema, subqueryMap, outerSchema);
         var values = new List<ResolvedExpression>(il.Values.Count);
         foreach (var v in il.Values)
         {
-            values.Add(ResolveScalarExpression(v, schema, subqueryMap));
+            values.Add(ResolveScalarExpression(v, schema, subqueryMap, outerSchema));
         }
 
         // Fold a common comparable type across probe and every value, then
@@ -1375,18 +1712,38 @@ public sealed class Resolver
         return new ResolvedLiteral(LiteralKind.Integer, v, new SqlBigintType(false));
     }
 
-    private static ResolvedColumn ResolveColumn(ColumnReference cr, Schema schema)
+    private static ResolvedExpression ResolveColumn(
+        ColumnReference cr, Schema schema, Schema? outerSchema = null)
     {
-        var idx = schema.Resolve(cr.Qualifier, cr.Name);
-        return new ResolvedColumn(idx, schema[idx].Type);
+        var idx = schema.TryResolve(cr.Qualifier, cr.Name);
+        if (idx >= 0)
+        {
+            return new ResolvedColumn(idx, schema[idx].Type);
+        }
+
+        if (outerSchema is not null)
+        {
+            var outerIdx = outerSchema.TryResolve(cr.Qualifier, cr.Name);
+            if (outerIdx >= 0)
+            {
+                return new ResolvedCorrelationRef(outerIdx, outerSchema[outerIdx].Type);
+            }
+        }
+
+        // Re-call the throwing form on the local schema so the error message
+        // matches what callers see today (column-not-found pointing at the
+        // local scope, not the outer scope).
+        schema.Resolve(cr.Qualifier, cr.Name);
+        throw new InvalidOperationException("unreachable");
     }
 
     private static ResolvedExpression ResolveUnary(
         UnaryExpression un,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null)
     {
-        var operand = ResolveScalarExpression(un.Operand, schema, subqueryMap);
+        var operand = ResolveScalarExpression(un.Operand, schema, subqueryMap, outerSchema);
         if (un.Operator == UnaryOperator.Not)
         {
             if (!TypeInference.IsBoolean(operand.Type))
@@ -1409,10 +1766,11 @@ public sealed class Resolver
     private static ResolvedExpression ResolveBinary(
         BinaryExpression bin,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null)
     {
-        var left = ResolveScalarExpression(bin.Left, schema, subqueryMap);
-        var right = ResolveScalarExpression(bin.Right, schema, subqueryMap);
+        var left = ResolveScalarExpression(bin.Left, schema, subqueryMap, outerSchema);
+        var right = ResolveScalarExpression(bin.Right, schema, subqueryMap, outerSchema);
         switch (bin.Operator)
         {
             case BinaryOperator.Add:
@@ -1526,18 +1884,20 @@ public sealed class Resolver
     private static ResolvedExpression ResolveIsNull(
         IsNullExpression isn,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null)
     {
-        var operand = ResolveScalarExpression(isn.Operand, schema, subqueryMap);
+        var operand = ResolveScalarExpression(isn.Operand, schema, subqueryMap, outerSchema);
         return new ResolvedIsNull(operand, isn.Negated, new SqlBooleanType(false));
     }
 
     private static ResolvedExpression ResolveCast(
         CastExpression cast,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null)
     {
-        var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap);
+        var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap, outerSchema);
         var target = TypeInference.FromSpec(cast.TargetType, nullable: operand.Type.Nullable);
         return new ResolvedCast(operand, target);
     }
@@ -1545,7 +1905,8 @@ public sealed class Resolver
     private static ResolvedExpression ResolveScalarFunction(
         FunctionCallExpression fn,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
+        Schema? outerSchema = null)
     {
         if (!BuiltinScalarFunctions.IsKnown(fn.FunctionName))
         {
@@ -1555,7 +1916,7 @@ public sealed class Resolver
         var args = new List<ResolvedExpression>(fn.Arguments.Count);
         foreach (var a in fn.Arguments)
         {
-            args.Add(ResolveScalarExpression(a, schema, subqueryMap));
+            args.Add(ResolveScalarExpression(a, schema, subqueryMap, outerSchema));
         }
 
         return BuiltinScalarFunctions.Resolve(fn.FunctionName, args);

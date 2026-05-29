@@ -121,18 +121,8 @@ public class InSubqueryTests
             "SELECT id FROM t WHERE id IN (SELECT a, b FROM u)"));
     }
 
-    [Fact]
-    public void Resolver_CorrelatedReference_Rejected()
-    {
-        // Correlated reference (subquery references outer column) falls out as
-        // "column not found" — no decorrelation in v1.
-        Assert.Throws<ResolveException>(() => Plan(
-            [
-                "CREATE TABLE t (id INT NOT NULL, k INT NOT NULL)",
-                "CREATE TABLE u (uid INT NOT NULL, k INT NOT NULL)",
-            ],
-            "SELECT id FROM t WHERE id IN (SELECT uid FROM u WHERE u.k = t.k)"));
-    }
+    // Note: correlated IN-subquery is no longer rejected — it's decorrelated.
+    // See CorrelatedInSubqueryTests.cs for the positive coverage.
 
     // ---------- End-to-end ----------
 

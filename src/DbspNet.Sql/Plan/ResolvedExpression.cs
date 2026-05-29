@@ -19,6 +19,22 @@ public sealed record ResolvedLiteral(LiteralKind Kind, object? Value, SqlType Ty
 
 public sealed record ResolvedColumn(int Index, SqlType Type) : ResolvedExpression(Type);
 
+/// <summary>
+/// A reference to an outer-scope column from inside a correlated subquery.
+/// Produced by <see cref="Resolver.ResolveColumn"/> when an identifier misses
+/// in the inner schema but hits in an enclosing <c>outerSchema</c>.
+/// </summary>
+/// <remarks>
+/// The decorrelator (see <c>Resolver.LiftInSubqueryToSemiJoin</c>) walks the
+/// resolved subquery plan, collects every <see cref="ResolvedCorrelationRef"/>,
+/// and rewrites the plan to lift each correlation into an equi-join key
+/// against the outer relation. By the time PlanToCircuit sees the plan,
+/// every correlation ref has been eliminated; the expression compilers
+/// throw if one survives — a defensive invariant.
+/// </remarks>
+public sealed record ResolvedCorrelationRef(int OuterIndex, SqlType Type)
+    : ResolvedExpression(Type);
+
 public sealed record ResolvedBinary(
     BinaryOperator Operator,
     ResolvedExpression Left,

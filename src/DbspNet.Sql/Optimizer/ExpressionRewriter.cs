@@ -104,7 +104,63 @@ internal static class ExpressionRewriter
                     }
 
                     break;
+                case ResolvedCorrelationRef:
+                    // Correlation refs aren't local-column refs — they index
+                    // into the OUTER schema. The decorrelator walks them
+                    // separately via CollectCorrelationIndices.
+                    break;
                 // ResolvedLiteral: no columns.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Collect the set of outer-column indices referenced by
+    /// <see cref="ResolvedCorrelationRef"/> nodes in the expression. Used
+    /// by the decorrelator to identify which outer columns a correlated
+    /// subquery depends on.
+    /// </summary>
+    public static HashSet<int> CollectCorrelationIndices(ResolvedExpression expr)
+    {
+        var set = new HashSet<int>();
+        Walk(expr, set);
+        return set;
+
+        static void Walk(ResolvedExpression e, HashSet<int> acc)
+        {
+            switch (e)
+            {
+                case ResolvedCorrelationRef r:
+                    acc.Add(r.OuterIndex);
+                    break;
+                case ResolvedBinary b:
+                    Walk(b.Left, acc);
+                    Walk(b.Right, acc);
+                    break;
+                case ResolvedUnary u:
+                    Walk(u.Operand, acc);
+                    break;
+                case ResolvedIsNull isn:
+                    Walk(isn.Operand, acc);
+                    break;
+                case ResolvedCast cast:
+                    Walk(cast.Operand, acc);
+                    break;
+                case ResolvedFunctionCall fn:
+                    foreach (var a in fn.Arguments)
+                    {
+                        Walk(a, acc);
+                    }
+
+                    break;
+                case ResolvedInList il:
+                    Walk(il.Probe, acc);
+                    foreach (var v in il.Values)
+                    {
+                        Walk(v, acc);
+                    }
+
+                    break;
             }
         }
     }
@@ -140,6 +196,9 @@ internal static class ExpressionRewriter
                 ShiftArgs(il.Values, delta),
                 il.IsNegated,
                 il.Type),
+            // Correlation refs index OUTER columns, not local ones — shifting
+            // a local-column delta past them is a no-op.
+            ResolvedCorrelationRef => expr,
             _ => expr,
         };
 
@@ -192,6 +251,7 @@ internal static class ExpressionRewriter
                 RemapArgs(il.Values, remap),
                 il.IsNegated,
                 il.Type),
+            ResolvedCorrelationRef => expr,
             _ => expr,
         };
 
@@ -241,6 +301,7 @@ internal static class ExpressionRewriter
                 SubstituteArgs(il.Values, projection),
                 il.IsNegated,
                 il.Type),
+            ResolvedCorrelationRef => expr,
             _ => expr,
         };
 

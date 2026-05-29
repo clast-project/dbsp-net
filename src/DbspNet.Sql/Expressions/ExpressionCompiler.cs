@@ -85,6 +85,9 @@ public static class ExpressionCompiler
         ResolvedCast cast => BuildCast(cast, row),
         ResolvedFunctionCall fn => BuildFunction(fn, row),
         ResolvedInList il => BuildInList(il, row),
+        ResolvedCorrelationRef => throw new InvalidOperationException(
+            "internal: ResolvedCorrelationRef reached ExpressionCompiler — " +
+            "decorrelator should have rewritten every correlation reference"),
         _ => throw new InvalidOperationException($"unsupported expression: {expr.GetType().Name}"),
     };
 
