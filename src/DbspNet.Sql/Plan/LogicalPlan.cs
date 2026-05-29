@@ -140,6 +140,28 @@ public sealed record JoinPlan(
     Schema Schema,
     bool AllowNullKeys = false) : LogicalPlan(Schema);
 
+/// <summary>
+/// Semi-join (equi-keyed): keep every row of <see cref="Input"/> whose
+/// <see cref="OuterKey"/> projection matches at least one value in the
+/// single-column <see cref="Subquery"/>. Output schema is <see cref="Input"/>'s
+/// schema unchanged (the subquery side is consumed by the match check).
+/// Compiles to <c>Distinct(Subquery) ⋈ Input</c> on the equi-key + project
+/// outer columns. Used for the WHERE-level <c>x IN (subquery)</c> rewrite.
+/// </summary>
+/// <remarks>
+/// <para>NULL semantics match the SQL WHERE shape: <c>NULL</c> outer-key
+/// rows are dropped (equi-join filters NULL keys); <c>NULL</c> values in the
+/// subquery never match (same).</para>
+/// <para><see cref="IsAnti"/> is reserved for future <c>NOT IN (subquery)</c>
+/// (anti-semi-join). Always <c>false</c> in v1; resolver rejects the
+/// negated form with an explicit "deferred" message.</para>
+/// </remarks>
+public sealed record SemiJoinPlan(
+    LogicalPlan Input,
+    LogicalPlan Subquery,
+    ResolvedExpression OuterKey,
+    bool IsAnti = false) : LogicalPlan(Input.Schema);
+
 /// <summary>One equi-join conjunct: <c>left[LeftIndex] = right[RightIndex]</c>.</summary>
 public sealed record JoinEquality(int LeftIndex, int RightIndex, SqlType KeyType);
 

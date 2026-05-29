@@ -175,6 +175,12 @@ public static class MonotonicityAnalyzer
                 // Input columns pass through; appended subquery columns are null.
                 return ResizeTo(Visit(s.Input, memo), s.Schema.Count);
 
+            case SemiJoinPlan sj:
+                // Semi-join's output schema is the input's, unchanged — the
+                // subquery side is consumed by the match. Outer monotonicity
+                // carries through.
+                return Visit(sj.Input, memo);
+
             // Recursion + frontier is unsolved here; conservatively not monotone.
             case RecursiveCtePlan r:
                 return new IReadOnlySet<LatenessSource>?[r.Schema.Count];

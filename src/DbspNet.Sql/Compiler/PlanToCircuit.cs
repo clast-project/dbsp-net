@@ -470,6 +470,10 @@ public static class PlanToCircuit
                     }
 
                     break;
+                case SemiJoinPlan sj:
+                    Walk(sj.Input);
+                    Walk(sj.Subquery);
+                    break;
                 case UnionAllPlan u:
                     foreach (var branch in u.Branches)
                     {
@@ -542,6 +546,9 @@ public static class PlanToCircuit
 
             case ScalarSubqueryJoinPlan s:
                 return CompileScalarSubqueryJoin(builder, s, ctx);
+
+            case SemiJoinPlan sj:
+                return CompileSemiJoin(builder, sj, ctx);
 
             case UnionAllPlan u:
                 {
@@ -968,6 +975,70 @@ public static class PlanToCircuit
     /// any allocation works — the singleton just avoids per-row allocation.
     /// </summary>
     private static readonly StructuralRow s_unitKey = new(Array.Empty<object?>());
+
+    /// <summary>
+    /// Compile <c>WHERE probe IN (subquery)</c>: dedup the subquery's column,
+    /// equi-join with the outer rows on <c>probe = subqueryCol</c>, project
+    /// the outer columns. Output preserves outer schema and weights — every
+    /// matching outer row stays once even if the subquery has duplicates
+    /// (the Distinct collapses them). NULL outer-keys and NULL subquery
+    /// values are dropped by the inner-join's NULL-key filter, matching
+    /// SQL three-valued logic at the WHERE boundary.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> CompileSemiJoin(
+        CircuitBuilder builder,
+        SemiJoinPlan plan,
+        CompileContext ctx)
+    {
+        if (plan.IsAnti)
+        {
+            throw new InvalidOperationException(
+                "internal: NOT IN (subquery) reached PlanToCircuit; resolver should have rejected");
+        }
+
+        var outer = CompilePlan(builder, plan.Input, ctx);
+        var subqueryStream = CompilePlan(builder, plan.Subquery, ctx);
+
+        // Distinct the subquery so duplicate target values don't multiply
+        // outer rows on the join. No GC frontier — the subquery's monotonicity
+        // (if any) would need a separate analysis pass.
+        var subqueryDistinct = EmitDistinct(
+            builder, ctx, subqueryStream,
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Subquery.Schema));
+
+        // Build the outer-side key as a 1-column StructuralRow holding the
+        // probe expression's value. The compiled scalar may return null
+        // (NULL probe), which we filter out below.
+        var codec = ctx.Codec;
+        var probeFn = ExpressionCompiler.CompileScalar(plan.OuterKey);
+        var keySchema = new Schema([new SchemaColumn("__semi_key", plan.OuterKey.Type, null)]);
+
+        // Filter NULL probes (NULL = anything is NULL, never TRUE in WHERE)
+        // and NULL subquery values (same reason).
+        var outerNonNull = builder.Filter(outer, row => probeFn(row) is not null);
+        var subqNonNull = builder.Filter(subqueryDistinct, row => row[0] is not null);
+
+        var outerIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            outerNonNull,
+            row => codec.BuildRow(keySchema, new object?[] { probeFn(row) }),
+            row => row);
+        var subqIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            subqNonNull,
+            row => codec.BuildRow(keySchema, new object?[] { row[0] }),
+            row => row);
+
+        var leftJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, plan.Input.Schema);
+        var rightJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, plan.Subquery.Schema);
+
+        // Combine emits ONLY the outer row — semi-join semantics. The
+        // subquery row is consumed by the match check.
+        return EmitInnerJoin(
+            builder, ctx,
+            outerIndexed,
+            subqIndexed,
+            (_, outerRow, _) => outerRow,
+            leftJoinCodec, rightJoinCodec);
+    }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompileScalarSubqueryJoin(
         CircuitBuilder builder,

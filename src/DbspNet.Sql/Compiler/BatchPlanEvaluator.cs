@@ -79,6 +79,9 @@ internal static class BatchPlanEvaluator
             case ScalarSubqueryJoinPlan s:
                 return BatchScalarSubqueryJoin(s, ctx);
 
+            case SemiJoinPlan sj:
+                return BatchSemiJoin(sj, ctx);
+
             case RecursiveCtePlan:
                 throw new InvalidOperationException(
                     "RecursiveCtePlan cannot be batch-evaluated directly; it's handled by RecursiveCteOp.");
@@ -360,6 +363,50 @@ internal static class BatchPlanEvaluator
         AggregateKind.Avg => new SqlAvgAggregator(ExpressionCompiler.CompileScalar(call.Argument!), call.ResultType),
         _ => throw new InvalidOperationException($"unknown aggregate kind {call.Kind}"),
     };
+
+    // ---- Semi-join (uncorrelated IN-subquery) ----
+
+    private static ZSet<StructuralRow, Z64> BatchSemiJoin(SemiJoinPlan plan, BatchEvalContext ctx)
+    {
+        // Mirrors CompileSemiJoin: keep outer rows whose probe is non-null
+        // and matches at least one non-null distinct value in the subquery.
+        // Output schema = outer schema, weights preserved.
+        var outer = Evaluate(plan.Input, ctx);
+        var subquery = Evaluate(plan.Subquery, ctx);
+
+        var matchSet = new HashSet<object>();
+        foreach (var (row, w) in subquery)
+        {
+            if (!Z64.IsPositive(w))
+            {
+                continue;
+            }
+
+            var v = row[0];
+            if (v is not null)
+            {
+                matchSet.Add(v);
+            }
+        }
+
+        var probeFn = ExpressionCompiler.CompileScalar(plan.OuterKey);
+        var builder = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var (row, w) in outer)
+        {
+            var key = probeFn(row);
+            if (key is null)
+            {
+                continue;
+            }
+
+            if (matchSet.Contains(key))
+            {
+                builder.Add(row, w);
+            }
+        }
+
+        return builder.Build();
+    }
 
     // ---- Scalar subquery cross-join ----
 

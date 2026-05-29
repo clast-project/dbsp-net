@@ -65,13 +65,14 @@ public class InListTests
     }
 
     [Fact]
-    public void Parser_InSubquery_RejectedUntilPhase2()
+    public void Parser_InSubquery_ProducesInSubqueryExpression()
     {
-        // Phase 1 only handles the literal-list form. Subquery form raises
-        // a clear error rather than silently mis-parsing.
-        var ex = Assert.Throws<ParseException>(() =>
-            new Parser(Lexer.Tokenize("x IN (SELECT id FROM t)")).ParseExpression());
-        Assert.Contains("subquery", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // Subquery form parses to InSubqueryExpression; see InSubqueryTests
+        // for resolver/compiler coverage of the semi-join lift.
+        var expr = new Parser(Lexer.Tokenize("x IN (SELECT id FROM t)")).ParseExpression();
+        var isq = Assert.IsType<InSubqueryExpression>(expr);
+        Assert.False(isq.IsNegated);
+        Assert.IsType<ColumnReference>(isq.Probe);
     }
 
     [Fact]

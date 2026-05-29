@@ -133,13 +133,47 @@ public sealed class Resolver
         var plan = ResolveFrom(stmt.From, scope);
 
         // WHERE — pre-pass for scalar subqueries referenced in the predicate
-        // (each adds a hidden column via ScalarSubqueryJoinPlan).
+        // (each adds a hidden column via ScalarSubqueryJoinPlan), and a
+        // semi-join lift for any `x IN (subquery)` conjunct.
         if (stmt.Where is not null)
         {
-            plan = WrapWithScalarSubqueries(plan, scope, CollectSubqueries(stmt.Where), out var whereSubMap);
-            var pred = ResolveScalarExpression(stmt.Where, plan.Schema, whereSubMap);
-            EnsureBooleanCoercible(pred, "WHERE");
-            plan = new FilterPlan(plan, pred);
+            // Split at top-level AND so IN-subquery terms can be peeled off
+            // and lifted to SemiJoinPlan; the remaining scalar predicates
+            // stay as a FilterPlan over the result.
+            var conjuncts = SplitAndConjuncts(stmt.Where);
+            var inSubqueries = new List<InSubqueryExpression>();
+            var scalarConjuncts = new List<Expression>();
+            foreach (var c in conjuncts)
+            {
+                if (c is InSubqueryExpression isq)
+                {
+                    if (isq.IsNegated)
+                    {
+                        throw new ResolveException(
+                            "NOT IN (subquery) is not yet supported in v1 (anti-semi-join + NULL handling deferred)");
+                    }
+
+                    inSubqueries.Add(isq);
+                }
+                else
+                {
+                    scalarConjuncts.Add(c);
+                }
+            }
+
+            foreach (var isq in inSubqueries)
+            {
+                plan = LiftInSubqueryToSemiJoin(plan, isq, scope);
+            }
+
+            if (scalarConjuncts.Count > 0)
+            {
+                var remaining = JoinAnd(scalarConjuncts);
+                plan = WrapWithScalarSubqueries(plan, scope, CollectSubqueries(remaining), out var whereSubMap);
+                var pred = ResolveScalarExpression(remaining, plan.Schema, whereSubMap);
+                EnsureBooleanCoercible(pred, "WHERE");
+                plan = new FilterPlan(plan, pred);
+            }
         }
 
         // Aggregation?
@@ -1015,8 +1049,88 @@ public sealed class Resolver
                 }
 
                 break;
+            case InSubqueryExpression:
+                // Don't recurse — InSubqueryExpression is either lifted to a
+                // SemiJoinPlan by the WHERE pre-pass (its inner subquery is
+                // handled there with its own scope) or rejected by
+                // ResolveScalarExpression with a "deferred" error.
+                break;
             // Literals, column refs: no subqueries possible.
         }
+    }
+
+    /// <summary>
+    /// Walk a boolean expression and return its top-level AND conjuncts.
+    /// Non-AND expressions return as a single-element list. Used by the
+    /// WHERE pre-pass to peel <c>IN (subquery)</c> terms off into a
+    /// <see cref="SemiJoinPlan"/> while keeping scalar predicates in a
+    /// <see cref="FilterPlan"/>.
+    /// </summary>
+    private static List<Expression> SplitAndConjuncts(Expression expr)
+    {
+        var result = new List<Expression>();
+        Walk(expr, result);
+        return result;
+
+        static void Walk(Expression e, List<Expression> acc)
+        {
+            if (e is BinaryExpression { Operator: BinaryOperator.And } b)
+            {
+                Walk(b.Left, acc);
+                Walk(b.Right, acc);
+            }
+            else
+            {
+                acc.Add(e);
+            }
+        }
+    }
+
+    /// <summary>Re-AND a non-empty conjunct list into a left-leaning chain.</summary>
+    private static Expression JoinAnd(IReadOnlyList<Expression> conjuncts)
+    {
+        var acc = conjuncts[0];
+        for (var i = 1; i < conjuncts.Count; i++)
+        {
+            acc = new BinaryExpression(BinaryOperator.And, acc, conjuncts[i]);
+        }
+
+        return acc;
+    }
+
+    /// <summary>
+    /// Lift a single <c>probe IN (subquery)</c> conjunct into a
+    /// <see cref="SemiJoinPlan"/> over <paramref name="plan"/>. The subquery
+    /// is resolved with CTE-only scope (no outer-column access — correlation
+    /// falls out as "column not found" the same way uncorrelated scalar
+    /// subqueries do today).
+    /// </summary>
+    private LogicalPlan LiftInSubqueryToSemiJoin(
+        LogicalPlan plan,
+        InSubqueryExpression isq,
+        IReadOnlyDictionary<string, CteRef> cteScope)
+    {
+        var probe = ResolveScalarExpression(isq.Probe, plan.Schema);
+        var subPlan = ResolveQuery(isq.Subquery.Query, cteScope);
+        if (subPlan.Schema.Count != 1)
+        {
+            throw new ResolveException(
+                $"IN-subquery must return exactly 1 column; got {subPlan.Schema.Count}");
+        }
+
+        // Promote probe and subquery column to a common comparable type so
+        // the downstream join's equi-key compare is well-defined.
+        var common = TypeInference.CommonComparableType(probe.Type, subPlan.Schema[0].Type);
+        probe = MaybeCast(probe, common);
+        if (!SameTypeIgnoringNullable(subPlan.Schema[0].Type, common))
+        {
+            // Project the subquery's single column to the common type.
+            var projected = new ResolvedCast(new ResolvedColumn(0, subPlan.Schema[0].Type), common);
+            var col = new ProjectionItem(projected, subPlan.Schema[0].Name, subPlan.Schema[0].Qualifier);
+            subPlan = new ProjectPlan(subPlan, [col], new Schema([new SchemaColumn(col.Name, common, col.Qualifier)]));
+        }
+
+        return new SemiJoinPlan(plan, subPlan, probe, IsAnti: false);
     }
 
     /// <summary>
@@ -1171,6 +1285,9 @@ public sealed class Resolver
             $"aggregate function '{fn.FunctionName}' is not allowed here"),
         SubqueryExpression sq => ResolveSubqueryReference(sq, subqueryMap),
         InListExpression il => ResolveInList(il, schema, subqueryMap),
+        InSubqueryExpression => throw new ResolveException(
+            "IN (subquery) is only supported as a top-level conjunct of WHERE in v1 " +
+            "(SELECT / HAVING / nested boolean uses are deferred)"),
         _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
     };
 

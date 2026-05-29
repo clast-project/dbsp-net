@@ -97,3 +97,16 @@ public sealed record InListExpression(
     Expression Probe,
     IReadOnlyList<Expression> Values,
     bool IsNegated) : Expression;
+
+/// <summary>
+/// <c>probe [NOT] IN (subquery)</c> — the subquery form of <c>IN</c>.
+/// Uncorrelated only; the subquery body has no access to outer-scope
+/// columns. Resolves to a <see cref="Plan.SemiJoinPlan"/> when used as a
+/// (top-level conjunct of a) WHERE predicate; rejects with a clear
+/// "deferred" error in other expression positions (SELECT / HAVING /
+/// nested boolean).
+/// </summary>
+public sealed record InSubqueryExpression(
+    Expression Probe,
+    SubqueryExpression Subquery,
+    bool IsNegated) : Expression;

@@ -681,9 +681,10 @@ public sealed class Parser
         var next = Peek().Kind;
         if (next == TokenKind.Select || next == TokenKind.With)
         {
-            // Reserved for Phase 2b — IN-subquery. Until that lands, raise a
-            // clear error rather than silently mis-parsing.
-            throw Error(Peek(), "IN (subquery) is not yet supported in v1");
+            var sq = ParseQuery();
+            Expect(TokenKind.RParen);
+            _ = inPos;
+            return new InSubqueryExpression(probe, new SubqueryExpression(sq), isNegated);
         }
 
         var values = new List<Expression> { ParseExpression() };
@@ -694,7 +695,7 @@ public sealed class Parser
         }
 
         Expect(TokenKind.RParen);
-        _ = inPos; // reserved for future source-position tracking on IN
+        _ = inPos;
         return new InListExpression(probe, values, isNegated);
     }
 

@@ -94,6 +94,11 @@ public static class PlanOptimizer
                 Input = OptimizeNode(s.Input),
                 Subqueries = OptimizeBranches(s.Subqueries),
             },
+            SemiJoinPlan sj => sj with
+            {
+                Input = OptimizeNode(sj.Input),
+                Subquery = OptimizeNode(sj.Subquery),
+            },
             // ScanPlan / CteScanPlan: leaves (CTE body was already optimized
             // at its defining site or we skip to avoid breaking sharing).
             // RecursiveCtePlan: the base/step subplans are executed by a
