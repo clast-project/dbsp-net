@@ -1202,19 +1202,6 @@ public sealed class Resolver
                 $"IN-subquery must return exactly 1 column; got {subPlan.Schema.Count}");
         }
 
-        if (isq.IsNegated
-            && (probe.Type.Nullable || subPlan.Schema[0].Type.Nullable))
-        {
-            // SQL 3VL: `x NOT IN (sq)` is NULL when x is NULL OR any value
-            // in sq is NULL (with no match found). Implementing the full
-            // semantics needs an "any NULL in sq" scalar-subquery layer
-            // atop the anti-semi-join. For v1, restrict NOT IN to NOT NULL
-            // operands; the user can use NOT EXISTS for the nullable case.
-            throw new ResolveException(
-                "NOT IN (subquery) with nullable operands requires three-valued NULL handling " +
-                "(deferred); both the probe and the subquery column must be NOT NULL");
-        }
-
         // Detect correlations introduced via ResolvedCorrelationRef and
         // decorrelate: returns the rewritten subquery plan with the
         // correlation columns appended to its schema, plus the per-outer-index
@@ -1251,6 +1238,18 @@ public sealed class Resolver
             decorrelated = new ProjectPlan(decorrelated, projItems, new Schema(newCols));
         }
 
+        // For NOT IN with nullable probe or nullable subquery column, SQL
+        // 3VL says the row drops when probe is NULL OR (no match found AND
+        // any value in the subquery is NULL). The anti-semi-join handles
+        // "no match found"; the rest is layered via LayerNullCountAndFilter:
+        // it appends a hidden per-correlation-group null-count column,
+        // then filters on probe IS NOT NULL AND (null_count IS NULL OR = 0).
+        if (isq.IsNegated
+            && (probe.Type.Nullable || decorrelated.Schema[probeInnerIndex].Type.Nullable))
+        {
+            plan = LayerNullCountAndFilter(plan, decorrelated, correlationKeys, probe, probeInnerIndex);
+        }
+
         var equiKeys = new List<SemiJoinEqui>(correlationKeys.Count + 1)
         {
             new SemiJoinEqui(probe, probeInnerIndex, common),
@@ -1258,6 +1257,107 @@ public sealed class Resolver
         equiKeys.AddRange(correlationKeys);
 
         return new SemiJoinPlan(plan, decorrelated, equiKeys, IsAnti: isq.IsNegated);
+    }
+
+    /// <summary>
+    /// For nullable-operand <c>NOT IN (subquery)</c>: layer a hidden
+    /// "null_count" column onto <paramref name="plan"/> (per-correlation-
+    /// group when correlated, single global value when uncorrelated),
+    /// then add a <see cref="FilterPlan"/> that enforces SQL three-valued
+    /// semantics — drop the row if the probe is NULL or the subquery's
+    /// correlation group contains any NULL value.
+    /// </summary>
+    /// <remarks>
+    /// The null-count plan is built by filtering the decorrelated subquery
+    /// to value-is-NULL rows and aggregating <c>COUNT(*)</c> grouped by
+    /// the correlation columns. For uncorrelated cases the aggregate has
+    /// no group keys (single global count); for correlated cases it
+    /// groups by the correlation columns. Wraps via the existing
+    /// <see cref="ScalarSubqueryJoinPlan"/> / <see cref="CorrelatedScalarSubqueryJoinPlan"/>
+    /// machinery so the appended column is nullable (LEFT JOIN null-pad
+    /// covers correlation groups with no inner rows, and DbspNet's
+    /// aggregate emits no row for empty inputs).
+    /// </remarks>
+    private static LogicalPlan LayerNullCountAndFilter(
+        LogicalPlan plan,
+        LogicalPlan decorrelated,
+        IReadOnlyList<SemiJoinEqui> correlationKeys,
+        ResolvedExpression probe,
+        int probeInnerIndex)
+    {
+        // Step 1: Filter the decorrelated subquery to rows where the value
+        // column is NULL.
+        var valueType = decorrelated.Schema[probeInnerIndex].Type;
+        var valueColRef = new ResolvedColumn(probeInnerIndex, valueType);
+        var isNullPred = new ResolvedIsNull(valueColRef, Negated: false, new SqlBooleanType(false));
+        LogicalPlan nullsOnly = new FilterPlan(decorrelated, isNullPred);
+
+        // Step 2: Aggregate COUNT(*) over the NULL-filtered subquery,
+        // grouped by correlation columns (or no group key if uncorrelated).
+        var groupKeys = new List<ResolvedExpression>(correlationKeys.Count);
+        var groupKeyCols = new List<SchemaColumn>(correlationKeys.Count);
+        for (var i = 0; i < correlationKeys.Count; i++)
+        {
+            var k = correlationKeys[i];
+            groupKeys.Add(new ResolvedColumn(k.InnerColumnIndex, k.Type));
+            groupKeyCols.Add(new SchemaColumn("__null_corr_" + i, k.Type));
+        }
+
+        var countType = new SqlBigintType(false);
+        var aggregates = new List<AggregateCall>
+        {
+            new AggregateCall(AggregateKind.CountStar, Argument: null, countType),
+        };
+
+        var aggSchemaCols = new List<SchemaColumn>(groupKeyCols.Count + 1);
+        aggSchemaCols.AddRange(groupKeyCols);
+        aggSchemaCols.Add(new SchemaColumn("__null_count", countType));
+        LogicalPlan nullCountPlan = new AggregatePlan(
+            nullsOnly, groupKeys, aggregates, new Schema(aggSchemaCols));
+
+        // For the uncorrelated case the ScalarSubqueryJoinPlan expects a
+        // single-column subquery, which matches here (no group keys).
+        // For the correlated case the inner is [__null_corr_0..N, __null_count];
+        // the CorrelatedScalarSubqueryJoinPlan reads the last column.
+
+        // Step 3: Layer as hidden column on `plan`. The added column lands
+        // at index plan.Schema.Count and is nullable (LEFT JOIN null-pad).
+        var hiddenColType = countType.WithNullable(true);
+        var hiddenColName = $"$nullcnt{plan.Schema.Count}";
+        var augmentedSchema = plan.Schema.Concat(
+            new Schema([new SchemaColumn(hiddenColName, hiddenColType)]));
+        var nullCountColIndex = plan.Schema.Count;
+
+        if (correlationKeys.Count > 0)
+        {
+            var scalarIdx = nullCountPlan.Schema.Count - 1;
+            plan = new CorrelatedScalarSubqueryJoinPlan(
+                plan, nullCountPlan, correlationKeys, scalarIdx, augmentedSchema);
+        }
+        else
+        {
+            plan = new ScalarSubqueryJoinPlan(
+                plan, new List<LogicalPlan> { nullCountPlan }, augmentedSchema);
+        }
+
+        // Step 4: Build the 3VL filter predicate:
+        //   probe IS NOT NULL AND (null_count IS NULL OR null_count = 0)
+        var boolNonNull = new SqlBooleanType(false);
+        var boolNullable = new SqlBooleanType(true);
+        ResolvedExpression probeNotNull = new ResolvedIsNull(probe, Negated: true, boolNonNull);
+
+        var nullCountCol = new ResolvedColumn(nullCountColIndex, hiddenColType);
+        ResolvedExpression nullCountIsNull =
+            new ResolvedIsNull(nullCountCol, Negated: false, boolNonNull);
+        var zeroLit = new ResolvedLiteral(LiteralKind.Integer, 0L, countType);
+        ResolvedExpression nullCountEqZero = new ResolvedBinary(
+            BinaryOperator.Equal, nullCountCol, zeroLit, boolNullable);
+        ResolvedExpression nullCountIsNullOrZero = new ResolvedBinary(
+            BinaryOperator.Or, nullCountIsNull, nullCountEqZero, boolNullable);
+        ResolvedExpression filter = new ResolvedBinary(
+            BinaryOperator.And, probeNotNull, nullCountIsNullOrZero, boolNullable);
+
+        return new FilterPlan(plan, filter);
     }
 
     /// <summary>

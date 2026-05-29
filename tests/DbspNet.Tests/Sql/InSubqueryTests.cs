@@ -114,29 +114,8 @@ public class InSubqueryTests
         Assert.Single(semi.EquiKeys);
     }
 
-    [Fact]
-    public void Resolver_NotInSubquery_NullableProbe_Rejected()
-    {
-        var ex = Assert.Throws<ResolveException>(() => Plan(
-            [
-                "CREATE TABLE t (id INT)",  // nullable probe
-                "CREATE TABLE u (uid INT NOT NULL)",
-            ],
-            "SELECT id FROM t WHERE id NOT IN (SELECT uid FROM u)"));
-        Assert.Contains("NOT IN", ex.Message);
-        Assert.Contains("NOT NULL", ex.Message);
-    }
-
-    [Fact]
-    public void Resolver_NotInSubquery_NullableSubqueryCol_Rejected()
-    {
-        Assert.Throws<ResolveException>(() => Plan(
-            [
-                "CREATE TABLE t (id INT NOT NULL)",
-                "CREATE TABLE u (uid INT)",  // nullable subquery col
-            ],
-            "SELECT id FROM t WHERE id NOT IN (SELECT uid FROM u)"));
-    }
+    // The previous nullable-NOT-IN rejection tests were replaced once
+    // full 3VL ships — see NullableNotInTests.cs for the positive coverage.
 
     [Fact]
     public void Resolver_MultiColumnSubquery_Rejected()
