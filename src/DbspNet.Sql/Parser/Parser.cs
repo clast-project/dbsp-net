@@ -840,11 +840,63 @@ public sealed class Parser
                 return ParseCastExpression();
             case TokenKind.Coalesce:
                 return ParseCoalesceExpression();
+            case TokenKind.Exists:
+                return ParseExistsExpression();
             case TokenKind.Identifier:
                 return ParseIdentifierExpression();
             default:
                 throw Error(t, $"expected expression, got {Describe(t)}");
         }
+    }
+
+    /// <summary>
+    /// <c>EXISTS (subquery)</c> — desugar at parse time to
+    /// <c>COALESCE((SELECT COUNT(*) FROM (subquery)), 0) &gt; 0</c>. The
+    /// synthesized scalar subquery rides on the existing
+    /// <see cref="Plan.Resolver.WrapWithScalarSubqueries"/> machinery; no
+    /// new resolver case, no new operator. <c>NOT EXISTS (sq)</c> falls
+    /// out naturally as <c>NOT (count &gt; 0)</c> via the existing unary-NOT
+    /// handling at <see cref="ParseNot"/>.
+    /// </summary>
+    /// <remarks>
+    /// The <c>COALESCE(..., 0)</c> wrap is load-bearing for NOT EXISTS over
+    /// an empty subquery: DbspNet's incremental aggregate emits no row for
+    /// an empty input (its observable behaviour, see
+    /// <c>WhereScalarSubquery_EmptySubquery_ComparisonYieldsNull_FiltersOut</c>),
+    /// so the bare <c>(SELECT COUNT(*) FROM (sq))</c> evaluates to NULL on
+    /// empty <c>sq</c>. Without COALESCE, <c>NOT (NULL &gt; 0)</c> stays NULL
+    /// and WHERE would drop the row instead of passing it. Standard SQL has
+    /// <c>COUNT(*)</c> always return one row, so the COALESCE is a no-op
+    /// against any conformant input; it's the engine-quirk shim.
+    /// </remarks>
+    private Expression ParseExistsExpression()
+    {
+        Expect(TokenKind.Exists);
+        Expect(TokenKind.LParen);
+        if (Peek().Kind is not TokenKind.Select and not TokenKind.With)
+        {
+            throw Error(Peek(), "EXISTS requires a parenthesised subquery");
+        }
+
+        var inner = ParseQuery();
+        Expect(TokenKind.RParen);
+
+        var derived = new DerivedTableReference(inner, Alias: "__exists_inner");
+        var countStar = new FunctionCallExpression("count", Array.Empty<Expression>(), IsStar: true);
+        var countSelect = new SelectStatement(
+            Items: [new ExpressionSelectItem(countStar, Alias: null)],
+            From: derived,
+            Where: null,
+            GroupBy: Array.Empty<Expression>(),
+            Having: null,
+            Ctes: Array.Empty<CteDefinition>());
+        var countSubquery = new SubqueryExpression(countSelect);
+        var zero = new LiteralExpression(LiteralKind.Integer, 0L);
+        var coalesced = new FunctionCallExpression(
+            "coalesce",
+            new Expression[] { countSubquery, zero },
+            IsStar: false);
+        return new BinaryExpression(BinaryOperator.Greater, coalesced, zero);
     }
 
     private CastExpression ParseCastExpression()
