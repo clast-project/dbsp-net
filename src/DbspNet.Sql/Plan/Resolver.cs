@@ -1465,6 +1465,186 @@ public sealed class Resolver
     /// <see cref="DecorrelateSubqueryPlan"/>.
     /// </summary>
     /// <summary>
+    /// Decorrelate a correlated scalar subquery. Expected shape (post-resolve)
+    /// is <c>Project(Aggregate(GroupKeys=[…], Aggregates=[scalar],
+    /// Filter(p, Scan(...))))</c> — the user wrote
+    /// <c>SELECT MAX(y) FROM t WHERE t.k = outer.k</c>. The decorrelator
+    /// strips the equi-correlation predicate from the inner filter,
+    /// prepends correlation columns to the aggregate's GROUP BY, and
+    /// rebuilds the outer Project to expose [corr_0, …, corr_N, scalar].
+    /// Returns the rewritten plan plus the equi-key list and the index of
+    /// the scalar column in the new schema.
+    /// </summary>
+    private (LogicalPlan Plan, IReadOnlyList<SemiJoinEqui> CorrelationKeys, int ScalarColumnIndex)
+        DecorrelateScalarSubqueryPlan(LogicalPlan subPlan, Schema outerSchema)
+    {
+        // v1 only handles Project(Aggregate(Filter(...))) shape. Unwrap the
+        // outer Project and find an AggregatePlan above a FilterPlan.
+        if (subPlan is not ProjectPlan outerProject)
+        {
+            throw new ResolveException(
+                "correlated scalar subquery must end in a projection over an aggregate in v1");
+        }
+
+        if (outerProject.Input is not AggregatePlan aggregate)
+        {
+            throw new ResolveException(
+                "correlated scalar subquery without an aggregate is not supported in v1 " +
+                "(the inner must group its result per correlation key)");
+        }
+
+        if (aggregate.Input is not FilterPlan filter)
+        {
+            throw new ResolveException(
+                "correlated scalar subquery's inner aggregate must filter the input directly in v1");
+        }
+
+        // Correlation must live ONLY inside the FilterPlan's predicate.
+        // Anywhere else (in GroupKeys, in Aggregates, in scalar projections)
+        // is out of scope for v1.
+        var inGroupKeys = aggregate.GroupKeys.Any(k =>
+            ExpressionRewriter.CollectCorrelationIndices(k).Count > 0);
+        var inAggregates = aggregate.Aggregates.Any(a =>
+            a.Argument is { } arg && ExpressionRewriter.CollectCorrelationIndices(arg).Count > 0);
+        if (inGroupKeys || inAggregates)
+        {
+            throw new ResolveException(
+                "correlated scalar subquery with correlation inside the aggregate or " +
+                "GROUP BY is not supported in v1");
+        }
+
+        var inProjections = outerProject.Projections.Any(p =>
+            ExpressionRewriter.CollectCorrelationIndices(p.Expression).Count > 0);
+        if (inProjections)
+        {
+            throw new ResolveException(
+                "correlated scalar subquery with correlation inside its SELECT projection is not supported in v1");
+        }
+
+        // Split the FilterPlan's predicate at top-level AND. Pull out the
+        // equi-correlation conjuncts; the rest stays as the residual filter.
+        var conjuncts = ExpressionRewriter.SplitAnd(filter.Predicate);
+        var matched = new Dictionary<int, int>();    // outer-index → inner-column-index in Filter's schema
+        var residual = new List<ResolvedExpression>();
+        foreach (var c in conjuncts)
+        {
+            if (TryMatchEquiCorrelation(c, out var oIdx, out var iIdx))
+            {
+                if (matched.ContainsKey(oIdx))
+                {
+                    throw new ResolveException(
+                        "correlated scalar subquery references the same outer column via multiple equi-predicates");
+                }
+
+                matched[oIdx] = iIdx;
+            }
+            else if (ExpressionRewriter.CollectCorrelationIndices(c).Count > 0)
+            {
+                throw new ResolveException(
+                    "only equi-correlation predicates (outer.col = inner.col) are supported in v1");
+            }
+            else
+            {
+                residual.Add(c);
+            }
+        }
+
+        if (matched.Count == 0)
+        {
+            throw new ResolveException(
+                "correlated scalar subquery has correlation refs but no equi-correlation predicate was found");
+        }
+
+        // Rebuild the filter without correlation conjuncts.
+        LogicalPlan filteredInput = residual.Count == 0
+            ? filter.Input
+            : new FilterPlan(filter.Input, ExpressionRewriter.AndAll(residual));
+
+        // Prepend correlation columns to the aggregate's GroupKeys. The
+        // aggregate's output schema becomes
+        //   [user GroupKeys..., correlation GroupKeys..., aggregate results...].
+        // Reorder so correlation columns come FIRST, matching the
+        // CorrelatedScalarSubqueryJoinPlan's expected
+        // [__corr_0, ..., __corr_N, ..., scalar] shape; the
+        // outer Project re-references them by their new positions.
+        var orderedOuter = matched.Keys.ToList();
+        orderedOuter.Sort();
+
+        var newGroupKeys = new List<ResolvedExpression>(orderedOuter.Count + aggregate.GroupKeys.Count);
+        var newGroupKeyAstCount = orderedOuter.Count + aggregate.GroupKeys.Count;
+        var correlationInnerSchemaCols = new List<SchemaColumn>(orderedOuter.Count);
+        var equiKeys = new List<SemiJoinEqui>(orderedOuter.Count);
+        for (var i = 0; i < orderedOuter.Count; i++)
+        {
+            var outerIdx = orderedOuter[i];
+            var innerIdx = matched[outerIdx];
+            var innerType = filter.Input.Schema[innerIdx].Type;
+            var common = TypeInference.CommonComparableType(
+                outerSchema[outerIdx].Type, innerType);
+            ResolvedExpression projected = new ResolvedColumn(innerIdx, innerType);
+            if (!SameTypeIgnoringNullable(innerType, common))
+            {
+                projected = new ResolvedCast(projected, common);
+            }
+
+            newGroupKeys.Add(projected);
+            correlationInnerSchemaCols.Add(new SchemaColumn($"__corr_{i}", common));
+            equiKeys.Add(new SemiJoinEqui(
+                new ResolvedColumn(outerIdx, outerSchema[outerIdx].Type),
+                InnerColumnIndex: i,
+                Type: common));
+        }
+
+        // Append the user's existing GroupKeys (preserve their semantics).
+        foreach (var k in aggregate.GroupKeys)
+        {
+            newGroupKeys.Add(k);
+        }
+
+        // Build the aggregate's new schema:
+        // [__corr_0..N, user GroupKey cols..., aggregate-result cols...].
+        var aggOutCols = new List<SchemaColumn>(aggregate.Schema.Count + orderedOuter.Count);
+        aggOutCols.AddRange(correlationInnerSchemaCols);
+        // The aggregate's existing schema layout = [user GroupKeys..., agg results...].
+        for (var i = 0; i < aggregate.Schema.Count; i++)
+        {
+            aggOutCols.Add(aggregate.Schema[i]);
+        }
+
+        var newAggregate = new AggregatePlan(
+            filteredInput, newGroupKeys, aggregate.Aggregates, new Schema(aggOutCols));
+
+        // Rebuild the outer Project: prepend correlation column refs
+        // (now at indices [0, N) of the aggregate's schema), then re-emit
+        // the user's original projections shifted by N.
+        var newProjs = new List<ProjectionItem>(orderedOuter.Count + outerProject.Projections.Count);
+        var newProjCols = new List<SchemaColumn>(orderedOuter.Count + outerProject.Projections.Count);
+        for (var i = 0; i < orderedOuter.Count; i++)
+        {
+            var col = correlationInnerSchemaCols[i];
+            newProjs.Add(new ProjectionItem(
+                new ResolvedColumn(i, col.Type), col.Name, col.Qualifier));
+            newProjCols.Add(col);
+        }
+
+        // The user's projections referenced the OLD aggregate schema
+        // (where aggregate-result columns start at GroupKeys.Count). The
+        // new aggregate schema shifts user GroupKey + aggregate-result
+        // columns by N (the correlation columns added in front).
+        for (var i = 0; i < outerProject.Projections.Count; i++)
+        {
+            var p = outerProject.Projections[i];
+            var shifted = ExpressionRewriter.ShiftColumnIndices(p.Expression, delta: orderedOuter.Count);
+            newProjs.Add(new ProjectionItem(shifted, p.Name, p.Qualifier));
+            newProjCols.Add(new SchemaColumn(p.Name, shifted.Type, p.Qualifier));
+        }
+
+        var newProject = new ProjectPlan(newAggregate, newProjs, new Schema(newProjCols));
+        var scalarIdx = newProject.Schema.Count - 1;
+        return (newProject, equiKeys, scalarIdx);
+    }
+
+    /// <summary>
     /// Collect every outer-column index referenced by a
     /// <see cref="ResolvedCorrelationRef"/> anywhere in the plan tree.
     /// </summary>
@@ -1576,8 +1756,13 @@ public sealed class Resolver
             return plan;
         }
 
-        var subPlans = new List<LogicalPlan>();
-        var newCols = new List<SchemaColumn>(plan.Schema.Columns);
+        // Uncorrelated subqueries stay batched in a single
+        // ScalarSubqueryJoinPlan (one hidden column per subquery, unit-key
+        // LEFT JOIN — the existing path). Correlated subqueries each get
+        // their own layered CorrelatedScalarSubqueryJoinPlan on top of the
+        // running plan because every one has its own equi-key tuple.
+        var uncorrelatedSubPlans = new List<LogicalPlan>();
+        var uncorrelatedSubqueries = new List<SubqueryExpression>();
 
         foreach (var sq in subqueries)
         {
@@ -1592,23 +1777,54 @@ public sealed class Resolver
                 continue;
             }
 
-            var subPlan = ResolveQuery(sq.Query, cteScope);
+            var subPlan = ResolveQuery(sq.Query, cteScope, outerSchema: plan.Schema);
             if (subPlan.Schema.Count != 1)
             {
                 throw new ResolveException(
                     $"scalar subquery must return exactly 1 column; got {subPlan.Schema.Count}");
             }
 
-            // Empty subquery → NULL contribution, so result is nullable
-            // regardless of the subquery column's declared nullability.
-            var resultType = subPlan.Schema[0].Type.WithNullable(true);
-            var colIdx = plan.Schema.Count + subPlans.Count;
-            map[sq] = new SubqueryBinding(colIdx, resultType);
-            subPlans.Add(subPlan);
-            newCols.Add(new SchemaColumn($"$sub{colIdx}", resultType));
+            var correlations = FindAllCorrelations(subPlan);
+            if (correlations.Count == 0)
+            {
+                uncorrelatedSubPlans.Add(subPlan);
+                uncorrelatedSubqueries.Add(sq);
+                continue;
+            }
+
+            // Correlated scalar subquery: decorrelate to a multi-column
+            // LEFT JOIN. Layer one CorrelatedScalarSubqueryJoinPlan per
+            // correlated subquery on top of the running plan; the binding
+            // points at the appended scalar column on this new layer.
+            var (decorrelated, correlationKeys, scalarIdx) =
+                DecorrelateScalarSubqueryPlan(subPlan, plan.Schema);
+            var scalarType = decorrelated.Schema[scalarIdx].Type.WithNullable(true);
+            var hiddenColIdx = plan.Schema.Count;
+            var hiddenColName = $"$sub{hiddenColIdx}";
+            var newSchema = plan.Schema.Concat(
+                new Schema([new SchemaColumn(hiddenColName, scalarType)]));
+            plan = new CorrelatedScalarSubqueryJoinPlan(
+                plan, decorrelated, correlationKeys, scalarIdx, newSchema);
+            map[sq] = new SubqueryBinding(hiddenColIdx, scalarType);
         }
 
-        return new ScalarSubqueryJoinPlan(plan, subPlans, new Schema(newCols));
+        if (uncorrelatedSubPlans.Count > 0)
+        {
+            var newCols = new List<SchemaColumn>(plan.Schema.Columns);
+            for (var i = 0; i < uncorrelatedSubPlans.Count; i++)
+            {
+                var sq = uncorrelatedSubqueries[i];
+                var subPlan = uncorrelatedSubPlans[i];
+                var resultType = subPlan.Schema[0].Type.WithNullable(true);
+                var colIdx = plan.Schema.Count + i;
+                map[sq] = new SubqueryBinding(colIdx, resultType);
+                newCols.Add(new SchemaColumn($"$sub{colIdx}", resultType));
+            }
+
+            plan = new ScalarSubqueryJoinPlan(plan, uncorrelatedSubPlans, new Schema(newCols));
+        }
+
+        return plan;
     }
 
     // ---------- Aggregate collection (pre-walk) ----------

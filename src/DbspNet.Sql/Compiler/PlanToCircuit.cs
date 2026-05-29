@@ -474,6 +474,10 @@ public static class PlanToCircuit
                     Walk(sj.Input);
                     Walk(sj.Subquery);
                     break;
+                case CorrelatedScalarSubqueryJoinPlan csp:
+                    Walk(csp.Input);
+                    Walk(csp.Subquery);
+                    break;
                 case UnionAllPlan u:
                     foreach (var branch in u.Branches)
                     {
@@ -549,6 +553,9 @@ public static class PlanToCircuit
 
             case SemiJoinPlan sj:
                 return CompileSemiJoin(builder, sj, ctx);
+
+            case CorrelatedScalarSubqueryJoinPlan csp:
+                return CompileCorrelatedScalarSubqueryJoin(builder, csp, ctx);
 
             case UnionAllPlan u:
                 {
@@ -1158,6 +1165,117 @@ public static class PlanToCircuit
             joinCombine: (_, outerRow, scalarRow) => AppendColumn(codec, null, outerRow, scalarRow[0]),
             nullPadCombine: (_, outerRow) => AppendColumn(codec, null, outerRow, null),
             leftCodec, rightCodec);
+    }
+
+    /// <summary>
+    /// Compile a correlated scalar subquery LEFT JOIN: the inner subquery
+    /// schema is <c>[__corr_0, ..., __corr_N, scalar]</c>; we equi-join
+    /// outer with it on the composite correlation key, append the scalar
+    /// (or NULL on no match) to the outer row.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> CompileCorrelatedScalarSubqueryJoin(
+        CircuitBuilder builder,
+        CorrelatedScalarSubqueryJoinPlan plan,
+        CompileContext ctx)
+    {
+        if (plan.CorrelationKeys.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "internal: CorrelatedScalarSubqueryJoinPlan with no correlation keys — " +
+                "the resolver should have produced a ScalarSubqueryJoinPlan instead");
+        }
+
+        var outer = CompilePlan(builder, plan.Input, ctx);
+        var subqueryStream = CompilePlan(builder, plan.Subquery, ctx);
+        var codec = ctx.Codec;
+        var outerSchema = plan.Input.Schema;
+        var joinedSchema = plan.Schema;
+
+        var probeFns = new Func<IReadOnlyList<object?>, object?>[plan.CorrelationKeys.Count];
+        for (var i = 0; i < plan.CorrelationKeys.Count; i++)
+        {
+            probeFns[i] = ExpressionCompiler.CompileScalar(plan.CorrelationKeys[i].OuterKey);
+        }
+
+        var innerIndices = new int[plan.CorrelationKeys.Count];
+        var keyCols = new SchemaColumn[plan.CorrelationKeys.Count];
+        for (var i = 0; i < plan.CorrelationKeys.Count; i++)
+        {
+            innerIndices[i] = plan.CorrelationKeys[i].InnerColumnIndex;
+            keyCols[i] = new SchemaColumn("__corr_key_" + i, plan.CorrelationKeys[i].Type, null);
+        }
+
+        var keySchema = new Schema(keyCols);
+        var scalarColumnIndex = plan.ScalarColumnIndex;
+
+        // Outer rows with a NULL component in the correlation key tuple
+        // can never match (NULL = anything is NULL); route them to the
+        // NULL-padded branch directly rather than through the join.
+        var validKeyOuter = builder.Filter(outer, row => HasNoNullProbe(probeFns, row));
+        var nullKeyOuter = builder.Filter(outer, row => !HasNoNullProbe(probeFns, row));
+
+        // Drop inner rows whose correlation tuple has any NULL — they
+        // wouldn't match a non-NULL outer key either.
+        var validInner = builder.Filter(subqueryStream, row =>
+        {
+            for (var i = 0; i < innerIndices.Length; i++)
+            {
+                if (row[innerIndices[i]] is null)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        var outerIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            validKeyOuter,
+            row =>
+            {
+                var vs = new object?[probeFns.Length];
+                for (var i = 0; i < probeFns.Length; i++)
+                {
+                    vs[i] = probeFns[i](row);
+                }
+
+                return codec.BuildRow(keySchema, vs);
+            },
+            row => row);
+
+        var innerIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            validInner,
+            row =>
+            {
+                var vs = new object?[innerIndices.Length];
+                for (var i = 0; i < innerIndices.Length; i++)
+                {
+                    vs[i] = row[innerIndices[i]];
+                }
+
+                return codec.BuildRow(keySchema, vs);
+            },
+            row => row);
+
+        var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, outerSchema);
+        var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, plan.Subquery.Schema);
+
+        var matched = EmitLeftJoin(
+            builder, ctx,
+            outerIndexed,
+            innerIndexed,
+            joinCombine: (_, outerRow, innerRow) =>
+                AppendColumn(codec, joinedSchema, outerRow, innerRow[scalarColumnIndex]),
+            nullPadCombine: (_, outerRow) =>
+                AppendColumn(codec, joinedSchema, outerRow, null),
+            leftCodec, rightCodec);
+
+        // NULL-key outer rows bypass the join — append NULL directly.
+        var nullPadded = builder.MapRows<StructuralRow, StructuralRow, Z64>(
+            nullKeyOuter,
+            row => AppendColumn(codec, joinedSchema, row, null));
+
+        return builder.Union(matched, nullPadded);
     }
 
     private static StructuralRow AppendColumn(IRowCodec<StructuralRow> codec, Schema? schema, StructuralRow row, object? value)

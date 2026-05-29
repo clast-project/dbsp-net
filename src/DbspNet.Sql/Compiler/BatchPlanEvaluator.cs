@@ -82,6 +82,9 @@ internal static class BatchPlanEvaluator
             case SemiJoinPlan sj:
                 return BatchSemiJoin(sj, ctx);
 
+            case CorrelatedScalarSubqueryJoinPlan csp:
+                return BatchCorrelatedScalarSubqueryJoin(csp, ctx);
+
             case RecursiveCtePlan:
                 throw new InvalidOperationException(
                     "RecursiveCtePlan cannot be batch-evaluated directly; it's handled by RecursiveCteOp.");
@@ -486,6 +489,66 @@ internal static class BatchPlanEvaluator
 
             return h;
         }
+    }
+
+    // ---- Correlated scalar subquery LEFT JOIN ----
+
+    private static ZSet<StructuralRow, Z64> BatchCorrelatedScalarSubqueryJoin(
+        CorrelatedScalarSubqueryJoinPlan plan, BatchEvalContext ctx)
+    {
+        var outer = Evaluate(plan.Input, ctx);
+        var subquery = Evaluate(plan.Subquery, ctx);
+
+        var innerIndices = new int[plan.CorrelationKeys.Count];
+        for (var i = 0; i < plan.CorrelationKeys.Count; i++)
+        {
+            innerIndices[i] = plan.CorrelationKeys[i].InnerColumnIndex;
+        }
+
+        // Map composite correlation tuple → scalar value. Inner rows with
+        // any NULL component drop out (no outer can match a NULL key).
+        var lookup = new Dictionary<TupleKey, object?>();
+        foreach (var (row, w) in subquery)
+        {
+            if (!Z64.IsPositive(w)) { continue; }
+            var key = BuildTupleKey(row, innerIndices);
+            if (key is null) { continue; }
+            lookup[key.Value] = row[plan.ScalarColumnIndex];
+        }
+
+        var probeFns = new Func<IReadOnlyList<object?>, object?>[plan.CorrelationKeys.Count];
+        for (var i = 0; i < plan.CorrelationKeys.Count; i++)
+        {
+            probeFns[i] = ExpressionCompiler.CompileScalar(plan.CorrelationKeys[i].OuterKey);
+        }
+
+        var builder = new ZSetBuilder<StructuralRow, Z64>();
+        var schema = plan.Schema;
+        foreach (var (row, w) in outer)
+        {
+            var probeVals = new object?[probeFns.Length];
+            var hasNull = false;
+            for (var i = 0; i < probeFns.Length; i++)
+            {
+                var v = probeFns[i](row);
+                if (v is null) { hasNull = true; break; }
+                probeVals[i] = v;
+            }
+
+            object? scalar = null;
+            if (!hasNull && lookup.TryGetValue(new TupleKey(probeVals), out var found))
+            {
+                scalar = found;
+            }
+
+            // Append the scalar column to the outer row (NULL on miss).
+            var vs = new object?[row.Count + 1];
+            for (var i = 0; i < row.Count; i++) { vs[i] = row[i]; }
+            vs[row.Count] = scalar;
+            builder.Add(ctx.Codec.BuildRow(schema, vs), w);
+        }
+
+        return builder.Build();
     }
 
     // ---- Scalar subquery cross-join ----

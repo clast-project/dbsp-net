@@ -173,6 +173,33 @@ public sealed record SemiJoinPlan(
     IReadOnlyList<SemiJoinEqui> EquiKeys,
     bool IsAnti = false) : LogicalPlan(Input.Schema);
 
+/// <summary>
+/// Correlated scalar-subquery LEFT JOIN: appends one nullable column to
+/// every row of <see cref="Input"/>, computed as the
+/// <see cref="ScalarColumnIndex"/> column of the inner subquery for the
+/// row whose correlation tuple (per <see cref="CorrelationKeys"/>)
+/// matches the outer row, or NULL when no inner row matches.
+/// </summary>
+/// <remarks>
+/// <para><b>Why a separate node from <see cref="ScalarSubqueryJoinPlan"/>:</b>
+/// uncorrelated scalar subqueries are batched in a single node (one
+/// hidden column per subquery) using a 0-column unit key. Correlated
+/// scalar subqueries each need their own key tuple, so they're layered
+/// individually — mirrors the IN/EXISTS separation between
+/// <see cref="SemiJoinPlan"/> and the uncorrelated batched form.</para>
+/// <para><b>Subquery shape (post-decorrelation):</b>
+/// <c>[__corr_0, ..., __corr_N, scalar_value]</c>. The first N columns
+/// are projected from the inner's aggregate GROUP BY (the correlation
+/// columns); the last column is the original scalar value the user
+/// referenced.</para>
+/// </remarks>
+public sealed record CorrelatedScalarSubqueryJoinPlan(
+    LogicalPlan Input,
+    LogicalPlan Subquery,
+    IReadOnlyList<SemiJoinEqui> CorrelationKeys,
+    int ScalarColumnIndex,
+    Schema Schema) : LogicalPlan(Schema);
+
 /// <summary>One equi-join conjunct: <c>left[LeftIndex] = right[RightIndex]</c>.</summary>
 public sealed record JoinEquality(int LeftIndex, int RightIndex, SqlType KeyType);
 

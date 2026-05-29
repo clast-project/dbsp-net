@@ -99,6 +99,11 @@ public static class PlanOptimizer
                 Input = OptimizeNode(sj.Input),
                 Subquery = OptimizeNode(sj.Subquery),
             },
+            CorrelatedScalarSubqueryJoinPlan csp => csp with
+            {
+                Input = OptimizeNode(csp.Input),
+                Subquery = OptimizeNode(csp.Subquery),
+            },
             // ScanPlan / CteScanPlan: leaves (CTE body was already optimized
             // at its defining site or we skip to avoid breaking sharing).
             // RecursiveCtePlan: the base/step subplans are executed by a

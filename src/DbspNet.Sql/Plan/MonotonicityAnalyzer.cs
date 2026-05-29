@@ -181,6 +181,12 @@ public static class MonotonicityAnalyzer
                 // carries through.
                 return Visit(sj.Input, memo);
 
+            case CorrelatedScalarSubqueryJoinPlan csp:
+                // Input columns pass through; the appended scalar column is
+                // non-monotone (LEFT JOIN — value can become NULL or change
+                // arbitrarily as the inner aggregate updates).
+                return ResizeTo(Visit(csp.Input, memo), csp.Schema.Count);
+
             // Recursion + frontier is unsolved here; conservatively not monotone.
             case RecursiveCtePlan r:
                 return new IReadOnlySet<LatenessSource>?[r.Schema.Count];
