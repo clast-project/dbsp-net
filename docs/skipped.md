@@ -58,24 +58,26 @@ reflect that shape, not a backlog.
     - **[P1]** `IN (subquery)` in SELECT / HAVING / nested boolean
       positions — returns a per-row boolean rather than a row filter,
       different shape from the semi-join lift.
-- Correlated `IN (subquery)` — **implemented** for the single-level form.
-  When a top-level WHERE conjunct is `probe IN (subquery)` and the
+- Correlated `IN (subquery)` and correlated `EXISTS (subquery)` —
+  **implemented** for the single-level form. When a top-level WHERE
+  conjunct is `probe IN (subquery)` or `EXISTS (subquery)` and the
   subquery's body equi-references an outer column
   (`outer.col = inner.col`), the resolver decorrelates by lifting the
   correlation predicate out of the inner WHERE, projecting the inner
   correlation column into the subquery schema, and emitting a
-  multi-key `SemiJoinPlan` whose `EquiKeys` cover both the IN-probe
-  and every correlation column. The same outer-scope plumbing
-  (`outerSchema: Schema?` parameter + `ResolvedCorrelationRef`
-  expression node) is the foundation correlated `EXISTS` and scalar
-  subqueries will ride on when added. Deferred:
-    - **[P1]** Correlated `EXISTS`. Needs to restructure the parser-time
-      EXISTS desugar so the resolver can route uncorrelated → existing
-      COALESCE(COUNT(*), 0) > 0 path vs correlated → SemiJoinPlan.
+  `SemiJoinPlan`. For `IN`, the equi-key list covers both the IN-probe
+  and every correlation column; for `EXISTS`, only the correlation
+  columns (no probe). Both share the same `outerSchema: Schema?`
+  plumbing, `ResolvedCorrelationRef` expression node, and
+  `DecorrelateSubqueryPlan` rewrite. Deferred:
     - **[P1]** Correlated scalar subquery. Needs a LEFT JOIN rewrite with
       the inner aggregated by the correlation columns; the inner's
       aggregate has to be re-pushed under the new GROUP BY.
-    - **[P1]** Correlated `NOT IN` — anti-semi-join + NULL handling.
+    - **[P1]** Correlated `NOT EXISTS` and `NOT IN` — anti-semi-join +
+      three-valued NULL handling.
+    - **[P1]** Correlated `EXISTS` / `IN` outside top-level WHERE
+      conjuncts (SELECT / HAVING / nested boolean) — per-row boolean
+      shape, distinct from the row-filter semi-join.
     - **[P2]** Nested correlation (subquery inside subquery referencing
       grand-outer columns). v1 supports a single level.
     - **[P2]** Non-equi correlation (`outer.col > inner.col`) and
