@@ -358,10 +358,6 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
       `ICompactionStrategy` only sees `SpineState`-of-counts; a strategy
       that proactively merges sub-frontier-heavy levels would compact
       hot keys faster than batch-count alone.
-    - **[P2]** GC-on-empty-tick. `IncrementalAggregateOp.Step` (and its
-      spine sibling) returns before `CollectGarbage` when the input
-      delta is empty, so a pure-frontier-advance tick doesn't GC. A
-      bugfix, not a structural change — the GC path itself is correct.
 - **[P2]** Multi-threaded circuit execution. v1 is single-threaded per
   `step()` call.
 - **[P3]** Dynamic / polymorphic operators (Feldera's `dynamic` module).
