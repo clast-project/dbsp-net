@@ -271,7 +271,16 @@ internal static class RandomQuery
 
         // 55. Concatenation over the nullable table — a NULL operand makes the
         // whole result NULL (|| propagates, unlike CONCAT).
-        Gen.Const("SELECT CAST(k AS VARCHAR) || CAST(v AS VARCHAR) AS s FROM n"));
+        Gen.Const("SELECT CAST(k AS VARCHAR) || CAST(v AS VARCHAR) AS s FROM n"),
+
+        // ---- IS [NOT] DISTINCT FROM (NULL-safe (in)equality) ----
+
+        // 56. NULL-safe equality as a WHERE filter over two nullable columns
+        // (keeps both-NULL rows that `=` would drop).
+        Gen.Const("SELECT k, v FROM n WHERE v IS NOT DISTINCT FROM k"),
+
+        // 57. IS DISTINCT FROM as a (always-definite) boolean projection.
+        Gen.Const("SELECT k, k IS DISTINCT FROM v AS d FROM n"));
 
     // ---- Data generator ----
 

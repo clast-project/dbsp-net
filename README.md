@@ -142,7 +142,8 @@ batch re-computation.
   The conditional functions `IIF(c, a, b)` and `DECODE(...)` desugar to CASE
   (DECODE matches `NULL = NULL`, per Oracle). `[NOT] BETWEEN` desugars to a
   comparison conjunction. The `||` string-concatenation operator propagates
-  NULL (unlike PG-style `CONCAT`, which skips NULLs).
+  NULL (unlike PG-style `CONCAT`, which skips NULLs). `IS [NOT] DISTINCT
+  FROM` gives NULL-safe (in)equality (always a definite boolean).
 - Scalar functions: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `UPPER`,
   `LOWER`, `LENGTH`, `CONCAT`, `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`,
   `POWER`, `SQRT`. NULL semantics follow PostgreSQL (most propagate;

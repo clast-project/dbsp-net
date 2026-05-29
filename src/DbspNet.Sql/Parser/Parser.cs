@@ -794,11 +794,62 @@ public sealed class Parser
                 negated = true;
             }
 
+            // IS [NOT] DISTINCT FROM rhs — NULL-safe (in)equality — vs the
+            // plain IS [NOT] NULL test. The `negated` flag captured above
+            // means "NOT DISTINCT" (i.e. NULL-safe equal) here.
+            if (Peek().Kind == TokenKind.Distinct)
+            {
+                Advance();
+                Expect(TokenKind.From);
+                var rhs = ParseConcat();
+                left = BuildIsDistinctFrom(left, rhs, isNotDistinct: negated);
+                continue;
+            }
+
             Expect(TokenKind.Null);
             left = new IsNullExpression(left, negated);
         }
 
         return left;
+    }
+
+    /// <summary>
+    /// <c>a IS [NOT] DISTINCT FROM b</c> — NULL-safe (in)equality, always a
+    /// definite boolean (never NULL). Desugared to existing nodes:
+    /// <c>a IS NOT DISTINCT FROM b</c> ≡
+    /// <c>(a IS NULL AND b IS NULL) OR (a IS NOT NULL AND b IS NOT NULL AND a = b)</c>.
+    /// The <c>IS NOT NULL</c> guards make three-valued <c>FALSE AND (a = b)</c>
+    /// collapse to FALSE, so a one-sided NULL yields FALSE rather than leaking
+    /// NULL. <c>IS DISTINCT FROM</c> is the logical negation of that.
+    /// </summary>
+    private Expression BuildIsDistinctFrom(Expression a, Expression b, bool isNotDistinct)
+    {
+        // a and b are each referenced several times by the desugar, so a
+        // subquery operand would be reference-duplicated — reject it, as the
+        // other operand-fanning desugars do.
+        if (a is SubqueryExpression || b is SubqueryExpression)
+        {
+            throw Error(Peek(), "a scalar subquery is not supported as an IS [NOT] DISTINCT FROM operand");
+        }
+
+        var bothNull = new BinaryExpression(
+            BinaryOperator.And,
+            new IsNullExpression(a, Negated: false),
+            new IsNullExpression(b, Negated: false));
+
+        var bothPresentAndEqual = new BinaryExpression(
+            BinaryOperator.And,
+            new BinaryExpression(
+                BinaryOperator.And,
+                new IsNullExpression(a, Negated: true),
+                new IsNullExpression(b, Negated: true)),
+            new BinaryExpression(BinaryOperator.Equal, a, b));
+
+        var notDistinct = new BinaryExpression(BinaryOperator.Or, bothNull, bothPresentAndEqual);
+
+        return isNotDistinct
+            ? notDistinct
+            : new UnaryExpression(UnaryOperator.Not, notDistinct);
     }
 
     private Expression ParseAdditive()

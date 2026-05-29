@@ -194,8 +194,14 @@ reflect that shape, not a backlog.
   stack overflow on large lists (.NET's practical recursion limit is
   ~100-200 levels). Compiles to a single iterative call into
   `InListRuntime.Evaluate` that honours SQL three-valued NULL semantics.
-- **[P1]** `IS [NOT] DISTINCT FROM`. NULL-safe equality. The parser's
-  `IS` arm only accepts `NULL` / `NOT NULL` today.
+- `IS [NOT] DISTINCT FROM` — **implemented**. NULL-safe (in)equality,
+  always a definite boolean (two NULLs are not distinct; a one-sided NULL
+  is distinct). Parse-time desugar to guarded nodes —
+  `a IS NOT DISTINCT FROM b` ≡ `(a IS NULL AND b IS NULL) OR (a IS NOT
+  NULL AND b IS NOT NULL AND a = b)` — where the `IS NOT NULL` guards make
+  3VL `FALSE AND (a = b)` collapse to FALSE so a one-sided NULL never leaks
+  UNKNOWN; `IS DISTINCT FROM` is its negation. No new resolver/compiler
+  support.
 - **[P2]** `IS TRUE` / `IS FALSE` / `IS UNKNOWN`. Boolean tests; same
   parser arm as above.
 - **[P1]** `JOIN ... USING (col, ...)`. Parser only accepts `ON`.
