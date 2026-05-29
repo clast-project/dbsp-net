@@ -32,6 +32,7 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     private readonly ICompactionStrategy _strategy;
     private readonly IComparer<TKey> _comparer;
     private readonly SpineSpillConfig<TKey, TWeight>? _spillConfig;
+    private readonly Func<TKey, long>? _monotoneKey;
     private long _spillCounter;
 
     /// <summary>
@@ -46,12 +47,14 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     public SpineZSetTrace(
         ICompactionStrategy strategy,
         IComparer<TKey>? comparer = null,
-        SpineSpillConfig<TKey, TWeight>? spillConfig = null)
+        SpineSpillConfig<TKey, TWeight>? spillConfig = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
         _comparer = comparer ?? Comparer<TKey>.Default;
         _spillConfig = spillConfig;
+        _monotoneKey = monotoneKey;
     }
 
     /// <summary>
@@ -68,7 +71,7 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         }
 
         EnsureLevel(0);
-        _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(delta, _comparer));
+        _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(delta, _comparer, _monotoneKey));
         RunCompaction();
     }
 
@@ -76,54 +79,154 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     /// Drops every key whose <paramref name="monotoneKey"/> projection is
     /// strictly below <paramref name="threshold"/> (frontier-driven GC),
     /// returning the number of keys removed. A key exactly at the threshold is
-    /// retained. Rebuilds the spine from the surviving (≥ threshold) state —
-    /// O(retained), which stays window-bounded as the frontier advances; spill
-    /// files for discarded batches are deleted. The non-indexed analogue of
+    /// retained. The non-indexed analogue of
     /// <see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}.DropKeysBelow"/>,
     /// used by DISTINCT (where the key is the whole row).
     /// </summary>
+    /// <remarks>
+    /// Per-batch dispatch on each batch's <see cref="SpineBatch{TKey,TWeight}.MinMonotoneKey"/>
+    /// / <see cref="SpineBatch{TKey,TWeight}.MaxMonotoneKey"/>:
+    /// <list type="bullet">
+    ///   <item><c>MaxMonotoneKey &lt; threshold</c> — whole batch is sub-frontier:
+    ///   evict in place, delete the spill file if any. O(1) (plus spill delete).</item>
+    ///   <item><c>MinMonotoneKey ≥ threshold</c> — every key survives: keep
+    ///   the batch at its original level with no work.</item>
+    ///   <item>Otherwise — mixed: load resident, mask-filter keys above the
+    ///   threshold, replace the batch at its original level.</item>
+    /// </list>
+    /// Batch ordering and level layout are preserved, so the tiered compaction
+    /// strategy's insertion-order assumptions stay intact (cf.
+    /// <see cref="ICompactionStrategy"/> + <c>Apply()</c>). Batches whose min/max
+    /// projections are unknown (the trace was constructed without a
+    /// <c>monotoneKey</c>) fall back to a per-key scan over a loaded resident
+    /// copy — still local to the batch, no global rebuild.
+    /// </remarks>
     public int DropKeysBelow(long threshold, Func<TKey, long> monotoneKey)
     {
         ArgumentNullException.ThrowIfNull(monotoneKey);
 
         var removed = 0;
-        var survivors = new ZSetBuilder<TKey, TWeight>();
-        foreach (var (key, w) in MergeEntries())
+        for (var li = 0; li < _levels.Count; li++)
         {
-            if (monotoneKey(key) < threshold)
+            var level = _levels[li];
+            for (var bi = level.Count - 1; bi >= 0; bi--)
             {
-                removed++;
-            }
-            else
-            {
-                survivors.Add(key, w);
-            }
-        }
+                var batch = level[bi];
+                var (batchMin, batchMax) = GetOrComputeMonotoneRange(batch, monotoneKey);
 
-        if (removed == 0)
-        {
-            return 0;
-        }
-
-        foreach (var level in _levels)
-        {
-            foreach (var batch in level)
-            {
-                if (batch is SpilledSpineBatch<TKey, TWeight> spilled)
+                if (batch.IsEmpty || batchMax < threshold)
                 {
-                    SyncDelete(spilled);
+                    if (batch is SpilledSpineBatch<TKey, TWeight> spilled)
+                    {
+                        SyncDelete(spilled);
+                    }
+
+                    removed += batch.Count;
+                    level.RemoveAt(bi);
+                    continue;
+                }
+
+                if (batchMin >= threshold)
+                {
+                    continue;
+                }
+
+                var resident = batch.Materialise(_comparer);
+                var (filtered, dropped) = FilterAbove(resident, threshold, monotoneKey);
+                removed += dropped;
+
+                if (batch is SpilledSpineBatch<TKey, TWeight> spilledMixed)
+                {
+                    SyncDelete(spilledMixed);
+                }
+
+                if (filtered.IsEmpty)
+                {
+                    level.RemoveAt(bi);
+                }
+                else
+                {
+                    level[bi] = MaybeSpill(filtered, li);
                 }
             }
         }
 
-        _levels.Clear();
-        var surviving = survivors.Build();
-        if (!surviving.IsEmpty)
+        return removed;
+    }
+
+    private (long Min, long Max) GetOrComputeMonotoneRange(
+        SpineBatch<TKey, TWeight> batch, Func<TKey, long> monotoneKey)
+    {
+        if (batch.MinMonotoneKey is long min && batch.MaxMonotoneKey is long max)
         {
-            Integrate(surviving);
+            return (min, max);
         }
 
-        return removed;
+        // Cold path: the trace was constructed without a monotoneKey
+        // projection but DropKeysBelow is being called with one anyway.
+        // Materialise once and compute the range; correct but pays an
+        // extra load for spilled batches.
+        if (batch.IsEmpty)
+        {
+            return (long.MaxValue, long.MinValue);
+        }
+
+        var resident = batch.Materialise(_comparer);
+        var keys = resident.Keys;
+        var rangeMin = monotoneKey(keys[0]);
+        var rangeMax = rangeMin;
+        for (var i = 1; i < keys.Length; i++)
+        {
+            var p = monotoneKey(keys[i]);
+            if (p < rangeMin) { rangeMin = p; }
+            if (p > rangeMax) { rangeMax = p; }
+        }
+
+        return (rangeMin, rangeMax);
+    }
+
+    private (ResidentSpineBatch<TKey, TWeight> Filtered, int Dropped) FilterAbove(
+        ResidentSpineBatch<TKey, TWeight> resident, long threshold, Func<TKey, long> monotoneKey)
+    {
+        var keys = resident.Keys;
+        var weights = resident.Weights;
+        var keep = new bool[keys.Length];
+        var keptCount = 0;
+        for (var i = 0; i < keys.Length; i++)
+        {
+            if (monotoneKey(keys[i]) >= threshold)
+            {
+                keep[i] = true;
+                keptCount++;
+            }
+        }
+
+        var dropped = keys.Length - keptCount;
+        if (dropped == 0)
+        {
+            return (resident, 0);
+        }
+
+        if (keptCount == 0)
+        {
+            return (ResidentSpineBatch<TKey, TWeight>.Empty(_comparer), dropped);
+        }
+
+        var newKeys = new TKey[keptCount];
+        var newWeights = new TWeight[keptCount];
+        var oi = 0;
+        for (var i = 0; i < keys.Length; i++)
+        {
+            if (keep[i])
+            {
+                newKeys[oi] = keys[i];
+                newWeights[oi] = weights[i];
+                oi++;
+            }
+        }
+
+        return (ResidentSpineBatch<TKey, TWeight>.FromSortedArrays(
+            newKeys, newWeights, _comparer, _monotoneKey ?? monotoneKey), dropped);
     }
 
     /// <summary>
@@ -315,7 +418,7 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         // don't get pushed deep into the tier hierarchy on every
         // compaction round.
         var toMerge = src.GetRange(0, action.BatchCount);
-        var merged = SpineBatch<TKey, TWeight>.Merge(toMerge, _comparer);
+        var merged = SpineBatch<TKey, TWeight>.Merge(toMerge, _comparer, _monotoneKey);
         src.RemoveRange(0, action.BatchCount);
 
         // Delete on-disk files for any spilled inputs — they have been
@@ -366,7 +469,8 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         }
 
         return new SpilledSpineBatch<TKey, TWeight>(
-            _spillConfig.FileSystem, path, _spillConfig.Codec, _comparer, batch.Bloom, batch.Count);
+            _spillConfig.FileSystem, path, _spillConfig.Codec, _comparer, batch.Bloom, batch.Count,
+            batch.MinMonotoneKey, batch.MaxMonotoneKey);
     }
 
     private static void SyncDelete(SpilledSpineBatch<TKey, TWeight> spilled)

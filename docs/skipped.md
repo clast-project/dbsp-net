@@ -336,14 +336,32 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
     (recursive CTEs always use a flat trace), and a trace-size-driven
     automatic flat/spine decision is future work — today it's an
     explicit caller toggle.
-- **[P2]** Trace compaction / waterline (since-frontier
-  advancement that lets multiple updates at the same (key, value)
-  collapse into one row). A data-derived frontier *is* now advertised via
-  `LATENESS` (see *Streaming extensions*), and drives whole-key trace GC —
-  but it drops keys strictly below the frontier rather than *consolidating*
-  same-(key, value) update histories at compaction time. The spine has the
-  right shape for that consolidation; wiring it to the frontier is the
-  remaining work.
+- Trace compaction / waterline — **implemented** for the spine traces.
+  Each spine batch tracks its `(min, max) monotone-key projection` (set
+  at construction from a `Func<TKey, long>` supplied to the trace),
+  letting `SpineZSetTrace.DropKeysBelow` and
+  `SpineIndexedZSetTrace.DropKeysBelow` dispatch per batch: whole-batch
+  drop when the batch's max projection is below the frontier (with
+  spill-file delete), keep-in-place when its min projection is at or
+  above, and mask-filter when the batch is mixed. Batch ordering and
+  level layout are preserved, so the tiered compaction strategy's
+  insertion-order assumption stays intact and above-frontier batches
+  consolidate on the normal compaction schedule rather than via a
+  global rebuild on every frontier advance. Cost is O(touched batches)
+  per call, not O(retained state). Deferred follow-ons:
+    - **[P2]** Within-group value-monotone consolidation. Today's
+      analyzer only flags outer/group keys; an indexed trace whose
+      `TValue` carries its own monotone column could consolidate
+      per-(key, value) histories more aggressively. Needs
+      `MonotonicityAnalyzer` extension.
+    - **[P2]** Frontier-aware compaction strategy.
+      `ICompactionStrategy` only sees `SpineState`-of-counts; a strategy
+      that proactively merges sub-frontier-heavy levels would compact
+      hot keys faster than batch-count alone.
+    - **[P2]** GC-on-empty-tick. `IncrementalAggregateOp.Step` (and its
+      spine sibling) returns before `CollectGarbage` when the input
+      delta is empty, so a pure-frontier-advance tick doesn't GC. A
+      bugfix, not a structural change — the GC path itself is correct.
 - **[P2]** Multi-threaded circuit execution. v1 is single-threaded per
   `step()` call.
 - **[P3]** Dynamic / polymorphic operators (Feldera's `dynamic` module).

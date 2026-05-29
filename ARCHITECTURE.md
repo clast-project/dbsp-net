@@ -257,6 +257,17 @@ bounded-memory. The mechanism spans the plan and the runtime:
   monotone column of the row; the joins on the equi-key, but only when it is
   monotone on *both* sides (a future row on a non-monotone side could still
   flip a match below the frontier). Multiple sources combine via `MinFrontier`.
+  On the spine traces, GC is compaction-folded: each spine batch carries
+  its `(min, max)` monotone-key projection (computed when the batch is
+  built), so `SpineZSetTrace.DropKeysBelow` and `SpineIndexedZSetTrace.
+  DropKeysBelow` dispatch per batch — whole-batch drop when the max
+  projection is below the frontier (spill file deleted), keep-in-place
+  when the min projection is at or above, and mask-filter when the batch
+  is mixed. Batch ordering and level layout are preserved, so the
+  tiered compaction strategy's insertion-order assumption stays intact
+  and above-frontier batches consolidate on the normal compaction
+  schedule rather than via a global rebuild on every frontier advance.
+  Cost is O(touched batches) per call instead of O(total retained state).
 - **Persistence.** `LatenessOperator` snapshots `max_seen`; on restore it
   re-advances the frontier so the late-drop stays consistent with the GC'd
   traces restored alongside it.

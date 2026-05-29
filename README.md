@@ -155,9 +155,13 @@ batch re-computation.
   collected group stays downstream. The frontier source (`max_seen`) is
   persisted, so a restored circuit resumes its late-drop consistently with the
   GC'd traces. This is what keeps long-running, append-mostly pipelines
-  bounded-memory. The bound is written in native units (µs for `TIMESTAMP`,
-  days for `DATE`, the integer itself for `BIGINT`); duration-literal sugar
-  (`'1' HOUR`) and a first-class `INTERVAL` type are deferred.
+  bounded-memory. On the spine traces, GC is compaction-folded — each batch
+  records its min/max monotone-key projection, so `DropKeysBelow` dispatches
+  per batch (whole-batch drop / keep-in-place / mask-filter) at O(touched
+  batches) and preserves batch / level layout. The bound is written in
+  native units (µs for `TIMESTAMP`, days for `DATE`, the integer itself for
+  `BIGINT`); duration-literal sugar (`'1' HOUR`) and a first-class
+  `INTERVAL` type are deferred.
 - Plan optimizer (`DbspNet.Sql.Optimizer.PlanOptimizer`, explicit pass):
   predicate pushdown (through Project / Join / UnionAll / Distinct /
   Difference, respecting outer-join restrictions), projection
@@ -248,10 +252,6 @@ The biggest tracked-but-not-yet-shipped pieces:
   the typed compiler to spine-backed operators (generated per-schema
   comparers for the emitted structs) is the remaining integration
   step. `RecursiveCteOp` likewise has no spine sibling and stays flat.
-- **Trace compaction / waterline.** The `LATENESS` frontier now drives
-  whole-key trace GC (dropping state below the frontier), but the spine
-  doesn't yet *consolidate* same-`(key, value)` update histories into one
-  row at compaction time as the frontier advances — that is still future.
 - **DRED-style retraction propagation for recursive CTEs**, so the
   full recomputation fallback on retraction-containing ticks goes
   away.

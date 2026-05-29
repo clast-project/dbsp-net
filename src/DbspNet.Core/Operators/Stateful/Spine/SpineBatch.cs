@@ -29,6 +29,17 @@ internal abstract class SpineBatch<TKey, TWeight>
 
     public BloomFilter<TKey>? Bloom { get; protected init; }
 
+    /// <summary>
+    /// Minimum <c>monotoneKey(k)</c> across keys in this batch, or
+    /// <c>null</c> if the owning trace was constructed without a
+    /// monotone-key projection (in which case no LATENESS-driven GC
+    /// can target this batch).
+    /// </summary>
+    public long? MinMonotoneKey { get; protected init; }
+
+    /// <summary>Maximum <c>monotoneKey(k)</c> — companion to <see cref="MinMonotoneKey"/>.</summary>
+    public long? MaxMonotoneKey { get; protected init; }
+
     public bool IsEmpty => Count == 0;
 
     public abstract int Count { get; }
@@ -42,10 +53,14 @@ internal abstract class SpineBatch<TKey, TWeight>
     /// Pairwise sorted merge of the supplied batches into a fresh
     /// resident batch. Inputs may be resident or spilled — spilled
     /// inputs are loaded transiently via their codec. Matching keys
-    /// have their weights summed and zero-sum entries dropped.
+    /// have their weights summed and zero-sum entries dropped. The
+    /// merged batch's monotone-key range is computed from the output
+    /// keys via <paramref name="monotoneKey"/> when supplied.
     /// </summary>
     public static ResidentSpineBatch<TKey, TWeight> Merge(
-        IReadOnlyList<SpineBatch<TKey, TWeight>> batches, IComparer<TKey> comparer)
+        IReadOnlyList<SpineBatch<TKey, TWeight>> batches,
+        IComparer<TKey> comparer,
+        Func<TKey, long>? monotoneKey = null)
     {
         if (batches.Count == 0)
         {
@@ -56,7 +71,7 @@ internal abstract class SpineBatch<TKey, TWeight>
         for (var i = 1; i < batches.Count; i++)
         {
             var next = batches[i].Materialise(comparer);
-            result = ResidentSpineBatch<TKey, TWeight>.MergePair(result, next, comparer);
+            result = ResidentSpineBatch<TKey, TWeight>.MergePair(result, next, comparer, monotoneKey);
         }
 
         return result;
@@ -67,6 +82,23 @@ internal abstract class SpineBatch<TKey, TWeight>
     /// resident batches, a transient load for spilled ones.
     /// </summary>
     protected internal abstract ResidentSpineBatch<TKey, TWeight> Materialise(IComparer<TKey> comparer);
+
+    /// <summary>
+    /// Computes the (min, max) <c>monotoneKey(k)</c> range over a non-empty key span.
+    /// </summary>
+    protected static (long Min, long Max) ComputeMonotoneRange(TKey[] keys, Func<TKey, long> monotoneKey)
+    {
+        var min = monotoneKey(keys[0]);
+        var max = min;
+        for (var i = 1; i < keys.Length; i++)
+        {
+            var p = monotoneKey(keys[i]);
+            if (p < min) { min = p; }
+            if (p > max) { max = p; }
+        }
+
+        return (min, max);
+    }
 
     protected static BloomFilter<TKey>? BuildBloom(TKey[] keys)
     {
@@ -104,12 +136,19 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
 
     internal IComparer<TKey> Comparer => _comparer;
 
-    private ResidentSpineBatch(TKey[] keys, TWeight[] weights, IComparer<TKey> comparer)
+    private ResidentSpineBatch(
+        TKey[] keys, TWeight[] weights, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey)
     {
         _keys = keys;
         _weights = weights;
         _comparer = comparer;
         Bloom = BuildBloom(keys);
+        if (monotoneKey is not null && keys.Length > 0)
+        {
+            var (min, max) = ComputeMonotoneRange(keys, monotoneKey);
+            MinMonotoneKey = min;
+            MaxMonotoneKey = max;
+        }
     }
 
     public override int Count => _keys.Length;
@@ -136,9 +175,10 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
     protected internal override ResidentSpineBatch<TKey, TWeight> Materialise(IComparer<TKey> comparer) => this;
 
     public static ResidentSpineBatch<TKey, TWeight> Empty(IComparer<TKey> comparer) =>
-        new(Array.Empty<TKey>(), Array.Empty<TWeight>(), comparer);
+        new(Array.Empty<TKey>(), Array.Empty<TWeight>(), comparer, monotoneKey: null);
 
-    public static ResidentSpineBatch<TKey, TWeight> FromZSet(ZSet<TKey, TWeight> data, IComparer<TKey> comparer)
+    public static ResidentSpineBatch<TKey, TWeight> FromZSet(
+        ZSet<TKey, TWeight> data, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey = null)
     {
         if (data.IsEmpty)
         {
@@ -157,18 +197,19 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
         }
 
         Array.Sort(keys, weights, comparer);
-        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer);
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer, monotoneKey);
     }
 
     /// <summary>Reconstructs a resident batch from its sorted columnar pair without re-sorting.</summary>
     internal static ResidentSpineBatch<TKey, TWeight> FromSortedArrays(
-        TKey[] keys, TWeight[] weights, IComparer<TKey> comparer)
+        TKey[] keys, TWeight[] weights, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey = null)
     {
-        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer);
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer, monotoneKey);
     }
 
     internal static ResidentSpineBatch<TKey, TWeight> MergePair(
-        ResidentSpineBatch<TKey, TWeight> a, ResidentSpineBatch<TKey, TWeight> b, IComparer<TKey> comparer)
+        ResidentSpineBatch<TKey, TWeight> a, ResidentSpineBatch<TKey, TWeight> b,
+        IComparer<TKey> comparer, Func<TKey, long>? monotoneKey = null)
     {
         var aKeys = a._keys;
         var aWeights = a._weights;
@@ -233,7 +274,7 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
             Array.Resize(ref weights, oi);
         }
 
-        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer);
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer, monotoneKey);
     }
 }
 
@@ -261,7 +302,9 @@ internal sealed class SpilledSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeigh
         IZSetTraceCodec<TKey, TWeight> codec,
         IComparer<TKey> comparer,
         BloomFilter<TKey>? bloom,
-        int count)
+        int count,
+        long? minMonotoneKey = null,
+        long? maxMonotoneKey = null)
     {
         _fileSystem = fileSystem;
         _filePath = filePath;
@@ -269,6 +312,8 @@ internal sealed class SpilledSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeigh
         _comparer = comparer;
         _count = count;
         Bloom = bloom;
+        MinMonotoneKey = minMonotoneKey;
+        MaxMonotoneKey = maxMonotoneKey;
     }
 
     public override int Count => _count;
@@ -318,6 +363,17 @@ internal abstract class SpineIndexedBatch<TKey, TValue, TWeight>
 
     public BloomFilter<TKey>? Bloom { get; protected init; }
 
+    /// <summary>
+    /// Minimum <c>monotoneKey(k)</c> across outer keys in this batch, or
+    /// <c>null</c> if no monotone-key projection was supplied.
+    /// Indexed-trace GC is always keyed on the outer key (group key),
+    /// so this is sufficient for whole-group drop decisions.
+    /// </summary>
+    public long? MinMonotoneKey { get; protected init; }
+
+    /// <summary>Maximum <c>monotoneKey(k)</c> — companion to <see cref="MinMonotoneKey"/>.</summary>
+    public long? MaxMonotoneKey { get; protected init; }
+
     public bool IsEmpty => GroupCount == 0;
 
     public abstract int GroupCount { get; }
@@ -330,7 +386,8 @@ internal abstract class SpineIndexedBatch<TKey, TValue, TWeight>
 
     public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> Merge(
         IReadOnlyList<SpineIndexedBatch<TKey, TValue, TWeight>> batches,
-        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
+        Func<TKey, long>? monotoneKey = null)
     {
         if (batches.Count == 0)
         {
@@ -342,7 +399,7 @@ internal abstract class SpineIndexedBatch<TKey, TValue, TWeight>
         {
             var next = batches[i].MaterialiseIndexed(keyComparer, valueComparer);
             result = ResidentSpineIndexedBatch<TKey, TValue, TWeight>.MergePair(
-                result, next, keyComparer, valueComparer);
+                result, next, keyComparer, valueComparer, monotoneKey);
         }
 
         return result;
@@ -350,6 +407,23 @@ internal abstract class SpineIndexedBatch<TKey, TValue, TWeight>
 
     protected internal abstract ResidentSpineIndexedBatch<TKey, TValue, TWeight> MaterialiseIndexed(
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer);
+
+    /// <summary>
+    /// Computes the (min, max) <c>monotoneKey(k)</c> range over a non-empty outer-key span.
+    /// </summary>
+    protected static (long Min, long Max) ComputeMonotoneRange(TKey[] keys, Func<TKey, long> monotoneKey)
+    {
+        var min = monotoneKey(keys[0]);
+        var max = min;
+        for (var i = 1; i < keys.Length; i++)
+        {
+            var p = monotoneKey(keys[i]);
+            if (p < min) { min = p; }
+            if (p > max) { max = p; }
+        }
+
+        return (min, max);
+    }
 
     protected static BloomFilter<TKey>? BuildBloom(TKey[] keys)
     {
@@ -380,9 +454,22 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
     private readonly IComparer<TKey> _keyComparer;
     private readonly IComparer<TValue> _valueComparer;
 
+    internal TKey[] Keys => _keys;
+
+    internal int[] Offsets => _offsets;
+
+    internal TValue[] Values => _values;
+
+    internal TWeight[] Weights => _weights;
+
+    internal IComparer<TKey> KeyComparer => _keyComparer;
+
+    internal IComparer<TValue> ValueComparer => _valueComparer;
+
     private ResidentSpineIndexedBatch(
         TKey[] keys, int[] offsets, TValue[] values, TWeight[] weights,
-        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
+        Func<TKey, long>? monotoneKey)
     {
         _keys = keys;
         _offsets = offsets;
@@ -391,6 +478,12 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
         _keyComparer = keyComparer;
         _valueComparer = valueComparer;
         Bloom = BuildBloom(keys);
+        if (monotoneKey is not null && keys.Length > 0)
+        {
+            var (min, max) = ComputeMonotoneRange(keys, monotoneKey);
+            MinMonotoneKey = min;
+            MaxMonotoneKey = max;
+        }
     }
 
     public override int GroupCount => _keys.Length;
@@ -441,11 +534,26 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
     public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> Empty(
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer) =>
         new(Array.Empty<TKey>(), new int[] { 0 }, Array.Empty<TValue>(), Array.Empty<TWeight>(),
-            keyComparer, valueComparer);
+            keyComparer, valueComparer, monotoneKey: null);
+
+    /// <summary>
+    /// Constructs a resident batch directly from sorted columnar arrays.
+    /// Used by the GC's mixed-batch filter, which has already pruned
+    /// sub-frontier groups in-place while preserving sort order.
+    /// </summary>
+    internal static ResidentSpineIndexedBatch<TKey, TValue, TWeight> FromSortedArrays(
+        TKey[] keys, int[] offsets, TValue[] values, TWeight[] weights,
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
+        Func<TKey, long>? monotoneKey = null)
+    {
+        return new ResidentSpineIndexedBatch<TKey, TValue, TWeight>(
+            keys, offsets, values, weights, keyComparer, valueComparer, monotoneKey);
+    }
 
     public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> FromIndexed(
         IndexedZSet<TKey, TValue, TWeight> data,
-        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
+        Func<TKey, long>? monotoneKey = null)
     {
         if (data.IsEmpty)
         {
@@ -491,13 +599,14 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
         offsets[groups.Count] = cursor;
 
         return new ResidentSpineIndexedBatch<TKey, TValue, TWeight>(
-            keys, offsets, values, weights, keyComparer, valueComparer);
+            keys, offsets, values, weights, keyComparer, valueComparer, monotoneKey);
     }
 
     internal static ResidentSpineIndexedBatch<TKey, TValue, TWeight> MergePair(
         ResidentSpineIndexedBatch<TKey, TValue, TWeight> a,
         ResidentSpineIndexedBatch<TKey, TValue, TWeight> b,
-        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer)
+        IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
+        Func<TKey, long>? monotoneKey = null)
     {
         var aKeys = a._keys;
         var bKeys = b._keys;
@@ -547,7 +656,7 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
             offsetsOut.ToArray(),
             valuesOut.ToArray(),
             weightsOut.ToArray(),
-            keyComparer, valueComparer);
+            keyComparer, valueComparer, monotoneKey);
     }
 
     private static void AppendGroup(
@@ -665,7 +774,9 @@ internal sealed class SpilledSpineIndexedBatch<TKey, TValue, TWeight> : SpineInd
         IComparer<TKey> keyComparer,
         IComparer<TValue> valueComparer,
         BloomFilter<TKey>? bloom,
-        int groupCount)
+        int groupCount,
+        long? minMonotoneKey = null,
+        long? maxMonotoneKey = null)
     {
         _fileSystem = fileSystem;
         _filePath = filePath;
@@ -674,6 +785,8 @@ internal sealed class SpilledSpineIndexedBatch<TKey, TValue, TWeight> : SpineInd
         _valueComparer = valueComparer;
         _groupCount = groupCount;
         Bloom = bloom;
+        MinMonotoneKey = minMonotoneKey;
+        MaxMonotoneKey = maxMonotoneKey;
     }
 
     public override int GroupCount => _groupCount;

@@ -54,7 +54,8 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
             compactionStrategy ?? TieredCompactionStrategy.Default,
             keyComparer,
             valueComparer,
-            spillConfig);
+            spillConfig,
+            monotoneKey);
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
         _monotoneKey = monotoneKey;
@@ -65,6 +66,9 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
     /// that assert frontier-driven GC keeps state bounded.
     /// </summary>
     internal int RetainedGroupCount => _trace.GroupCount;
+
+    /// <summary>Underlying trace — exposed for GC-shape tests.</summary>
+    internal SpineIndexedZSetTrace<TKey, TValue, Z64> Trace => _trace;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {

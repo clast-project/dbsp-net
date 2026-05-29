@@ -63,7 +63,8 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         _trace = new SpineZSetTrace<TKey, TWeight>(
             compactionStrategy ?? TieredCompactionStrategy.Default,
             keyComparer,
-            spillConfig);
+            spillConfig,
+            monotoneKey);
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
         _monotoneKey = monotoneKey;
@@ -71,6 +72,9 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
 
     /// <summary>Distinct keys retained in the trace. Exposed for GC-bound tests.</summary>
     internal int RetainedKeyCount => _trace.KeyCount;
+
+    /// <summary>Underlying trace — exposed for GC-shape tests.</summary>
+    internal SpineZSetTrace<TKey, TWeight> Trace => _trace;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {

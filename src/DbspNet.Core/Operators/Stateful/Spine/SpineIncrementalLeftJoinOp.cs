@@ -61,8 +61,8 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
         _joinCombine = joinCombine;
         _nullPadCombine = nullPadCombine;
         var strategy = compactionStrategy ?? TieredCompactionStrategy.Default;
-        _leftTrace = new SpineIndexedZSetTrace<TKey, TLeft, TWeight>(strategy, keyComparer, leftValueComparer, leftSpillConfig);
-        _rightTrace = new SpineIndexedZSetTrace<TKey, TRight, TWeight>(strategy, keyComparer, rightValueComparer, rightSpillConfig);
+        _leftTrace = new SpineIndexedZSetTrace<TKey, TLeft, TWeight>(strategy, keyComparer, leftValueComparer, leftSpillConfig, monotoneKey);
+        _rightTrace = new SpineIndexedZSetTrace<TKey, TRight, TWeight>(strategy, keyComparer, rightValueComparer, rightSpillConfig, monotoneKey);
         _leftSnapshotCodec = leftSnapshotCodec;
         _rightSnapshotCodec = rightSnapshotCodec;
         _frontier = frontier;

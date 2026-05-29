@@ -28,6 +28,7 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     private readonly IComparer<TKey> _keyComparer;
     private readonly IComparer<TValue> _valueComparer;
     private readonly SpineIndexedSpillConfig<TKey, TValue, TWeight>? _spillConfig;
+    private readonly Func<TKey, long>? _monotoneKey;
     private long _spillCounter;
 
     public SpineIndexedZSetTrace() : this(TieredCompactionStrategy.Default, keyComparer: null, valueComparer: null)
@@ -38,13 +39,15 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         ICompactionStrategy strategy,
         IComparer<TKey>? keyComparer = null,
         IComparer<TValue>? valueComparer = null,
-        SpineIndexedSpillConfig<TKey, TValue, TWeight>? spillConfig = null)
+        SpineIndexedSpillConfig<TKey, TValue, TWeight>? spillConfig = null,
+        Func<TKey, long>? monotoneKey = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
         _keyComparer = keyComparer ?? Comparer<TKey>.Default;
         _valueComparer = valueComparer ?? Comparer<TValue>.Default;
         _spillConfig = spillConfig;
+        _monotoneKey = monotoneKey;
     }
 
     /// <summary>
@@ -62,67 +65,187 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
 
         EnsureLevel(0);
         _levels[0].Add(ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
-            delta, _keyComparer, _valueComparer));
+            delta, _keyComparer, _valueComparer, _monotoneKey));
         RunCompaction();
     }
 
     /// <summary>
-    /// Frontier-driven GC: drops every key whose <paramref name="monotoneKey"/>
+    /// Frontier-driven GC: drops every outer key whose <paramref name="monotoneKey"/>
     /// projection is strictly below <paramref name="threshold"/>, returning the
     /// removed keys so the owning operator can drop parallel per-key caches.
     /// </summary>
     /// <remarks>
-    /// Rebuilds the spine from the surviving (≥ threshold) state — O(retained
-    /// state), which stays window-bounded as the frontier advances. Spill files
-    /// for discarded batches are deleted. Folding the drop into compaction (so
-    /// it costs O(dropped) and preserves batch structure) is a future
-    /// optimisation; this correct first cut bounds memory, which is the point.
+    /// Per-batch dispatch on each batch's
+    /// <see cref="SpineIndexedBatch{TKey,TValue,TWeight}.MinMonotoneKey"/> /
+    /// <see cref="SpineIndexedBatch{TKey,TValue,TWeight}.MaxMonotoneKey"/>:
+    /// whole-batch drop, keep-as-is, or load-and-mask-filter. Filtering removes
+    /// whole groups (no partial-group filtering — the analyzer only flags outer
+    /// keys today). Batch ordering and level layout are preserved so the
+    /// compaction strategy's insertion-order assumptions stay intact. Counterpart
+    /// to <see cref="SpineZSetTrace{TKey,TWeight}.DropKeysBelow"/>.
     /// </remarks>
     public IReadOnlyList<TKey> DropKeysBelow(long threshold, Func<TKey, long> monotoneKey)
     {
         ArgumentNullException.ThrowIfNull(monotoneKey);
 
         List<TKey>? removed = null;
-        var survivors = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (key, group) in MaterialiseGroups())
+        for (var li = 0; li < _levels.Count; li++)
         {
-            if (monotoneKey(key) < threshold)
+            var level = _levels[li];
+            for (var bi = level.Count - 1; bi >= 0; bi--)
             {
-                (removed ??= new List<TKey>()).Add(key);
+                var batch = level[bi];
+                var (batchMin, batchMax) = GetOrComputeMonotoneRange(batch, monotoneKey);
+
+                if (batch.IsEmpty || batchMax < threshold)
+                {
+                    if (batch is SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilled)
+                    {
+                        SyncDelete(spilled);
+                    }
+
+                    if (!batch.IsEmpty)
+                    {
+                        foreach (var (k, _) in batch.Entries())
+                        {
+                            (removed ??= new List<TKey>()).Add(k);
+                        }
+                    }
+
+                    level.RemoveAt(bi);
+                    continue;
+                }
+
+                if (batchMin >= threshold)
+                {
+                    continue;
+                }
+
+                var resident = batch.MaterialiseIndexed(_keyComparer, _valueComparer);
+                var (filtered, droppedKeys) = FilterAbove(resident, threshold, monotoneKey);
+
+                if (droppedKeys is not null)
+                {
+                    (removed ??= new List<TKey>()).AddRange(droppedKeys);
+                }
+
+                if (batch is SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilledMixed)
+                {
+                    SyncDelete(spilledMixed);
+                }
+
+                if (filtered.IsEmpty)
+                {
+                    level.RemoveAt(bi);
+                }
+                else
+                {
+                    level[bi] = MaybeSpill(filtered, li);
+                }
+            }
+        }
+
+        return (IReadOnlyList<TKey>?)removed ?? Array.Empty<TKey>();
+    }
+
+    private (long Min, long Max) GetOrComputeMonotoneRange(
+        SpineIndexedBatch<TKey, TValue, TWeight> batch, Func<TKey, long> monotoneKey)
+    {
+        if (batch.MinMonotoneKey is long min && batch.MaxMonotoneKey is long max)
+        {
+            return (min, max);
+        }
+
+        if (batch.IsEmpty)
+        {
+            return (long.MaxValue, long.MinValue);
+        }
+
+        var resident = batch.MaterialiseIndexed(_keyComparer, _valueComparer);
+        var keys = resident.Keys;
+        var rangeMin = monotoneKey(keys[0]);
+        var rangeMax = rangeMin;
+        for (var i = 1; i < keys.Length; i++)
+        {
+            var p = monotoneKey(keys[i]);
+            if (p < rangeMin) { rangeMin = p; }
+            if (p > rangeMax) { rangeMax = p; }
+        }
+
+        return (rangeMin, rangeMax);
+    }
+
+    private (ResidentSpineIndexedBatch<TKey, TValue, TWeight> Filtered, List<TKey>? Dropped) FilterAbove(
+        ResidentSpineIndexedBatch<TKey, TValue, TWeight> resident, long threshold, Func<TKey, long> monotoneKey)
+    {
+        var keys = resident.Keys;
+        var offsets = resident.Offsets;
+        var values = resident.Values;
+        var weights = resident.Weights;
+        var keep = new bool[keys.Length];
+        var keptGroups = 0;
+        var keptItems = 0;
+        List<TKey>? dropped = null;
+
+        for (var ki = 0; ki < keys.Length; ki++)
+        {
+            if (monotoneKey(keys[ki]) >= threshold)
+            {
+                keep[ki] = true;
+                keptGroups++;
+                keptItems += offsets[ki + 1] - offsets[ki];
             }
             else
             {
-                foreach (var (v, w) in group)
-                {
-                    survivors.Add(key, v, w);
-                }
+                (dropped ??= new List<TKey>()).Add(keys[ki]);
             }
         }
 
-        if (removed is null)
+        if (dropped is null)
         {
-            return Array.Empty<TKey>();
+            return (resident, null);
         }
 
-        foreach (var level in _levels)
+        if (keptGroups == 0)
         {
-            foreach (var batch in level)
+            return (ResidentSpineIndexedBatch<TKey, TValue, TWeight>.Empty(_keyComparer, _valueComparer), dropped);
+        }
+
+        var newKeys = new TKey[keptGroups];
+        var newOffsets = new int[keptGroups + 1];
+        var newValues = new TValue[keptItems];
+        var newWeights = new TWeight[keptItems];
+
+        var go = 0;
+        var vo = 0;
+        for (var ki = 0; ki < keys.Length; ki++)
+        {
+            if (!keep[ki])
             {
-                if (batch is SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilled)
-                {
-                    SyncDelete(spilled);
-                }
+                continue;
             }
+
+            newKeys[go] = keys[ki];
+            newOffsets[go] = vo;
+            var start = offsets[ki];
+            var end = offsets[ki + 1];
+            for (var i = start; i < end; i++)
+            {
+                newValues[vo] = values[i];
+                newWeights[vo] = weights[i];
+                vo++;
+            }
+
+            go++;
         }
 
-        _levels.Clear();
-        var surviving = survivors.Build();
-        if (!surviving.IsEmpty)
-        {
-            Integrate(surviving);
-        }
+        newOffsets[keptGroups] = vo;
 
-        return removed;
+        var filtered = ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromSortedArrays(
+            newKeys, newOffsets, newValues, newWeights,
+            _keyComparer, _valueComparer, _monotoneKey ?? monotoneKey);
+
+        return (filtered, dropped);
     }
 
     /// <summary>
@@ -320,7 +443,7 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
 
         var toMerge = src.GetRange(0, action.BatchCount);
         var merged = SpineIndexedBatch<TKey, TValue, TWeight>.Merge(
-            toMerge, _keyComparer, _valueComparer);
+            toMerge, _keyComparer, _valueComparer, _monotoneKey);
         src.RemoveRange(0, action.BatchCount);
 
         foreach (var input in toMerge)
@@ -370,7 +493,8 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
 
         return new SpilledSpineIndexedBatch<TKey, TValue, TWeight>(
             _spillConfig.FileSystem, path, _spillConfig.Codec,
-            _keyComparer, _valueComparer, batch.Bloom, batch.GroupCount);
+            _keyComparer, _valueComparer, batch.Bloom, batch.GroupCount,
+            batch.MinMonotoneKey, batch.MaxMonotoneKey);
     }
 
     private static void SyncDelete(SpilledSpineIndexedBatch<TKey, TValue, TWeight> spilled)
