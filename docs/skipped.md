@@ -59,38 +59,51 @@ reflect that shape, not a backlog.
       positions — returns a per-row boolean rather than a row filter,
       different shape from the semi-join lift.
 - Correlated subqueries — **implemented** for the single-level form
-  across all three shapes: `IN (subquery)`, `EXISTS (subquery)`, and
-  scalar subquery. When the subquery's body equi-references an outer
-  column (`outer.col = inner.col`), the resolver decorrelates by
-  lifting the correlation predicate out of the inner WHERE,
-  projecting the inner correlation column into the subquery schema,
-  and emitting one of:
-    - `SemiJoinPlan` for correlated `IN` (multi-key: probe + correlation
-      columns).
-    - `SemiJoinPlan` for correlated `EXISTS` (correlation-only equi-keys).
+  across all four shapes: `IN (subquery)`, `EXISTS (subquery)`,
+  scalar subquery, and the anti-semi-join forms
+  `NOT IN (subquery)` + correlated `NOT EXISTS`. When the subquery's
+  body equi-references an outer column (`outer.col = inner.col`),
+  the resolver decorrelates by lifting the correlation predicate out
+  of the inner WHERE, projecting the inner correlation column into
+  the subquery schema, and emitting one of:
+    - `SemiJoinPlan(IsAnti=false)` for `IN` / `EXISTS` (multi-key
+      with probe + correlation columns for `IN`; correlation-only
+      for `EXISTS`).
+    - `SemiJoinPlan(IsAnti=true)` for `NOT IN` / correlated
+      `NOT EXISTS`. The compiler emits this as
+      `outer − SemiJoin(outer, sq)` via the existing
+      `builder.Difference` Z-set subtraction.
     - `CorrelatedScalarSubqueryJoinPlan` for correlated scalar (the
-      inner aggregate's GROUP BY is augmented with correlation columns;
-      multi-column-key LEFT JOIN appends the scalar value).
-  All three share the same `outerSchema: Schema?` plumbing,
-  `ResolvedCorrelationRef` expression node, and `TryMatchEquiCorrelation`
-  / `FindAllCorrelations` helpers. Deferred:
-    - **[P1]** Correlated `NOT EXISTS` and `NOT IN` — anti-semi-join +
-      three-valued NULL handling.
-    - **[P1]** Correlated `EXISTS` / `IN` outside top-level WHERE
-      conjuncts (SELECT / HAVING / nested boolean) — per-row boolean
-      shape, distinct from the row-filter semi-join.
+      inner aggregate's GROUP BY is augmented with correlation
+      columns; multi-column-key LEFT JOIN appends the scalar value).
+  All shapes share the same `outerSchema: Schema?` plumbing,
+  `ResolvedCorrelationRef` expression node, and
+  `TryMatchEquiCorrelation` / `FindAllCorrelations` helpers. v1
+  restricts `NOT IN` to **NOT NULL operands only** — nullable probe
+  or nullable subquery column rejects with "NOT IN with nullable
+  operands requires three-valued NULL handling (deferred)". Deferred:
+    - **[P1]** `NOT IN (subquery)` with nullable operands — needs an
+      "any NULL in sq" per-correlation-group scalar-subquery layer
+      atop the anti-semi-join. The `CorrelatedScalarSubqueryJoinPlan`
+      machinery is in place; the missing piece is the resolver-side
+      synthesis of the inner `SELECT COUNT(*) WHERE col IS NULL` plan
+      and the outer filter.
+    - **[P1]** `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` outside
+      top-level WHERE conjuncts (SELECT / HAVING / nested boolean)
+      — per-row boolean shape, distinct from the row-filter
+      semi-join.
     - **[P2]** Correlated scalar subquery without an aggregate — would
       need a uniqueness guarantee on the inner per correlation key.
     - **[P2]** Correlation refs inside the aggregate expressions
-      themselves (`SELECT MAX(outer.k + y) FROM t WHERE ...`). Rejected
-      today as "unknown column" via the existing column-resolution
-      path.
-    - **[P2]** Nested correlation (subquery inside subquery referencing
-      grand-outer columns). v1 supports a single level.
+      themselves (`SELECT MAX(outer.k + y) FROM t WHERE ...`).
+      Rejected today as "unknown column" via the existing
+      column-resolution path.
+    - **[P2]** Nested correlation (subquery inside subquery
+      referencing grand-outer columns). v1 supports a single level.
     - **[P2]** Non-equi correlation (`outer.col > inner.col`) and
-      correlation in JOIN ON / HAVING / GROUP BY / aggregates. Rejected
-      with explicit "only equi-correlation in inner WHERE supported"
-      errors.
+      correlation in JOIN ON / HAVING / GROUP BY / aggregates.
+      Rejected with explicit "only equi-correlation in inner WHERE
+      supported" errors.
 - **[P2]** DBSP-paper-faithful retraction propagation for recursive CTEs.
   `WITH RECURSIVE` uses semi-naïve incremental evaluation on pure-insert
   ticks: <c>R</c> is preserved across outer ticks, and each tick's external
