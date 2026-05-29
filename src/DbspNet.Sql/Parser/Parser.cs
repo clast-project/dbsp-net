@@ -851,25 +851,14 @@ public sealed class Parser
     }
 
     /// <summary>
-    /// <c>EXISTS (subquery)</c> — desugar at parse time to
-    /// <c>COALESCE((SELECT COUNT(*) FROM (subquery)), 0) &gt; 0</c>. The
-    /// synthesized scalar subquery rides on the existing
-    /// <see cref="Plan.Resolver.WrapWithScalarSubqueries"/> machinery; no
-    /// new resolver case, no new operator. <c>NOT EXISTS (sq)</c> falls
-    /// out naturally as <c>NOT (count &gt; 0)</c> via the existing unary-NOT
-    /// handling at <see cref="ParseNot"/>.
+    /// <c>EXISTS (subquery)</c> — parses to an
+    /// <see cref="ExistsExpression"/> AST node. The resolver routes
+    /// uncorrelated cases via a synthesised
+    /// <c>COALESCE((SELECT COUNT(*) FROM (sq)), 0) &gt; 0</c> desugar (same
+    /// shape the parser used to emit before this AST node existed), and
+    /// correlated cases via a <see cref="Plan.SemiJoinPlan"/> lift with
+    /// the correlation columns as equi-keys.
     /// </summary>
-    /// <remarks>
-    /// The <c>COALESCE(..., 0)</c> wrap is load-bearing for NOT EXISTS over
-    /// an empty subquery: DbspNet's incremental aggregate emits no row for
-    /// an empty input (its observable behaviour, see
-    /// <c>WhereScalarSubquery_EmptySubquery_ComparisonYieldsNull_FiltersOut</c>),
-    /// so the bare <c>(SELECT COUNT(*) FROM (sq))</c> evaluates to NULL on
-    /// empty <c>sq</c>. Without COALESCE, <c>NOT (NULL &gt; 0)</c> stays NULL
-    /// and WHERE would drop the row instead of passing it. Standard SQL has
-    /// <c>COUNT(*)</c> always return one row, so the COALESCE is a no-op
-    /// against any conformant input; it's the engine-quirk shim.
-    /// </remarks>
     private Expression ParseExistsExpression()
     {
         Expect(TokenKind.Exists);
@@ -882,6 +871,10 @@ public sealed class Parser
         var inner = ParseQuery();
         Expect(TokenKind.RParen);
 
+        var original = new SubqueryExpression(inner);
+        // Cache the (SELECT COUNT(*) FROM (inner) AS __exists_inner)
+        // subquery used by the resolver's COALESCE-desugar. Computed once
+        // so reference-equality dedup in WrapWithScalarSubqueries works.
         var derived = new DerivedTableReference(inner, Alias: "__exists_inner");
         var countStar = new FunctionCallExpression("count", Array.Empty<Expression>(), IsStar: true);
         var countSelect = new SelectStatement(
@@ -892,12 +885,7 @@ public sealed class Parser
             Having: null,
             Ctes: Array.Empty<CteDefinition>());
         var countSubquery = new SubqueryExpression(countSelect);
-        var zero = new LiteralExpression(LiteralKind.Integer, 0L);
-        var coalesced = new FunctionCallExpression(
-            "coalesce",
-            new Expression[] { countSubquery, zero },
-            IsStar: false);
-        return new BinaryExpression(BinaryOperator.Greater, coalesced, zero);
+        return new ExistsExpression(original, countSubquery);
     }
 
     private CastExpression ParseCastExpression()

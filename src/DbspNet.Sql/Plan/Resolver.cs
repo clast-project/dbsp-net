@@ -138,15 +138,17 @@ public sealed class Resolver
         var plan = ResolveFrom(stmt.From, scope);
 
         // WHERE — pre-pass for scalar subqueries referenced in the predicate
-        // (each adds a hidden column via ScalarSubqueryJoinPlan), and a
-        // semi-join lift for any `x IN (subquery)` conjunct.
+        // (each adds a hidden column via ScalarSubqueryJoinPlan), plus
+        // semi-join lifts for `x IN (subquery)` and `EXISTS (subquery)`
+        // conjuncts.
         if (stmt.Where is not null)
         {
-            // Split at top-level AND so IN-subquery terms can be peeled off
-            // and lifted to SemiJoinPlan; the remaining scalar predicates
-            // stay as a FilterPlan over the result.
+            // Split at top-level AND so IN-subquery and EXISTS terms can be
+            // peeled off and lifted to SemiJoinPlan; the remaining scalar
+            // predicates stay as a FilterPlan over the result.
             var conjuncts = SplitAndConjuncts(stmt.Where);
             var inSubqueries = new List<InSubqueryExpression>();
+            var existsConjuncts = new List<(ExistsExpression Sq, bool IsNegated)>();
             var scalarConjuncts = new List<Expression>();
             foreach (var c in conjuncts)
             {
@@ -160,6 +162,14 @@ public sealed class Resolver
 
                     inSubqueries.Add(isq);
                 }
+                else if (c is ExistsExpression e)
+                {
+                    existsConjuncts.Add((e, false));
+                }
+                else if (c is UnaryExpression { Operator: UnaryOperator.Not, Operand: ExistsExpression eNeg })
+                {
+                    existsConjuncts.Add((eNeg, true));
+                }
                 else
                 {
                     scalarConjuncts.Add(c);
@@ -169,6 +179,11 @@ public sealed class Resolver
             foreach (var isq in inSubqueries)
             {
                 plan = LiftInSubqueryToSemiJoin(plan, isq, scope);
+            }
+
+            foreach (var (e, isNegated) in existsConjuncts)
+            {
+                plan = LiftExistsOrDesugar(plan, e, isNegated, scope, scalarConjuncts);
             }
 
             if (scalarConjuncts.Count > 0)
@@ -1060,6 +1075,15 @@ public sealed class Resolver
                 // handled there with its own scope) or rejected by
                 // ResolveScalarExpression with a "deferred" error.
                 break;
+            case ExistsExpression existsE:
+                // Register the cached CountSubquery: it's the scalar that
+                // WrapWithScalarSubqueries needs to hide as a column when
+                // the EXISTS appears in a non-WHERE position (SELECT/HAVING)
+                // or as a nested-boolean subexpression. For WHERE-top-level
+                // EXISTS the lift in LiftExistsOrDesugar handles it; for
+                // correlated EXISTS the path skips this walker entirely.
+                acc.Add(existsE.CountSubquery);
+                break;
             // Literals, column refs: no subqueries possible.
         }
     }
@@ -1101,6 +1125,69 @@ public sealed class Resolver
         }
 
         return acc;
+    }
+
+    /// <summary>
+    /// Build the COALESCE-desugar for <c>EXISTS (sq)</c>:
+    /// <c>COALESCE(countSubquery, 0) &gt; 0</c>. The
+    /// <paramref name="countSubquery"/> is the parser-cached
+    /// <c>(SELECT COUNT(*) FROM (sq) AS __exists_inner)</c> — reusing the
+    /// same instance everywhere keeps reference-equality dedup in
+    /// <see cref="WrapWithScalarSubqueries"/> working across the WHERE
+    /// pre-pass's uncorrelated arm and the scalar-resolve path.
+    /// </summary>
+    private static Expression BuildExistsCoalesceDesugar(SubqueryExpression countSubquery)
+    {
+        var zero = new LiteralExpression(LiteralKind.Integer, 0L);
+        var coalesced = new FunctionCallExpression(
+            "coalesce", new Expression[] { countSubquery, zero }, IsStar: false);
+        return new BinaryExpression(BinaryOperator.Greater, coalesced, zero);
+    }
+
+    /// <summary>
+    /// Lift a top-level <c>WHERE EXISTS (subquery)</c> or
+    /// <c>WHERE NOT EXISTS (subquery)</c> conjunct.
+    /// Uncorrelated cases re-synthesise the COALESCE-desugar and append it
+    /// to <paramref name="scalarConjunctsForLater"/> for normal scalar
+    /// resolution. Correlated cases lift to a <see cref="SemiJoinPlan"/>
+    /// with the correlation columns as equi-keys (no IN-probe key, unlike
+    /// <see cref="LiftInSubqueryToSemiJoin"/>). Correlated NOT EXISTS
+    /// rejects with a deferred message — the anti-semi-join primitive
+    /// isn't in v1.
+    /// </summary>
+    private LogicalPlan LiftExistsOrDesugar(
+        LogicalPlan plan,
+        ExistsExpression e,
+        bool isNegated,
+        IReadOnlyDictionary<string, CteRef> cteScope,
+        List<Expression> scalarConjunctsForLater)
+    {
+        var subPlan = ResolveQuery(e.Subquery.Query, cteScope, outerSchema: plan.Schema);
+        var correlations = FindAllCorrelations(subPlan);
+
+        if (correlations.Count == 0)
+        {
+            // Uncorrelated EXISTS: route through the existing scalar-subquery
+            // path by appending the COALESCE-desugar to the pending scalar
+            // conjuncts. Wrap with the unary-NOT if this was NOT EXISTS.
+            Expression desugared = BuildExistsCoalesceDesugar(e.CountSubquery);
+            if (isNegated)
+            {
+                desugared = new UnaryExpression(UnaryOperator.Not, desugared);
+            }
+
+            scalarConjunctsForLater.Add(desugared);
+            return plan;
+        }
+
+        if (isNegated)
+        {
+            throw new ResolveException(
+                "correlated NOT EXISTS is not yet supported in v1 (anti-semi-join + three-valued NULL handling deferred)");
+        }
+
+        var (decorrelated, correlationKeys) = DecorrelateSubqueryPlan(subPlan, plan.Schema);
+        return new SemiJoinPlan(plan, decorrelated, correlationKeys, IsAnti: false);
     }
 
     /// <summary>
@@ -1598,6 +1685,10 @@ public sealed class Resolver
                 }
 
                 break;
+            case ExistsExpression:
+                // EXISTS's inner subquery lives in its own scope; its
+                // aggregates don't roll up to the outer SELECT.
+                break;
             // Literals, column refs, subqueries contribute no aggregates here.
         }
     }
@@ -1624,8 +1715,27 @@ public sealed class Resolver
         InSubqueryExpression => throw new ResolveException(
             "IN (subquery) is only supported as a top-level conjunct of WHERE in v1 " +
             "(SELECT / HAVING / nested boolean uses are deferred)"),
+        ExistsExpression e => ResolveExistsAsScalar(e, schema, subqueryMap),
         _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
     };
+
+    /// <summary>
+    /// Resolve <see cref="ExistsExpression"/> outside the WHERE-conjunct
+    /// fast path: synthesise the <c>COALESCE((SELECT COUNT(*) FROM (sq)), 0) &gt; 0</c>
+    /// desugar and recursively resolve. <see cref="outerSchema"/> is dropped
+    /// on the recursive call — correlated EXISTS in SELECT / HAVING / nested
+    /// boolean positions is deferred; any outer-column reference in the
+    /// inner subquery will fail at <see cref="Schema.Resolve"/> with the
+    /// usual "unknown column" error.
+    /// </summary>
+    private static ResolvedExpression ResolveExistsAsScalar(
+        ExistsExpression e,
+        Schema schema,
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+    {
+        var desugared = BuildExistsCoalesceDesugar(e.CountSubquery);
+        return ResolveScalarExpression(desugared, schema, subqueryMap, outerSchema: null);
+    }
 
     private static ResolvedExpression ResolveInList(
         InListExpression il,
@@ -1968,6 +2078,9 @@ public sealed class Resolver
         IsNullExpression isn => HasAggregate(isn.Operand),
         CastExpression cast => HasAggregate(cast.Operand),
         InListExpression il => HasAggregate(il.Probe) || AnyHasAggregate(il.Values),
+        // ExistsExpression / InSubqueryExpression / SubqueryExpression:
+        // the inner subquery is a separate scope and its aggregates don't
+        // count as outer aggregates.
         _ => false,
     };
 

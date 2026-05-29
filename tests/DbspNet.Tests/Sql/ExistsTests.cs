@@ -39,23 +39,11 @@ public class ExistsTests
     // ---------- Parser ----------
 
     [Fact]
-    public void Parser_Exists_DesugarsToCoalescedCountGreaterThanZero()
+    public void Parser_Exists_ProducesExistsExpression()
     {
-        // EXISTS (SELECT 1 FROM t) → COALESCE((SELECT COUNT(*) FROM (SELECT 1 FROM t)), 0) > 0
         var expr = new Parser(Lexer.Tokenize("EXISTS (SELECT 1 FROM t)")).ParseExpression();
-        var cmp = Assert.IsType<BinaryExpression>(expr);
-        Assert.Equal(BinaryOperator.Greater, cmp.Operator);
-
-        // Left: COALESCE(subquery, 0).
-        var coalesce = Assert.IsType<FunctionCallExpression>(cmp.Left);
-        Assert.Equal("coalesce", coalesce.FunctionName);
-        Assert.Equal(2, coalesce.Arguments.Count);
-        Assert.IsType<SubqueryExpression>(coalesce.Arguments[0]);
-
-        // Right: literal 0.
-        var lit = Assert.IsType<LiteralExpression>(cmp.Right);
-        Assert.Equal(LiteralKind.Integer, lit.Kind);
-        Assert.Equal(0L, lit.Value);
+        var exists = Assert.IsType<ExistsExpression>(expr);
+        Assert.IsType<SubqueryExpression>(exists.Subquery);
     }
 
     [Fact]
@@ -70,13 +58,13 @@ public class ExistsTests
     [Fact]
     public void Parser_NotExists_FlowsThroughUnaryNot()
     {
-        // No special NOT EXISTS AST — `NOT EXISTS (...)` parses to
-        // `NOT (COALESCE(count, 0) > 0)` via the existing unary-not arm.
+        // No dedicated NOT EXISTS AST — `NOT EXISTS (...)` parses as
+        // UnaryExpression(Not, ExistsExpression(...)) via the existing
+        // unary-not arm at ParseNot.
         var expr = new Parser(Lexer.Tokenize("NOT EXISTS (SELECT 1 FROM t)")).ParseExpression();
         var not = Assert.IsType<UnaryExpression>(expr);
         Assert.Equal(UnaryOperator.Not, not.Operator);
-        var cmp = Assert.IsType<BinaryExpression>(not.Operand);
-        Assert.Equal(BinaryOperator.Greater, cmp.Operator);
+        Assert.IsType<ExistsExpression>(not.Operand);
     }
 
     // ---------- End-to-end ----------

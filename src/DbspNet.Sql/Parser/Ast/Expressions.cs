@@ -110,3 +110,24 @@ public sealed record InSubqueryExpression(
     Expression Probe,
     SubqueryExpression Subquery,
     bool IsNegated) : Expression;
+
+/// <summary>
+/// <c>EXISTS (subquery)</c> — the membership-test form. The resolver
+/// routes uncorrelated cases via a synthesised
+/// <c>COALESCE((SELECT COUNT(*) FROM (sq)), 0) &gt; 0</c> desugar (the
+/// shape the parser used to produce before this node existed), and
+/// correlated cases via a <see cref="Plan.SemiJoinPlan"/> lift with the
+/// correlation columns as equi-keys. <c>NOT EXISTS</c> is just
+/// <see cref="UnaryExpression"/> wrapping this node — no dedicated
+/// negation field.
+/// </summary>
+/// <param name="Subquery">The original subquery the user wrote.</param>
+/// <param name="CountSubquery">
+/// Pre-cached <c>(SELECT COUNT(*) FROM (Subquery) AS __exists_inner)</c>
+/// subquery — the scalar value used by the COALESCE-desugar. Computed
+/// once by the parser so reference-equality dedup works across
+/// <c>CollectSubqueriesInto</c> and the resolver's synthesised expression.
+/// </param>
+public sealed record ExistsExpression(
+    SubqueryExpression Subquery,
+    SubqueryExpression CountSubquery) : Expression;
