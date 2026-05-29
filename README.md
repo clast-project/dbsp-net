@@ -243,9 +243,12 @@ beyond "Feldera is much bigger":
   `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` to a hidden
   per-correlation-group `COUNT(*)` column layered via
   `CorrelatedScalarSubqueryJoinPlan`; the bound AST node rewrites to
-  `COALESCE(count, 0) > 0` (or `= 0` when negated). NOT NULL operands
-  only — nullable non-WHERE IN/NOT IN would rewrite through `CASE WHEN`
-  (now available) but that wiring isn't done yet.
+  `COALESCE(count, 0) > 0` (or `= 0` when negated). Nullable-operand
+  `IN` / `NOT IN` in these positions get the full SQL three-valued
+  result: the resolver layers per-group match / total / null counts and
+  emits a `CASE` (`match>0 → TRUE`, empty group → `FALSE`,
+  NULL probe or a NULL subquery value with no match → `NULL`), with
+  `NOT IN` the three-valued negation.
   **Deferred**: nested correlation (subquery-inside-subquery
   referencing grand-outer columns).
 - `WITH RECURSIVE` evaluates semi-naïvely on pure-insert ticks (preserves

@@ -141,28 +141,136 @@ public class NonWhereSubqueryTests
         Assert.Equal(3, q.Current.Count);
     }
 
+    // ---------- Nullable-operand IN / NOT IN: full SQL three-valued logic ----------
+
     [Fact]
-    public void NullableProbe_InSelectIn_Rejected()
+    public void NullableProbe_InSelectIn_ThreeValued()
     {
-        var ex = Assert.Throws<ResolveException>(() => Compile(
+        // vips column is NOT NULL, so the only NULL source is the probe.
+        //   cust=1    → TRUE   (matches)
+        //   cust=3    → FALSE  (no match, subquery has no NULLs)
+        //   cust=NULL → NULL   (NULL probe against a non-empty subquery)
+        var q = Compile(
             [
                 "CREATE TABLE orders (cust INT)",
                 "CREATE TABLE vips (vid INT NOT NULL)",
             ],
-            "SELECT cust, cust IN (SELECT vid FROM vips) AS is_vip FROM orders"));
-        Assert.Contains("NOT NULL operands", ex.Message);
+            "SELECT cust, cust IN (SELECT vid FROM vips) AS is_vip FROM orders");
+
+        q.Table("vips").Insert(1);
+        q.Table("vips").Insert(2);
+        q.Table("orders").Insert(1);
+        q.Table("orders").Insert(3);
+        q.Table("orders").Insert((object?)null);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1, true));
+        Assert.Equal(1, WeightOf(q.Current, 3, false));
+        Assert.Equal(1, WeightOf(q.Current, null, null));
+        Assert.Equal(3, q.Current.Count);
     }
 
     [Fact]
-    public void NullableSubqueryColumn_InSelectIn_Rejected()
+    public void NullableSubqueryColumn_InSelectIn_ThreeValued()
     {
-        var ex = Assert.Throws<ResolveException>(() => Compile(
+        // vips contains a NULL value, so a non-matching probe is UNKNOWN.
+        //   cust=1 → TRUE   (matches the non-null 1)
+        //   cust=3 → NULL   (no match, but the subquery contains a NULL)
+        var q = Compile(
             [
                 "CREATE TABLE orders (cust INT NOT NULL)",
                 "CREATE TABLE vips (vid INT)",
             ],
-            "SELECT cust, cust IN (SELECT vid FROM vips) AS is_vip FROM orders"));
-        Assert.Contains("NOT NULL operands", ex.Message);
+            "SELECT cust, cust IN (SELECT vid FROM vips) AS is_vip FROM orders");
+
+        q.Table("vips").Insert(1);
+        q.Table("vips").Insert((object?)null);
+        q.Table("orders").Insert(1);
+        q.Table("orders").Insert(3);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1, true));
+        Assert.Equal(1, WeightOf(q.Current, 3, null));
+        Assert.Equal(2, q.Current.Count);
+    }
+
+    [Fact]
+    public void NullableSubqueryColumn_NotInSelect_ThreeValued()
+    {
+        // The classic NOT IN + NULL gotcha: NOT IN is the 3VL negation.
+        //   cust=1 → FALSE  (1 IN → TRUE)
+        //   cust=3 → NULL   (3 IN → NULL, NOT NULL = NULL)
+        var q = Compile(
+            [
+                "CREATE TABLE orders (cust INT NOT NULL)",
+                "CREATE TABLE vips (vid INT)",
+            ],
+            "SELECT cust, cust NOT IN (SELECT vid FROM vips) AS not_vip FROM orders");
+
+        q.Table("vips").Insert(1);
+        q.Table("vips").Insert((object?)null);
+        q.Table("orders").Insert(1);
+        q.Table("orders").Insert(3);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1, false));
+        Assert.Equal(1, WeightOf(q.Current, 3, null));
+        Assert.Equal(2, q.Current.Count);
+    }
+
+    [Fact]
+    public void NullableProbe_InSelectIn_EmptySubquery_IsFalseNotNull()
+    {
+        // `x IN (empty)` is FALSE for every x — including a NULL probe. This is
+        // the edge the per-group total count exists to get right.
+        var q = Compile(
+            [
+                "CREATE TABLE orders (cust INT)",
+                "CREATE TABLE vips (vid INT NOT NULL)",
+            ],
+            "SELECT cust, cust IN (SELECT vid FROM vips) AS is_vip FROM orders");
+
+        // vips stays empty.
+        q.Table("orders").Insert(5);
+        q.Table("orders").Insert((object?)null);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 5, false));
+        Assert.Equal(1, WeightOf(q.Current, null, false));
+        Assert.Equal(2, q.Current.Count);
+    }
+
+    [Fact]
+    public void NullableCorrelatedIn_InSelect_ThreeValuedPerGroup()
+    {
+        // Correlated nullable IN: total / null / match counts are per
+        // correlation group (region).
+        //   (1,10) → TRUE   (1 ∈ {1,NULL} for region 10)
+        //   (2,10) → NULL   (no match, region-10 group has a NULL)
+        //   (5,20) → TRUE   (5 ∈ {5} for region 20)
+        //   (9,30) → FALSE  (region-30 group is empty)
+        var q = Compile(
+            [
+                "CREATE TABLE orders (cust INT, region INT NOT NULL)",
+                "CREATE TABLE vips (vid INT, region INT NOT NULL)",
+            ],
+            "SELECT cust, cust IN (SELECT vid FROM vips WHERE vips.region = orders.region) AS is_vip " +
+            "FROM orders");
+
+        q.Table("vips").Insert(1, 10);
+        q.Table("vips").Insert((object?)null, 10);
+        q.Table("vips").Insert(5, 20);
+        q.Table("orders").Insert(1, 10);
+        q.Table("orders").Insert(2, 10);
+        q.Table("orders").Insert(5, 20);
+        q.Table("orders").Insert(9, 30);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1, true));
+        Assert.Equal(1, WeightOf(q.Current, 2, null));
+        Assert.Equal(1, WeightOf(q.Current, 5, true));
+        Assert.Equal(1, WeightOf(q.Current, 9, false));
+        Assert.Equal(4, q.Current.Count);
     }
 
     // ---------- HAVING positions ----------

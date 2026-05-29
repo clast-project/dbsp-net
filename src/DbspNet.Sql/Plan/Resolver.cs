@@ -62,7 +62,26 @@ public sealed class Resolver
     /// <c>COALESCE(match_count, 0) &gt; 0</c> (or the negated form for
     /// <c>NOT IN</c> / a wrapping <c>NOT EXISTS</c>).
     /// </summary>
-    private readonly record struct BooleanSubqueryBinding(int CountColumnIndex, bool IsNegated);
+    private readonly record struct BooleanSubqueryBinding(int CountColumnIndex, bool IsNegated)
+    {
+        /// <summary>
+        /// Set for the nullable-operand <c>IN</c> / <c>NOT IN</c> 3VL path in
+        /// non-WHERE positions. When non-<c>null</c>,
+        /// <see cref="BuildBooleanSubqueryRef"/> emits a full <c>CASE</c> using
+        /// <see cref="CountColumnIndex"/> as the match count plus the total /
+        /// null counts below; the probe expression is needed for the
+        /// <c>probe IS NULL → NULL</c> arm. <c>null</c> on the EXISTS and
+        /// NOT-NULL-operand fast paths, which use the plain
+        /// <c>COALESCE(count, 0) &gt; 0</c> comparison.
+        /// </summary>
+        public ResolvedExpression? NullableProbe { get; init; }
+
+        /// <summary>Per-group total row count (empty-subquery detection). Nullable path only.</summary>
+        public int TotalCountColumnIndex { get; init; }
+
+        /// <summary>Per-group count of NULL subquery values. Nullable path only.</summary>
+        public int NullCountColumnIndex { get; init; }
+    }
 
     // ---------- DDL ----------
 
@@ -2110,12 +2129,39 @@ public sealed class Resolver
         {
             if (inMap.ContainsKey(isq)) { continue; }
             var probe = ResolveScalarExpression(isq.Probe, plan.Schema);
-            // For non-WHERE IN/NOT IN: NULL operands need CASE WHEN (deferred).
-            // (For WHERE the LayerNullCountAndFilter machinery handles it; in
-            // non-WHERE the scalar boolean shape requires CASE for NULL.)
+
+            // Decide the path by operand nullability. When neither the probe
+            // nor the subquery column can be NULL, IN/NOT IN are two-valued and
+            // the plain match-count comparison suffices (fast path). Otherwise
+            // SQL three-valued logic can produce NULL, which a count comparison
+            // can't express — layer total / null counts and emit a CASE.
+            var probeSub = ResolveQuery(isq.Subquery.Query, cteScope, outerSchema: plan.Schema);
+            if (probeSub.Schema.Count != 1)
+            {
+                throw new ResolveException(
+                    $"IN (subquery) requires exactly 1 subquery column; got {probeSub.Schema.Count}");
+            }
+
+            var nullable = probe.Type.Nullable || probeSub.Schema[0].Type.Nullable;
+            if (!nullable)
+            {
+                plan = LayerBooleanSubqueryCount(plan, cteScope, isq.Subquery,
+                    probe: probe, isNegated: isq.IsNegated, out var bindingIdx);
+                inMap[isq] = new BooleanSubqueryBinding(bindingIdx, isq.IsNegated);
+                continue;
+            }
+
             plan = LayerBooleanSubqueryCount(plan, cteScope, isq.Subquery,
-                probe: probe, isNegated: isq.IsNegated, out var bindingIdx);
-            inMap[isq] = new BooleanSubqueryBinding(bindingIdx, isq.IsNegated);
+                probe: probe, isNegated: false, out var matchIdx);
+            plan = LayerBooleanSubqueryCount(plan, cteScope, isq.Subquery,
+                probe: null, isNegated: false, out var totalIdx);
+            plan = LayerNullCountColumn(plan, cteScope, isq.Subquery, out var nullIdx);
+            inMap[isq] = new BooleanSubqueryBinding(matchIdx, isq.IsNegated)
+            {
+                NullableProbe = probe,
+                TotalCountColumnIndex = totalIdx,
+                NullCountColumnIndex = nullIdx,
+            };
         }
 
         return (plan, existsMap, inMap);
@@ -2143,14 +2189,11 @@ public sealed class Resolver
                 $"IN (subquery) requires exactly 1 subquery column; got {subPlan.Schema.Count}");
         }
 
-        // For IN/NOT IN in non-WHERE: NULL operands need CASE WHEN (deferred).
-        if (probe is not null
-            && (probe.Type.Nullable || subPlan.Schema[0].Type.Nullable))
-        {
-            throw new ResolveException(
-                "IN (subquery) / NOT IN (subquery) in non-WHERE positions requires NOT NULL operands in v1 " +
-                "(the nullable-operand 3VL needs CASE WHEN, deferred); the WHERE-conjunct form handles nullable operands today");
-        }
+        // Nullable operands are handled by the caller layering extra total /
+        // null count columns and emitting a full 3VL CASE; this method just
+        // produces the per-(correlation,value)-group match count. NULL probe
+        // keys and NULL subquery values never equi-join, so the match count
+        // correctly excludes them (the CASE then resolves their 3VL outcome).
 
         // Decorrelate; correlation columns project at the front, value column
         // (if any) sits at the back.
@@ -2233,6 +2276,72 @@ public sealed class Resolver
     }
 
     /// <summary>
+    /// Layer a hidden per-correlation-group count of <em>NULL subquery
+    /// values</em> onto <paramref name="plan"/>, returning its column index.
+    /// Used by the nullable-operand non-WHERE <c>IN</c> / <c>NOT IN</c> 3VL
+    /// path: a non-matching probe whose subquery group contains a NULL value
+    /// yields UNKNOWN rather than FALSE. Mirrors the aggregation half of
+    /// <see cref="LayerNullCountAndFilter"/> (the WHERE path) but appends a
+    /// column instead of filtering. The appended column is nullable: empty
+    /// correlation groups null-pad through the LEFT-JOIN layering, and
+    /// <see cref="BuildBooleanSubqueryRef"/> reads it as <c>COALESCE(_, 0)</c>.
+    /// </summary>
+    private LogicalPlan LayerNullCountColumn(
+        LogicalPlan plan,
+        IReadOnlyDictionary<string, CteRef> cteScope,
+        SubqueryExpression subquery,
+        out int nullCountColIndex)
+    {
+        var subPlan = ResolveQuery(subquery.Query, cteScope, outerSchema: plan.Schema);
+        var (decorrelated, correlationKeys) = DecorrelateSubqueryPlan(subPlan, plan.Schema);
+
+        // Filter the decorrelated subquery to rows whose value column is NULL.
+        var valueIndex = decorrelated.Schema.Count - 1;
+        var valueType = decorrelated.Schema[valueIndex].Type;
+        var isNullPred = new ResolvedIsNull(
+            new ResolvedColumn(valueIndex, valueType), Negated: false, new SqlBooleanType(false));
+        LogicalPlan nullsOnly = new FilterPlan(decorrelated, isNullPred);
+
+        // COUNT(*) grouped by the correlation columns (none → single global count).
+        var groupKeys = new List<ResolvedExpression>(correlationKeys.Count);
+        var groupKeyCols = new List<SchemaColumn>(correlationKeys.Count);
+        for (var i = 0; i < correlationKeys.Count; i++)
+        {
+            var k = correlationKeys[i];
+            groupKeys.Add(new ResolvedColumn(k.InnerColumnIndex, k.Type));
+            groupKeyCols.Add(new SchemaColumn("__nin_corr_" + i, k.Type));
+        }
+
+        var countType = new SqlBigintType(false);
+        var aggregates = new List<AggregateCall>
+        {
+            new AggregateCall(AggregateKind.CountStar, Argument: null, countType),
+        };
+
+        var aggCols = new List<SchemaColumn>(groupKeyCols.Count + 1);
+        aggCols.AddRange(groupKeyCols);
+        aggCols.Add(new SchemaColumn("__nin_null_count", countType));
+        LogicalPlan nullCountPlan = new AggregatePlan(
+            nullsOnly, groupKeys, aggregates, new Schema(aggCols));
+
+        var hiddenColType = countType.WithNullable(true);
+        var hiddenColName = $"$nincnt{plan.Schema.Count}";
+        var augmentedSchema = plan.Schema.Concat(
+            new Schema([new SchemaColumn(hiddenColName, hiddenColType)]));
+        nullCountColIndex = plan.Schema.Count;
+
+        if (correlationKeys.Count > 0)
+        {
+            var scalarIdx = nullCountPlan.Schema.Count - 1;
+            return new CorrelatedScalarSubqueryJoinPlan(
+                plan, nullCountPlan, correlationKeys, scalarIdx, augmentedSchema);
+        }
+
+        return new ScalarSubqueryJoinPlan(
+            plan, new List<LogicalPlan> { nullCountPlan }, augmentedSchema);
+    }
+
+    /// <summary>
     /// Build a single AST-keyed substitution dictionary from the per-AST
     /// EXISTS / IN binding maps. <see cref="ResolveScalarExpression"/>
     /// consults this dictionary at the top of its dispatch to short-circuit
@@ -2261,9 +2370,20 @@ public sealed class Resolver
         return d;
     }
 
-    /// <summary>Build the resolved expression `COALESCE(count, 0) > 0` (or `= 0` for negated).</summary>
+    /// <summary>
+    /// Build the resolved boolean that a bound non-WHERE EXISTS / IN node
+    /// reads as. The two-valued fast path (EXISTS, NOT-NULL-operand IN) is
+    /// <c>COALESCE(match, 0) &gt; 0</c> (or <c>= 0</c> when negated). The
+    /// nullable-operand IN path emits the full SQL three-valued
+    /// <c>CASE</c> — see <see cref="BuildNullableInSubqueryRef"/>.
+    /// </summary>
     private static ResolvedExpression BuildBooleanSubqueryRef(BooleanSubqueryBinding bind)
     {
+        if (bind.NullableProbe is not null)
+        {
+            return BuildNullableInSubqueryRef(bind);
+        }
+
         var countNullable = new SqlBigintType(true);
         var countNotNull = new SqlBigintType(false);
         var boolNullable = new SqlBooleanType(true);
@@ -2276,6 +2396,58 @@ public sealed class Resolver
         return new ResolvedBinary(
             bind.IsNegated ? BinaryOperator.Equal : BinaryOperator.Greater,
             coalesced, zero, boolNullable);
+    }
+
+    /// <summary>
+    /// Build the full SQL three-valued <c>IN</c> result for a nullable-operand
+    /// subquery in a non-WHERE position, as a <c>CASE</c> over the three
+    /// hidden count columns (match / total / null), then negate for
+    /// <c>NOT IN</c>:
+    /// <code>
+    ///   CASE WHEN COALESCE(match, 0) > 0 THEN TRUE   -- a value equals the probe
+    ///        WHEN COALESCE(total, 0) = 0 THEN FALSE  -- empty subquery group
+    ///        WHEN probe IS NULL          THEN NULL   -- NULL probe vs non-empty
+    ///        WHEN COALESCE(null,  0) > 0 THEN NULL   -- no match, but a NULL value
+    ///        ELSE FALSE END                          -- no match, no NULLs
+    /// </code>
+    /// <c>NOT IN</c> wraps this in <c>NOT(...)</c>; three-valued NOT maps
+    /// TRUE→FALSE, FALSE→TRUE, NULL→NULL, which is exactly the SQL
+    /// <c>NOT IN</c> truth table.
+    /// </summary>
+    private static ResolvedExpression BuildNullableInSubqueryRef(BooleanSubqueryBinding bind)
+    {
+        var boolNonNull = new SqlBooleanType(false);
+        var boolNullable = new SqlBooleanType(true);
+
+        ResolvedExpression trueLit = new ResolvedLiteral(LiteralKind.Boolean, true, boolNonNull);
+        ResolvedExpression falseLit = new ResolvedLiteral(LiteralKind.Boolean, false, boolNonNull);
+        ResolvedExpression nullLit = new ResolvedLiteral(LiteralKind.Null, null, boolNullable);
+
+        var clauses = new List<ResolvedCaseClause>
+        {
+            new ResolvedCaseClause(CountCompare(bind.CountColumnIndex, BinaryOperator.Greater), trueLit),
+            new ResolvedCaseClause(CountCompare(bind.TotalCountColumnIndex, BinaryOperator.Equal), falseLit),
+            new ResolvedCaseClause(
+                new ResolvedIsNull(bind.NullableProbe!, Negated: false, boolNonNull), nullLit),
+            new ResolvedCaseClause(CountCompare(bind.NullCountColumnIndex, BinaryOperator.Greater), nullLit),
+        };
+
+        ResolvedExpression positive = new ResolvedCaseWhen(clauses, falseLit, boolNullable);
+        return bind.IsNegated
+            ? new ResolvedUnary(UnaryOperator.Not, positive, boolNullable)
+            : positive;
+
+        // COALESCE(countCol, 0) <op> 0 — a definite boolean over a nullable count.
+        static ResolvedExpression CountCompare(int countColIndex, BinaryOperator op)
+        {
+            var countNullable = new SqlBigintType(true);
+            var countNotNull = new SqlBigintType(false);
+            var countCol = new ResolvedColumn(countColIndex, countNullable);
+            var zero = new ResolvedLiteral(LiteralKind.Integer, 0L, countNotNull);
+            var coalesced = new ResolvedFunctionCall(
+                "coalesce", new List<ResolvedExpression> { countCol, zero }, countNotNull);
+            return new ResolvedBinary(op, coalesced, zero, new SqlBooleanType(false));
+        }
     }
 
     /// <summary>

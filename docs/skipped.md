@@ -96,11 +96,16 @@ reflect that shape, not a backlog.
   when negated). Threading is via a single
   `IReadOnlyDictionary<Expression, ResolvedExpression>? preBound`
   parameter on `ResolveScalarExpression` /
-  `ResolvePostAggregateExpression`. Deferred:
-    - **[P1]** Nullable operands in non-WHERE `IN` / `NOT IN` — needs
-      `CASE WHEN` for SQL three-valued logic in scalar context. The
-      WHERE-conjunct form handles nullables today via
-      `LayerNullCountAndFilter`.
+  `ResolvePostAggregateExpression`.
+
+  Nullable-operand `IN` / `NOT IN` in non-WHERE positions — **implemented**.
+  When the probe or subquery column is nullable, the resolver layers two
+  more hidden counts (per-group total and per-group NULL-value count, the
+  latter via `LayerNullCountColumn`) and `BuildBooleanSubqueryRef` emits
+  the full SQL three-valued result as a `CASE`: `match>0 → TRUE`, empty
+  group → `FALSE`, NULL probe (vs a non-empty group) or a NULL subquery
+  value with no match → `NULL`, else `FALSE`; `NOT IN` is the three-valued
+  negation. Deferred:
     - **[P2]** Correlated scalar subquery without an aggregate — would
       need a uniqueness guarantee on the inner per correlation key.
     - **[P2]** Correlation refs inside the aggregate expressions

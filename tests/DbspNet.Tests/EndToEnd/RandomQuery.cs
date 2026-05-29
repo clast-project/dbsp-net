@@ -224,7 +224,22 @@ internal static class RandomQuery
 
         // 46. CASE over the nullable table — a NULL condition (v > lit when v is
         // NULL) must fall through to ELSE (SQL three-valued semantics).
-        GenLiteral.Select(p => $"SELECT k, CASE WHEN v > {p} THEN 1 ELSE 0 END AS c FROM n"));
+        GenLiteral.Select(p => $"SELECT k, CASE WHEN v > {p} THEN 1 ELSE 0 END AS c FROM n"),
+
+        // ---- Nullable-operand IN / NOT IN in non-WHERE positions ----
+        // The probe (n.v / n.k) is nullable, so these resolve through the full
+        // three-valued CASE rewrite (match/total/null hidden counts). The PBT
+        // checks the resulting plan executes identically incrementally vs
+        // batch across the flat / optimized / spine paths.
+
+        // 47. Uncorrelated nullable IN in the SELECT list.
+        Gen.Const("SELECT k, v IN (SELECT v FROM t) AS m FROM n"),
+
+        // 48. Uncorrelated nullable NOT IN in the SELECT list.
+        Gen.Const("SELECT k, v NOT IN (SELECT v FROM u) AS m FROM n"),
+
+        // 49. Correlated nullable IN in the SELECT list (per-group counts).
+        Gen.Const("SELECT k, v IN (SELECT v FROM t WHERE t.k = n.k) AS m FROM n"));
 
     // ---- Data generator ----
 
