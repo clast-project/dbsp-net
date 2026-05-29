@@ -45,12 +45,24 @@ reflect that shape, not a backlog.
   SQL surface for it.
 
 ### Query constructs
-- **[P1]** `IN` / `EXISTS` subqueries. DbspNet supports uncorrelated scalar
-  subqueries in expression position; `IN` and `EXISTS` are deferred
-  (both decompose to a semi-join that needs one more operator-level primitive).
+- `IN (subquery)` / `EXISTS` / `NOT EXISTS` — **implemented** for the
+  **uncorrelated** form. `IN (subquery)` lifts to a `SemiJoinPlan` at the
+  top-level conjunct of WHERE (compiles to `Distinct(sq) ⋈ outer`).
+  `EXISTS (sq)` desugars at parse time to
+  `COALESCE((SELECT COUNT(*) FROM (sq)), 0) > 0`, which rides on the
+  existing scalar-subquery + COALESCE + comparison machinery; `NOT EXISTS`
+  falls out via the unary-NOT arm. Deferred follow-ons:
+    - **[P1]** `NOT IN (subquery)` — needs anti-semi-join + three-valued
+      NULL handling (`NOT IN` with a NULL in the subquery is NULL, not
+      simply `NOT (x IN ...)`).
+    - **[P1]** `IN (subquery)` in SELECT / HAVING / nested boolean
+      positions — returns a per-row boolean rather than a row filter,
+      different shape from the semi-join lift.
 - **[P1]** Correlated subqueries of any kind. Feldera handles these via
   Calcite's decorrelation rewrite; DbspNet's resolver treats subqueries as
-  closed over their own scope only.
+  closed over their own scope only — the same restriction applies to
+  `IN (subquery)` and `EXISTS` (so the patterns above are uncorrelated
+  only).
 - **[P2]** DBSP-paper-faithful retraction propagation for recursive CTEs.
   `WITH RECURSIVE` uses semi-naïve incremental evaluation on pure-insert
   ticks: <c>R</c> is preserved across outer ticks, and each tick's external
@@ -104,9 +116,15 @@ reflect that shape, not a backlog.
   to `x >= a AND x <= b`; no runtime work needed.
 - **[P1]** `LIKE`, `ILIKE`, `SIMILAR TO`. No keyword. Runtime story
   ties into the Utf8String roadmap noted under Type system.
-- **[P1]** `IN (literal_list)` / `NOT IN (literal_list)`. Distinct
-  from the IN-subquery form already listed — desugars to a disjunction
-  of equalities at parse time, no operator-level support needed.
+- `IN (literal_list)` / `NOT IN (literal_list)` — **implemented**.
+  Modeled as a flat `InListExpression(probe, values, isNegated)` AST
+  node, not a parser-time desugar to a left-leaning OR chain. The flat
+  representation keeps every recursive walker (resolver, expression
+  compiler, monotonicity analyzer, optimizer passes) at constant depth
+  contribution; a desugar would build an O(N)-depth tree and risk a C#
+  stack overflow on large lists (.NET's practical recursion limit is
+  ~100-200 levels). Compiles to a single iterative call into
+  `InListRuntime.Evaluate` that honours SQL three-valued NULL semantics.
 - **[P1]** `IS [NOT] DISTINCT FROM`. NULL-safe equality. The parser's
   `IS` arm only accepts `NULL` / `NOT NULL` today.
 - **[P2]** `IS TRUE` / `IS FALSE` / `IS UNKNOWN`. Boolean tests; same

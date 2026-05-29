@@ -221,8 +221,14 @@ beyond "Feldera is much bigger":
 - `INNER` / `LEFT` / `RIGHT [OUTER] JOIN` require at least one equi-key in
   `ON`. Non-equi conjuncts are allowed on `INNER JOIN` (applied as a
   post-filter) but rejected on outer joins.
-- Subqueries are uncorrelated and scalar only (exactly one column). `IN`,
-  `EXISTS`, and correlated subqueries are deferred.
+- Subqueries are uncorrelated only — correlated subqueries are deferred.
+  Uncorrelated support covers scalar subqueries (exactly one column),
+  `IN (subquery)` as a top-level conjunct of WHERE (via a `SemiJoinPlan`
+  lift over `Distinct(sq) ⋈ outer`), and `EXISTS` / `NOT EXISTS` (via a
+  `COALESCE((SELECT COUNT(*) FROM (sq)), 0)` desugar). `IN (literal_list)`
+  / `NOT IN (literal_list)` are flat-AST. `NOT IN (subquery)` and
+  `IN (subquery)` in SELECT/HAVING/nested-boolean positions are
+  deferred.
 - `WITH RECURSIVE` evaluates semi-naïvely on pure-insert ticks (preserves
   `R` across ticks, propagates only newly-derivable rows), and falls back
   to full recomputation on any tick containing a retraction. Body may
@@ -255,8 +261,11 @@ The biggest tracked-but-not-yet-shipped pieces:
 - **DRED-style retraction propagation for recursive CTEs**, so the
   full recomputation fallback on retraction-containing ticks goes
   away.
-- **Subquery decorrelation** and **`IN` / `EXISTS`** as
-  semi-join-based operators.
+- **Subquery decorrelation** — the pass that converts correlated
+  subqueries to joins. Unblocks correlated `IN` / `EXISTS` / scalar
+  subqueries in one go (the uncorrelated forms already ship).
+- **`NOT IN (subquery)`** — anti-semi-join + three-valued NULL handling
+  (`NOT IN` with a NULL in the subquery is NULL, not just `NOT (x IN ...)`).
 
 ## License
 
