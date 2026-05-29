@@ -430,10 +430,15 @@ internal static class BatchPlanEvaluator
 
             if (hasNull)
             {
+                // NULL probe drops the row in both semi and anti modes —
+                // consistent with WHERE's NULL → drop semantics at the
+                // conjunct level. (Anti-semi-join callers are always WHERE
+                // conjuncts in v1.)
                 continue;
             }
 
-            if (matchSet.Contains(new TupleKey(probeVals)))
+            var inMatchSet = matchSet.Contains(new TupleKey(probeVals));
+            if (inMatchSet != plan.IsAnti)
             {
                 builder.Add(row, w);
             }

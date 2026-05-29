@@ -154,12 +154,9 @@ public sealed class Resolver
             {
                 if (c is InSubqueryExpression isq)
                 {
-                    if (isq.IsNegated)
-                    {
-                        throw new ResolveException(
-                            "NOT IN (subquery) is not yet supported in v1 (anti-semi-join + NULL handling deferred)");
-                    }
-
+                    // Both IN and NOT IN go through the same lift; the lift
+                    // builds a SemiJoinPlan with IsAnti=isNegated, and
+                    // (for NOT IN only) rejects nullable operands.
                     inSubqueries.Add(isq);
                 }
                 else if (c is ExistsExpression e)
@@ -1180,14 +1177,8 @@ public sealed class Resolver
             return plan;
         }
 
-        if (isNegated)
-        {
-            throw new ResolveException(
-                "correlated NOT EXISTS is not yet supported in v1 (anti-semi-join + three-valued NULL handling deferred)");
-        }
-
         var (decorrelated, correlationKeys) = DecorrelateSubqueryPlan(subPlan, plan.Schema);
-        return new SemiJoinPlan(plan, decorrelated, correlationKeys, IsAnti: false);
+        return new SemiJoinPlan(plan, decorrelated, correlationKeys, IsAnti: isNegated);
     }
 
     /// <summary>
@@ -1209,6 +1200,19 @@ public sealed class Resolver
         {
             throw new ResolveException(
                 $"IN-subquery must return exactly 1 column; got {subPlan.Schema.Count}");
+        }
+
+        if (isq.IsNegated
+            && (probe.Type.Nullable || subPlan.Schema[0].Type.Nullable))
+        {
+            // SQL 3VL: `x NOT IN (sq)` is NULL when x is NULL OR any value
+            // in sq is NULL (with no match found). Implementing the full
+            // semantics needs an "any NULL in sq" scalar-subquery layer
+            // atop the anti-semi-join. For v1, restrict NOT IN to NOT NULL
+            // operands; the user can use NOT EXISTS for the nullable case.
+            throw new ResolveException(
+                "NOT IN (subquery) with nullable operands requires three-valued NULL handling " +
+                "(deferred); both the probe and the subquery column must be NOT NULL");
         }
 
         // Detect correlations introduced via ResolvedCorrelationRef and
@@ -1253,7 +1257,7 @@ public sealed class Resolver
         };
         equiKeys.AddRange(correlationKeys);
 
-        return new SemiJoinPlan(plan, decorrelated, equiKeys, IsAnti: false);
+        return new SemiJoinPlan(plan, decorrelated, equiKeys, IsAnti: isq.IsNegated);
     }
 
     /// <summary>

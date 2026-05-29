@@ -89,17 +89,19 @@ public class CorrelatedExistsTests
     }
 
     [Fact]
-    public void Resolver_CorrelatedNotExists_Deferred()
+    public void Resolver_CorrelatedNotExists_LiftsToAntiSemiJoin()
     {
-        // Correlated NOT EXISTS needs anti-semi-join + three-valued NULL
-        // handling; resolver rejects with a clear deferred message.
-        var ex = Assert.Throws<ResolveException>(() => Plan(
+        var plan = Plan(
             [
                 "CREATE TABLE orders (cust INT NOT NULL, region INT NOT NULL)",
                 "CREATE TABLE vips (vid INT NOT NULL, region INT NOT NULL)",
             ],
-            "SELECT cust FROM orders WHERE NOT EXISTS (SELECT 1 FROM vips WHERE vips.region = orders.region)"));
-        Assert.Contains("NOT EXISTS", ex.Message);
+            "SELECT cust FROM orders WHERE NOT EXISTS (SELECT 1 FROM vips WHERE vips.region = orders.region)");
+
+        var project = Assert.IsType<ProjectPlan>(plan);
+        var semi = Assert.IsType<SemiJoinPlan>(project.Input);
+        Assert.True(semi.IsAnti);
+        Assert.Single(semi.EquiKeys);
     }
 
     [Fact]

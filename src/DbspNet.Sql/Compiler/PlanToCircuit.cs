@@ -997,12 +997,6 @@ public static class PlanToCircuit
         SemiJoinPlan plan,
         CompileContext ctx)
     {
-        if (plan.IsAnti)
-        {
-            throw new InvalidOperationException(
-                "internal: NOT IN (subquery) reached PlanToCircuit; resolver should have rejected");
-        }
-
         if (plan.EquiKeys.Count == 0)
         {
             throw new InvalidOperationException("internal: SemiJoinPlan with no equi-keys");
@@ -1075,12 +1069,24 @@ public static class PlanToCircuit
         var rightJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, keySchema);
 
         // Combine emits ONLY the outer row — semi-join semantics.
-        return EmitInnerJoin(
+        var matched = EmitInnerJoin(
             builder, ctx,
             outerIndexed,
             subqIndexed,
             (_, outerRow, _) => outerRow,
             leftJoinCodec, rightJoinCodec);
+
+        if (plan.IsAnti)
+        {
+            // Anti-semi-join via Z-set subtraction: keep outer rows that
+            // did NOT match. NULL-key outer rows were filtered above and
+            // never entered the join, so they don't appear in `outer` here
+            // either; they're consistently dropped, matching SQL's
+            // WHERE-NULL-drops semantics at the conjunct level.
+            return builder.Difference(outerNonNull, matched);
+        }
+
+        return matched;
     }
 
     private static bool HasNoNullProbe(
