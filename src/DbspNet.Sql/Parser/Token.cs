@@ -47,7 +47,7 @@ public enum TokenKind
     LParen, RParen, Comma, Semicolon, Dot, Star,
 
     // Operators
-    Plus, Minus, Slash, Percent,
+    Plus, Minus, Slash, Percent, BarBar,
     Eq, NotEq, Less, LessEq, Greater, GreaterEq,
 }
 

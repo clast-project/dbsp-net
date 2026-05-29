@@ -51,6 +51,7 @@ internal static class TypedBuiltinScalarFunctions
             "lower" => BuildUpperLower(args[0], isUpper: false),
             "length" => BuildLength(args[0]),
             "concat" => BuildConcat(args),
+            "||" => BuildConcatStrict(args),
             "abs" => BuildAbs(args[0], astArgs[0].Type),
             "floor" => BuildFloorCeil(args[0], astArgs[0].Type, floor: true),
             "ceil" or "ceiling" => BuildFloorCeil(args[0], astArgs[0].Type, floor: false),
@@ -200,6 +201,8 @@ internal static class TypedBuiltinScalarFunctions
         typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatTyped))!;
     private static readonly MethodInfo ConcatTypedNullable =
         typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatTypedNullable))!;
+    private static readonly MethodInfo ConcatStrictTypedNullable =
+        typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatStrictTypedNullable))!;
 
     private static Expression BuildConcat(Expression[] args)
     {
@@ -230,6 +233,35 @@ internal static class TypedBuiltinScalarFunctions
 
         var nullableArray = Expression.NewArrayInit(typeof(Utf8String?), lifted);
         return Expression.Call(ConcatTypedNullable, nullableArray);
+    }
+
+    private static Expression BuildConcatStrict(Expression[] args)
+    {
+        // The `||` operator: NULL-propagating. All-non-null collapses to the
+        // plain concat (non-null Utf8String). If any arg is nullable, route to
+        // the propagating helper, which returns Utf8String? (null if any null).
+        var anyNullable = false;
+        foreach (var a in args)
+        {
+            if (TypedExpressionCompiler.IsNullable(a.Type)) { anyNullable = true; break; }
+        }
+
+        if (!anyNullable)
+        {
+            var argArray = Expression.NewArrayInit(typeof(Utf8String), args);
+            return Expression.Call(ConcatTyped, argArray);
+        }
+
+        var lifted = new Expression[args.Length];
+        for (var i = 0; i < args.Length; i++)
+        {
+            lifted[i] = TypedExpressionCompiler.IsNullable(args[i].Type)
+                ? args[i]
+                : Expression.Convert(args[i], typeof(Utf8String?));
+        }
+
+        var nullableArray = Expression.NewArrayInit(typeof(Utf8String?), lifted);
+        return Expression.Call(ConcatStrictTypedNullable, nullableArray);
     }
 
     // ---- Numeric ----
@@ -433,6 +465,37 @@ internal static class TypedBuiltinRuntime
         var offset = 0;
         foreach (var u in args)
         {
+            u.Span.CopyTo(buf.AsSpan(offset));
+            offset += u.ByteLength;
+        }
+
+        return Utf8String.FromBytes(buf);
+    }
+
+    /// <summary>
+    /// The <c>||</c> operator on the typed path: concatenate, but PROPAGATE
+    /// NULL — return <c>null</c> if any arg is NULL (SQL standard), otherwise
+    /// the concatenation of all (definite) args.
+    /// </summary>
+    public static Utf8String? ConcatStrictTypedNullable(Utf8String?[] args)
+    {
+        var totalBytes = 0;
+        foreach (var a in args)
+        {
+            if (!a.HasValue) return null;
+            totalBytes += a.GetValueOrDefault().ByteLength;
+        }
+
+        if (totalBytes == 0)
+        {
+            return Utf8String.Empty;
+        }
+
+        var buf = new byte[totalBytes];
+        var offset = 0;
+        foreach (var a in args)
+        {
+            var u = a.GetValueOrDefault();
             u.Span.CopyTo(buf.AsSpan(offset));
             offset += u.ByteLength;
         }

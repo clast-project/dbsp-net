@@ -754,9 +754,36 @@ public sealed class Parser
         return new InListExpression(probe, values, isNegated);
     }
 
-    private Expression ParseIsNull()
+    /// <summary>
+    /// Parse the <c>||</c> string-concatenation level, between IS-NULL /
+    /// comparison (looser) and additive (tighter). A run of <c>||</c> is
+    /// collected into a single flat <c>FunctionCallExpression("||", …)</c>
+    /// rather than a left-leaning binary chain, so the recursive walkers stay
+    /// shallow and each operand is compiled exactly once. The <c>"||"</c>
+    /// builtin propagates NULL (any NULL operand → NULL result), which is how
+    /// SQL <c>||</c> differs from this engine's PG-style NULL-skipping CONCAT.
+    /// </summary>
+    private Expression ParseConcat()
     {
         var left = ParseAdditive();
+        if (Peek().Kind != TokenKind.BarBar)
+        {
+            return left;
+        }
+
+        var operands = new List<Expression> { left };
+        while (Peek().Kind == TokenKind.BarBar)
+        {
+            Advance();
+            operands.Add(ParseAdditive());
+        }
+
+        return new FunctionCallExpression("||", operands, IsStar: false);
+    }
+
+    private Expression ParseIsNull()
+    {
+        var left = ParseConcat();
         while (Peek().Kind == TokenKind.Is)
         {
             Advance();

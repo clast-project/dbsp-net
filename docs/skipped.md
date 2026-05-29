@@ -204,8 +204,12 @@ reflect that shape, not a backlog.
 - **[P2]** `VALUES (...), (...) AS t(a, b)` as a row source.
   `ParsePrimaryTableRef` accepts only `(SELECT ...)` or a base table;
   would need a literal-table constructor.
-- **[P1]** `||` string concatenation operator. Lexer has no `||`;
-  users must call `CONCAT(...)`. One lexer entry + one parser arm.
+- `||` string concatenation operator — **implemented**. A run of `||`
+  parses to a single flat `FunctionCallExpression("||", …)` (not a binary
+  chain), keeping walkers shallow and compiling each operand once. Unlike
+  PG-style `CONCAT` (which skips NULLs), `||` PROPAGATES NULL per the SQL
+  standard — it's a distinct internal builtin, not a `CONCAT` desugar.
+  Supported on both compiler paths.
 - **[P2]** `ROW(...)` and `ARRAY[...]` constructors. Tied to the
   deferred ROW/STRUCT and ARRAY types under Type system.
 - **[P2]** Exponentiation operator `**` / `^`. `POWER(x, y)` exists.

@@ -260,7 +260,18 @@ internal static class RandomQuery
         // 53. NOT BETWEEN as a boolean projection over the nullable table
         // (3VL: a NULL probe yields NULL).
         Gen.Select(GenLiteral, GenLiteral)
-            .Select(p => $"SELECT k, v NOT BETWEEN {p.Item1} AND {p.Item2} AS r FROM n"));
+            .Select(p => $"SELECT k, v NOT BETWEEN {p.Item1} AND {p.Item2} AS r FROM n"),
+
+        // ---- || string concatenation (NULL-propagating) ----
+        // The tables are INT-only, so cast to VARCHAR first.
+
+        // 54. Concatenation over non-null columns.
+        GenTable.Select(t =>
+            $"SELECT CAST(k AS VARCHAR) || CAST(v AS VARCHAR) AS s FROM {t}"),
+
+        // 55. Concatenation over the nullable table — a NULL operand makes the
+        // whole result NULL (|| propagates, unlike CONCAT).
+        Gen.Const("SELECT CAST(k AS VARCHAR) || CAST(v AS VARCHAR) AS s FROM n"));
 
     // ---- Data generator ----
 

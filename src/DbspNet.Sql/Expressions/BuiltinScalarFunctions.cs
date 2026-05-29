@@ -36,7 +36,7 @@ internal static class BuiltinScalarFunctions
     /// </summary>
     public static bool IsKnown(string name) => name switch
     {
-        "coalesce" or "upper" or "lower" or "length" or "concat"
+        "coalesce" or "upper" or "lower" or "length" or "concat" or "||"
             or "abs" or "floor" or "ceil" or "ceiling" or "round" or "power" or "sqrt"
             or "greatest" or "least" or "nullif" => true,
         _ => false,
@@ -74,6 +74,26 @@ internal static class BuiltinScalarFunctions
 
                 // PG semantics: CONCAT never returns NULL. NULL args are skipped.
                 return new ResolvedFunctionCall(name, args, new SqlVarcharType(null, Nullable: false));
+            case "||":
+                // String-concatenation operator. Unlike CONCAT it PROPAGATES
+                // NULL (any NULL operand → NULL result), per the SQL standard.
+                if (args.Count < 2)
+                {
+                    throw new ResolveException("|| requires at least two operands");
+                }
+
+                foreach (var a in args)
+                {
+                    RequireString("||", a);
+                }
+
+                var concatNullable = false;
+                foreach (var a in args)
+                {
+                    concatNullable |= a.Type.Nullable;
+                }
+
+                return new ResolvedFunctionCall("||", args, new SqlVarcharType(null, concatNullable));
             case "abs":
                 RequireArity(name, args, 1);
                 RequireNumeric(name, args[0]);
@@ -129,6 +149,7 @@ internal static class BuiltinScalarFunctions
             "lower" => BuildUpperLower(compiled[0], isUpper: false),
             "length" => BuildLength(compiled[0]),
             "concat" => BuildConcat(compiled),
+            "||" => BuildConcatStrict(compiled),
             "abs" => BuildAbs(compiled[0], fn.Arguments[0].Type),
             "floor" => BuildFloorCeil(compiled[0], fn.Arguments[0].Type, floor: true),
             "ceil" or "ceiling" => BuildFloorCeil(compiled[0], fn.Arguments[0].Type, floor: false),
@@ -318,6 +339,18 @@ internal static class BuiltinScalarFunctions
         // at runtime since arity is variable.
         var argArray = Expression.NewArrayInit(typeof(object), args);
         return Expression.Convert(Expression.Call(ConcatRuntime, argArray), typeof(object));
+    }
+
+    private static readonly MethodInfo ConcatStrictRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.ConcatStrict))!;
+
+    private static Expression BuildConcatStrict(Expression[] args)
+    {
+        // The `||` operator: NULL-propagating concat. The runtime helper
+        // already returns object? (null when any arg is null), so no boxing
+        // conversion is needed here.
+        var argArray = Expression.NewArrayInit(typeof(object), args);
+        return Expression.Call(ConcatStrictRuntime, argArray);
     }
 
     private static Expression BuildAbs(Expression arg, SqlType argType)
@@ -556,6 +589,24 @@ internal static class SqlBuiltinRuntime
         }
 
         return Utf8String.FromBytes(buf);
+    }
+
+    /// <summary>
+    /// The <c>||</c> operator: concatenate UTF-8 args, but PROPAGATE NULL —
+    /// if any arg is NULL the whole result is NULL (SQL standard, unlike the
+    /// PG-style NULL-skipping <see cref="Concat"/>).
+    /// </summary>
+    public static object? ConcatStrict(object?[] args)
+    {
+        foreach (var a in args)
+        {
+            if (a is null)
+            {
+                return null;
+            }
+        }
+
+        return Concat(args);
     }
 
     // ---- FLOOR / CEIL / ROUND per-type ----

@@ -426,6 +426,16 @@ public sealed class Lexer
             case '-': return new Token(TokenKind.Minus, "-", start);
             case '/': return new Token(TokenKind.Slash, "/", start);
             case '%': return new Token(TokenKind.Percent, "%", start);
+            case '|':
+                if (_pos < _source.Length && _source[_pos] == '|')
+                {
+                    _pos++;
+                    return new Token(TokenKind.BarBar, "||", start);
+                }
+
+                // A lone '|' (bitwise OR) is not supported; only the '||'
+                // string-concatenation operator.
+                throw new LexException($"unexpected character '{c}'", start);
             case '=': return new Token(TokenKind.Eq, "=", start);
             case '<':
                 if (_pos < _source.Length && _source[_pos] == '=')
