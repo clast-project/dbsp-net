@@ -58,26 +58,33 @@ reflect that shape, not a backlog.
     - **[P1]** `IN (subquery)` in SELECT / HAVING / nested boolean
       positions — returns a per-row boolean rather than a row filter,
       different shape from the semi-join lift.
-- Correlated `IN (subquery)` and correlated `EXISTS (subquery)` —
-  **implemented** for the single-level form. When a top-level WHERE
-  conjunct is `probe IN (subquery)` or `EXISTS (subquery)` and the
-  subquery's body equi-references an outer column
-  (`outer.col = inner.col`), the resolver decorrelates by lifting the
-  correlation predicate out of the inner WHERE, projecting the inner
-  correlation column into the subquery schema, and emitting a
-  `SemiJoinPlan`. For `IN`, the equi-key list covers both the IN-probe
-  and every correlation column; for `EXISTS`, only the correlation
-  columns (no probe). Both share the same `outerSchema: Schema?`
-  plumbing, `ResolvedCorrelationRef` expression node, and
-  `DecorrelateSubqueryPlan` rewrite. Deferred:
-    - **[P1]** Correlated scalar subquery. Needs a LEFT JOIN rewrite with
-      the inner aggregated by the correlation columns; the inner's
-      aggregate has to be re-pushed under the new GROUP BY.
+- Correlated subqueries — **implemented** for the single-level form
+  across all three shapes: `IN (subquery)`, `EXISTS (subquery)`, and
+  scalar subquery. When the subquery's body equi-references an outer
+  column (`outer.col = inner.col`), the resolver decorrelates by
+  lifting the correlation predicate out of the inner WHERE,
+  projecting the inner correlation column into the subquery schema,
+  and emitting one of:
+    - `SemiJoinPlan` for correlated `IN` (multi-key: probe + correlation
+      columns).
+    - `SemiJoinPlan` for correlated `EXISTS` (correlation-only equi-keys).
+    - `CorrelatedScalarSubqueryJoinPlan` for correlated scalar (the
+      inner aggregate's GROUP BY is augmented with correlation columns;
+      multi-column-key LEFT JOIN appends the scalar value).
+  All three share the same `outerSchema: Schema?` plumbing,
+  `ResolvedCorrelationRef` expression node, and `TryMatchEquiCorrelation`
+  / `FindAllCorrelations` helpers. Deferred:
     - **[P1]** Correlated `NOT EXISTS` and `NOT IN` — anti-semi-join +
       three-valued NULL handling.
     - **[P1]** Correlated `EXISTS` / `IN` outside top-level WHERE
       conjuncts (SELECT / HAVING / nested boolean) — per-row boolean
       shape, distinct from the row-filter semi-join.
+    - **[P2]** Correlated scalar subquery without an aggregate — would
+      need a uniqueness guarantee on the inner per correlation key.
+    - **[P2]** Correlation refs inside the aggregate expressions
+      themselves (`SELECT MAX(outer.k + y) FROM t WHERE ...`). Rejected
+      today as "unknown column" via the existing column-resolution
+      path.
     - **[P2]** Nested correlation (subquery inside subquery referencing
       grand-outer columns). v1 supports a single level.
     - **[P2]** Non-equi correlation (`outer.col > inner.col`) and
