@@ -153,6 +153,28 @@ public class SpineLatenessGcTests
         Assert.Equal(50, s.Op.RetainedGroupCount);
     }
 
+    [Fact]
+    public void SpineGc_RunsOnEmptyDeltaTick_AfterFrontierAdvance()
+    {
+        // Regression — see the matching flat LatenessGcTests entry.
+        var frontier = new MutableFrontier();
+        var s = BuildSpine(frontier);
+
+        for (long t = 0; t < 20; t++)
+        {
+            s.Input.Push(Delta((t, 1, 1)));
+            s.Circuit.Step();
+        }
+
+        Assert.Equal(20, s.Op.RetainedGroupCount);
+
+        frontier.AdvanceTo(15);
+        s.Input.Push(ZSet<Event, Z64>.Empty);
+        s.Circuit.Step();
+
+        Assert.Equal(5, s.Op.RetainedGroupCount);
+    }
+
     // ----------------------------------------------------------------
     // Per-batch GC tests for the compaction-folded DropKeysBelow path.
     //
@@ -200,20 +222,16 @@ public class SpineLatenessGcTests
         Assert.Equal(15, op.RetainedGroupCount);
 
         // Advance frontier past the oldest batch's max (4) but below the
-        // next batch's min (10). The OLDEST batch should drop wholesale;
-        // batches [10..14] and [20..24] should survive untouched at their
-        // original level. A new key (100) is added in the same tick to
-        // get past the operator's empty-delta short-circuit on Step that
-        // skips CollectGarbage (cf. SpineIncrementalAggregateOp.Step).
+        // next batch's min (10). The OLDEST batch drops wholesale;
+        // batches [10..14] and [20..24] survive untouched at their
+        // original level.
         frontier.AdvanceTo(10);
-        ih.Push(Delta((100, 1, 1)));
+        ih.Push(ZSet<Event, Z64>.Empty);
         circuit.Step();
 
-        // After GC: oldest batch [0..4] dropped, [10..14] and [20..24]
-        // preserved at level 0, and the new singleton batch [100] added.
-        Assert.Equal(3, op.Trace.BatchCount);
+        Assert.Equal(2, op.Trace.BatchCount);
         Assert.Equal(1, op.Trace.LevelCount);
-        Assert.Equal(11, op.RetainedGroupCount);
+        Assert.Equal(10, op.RetainedGroupCount);
     }
 
     [Fact]
@@ -247,18 +265,15 @@ public class SpineLatenessGcTests
         Assert.Equal(1, op.Trace.BatchCount);
         Assert.Equal(10, op.RetainedGroupCount);
 
-        // Same empty-delta workaround as above — add a key well above
-        // the frontier to trigger the CollectGarbage path.
         frontier.AdvanceTo(5);
-        ih.Push(Delta((50, 1, 1)));
+        ih.Push(ZSet<Event, Z64>.Empty);
         circuit.Step();
 
         // Mixed-batch filter retains the batch at its original level
-        // with only above-frontier groups (5..9 = 5 keys); the new
-        // singleton batch [50] is appended.
-        Assert.Equal(2, op.Trace.BatchCount);
+        // with only above-frontier groups (5..9 = 5 keys).
+        Assert.Equal(1, op.Trace.BatchCount);
         Assert.Equal(1, op.Trace.LevelCount);
-        Assert.Equal(6, op.RetainedGroupCount);
+        Assert.Equal(5, op.RetainedGroupCount);
     }
 
     [Fact]
@@ -319,10 +334,9 @@ public class SpineLatenessGcTests
         // Advance the frontier past the OLDEST spilled batch's max (33)
         // but well below the next batch's min (40). This whole-batch-
         // drops L1[0] (file deleted) and leaves L1[1] / L1[2] in place
-        // with their spill files. Push a high-time key in the same tick
-        // to get past the operator's empty-delta short-circuit.
+        // with their spill files.
         frontier.AdvanceTo(40);
-        ih!.Push(Delta((200, 1, 1)));
+        ih!.Push(ZSet<Event, Z64>.Empty);
         circuit.Step();
 
         var filesAfter = new List<string>();
@@ -333,11 +347,10 @@ public class SpineLatenessGcTests
 
         // Two spill files survive (L1[1] = keys 40..73, L1[2] = keys 80..113).
         Assert.Equal(2, filesAfter.Count);
-        // Surviving groups = keys ≥ 40 from the 12 streamed ticks plus
-        // the new key (200) added on the GC-trigger tick.
+        // Surviving groups = keys ≥ 40 from the 12 streamed ticks.
         var expectedSurvivors = Enumerable.Range(0, 12 * 4)
             .Select(i => (i / 4) * 10L + (i % 4))
-            .Count(t => t >= 40) + 1;
+            .Count(t => t >= 40);
         Assert.Equal(expectedSurvivors, op.RetainedGroupCount);
     }
 

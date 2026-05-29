@@ -123,7 +123,11 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         var delta = _input.Current;
         if (delta.IsEmpty)
         {
+            // No input deltas to process, but the frontier may still
+            // have advanced — drop sub-frontier state before returning.
+            // Mirrors DistinctOp's empty-path CollectGarbage.
             _output.SetCurrent(ZSet<(TKey, TOut), Z64>.Empty);
+            CollectGarbage();
             return;
         }
 

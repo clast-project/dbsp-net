@@ -145,4 +145,28 @@ public class LatenessGcTests
 
         Assert.Equal(50, h.Op.RetainedGroupCount);
     }
+
+    [Fact]
+    public void Gc_RunsOnEmptyDeltaTick_AfterFrontierAdvance()
+    {
+        // Regression: IncrementalAggregateOp.Step returned before
+        // CollectGarbage on empty deltas, so a frontier advance with no
+        // input couldn't reclaim state. Fix mirrors DistinctOp.Step.
+        var frontier = new MutableFrontier();
+        var h = Build(frontier);
+
+        for (long t = 0; t < 20; t++)
+        {
+            h.Input.Push(Delta((t, 1, 1)));
+            h.Circuit.Step();
+        }
+
+        Assert.Equal(20, h.Op.RetainedGroupCount);
+
+        frontier.AdvanceTo(15);
+        h.Input.Push(ZSet<Event, Z64>.Empty);
+        h.Circuit.Step();
+
+        Assert.Equal(5, h.Op.RetainedGroupCount);
+    }
 }

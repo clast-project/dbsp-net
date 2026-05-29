@@ -107,7 +107,11 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         var delta = _input.Current;
         if (delta.IsEmpty)
         {
+            // No input deltas to process, but the frontier may still
+            // have advanced — drop sub-frontier state before returning.
+            // Mirrors DistinctOp's empty-path CollectGarbage.
             _output.SetCurrent(ZSet<(TKey, TOut), Z64>.Empty);
+            CollectGarbage();
             return;
         }
 
