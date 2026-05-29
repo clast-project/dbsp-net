@@ -299,6 +299,131 @@ public class CaseWhenTests
         Assert.Equal(1, WeightOf(q.Current, Utf8String.Of("y"), 7L));
     }
 
+    // ---------- IIF / DECODE (parse-time desugar to CASE) ----------
+
+    [Fact]
+    public void Parser_Iif_DesugarsToCase()
+    {
+        // IIF(c, a, b) → CASE WHEN c THEN a ELSE b END
+        var expr = new Parser(Lexer.Tokenize("IIF(x > 0, 1, 2)")).ParseExpression();
+        var ce = Assert.IsType<CaseExpression>(expr);
+        Assert.Single(ce.Whens);
+        Assert.IsType<BinaryExpression>(ce.Whens[0].Condition);
+        Assert.NotNull(ce.ElseResult);
+    }
+
+    [Fact]
+    public void Parser_Iif_WrongArity_Throws()
+    {
+        Assert.ThrowsAny<Exception>(() =>
+            new Parser(Lexer.Tokenize("IIF(x > 0, 1)")).ParseExpression());
+        Assert.ThrowsAny<Exception>(() =>
+            new Parser(Lexer.Tokenize("IIF(x > 0, 1, 2, 3)")).ParseExpression());
+    }
+
+    [Fact]
+    public void Parser_Decode_DesugarsToCase_WithNullSafeConditions()
+    {
+        // DECODE(x, 1, 'one', 2, 'two', 'other')
+        //   → CASE WHEN (x=1 OR (x IS NULL AND 1 IS NULL)) THEN 'one'
+        //          WHEN (x=2 OR ...) THEN 'two' ELSE 'other' END
+        var expr = new Parser(Lexer.Tokenize(
+            "DECODE(x, 1, 'one', 2, 'two', 'other')")).ParseExpression();
+        var ce = Assert.IsType<CaseExpression>(expr);
+        Assert.Equal(2, ce.Whens.Count);
+        Assert.NotNull(ce.ElseResult);
+
+        // Each condition is the NULL-safe (= OR (IS NULL AND IS NULL)) shape.
+        var cond = Assert.IsType<BinaryExpression>(ce.Whens[0].Condition);
+        Assert.Equal(BinaryOperator.Or, cond.Operator);
+        Assert.Equal(BinaryOperator.Equal, Assert.IsType<BinaryExpression>(cond.Left).Operator);
+        Assert.Equal(BinaryOperator.And, Assert.IsType<BinaryExpression>(cond.Right).Operator);
+    }
+
+    [Fact]
+    public void Parser_Decode_NoDefault_LeavesElseNull()
+    {
+        var expr = new Parser(Lexer.Tokenize("DECODE(x, 1, 'one', 2, 'two')")).ParseExpression();
+        var ce = Assert.IsType<CaseExpression>(expr);
+        Assert.Equal(2, ce.Whens.Count);
+        Assert.Null(ce.ElseResult);
+    }
+
+    [Fact]
+    public void Parser_Decode_TooFewArgs_Throws()
+    {
+        Assert.ThrowsAny<Exception>(() =>
+            new Parser(Lexer.Tokenize("DECODE(x, 1)")).ParseExpression());
+    }
+
+    [Fact]
+    public void Parser_Decode_SubqueryExpression_Throws()
+    {
+        Assert.ThrowsAny<Exception>(() =>
+            new Parser(Lexer.Tokenize("DECODE((SELECT 1), 1, 'a')")).ParseExpression());
+    }
+
+    [Fact]
+    public void Eval_Iif_SelectsBranchOnCondition()
+    {
+        var f = CompileExpr("IIF(a > 0, 10, 20)", ("a", new SqlIntegerType(false)));
+        Assert.Equal(10, f([5]));
+        Assert.Equal(20, f([-1]));
+    }
+
+    [Fact]
+    public void Eval_Iif_NullCondition_TakesElse()
+    {
+        // a > 0 is NULL when a is NULL → condition not taken → ELSE.
+        var f = CompileExpr("IIF(a > 0, 10, 20)", ("a", new SqlIntegerType(true)));
+        Assert.Equal(20, f([null]));
+    }
+
+    [Fact]
+    public void Eval_Decode_MatchesAndFallsToDefault()
+    {
+        var f = CompileExpr(
+            "DECODE(a, 1, 100, 2, 200, -1)", ("a", new SqlIntegerType(false)));
+        Assert.Equal(100, f([1]));
+        Assert.Equal(200, f([2]));
+        Assert.Equal(-1, f([9]));
+    }
+
+    [Fact]
+    public void Eval_Decode_NoMatchNoDefault_YieldsNull()
+    {
+        var f = CompileExpr("DECODE(a, 1, 100, 2, 200)", ("a", new SqlIntegerType(false)));
+        Assert.Null(f([9]));
+    }
+
+    [Fact]
+    public void Eval_Decode_MatchesNullToNull()
+    {
+        // DECODE's defining quirk: NULL matches NULL (unlike =/simple CASE).
+        var f = CompileExpr(
+            "DECODE(a, NULL, 'wasnull', 'other')", ("a", new SqlIntegerType(true)));
+        Assert.Equal(Utf8String.Of("wasnull"), f([null]));
+        Assert.Equal(Utf8String.Of("other"), f([5]));
+    }
+
+    [Fact]
+    public void EndToEnd_IifAndDecode_InProjection()
+    {
+        var q = CompileView(
+            ["CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)"],
+            "SELECT IIF(v > 0, 1, 0) AS sign_pos, DECODE(id, 1, 100, 2, 200, -1) AS d FROM t");
+
+        q.Table("t").Insert(1, 5);
+        q.Table("t").Insert(2, -3);
+        q.Table("t").Insert(9, 7);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1, 100));   // v=5>0 → 1; id=1 → 100
+        Assert.Equal(1, WeightOf(q.Current, 0, 200));   // v=-3 → 0; id=2 → 200
+        Assert.Equal(1, WeightOf(q.Current, 1, -1));    // v=7>0 → 1; id=9 → -1 (default)
+        Assert.Equal(3, q.Current.Count);
+    }
+
     // ---------- Helpers ----------
 
     private static Func<object?[], object?> CompileExpr(string exprText, params (string Name, SqlType Type)[] cols)

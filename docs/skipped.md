@@ -173,9 +173,11 @@ reflect that shape, not a backlog.
   taken iff its condition is a definite TRUE — NULL/FALSE fall through
   (SQL three-valued semantics). Result type unifies all branches +ELSE
   via `CommonComparableType`; nullable when ELSE is absent. Supported on
-  both the typed fast path and the structural compiler. **[P2]** the
-  function-form variants (`IIF`, `DECODE`) are still deferred — both
-  reduce to a `CaseExpression` desugar.
+  both the typed fast path and the structural compiler. The function-form
+  variants `IIF(c, a, b)` and `DECODE(expr, s1, r1, …, [default])` are
+  **implemented** too — desugared to a `CaseExpression` in the parser
+  (`DECODE` uses NULL-safe equality per arm, since Oracle DECODE matches
+  `NULL = NULL` unlike `=`), so they need no resolver/compiler support.
 - **[P1]** `BETWEEN x AND y` / `NOT BETWEEN`. Desugars at parse time
   to `x >= a AND x <= b`; no runtime work needed.
 - **[P1]** `LIKE`, `ILIKE`, `SIMILAR TO`. No keyword. Runtime story

@@ -239,7 +239,17 @@ internal static class RandomQuery
         Gen.Const("SELECT k, v NOT IN (SELECT v FROM u) AS m FROM n"),
 
         // 49. Correlated nullable IN in the SELECT list (per-group counts).
-        Gen.Const("SELECT k, v IN (SELECT v FROM t WHERE t.k = n.k) AS m FROM n"));
+        Gen.Const("SELECT k, v IN (SELECT v FROM t WHERE t.k = n.k) AS m FROM n"),
+
+        // ---- IIF / DECODE (parse-time CASE desugar) ----
+
+        // 50. IIF in projection.
+        Gen.Select(GenTable, GenLiteral)
+            .Select(p => $"SELECT k, IIF(v > {p.Item2}, 1, 0) AS f FROM {p.Item1}"),
+
+        // 51. DECODE in projection (over the nullable table — exercises the
+        // NULL-safe equality desugar against NULL keys).
+        Gen.Const("SELECT k, DECODE(k, 0, 100, 1, 200, -1) AS d FROM n"));
 
     // ---- Data generator ----
 

@@ -947,6 +947,76 @@ public sealed class Parser
         return new CaseExpression(whens, elseResult);
     }
 
+    /// <summary>
+    /// <c>IIF(condition, a, b)</c> ≡ <c>CASE WHEN condition THEN a ELSE b END</c>.
+    /// The resolver enforces that <c>condition</c> is BOOLEAN (via the CASE arm).
+    /// </summary>
+    private CaseExpression BuildIifExpression(IReadOnlyList<Expression> args, Token nameToken)
+    {
+        if (args.Count != 3)
+        {
+            throw Error(nameToken, $"IIF takes exactly 3 arguments, got {args.Count}");
+        }
+
+        return new CaseExpression(
+            new[] { new CaseWhenClause(args[0], args[1]) },
+            args[2]);
+    }
+
+    /// <summary>
+    /// <c>DECODE(expr, s1, r1 [, s2, r2 …] [, default])</c> ≡
+    /// <c>CASE WHEN expr ≡ s1 THEN r1 [WHEN expr ≡ s2 THEN r2 …] [ELSE default] END</c>,
+    /// where <c>≡</c> is NULL-safe equality. DECODE (Oracle) treats
+    /// <c>NULL = NULL</c> as a match, unlike <c>=</c> / simple CASE, so each
+    /// arm tests <c>(expr = sK) OR (expr IS NULL AND sK IS NULL)</c> — which
+    /// under CASE three-valued fall-through selects the arm exactly when
+    /// DECODE would match.
+    /// </summary>
+    private CaseExpression BuildDecodeExpression(IReadOnlyList<Expression> args, Token nameToken)
+    {
+        if (args.Count < 3)
+        {
+            throw Error(nameToken, $"DECODE takes at least 3 arguments, got {args.Count}");
+        }
+
+        var expr = args[0];
+        // expr (and each search) is fanned out across the arms, so a subquery
+        // there would be reference-duplicated and double-counted in the
+        // subquery map — reject it, as simple CASE does for its operand.
+        if (expr is SubqueryExpression)
+        {
+            throw Error(nameToken, "a scalar subquery is not supported as the DECODE expression");
+        }
+
+        var whens = new List<CaseWhenClause>();
+        var i = 1;
+        while (i + 1 < args.Count)
+        {
+            var search = args[i];
+            if (search is SubqueryExpression)
+            {
+                throw Error(nameToken, "a scalar subquery is not supported as a DECODE search value");
+            }
+
+            whens.Add(new CaseWhenClause(NullSafeEqual(expr, search), args[i + 1]));
+            i += 2;
+        }
+
+        // A final unpaired argument is the ELSE default; otherwise none (NULL).
+        var elseResult = i < args.Count ? args[i] : null;
+        return new CaseExpression(whens, elseResult);
+
+        static Expression NullSafeEqual(Expression a, Expression b)
+        {
+            var eq = new BinaryExpression(BinaryOperator.Equal, a, b);
+            var bothNull = new BinaryExpression(
+                BinaryOperator.And,
+                new IsNullExpression(a, Negated: false),
+                new IsNullExpression(b, Negated: false));
+            return new BinaryExpression(BinaryOperator.Or, eq, bothNull);
+        }
+    }
+
     private CastExpression ParseCastExpression()
     {
         Expect(TokenKind.Cast);
@@ -1010,6 +1080,20 @@ public sealed class Parser
             }
 
             Expect(TokenKind.RParen);
+
+            // IIF / DECODE are conditional functions; desugar to CASE here so
+            // they flow through resolution, aggregation, and both compilers
+            // exactly like a hand-written CASE (no downstream support needed).
+            if (first.Text == "iif")
+            {
+                return BuildIifExpression(args, first);
+            }
+
+            if (first.Text == "decode")
+            {
+                return BuildDecodeExpression(args, first);
+            }
+
             return new FunctionCallExpression(first.Text, args, IsStar: false);
         }
 
