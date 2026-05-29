@@ -58,11 +58,30 @@ reflect that shape, not a backlog.
     - **[P1]** `IN (subquery)` in SELECT / HAVING / nested boolean
       positions — returns a per-row boolean rather than a row filter,
       different shape from the semi-join lift.
-- **[P1]** Correlated subqueries of any kind. Feldera handles these via
-  Calcite's decorrelation rewrite; DbspNet's resolver treats subqueries as
-  closed over their own scope only — the same restriction applies to
-  `IN (subquery)` and `EXISTS` (so the patterns above are uncorrelated
-  only).
+- Correlated `IN (subquery)` — **implemented** for the single-level form.
+  When a top-level WHERE conjunct is `probe IN (subquery)` and the
+  subquery's body equi-references an outer column
+  (`outer.col = inner.col`), the resolver decorrelates by lifting the
+  correlation predicate out of the inner WHERE, projecting the inner
+  correlation column into the subquery schema, and emitting a
+  multi-key `SemiJoinPlan` whose `EquiKeys` cover both the IN-probe
+  and every correlation column. The same outer-scope plumbing
+  (`outerSchema: Schema?` parameter + `ResolvedCorrelationRef`
+  expression node) is the foundation correlated `EXISTS` and scalar
+  subqueries will ride on when added. Deferred:
+    - **[P1]** Correlated `EXISTS`. Needs to restructure the parser-time
+      EXISTS desugar so the resolver can route uncorrelated → existing
+      COALESCE(COUNT(*), 0) > 0 path vs correlated → SemiJoinPlan.
+    - **[P1]** Correlated scalar subquery. Needs a LEFT JOIN rewrite with
+      the inner aggregated by the correlation columns; the inner's
+      aggregate has to be re-pushed under the new GROUP BY.
+    - **[P1]** Correlated `NOT IN` — anti-semi-join + NULL handling.
+    - **[P2]** Nested correlation (subquery inside subquery referencing
+      grand-outer columns). v1 supports a single level.
+    - **[P2]** Non-equi correlation (`outer.col > inner.col`) and
+      correlation in JOIN ON / HAVING / GROUP BY / aggregates. Rejected
+      with explicit "only equi-correlation in inner WHERE supported"
+      errors.
 - **[P2]** DBSP-paper-faithful retraction propagation for recursive CTEs.
   `WITH RECURSIVE` uses semi-naïve incremental evaluation on pure-insert
   ticks: <c>R</c> is preserved across outer ticks, and each tick's external
