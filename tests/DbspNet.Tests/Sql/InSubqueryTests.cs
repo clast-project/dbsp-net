@@ -85,17 +85,20 @@ public class InSubqueryTests
     }
 
     [Fact]
-    public void Resolver_InSubqueryInSelect_Rejected()
+    public void Resolver_InSubqueryInSelect_LiftsToCorrelatedScalarSubqueryJoin()
     {
-        // IN-subquery as a scalar boolean expression (SELECT-position) is
-        // deferred; resolver rejects with a clear message.
-        var ex = Assert.Throws<ResolveException>(() => Plan(
+        // IN-subquery as a per-row boolean (SELECT position) lifts to a
+        // hidden per-value COUNT(*) column via the non-WHERE pre-pass.
+        // Even though the subquery body is uncorrelated, the probe→value
+        // equi-key makes the join correlated.
+        var plan = Plan(
             [
                 "CREATE TABLE t (id INT NOT NULL)",
                 "CREATE TABLE u (uid INT NOT NULL)",
             ],
-            "SELECT id IN (SELECT uid FROM u) AS hit FROM t"));
-        Assert.Contains("IN (subquery)", ex.Message);
+            "SELECT id IN (SELECT uid FROM u) AS hit FROM t");
+        var project = Assert.IsType<ProjectPlan>(plan);
+        Assert.IsType<CorrelatedScalarSubqueryJoinPlan>(project.Input);
     }
 
     [Fact]

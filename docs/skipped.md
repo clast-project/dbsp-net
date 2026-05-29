@@ -55,9 +55,6 @@ reflect that shape, not a backlog.
     - **[P1]** `NOT IN (subquery)` — needs anti-semi-join + three-valued
       NULL handling (`NOT IN` with a NULL in the subquery is NULL, not
       simply `NOT (x IN ...)`).
-    - **[P1]** `IN (subquery)` in SELECT / HAVING / nested boolean
-      positions — returns a per-row boolean rather than a row filter,
-      different shape from the semi-join lift.
 - Correlated subqueries — **implemented** for the single-level form
   across all four shapes: `IN (subquery)`, `EXISTS (subquery)`,
   scalar subquery, and the anti-semi-join forms
@@ -85,11 +82,25 @@ reflect that shape, not a backlog.
   per-correlation-group null-count column layered via
   `CorrelatedScalarSubqueryJoinPlan` (or `ScalarSubqueryJoinPlan` when
   uncorrelated), filtered on `probe IS NOT NULL AND (null_count IS
-  NULL OR null_count = 0)` before the anti-semi-join. Deferred:
-    - **[P1]** `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` outside
-      top-level WHERE conjuncts (SELECT / HAVING / nested boolean)
-      — per-row boolean shape, distinct from the row-filter
-      semi-join.
+  NULL OR null_count = 0)` before the anti-semi-join.
+
+  Non-WHERE positions (`IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` in
+  SELECT / HAVING / nested boolean) ship as a separate per-row
+  boolean shape: the resolver runs a pre-pass that lifts each such
+  expression into a hidden per-correlation-group `COUNT(*)` column
+  layered via `CorrelatedScalarSubqueryJoinPlan` (or
+  `ScalarSubqueryJoinPlan` for uncorrelated EXISTS). For `IN`, the
+  value column joins as an additional equi-key (so even uncorrelated
+  `IN` lifts through the correlated path). Scalar resolution then
+  rewrites the bound AST node to `COALESCE(count, 0) > 0` (or `= 0`
+  when negated). Threading is via a single
+  `IReadOnlyDictionary<Expression, ResolvedExpression>? preBound`
+  parameter on `ResolveScalarExpression` /
+  `ResolvePostAggregateExpression`. Deferred:
+    - **[P1]** Nullable operands in non-WHERE `IN` / `NOT IN` — needs
+      `CASE WHEN` for SQL three-valued logic in scalar context. The
+      WHERE-conjunct form handles nullables today via
+      `LayerNullCountAndFilter`.
     - **[P2]** Correlated scalar subquery without an aggregate — would
       need a uniqueness guarantee on the inner per correlation key.
     - **[P2]** Correlation refs inside the aggregate expressions

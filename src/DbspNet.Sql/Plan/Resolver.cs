@@ -54,6 +54,16 @@ public sealed class Resolver
     /// </summary>
     private readonly record struct SubqueryBinding(int ColumnIndex, SqlType Type);
 
+    /// <summary>
+    /// Maps an <see cref="ExistsExpression"/> or
+    /// <see cref="InSubqueryExpression"/> (by reference identity) to the
+    /// hidden match-count column the non-WHERE pre-pass layered onto the
+    /// running plan. The expression resolves to
+    /// <c>COALESCE(match_count, 0) &gt; 0</c> (or the negated form for
+    /// <c>NOT IN</c> / a wrapping <c>NOT EXISTS</c>).
+    /// </summary>
+    private readonly record struct BooleanSubqueryBinding(int CountColumnIndex, bool IsNegated);
+
     // ---------- DDL ----------
 
     private CreateTablePlan ResolveCreateTable(CreateTableStatement stmt)
@@ -135,7 +145,7 @@ public sealed class Resolver
         IReadOnlyDictionary<string, CteRef> scope = cteScope ?? outerCteScope;
 
         // FROM
-        var plan = ResolveFrom(stmt.From, scope);
+        var plan = ResolveFrom(stmt.From, scope, outerSchema);
 
         // WHERE — pre-pass for scalar subqueries referenced in the predicate
         // (each adds a hidden column via ScalarSubqueryJoinPlan), plus
@@ -204,19 +214,43 @@ public sealed class Resolver
                 throw new ResolveException("HAVING without GROUP BY or aggregate");
             }
 
-            // Non-aggregate SELECT: any scalar subqueries in the projection
-            // add hidden columns to the plan before we resolve the projections.
+            // Non-aggregate SELECT: lift any non-WHERE boolean subqueries
+            // (correlated/uncorrelated EXISTS, IN, NOT IN, NOT EXISTS in
+            // SELECT items) to hidden match-count columns FIRST so that the
+            // scalar-resolve below sees their bindings. Then collect any
+            // remaining SubqueryExpressions (regular scalar subqueries) and
+            // wrap as today.
+            var selectExists = new List<ExistsExpression>();
+            var selectInSubs = new List<InSubqueryExpression>();
+            foreach (var item in stmt.Items)
+            {
+                if (item is ExpressionSelectItem esi)
+                {
+                    CollectNonWhereBooleanSubqueries(esi.Expression, selectExists, selectInSubs);
+                }
+            }
+
+            // Lift ALL non-WHERE EXISTS/IN via the pre-pass for uniformity.
+            // The path works for both correlated and uncorrelated forms;
+            // uncorrelated subqueries produce a no-GroupBy aggregate layered
+            // via ScalarSubqueryJoinPlan (same semantic shape as the
+            // parser-time CountSubquery path).
+            var (planAfterBool, existsMap, inMap) = WrapWithNonWhereBooleanSubqueries(
+                plan, scope, selectExists, selectInSubs);
+            plan = planAfterBool;
+
             var selectSubs = new List<SubqueryExpression>();
             foreach (var item in stmt.Items)
             {
                 if (item is ExpressionSelectItem esi)
                 {
-                    CollectSubqueriesInto(esi.Expression, selectSubs);
+                    CollectSubqueriesIntoExcludingBound(esi.Expression, selectSubs, existsMap, inMap);
                 }
             }
 
             plan = WrapWithScalarSubqueries(plan, scope, selectSubs, out var selectSubMap);
-            var projections = ResolveProjections(stmt.Items, plan.Schema, selectSubMap);
+            var preBound = BuildPreBoundFromBoolMaps(existsMap, inMap);
+            var projections = ResolveProjections(stmt.Items, plan.Schema, selectSubMap, preBound);
             return new ProjectPlan(plan, projections, BuildProjectSchema(projections));
         }
 
@@ -281,34 +315,57 @@ public sealed class Resolver
         var groupedSchema = new Schema([.. groupCols, .. aggCols]);
         LogicalPlan aggPlan = new AggregatePlan(plan, groupKeyExprs, aggregates, groupedSchema);
 
-        // HAVING — subquery pre-pass on the post-aggregate schema, then
-        // resolve the filter predicate (post-aggregate resolution has
-        // already inlined aggregate calls into aggregates[], so HAVING
-        // references those by index).
+        // HAVING — non-WHERE boolean pre-pass (EXISTS / IN lift), then
+        // scalar-subquery pre-pass, then resolve the filter predicate.
         LogicalPlan withHaving = aggPlan;
         if (stmt.Having is not null)
         {
-            withHaving = WrapWithScalarSubqueries(withHaving, scope, CollectSubqueries(stmt.Having), out var havingSubMap);
+            var havingExists = new List<ExistsExpression>();
+            var havingIns = new List<InSubqueryExpression>();
+            CollectNonWhereBooleanSubqueries(stmt.Having, havingExists, havingIns);
+            var (planAfterBoolH, havingExistsMap, havingInMap) =
+                WrapWithNonWhereBooleanSubqueries(withHaving, scope, havingExists, havingIns);
+            withHaving = planAfterBoolH;
+
+            var havingScalarSubs = new List<SubqueryExpression>();
+            CollectSubqueriesIntoExcludingBound(stmt.Having, havingScalarSubs, havingExistsMap, havingInMap);
+            withHaving = WrapWithScalarSubqueries(withHaving, scope, havingScalarSubs, out var havingSubMap);
+
+            var havingPreBound = BuildPreBoundFromBoolMaps(havingExistsMap, havingInMap);
             var havingPred = ResolvePostAggregateExpression(
                 stmt.Having, plan.Schema, groupKeyAstItems, aggregates, aggIndex, aggStart,
-                havingSubMap, withHaving.Schema);
+                havingSubMap, withHaving.Schema, havingPreBound);
             EnsureBooleanCoercible(havingPred, "HAVING");
             withHaving = new FilterPlan(withHaving, havingPred);
         }
 
-        // SELECT (aggregate path) — another subquery pre-pass for the
-        // projection list. Post-aggregate resolver handles aggregate refs
-        // and looks up subquery bindings where applicable.
+        // SELECT (aggregate path) — non-WHERE boolean pre-pass for the
+        // projection list, then scalar-subquery pre-pass.
+        var selectExistsAgg = new List<ExistsExpression>();
+        var selectInsAgg = new List<InSubqueryExpression>();
+        foreach (var item in stmt.Items)
+        {
+            if (item is ExpressionSelectItem esi)
+            {
+                CollectNonWhereBooleanSubqueries(esi.Expression, selectExistsAgg, selectInsAgg);
+            }
+        }
+
+        var (withHavingPlusBool, existsMapAgg, inMapAgg) =
+            WrapWithNonWhereBooleanSubqueries(withHaving, scope, selectExistsAgg, selectInsAgg);
+        withHaving = withHavingPlusBool;
+
         var selectSubsAgg = new List<SubqueryExpression>();
         foreach (var item in stmt.Items)
         {
             if (item is ExpressionSelectItem esi)
             {
-                CollectSubqueriesInto(esi.Expression, selectSubsAgg);
+                CollectSubqueriesIntoExcludingBound(esi.Expression, selectSubsAgg, existsMapAgg, inMapAgg);
             }
         }
 
         withHaving = WrapWithScalarSubqueries(withHaving, scope, selectSubsAgg, out var selectSubMapAgg);
+        var selectPreBoundAgg = BuildPreBoundFromBoolMaps(existsMapAgg, inMapAgg);
 
         resolvedItems.Clear();
         foreach (var item in stmt.Items)
@@ -316,7 +373,7 @@ public sealed class Resolver
             var exprItem = (ExpressionSelectItem)item;
             var resolved = ResolvePostAggregateExpression(
                 exprItem.Expression, plan.Schema, groupKeyAstItems, aggregates, aggIndex, aggStart,
-                selectSubMapAgg, withHaving.Schema);
+                selectSubMapAgg, withHaving.Schema, selectPreBoundAgg);
 
             var (name, qualifier) = DeriveProjectionName(exprItem.Expression, exprItem.Alias);
             resolvedItems.Add((resolved, name, qualifier));
@@ -702,11 +759,14 @@ public sealed class Resolver
 
     // ---------- FROM ----------
 
-    private LogicalPlan ResolveFrom(FromClause from, IReadOnlyDictionary<string, CteRef> cteScope) => from switch
+    private LogicalPlan ResolveFrom(
+        FromClause from,
+        IReadOnlyDictionary<string, CteRef> cteScope,
+        Schema? outerSchema = null) => from switch
     {
         TableReference tr => ResolveTableReference(tr, cteScope),
         JoinClause jc => ResolveJoin(jc, cteScope),
-        DerivedTableReference dt => ResolveDerivedTable(dt, cteScope),
+        DerivedTableReference dt => ResolveDerivedTable(dt, cteScope, outerSchema),
         _ => throw new ResolveException($"unsupported FROM clause: {from.GetType().Name}"),
     };
 
@@ -717,9 +777,19 @@ public sealed class Resolver
     /// projection is recognized and skipped by the plan→circuit compiler, so
     /// runtime cost is nil.
     /// </summary>
-    private LogicalPlan ResolveDerivedTable(DerivedTableReference dt, IReadOnlyDictionary<string, CteRef> cteScope)
+    /// <remarks>
+    /// When a derived table sits inside a correlated subquery, the
+    /// enclosing scope's columns are visible — pass <paramref name="outerSchema"/>
+    /// through to the inner <see cref="ResolveQuery"/> so correlation refs
+    /// resolve to <see cref="ResolvedCorrelationRef"/>. Top-level callers
+    /// pass <c>null</c>, preserving non-LATERAL semantics.
+    /// </remarks>
+    private LogicalPlan ResolveDerivedTable(
+        DerivedTableReference dt,
+        IReadOnlyDictionary<string, CteRef> cteScope,
+        Schema? outerSchema = null)
     {
-        var inner = ResolveQuery(dt.Query, cteScope);
+        var inner = ResolveQuery(dt.Query, cteScope, outerSchema: outerSchema);
 
         var cols = new List<SchemaColumn>(inner.Schema.Count);
         var projections = new List<ProjectionItem>(inner.Schema.Count);
@@ -941,7 +1011,8 @@ public sealed class Resolver
     private List<ProjectionItem> ResolveProjections(
         IReadOnlyList<SelectItem> items,
         Schema schema,
-        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null)
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
         var result = new List<ProjectionItem>();
         foreach (var item in items)
@@ -981,7 +1052,7 @@ public sealed class Resolver
 
                     break;
                 case ExpressionSelectItem e:
-                    var resolved = ResolveScalarExpression(e.Expression, schema, subqueryMap);
+                    var resolved = ResolveScalarExpression(e.Expression, schema, subqueryMap, outerSchema: null, preBound);
                     var (name, qualifier) = DeriveProjectionName(e.Expression, e.Alias);
                     result.Add(new ProjectionItem(resolved, name, qualifier));
                     break;
@@ -1082,6 +1153,65 @@ public sealed class Resolver
                 acc.Add(existsE.CountSubquery);
                 break;
             // Literals, column refs: no subqueries possible.
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="CollectSubqueriesInto"/> but skips
+    /// <see cref="ExistsExpression"/> / <see cref="InSubqueryExpression"/>
+    /// nodes that have already been bound to hidden match-count columns by
+    /// the non-WHERE boolean pre-pass. Avoids the existing CountSubquery
+    /// from also being registered as a regular scalar subquery.
+    /// </summary>
+    private static void CollectSubqueriesIntoExcludingBound(
+        Expression expr,
+        List<SubqueryExpression> acc,
+        IReadOnlyDictionary<ExistsExpression, BooleanSubqueryBinding> boundExists,
+        IReadOnlyDictionary<InSubqueryExpression, BooleanSubqueryBinding> boundIn)
+    {
+        switch (expr)
+        {
+            case SubqueryExpression sq:
+                acc.Add(sq);
+                break;
+            case BinaryExpression b:
+                CollectSubqueriesIntoExcludingBound(b.Left, acc, boundExists, boundIn);
+                CollectSubqueriesIntoExcludingBound(b.Right, acc, boundExists, boundIn);
+                break;
+            case UnaryExpression u:
+                CollectSubqueriesIntoExcludingBound(u.Operand, acc, boundExists, boundIn);
+                break;
+            case IsNullExpression isn:
+                CollectSubqueriesIntoExcludingBound(isn.Operand, acc, boundExists, boundIn);
+                break;
+            case CastExpression cast:
+                CollectSubqueriesIntoExcludingBound(cast.Operand, acc, boundExists, boundIn);
+                break;
+            case FunctionCallExpression fn:
+                foreach (var a in fn.Arguments)
+                {
+                    CollectSubqueriesIntoExcludingBound(a, acc, boundExists, boundIn);
+                }
+
+                break;
+            case InListExpression il:
+                CollectSubqueriesIntoExcludingBound(il.Probe, acc, boundExists, boundIn);
+                foreach (var v in il.Values)
+                {
+                    CollectSubqueriesIntoExcludingBound(v, acc, boundExists, boundIn);
+                }
+
+                break;
+            case InSubqueryExpression isq when boundIn.ContainsKey(isq):
+                break;
+            case InSubqueryExpression:
+                // Fall through to today's reject behaviour at scalar resolve.
+                break;
+            case ExistsExpression existsE when boundExists.ContainsKey(existsE):
+                break;
+            case ExistsExpression existsE:
+                acc.Add(existsE.CountSubquery);
+                break;
         }
     }
 
@@ -1840,6 +1970,276 @@ public sealed class Resolver
     }
 
     /// <summary>
+    /// Walk an expression for <see cref="ExistsExpression"/> and
+    /// <see cref="InSubqueryExpression"/> nodes — anywhere they appear in
+    /// non-WHERE positions (SELECT / HAVING / nested boolean). Used by the
+    /// non-WHERE subquery boolean pre-pass to lift each to a hidden
+    /// match-count column on the running plan. (WHERE-conjunct uses are
+    /// peeled off in the WHERE pre-pass before this walker runs and don't
+    /// reach here.)
+    /// </summary>
+    private static void CollectNonWhereBooleanSubqueries(
+        Expression expr,
+        List<ExistsExpression> existsAcc,
+        List<InSubqueryExpression> inAcc)
+    {
+        switch (expr)
+        {
+            case ExistsExpression e:
+                existsAcc.Add(e);
+                // Don't recurse into the subquery; it has its own scope and
+                // is handled when the boolean is lifted.
+                break;
+            case InSubqueryExpression isq:
+                inAcc.Add(isq);
+                break;
+            case BinaryExpression b:
+                CollectNonWhereBooleanSubqueries(b.Left, existsAcc, inAcc);
+                CollectNonWhereBooleanSubqueries(b.Right, existsAcc, inAcc);
+                break;
+            case UnaryExpression u:
+                CollectNonWhereBooleanSubqueries(u.Operand, existsAcc, inAcc);
+                break;
+            case IsNullExpression isn:
+                CollectNonWhereBooleanSubqueries(isn.Operand, existsAcc, inAcc);
+                break;
+            case CastExpression c:
+                CollectNonWhereBooleanSubqueries(c.Operand, existsAcc, inAcc);
+                break;
+            case FunctionCallExpression fn:
+                foreach (var a in fn.Arguments)
+                {
+                    CollectNonWhereBooleanSubqueries(a, existsAcc, inAcc);
+                }
+
+                break;
+            case InListExpression il:
+                CollectNonWhereBooleanSubqueries(il.Probe, existsAcc, inAcc);
+                foreach (var v in il.Values)
+                {
+                    CollectNonWhereBooleanSubqueries(v, existsAcc, inAcc);
+                }
+
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Lift each <see cref="ExistsExpression"/> and
+    /// <see cref="InSubqueryExpression"/> in non-WHERE positions to a
+    /// hidden match-count column on <paramref name="plan"/>. Returns the
+    /// augmented plan plus a binding map keyed by reference identity.
+    /// </summary>
+    /// <remarks>
+    /// For each subquery: resolve with <c>outerSchema</c>, decorrelate via
+    /// <see cref="DecorrelateSubqueryPlan"/> (correlation cols projected at
+    /// the front of the inner schema), apply an optional <c>probe = value</c>
+    /// filter (for IN/NOT IN), and aggregate <c>COUNT(*)</c> grouped by the
+    /// correlation columns. The resulting per-correlation-group count is
+    /// layered via <see cref="CorrelatedScalarSubqueryJoinPlan"/> (when
+    /// correlated) or <see cref="ScalarSubqueryJoinPlan"/> (uncorrelated).
+    /// The bound expression is read as <c>COALESCE(count, 0) &gt; 0</c>;
+    /// <c>NOT IN</c> /<c>NOT EXISTS</c> inverts via the binding's
+    /// <c>IsNegated</c> flag at scalar-resolve time.
+    /// </remarks>
+    private (LogicalPlan Plan,
+        IReadOnlyDictionary<ExistsExpression, BooleanSubqueryBinding> ExistsMap,
+        IReadOnlyDictionary<InSubqueryExpression, BooleanSubqueryBinding> InMap)
+        WrapWithNonWhereBooleanSubqueries(
+            LogicalPlan plan,
+            IReadOnlyDictionary<string, CteRef> cteScope,
+            IReadOnlyList<ExistsExpression> existsExprs,
+            IReadOnlyList<InSubqueryExpression> inExprs)
+    {
+        var existsMap = new Dictionary<ExistsExpression, BooleanSubqueryBinding>();
+        var inMap = new Dictionary<InSubqueryExpression, BooleanSubqueryBinding>();
+        if (existsExprs.Count == 0 && inExprs.Count == 0)
+        {
+            return (plan, existsMap, inMap);
+        }
+
+        // Process EXISTS first, then IN.
+        foreach (var e in existsExprs)
+        {
+            if (existsMap.ContainsKey(e)) { continue; }
+            plan = LayerBooleanSubqueryCount(plan, cteScope, e.Subquery, probe: null,
+                isNegated: false, out var bindingIdx);
+            existsMap[e] = new BooleanSubqueryBinding(bindingIdx, IsNegated: false);
+        }
+
+        foreach (var isq in inExprs)
+        {
+            if (inMap.ContainsKey(isq)) { continue; }
+            var probe = ResolveScalarExpression(isq.Probe, plan.Schema);
+            // For non-WHERE IN/NOT IN: NULL operands need CASE WHEN (deferred).
+            // (For WHERE the LayerNullCountAndFilter machinery handles it; in
+            // non-WHERE the scalar boolean shape requires CASE for NULL.)
+            plan = LayerBooleanSubqueryCount(plan, cteScope, isq.Subquery,
+                probe: probe, isNegated: isq.IsNegated, out var bindingIdx);
+            inMap[isq] = new BooleanSubqueryBinding(bindingIdx, isq.IsNegated);
+        }
+
+        return (plan, existsMap, inMap);
+    }
+
+    /// <summary>
+    /// Layer a per-correlation-group <c>COUNT(*)</c> hidden column on
+    /// <paramref name="plan"/>. If <paramref name="probe"/> is non-null,
+    /// the count only includes rows matching <c>value_col = probe</c>
+    /// (i.e. IN-membership). Otherwise it counts all rows in the correlation
+    /// group (i.e. EXISTS).
+    /// </summary>
+    private LogicalPlan LayerBooleanSubqueryCount(
+        LogicalPlan plan,
+        IReadOnlyDictionary<string, CteRef> cteScope,
+        SubqueryExpression subquery,
+        ResolvedExpression? probe,
+        bool isNegated,
+        out int countColIndex)
+    {
+        var subPlan = ResolveQuery(subquery.Query, cteScope, outerSchema: plan.Schema);
+        if (probe is not null && subPlan.Schema.Count != 1)
+        {
+            throw new ResolveException(
+                $"IN (subquery) requires exactly 1 subquery column; got {subPlan.Schema.Count}");
+        }
+
+        // For IN/NOT IN in non-WHERE: NULL operands need CASE WHEN (deferred).
+        if (probe is not null
+            && (probe.Type.Nullable || subPlan.Schema[0].Type.Nullable))
+        {
+            throw new ResolveException(
+                "IN (subquery) / NOT IN (subquery) in non-WHERE positions requires NOT NULL operands in v1 " +
+                "(the nullable-operand 3VL needs CASE WHEN, deferred); the WHERE-conjunct form handles nullable operands today");
+        }
+
+        // Decorrelate; correlation columns project at the front, value column
+        // (if any) sits at the back.
+        var (decorrelated, correlationKeys) = DecorrelateSubqueryPlan(subPlan, plan.Schema);
+
+        // Build Aggregate(GroupBy=correlation_cols [+ value_col when IN],
+        // CountStar). For IN, the probe joins to the value column on the
+        // outer side via an additional equi-key — so the value column becomes
+        // a synthetic "correlation" column from the join layer's perspective.
+        var groupKeys = new List<ResolvedExpression>(correlationKeys.Count + 1);
+        var groupKeyCols = new List<SchemaColumn>(correlationKeys.Count + 1);
+        for (var i = 0; i < correlationKeys.Count; i++)
+        {
+            var k = correlationKeys[i];
+            groupKeys.Add(new ResolvedColumn(k.InnerColumnIndex, k.Type));
+            groupKeyCols.Add(new SchemaColumn("__b_corr_" + i, k.Type));
+        }
+
+        // For IN, append the value column as an extra group key.
+        SqlType? probeCommonType = null;
+        int valueGroupKeyIndex = -1;
+        if (probe is not null)
+        {
+            var probeInnerIndex = decorrelated.Schema.Count - 1;
+            var probeInnerType = decorrelated.Schema[probeInnerIndex].Type;
+            probeCommonType = TypeInference.CommonComparableType(probe.Type, probeInnerType);
+            ResolvedExpression valueGroupExpr = new ResolvedColumn(probeInnerIndex, probeInnerType);
+            if (!SameTypeIgnoringNullable(probeInnerType, probeCommonType))
+            {
+                valueGroupExpr = new ResolvedCast(valueGroupExpr, probeCommonType);
+            }
+
+            valueGroupKeyIndex = groupKeys.Count;
+            groupKeys.Add(valueGroupExpr);
+            groupKeyCols.Add(new SchemaColumn("__b_val", probeCommonType));
+        }
+
+        var countType = new SqlBigintType(false);
+        var aggregates = new List<AggregateCall>
+        {
+            new AggregateCall(AggregateKind.CountStar, Argument: null, countType),
+        };
+
+        var aggCols = new List<SchemaColumn>(groupKeyCols.Count + 1);
+        aggCols.AddRange(groupKeyCols);
+        aggCols.Add(new SchemaColumn("__b_count", countType));
+        LogicalPlan countPlan = new AggregatePlan(decorrelated, groupKeys, aggregates, new Schema(aggCols));
+
+        // Layer as a hidden column on plan.
+        var hiddenColType = countType.WithNullable(true);
+        var hiddenColName = $"$bcount{plan.Schema.Count}";
+        var augmentedSchema = plan.Schema.Concat(
+            new Schema([new SchemaColumn(hiddenColName, hiddenColType)]));
+        countColIndex = plan.Schema.Count;
+
+        // For IN: augment correlationKeys with the probe→value-column key.
+        // For uncorrelated IN this means we still use CorrelatedScalarSubqueryJoinPlan
+        // (with a single equi-key) — the outer probe drives the per-row lookup.
+        if (probe is not null)
+        {
+            var augmentedKeys = new List<SemiJoinEqui>(correlationKeys.Count + 1);
+            augmentedKeys.AddRange(correlationKeys);
+            augmentedKeys.Add(new SemiJoinEqui(probe, valueGroupKeyIndex, probeCommonType!));
+
+            var scalarIdx = countPlan.Schema.Count - 1;
+            return new CorrelatedScalarSubqueryJoinPlan(
+                plan, countPlan, augmentedKeys, scalarIdx, augmentedSchema);
+        }
+
+        // EXISTS path: only correlation keys (if any) drive the lookup.
+        if (correlationKeys.Count > 0)
+        {
+            var scalarIdx = countPlan.Schema.Count - 1;
+            return new CorrelatedScalarSubqueryJoinPlan(
+                plan, countPlan, correlationKeys, scalarIdx, augmentedSchema);
+        }
+
+        return new ScalarSubqueryJoinPlan(
+            plan, new List<LogicalPlan> { countPlan }, augmentedSchema);
+    }
+
+    /// <summary>
+    /// Build a single AST-keyed substitution dictionary from the per-AST
+    /// EXISTS / IN binding maps. <see cref="ResolveScalarExpression"/>
+    /// consults this dictionary at the top of its dispatch to short-circuit
+    /// bound nodes into their lifted column reference.
+    /// </summary>
+    private static IReadOnlyDictionary<Expression, ResolvedExpression>? BuildPreBoundFromBoolMaps(
+        IReadOnlyDictionary<ExistsExpression, BooleanSubqueryBinding> existsMap,
+        IReadOnlyDictionary<InSubqueryExpression, BooleanSubqueryBinding> inMap)
+    {
+        if (existsMap.Count == 0 && inMap.Count == 0)
+        {
+            return null;
+        }
+
+        var d = new Dictionary<Expression, ResolvedExpression>();
+        foreach (var (e, bind) in existsMap)
+        {
+            d[e] = BuildBooleanSubqueryRef(bind);
+        }
+
+        foreach (var (isq, bind) in inMap)
+        {
+            d[isq] = BuildBooleanSubqueryRef(bind);
+        }
+
+        return d;
+    }
+
+    /// <summary>Build the resolved expression `COALESCE(count, 0) > 0` (or `= 0` for negated).</summary>
+    private static ResolvedExpression BuildBooleanSubqueryRef(BooleanSubqueryBinding bind)
+    {
+        var countNullable = new SqlBigintType(true);
+        var countNotNull = new SqlBigintType(false);
+        var boolNullable = new SqlBooleanType(true);
+        var countCol = new ResolvedColumn(bind.CountColumnIndex, countNullable);
+        var zero = new ResolvedLiteral(LiteralKind.Integer, 0L, countNotNull);
+        var coalesced = new ResolvedFunctionCall(
+            "coalesce",
+            new List<ResolvedExpression> { countCol, zero },
+            countNotNull);
+        return new ResolvedBinary(
+            bind.IsNegated ? BinaryOperator.Equal : BinaryOperator.Greater,
+            coalesced, zero, boolNullable);
+    }
+
+    /// <summary>
     /// Resolve each (distinct-by-AST) scalar subquery in <paramref name="subqueries"/>
     /// and append a hidden column per subquery to <paramref name="plan"/>'s
     /// schema via a <see cref="ScalarSubqueryJoinPlan"/>. Returns the wrapped
@@ -2019,25 +2419,34 @@ public sealed class Resolver
         Expression expr,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null,
-        Schema? outerSchema = null) => expr switch
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        LiteralExpression lit => ResolveLiteral(lit),
-        ColumnReference cr => ResolveColumn(cr, schema, outerSchema),
-        UnaryExpression un => ResolveUnary(un, schema, subqueryMap, outerSchema),
-        BinaryExpression bin => ResolveBinary(bin, schema, subqueryMap, outerSchema),
-        IsNullExpression isn => ResolveIsNull(isn, schema, subqueryMap, outerSchema),
-        CastExpression cast => ResolveCast(cast, schema, subqueryMap, outerSchema),
-        FunctionCallExpression fn when !IsAggregateName(fn.FunctionName, fn.IsStar) => ResolveScalarFunction(fn, schema, subqueryMap, outerSchema),
-        FunctionCallExpression fn => throw new ResolveException(
-            $"aggregate function '{fn.FunctionName}' is not allowed here"),
-        SubqueryExpression sq => ResolveSubqueryReference(sq, subqueryMap),
-        InListExpression il => ResolveInList(il, schema, subqueryMap, outerSchema),
-        InSubqueryExpression => throw new ResolveException(
-            "IN (subquery) is only supported as a top-level conjunct of WHERE in v1 " +
-            "(SELECT / HAVING / nested boolean uses are deferred)"),
-        ExistsExpression e => ResolveExistsAsScalar(e, schema, subqueryMap),
-        _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
-    };
+        if (preBound is not null && preBound.TryGetValue(expr, out var pre))
+        {
+            return pre;
+        }
+
+        return expr switch
+        {
+            LiteralExpression lit => ResolveLiteral(lit),
+            ColumnReference cr => ResolveColumn(cr, schema, outerSchema),
+            UnaryExpression un => ResolveUnary(un, schema, subqueryMap, outerSchema, preBound),
+            BinaryExpression bin => ResolveBinary(bin, schema, subqueryMap, outerSchema, preBound),
+            IsNullExpression isn => ResolveIsNull(isn, schema, subqueryMap, outerSchema, preBound),
+            CastExpression cast => ResolveCast(cast, schema, subqueryMap, outerSchema, preBound),
+            FunctionCallExpression fn when !IsAggregateName(fn.FunctionName, fn.IsStar) => ResolveScalarFunction(fn, schema, subqueryMap, outerSchema, preBound),
+            FunctionCallExpression fn => throw new ResolveException(
+                $"aggregate function '{fn.FunctionName}' is not allowed here"),
+            SubqueryExpression sq => ResolveSubqueryReference(sq, subqueryMap),
+            InListExpression il => ResolveInList(il, schema, subqueryMap, outerSchema, preBound),
+            InSubqueryExpression => throw new ResolveException(
+                "IN (subquery) is only supported as a top-level conjunct of WHERE, " +
+                "or in SELECT/HAVING with NOT NULL probe and subquery column"),
+            ExistsExpression e => ResolveExistsAsScalar(e, schema, subqueryMap),
+            _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
+        };
+    }
 
     /// <summary>
     /// Resolve <see cref="ExistsExpression"/> outside the WHERE-conjunct
@@ -2061,18 +2470,19 @@ public sealed class Resolver
         InListExpression il,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
-        Schema? outerSchema = null)
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
         if (il.Values.Count == 0)
         {
             throw new ResolveException("IN (...) requires at least one value");
         }
 
-        var probe = ResolveScalarExpression(il.Probe, schema, subqueryMap, outerSchema);
+        var probe = ResolveScalarExpression(il.Probe, schema, subqueryMap, outerSchema, preBound);
         var values = new List<ResolvedExpression>(il.Values.Count);
         foreach (var v in il.Values)
         {
-            values.Add(ResolveScalarExpression(v, schema, subqueryMap, outerSchema));
+            values.Add(ResolveScalarExpression(v, schema, subqueryMap, outerSchema, preBound));
         }
 
         // Fold a common comparable type across probe and every value, then
@@ -2171,9 +2581,10 @@ public sealed class Resolver
         UnaryExpression un,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
-        Schema? outerSchema = null)
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var operand = ResolveScalarExpression(un.Operand, schema, subqueryMap, outerSchema);
+        var operand = ResolveScalarExpression(un.Operand, schema, subqueryMap, outerSchema, preBound);
         if (un.Operator == UnaryOperator.Not)
         {
             if (!TypeInference.IsBoolean(operand.Type))
@@ -2197,10 +2608,11 @@ public sealed class Resolver
         BinaryExpression bin,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
-        Schema? outerSchema = null)
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var left = ResolveScalarExpression(bin.Left, schema, subqueryMap, outerSchema);
-        var right = ResolveScalarExpression(bin.Right, schema, subqueryMap, outerSchema);
+        var left = ResolveScalarExpression(bin.Left, schema, subqueryMap, outerSchema, preBound);
+        var right = ResolveScalarExpression(bin.Right, schema, subqueryMap, outerSchema, preBound);
         switch (bin.Operator)
         {
             case BinaryOperator.Add:
@@ -2315,9 +2727,10 @@ public sealed class Resolver
         IsNullExpression isn,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
-        Schema? outerSchema = null)
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var operand = ResolveScalarExpression(isn.Operand, schema, subqueryMap, outerSchema);
+        var operand = ResolveScalarExpression(isn.Operand, schema, subqueryMap, outerSchema, preBound);
         return new ResolvedIsNull(operand, isn.Negated, new SqlBooleanType(false));
     }
 
@@ -2325,9 +2738,10 @@ public sealed class Resolver
         CastExpression cast,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
-        Schema? outerSchema = null)
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap, outerSchema);
+        var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap, outerSchema, preBound);
         var target = TypeInference.FromSpec(cast.TargetType, nullable: operand.Type.Nullable);
         return new ResolvedCast(operand, target);
     }
@@ -2336,7 +2750,8 @@ public sealed class Resolver
         FunctionCallExpression fn,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap,
-        Schema? outerSchema = null)
+        Schema? outerSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
         if (!BuiltinScalarFunctions.IsKnown(fn.FunctionName))
         {
@@ -2346,7 +2761,7 @@ public sealed class Resolver
         var args = new List<ResolvedExpression>(fn.Arguments.Count);
         foreach (var a in fn.Arguments)
         {
-            args.Add(ResolveScalarExpression(a, schema, subqueryMap, outerSchema));
+            args.Add(ResolveScalarExpression(a, schema, subqueryMap, outerSchema, preBound));
         }
 
         return BuiltinScalarFunctions.Resolve(fn.FunctionName, args);
@@ -2436,8 +2851,16 @@ public sealed class Resolver
         Dictionary<AggregateKey, int> aggIndex,
         int aggStartColumn,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null,
-        Schema? postSchema = null)
+        Schema? postSchema = null,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
+        // Non-WHERE boolean pre-pass substitution: bound EXISTS / IN nodes
+        // resolve to the lifted hidden-column expression.
+        if (preBound is not null && preBound.TryGetValue(expr, out var sub))
+        {
+            return sub;
+        }
+
         // Scalar subquery reference: look up by AST identity.
         if (expr is SubqueryExpression sq)
         {
@@ -2487,12 +2910,12 @@ public sealed class Resolver
         return expr switch
         {
             LiteralExpression lit => ResolveLiteral(lit),
-            UnaryExpression un => BuildUnaryPost(un, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema),
-            BinaryExpression bin => BuildBinaryPost(bin, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema),
-            IsNullExpression isn => BuildIsNullPost(isn, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema),
-            CastExpression cast => BuildCastPost(cast, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema),
+            UnaryExpression un => BuildUnaryPost(un, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
+            BinaryExpression bin => BuildBinaryPost(bin, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
+            IsNullExpression isn => BuildIsNullPost(isn, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
+            CastExpression cast => BuildCastPost(cast, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
             FunctionCallExpression fn when BuiltinScalarFunctions.IsKnown(fn.FunctionName) && !IsAggregateName(fn.FunctionName, fn.IsStar)
-                => BuildBuiltinCallPost(fn, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema),
+                => BuildBuiltinCallPost(fn, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
             ColumnReference cr => throw new ResolveException(
                 $"column '{(cr.Qualifier is null ? cr.Name : cr.Qualifier + "." + cr.Name)}' must appear in GROUP BY or in an aggregate"),
             _ => throw new ResolveException($"unsupported expression in aggregate query: {expr.GetType().Name}"),
@@ -2504,9 +2927,10 @@ public sealed class Resolver
         IReadOnlyList<(Expression, int)> gk, List<AggregateCall> aggs,
         Dictionary<AggregateKey, int> idx, int start,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subMap,
-        Schema? postSchema)
+        Schema? postSchema,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var op = ResolvePostAggregateExpression(un.Operand, pre, gk, aggs, idx, start, subMap, postSchema);
+        var op = ResolvePostAggregateExpression(un.Operand, pre, gk, aggs, idx, start, subMap, postSchema, preBound);
         if (un.Operator == UnaryOperator.Not)
         {
             if (!TypeInference.IsBoolean(op.Type))
@@ -2530,10 +2954,11 @@ public sealed class Resolver
         IReadOnlyList<(Expression, int)> gk, List<AggregateCall> aggs,
         Dictionary<AggregateKey, int> idx, int start,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subMap,
-        Schema? postSchema)
+        Schema? postSchema,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var l = ResolvePostAggregateExpression(bin.Left, pre, gk, aggs, idx, start, subMap, postSchema);
-        var r = ResolvePostAggregateExpression(bin.Right, pre, gk, aggs, idx, start, subMap, postSchema);
+        var l = ResolvePostAggregateExpression(bin.Left, pre, gk, aggs, idx, start, subMap, postSchema, preBound);
+        var r = ResolvePostAggregateExpression(bin.Right, pre, gk, aggs, idx, start, subMap, postSchema, preBound);
         switch (bin.Operator)
         {
             case BinaryOperator.Add:
@@ -2570,9 +2995,10 @@ public sealed class Resolver
         IReadOnlyList<(Expression, int)> gk, List<AggregateCall> aggs,
         Dictionary<AggregateKey, int> idx, int start,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subMap,
-        Schema? postSchema)
+        Schema? postSchema,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var op = ResolvePostAggregateExpression(isn.Operand, pre, gk, aggs, idx, start, subMap, postSchema);
+        var op = ResolvePostAggregateExpression(isn.Operand, pre, gk, aggs, idx, start, subMap, postSchema, preBound);
         return new ResolvedIsNull(op, isn.Negated, new SqlBooleanType(false));
     }
 
@@ -2581,9 +3007,10 @@ public sealed class Resolver
         IReadOnlyList<(Expression, int)> gk, List<AggregateCall> aggs,
         Dictionary<AggregateKey, int> idx, int start,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subMap,
-        Schema? postSchema)
+        Schema? postSchema,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        var op = ResolvePostAggregateExpression(cast.Operand, pre, gk, aggs, idx, start, subMap, postSchema);
+        var op = ResolvePostAggregateExpression(cast.Operand, pre, gk, aggs, idx, start, subMap, postSchema, preBound);
         var target = TypeInference.FromSpec(cast.TargetType, nullable: op.Type.Nullable);
         return new ResolvedCast(op, target);
     }
@@ -2593,12 +3020,13 @@ public sealed class Resolver
         IReadOnlyList<(Expression, int)> gk, List<AggregateCall> aggs,
         Dictionary<AggregateKey, int> idx, int start,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subMap,
-        Schema? postSchema)
+        Schema? postSchema,
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
         var args = new List<ResolvedExpression>(fn.Arguments.Count);
         foreach (var a in fn.Arguments)
         {
-            args.Add(ResolvePostAggregateExpression(a, pre, gk, aggs, idx, start, subMap, postSchema));
+            args.Add(ResolvePostAggregateExpression(a, pre, gk, aggs, idx, start, subMap, postSchema, preBound));
         }
 
         return BuiltinScalarFunctions.Resolve(fn.FunctionName, args);

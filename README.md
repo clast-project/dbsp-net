@@ -237,9 +237,14 @@ beyond "Feldera is much bigger":
   `CorrelatedScalarSubqueryJoinPlan` whose inner aggregate is
   augmented with a GROUP BY on the correlation columns.
   `IN (literal_list)` / `NOT IN (literal_list)` are flat-AST.
-  **Deferred**: `IN`/`EXISTS`/`NOT IN`/`NOT EXISTS` in
-  SELECT/HAVING/nested-boolean positions; nested correlation
-  (subquery-inside-subquery referencing grand-outer columns).
+  In SELECT / HAVING / nested-boolean positions, the resolver lifts
+  `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` to a hidden
+  per-correlation-group `COUNT(*)` column layered via
+  `CorrelatedScalarSubqueryJoinPlan`; the bound AST node rewrites to
+  `COALESCE(count, 0) > 0` (or `= 0` when negated). NOT NULL operands
+  only — nullable non-WHERE IN/NOT IN needs `CASE WHEN` (deferred).
+  **Deferred**: nested correlation (subquery-inside-subquery
+  referencing grand-outer columns).
 - `WITH RECURSIVE` evaluates semi-naïvely on pure-insert ticks (preserves
   `R` across ticks, propagates only newly-derivable rows), and falls back
   to full recomputation on any tick containing a retraction. Body may
@@ -272,9 +277,8 @@ The biggest tracked-but-not-yet-shipped pieces:
 - **DRED-style retraction propagation for recursive CTEs**, so the
   full recomputation fallback on retraction-containing ticks goes
   away.
-- **`IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` in SELECT / HAVING /
-  nested-boolean positions** — per-row boolean shape, distinct from
-  the WHERE-conjunct semi-join lift.
+- **`CASE WHEN`** — needed for several deferred shapes (nullable
+  non-WHERE `IN` / `NOT IN`, NULL-safe equality, NULLIF, etc.).
 
 ## License
 
