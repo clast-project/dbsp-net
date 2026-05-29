@@ -30,7 +30,7 @@ public enum TokenKind
     Union, All, Intersect, Except,
 
     // Boolean / nullability keywords
-    And, Or, Not, Is, Null, True, False,
+    And, Or, Not, Is, Null, True, False, In, Exists,
 
     // Functional keywords
     Cast, Coalesce, Primary, Key, Lateness,

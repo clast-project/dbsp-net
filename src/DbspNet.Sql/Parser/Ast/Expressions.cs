@@ -81,3 +81,19 @@ public sealed record FunctionCallExpression(
 /// → SQL runtime error — undefined in v1).
 /// </summary>
 public sealed record SubqueryExpression(SqlQuery Query) : Expression;
+
+/// <summary>
+/// <c>probe [NOT] IN (v1, v2, ..., vN)</c> — the literal-list form of <c>IN</c>.
+/// Modeled as a single AST node with a flat <see cref="Values"/> list so the
+/// recursive walkers (resolver, expression compiler, monotonicity analyzer)
+/// don't blow the C# stack on large lists. A naïve desugar to
+/// <c>(probe = v1) OR (probe = v2) OR ...</c> would build an O(N)-depth tree.
+/// SQL three-valued NULL semantics are honoured at evaluation: NULL probe →
+/// NULL; match on a non-NULL value → TRUE (or FALSE if negated); no match
+/// with a NULL among the values → NULL; no match and no NULLs → FALSE (or TRUE
+/// if negated).
+/// </summary>
+public sealed record InListExpression(
+    Expression Probe,
+    IReadOnlyList<Expression> Values,
+    bool IsNegated) : Expression;

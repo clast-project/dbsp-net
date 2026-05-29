@@ -45,6 +45,8 @@ public sealed class Lexer
         ["null"] = TokenKind.Null,
         ["true"] = TokenKind.True,
         ["false"] = TokenKind.False,
+        ["in"] = TokenKind.In,
+        ["exists"] = TokenKind.Exists,
         ["cast"] = TokenKind.Cast,
         ["coalesce"] = TokenKind.Coalesce,
         ["primary"] = TokenKind.Primary,

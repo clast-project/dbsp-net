@@ -42,3 +42,16 @@ public sealed record ResolvedFunctionCall(
     string FunctionName,
     IReadOnlyList<ResolvedExpression> Arguments,
     SqlType Type) : ResolvedExpression(Type);
+
+/// <summary>
+/// <c>probe [NOT] IN (v1, ..., vN)</c> — literal-list form. Probe and every
+/// value have been promoted to the same common comparable type by the
+/// resolver; equality at compile time is on that common type. Three-valued
+/// NULL semantics; see <see cref="DbspNet.Sql.Parser.Ast.InListExpression"/>
+/// for the algebra.
+/// </summary>
+public sealed record ResolvedInList(
+    ResolvedExpression Probe,
+    IReadOnlyList<ResolvedExpression> Values,
+    bool IsNegated,
+    SqlType Type) : ResolvedExpression(Type);

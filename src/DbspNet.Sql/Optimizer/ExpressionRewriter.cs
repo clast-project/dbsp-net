@@ -96,6 +96,14 @@ internal static class ExpressionRewriter
                     }
 
                     break;
+                case ResolvedInList il:
+                    Walk(il.Probe, acc);
+                    foreach (var v in il.Values)
+                    {
+                        Walk(v, acc);
+                    }
+
+                    break;
                 // ResolvedLiteral: no columns.
             }
         }
@@ -127,6 +135,11 @@ internal static class ExpressionRewriter
                 fn.FunctionName,
                 ShiftArgs(fn.Arguments, delta),
                 fn.Type),
+            ResolvedInList il => new ResolvedInList(
+                ShiftColumnIndices(il.Probe, delta),
+                ShiftArgs(il.Values, delta),
+                il.IsNegated,
+                il.Type),
             _ => expr,
         };
 
@@ -174,6 +187,11 @@ internal static class ExpressionRewriter
                 fn.FunctionName,
                 RemapArgs(fn.Arguments, remap),
                 fn.Type),
+            ResolvedInList il => new ResolvedInList(
+                RemapColumnIndices(il.Probe, remap),
+                RemapArgs(il.Values, remap),
+                il.IsNegated,
+                il.Type),
             _ => expr,
         };
 
@@ -218,6 +236,11 @@ internal static class ExpressionRewriter
                 fn.FunctionName,
                 SubstituteArgs(fn.Arguments, projection),
                 fn.Type),
+            ResolvedInList il => new ResolvedInList(
+                SubstituteViaProjection(il.Probe, projection),
+                SubstituteArgs(il.Values, projection),
+                il.IsNegated,
+                il.Type),
             _ => expr,
         };
 

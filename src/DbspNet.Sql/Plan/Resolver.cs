@@ -455,6 +455,8 @@ public sealed class Resolver
         CastExpression c => ExpressionReferencesName(c.Operand, name),
         FunctionCallExpression fn => fn.Arguments.Any(a => ExpressionReferencesName(a, name)),
         SubqueryExpression sq => QueryReferencesName(sq.Query, name),
+        InListExpression il => ExpressionReferencesName(il.Probe, name)
+            || il.Values.Any(v => ExpressionReferencesName(v, name)),
         _ => false,
     };
 
@@ -1005,6 +1007,14 @@ public sealed class Resolver
                 }
 
                 break;
+            case InListExpression il:
+                CollectSubqueriesInto(il.Probe, acc);
+                foreach (var v in il.Values)
+                {
+                    CollectSubqueriesInto(v, acc);
+                }
+
+                break;
             // Literals, column refs: no subqueries possible.
         }
     }
@@ -1131,6 +1141,14 @@ public sealed class Resolver
             case CastExpression c:
                 CollectAggregatesInto(c.Operand, preSchema, groupKeys, aggregates, aggIndex);
                 break;
+            case InListExpression il:
+                CollectAggregatesInto(il.Probe, preSchema, groupKeys, aggregates, aggIndex);
+                foreach (var v in il.Values)
+                {
+                    CollectAggregatesInto(v, preSchema, groupKeys, aggregates, aggIndex);
+                }
+
+                break;
             // Literals, column refs, subqueries contribute no aggregates here.
         }
     }
@@ -1152,8 +1170,52 @@ public sealed class Resolver
         FunctionCallExpression fn => throw new ResolveException(
             $"aggregate function '{fn.FunctionName}' is not allowed here"),
         SubqueryExpression sq => ResolveSubqueryReference(sq, subqueryMap),
+        InListExpression il => ResolveInList(il, schema, subqueryMap),
         _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
     };
+
+    private static ResolvedExpression ResolveInList(
+        InListExpression il,
+        Schema schema,
+        IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap)
+    {
+        if (il.Values.Count == 0)
+        {
+            throw new ResolveException("IN (...) requires at least one value");
+        }
+
+        var probe = ResolveScalarExpression(il.Probe, schema, subqueryMap);
+        var values = new List<ResolvedExpression>(il.Values.Count);
+        foreach (var v in il.Values)
+        {
+            values.Add(ResolveScalarExpression(v, schema, subqueryMap));
+        }
+
+        // Fold a common comparable type across probe and every value, then
+        // cast each side to it — same shape as a chain of binary equalities.
+        // Mismatched types fall out of CommonComparableType with a clear error.
+        var common = probe.Type;
+        foreach (var v in values)
+        {
+            common = TypeInference.CommonComparableType(common, v.Type);
+        }
+
+        probe = MaybeCast(probe, common);
+        for (var i = 0; i < values.Count; i++)
+        {
+            values[i] = MaybeCast(values[i], common);
+        }
+
+        // Result is BOOLEAN; nullable iff probe or any value is nullable
+        // (NULL probe → NULL result; non-match with NULL among values → NULL).
+        var nullable = probe.Type.Nullable;
+        foreach (var v in values)
+        {
+            nullable |= v.Type.Nullable;
+        }
+
+        return new ResolvedInList(probe, values, il.IsNegated, new SqlBooleanType(nullable));
+    }
 
     private static ResolvedColumn ResolveSubqueryReference(
         SubqueryExpression sq,
@@ -1427,6 +1489,7 @@ public sealed class Resolver
         UnaryExpression un => HasAggregate(un.Operand),
         IsNullExpression isn => HasAggregate(isn.Operand),
         CastExpression cast => HasAggregate(cast.Operand),
+        InListExpression il => HasAggregate(il.Probe) || AnyHasAggregate(il.Values),
         _ => false,
     };
 

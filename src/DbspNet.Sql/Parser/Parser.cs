@@ -635,6 +635,28 @@ public sealed class Parser
         while (true)
         {
             var t = Peek();
+
+            // [NOT] IN (...): two-token lookahead for the negated form. The
+            // `NOT` here is part of the IN operator, not the unary-not at
+            // ParseNot (which sits at a higher precedence level and binds
+            // an entire boolean expression).
+            if (t.Kind == TokenKind.In)
+            {
+                Advance();
+                left = ParseInRhs(left, isNegated: false, t.Position);
+                continue;
+            }
+
+            if (t.Kind == TokenKind.Not
+                && _pos + 1 < _tokens.Count
+                && _tokens[_pos + 1].Kind == TokenKind.In)
+            {
+                Advance(); // NOT
+                Advance(); // IN
+                left = ParseInRhs(left, isNegated: true, t.Position);
+                continue;
+            }
+
             BinaryOperator op;
             switch (t.Kind)
             {
@@ -651,6 +673,29 @@ public sealed class Parser
             var right = ParseIsNull();
             left = new BinaryExpression(op, left, right);
         }
+    }
+
+    private Expression ParseInRhs(Expression probe, bool isNegated, SourcePosition inPos)
+    {
+        Expect(TokenKind.LParen);
+        var next = Peek().Kind;
+        if (next == TokenKind.Select || next == TokenKind.With)
+        {
+            // Reserved for Phase 2b — IN-subquery. Until that lands, raise a
+            // clear error rather than silently mis-parsing.
+            throw Error(Peek(), "IN (subquery) is not yet supported in v1");
+        }
+
+        var values = new List<Expression> { ParseExpression() };
+        while (Peek().Kind == TokenKind.Comma)
+        {
+            Advance();
+            values.Add(ParseExpression());
+        }
+
+        Expect(TokenKind.RParen);
+        _ = inPos; // reserved for future source-position tracking on IN
+        return new InListExpression(probe, values, isNegated);
     }
 
     private Expression ParseIsNull()

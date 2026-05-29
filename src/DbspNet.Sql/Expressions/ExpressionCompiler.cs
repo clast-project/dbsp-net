@@ -84,8 +84,32 @@ public static class ExpressionCompiler
         ResolvedIsNull isn => BuildIsNull(isn, row),
         ResolvedCast cast => BuildCast(cast, row),
         ResolvedFunctionCall fn => BuildFunction(fn, row),
+        ResolvedInList il => BuildInList(il, row),
         _ => throw new InvalidOperationException($"unsupported expression: {expr.GetType().Name}"),
     };
+
+    private static readonly MethodInfo InListEvaluateMethod =
+        typeof(InListRuntime).GetMethod(nameof(InListRuntime.Evaluate))!;
+
+    private static Expression BuildInList(ResolvedInList il, ParameterExpression row)
+    {
+        // Each value is evaluated up front and packed into an object?[].
+        // The runtime helper does the search iteratively, so the C# stack
+        // and the Linq.Expression tree both stay shallow regardless of N.
+        var probeExpr = Build(il.Probe, row);
+        var valueExprs = new Expression[il.Values.Count];
+        for (var i = 0; i < il.Values.Count; i++)
+        {
+            valueExprs[i] = Build(il.Values[i], row);
+        }
+
+        var valuesArr = Expression.NewArrayInit(typeof(object), valueExprs);
+        return Expression.Call(
+            InListEvaluateMethod,
+            probeExpr,
+            valuesArr,
+            Expression.Constant(il.IsNegated));
+    }
 
     private static Expression BuildLiteral(ResolvedLiteral lit)
     {
@@ -631,4 +655,50 @@ internal static class SqlCasts
     public static string NumericToString(double v) => v.ToString(CultureInfo.InvariantCulture);
 
     public static string NumericToString(decimal v) => v.ToString(CultureInfo.InvariantCulture);
+}
+
+/// <summary>
+/// Runtime helper for <c>probe [NOT] IN (v1, ..., vN)</c>. Compiles to a
+/// single call from the expression tree — the iteration is here, not in the
+/// generated Linq.Expression, so the tree depth stays constant in the list
+/// size.
+/// </summary>
+/// <remarks>
+/// SQL three-valued NULL semantics:
+/// <list type="bullet">
+///   <item>Probe is NULL → result is NULL.</item>
+///   <item>Match found on a non-NULL value → TRUE (or FALSE if negated).</item>
+///   <item>No match and at least one value is NULL → NULL.</item>
+///   <item>No match and no NULL values → FALSE (or TRUE if negated).</item>
+/// </list>
+/// The resolver has cast probe and every value to the same comparable CLR
+/// type, so <see cref="object.Equals(object)"/> performs value equality.
+/// </remarks>
+internal static class InListRuntime
+{
+    public static object? Evaluate(object? probe, object?[] values, bool isNegated)
+    {
+        if (probe is null)
+        {
+            return null;
+        }
+
+        var hasNull = false;
+        for (var i = 0; i < values.Length; i++)
+        {
+            var v = values[i];
+            if (v is null)
+            {
+                hasNull = true;
+                continue;
+            }
+
+            if (probe.Equals(v))
+            {
+                return !isNegated;
+            }
+        }
+
+        return hasNull ? null : (object?)isNegated;
+    }
 }
