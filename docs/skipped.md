@@ -426,13 +426,25 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   batches), validated by a spine pass of the random-query PBT and by
   spine snapshot round-trip tests. See `docs/persistence.md` "What
   ships in (D) — spine".
-  - **[P1]** Spine on the typed-row fast path. The typed compiler
-    still emits the flat family, so a spine-mode query compiles via the
-    structural path. Extending it needs generated per-schema comparers
-    for the emitted structs. `RecursiveCteOp` also has no spine sibling
-    (recursive CTEs always use a flat trace), and a trace-size-driven
-    automatic flat/spine decision is future work — today it's an
-    explicit caller toggle.
+  Spine on the typed-row fast path — **implemented**. `TypedRowEmitter`
+  emits `IComparable<TSelf>` + non-generic `IComparable` on every
+  generated struct (lexicographic field compare via `Comparer<T>.Default`,
+  consistent with the emitted `IEquatable<TSelf>`), so the spine builders'
+  default `Comparer<TKey>.Default` fallback works without a per-schema
+  comparer. `TypedPlanCompiler` dispatches Distinct / inner / left / right
+  joins / aggregate to the spine sibling when `CompileOptions.TraceFamily`
+  is `Spine` (see `Emit{Distinct,InnerJoin,LeftJoin,Aggregate}` and the
+  `InvokeSpine*` reflection wrappers). `PlanToCircuit` no longer gates
+  the typed pipeline on `TraceFamily.Flat`. Verified by the existing
+  spine-PBT and SQL compile tests plus dedicated
+  `SpineCompileTests.Spine{Distinct,Aggregate,InnerJoin,LeftJoin}_ClosesOverTypedRow`
+  that inspect the spine ops' closed generic args. Deferred follow-ons:
+    - **[P1]** `RecursiveCteOp` has no spine sibling — recursive CTEs
+      inside a spine-mode query still use a flat trace for the
+      self-reference (the external base-table inputs honour spine
+      via the surrounding pipeline). Tied to the DRED retraction work.
+    - **[P2]** Trace-size-driven automatic flat/spine decision — today
+      it's an explicit caller toggle.
 - Trace compaction / waterline — **implemented** for the spine traces.
   Each spine batch tracks its `(min, max) monotone-key projection` (set
   at construction from a `Func<TKey, long>` supplied to the trace),

@@ -30,10 +30,17 @@ public enum TraceFamily
 /// Knobs for <see cref="PlanToCircuit.Compile(DbspNet.Sql.Plan.LogicalPlan, ISqlSnapshotCodecs, CompileOptions)"/>.
 /// </summary>
 /// <remarks>
-/// Selecting <see cref="TraceFamily.Spine"/> compiles via the structural path
-/// only — the typed-row fast path is skipped, since it emits the flat operator
-/// family. Recursive CTEs always use a flat trace regardless of this setting
-/// (no spine sibling exists for <c>RecursiveCteOp</c>).
+/// Selecting <see cref="TraceFamily.Spine"/> routes every keyed stateful site
+/// (DISTINCT, GROUP BY aggregate, INNER / LEFT / RIGHT join) to its spine
+/// counterpart — on both the typed-row fast path and the structural fallback.
+/// The typed pipeline supplies <c>Comparer&lt;TRow&gt;.Default</c> implicitly
+/// (the emitted struct row types implement <c>IComparable&lt;TSelf&gt;</c> via
+/// <c>TypedRowEmitter</c>'s <c>EmitTypedCompareTo</c>); the structural pipeline
+/// supplies <see cref="DbspNet.Core.Collections.StructuralRowComparer.Instance"/>.
+/// Recursive CTEs always use a flat trace regardless of this setting (no spine
+/// sibling exists for <c>RecursiveCteOp</c>); a query containing a recursive
+/// CTE still compiles fine in spine mode — only the recursive op's internal
+/// trace stays flat.
 /// </remarks>
 public sealed record CompileOptions
 {

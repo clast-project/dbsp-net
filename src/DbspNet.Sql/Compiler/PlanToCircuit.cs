@@ -107,20 +107,26 @@ public static class PlanToCircuit
             // typed↔structural at save/load time, so the on-disk
             // format stays compatible with the structural pipeline.
             //
+            // Trace family flows through: in spine mode the typed
+            // compiler dispatches to the SpineDistinct / SpineIncrementalInnerJoin
+            // / SpineIncrementalLeftJoin / SpineIncrementalAggregate builders
+            // instead of their flat siblings (see TypedPlanCompiler.Emit*),
+            // backed by Comparer<TRow>.Default on the emitted IComparable
+            // structs (see TypedRowEmitter.EmitTypedCompareTo).
+            //
             // Disabled when a non-default IRowCodec<StructuralRow> is
             // supplied — the structural compile is the only path that
             // honours an alternative codec on every stage's output row.
-            // Also disabled in spine mode (the typed compiler emits the flat
-            // operator family) and when LATENESS is present (GC is wired only on
-            // the structural path — long-running bounded pipelines use spine +
-            // LATENESS structurally; the typed fast path is for short queries).
+            // Also disabled when LATENESS is present (GC is wired only on
+            // the structural path — long-running bounded pipelines use
+            // LATENESS structurally; the typed fast path is for short
+            // queries).
             Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
-            if (options.TraceFamily == TraceFamily.Flat
-                && ReferenceEquals(codec, StructuralRowCodec.Instance)
+            if (ReferenceEquals(codec, StructuralRowCodec.Instance)
                 && !hasLateness)
             {
                 queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
-                    builder, plan, streams, codec, snapshotCodecs);
+                    builder, plan, streams, codec, snapshotCodecs, options);
             }
 
             if (queryStream is null)

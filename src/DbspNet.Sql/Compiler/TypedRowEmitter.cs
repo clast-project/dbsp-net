@@ -25,7 +25,14 @@ namespace DbspNet.Sql.Compiler;
 /// <see cref="IEquatable{T}"/> is implemented to avoid the reflective
 /// fallback in <see cref="ValueType.Equals(object)"/>;
 /// <see cref="ValueType.GetHashCode"/> is overridden with a
-/// <see cref="HashCode"/> combine over field values.</para>
+/// <see cref="HashCode"/> combine over field values.
+/// <see cref="IComparable{T}"/> + non-generic <see cref="IComparable"/>
+/// are implemented lexicographically (left-to-right field compare via
+/// <c>Comparer&lt;T&gt;.Default</c>) so the spine trace family
+/// (<c>SpineZSetTrace</c> / <c>SpineIndexedZSetTrace</c>), which keeps
+/// keys in sorted batches, can use <c>Comparer&lt;TRow&gt;.Default</c>
+/// without an externally-supplied comparer. Order is consistent with
+/// <c>Equals</c>: <c>a.CompareTo(b) == 0</c> iff <c>a.Equals(b)</c>.</para>
 /// <para><b>Scope gate.</b> Columns of int, long, double, bool,
 /// string, and the project's date/time/decimal/Utf8 value types.
 /// Both NOT NULL and nullable variants of those types are supported;
@@ -184,11 +191,21 @@ public static class TypedRowEmitter
         var iequatable = typeof(IEquatable<>).MakeGenericType(tb);
         tb.AddInterfaceImplementation(iequatable);
 
+        // IComparable<TSelf> + non-generic IComparable. Comparer<T>.Default
+        // for the emitted struct devirtualises to the typed CompareTo, so
+        // the spine path can use it directly with no externally-supplied
+        // IComparer<TKey>.
+        var icomparable = typeof(IComparable<>).MakeGenericType(tb);
+        tb.AddInterfaceImplementation(icomparable);
+        tb.AddInterfaceImplementation(typeof(IComparable));
+
         EmitCtor(tb, fp, fields);
         EmitTypedFieldsCtor(tb, fp, fields);
         var typedEquals = EmitTypedEquals(tb, fp, fields, iequatable);
         EmitObjectEquals(tb, typedEquals);
         EmitGetHashCode(tb, fp, fields);
+        var typedCompareTo = EmitTypedCompareTo(tb, fp, fields, icomparable);
+        EmitObjectCompareTo(tb, typedCompareTo);
 
         return tb.CreateType();
     }
@@ -486,6 +503,127 @@ public static class TypedRowEmitter
         var toHashCode = typeof(HashCode).GetMethod(nameof(HashCode.ToHashCode))!;
         il.Emit(OpCodes.Call, toHashCode);
         il.Emit(OpCodes.Ret);
+    }
+
+    /// <summary>
+    /// Emits <c>int CompareTo(TSelf other)</c> wired as the
+    /// <see cref="IComparable{T}"/> slot for <c>TSelf</c>. Body is a
+    /// lexicographic left-to-right field compare via
+    /// <see cref="Comparer{T}.Default"/> — the first non-zero result
+    /// returns, all-zero falls through to <c>0</c>.
+    ///
+    /// <para><c>Comparer&lt;T&gt;.Default</c> handles all our field
+    /// types: primitives compare directly; <see cref="Nullable{T}"/>
+    /// puts <c>null</c> before any non-null value and falls through to
+    /// <c>T</c>'s default compare otherwise; <see cref="Utf8String"/>,
+    /// <see cref="Clast.DatabaseDecimal.Values.Decimal128"/>, and the
+    /// temporal types (<see cref="Date32"/>, <see cref="Time64"/>,
+    /// <see cref="Timestamp"/>) all implement
+    /// <c>IComparable&lt;T&gt;</c>. The resulting order is consistent
+    /// with the emitted <see cref="IEquatable{T}.Equals(T)"/> — both
+    /// reduce to per-field <c>Equals</c>/<c>CompareTo == 0</c>.</para>
+    /// </summary>
+    private static MethodBuilder EmitTypedCompareTo(
+        TypeBuilder tb, Fingerprint fp, FieldBuilder[] fields, Type icomparable)
+    {
+        var method = tb.DefineMethod(
+            nameof(IComparable<object>.CompareTo),
+            MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig
+                | MethodAttributes.Final | MethodAttributes.NewSlot,
+            typeof(int),
+            [tb]);
+        var il = method.GetILGenerator();
+
+        var cLocal = il.DeclareLocal(typeof(int));
+        var returnC = il.DefineLabel();
+
+        for (var i = 0; i < fp.Columns.Length; i++)
+        {
+            var fieldType = fp.Columns[i];
+            var comparerType = typeof(Comparer<>).MakeGenericType(fieldType);
+            var defaultGet = comparerType
+                .GetProperty(nameof(Comparer<int>.Default))!.GetGetMethod()!;
+            var compareMethod = comparerType
+                .GetMethod(nameof(Comparer<int>.Compare), [fieldType, fieldType])!;
+
+            // c = Comparer<T>.Default.Compare(this.Fi, other.Fi);
+            il.Emit(OpCodes.Call, defaultGet);
+            il.Emit(OpCodes.Ldarg_0);                  // this (managed ptr)
+            il.Emit(OpCodes.Ldfld, fields[i]);
+            il.Emit(OpCodes.Ldarga_S, (byte)1);        // &other
+            il.Emit(OpCodes.Ldfld, fields[i]);
+            il.Emit(OpCodes.Callvirt, compareMethod);
+            il.Emit(OpCodes.Stloc, cLocal);
+            il.Emit(OpCodes.Ldloc, cLocal);
+            il.Emit(OpCodes.Brtrue, returnC);          // if (c != 0) goto returnC
+        }
+
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Ret);
+
+        il.MarkLabel(returnC);
+        il.Emit(OpCodes.Ldloc, cLocal);
+        il.Emit(OpCodes.Ret);
+
+        // Bind as IComparable<TSelf>.CompareTo — TypeBuilder.GetMethod
+        // resolves the slot against the closed generic interface.
+        var openIcmpCompareTo = typeof(IComparable<>)
+            .GetMethod(nameof(IComparable<object>.CompareTo))!;
+        var closedIcmpCompareTo = TypeBuilder.GetMethod(icomparable, openIcmpCompareTo);
+        tb.DefineMethodOverride(method, closedIcmpCompareTo);
+
+        return method;
+    }
+
+    /// <summary>
+    /// Emits the explicit non-generic
+    /// <see cref="IComparable.CompareTo"/> implementation. Throws
+    /// <see cref="ArgumentException"/> on a non-<c>TSelf</c> non-null
+    /// argument (matching <see cref="ValueType.CompareTo(object)"/>'s
+    /// contract); returns <c>1</c> on <c>null</c> (so a value sorts
+    /// after a null reference, which never occurs in practice but
+    /// satisfies the interface).
+    /// </summary>
+    private static void EmitObjectCompareTo(TypeBuilder tb, MethodBuilder typedCompareTo)
+    {
+        var method = tb.DefineMethod(
+            nameof(IComparable.CompareTo),
+            MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig
+                | MethodAttributes.Final | MethodAttributes.NewSlot,
+            typeof(int),
+            [typeof(object)]);
+        var il = method.GetILGenerator();
+
+        var notNull = il.DefineLabel();
+        var throwLabel = il.DefineLabel();
+
+        // if (obj is null) return 1;
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Brtrue, notNull);
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Ret);
+
+        il.MarkLabel(notNull);
+        // if (!(obj is TSelf)) throw new ArgumentException(...);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Isinst, tb);
+        il.Emit(OpCodes.Brfalse, throwLabel);
+
+        // return this.CompareTo((TSelf)obj);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Unbox_Any, tb);
+        il.Emit(OpCodes.Call, typedCompareTo);
+        il.Emit(OpCodes.Ret);
+
+        il.MarkLabel(throwLabel);
+        var argExCtor = typeof(ArgumentException).GetConstructor([typeof(string)])!;
+        il.Emit(OpCodes.Ldstr, "Argument is not a " + tb.Name);
+        il.Emit(OpCodes.Newobj, argExCtor);
+        il.Emit(OpCodes.Throw);
+
+        tb.DefineMethodOverride(method,
+            typeof(IComparable).GetMethod(nameof(IComparable.CompareTo))!);
     }
 
     /// <summary>

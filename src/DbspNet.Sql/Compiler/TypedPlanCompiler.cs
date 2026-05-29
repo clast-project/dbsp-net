@@ -7,6 +7,7 @@ using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Linear;
 using DbspNet.Core.Operators.Stateful;
+using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
@@ -96,7 +97,8 @@ public static class TypedPlanCompiler
         LogicalPlan plan,
         IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans,
         IRowCodec<StructuralRow> outputCodec,
-        ISqlSnapshotCodecs? snapshotCodecs = null)
+        ISqlSnapshotCodecs? snapshotCodecs = null,
+        CompileOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(plan);
@@ -105,7 +107,7 @@ public static class TypedPlanCompiler
 
         try
         {
-            var ctx = new CompileContext(builder, structuralScans, snapshotCodecs);
+            var ctx = new CompileContext(builder, structuralScans, snapshotCodecs, options ?? CompileOptions.Default);
             var topNode = TryCompileNode(plan, ctx)
                 ?? throw new UnsupportedPlanException();
 
@@ -161,23 +163,36 @@ public static class TypedPlanCompiler
         /// </summary>
         public ISqlSnapshotCodecs? SnapshotCodecs { get; }
 
+        /// <summary>
+        /// Compile-time knobs threaded from <see cref="PlanToCircuit.Compile"/>.
+        /// In particular, <c>Options.TraceFamily</c> selects between the
+        /// flat and spine stateful operators at every site the typed
+        /// pipeline emits (Distinct, Aggregate, Join). Defaults to
+        /// <see cref="CompileOptions.Default"/> (flat) for standalone
+        /// callers via <see cref="TryCompile"/>.
+        /// </summary>
+        public CompileOptions Options { get; }
+
         public CompileContext(CircuitBuilder builder, Dictionary<string, TypedTableInput> inputs)
         {
             Builder = builder;
             Inputs = inputs;
             StructuralScans = null;
             SnapshotCodecs = null;
+            Options = CompileOptions.Default;
         }
 
         public CompileContext(
             CircuitBuilder builder,
             IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans,
-            ISqlSnapshotCodecs? snapshotCodecs)
+            ISqlSnapshotCodecs? snapshotCodecs,
+            CompileOptions options)
         {
             Builder = builder;
             Inputs = null;
             StructuralScans = structuralScans;
             SnapshotCodecs = snapshotCodecs;
+            Options = options;
         }
     }
 
@@ -378,8 +393,8 @@ public static class TypedPlanCompiler
         object joined;
         if (plan.JoinType is AstJoinType.Inner)
         {
-            joined = InvokeIncrementalInnerJoin(
-                ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
+            joined = EmitInnerJoin(
+                ctx, keyRowType, left.RowType, right.RowType, outputRowType,
                 leftIndexed, rightIndexed, combineDelegate,
                 leftSnapshotCodec, rightSnapshotCodec);
         }
@@ -393,8 +408,8 @@ public static class TypedPlanCompiler
                 keyRowType, left.RowType, outputRowType, outputSchema,
                 preservedSideOffset: 0, preservedSideCount: left.Schema.Count);
             if (nullPad is null) return null;
-            joined = InvokeIncrementalLeftJoin(
-                ctx.Builder, keyRowType, left.RowType, right.RowType, outputRowType,
+            joined = EmitLeftJoin(
+                ctx, keyRowType, left.RowType, right.RowType, outputRowType,
                 leftIndexed, rightIndexed, combineDelegate, nullPad,
                 leftSnapshotCodec, rightSnapshotCodec);
         }
@@ -415,8 +430,8 @@ public static class TypedPlanCompiler
                 preservedSideOffset: left.Schema.Count,
                 preservedSideCount: right.Schema.Count);
             if (nullPad is null) return null;
-            joined = InvokeIncrementalLeftJoin(
-                ctx.Builder, keyRowType, right.RowType, left.RowType, outputRowType,
+            joined = EmitLeftJoin(
+                ctx, keyRowType, right.RowType, left.RowType, outputRowType,
                 rightIndexed, leftIndexed, swappedCombine, nullPad,
                 rightSnapshotCodec, leftSnapshotCodec);
         }
@@ -666,8 +681,8 @@ public static class TypedPlanCompiler
             var subCodec = BuildAdaptedIndexedCodec(
                 ctx.SnapshotCodecs, unitSchema, subPlan.Schema, unitKeyType, sub.RowType);
 
-            var joined = InvokeIncrementalLeftJoin(
-                ctx.Builder, unitKeyType, current.RowType, sub.RowType, newRowType,
+            var joined = EmitLeftJoin(
+                ctx, unitKeyType, current.RowType, sub.RowType, newRowType,
                 outerIndexed, subIndexed, combine, nullPad, outerCodec, subCodec);
 
             current = new TypedNode(newRowType, newSchema, joined);
@@ -712,7 +727,7 @@ public static class TypedPlanCompiler
         var snapshotCodec = BuildAdaptedZSetCodec(
             ctx.SnapshotCodecs, plan.Schema, inner.RowType);
 
-        var output = InvokeDistinct(ctx.Builder, inner.RowType, inner.Stream, snapshotCodec);
+        var output = EmitDistinct(ctx, inner.RowType, inner.Stream, snapshotCodec);
         return new TypedNode(inner.RowType, plan.Schema, output);
     }
 
@@ -805,8 +820,8 @@ public static class TypedPlanCompiler
         // Output: Stream<ZSet<(TKey, TAgg), Z64>>
         var aggSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, inner.Schema, keyRowType, inner.RowType);
-        var aggregated = InvokeIncrementalAggregate(
-            ctx.Builder, keyRowType, inner.RowType, aggRowType, indexed, composite,
+        var aggregated = EmitAggregate(
+            ctx, keyRowType, inner.RowType, aggRowType, indexed, composite,
             aggSnapshotCodec);
 
         // Flatten (TKey, TAgg) -> TFinal: TFinal columns are
@@ -1704,6 +1719,68 @@ public static class TypedPlanCompiler
         IRowCodec<StructuralRow> codec, Schema schema, object?[] values)
         => codec.BuildRow(schema, values);
 
+    // ---- Stateful op family dispatch: flat vs spine ----
+    //
+    // Every typed stateful site dispatches through one of these
+    // EmitXxx helpers, mirroring PlanToCircuit's EmitDistinct /
+    // EmitInnerJoin / EmitLeftJoin / EmitAggregate. The spine path
+    // does not pass an externally-supplied IComparer — the emitted
+    // struct row types implement IComparable<TSelf> (see
+    // TypedRowEmitter.EmitTypedCompareTo), so Comparer<T>.Default
+    // works.
+
+    private static object EmitDistinct(
+        CompileContext ctx, Type rowType, object input, object? snapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? InvokeSpineDistinct(ctx.Builder, rowType, input, ctx.Options.Compaction, snapshotCodec)
+            : InvokeDistinct(ctx.Builder, rowType, input, snapshotCodec);
+    }
+
+    private static object EmitInnerJoin(
+        CompileContext ctx, Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
+        object leftIndexed, object rightIndexed, Delegate combine,
+        object? leftSnapshotCodec, object? rightSnapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? InvokeSpineIncrementalInnerJoin(
+                ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
+                leftIndexed, rightIndexed, combine,
+                leftSnapshotCodec, rightSnapshotCodec, ctx.Options.Compaction)
+            : InvokeIncrementalInnerJoin(
+                ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
+                leftIndexed, rightIndexed, combine, leftSnapshotCodec, rightSnapshotCodec);
+    }
+
+    private static object EmitLeftJoin(
+        CompileContext ctx, Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
+        object leftIndexed, object rightIndexed, Delegate joinCombine, Delegate nullPadCombine,
+        object? leftSnapshotCodec, object? rightSnapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? InvokeSpineIncrementalLeftJoin(
+                ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
+                leftIndexed, rightIndexed, joinCombine, nullPadCombine,
+                leftSnapshotCodec, rightSnapshotCodec, ctx.Options.Compaction)
+            : InvokeIncrementalLeftJoin(
+                ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
+                leftIndexed, rightIndexed, joinCombine, nullPadCombine,
+                leftSnapshotCodec, rightSnapshotCodec);
+    }
+
+    private static object EmitAggregate(
+        CompileContext ctx, Type keyRowType, Type valueRowType, Type aggRowType,
+        object indexed, object aggregator, object? snapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? InvokeSpineIncrementalAggregate(
+                ctx.Builder, keyRowType, valueRowType, aggRowType,
+                indexed, aggregator, snapshotCodec, ctx.Options.Compaction)
+            : InvokeIncrementalAggregate(
+                ctx.Builder, keyRowType, valueRowType, aggRowType,
+                indexed, aggregator, snapshotCodec);
+    }
+
     // ---- Reflection-built generic calls ----
 
     /// <summary>builder.ZSetInput&lt;TRow, Z64&gt;()</summary>
@@ -1874,6 +1951,123 @@ public static class TypedPlanCompiler
         return closed.Invoke(null, new object?[]
         {
             builder, indexed, aggregator, snapshotCodec, null, null,
+        })!;
+    }
+
+    // ---- Spine builder reflection wrappers ----
+    //
+    // Each method mirrors its flat-trace sibling above but targets the
+    // SpineStatefulOperators extensions. Comparers are NOT passed
+    // (left as null) — the emitted struct row types implement
+    // IComparable<TSelf>, so Comparer<T>.Default takes over. spill
+    // configs, frontier, and monotoneKey are all null; LATENESS forces
+    // the structural compile, so GC is wired only there.
+
+    /// <summary>
+    /// <c>builder.SpineDistinct&lt;TRow, Z64&gt;(input, compaction, snapshotCodec, null, null, null, null)</c>.
+    /// </summary>
+    private static object InvokeSpineDistinct(
+        CircuitBuilder builder, Type rowType, object input,
+        ICompactionStrategy? compaction, object? snapshotCodec)
+    {
+        var openMethod = typeof(SpineStatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(SpineStatefulOperators.SpineDistinct)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
+        return closed.Invoke(null, new object?[]
+        {
+            builder, input, compaction, snapshotCodec,
+            null,   // keyComparer — Comparer<TRow>.Default via IComparable<TRow>
+            null,   // spillConfig
+            null,   // frontier
+            null,   // monotoneKey
+        })!;
+    }
+
+    /// <summary>
+    /// <c>builder.SpineIncrementalInnerJoin&lt;TKey, TLeft, TRight, TOut, Z64&gt;(...)</c>.
+    /// </summary>
+    private static object InvokeSpineIncrementalInnerJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        Type outputRowType, object leftIndexed, object rightIndexed, Delegate combine,
+        object? leftSnapshotCodec, object? rightSnapshotCodec,
+        ICompactionStrategy? compaction)
+    {
+        var openMethod = typeof(SpineStatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(SpineStatefulOperators.SpineIncrementalInnerJoin)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(
+            keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object?[]
+        {
+            builder, leftIndexed, rightIndexed, combine,
+            leftSnapshotCodec, rightSnapshotCodec,
+            compaction,
+            null,  // keyComparer
+            null,  // leftValueComparer
+            null,  // rightValueComparer
+            null,  // leftSpillConfig
+            null,  // rightSpillConfig
+            null,  // frontier
+            null,  // monotoneKey
+        })!;
+    }
+
+    /// <summary>
+    /// <c>builder.SpineIncrementalLeftJoin&lt;TKey, TLeft, TRight, TOut, Z64&gt;(...)</c>.
+    /// </summary>
+    private static object InvokeSpineIncrementalLeftJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        Type outputRowType, object leftIndexed, object rightIndexed,
+        Delegate joinCombine, Delegate nullPadCombine,
+        object? leftSnapshotCodec, object? rightSnapshotCodec,
+        ICompactionStrategy? compaction)
+    {
+        var openMethod = typeof(SpineStatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(SpineStatefulOperators.SpineIncrementalLeftJoin)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(
+            keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object?[]
+        {
+            builder, leftIndexed, rightIndexed, joinCombine, nullPadCombine,
+            leftSnapshotCodec, rightSnapshotCodec,
+            compaction,
+            null,  // keyComparer
+            null,  // leftValueComparer
+            null,  // rightValueComparer
+            null,  // leftSpillConfig
+            null,  // rightSpillConfig
+            null,  // frontier
+            null,  // monotoneKey
+        })!;
+    }
+
+    /// <summary>
+    /// <c>builder.SpineIncrementalAggregate&lt;TKey, TValue, TOut&gt;(indexed, aggregator, ...)</c>.
+    /// Output stream carries <c>ZSet&lt;(TKey, TOut), Z64&gt;</c>.
+    /// </summary>
+    private static object InvokeSpineIncrementalAggregate(
+        CircuitBuilder builder, Type keyRowType, Type valueRowType, Type aggRowType,
+        object indexed, object aggregator, object? snapshotCodec,
+        ICompactionStrategy? compaction)
+    {
+        var openMethod = typeof(SpineStatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(SpineStatefulOperators.SpineIncrementalAggregate)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, valueRowType, aggRowType);
+        return closed.Invoke(null, new object?[]
+        {
+            builder, indexed, aggregator, snapshotCodec, compaction,
+            null,  // keyComparer
+            null,  // valueComparer
+            null,  // spillConfig
+            null,  // frontier
+            null,  // monotoneKey
         })!;
     }
 

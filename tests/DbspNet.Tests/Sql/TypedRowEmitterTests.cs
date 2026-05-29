@@ -337,4 +337,110 @@ public class TypedRowEmitterTests
 
         _ = empty;  // touch to keep the variable used
     }
+
+    // ---- IComparable / Comparer<TRow>.Default smoke tests ----
+    //
+    // The emitted type must implement IComparable<TSelf> + non-generic
+    // IComparable so the spine trace family (which keeps keys sorted)
+    // can use Comparer<TRow>.Default directly. Order is consistent with
+    // equality: a.CompareTo(b) == 0 iff a.Equals(b).
+
+    [Fact]
+    public void EmittedTypeImplementsIComparable()
+    {
+        var type = TypedRowEmitter.EmitRowType(TwoIntSchema)!;
+        Assert.Contains(typeof(IComparable<>).MakeGenericType(type), type.GetInterfaces());
+        Assert.Contains(typeof(IComparable), type.GetInterfaces());
+    }
+
+    [Fact]
+    public void IComparableOrdersLexicographically_TwoInts()
+    {
+        var type = TypedRowEmitter.EmitRowType(TwoIntSchema)!;
+        var factory = TypedRowEmitter.BuildBoxedFactory(TwoIntSchema)!;
+
+        var a = factory(new object?[] { 1, 2 });
+        var b = factory(new object?[] { 1, 3 });   // greater on second col
+        var c = factory(new object?[] { 2, 0 });   // greater on first col
+        var aDup = factory(new object?[] { 1, 2 });
+
+        var compareTo = type.GetMethod(nameof(IComparable<object>.CompareTo), new[] { type })!;
+        int Cmp(object x, object y) => (int)compareTo.Invoke(x, new[] { y })!;
+
+        Assert.True(Cmp(a, b) < 0);
+        Assert.True(Cmp(b, a) > 0);
+        Assert.True(Cmp(a, c) < 0);          // first-column dominance
+        Assert.True(Cmp(c, b) > 0);          // first-column dominance
+        Assert.Equal(0, Cmp(a, aDup));
+    }
+
+    [Fact]
+    public void IComparableNullSortsBeforeNonNull()
+    {
+        var schema = new Schema(new[]
+        {
+            new SchemaColumn("x", new SqlIntegerType(true)),
+        });
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+        var type = TypedRowEmitter.EmitRowType(schema)!;
+        var compareTo = type.GetMethod(nameof(IComparable<object>.CompareTo), new[] { type })!;
+
+        var nullRow = factory(new object?[] { null });
+        var oneRow = factory(new object?[] { 1 });
+
+        Assert.True((int)compareTo.Invoke(nullRow, new[] { oneRow })! < 0);
+        Assert.True((int)compareTo.Invoke(oneRow, new[] { nullRow })! > 0);
+        Assert.Equal(0, (int)compareTo.Invoke(nullRow, new[] { factory(new object?[] { null }) })!);
+    }
+
+    [Fact]
+    public void NonGenericIComparableHandlesNullAndWrongType()
+    {
+        var type = TypedRowEmitter.EmitRowType(TwoIntSchema)!;
+        var factory = TypedRowEmitter.BuildBoxedFactory(TwoIntSchema)!;
+        var row = factory(new object?[] { 1, 2 });
+
+        var nonGeneric = (IComparable)row;
+        Assert.Equal(1, nonGeneric.CompareTo(null));
+        Assert.Throws<ArgumentException>(() => nonGeneric.CompareTo("not a row"));
+    }
+
+    [Fact]
+    public void ComparerOfDefaultDevirtualisesToTypedCompareTo()
+    {
+        // The whole point of emitting IComparable<TSelf> is that the
+        // spine trace family can use Comparer<TRow>.Default with no
+        // externally-supplied IComparer<TKey>. This test reaches the
+        // typed compare via that path.
+        var type = TypedRowEmitter.EmitRowType(TwoIntSchema)!;
+        var factory = TypedRowEmitter.BuildBoxedFactory(TwoIntSchema)!;
+        var a = factory(new object?[] { 1, 2 });
+        var b = factory(new object?[] { 1, 3 });
+
+        var comparerType = typeof(Comparer<>).MakeGenericType(type);
+        var defaultInstance = comparerType.GetProperty(nameof(Comparer<int>.Default))!.GetValue(null)!;
+        var compareMethod = comparerType.GetMethod(nameof(Comparer<int>.Compare), new[] { type, type })!;
+
+        Assert.True((int)compareMethod.Invoke(defaultInstance, new[] { a, b })! < 0);
+        Assert.True((int)compareMethod.Invoke(defaultInstance, new[] { b, a })! > 0);
+        Assert.Equal(0, (int)compareMethod.Invoke(defaultInstance, new[] { a, a })!);
+    }
+
+    [Fact]
+    public void IComparableMixedFieldTypes()
+    {
+        // Lexicographic compare across heterogeneous fields:
+        // i < l < d < b < s. Differing on first columns decides.
+        var factory = TypedRowEmitter.BuildBoxedFactory(MixedSchema)!;
+        var type = TypedRowEmitter.EmitRowType(MixedSchema)!;
+        var compareTo = type.GetMethod(nameof(IComparable<object>.CompareTo), new[] { type })!;
+
+        var baseline = factory(new object?[] { 5, 10L, 1.5, true, Utf8String.Of("abc") });
+        var greaterInLastCol = factory(new object?[] { 5, 10L, 1.5, true, Utf8String.Of("abd") });
+        var greaterInFirstCol = factory(new object?[] { 6, 0L, 0.0, false, Utf8String.Of("") });
+
+        Assert.True((int)compareTo.Invoke(baseline, new[] { greaterInLastCol })! < 0);
+        Assert.True((int)compareTo.Invoke(baseline, new[] { greaterInFirstCol })! < 0);
+        Assert.True((int)compareTo.Invoke(greaterInFirstCol, new[] { greaterInLastCol })! > 0);
+    }
 }

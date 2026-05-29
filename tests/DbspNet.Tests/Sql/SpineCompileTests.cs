@@ -44,6 +44,31 @@ public class SpineCompileTests
             q.Circuit.Operators,
             op => op.GetType().Name.StartsWith("Spine", StringComparison.Ordinal));
 
+    /// <summary>
+    /// Assert that at least one spine operator on <paramref name="q"/>'s
+    /// circuit is closed over an emitted typed row, not over
+    /// <see cref="StructuralRow"/>. This is the proof that the typed-row
+    /// pipeline took the spine path (rather than silently falling back to
+    /// the structural compile). The emitted struct types live in the
+    /// <c>DbspNet.TypedRows</c> dynamic assembly and have names of the
+    /// form <c>TypedRow_{guid}</c>; the absence of <c>StructuralRow</c>
+    /// in the closure is the test.
+    /// </summary>
+    private static void AssertSpineClosedOverTypedRow(CompiledQuery q)
+    {
+        var spineOps = q.Circuit.Operators
+            .Where(op => op.GetType().Name.StartsWith("Spine", StringComparison.Ordinal))
+            .ToList();
+        Assert.NotEmpty(spineOps);
+
+        var anyTyped = spineOps.Any(op =>
+            op.GetType().GetGenericArguments()
+                .Any(t => t != typeof(StructuralRow) && t.Name.StartsWith("TypedRow_", StringComparison.Ordinal)));
+        Assert.True(anyTyped,
+            "expected at least one spine operator closed over an emitted typed row; " +
+            "found only: " + string.Join(", ", spineOps.Select(op => op.GetType().ToString())));
+    }
+
     /// <summary>Assert the two queries' current output deltas are identical.</summary>
     private static void AssertSameDelta(CompiledQuery flat, CompiledQuery spine)
     {
@@ -188,5 +213,58 @@ public class SpineCompileTests
         Assert.Equal(-1, spine.WeightOf(1, null).Value);
         Assert.Equal(1, spine.WeightOf(1, "x").Value);
         AssertSameDelta(flat, spine);
+    }
+
+    // ---- Typed-row + spine integration ----
+    //
+    // The next block asserts the spine path is actually taking the
+    // typed-row pipeline for typed-eligible queries (rather than
+    // falling back to structural). The assertion looks at the spine
+    // operators' closed generic args.
+
+    [Fact]
+    public void SpineDistinct_ClosesOverTypedRow()
+    {
+        // UNION (set semantics) lifts to a Distinct over UnionAll —
+        // the simplest way to land a DistinctPlan on the typed-row
+        // pipeline without relying on `SELECT DISTINCT` (the
+        // resolver-level SELECT-DISTINCT form is a P1 deferral).
+        var (_, spine) = CompilePair(
+            ["CREATE TABLE a (x INT NOT NULL)", "CREATE TABLE b (x INT NOT NULL)"],
+            "SELECT x FROM a UNION SELECT x FROM b");
+        AssertSpineEngaged(spine);
+        AssertSpineClosedOverTypedRow(spine);
+    }
+
+    [Fact]
+    public void SpineAggregate_ClosesOverTypedRow()
+    {
+        var (_, spine) = CompilePair(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, SUM(v) FROM t GROUP BY k");
+        AssertSpineEngaged(spine);
+        AssertSpineClosedOverTypedRow(spine);
+    }
+
+    [Fact]
+    public void SpineInnerJoin_ClosesOverTypedRow()
+    {
+        var (_, spine) = CompilePair(
+            ["CREATE TABLE a (k INT NOT NULL, x INT NOT NULL)",
+             "CREATE TABLE b (k INT NOT NULL, y INT NOT NULL)"],
+            "SELECT a.x, b.y FROM a INNER JOIN b ON a.k = b.k");
+        AssertSpineEngaged(spine);
+        AssertSpineClosedOverTypedRow(spine);
+    }
+
+    [Fact]
+    public void SpineLeftJoin_ClosesOverTypedRow()
+    {
+        var (_, spine) = CompilePair(
+            ["CREATE TABLE a (k INT NOT NULL, x INT NOT NULL)",
+             "CREATE TABLE b (k INT NOT NULL, y INT NOT NULL)"],
+            "SELECT a.x, b.y FROM a LEFT JOIN b ON a.k = b.k");
+        AssertSpineEngaged(spine);
+        AssertSpineClosedOverTypedRow(spine);
     }
 }
