@@ -222,19 +222,22 @@ beyond "Feldera is much bigger":
   `ON`. Non-equi conjuncts are allowed on `INNER JOIN` (applied as a
   post-filter) but rejected on outer joins.
 - Subqueries cover all the row-filter shapes — scalar (one column),
-  `IN (subquery)`, `NOT IN (subquery)`, `EXISTS (subquery)`, and
-  `NOT EXISTS (subquery)` — both uncorrelated AND **correlated**
-  (single level; the resolver decorrelates against an inner-WHERE
-  equi-predicate referencing an outer column). Correlated `IN` /
-  `NOT IN` / `EXISTS` / `NOT EXISTS` lift to a multi-key
-  `SemiJoinPlan` (with `IsAnti=true` for the NOT-forms; compiled as
-  `outer − SemiJoin(outer, sq)` via the existing Z-set subtraction);
-  correlated scalar lifts to a `CorrelatedScalarSubqueryJoinPlan`
-  whose inner aggregate is augmented with a GROUP BY on the
-  correlation columns. `IN (literal_list)` / `NOT IN (literal_list)`
-  are flat-AST. **Deferred**: `NOT IN (subquery)` with nullable
-  operands (needs an extra "any NULL in sq" scalar-subquery layer
-  for full 3VL); `IN`/`EXISTS`/`NOT IN`/`NOT EXISTS` in
+  `IN (subquery)`, `NOT IN (subquery)` (full SQL 3VL including
+  nullable operands), `EXISTS (subquery)`, and `NOT EXISTS (subquery)`
+  — both uncorrelated AND **correlated** (single level; the resolver
+  decorrelates against an inner-WHERE equi-predicate referencing an
+  outer column). Correlated `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS`
+  lift to a multi-key `SemiJoinPlan` (with `IsAnti=true` for the
+  NOT-forms; compiled as `outer − SemiJoin(outer, sq)` via the
+  existing Z-set subtraction). Nullable `NOT IN` adds a hidden
+  per-correlation-group null-count column (via
+  `CorrelatedScalarSubqueryJoinPlan` or `ScalarSubqueryJoinPlan`)
+  filtered on `probe IS NOT NULL AND (null_count IS NULL OR = 0)`
+  before the anti-semi-join. Correlated scalar lifts to a
+  `CorrelatedScalarSubqueryJoinPlan` whose inner aggregate is
+  augmented with a GROUP BY on the correlation columns.
+  `IN (literal_list)` / `NOT IN (literal_list)` are flat-AST.
+  **Deferred**: `IN`/`EXISTS`/`NOT IN`/`NOT EXISTS` in
   SELECT/HAVING/nested-boolean positions; nested correlation
   (subquery-inside-subquery referencing grand-outer columns).
 - `WITH RECURSIVE` evaluates semi-naïvely on pure-insert ticks (preserves
@@ -269,12 +272,6 @@ The biggest tracked-but-not-yet-shipped pieces:
 - **DRED-style retraction propagation for recursive CTEs**, so the
   full recomputation fallback on retraction-containing ticks goes
   away.
-- **`NOT IN (subquery)` with nullable operands** — full SQL three-valued
-  semantics needs an "any NULL in sq" per-correlation-group
-  scalar-subquery layer atop the anti-semi-join. The
-  `CorrelatedScalarSubqueryJoinPlan` machinery is in place; the
-  missing piece is the resolver-side rewrite. NOT NULL operands ship
-  today.
 - **`IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` in SELECT / HAVING /
   nested-boolean positions** — per-row boolean shape, distinct from
   the WHERE-conjunct semi-join lift.

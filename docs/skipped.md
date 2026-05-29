@@ -78,16 +78,14 @@ reflect that shape, not a backlog.
       columns; multi-column-key LEFT JOIN appends the scalar value).
   All shapes share the same `outerSchema: Schema?` plumbing,
   `ResolvedCorrelationRef` expression node, and
-  `TryMatchEquiCorrelation` / `FindAllCorrelations` helpers. v1
-  restricts `NOT IN` to **NOT NULL operands only** — nullable probe
-  or nullable subquery column rejects with "NOT IN with nullable
-  operands requires three-valued NULL handling (deferred)". Deferred:
-    - **[P1]** `NOT IN (subquery)` with nullable operands — needs an
-      "any NULL in sq" per-correlation-group scalar-subquery layer
-      atop the anti-semi-join. The `CorrelatedScalarSubqueryJoinPlan`
-      machinery is in place; the missing piece is the resolver-side
-      synthesis of the inner `SELECT COUNT(*) WHERE col IS NULL` plan
-      and the outer filter.
+  `TryMatchEquiCorrelation` / `FindAllCorrelations` helpers. `NOT IN`
+  covers the full SQL three-valued logic — nullable probe drops the
+  row, NULL in the (per-correlation-group) subquery drops outer rows
+  that don't otherwise match. Implementation: a hidden
+  per-correlation-group null-count column layered via
+  `CorrelatedScalarSubqueryJoinPlan` (or `ScalarSubqueryJoinPlan` when
+  uncorrelated), filtered on `probe IS NOT NULL AND (null_count IS
+  NULL OR null_count = 0)` before the anti-semi-join. Deferred:
     - **[P1]** `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` outside
       top-level WHERE conjuncts (SELECT / HAVING / nested boolean)
       — per-row boolean shape, distinct from the row-filter
