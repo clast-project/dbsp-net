@@ -294,6 +294,50 @@ public class CompilerTests
         }
     }
 
+    [Fact]
+    public void CommaJoin_WithWhereEquiPredicate_ActsAsInnerJoin()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a, b WHERE a.k = b.k");
+
+        q.Table("a").Insert(1, 100);
+        q.Table("a").Insert(2, 200);
+        q.Table("b").Insert(1, 10);
+        q.Table("b").Insert(3, 30);
+        q.Step();
+
+        // Implicit cross product filtered by a.k = b.k → only (1,…) matches.
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 100, 10));
+    }
+
+    [Fact]
+    public void CommaJoin_ThreeTables_CartesianProduct()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (v INT NOT NULL)",
+                "CREATE TABLE b (w INT NOT NULL)",
+                "CREATE TABLE c (z INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w, c.z FROM a, b, c");
+
+        q.Table("a").Insert(1);
+        q.Table("a").Insert(2);
+        q.Table("b").Insert(10);
+        q.Table("c").Insert(100);
+        q.Step();
+
+        // 2 × 1 × 1 = 2 rows.
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 100));
+        Assert.Equal(1, WeightOf(q.Current, 2, 10, 100));
+    }
+
     // ---- Group-by aggregate ----
 
     [Fact]

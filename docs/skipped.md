@@ -161,9 +161,13 @@ reflect that shape, not a backlog.
   (typed bails on nullable equi-keys → structural fallback handles the bypass).
   Deferred:
     - **[P1]** `NATURAL JOIN`.
-    - **[P2]** Comma-join `FROM a, b` (implicit cross join). `ParseFromClause`
-      doesn't consume a comma-separated table list yet; the explicit
-      `CROSS JOIN` keyword and `ON`-predicate forms cover the same expressivity.
+- Comma-join `FROM a, b` (implicit cross join) — **implemented**. Comma-
+  separated table references in `FROM` fold left-deep into `INNER JOIN ... ON
+  TRUE` cross joins (the comma binds lower than any explicit `JOIN`, so
+  `a, b JOIN c ON p` parses as `a × (b JOIN c)`). Rides the same keyless
+  unit-key path as the `CROSS JOIN` keyword; `FROM a, b WHERE a.k = b.k` is the
+  classic pre-ANSI inner-join spelling (cross product + residual filter, which
+  the optimizer's predicate pushdown can later fold into an equi-join).
 - **[P1]** `LEFT/RIGHT/FULL JOIN` with a non-equi conjunct in the `ON`
   clause (e.g. `LEFT JOIN b ON a.k = b.k AND b.v > 0`). Semantically,
   failing the residual should drop the match but retain the preserved row

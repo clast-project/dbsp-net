@@ -241,8 +241,8 @@ beyond "Feldera is much bigger":
   unit-key nested-loop cross product with the `ON` predicate applied as a
   residual filter. `LEFT` / `RIGHT` / `FULL [OUTER] JOIN` require at least one
   equi-key in `ON` and reject non-equi residual conjuncts (keyed
-  match-presence tracking). Comma-join (`FROM a, b`) and `NATURAL JOIN` are
-  not yet parsed.
+  match-presence tracking). Comma-join (`FROM a, b`, implicit cross join) is
+  supported; `NATURAL JOIN` is not yet parsed.
 - Subqueries cover all the row-filter shapes — scalar (one column),
   `IN (subquery)`, `NOT IN (subquery)` (full SQL 3VL including
   nullable operands), `EXISTS (subquery)`, and `NOT EXISTS (subquery)`

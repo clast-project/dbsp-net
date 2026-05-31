@@ -488,6 +488,25 @@ public sealed class Parser
 
     private FromClause ParseFromClause()
     {
+        // Comma-separated table references are implicit cross joins, with the
+        // lowest precedence (explicit JOINs inside each reference bind tighter).
+        // `FROM a, b` ≡ `FROM a CROSS JOIN b`: desugar each comma to an INNER
+        // JOIN with a literal-true ON so it rides the keyless (unit-key)
+        // inner-join path, exactly like the CROSS JOIN keyword.
+        var result = ParseJoinExpression();
+        while (Peek().Kind == TokenKind.Comma)
+        {
+            Advance();
+            var next = ParseJoinExpression();
+            var onTrue = new LiteralExpression(LiteralKind.Boolean, true);
+            result = new JoinClause(result, next, JoinType.Inner, onTrue);
+        }
+
+        return result;
+    }
+
+    private FromClause ParseJoinExpression()
+    {
         FromClause left = ParsePrimaryTableRef();
         while (true)
         {

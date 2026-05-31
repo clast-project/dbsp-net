@@ -296,7 +296,11 @@ internal static class RandomQuery
         Gen.Const("SELECT a.k, a.v, b.v FROM t a JOIN u b ON a.v > b.v"),
 
         // 59. CROSS JOIN — full cartesian product (keyless inner, no residual).
-        Gen.Const("SELECT a.k, a.v, b.v FROM t a CROSS JOIN u b"));
+        Gen.Const("SELECT a.k, a.v, b.v FROM t a CROSS JOIN u b"),
+
+        // 60. Comma-join (implicit cross join) filtered by WHERE — the classic
+        // pre-ANSI inner-join spelling.
+        Gen.Const("SELECT a.k, a.v, b.v FROM t a, u b WHERE a.k = b.k"));
 
     // ---- Data generator ----
 

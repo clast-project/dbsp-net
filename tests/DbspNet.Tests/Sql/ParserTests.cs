@@ -142,6 +142,41 @@ public class ParserTests
         Assert.Equal(JoinType.FullOuter, join.Type);
     }
 
+    [Fact]
+    public void Select_CommaJoin_BuildsImplicitCrossJoin()
+    {
+        var s = (SelectStatement)Parse("SELECT * FROM a, b");
+        var join = Assert.IsType<JoinClause>(s.From);
+        Assert.Equal(JoinType.Inner, join.Type);
+        Assert.IsType<TableReference>(join.Left);
+        Assert.IsType<TableReference>(join.Right);
+        var lit = Assert.IsType<LiteralExpression>(join.OnCondition);
+        Assert.Equal(true, lit.Value);
+    }
+
+    [Fact]
+    public void Select_CommaJoin_ThreeTables_LeftDeep()
+    {
+        var s = (SelectStatement)Parse("SELECT * FROM a, b, c");
+        // ((a × b) × c): outer join's left is itself a JoinClause.
+        var outer = Assert.IsType<JoinClause>(s.From);
+        Assert.IsType<JoinClause>(outer.Left);
+        Assert.IsType<TableReference>(outer.Right);
+    }
+
+    [Fact]
+    public void Select_CommaJoin_ExplicitJoinBindsTighter()
+    {
+        // `a, b JOIN c ON p` ≡ `a × (b JOIN c ON p)`: the comma is lowest
+        // precedence, so its right operand is the whole `b JOIN c`.
+        var s = (SelectStatement)Parse("SELECT * FROM a, b JOIN c ON b.k = c.k");
+        var comma = Assert.IsType<JoinClause>(s.From);
+        Assert.IsType<TableReference>(comma.Left);
+        var inner = Assert.IsType<JoinClause>(comma.Right);
+        Assert.Equal(JoinType.Inner, inner.Type);
+        Assert.NotNull(inner.OnCondition);
+    }
+
     // --- Pratt expression parser: precedence and associativity ---
 
     private static Expression ParseExpr(string src)
