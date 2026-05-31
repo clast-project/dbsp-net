@@ -332,7 +332,8 @@ public static class TypedPlanCompiler
     /// </summary>
     private static TypedNode? CompileJoin(JoinPlan plan, CompileContext ctx)
     {
-        if (plan.JoinType is not (AstJoinType.Inner or AstJoinType.LeftOuter or AstJoinType.RightOuter))
+        if (plan.JoinType is not (AstJoinType.Inner or AstJoinType.LeftOuter
+            or AstJoinType.RightOuter or AstJoinType.FullOuter))
         {
             return null;
         }
@@ -419,7 +420,7 @@ public static class TypedPlanCompiler
                 leftIndexed, rightIndexed, combineDelegate, nullPad,
                 leftSnapshotCodec, rightSnapshotCodec);
         }
-        else // RightOuter
+        else if (plan.JoinType is AstJoinType.RightOuter)
         {
             if (plan.Residual is not null) return null;
             // Swap sides: the right stream becomes the preserved side
@@ -440,6 +441,27 @@ public static class TypedPlanCompiler
                 ctx, keyRowType, right.RowType, left.RowType, outputRowType,
                 rightIndexed, leftIndexed, swappedCombine, nullPad,
                 rightSnapshotCodec, leftSnapshotCodec);
+        }
+        else // FullOuter
+        {
+            if (plan.Residual is not null) return null;
+            // Nullable equi-keys already bailed above, so every row here has a
+            // non-null key — no NULL-key bypass branch is needed (the structural
+            // fallback handles nullable-key FULL joins). Pad left rows into the
+            // left cols (right default) and right rows into the right cols
+            // (left default); output column order is [left, right].
+            var nullPadRight = BuildNullPadCombineDelegate(
+                keyRowType, left.RowType, outputRowType, outputSchema,
+                preservedSideOffset: 0, preservedSideCount: left.Schema.Count);
+            var nullPadLeft = BuildNullPadCombineDelegate(
+                keyRowType, right.RowType, outputRowType, outputSchema,
+                preservedSideOffset: left.Schema.Count,
+                preservedSideCount: right.Schema.Count);
+            if (nullPadRight is null || nullPadLeft is null) return null;
+            joined = EmitFullJoin(
+                ctx, keyRowType, left.RowType, right.RowType, outputRowType,
+                leftIndexed, rightIndexed, combineDelegate, nullPadRight, nullPadLeft,
+                leftSnapshotCodec, rightSnapshotCodec);
         }
 
         var node = new TypedNode(outputRowType, outputSchema, joined);
@@ -1774,6 +1796,23 @@ public static class TypedPlanCompiler
                 leftSnapshotCodec, rightSnapshotCodec);
     }
 
+    private static object EmitFullJoin(
+        CompileContext ctx, Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
+        object leftIndexed, object rightIndexed, Delegate joinCombine,
+        Delegate nullPadRightCombine, Delegate nullPadLeftCombine,
+        object? leftSnapshotCodec, object? rightSnapshotCodec)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? InvokeSpineIncrementalFullJoin(
+                ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
+                leftIndexed, rightIndexed, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+                leftSnapshotCodec, rightSnapshotCodec, ctx.Options.Compaction)
+            : InvokeIncrementalFullJoin(
+                ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
+                leftIndexed, rightIndexed, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+                leftSnapshotCodec, rightSnapshotCodec);
+    }
+
     private static object EmitAggregate(
         CompileContext ctx, Type keyRowType, Type valueRowType, Type aggRowType,
         object indexed, object aggregator, object? snapshotCodec)
@@ -1939,6 +1978,28 @@ public static class TypedPlanCompiler
     }
 
     /// <summary>
+    /// <c>builder.IncrementalFullJoin&lt;TKey, TLeft, TRight, TOut, Z64&gt;(...)</c>.
+    /// </summary>
+    private static object InvokeIncrementalFullJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        Type outputRowType, object leftIndexed, object rightIndexed,
+        Delegate joinCombine, Delegate nullPadRightCombine, Delegate nullPadLeftCombine,
+        object? leftSnapshotCodec = null, object? rightSnapshotCodec = null)
+    {
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(StatefulOperators.IncrementalFullJoin)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(
+            keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object?[]
+        {
+            builder, leftIndexed, rightIndexed, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+            leftSnapshotCodec, rightSnapshotCodec, null, null,
+        })!;
+    }
+
+    /// <summary>
     /// <c>builder.IncrementalAggregate&lt;TKey, TValue, TOut&gt;(indexed, aggregator)</c>.
     /// Output stream carries <c>ZSet&lt;(TKey, TOut), Z64&gt;</c>.
     /// </summary>
@@ -2040,6 +2101,37 @@ public static class TypedPlanCompiler
         return closed.Invoke(null, new object?[]
         {
             builder, leftIndexed, rightIndexed, joinCombine, nullPadCombine,
+            leftSnapshotCodec, rightSnapshotCodec,
+            compaction,
+            null,  // keyComparer
+            null,  // leftValueComparer
+            null,  // rightValueComparer
+            null,  // leftSpillConfig
+            null,  // rightSpillConfig
+            null,  // frontier
+            null,  // monotoneKey
+        })!;
+    }
+
+    /// <summary>
+    /// <c>builder.SpineIncrementalFullJoin&lt;TKey, TLeft, TRight, TOut, Z64&gt;(...)</c>.
+    /// </summary>
+    private static object InvokeSpineIncrementalFullJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        Type outputRowType, object leftIndexed, object rightIndexed,
+        Delegate joinCombine, Delegate nullPadRightCombine, Delegate nullPadLeftCombine,
+        object? leftSnapshotCodec, object? rightSnapshotCodec,
+        ICompactionStrategy? compaction)
+    {
+        var openMethod = typeof(SpineStatefulOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(SpineStatefulOperators.SpineIncrementalFullJoin)
+                && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(
+            keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object?[]
+        {
+            builder, leftIndexed, rightIndexed, joinCombine, nullPadRightCombine, nullPadLeftCombine,
             leftSnapshotCodec, rightSnapshotCodec,
             compaction,
             null,  // keyComparer

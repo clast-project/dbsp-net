@@ -178,6 +178,46 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Incremental FULL OUTER equi-join. Behaves like
+    /// <see cref="IncrementalLeftJoin{TKey,TLeft,TRight,TOut,TWeight}"/> for the
+    /// inner + left-preserved rows, and additionally emits a NULL-padded-left
+    /// row (produced by <paramref name="nullPadLeftCombine"/>) for every right
+    /// row whose key has no left-side match. Match-status flips on either side
+    /// correctly retract / emit the affected NULL-padded rows.
+    /// </summary>
+    public static Stream<ZSet<TOut, TWeight>> IncrementalFullJoin<TKey, TLeft, TRight, TOut, TWeight>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
+        Stream<IndexedZSet<TKey, TRight, TWeight>> right,
+        Func<TKey, TLeft, TRight, TOut> joinCombine,
+        Func<TKey, TLeft, TOut> nullPadRightCombine,
+        Func<TKey, TRight, TOut> nullPadLeftCombine,
+        IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
+        where TKey : notnull
+        where TLeft : notnull
+        where TRight : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+        ArgumentNullException.ThrowIfNull(joinCombine);
+        ArgumentNullException.ThrowIfNull(nullPadRightCombine);
+        ArgumentNullException.ThrowIfNull(nullPadLeftCombine);
+
+        var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
+        builder.AddRawOperator(
+            new IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
+                left, right, output, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+                leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey));
+        return output;
+    }
+
+    /// <summary>
     /// Incremental per-group aggregate. Input is an indexed Z-set (keyed by
     /// the GROUP BY columns); output is a flat Z-set of (key, aggregateValue)
     /// rows with correct retraction semantics.

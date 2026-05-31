@@ -209,6 +209,7 @@ the persistence layer.
 | `IncrementalAggregateOp` | `IncrementalAggregateOp.cs` | indexed `Trace` over (group key → value multiset), plus per-key last-emitted aggregate cache and an opaque per-key scratch state | Per touched group: hand the aggregator its prior cache, the per-key delta, and the post-delta multiset. Retracts old aggregate and emits new when the result changed. SUM / COUNT / AVG fold incrementally; MIN / MAX maintain a per-group sorted set of distinct positive-weight values for O(log n) extremum lookup. |
 | `IncrementalJoinOp` | `IncrementalJoinOp.cs` | two indexed `Trace`s (one per side) | Bilinear inner-join factoring: `delta = dl ⋈ R + L ⋈ dr + dl ⋈ dr` against the *prior* integrated states, then both traces integrate the new deltas. A non-equi / `CROSS JOIN` (no equi-key) routes both sides through a single unit key, so the same operator yields the full cross product and the `ON` predicate applies as a residual filter. |
 | `IncrementalLeftJoinOp` | `IncrementalLeftJoinOp.cs` | two indexed `Trace`s | LEFT OUTER per-key case analysis on match-presence transitions (stayed-matched / stayed-unmatched / gained-match / lost-match). NULL-padded rows ride the same Z-set. `RIGHT JOIN` is a swap-wrapper at the SQL layer. |
+| `IncrementalFullJoinOp` | `IncrementalFullJoinOp.cs` | two indexed `Trace`s | FULL OUTER: the LEFT-join case analysis (inner + left-pad, keyed on right-presence) plus a symmetric right-pad pass keyed on left-presence. Independent decompositions, so both-side match flips compose to the exact per-key delta. NULL-keyed rows on either side bypass to their NULL-padded branch at the SQL layer. |
 | `RecursiveCteOp` | `DbspNet.Sql/Compiler/RecursiveCteOp.cs` | materialised CTE result `R`, last per-tick base inputs, last full closure | Semi-naïve incremental recursion: preserves `R` across outer ticks; for an insert-only tick, propagates only newly-derivable rows through the recursive body to fixed-point. On any retraction-containing tick, falls back to full batch recomputation. |
 | `LatenessOperator` | `LatenessOperator.cs` | scalar `max_seen` + a shared `MutableFrontier` | Input-side `LATENESS` enforcement: drops rows whose monotone value is below the start-of-tick frontier (late rows), and advances the frontier to `max_seen − d` — the watermark downstream operators GC against. See *LATENESS* below. |
 
@@ -216,7 +217,8 @@ the persistence layer.
 
 `DbspNet.Core/Operators/Stateful/Spine/`. Sibling family —
 `SpineDistinctOp`, `SpineIncrementalAggregateOp`,
-`SpineIncrementalJoinOp`, `SpineIncrementalLeftJoinOp` — with the same
+`SpineIncrementalJoinOp`, `SpineIncrementalLeftJoinOp`,
+`SpineIncrementalFullJoinOp` — with the same
 external behaviour, but backed by `SpineZSetTrace` /
 `SpineIndexedZSetTrace` (tiered immutable sorted-columnar batches with
 configurable compaction) instead of a flat dictionary. Per-batch

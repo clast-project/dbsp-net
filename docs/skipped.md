@@ -147,11 +147,20 @@ reflect that shape, not a backlog.
   Both compiler paths route the two sides through a single unit (zero-column)
   key, so `IncrementalJoinOp` produces the full bilinear cross product and the
   residual filters it — same machinery, no new operator. The op stays bilinear,
-  so retractions are correct. Deferred:
-    - **[P1]** `FULL OUTER JOIN`, `NATURAL JOIN`. DbspNet supports `INNER`,
-      `LEFT [OUTER] JOIN`, and `RIGHT [OUTER] JOIN`. `RIGHT JOIN` is a swap
-      wrapper over `IncrementalLeftJoinOp`. `FULL OUTER JOIN` needs symmetric
-      match-presence tracking on both sides.
+  so retractions are correct.
+- `FULL OUTER JOIN` — **implemented**. A new `IncrementalFullJoinOp` (plus its
+  spine sibling `SpineIncrementalFullJoinOp`) extends the LEFT-join per-key case
+  analysis with a symmetric right-pad pass keyed on left-side presence:
+  `inner + leftPad` (the existing LEFT-join behaviour, keyed on right-presence)
+  plus `rightPad` (NULL-padded-left rows for right rows whose key has no left
+  match). The two decompositions are independent, so both-side match flips
+  compose correctly to `F(new) − F(old)` per key. NULL-keyed rows on either side
+  bypass the operator to their respective NULL-padded branch. The resolver makes
+  both sides nullable; `FULL JOIN ... USING (c)` merges each shared column via
+  `COALESCE(left, right)` (no non-null side). Supported on both compiler paths
+  (typed bails on nullable equi-keys → structural fallback handles the bypass).
+  Deferred:
+    - **[P1]** `NATURAL JOIN`.
     - **[P2]** Comma-join `FROM a, b` (implicit cross join). `ParseFromClause`
       doesn't consume a comma-separated table list yet; the explicit
       `CROSS JOIN` keyword and `ON`-predicate forms cover the same expressivity.
@@ -308,7 +317,8 @@ reflect that shape, not a backlog.
   modelled on cloud object stores (S3 / GCS / Azure Blob) with a
   built-in `LocalFileBlobStore` and `InMemoryBlobStore`. Every
   stateful SQL operator — `DistinctOp`, `IncrementalAggregateOp`,
-  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `RecursiveCteOp` —
+  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `IncrementalFullJoinOp`,
+  `RecursiveCteOp` —
   implements `ISnapshotable` and round-trips its trace(s) as Arrow IPC
   via the `ArrowSqlSnapshotCodecs` registry. Snapshot manifests carry
   both a plan fingerprint (operator-type sequence with generic args)

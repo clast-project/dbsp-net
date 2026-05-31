@@ -151,6 +151,30 @@ public class ResolverTests
     }
 
     [Fact]
+    public void FullJoin_MakesBothSidesNullable()
+    {
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+            "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)");
+        var plan = ResolveQuery(r, "SELECT a.v, b.w FROM a FULL JOIN b ON a.k = b.k");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Equal(DbspNet.Sql.Parser.Ast.JoinType.FullOuter, join.JoinType);
+        // Every join-output column is nullable (either side can be unmatched).
+        Assert.All(join.Schema.Columns, c => Assert.True(c.Type.Nullable));
+    }
+
+    [Fact]
+    public void FullJoin_WithoutEquiKey_Throws()
+    {
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y INT NOT NULL)");
+        Assert.Throws<ResolveException>(
+            () => ResolveQuery(r, "SELECT * FROM a FULL JOIN b ON a.x > b.y"));
+    }
+
+    [Fact]
     public void LeftJoin_WithoutEquiKey_Throws()
     {
         // Outer joins still require an equi-key in v1 (keyed match-presence).

@@ -172,4 +172,48 @@ public static class SpineStatefulOperators
                 leftSpillConfig, rightSpillConfig, frontier, monotoneKey));
         return output;
     }
+
+    /// <summary>
+    /// Spine-backed incremental FULL OUTER equi-join. Observable behaviour
+    /// matches <see cref="StatefulOperators.IncrementalFullJoin{TKey,TLeft,TRight,TOut,TWeight}"/>.
+    /// </summary>
+    public static Stream<ZSet<TOut, TWeight>> SpineIncrementalFullJoin<TKey, TLeft, TRight, TOut, TWeight>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
+        Stream<IndexedZSet<TKey, TRight, TWeight>> right,
+        Func<TKey, TLeft, TRight, TOut> joinCombine,
+        Func<TKey, TLeft, TOut> nullPadRightCombine,
+        Func<TKey, TRight, TOut> nullPadLeftCombine,
+        IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
+        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
+        ICompactionStrategy? compactionStrategy = null,
+        IComparer<TKey>? keyComparer = null,
+        IComparer<TLeft>? leftValueComparer = null,
+        IComparer<TRight>? rightValueComparer = null,
+        SpineIndexedSpillConfig<TKey, TLeft, TWeight>? leftSpillConfig = null,
+        SpineIndexedSpillConfig<TKey, TRight, TWeight>? rightSpillConfig = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
+        where TKey : notnull
+        where TLeft : notnull
+        where TRight : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+        ArgumentNullException.ThrowIfNull(joinCombine);
+        ArgumentNullException.ThrowIfNull(nullPadRightCombine);
+        ArgumentNullException.ThrowIfNull(nullPadLeftCombine);
+
+        var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
+        builder.AddRawOperator(
+            new SpineIncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
+                left, right, output, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+                leftSnapshotCodec, rightSnapshotCodec,
+                compactionStrategy, keyComparer, leftValueComparer, rightValueComparer,
+                leftSpillConfig, rightSpillConfig, frontier, monotoneKey));
+        return output;
+    }
 }

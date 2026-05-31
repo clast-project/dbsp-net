@@ -267,4 +267,15 @@ public class SpineCompileTests
         AssertSpineEngaged(spine);
         AssertSpineClosedOverTypedRow(spine);
     }
+
+    [Fact]
+    public void SpineFullJoin_ClosesOverTypedRow()
+    {
+        var (_, spine) = CompilePair(
+            ["CREATE TABLE a (k INT NOT NULL, x INT NOT NULL)",
+             "CREATE TABLE b (k INT NOT NULL, y INT NOT NULL)"],
+            "SELECT a.x, b.y FROM a FULL JOIN b ON a.k = b.k");
+        AssertSpineEngaged(spine);
+        AssertSpineClosedOverTypedRow(spine);
+    }
 }

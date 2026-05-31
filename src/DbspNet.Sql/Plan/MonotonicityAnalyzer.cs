@@ -243,6 +243,14 @@ public static class MonotonicityAnalyzer
                     }
 
                     break;
+
+                case JoinType.FullOuter:
+                    // Neither output key column is monotone: an unmatched row
+                    // NULLs out the absent side's key (left key NULL for a
+                    // right-only row, right key NULL for a left-only row), so
+                    // the projection loses its bound. (GC still works — it reads
+                    // the input-side sources directly, both-sides-monotone.)
+                    break;
             }
         }
 

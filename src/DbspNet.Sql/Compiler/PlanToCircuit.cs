@@ -273,6 +273,33 @@ public static class PlanToCircuit
                 left, right, joinCombine, nullPadCombine, leftCodec, rightCodec, frontier, monotoneKey);
     }
 
+    private static Stream<ZSet<StructuralRow, Z64>> EmitFullJoin(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadRightCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadLeftCombine,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
+        IFrontier? frontier = null,
+        Func<StructuralRow, long>? monotoneKey = null)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineIncrementalFullJoin(
+                left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftCodec, rightCodec,
+                ctx.Options.Compaction,
+                keyComparer: StructuralRowComparer.Instance,
+                leftValueComparer: StructuralRowComparer.Instance,
+                rightValueComparer: StructuralRowComparer.Instance,
+                frontier: frontier,
+                monotoneKey: monotoneKey)
+            : builder.IncrementalFullJoin(
+                left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+                leftCodec, rightCodec, frontier, monotoneKey);
+    }
+
     private static Stream<ZSet<(StructuralRow Key, StructuralRow Value), Z64>> EmitAggregate(
         CircuitBuilder builder,
         CompileContext ctx,
@@ -662,6 +689,7 @@ public static class PlanToCircuit
             DbspNet.Sql.Parser.Ast.JoinType.Inner => CompileInnerJoin(builder, plan, ctx),
             DbspNet.Sql.Parser.Ast.JoinType.LeftOuter => CompileLeftOuterJoin(builder, plan, ctx),
             DbspNet.Sql.Parser.Ast.JoinType.RightOuter => CompileRightOuterJoin(builder, plan, ctx),
+            DbspNet.Sql.Parser.Ast.JoinType.FullOuter => CompileFullOuterJoin(builder, plan, ctx),
             _ => throw new InvalidOperationException($"unsupported JoinType {plan.JoinType}"),
         };
     }
@@ -851,6 +879,71 @@ public static class PlanToCircuit
             row => NullPadLeft(codec, joinedSchema, row, leftCount, rightCount));
 
         return builder.Union(joined, nullKeyPadded);
+    }
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompileFullOuterJoin(
+        CircuitBuilder builder,
+        JoinPlan plan,
+        CompileContext ctx)
+    {
+        // Residual predicates on FULL OUTER are rejected by the resolver (same
+        // reason as LEFT / RIGHT — a failing residual must retain the preserved
+        // rows NULL-padded, which the operator doesn't encode).
+        if (plan.Residual is not null)
+        {
+            throw new InvalidOperationException(
+                "internal: FULL OUTER JOIN with residual reached PlanToCircuit; resolver should have rejected");
+        }
+
+        var left = CompilePlan(builder, plan.Left, ctx);
+        var right = CompilePlan(builder, plan.Right, ctx);
+
+        var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
+        var leftCount = plan.Left.Schema.Count;
+        var rightCount = plan.Right.Schema.Count;
+
+        // NULL-keyed rows can never match. A NULL-keyed left row emits straight
+        // to the NULL-padded-right branch; a NULL-keyed right row to the
+        // NULL-padded-left branch. Both bypass the keyed operator.
+        var nullKeyLeft = builder.Filter(left, row => !HasNoNullKey(row, leftIndices));
+        var validKeyLeft = builder.Filter(left, row => HasNoNullKey(row, leftIndices));
+        var nullKeyRight = builder.Filter(right, row => !HasNoNullKey(row, rightIndices));
+        var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
+
+        var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
+        var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
+        var joinedSchema = plan.Schema;
+        var codec = ctx.Codec;
+        var leftIndexed = builder.GroupProject(
+            validKeyLeft,
+            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
+            row => row);
+        var rightIndexed = builder.GroupProject(
+            validKeyRight,
+            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
+            row => row);
+
+        var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
+        var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
+        // Both-sides-monotone GC license, as for LEFT / RIGHT.
+        var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
+        var joined = EmitFullJoin(
+            builder, ctx,
+            leftIndexed,
+            rightIndexed,
+            joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
+            nullPadRightCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
+            nullPadLeftCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
+            leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
+
+        var nullKeyLeftPadded = builder.MapRows(
+            nullKeyLeft,
+            row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount));
+        var nullKeyRightPadded = builder.MapRows(
+            nullKeyRight,
+            row => NullPadLeft(codec, joinedSchema, row, leftCount, rightCount));
+
+        return builder.Union(builder.Union(joined, nullKeyLeftPadded), nullKeyRightPadded);
     }
 
     private static StructuralRow NullPadLeft(IRowCodec<StructuralRow> codec, Schema schema, StructuralRow right, int leftCount, int rightCount)

@@ -31,6 +31,7 @@ public sealed class Lexer
         ["inner"] = TokenKind.Inner,
         ["left"] = TokenKind.Left,
         ["right"] = TokenKind.Right,
+        ["full"] = TokenKind.Full,
         ["outer"] = TokenKind.Outer,
         ["cross"] = TokenKind.Cross,
         ["join"] = TokenKind.Join,

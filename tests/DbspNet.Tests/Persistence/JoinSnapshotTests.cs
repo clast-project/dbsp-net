@@ -222,6 +222,58 @@ public class JoinSnapshotTests : IDisposable
     }
 
     [Fact]
+    public async Task FullJoin_RestoredState_LeftOnlyGainsRightMatch()
+    {
+        // Producer: only the left side populated → NULL-padded-right row.
+        var producer = Compile(
+            CustomersDdl,
+            "SELECT customers.name, orders.amt FROM customers FULL JOIN orders ON customers.cid = orders.cid");
+        producer.Table("customers").Insert(1, "alice");
+        producer.Step();   // emits ('alice', NULL): +1
+
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
+
+        var consumer = Compile(
+            CustomersDdl,
+            "SELECT customers.name, orders.amt FROM customers FULL JOIN orders ON customers.cid = orders.cid");
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
+
+        consumer.Table("orders").Insert(100, 1, 50L);
+        consumer.Step();
+
+        Assert.Equal(2, consumer.Current.Count);
+        Assert.Equal(-1, consumer.WeightOf("alice", null).Value);
+        Assert.Equal(1, consumer.WeightOf("alice", 50L).Value);
+    }
+
+    [Fact]
+    public async Task FullJoin_RestoredState_RightOnlyGainsLeftMatch()
+    {
+        // Producer: only the right side populated → NULL-padded-left row. This
+        // exercises the FULL-OUTER right-pad branch (Part B) across a snapshot:
+        // the consumer adds a left match and the (NULL, amt) row must retract.
+        var producer = Compile(
+            CustomersDdl,
+            "SELECT customers.name, orders.amt FROM customers FULL JOIN orders ON customers.cid = orders.cid");
+        producer.Table("orders").Insert(100, 1, 50L);
+        producer.Step();   // emits (NULL, 50): +1
+
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
+
+        var consumer = Compile(
+            CustomersDdl,
+            "SELECT customers.name, orders.amt FROM customers FULL JOIN orders ON customers.cid = orders.cid");
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
+
+        consumer.Table("customers").Insert(1, "alice");
+        consumer.Step();
+
+        Assert.Equal(2, consumer.Current.Count);
+        Assert.Equal(-1, consumer.WeightOf(null, 50L).Value);
+        Assert.Equal(1, consumer.WeightOf("alice", 50L).Value);
+    }
+
+    [Fact]
     public async Task NoCodec_InnerJoin_ThrowsOnSnapshot()
     {
         var catalog = new Catalog();

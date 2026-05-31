@@ -567,6 +567,157 @@ public class CompilerTests
         Assert.Equal(1, q.Current.Count);
     }
 
+    // ---- FULL OUTER JOIN ----
+
+    [Fact]
+    public void FullJoin_MatchedLeftOnlyRightOnly_AllAppear()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.k, a.v, b.k, b.w FROM a FULL JOIN b ON a.k = b.k");
+
+        q.Table("a").Insert(1, 100); // matched
+        q.Table("a").Insert(2, 200); // left-only
+        q.Table("b").Insert(1, 10);  // matched
+        q.Table("b").Insert(3, 30);  // right-only
+        q.Step();
+
+        Assert.Equal(3, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, 1, 10));       // matched
+        Assert.Equal(1, WeightOf(q.Current, 2, 200, null, null));  // left-only → pad right
+        Assert.Equal(1, WeightOf(q.Current, null, null, 3, 30));   // right-only → pad left
+    }
+
+    [Fact]
+    public void FullJoin_GainedMatch_RetractsPad_EmitsJoined()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.k, a.v, b.k, b.w FROM a FULL JOIN b ON a.k = b.k");
+
+        q.Table("a").Insert(1, 100);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, null, null));
+
+        // Right row arrives on the same key: pad-right retracts, joined emits.
+        q.Table("b").Insert(1, 10);
+        q.Step();
+        Assert.Equal(-1, WeightOf(q.Current, 1, 100, null, null));
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, 1, 10));
+    }
+
+    [Fact]
+    public void FullJoin_LostRight_RetractsJoined_EmitsNullPaddedRight()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.k, a.v, b.k, b.w FROM a FULL JOIN b ON a.k = b.k");
+
+        q.Table("a").Insert(1, 100);
+        q.Table("b").Insert(1, 10);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, 1, 10));
+
+        // Remove the only right row: joined retracts, left row becomes pad-right.
+        q.Table("b").Delete(1, 10);
+        q.Step();
+        Assert.Equal(-1, WeightOf(q.Current, 1, 100, 1, 10));
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, null, null));
+    }
+
+    [Fact]
+    public void FullJoin_NullKeysBypassToBothBranches()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT, v INT NOT NULL)",
+                "CREATE TABLE b (k INT, w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a FULL JOIN b ON a.k = b.k");
+
+        // NULL keys never match: each emits its own NULL-padded row.
+        q.Table("a").Insert(null, 100);
+        q.Table("b").Insert(null, 10);
+        q.Step();
+
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 100, null)); // left-only (a.v, NULL b.w)
+        Assert.Equal(1, WeightOf(q.Current, null, 10));  // right-only (NULL a.v, b.w)
+    }
+
+    [Fact]
+    public void FullJoin_Using_CoalescesMergedKey()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT k, v, w FROM a FULL JOIN b USING (k)");
+
+        q.Table("a").Insert(1, 100); // matched
+        q.Table("a").Insert(2, 200); // left-only
+        q.Table("b").Insert(1, 10);  // matched
+        q.Table("b").Insert(3, 30);  // right-only
+        q.Step();
+
+        // Merged k is COALESCE(a.k, b.k): present for every row including the
+        // right-only one (k=3) where a.k is NULL.
+        Assert.Equal(3, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, 10));
+        Assert.Equal(1, WeightOf(q.Current, 2, 200, null));
+        Assert.Equal(1, WeightOf(q.Current, 3, null, 30));
+    }
+
+    [Fact]
+    public void FullJoin_TypedPathCompiles()
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)"));
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)"));
+        var plan = ((SelectPlan)resolver.Resolve(
+            Parser.ParseStatement("SELECT a.v, b.w FROM a FULL JOIN b ON a.k = b.k"))).Query;
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out _));
+    }
+
+    [Fact]
+    public void FullJoin_SpineAndFlatAgree()
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)"));
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)"));
+        var plan = ((SelectPlan)resolver.Resolve(
+            Parser.ParseStatement("SELECT a.k, a.v, b.k, b.w FROM a FULL JOIN b ON a.k = b.k"))).Query;
+
+        var flat = PlanToCircuit.Compile(plan);
+        var spine = PlanToCircuit.Compile(plan, null, new CompileOptions { TraceFamily = TraceFamily.Spine });
+
+        foreach (var q in new[] { flat, spine })
+        {
+            q.Table("a").Insert(1, 100);
+            q.Table("a").Insert(2, 200);
+            q.Table("b").Insert(1, 10);
+            q.Table("b").Insert(3, 30);
+            q.Step();
+            Assert.Equal(3, q.Current.Count);
+            Assert.Equal(1, WeightOf(q.Current, 1, 100, 1, 10));
+            Assert.Equal(1, WeightOf(q.Current, 2, 200, null, null));
+            Assert.Equal(1, WeightOf(q.Current, null, null, 3, 30));
+        }
+    }
+
     // ---- Combined (join + group-by) ----
 
     [Fact]

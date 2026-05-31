@@ -931,6 +931,7 @@ public sealed class Resolver
             JoinType.Inner => combined,
             JoinType.LeftOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: false),
             JoinType.RightOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: true),
+            JoinType.FullOuter => MakeBothNullable(left.Schema, right.Schema),
             _ => throw new ResolveException($"unsupported join type {join.Type}"),
         };
 
@@ -972,13 +973,17 @@ public sealed class Resolver
             JoinType.Inner => left.Schema.Concat(right.Schema),
             JoinType.LeftOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: false),
             JoinType.RightOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: true),
+            JoinType.FullOuter => MakeBothNullable(left.Schema, right.Schema),
             _ => throw new ResolveException($"unsupported join type {join.Type}"),
         };
 
         var joinPlan = new JoinPlan(left, right, join.Type, equi, Residual: null, joinOutputSchema);
 
         // INNER and LEFT keep the (non-null) left copy of each shared column;
-        // RIGHT keeps the (non-null) right copy.
+        // RIGHT keeps the (non-null) right copy. FULL has no non-null side, so
+        // each shared column merges via COALESCE(left, right) — at least one
+        // side is non-null for any output row (the join key is present on the
+        // preserved side).
         var takeLeftForMerged = join.Type != JoinType.RightOuter;
         var mergedLeft = new HashSet<int>(usingLeftIdx);
         var mergedRight = new HashSet<int>(usingRightCombinedIdx);
@@ -986,6 +991,23 @@ public sealed class Resolver
         var projections = new List<ProjectionItem>();
         for (var i = 0; i < join.UsingColumns!.Count; i++)
         {
+            if (join.Type == JoinType.FullOuter)
+            {
+                var leftCol = joinOutputSchema[usingLeftIdx[i]];
+                var rightCol = joinOutputSchema[usingRightCombinedIdx[i]];
+                var mergedType = equi[i].KeyType.WithNullable(false);
+                var coalesce = new ResolvedFunctionCall(
+                    "coalesce",
+                    new ResolvedExpression[]
+                    {
+                        new ResolvedColumn(usingLeftIdx[i], leftCol.Type),
+                        new ResolvedColumn(usingRightCombinedIdx[i], rightCol.Type),
+                    },
+                    mergedType);
+                projections.Add(new ProjectionItem(coalesce, join.UsingColumns[i], Qualifier: null));
+                continue;
+            }
+
             var idx = takeLeftForMerged ? usingLeftIdx[i] : usingRightCombinedIdx[i];
             var c = joinOutputSchema[idx];
             projections.Add(new ProjectionItem(new ResolvedColumn(idx, c.Type), join.UsingColumns[i], Qualifier: null));
@@ -1021,6 +1043,7 @@ public sealed class Resolver
         JoinType.Inner => "INNER JOIN",
         JoinType.LeftOuter => "LEFT JOIN",
         JoinType.RightOuter => "RIGHT JOIN",
+        JoinType.FullOuter => "FULL JOIN",
         _ => t.ToString(),
     };
 
@@ -1039,6 +1062,22 @@ public sealed class Resolver
             cols.Add(makeLeftNullable
                 ? c
                 : new SchemaColumn(c.Name, c.Type.WithNullable(true), c.Qualifier));
+        }
+
+        return new Schema(cols);
+    }
+
+    private static Schema MakeBothNullable(Schema left, Schema right)
+    {
+        var cols = new List<SchemaColumn>(left.Count + right.Count);
+        foreach (var c in left.Columns)
+        {
+            cols.Add(new SchemaColumn(c.Name, c.Type.WithNullable(true), c.Qualifier));
+        }
+
+        foreach (var c in right.Columns)
+        {
+            cols.Add(new SchemaColumn(c.Name, c.Type.WithNullable(true), c.Qualifier));
         }
 
         return new Schema(cols);

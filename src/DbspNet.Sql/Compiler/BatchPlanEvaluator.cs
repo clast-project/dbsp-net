@@ -53,6 +53,7 @@ internal static class BatchPlanEvaluator
                     DbspNet.Sql.Parser.Ast.JoinType.Inner => BatchInnerJoin(j, ctx),
                     DbspNet.Sql.Parser.Ast.JoinType.LeftOuter => BatchLeftOuterJoin(j, ctx),
                     DbspNet.Sql.Parser.Ast.JoinType.RightOuter => BatchRightOuterJoin(j, ctx),
+                    DbspNet.Sql.Parser.Ast.JoinType.FullOuter => BatchFullOuterJoin(j, ctx),
                     _ => throw new InvalidOperationException($"unsupported JoinType {j.JoinType}"),
                 };
 
@@ -272,6 +273,82 @@ internal static class BatchPlanEvaluator
                 }
             }
             else
+            {
+                builder.Add(NullPadLeft(ctx.Codec, rrow, leftCount, rightCount), rw);
+            }
+        }
+
+        return builder.Build();
+    }
+
+    private static ZSet<StructuralRow, Z64> BatchFullOuterJoin(JoinPlan plan, BatchEvalContext ctx)
+    {
+        // FULL OUTER = inner (both sides present) + NULL-padded-right (left rows
+        // whose key has no right match) + NULL-padded-left (right rows whose key
+        // has no left match). Null-keyed rows can never match: each emits its own
+        // NULL-padded row.
+        var left = Evaluate(plan.Left, ctx);
+        var right = Evaluate(plan.Right, ctx);
+        var (leftIdx, rightIdx) = KeyIndices(plan);
+        var leftCount = plan.Left.Schema.Count;
+        var rightCount = plan.Right.Schema.Count;
+
+        var rightByKey = new Dictionary<StructuralRow, List<(StructuralRow Row, Z64 Weight)>>();
+        foreach (var (row, w) in right)
+        {
+            if (HasNullKey(row, rightIdx))
+            {
+                continue;
+            }
+
+            var key = ExtractKey(ctx.Codec, row, rightIdx);
+            if (!rightByKey.TryGetValue(key, out var list))
+            {
+                rightByKey[key] = list = new List<(StructuralRow, Z64)>();
+            }
+
+            list.Add((row, w));
+        }
+
+        // Track which right keys found a left match so the right-only pass below
+        // skips them.
+        var matchedRightKeys = new HashSet<StructuralRow>();
+        var builder = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var (lrow, lw) in left)
+        {
+            if (HasNullKey(lrow, leftIdx))
+            {
+                builder.Add(NullPadRight(ctx.Codec, lrow, leftCount, rightCount), lw);
+                continue;
+            }
+
+            var key = ExtractKey(ctx.Codec, lrow, leftIdx);
+            if (rightByKey.TryGetValue(key, out var matches) && matches.Count > 0)
+            {
+                matchedRightKeys.Add(key);
+                foreach (var (rrow, rw) in matches)
+                {
+                    builder.Add(MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount), Z64.Multiply(lw, rw));
+                }
+            }
+            else
+            {
+                builder.Add(NullPadRight(ctx.Codec, lrow, leftCount, rightCount), lw);
+            }
+        }
+
+        // Right-only rows: null-keyed always pad; otherwise pad iff the key had
+        // no left match.
+        foreach (var (rrow, rw) in right)
+        {
+            if (HasNullKey(rrow, rightIdx))
+            {
+                builder.Add(NullPadLeft(ctx.Codec, rrow, leftCount, rightCount), rw);
+                continue;
+            }
+
+            var key = ExtractKey(ctx.Codec, rrow, rightIdx);
+            if (!matchedRightKeys.Contains(key))
             {
                 builder.Add(NullPadLeft(ctx.Codec, rrow, leftCount, rightCount), rw);
             }

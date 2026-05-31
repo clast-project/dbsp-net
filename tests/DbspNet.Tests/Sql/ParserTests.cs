@@ -132,6 +132,16 @@ public class ParserTests
         Assert.Equal(true, lit.Value);
     }
 
+    [Theory]
+    [InlineData("FULL JOIN")]
+    [InlineData("FULL OUTER JOIN")]
+    public void Select_FullJoin_BuildsFullOuter(string joinKeyword)
+    {
+        var s = (SelectStatement)Parse($"SELECT * FROM a {joinKeyword} b ON a.k = b.k");
+        var join = Assert.IsType<JoinClause>(s.From);
+        Assert.Equal(JoinType.FullOuter, join.Type);
+    }
+
     // --- Pratt expression parser: precedence and associativity ---
 
     private static Expression ParseExpr(string src)

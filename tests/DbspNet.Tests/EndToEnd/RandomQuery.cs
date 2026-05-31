@@ -60,6 +60,13 @@ internal static class RandomQuery
         // 6. Right outer join
         Gen.Const("SELECT a.k, a.v, b.v FROM t a RIGHT JOIN u b ON a.k = b.k"),
 
+        // 6b. Full outer join — symmetric match-presence tracking on both sides
+        Gen.Const("SELECT a.k, a.v, b.k, b.v FROM t a FULL JOIN u b ON a.k = b.k"),
+
+        // 6c. Full outer join over the nullable table — NULL-keyed rows on
+        // either side bypass to their respective NULL-padded branch
+        Gen.Const("SELECT a.k, a.v, b.k, b.v FROM n a FULL JOIN t b ON a.k = b.k"),
+
         // 7. GROUP BY SUM
         GenTable.Select(t => $"SELECT k, SUM(v) AS s FROM {t} GROUP BY k"),
 

@@ -535,6 +535,17 @@ public sealed class Parser
                 Expect(TokenKind.Join);
                 joinType = JoinType.RightOuter;
             }
+            else if (t.Kind == TokenKind.Full)
+            {
+                Advance();
+                if (Peek().Kind == TokenKind.Outer)
+                {
+                    Advance();
+                }
+
+                Expect(TokenKind.Join);
+                joinType = JoinType.FullOuter;
+            }
             else if (t.Kind == TokenKind.Join)
             {
                 // Bare JOIN is INNER.
