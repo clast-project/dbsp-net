@@ -38,7 +38,9 @@ internal static class BuiltinScalarFunctions
     {
         "coalesce" or "upper" or "lower" or "length" or "concat" or "||"
             or "abs" or "floor" or "ceil" or "ceiling" or "round" or "power" or "sqrt"
-            or "greatest" or "least" or "nullif" => true,
+            or "greatest" or "least" or "nullif"
+            or "substring" or "substr" or "ltrim" or "rtrim" or "trim" or "replace"
+            or "position" or "strpos" or "sign" or "ln" or "log" or "exp" => true,
         _ => false,
     };
 
@@ -121,6 +123,32 @@ internal static class BuiltinScalarFunctions
                 return ResolveGreatestLeast(name, args);
             case "nullif":
                 return ResolveNullIf(args);
+            case "substring":
+            case "substr":
+                return ResolveSubstring(args);
+            case "ltrim":
+            case "rtrim":
+            case "trim":
+                return ResolveTrim(name, args);
+            case "replace":
+                RequireArity(name, args, 3);
+                RequireString(name, args[0]);
+                RequireString(name, args[1]);
+                RequireString(name, args[2]);
+                return new ResolvedFunctionCall("replace", args, new SqlVarcharType(null, AnyNullable(args)));
+            case "position":
+            case "strpos":
+                RequireArity(name, args, 2);
+                RequireString(name, args[0]);
+                RequireString(name, args[1]);
+                return new ResolvedFunctionCall(name, args, new SqlIntegerType(AnyNullable(args)));
+            case "sign":
+                return ResolveSign(args);
+            case "ln":
+            case "exp":
+                return ResolveUnaryDouble(name, args);
+            case "log":
+                return ResolveLog(args);
             default:
                 throw new ResolveException($"unknown function '{name}'");
         }
@@ -159,6 +187,19 @@ internal static class BuiltinScalarFunctions
             "greatest" => BuildGreatestLeast(compiled, greatest: true),
             "least" => BuildGreatestLeast(compiled, greatest: false),
             "nullif" => BuildNullIf(compiled[0], compiled[1], fn.Arguments[0].Type),
+            "substring" or "substr" => BuildSubstring(compiled),
+            "ltrim" => BuildTrim(compiled, TrimSide.Left),
+            "rtrim" => BuildTrim(compiled, TrimSide.Right),
+            "trim" => BuildTrim(compiled, TrimSide.Both),
+            "replace" => Expression.Call(ReplaceRuntime, compiled[0], compiled[1], compiled[2]),
+            // POSITION(sub IN str) → (needle=sub, haystack=str); STRPOS(str, sub)
+            // is the same with the arguments swapped.
+            "position" => Expression.Call(PositionRuntime, compiled[0], compiled[1]),
+            "strpos" => Expression.Call(PositionRuntime, compiled[1], compiled[0]),
+            "sign" => NullPropagatingUnary(compiled[0], typeof(double), v => Expression.Call(MathSignDouble, v)),
+            "ln" => NullPropagatingUnary(compiled[0], typeof(double), v => Expression.Call(MathLog, v)),
+            "exp" => NullPropagatingUnary(compiled[0], typeof(double), v => Expression.Call(MathExp, v)),
+            "log" => BuildLog(compiled),
             _ => throw new InvalidOperationException($"unknown function '{fn.FunctionName}'"),
         };
     }
@@ -276,6 +317,101 @@ internal static class BuiltinScalarFunctions
 
         // Result is either the first arg (type X) or NULL, so always nullable.
         return new ResolvedFunctionCall("nullif", cast, args[0].Type.WithNullable(true));
+    }
+
+    private static bool AnyNullable(IReadOnlyList<ResolvedExpression> args)
+    {
+        foreach (var a in args)
+        {
+            if (a.Type.Nullable)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void RequireInteger(string name, ResolvedExpression arg)
+    {
+        if (arg.Type is not (SqlIntegerType or SqlBigintType))
+        {
+            throw new ResolveException($"{name.ToUpperInvariant()} requires integer position/length arguments");
+        }
+    }
+
+    private static ResolvedFunctionCall ResolveSubstring(IReadOnlyList<ResolvedExpression> args)
+    {
+        if (args.Count is < 2 or > 3)
+        {
+            throw new ResolveException("SUBSTRING takes 2 or 3 arguments");
+        }
+
+        RequireString("substring", args[0]);
+        RequireInteger("substring", args[1]);
+        if (args.Count == 3)
+        {
+            RequireInteger("substring", args[2]);
+        }
+
+        // Result type is VARCHAR; NULL in any argument yields NULL.
+        return new ResolvedFunctionCall("substring", args, new SqlVarcharType(null, AnyNullable(args)));
+    }
+
+    private static ResolvedFunctionCall ResolveTrim(string name, IReadOnlyList<ResolvedExpression> args)
+    {
+        if (args.Count is < 1 or > 2)
+        {
+            throw new ResolveException($"{name.ToUpperInvariant()} takes 1 or 2 arguments");
+        }
+
+        RequireString(name, args[0]);
+        if (args.Count == 2)
+        {
+            // Second argument is the set of characters to strip.
+            RequireString(name, args[1]);
+        }
+
+        return new ResolvedFunctionCall(name, args, new SqlVarcharType(null, AnyNullable(args)));
+    }
+
+    private static ResolvedFunctionCall ResolveSign(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("sign", args, 1);
+        RequireNumeric("sign", args[0]);
+
+        // Compute over DOUBLE (sign is exact for every representable value),
+        // result is INTEGER (-1 / 0 / 1). Casting up front keeps Build free
+        // of per-type dispatch — notably no Decimal128 internals.
+        var asDouble = MaybeCast(args[0], new SqlDoubleType(args[0].Type.Nullable));
+        return new ResolvedFunctionCall("sign", new[] { asDouble }, new SqlIntegerType(args[0].Type.Nullable));
+    }
+
+    private static ResolvedFunctionCall ResolveUnaryDouble(string name, IReadOnlyList<ResolvedExpression> args)
+    {
+        // LN / EXP: widen the operand to DOUBLE and return DOUBLE.
+        RequireArity(name, args, 1);
+        RequireNumeric(name, args[0]);
+        var d = new SqlDoubleType(args[0].Type.Nullable);
+        return new ResolvedFunctionCall(name, new[] { MaybeCast(args[0], d) }, d);
+    }
+
+    private static ResolvedFunctionCall ResolveLog(IReadOnlyList<ResolvedExpression> args)
+    {
+        // LOG(x) — base-10 logarithm; LOG(b, x) — logarithm of x to base b.
+        if (args.Count is < 1 or > 2)
+        {
+            throw new ResolveException("LOG takes 1 or 2 arguments");
+        }
+
+        var cast = new List<ResolvedExpression>(args.Count);
+        foreach (var a in args)
+        {
+            RequireNumeric("log", a);
+            cast.Add(MaybeCast(a, new SqlDoubleType(a.Type.Nullable)));
+        }
+
+        return new ResolvedFunctionCall("log", cast, new SqlDoubleType(AnyNullable(args)));
     }
 
     private static ResolvedExpression MaybeCast(ResolvedExpression e, SqlType target)
@@ -507,6 +643,69 @@ internal static class BuiltinScalarFunctions
         return Expression.Condition(xIsNull, NullObject, yIsNullBranch);
     }
 
+    // ---------------- String / numeric builders ----------------
+
+    private enum TrimSide
+    {
+        Left = 0,
+        Right = 1,
+        Both = 2,
+    }
+
+    private static readonly MethodInfo SubstringRuntime2 =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Substring), new[] { typeof(object), typeof(object) })!;
+    private static readonly MethodInfo SubstringRuntime3 =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Substring), new[] { typeof(object), typeof(object), typeof(object) })!;
+    private static readonly MethodInfo TrimRuntime1 =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.TrimString), new[] { typeof(object), typeof(int) })!;
+    private static readonly MethodInfo TrimRuntime2 =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.TrimString), new[] { typeof(object), typeof(object), typeof(int) })!;
+    private static readonly MethodInfo ReplaceRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Replace))!;
+    private static readonly MethodInfo PositionRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Position))!;
+    private static readonly MethodInfo MathSignDouble =
+        typeof(Math).GetMethod(nameof(Math.Sign), new[] { typeof(double) })!;
+    private static readonly MethodInfo MathLog =
+        typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double) })!;
+    private static readonly MethodInfo MathLog2 =
+        typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double), typeof(double) })!;
+    private static readonly MethodInfo MathLog10 =
+        typeof(Math).GetMethod(nameof(Math.Log10), new[] { typeof(double) })!;
+    private static readonly MethodInfo MathExp =
+        typeof(Math).GetMethod(nameof(Math.Exp), new[] { typeof(double) })!;
+
+    private static Expression BuildSubstring(Expression[] args) =>
+        args.Length == 2
+            ? Expression.Call(SubstringRuntime2, args[0], args[1])
+            : Expression.Call(SubstringRuntime3, args[0], args[1], args[2]);
+
+    private static Expression BuildTrim(Expression[] args, TrimSide side)
+    {
+        var sideConst = Expression.Constant((int)side);
+        return args.Length == 1
+            ? Expression.Call(TrimRuntime1, args[0], sideConst)
+            : Expression.Call(TrimRuntime2, args[0], args[1], sideConst);
+    }
+
+    private static Expression BuildLog(Expression[] args)
+    {
+        if (args.Length == 1)
+        {
+            return NullPropagatingUnary(args[0], typeof(double), v => Expression.Call(MathLog10, v));
+        }
+
+        // LOG(b, x) = log_b(x) = Math.Log(x, b). Both operands are already
+        // DOUBLE (the resolver cast them); NULL in either propagates.
+        var isNull = Expression.OrElse(
+            Expression.Equal(args[0], NullObject),
+            Expression.Equal(args[1], NullObject));
+        var b = Expression.Convert(args[0], typeof(double));
+        var x = Expression.Convert(args[1], typeof(double));
+        var call = Expression.Call(MathLog2, x, b);
+        return Expression.Condition(isNull, NullObject, Expression.Convert(call, typeof(object)));
+    }
+
     // ---------------- Misc helpers ----------------
 
     /// <summary>
@@ -607,6 +806,260 @@ internal static class SqlBuiltinRuntime
         }
 
         return Concat(args);
+    }
+
+    /// <summary>
+    /// <c>SUBSTRING(s, start)</c> — 1-based, code-point semantics, to the end
+    /// of the string. NULL in any argument yields NULL.
+    /// </summary>
+    public static object? Substring(object? s, object? start) =>
+        s is null || start is null ? null : SubstringCore((Utf8String)s, AsInt(start), null);
+
+    /// <summary>
+    /// <c>SUBSTRING(s, start, length)</c> — 1-based start, <paramref name="length"/>
+    /// code points. Positions below 1 are clipped to the string, counting
+    /// toward the length window (SQL standard). NULL in any argument → NULL.
+    /// </summary>
+    public static object? Substring(object? s, object? start, object? length) =>
+        s is null || start is null || length is null
+            ? null
+            : SubstringCore((Utf8String)s, AsInt(start), AsInt(length));
+
+    /// <summary><c>LTRIM/RTRIM/TRIM(s)</c> — strip leading/trailing spaces.</summary>
+    public static object? TrimString(object? s, int side) =>
+        s is null ? null : TrimCore((Utf8String)s, chars: null, side);
+
+    /// <summary>
+    /// <c>LTRIM/RTRIM/TRIM(s, chars)</c> — strip any leading/trailing code
+    /// point that appears in <paramref name="chars"/>.
+    /// </summary>
+    public static object? TrimString(object? s, object? chars, int side) =>
+        s is null || chars is null ? null : TrimCore((Utf8String)s, (Utf8String)chars, side);
+
+    /// <summary><c>REPLACE(s, from, to)</c> — replace every occurrence of
+    /// <c>from</c> with <c>to</c>. NULL in any argument → NULL.</summary>
+    public static object? Replace(object? s, object? from, object? to) =>
+        s is null || from is null || to is null
+            ? null
+            : ReplaceCore((Utf8String)s, (Utf8String)from, (Utf8String)to);
+
+    /// <summary>
+    /// <c>POSITION(needle IN haystack)</c> — 1-based code-point index of the
+    /// first occurrence of <paramref name="needle"/>, or 0 if absent. An empty
+    /// needle is at position 1. NULL in either argument → NULL.
+    /// </summary>
+    public static object? Position(object? needle, object? haystack) =>
+        needle is null || haystack is null
+            ? null
+            : (object)PositionCore((Utf8String)haystack, (Utf8String)needle);
+
+    private static int AsInt(object o) => o switch
+    {
+        int i => i,
+        long l => checked((int)l),
+        _ => Convert.ToInt32(o, CultureInfo.InvariantCulture),
+    };
+
+    private static Utf8String SubstringCore(Utf8String s, int start1, int? length)
+    {
+        var span = s.Span;
+        var n = CodePointCount(span);
+
+        // First selected code point (1-based, clipped to the string start).
+        var first = Math.Max(1, start1);
+        int lastExclusive;
+        if (length is null)
+        {
+            lastExclusive = n + 1;
+        }
+        else
+        {
+            // Positions strictly below start1 + length are in the window.
+            lastExclusive = start1 + length.Value;
+            lastExclusive = Math.Min(lastExclusive, n + 1);
+        }
+
+        if (lastExclusive <= first)
+        {
+            return Utf8String.Empty;
+        }
+
+        var byteStart = CpToByte(span, first - 1);
+        var byteEnd = CpToByte(span, lastExclusive - 1);
+        if (byteStart >= byteEnd)
+        {
+            return Utf8String.Empty;
+        }
+
+        return Utf8String.FromBytes(span[byteStart..byteEnd].ToArray());
+    }
+
+    private static Utf8String TrimCore(Utf8String s, Utf8String? chars, int side)
+    {
+        var set = new HashSet<Rune>();
+        if (chars is null)
+        {
+            set.Add(new Rune(' '));
+        }
+        else
+        {
+            var cs = chars.Value.Span;
+            var cp = 0;
+            while (cp < cs.Length)
+            {
+                Rune.DecodeFromUtf8(cs[cp..], out var r, out var consumed);
+                set.Add(r);
+                cp += consumed;
+            }
+        }
+
+        var span = s.Span;
+        var offsets = new List<int>();
+        var runes = new List<Rune>();
+        var p = 0;
+        while (p < span.Length)
+        {
+            offsets.Add(p);
+            Rune.DecodeFromUtf8(span[p..], out var r, out var consumed);
+            runes.Add(r);
+            p += consumed;
+        }
+
+        offsets.Add(span.Length);
+
+        var lo = 0;
+        var hi = runes.Count;
+        if (side is 0 or 2)
+        {
+            while (lo < hi && set.Contains(runes[lo]))
+            {
+                lo++;
+            }
+        }
+
+        if (side is 1 or 2)
+        {
+            while (hi > lo && set.Contains(runes[hi - 1]))
+            {
+                hi--;
+            }
+        }
+
+        if (lo == 0 && hi == runes.Count)
+        {
+            return s;
+        }
+
+        var byteStart = offsets[lo];
+        var byteEnd = offsets[hi];
+        return byteStart >= byteEnd ? Utf8String.Empty : Utf8String.FromBytes(span[byteStart..byteEnd].ToArray());
+    }
+
+    private static Utf8String ReplaceCore(Utf8String s, Utf8String from, Utf8String to)
+    {
+        var sp = s.Span;
+        var f = from.Span;
+        if (f.Length == 0 || f.Length > sp.Length)
+        {
+            return s;
+        }
+
+        var t = to.Span;
+        var result = new List<byte>(sp.Length);
+        var i = 0;
+        while (i <= sp.Length - f.Length)
+        {
+            if (sp.Slice(i, f.Length).SequenceEqual(f))
+            {
+                foreach (var b in t)
+                {
+                    result.Add(b);
+                }
+
+                i += f.Length;
+            }
+            else
+            {
+                result.Add(sp[i]);
+                i++;
+            }
+        }
+
+        while (i < sp.Length)
+        {
+            result.Add(sp[i]);
+            i++;
+        }
+
+        return Utf8String.FromBytes(result.ToArray());
+    }
+
+    private static int PositionCore(Utf8String haystack, Utf8String needle)
+    {
+        var h = haystack.Span;
+        var ndl = needle.Span;
+        if (ndl.Length == 0)
+        {
+            return 1;
+        }
+
+        var byteIdx = h.IndexOf(ndl);
+        if (byteIdx < 0)
+        {
+            return 0;
+        }
+
+        // Byte offset → 1-based code-point index.
+        var cp = 0;
+        for (var i = 0; i < byteIdx; i++)
+        {
+            if ((h[i] & 0xC0) != 0x80)
+            {
+                cp++;
+            }
+        }
+
+        return cp + 1;
+    }
+
+    private static int CodePointCount(ReadOnlySpan<byte> span)
+    {
+        var count = 0;
+        for (var i = 0; i < span.Length; i++)
+        {
+            if ((span[i] & 0xC0) != 0x80)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>Byte offset where the <paramref name="cp"/>-th (0-based) code
+    /// point starts; <c>span.Length</c> if past the end.</summary>
+    private static int CpToByte(ReadOnlySpan<byte> span, int cp)
+    {
+        if (cp <= 0)
+        {
+            return 0;
+        }
+
+        var seen = 0;
+        for (var i = 0; i < span.Length; i++)
+        {
+            if ((span[i] & 0xC0) != 0x80)
+            {
+                if (seen == cp)
+                {
+                    return i;
+                }
+
+                seen++;
+            }
+        }
+
+        return span.Length;
     }
 
     // ---- FLOOR / CEIL / ROUND per-type ----

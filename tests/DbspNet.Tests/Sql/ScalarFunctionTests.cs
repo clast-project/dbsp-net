@@ -380,4 +380,133 @@ public class ScalarFunctionTests
         Assert.Equal(1, WeightOf(q.Current, 1, 5L));  // 2 + 3
         Assert.Equal(1, WeightOf(q.Current, 2, 4L));
     }
+
+    // ---- SUBSTRING ----
+
+    private static object? EvalStr(string expr, string value) => EvalOne(
+        ["CREATE TABLE t (s VARCHAR NOT NULL)"], $"SELECT {expr} FROM t",
+        q => q.Table("t").Insert(value));
+
+    [Fact]
+    public void Substring_StartAndLength()
+    {
+        Assert.Equal("ell", EvalStr("SUBSTRING(s, 2, 3)", "hello"));
+        Assert.Equal("ello", EvalStr("SUBSTRING(s, 2)", "hello"));
+        Assert.Equal("hello", EvalStr("SUBSTR(s, 1, 99)", "hello"));
+    }
+
+    [Fact]
+    public void Substring_ClipsLowStart()
+    {
+        // SQL standard: positions below 1 count toward the length window.
+        // start=-1, length=4 → positions -1..2 → code points at 1,2 = "he".
+        Assert.Equal("he", EvalStr("SUBSTRING(s, -1, 4)", "hello"));
+        Assert.Equal(string.Empty, EvalStr("SUBSTRING(s, 2, 0)", "hello"));
+    }
+
+    [Fact]
+    public void Substring_IsCodePointAware()
+    {
+        // 'café' = c,a,f,é (1..4); SUBSTRING(2,2) = "af"; SUBSTRING(4,1) = "é".
+        Assert.Equal("af", EvalStr("SUBSTRING(s, 2, 2)", "café"));
+        Assert.Equal("é", EvalStr("SUBSTRING(s, 4, 1)", "café"));
+    }
+
+    [Fact]
+    public void Substring_PropagatesNull()
+    {
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (s VARCHAR)"],
+            "SELECT SUBSTRING(s, 1, 2) FROM t",
+            q => q.Table("t").Insert((object?)null)));
+    }
+
+    // ---- TRIM / LTRIM / RTRIM ----
+
+    [Fact]
+    public void Trim_StripsSpaces()
+    {
+        Assert.Equal("hi", EvalStr("TRIM(s)", "  hi  "));
+        Assert.Equal("hi  ", EvalStr("LTRIM(s)", "  hi  "));
+        Assert.Equal("  hi", EvalStr("RTRIM(s)", "  hi  "));
+    }
+
+    [Fact]
+    public void Trim_WithCharSet()
+    {
+        Assert.Equal("hi", EvalStr("TRIM(s, 'xy')", "xyxhiyx"));
+        Assert.Equal("hiyx", EvalStr("LTRIM(s, 'xy')", "xyxhiyx"));
+        Assert.Equal("xyxhi", EvalStr("RTRIM(s, 'xy')", "xyxhiyx"));
+    }
+
+    // ---- REPLACE ----
+
+    [Fact]
+    public void Replace_ReplacesAllOccurrences()
+    {
+        Assert.Equal("aXaX", EvalStr("REPLACE(s, 'bc', 'X')", "abcabc"));
+        Assert.Equal("cafe", EvalStr("REPLACE(s, 'é', 'e')", "café"));
+        Assert.Equal("abc", EvalStr("REPLACE(s, 'z', 'Q')", "abc"));
+    }
+
+    // ---- POSITION / STRPOS ----
+
+    [Fact]
+    public void Position_ReturnsOneBasedCodePointIndex()
+    {
+        Assert.Equal(4, EvalStr("POSITION('lo' IN s)", "hello"));
+        Assert.Equal(0, EvalStr("POSITION('z' IN s)", "hello"));
+        Assert.Equal(1, EvalStr("POSITION('' IN s)", "hello"));
+        Assert.Equal(4, EvalStr("POSITION('é' IN s)", "café"));
+    }
+
+    [Fact]
+    public void Strpos_IsPositionWithSwappedArgs()
+    {
+        Assert.Equal(4, EvalStr("STRPOS(s, 'lo')", "hello"));
+        Assert.Equal(0, EvalStr("STRPOS(s, 'z')", "hello"));
+    }
+
+    // ---- SIGN ----
+
+    [Fact]
+    public void Sign_ReturnsMinusZeroOrPlusOne()
+    {
+        object? EvalSignInt(int v) => EvalOne(
+            ["CREATE TABLE t (x INT NOT NULL)"], "SELECT SIGN(x) FROM t",
+            q => q.Table("t").Insert(v));
+
+        Assert.Equal(-1, EvalSignInt(-5));
+        Assert.Equal(0, EvalSignInt(0));
+        Assert.Equal(1, EvalSignInt(7));
+    }
+
+    // ---- LN / EXP / LOG ----
+
+    private static double EvalDouble(string expr) => (double)EvalOne(
+        ["CREATE TABLE t (x INT NOT NULL)"], $"SELECT {expr} FROM t",
+        q => q.Table("t").Insert(1))!;
+
+    [Fact]
+    public void Ln_Exp_Log_ComputeExpectedValues()
+    {
+        Assert.Equal(0.0, EvalDouble("LN(1)"), 10);
+        Assert.Equal(1.0, EvalDouble("EXP(0)"), 10);
+        Assert.Equal(2.0, EvalDouble("LOG(100)"), 10);     // base-10
+        Assert.Equal(3.0, EvalDouble("LOG(2, 8)"), 10);    // log base 2 of 8
+        Assert.Equal(1.0, EvalDouble("LN(EXP(1))"), 10);
+    }
+
+    [Fact]
+    public void Numeric_Functions_PropagateNull()
+    {
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (x INT)"],
+            "SELECT LN(x) FROM t",
+            q => q.Table("t").Insert((object?)null)));
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (x INT)"],
+            "SELECT SIGN(x) FROM t",
+            q => q.Table("t").Insert((object?)null)));
+    }
 }

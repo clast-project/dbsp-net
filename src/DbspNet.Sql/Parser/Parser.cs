@@ -357,6 +357,20 @@ public sealed class Parser
     private SelectStatement ParseSimpleSelect()
     {
         Expect(TokenKind.Select);
+
+        // Optional set quantifier. DISTINCT dedups the projected rows; ALL is
+        // the (default) bag-semantics no-op.
+        var distinct = false;
+        if (Peek().Kind == TokenKind.Distinct)
+        {
+            Advance();
+            distinct = true;
+        }
+        else if (Peek().Kind == TokenKind.All)
+        {
+            Advance();
+        }
+
         var items = ParseSelectItems();
         Expect(TokenKind.From);
         var from = ParseFromClause();
@@ -387,7 +401,7 @@ public sealed class Parser
             having = ParseExpression();
         }
 
-        return new SelectStatement(items, from, where, groupBy, having, Array.Empty<CteDefinition>());
+        return new SelectStatement(items, from, where, groupBy, having, Array.Empty<CteDefinition>(), distinct);
     }
 
     private List<CteDefinition> ParseWithClause()
@@ -519,9 +533,30 @@ public sealed class Parser
             }
 
             var right = ParsePrimaryTableRef();
-            Expect(TokenKind.On);
-            var cond = ParseExpression();
-            left = new JoinClause(left, right, joinType, cond);
+
+            // The join condition is either `ON <predicate>` or
+            // `USING (col, …)`. USING is desugared by the resolver into an
+            // equi-join on the named columns plus a merged-column projection.
+            if (Peek().Kind == TokenKind.Using)
+            {
+                Advance();
+                Expect(TokenKind.LParen);
+                var cols = new List<string> { ExpectIdentifier("USING column name") };
+                while (Peek().Kind == TokenKind.Comma)
+                {
+                    Advance();
+                    cols.Add(ExpectIdentifier("USING column name"));
+                }
+
+                Expect(TokenKind.RParen);
+                left = new JoinClause(left, right, joinType, OnCondition: null, cols);
+            }
+            else
+            {
+                Expect(TokenKind.On);
+                var cond = ParseExpression();
+                left = new JoinClause(left, right, joinType, cond);
+            }
         }
 
         return left;
@@ -806,6 +841,24 @@ public sealed class Parser
                 continue;
             }
 
+            // IS [NOT] TRUE / FALSE / UNKNOWN — boolean tests yielding a
+            // definite boolean (never NULL), per the SQL three-valued rules.
+            if (Peek().Kind is TokenKind.True or TokenKind.False)
+            {
+                var wantTrue = Peek().Kind == TokenKind.True;
+                Advance();
+                left = BuildIsBoolTest(left, wantTrue, negated);
+                continue;
+            }
+
+            if (Peek().Kind == TokenKind.Identifier && Peek().Text == "unknown")
+            {
+                // `b IS UNKNOWN` ≡ `b IS NULL`; `b IS NOT UNKNOWN` ≡ `b IS NOT NULL`.
+                Advance();
+                left = new IsNullExpression(left, negated);
+                continue;
+            }
+
             Expect(TokenKind.Null);
             left = new IsNullExpression(left, negated);
         }
@@ -850,6 +903,27 @@ public sealed class Parser
         return isNotDistinct
             ? notDistinct
             : new UnaryExpression(UnaryOperator.Not, notDistinct);
+    }
+
+    /// <summary>
+    /// <c>b IS [NOT] TRUE</c> / <c>b IS [NOT] FALSE</c> — a definite boolean
+    /// test (never NULL). Desugared via <c>COALESCE</c> so the operand is
+    /// referenced exactly once (subquery operands are fine):
+    /// <c>b IS TRUE</c> ≡ <c>COALESCE(b, FALSE)</c> and
+    /// <c>b IS FALSE</c> ≡ <c>NOT COALESCE(b, TRUE)</c>; the <c>IS NOT</c>
+    /// forms are the logical negations. <c>COALESCE(b, &lt;bool&gt;)</c> also
+    /// pins <c>b</c> to BOOLEAN at resolve time.
+    /// </summary>
+    private static Expression BuildIsBoolTest(Expression b, bool wantTrue, bool negated)
+    {
+        // IS TRUE falls back to FALSE; IS FALSE falls back to TRUE.
+        var fallback = new LiteralExpression(LiteralKind.Boolean, !wantTrue);
+        var coalesce = new FunctionCallExpression(
+            "coalesce", new Expression[] { b, fallback }, IsStar: false);
+        var baseExpr = wantTrue
+            ? (Expression)coalesce
+            : new UnaryExpression(UnaryOperator.Not, coalesce);
+        return negated ? new UnaryExpression(UnaryOperator.Not, baseExpr) : baseExpr;
     }
 
     private Expression ParseAdditive()
@@ -1199,6 +1273,22 @@ public sealed class Parser
                 Advance();
                 Expect(TokenKind.RParen);
                 return new FunctionCallExpression(first.Text, Array.Empty<Expression>(), IsStar: true);
+            }
+
+            // POSITION(substring IN string) — the standard spelling uses the
+            // IN keyword as the argument separator. Lower to a two-argument
+            // FunctionCallExpression(needle, haystack); STRPOS(string, sub) is
+            // the comma-form alias handled by the general arg path below.
+            if (first.Text == "position")
+            {
+                // The needle is parsed below the comparison level so the
+                // separating IN binds to POSITION rather than being consumed
+                // as an `x IN (…)` membership test.
+                var needle = ParseConcat();
+                Expect(TokenKind.In);
+                var haystack = ParseExpression();
+                Expect(TokenKind.RParen);
+                return new FunctionCallExpression("position", new[] { needle, haystack }, IsStar: false);
             }
 
             var args = new List<Expression>();

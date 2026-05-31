@@ -52,7 +52,8 @@ public sealed record SelectStatement(
     Expression? Where,
     IReadOnlyList<Expression> GroupBy,
     Expression? Having,
-    IReadOnlyList<CteDefinition> Ctes) : SqlQuery(Ctes);
+    IReadOnlyList<CteDefinition> Ctes,
+    bool Distinct = false) : SqlQuery(Ctes);
 
 public enum SetOpKind
 {
@@ -114,11 +115,19 @@ public sealed record TableReference(string TableName, string? Alias) : FromClaus
 /// </summary>
 public sealed record DerivedTableReference(SqlQuery Query, string Alias) : FromClause;
 
+/// <summary>
+/// A join. Exactly one of <see cref="OnCondition"/> (an <c>ON</c> predicate)
+/// or <see cref="UsingColumns"/> (a <c>USING (c1, …)</c> column list) is set;
+/// the parser never produces both. <c>USING</c> is resolved into an equi-join
+/// on the named columns plus an output projection that merges each shared
+/// column to a single unqualified copy (SQL standard).
+/// </summary>
 public sealed record JoinClause(
     FromClause Left,
     FromClause Right,
     JoinType Type,
-    Expression OnCondition) : FromClause;
+    Expression? OnCondition,
+    IReadOnlyList<string>? UsingColumns = null) : FromClause;
 
 public enum JoinType
 {

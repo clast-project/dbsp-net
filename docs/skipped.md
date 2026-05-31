@@ -160,10 +160,13 @@ reflect that shape, not a backlog.
   and no `SelectStatement` fields. Incremental TopK is a Feldera-
   supported pattern (RANK / ROW_NUMBER restricted to TopK windows);
   `LIMIT` without `ORDER BY` is also useful for snapshot queries.
-- **[P1]** `SELECT DISTINCT` (SELECT-list form). Distinct-inside-
-  aggregates is listed separately under Aggregate functions; the
-  list form (`SELECT DISTINCT a, b FROM t`) reduces to a `DistinctOp`
-  over the projection.
+- `SELECT DISTINCT` (SELECT-list form) — **implemented**. A `Distinct`
+  flag on `SelectStatement` (parsed after `SELECT`; `ALL` is the
+  bag-semantics no-op default); the resolver wraps the projection's
+  `ProjectPlan` in a `DistinctPlan`, so the existing `DistinctOp` (and its
+  spine sibling) handles the dedup incrementally on both compiler paths.
+  Distinct-inside-aggregates (`COUNT(DISTINCT x)`) is still listed
+  separately under Aggregate functions.
 - `CASE WHEN ... THEN ... [ELSE ...] END` (searched form) and
   `CASE x WHEN v THEN ... END` (simple form) — **implemented**. Modeled
   as a flat `CaseExpression(whens, elseResult)` AST node so the recursive
@@ -202,11 +205,20 @@ reflect that shape, not a backlog.
   3VL `FALSE AND (a = b)` collapse to FALSE so a one-sided NULL never leaks
   UNKNOWN; `IS DISTINCT FROM` is its negation. No new resolver/compiler
   support.
-- **[P2]** `IS TRUE` / `IS FALSE` / `IS UNKNOWN`. Boolean tests; same
-  parser arm as above.
-- **[P1]** `JOIN ... USING (col, ...)`. Parser only accepts `ON`.
-  Desugars to `ON a.c = b.c AND ...` plus dedup of the join columns
-  in the projection.
+- `IS TRUE` / `IS FALSE` / `IS UNKNOWN` (and the `IS NOT …` forms) —
+  **implemented**. Definite-boolean tests (never NULL) over a boolean
+  operand, in the same `ParseIsNull` arm as `IS [NOT] NULL` / `IS [NOT]
+  DISTINCT FROM`. Parse-time desugar with no operand duplication:
+  `b IS TRUE` ≡ `COALESCE(b, FALSE)`, `b IS FALSE` ≡ `NOT COALESCE(b, TRUE)`
+  (the `IS NOT` forms negate); `b IS [NOT] UNKNOWN` ≡ `b IS [NOT] NULL`. The
+  `COALESCE(b, <bool>)` also pins the operand to BOOLEAN at resolve time.
+- `JOIN ... USING (col, ...)` — **implemented**. The parser carries a
+  `UsingColumns` list on `JoinClause`; the resolver builds the equi-join
+  directly (one `JoinEquality` per shared column, resolved against each
+  side) and wraps the `JoinPlan` in a `ProjectPlan` that merges each shared
+  column to a single unqualified copy (taken from the preserved side for
+  outer joins). Output order is SQL-standard: merged USING columns, then
+  remaining left, then remaining right. Supported for INNER / LEFT / RIGHT.
 - **[P2]** `VALUES (...), (...) AS t(a, b)` as a row source.
   `ParsePrimaryTableRef` accepts only `(SELECT ...)` or a base table;
   would need a literal-table constructor.
@@ -254,9 +266,11 @@ reflect that shape, not a backlog.
 - VARCHAR is stored as `Utf8String` (Arrow-aligned
   `ReadOnlyMemory<byte>`) with native UTF-8 equality, ordering, hashing
   (XxHash3), `LENGTH` (code points), byte-wise `CONCAT`, and `Rune`-based
-  invariant `UPPER` / `LOWER`. Substring / LIKE / position-based ops are
-  not yet implemented — when added they should also be native UTF-8 with
-  code-point semantics.
+  invariant `UPPER` / `LOWER`. `SUBSTRING`, `TRIM`/`LTRIM`/`RTRIM`,
+  `REPLACE`, and `POSITION`/`STRPOS` are implemented with native UTF-8 /
+  code-point semantics (substring offsets and POSITION results are in code
+  points; REPLACE / POSITION search is byte-wise, which is correct for
+  valid UTF-8). `LIKE` / `SIMILAR TO` pattern matching is still deferred.
 - Apache Arrow boundary: `DbspNet.Arrow` exposes `CompiledQuery.ToArrowDelta()`
   (returns a `RecordBatch` + parallel weights array — positive for inserts,
   negative for retractions) and `TableInput.PushArrow(RecordBatch[, weights])`
@@ -340,7 +354,13 @@ reflect that shape, not a backlog.
 - **[P2]** `emit_final` view annotation. Feldera-specific.
 
 ### UDFs
-- **[P2]** User-defined scalar, table, and aggregate functions.
+- **[P2]** User-defined scalar, table, and aggregate functions. A
+  prerequisite refactor — reifying the builtin scalar library behind an
+  `IScalarFunction` registry (which also becomes the monotone-function
+  catalog hook for LATENESS) — is sketched in
+  [`scalar-function-registry.md`](scalar-function-registry.md). Note the
+  determinism contract: scalar functions must be pure for incremental
+  correctness, and the engine cannot verify a UDF's purity.
 
 ### Surface syntax
 
@@ -375,13 +395,26 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   Calcite.
 - **[P1]** `SELECT *` is forbidden with `GROUP BY` / aggregates. Feldera
   (via Calcite) rewrites to an explicit column list during resolution.
-- **[P1]** Scalar function library is still modest. Currently supported:
-  `COALESCE`, `CAST`, `UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `ABS`, `FLOOR`,
-  `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `GREATEST`, `LEAST`, `NULLIF`.
-  Missing and commonly needed: `SUBSTRING`, `TRIM`/`LTRIM`/`RTRIM`,
-  `REPLACE`, `POSITION`, numeric `SIGN`/`LN`/`LOG`/`EXP`, and anything
-  involving dates/times. Adding one is a single entry in
-  <c>BuiltinScalarFunctions</c>.
+- **[P1]** Scalar function library. Currently supported:
+  `COALESCE`, `CAST`, `UPPER`, `LOWER`, `LENGTH`, `CONCAT`,
+  `SUBSTRING`/`SUBSTR`, `TRIM`/`LTRIM`/`RTRIM` (whitespace default or a
+  custom char set), `REPLACE`, `POSITION(x IN y)`/`STRPOS`, `ABS`, `FLOOR`,
+  `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG`
+  (base-10, or `LOG(b, x)`), `EXP`, `GREATEST`, `LEAST`, `NULLIF`. String
+  functions are native UTF-8 / code-point. `SIGN`/`LN`/`LOG`/`EXP` cast the
+  operand to DOUBLE in the resolver (sign included — exact for every
+  representable value), so the multi-arg string functions are the only ones
+  that fall back from the typed-row fast path to the structural compile.
+  Missing and commonly needed: other math (`SIN`/`COS`/`TAN`, `MOD`,
+  `TRUNC`) and anything involving dates/times. Adding one is a single entry
+  in <c>BuiltinScalarFunctions</c> (resolve + structural build + typed
+  build). Reifying that into an `IScalarFunction` registry — removing the
+  parallel-switch drift surface and adding a monotonicity hook for LATENESS
+  — is sketched in
+  [`scalar-function-registry.md`](scalar-function-registry.md). The keyword
+  spellings
+  `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|BOTH … FROM …)`
+  are not parsed — use the comma / char-set forms.
 - **[P1]** Typeless `NULL`. A bare `NULL` literal resolves to `INTEGER NULL`
   rather than an unknown-type marker that context narrows (the PostgreSQL /
   Calcite behaviour). In practice this means `NULL = 'x'` fails at resolve

@@ -121,9 +121,11 @@ batch re-computation.
   native UTF-8 equality, ordering, hashing, code-point `LENGTH`, and
   `Rune`-based invariant `UPPER`/`LOWER`. Temporal types use Arrow's
   `Date32` / `Time64[microsecond]` / `Timestamp[microsecond]` (naive).
-- Queries: `SELECT` (list or `*`) with aliases and scalar expressions, `FROM`
+- Queries: `SELECT` (list or `*`, with optional `DISTINCT`) with aliases and
+  scalar expressions, `FROM`
   (single table, derived tables `(SELECT …) AS x`, `INNER JOIN … ON …`, or
-  `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN … ON …`), `WHERE`, `GROUP BY`,
+  `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN … ON …`, with `ON` or
+  `USING (cols)`), `WHERE`, `GROUP BY`,
   `HAVING`, set operations `UNION ALL` / `UNION` / `INTERSECT` / `EXCEPT`
   with per-column type unification (INTERSECT binds tighter; NULL=NULL for
   matching), `WITH … AS (…)` CTEs (a CTE referenced twice compiles
@@ -143,10 +145,15 @@ batch re-computation.
   (DECODE matches `NULL = NULL`, per Oracle). `[NOT] BETWEEN` desugars to a
   comparison conjunction. The `||` string-concatenation operator propagates
   NULL (unlike PG-style `CONCAT`, which skips NULLs). `IS [NOT] DISTINCT
-  FROM` gives NULL-safe (in)equality (always a definite boolean).
+  FROM` gives NULL-safe (in)equality (always a definite boolean). `IS [NOT]
+  TRUE` / `FALSE` / `UNKNOWN` are definite-boolean tests over a boolean
+  operand (NULL never leaks through).
 - Scalar functions: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `UPPER`,
-  `LOWER`, `LENGTH`, `CONCAT`, `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`,
-  `POWER`, `SQRT`. NULL semantics follow PostgreSQL (most propagate;
+  `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING`/`SUBSTR`, `TRIM`/`LTRIM`/`RTRIM`
+  (whitespace or a custom char set), `REPLACE`, `POSITION(x IN y)`/`STRPOS`,
+  `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`,
+  `LOG` (base-10, or `LOG(b, x)`), `EXP`. String functions are native UTF-8
+  with code-point semantics. NULL semantics follow PostgreSQL (most propagate;
   `CONCAT`/`GREATEST`/`LEAST` skip NULLs).
 - Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`. NULL
   skipping per SQL semantics; `COUNT(*)` counts all.
@@ -267,13 +274,14 @@ beyond "Feldera is much bigger":
   outer joins, or nested recursion inside the body.
 - Set ops: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` all supported;
   `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
-- `FULL OUTER JOIN`, window functions, `ORDER BY` / `LIMIT`,
-  `LIKE` / `SIMILAR TO`, `||` concatenation, and
-  `IS [NOT] DISTINCT FROM` are deferred.
+- `FULL OUTER JOIN`, `CROSS JOIN` / non-equi joins, window functions,
+  `ORDER BY` / `LIMIT`, and `LIKE` / `SIMILAR TO` are deferred. `JOIN …
+  USING` is supported (equi-join on the named columns + merged-column
+  projection); the `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|
+  BOTH … FROM …)` keyword spellings are not (use the comma / char-set forms).
 - Scalar function library covers the common arithmetic / string set
-  listed above; missing pieces include `SUBSTRING`, `TRIM`, `REPLACE`,
-  `POSITION`, `SIGN` / `LN` / `LOG` / `EXP`, and anything involving
-  dates/times.
+  listed above; missing pieces include other math (`SIN`/`COS`/`TAN`,
+  `MOD`), and anything involving dates/times.
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
   polymorphic "unknown" of PostgreSQL.
 - `INTERVAL` type and date/time arithmetic are deferred.

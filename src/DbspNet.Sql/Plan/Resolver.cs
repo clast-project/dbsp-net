@@ -270,7 +270,8 @@ public sealed class Resolver
             plan = WrapWithScalarSubqueries(plan, scope, selectSubs, out var selectSubMap);
             var preBound = BuildPreBoundFromBoolMaps(existsMap, inMap);
             var projections = ResolveProjections(stmt.Items, plan.Schema, selectSubMap, preBound);
-            return new ProjectPlan(plan, projections, BuildProjectSchema(projections));
+            LogicalPlan projected = new ProjectPlan(plan, projections, BuildProjectSchema(projections));
+            return stmt.Distinct ? new DistinctPlan(projected) : projected;
         }
 
         // Aggregation path. Resolve GROUP BY keys against the pre-aggregate schema.
@@ -404,7 +405,8 @@ public sealed class Resolver
             projItems.Add(new ProjectionItem(e, n, q));
         }
 
-        return new ProjectPlan(withHaving, projItems, BuildProjectSchema(projItems));
+        LogicalPlan aggProjected = new ProjectPlan(withHaving, projItems, BuildProjectSchema(projItems));
+        return stmt.Distinct ? new DistinctPlan(aggProjected) : aggProjected;
     }
 
     // ---------- Recursive CTE ----------
@@ -564,7 +566,7 @@ public sealed class Resolver
         JoinClause jc =>
             FromReferencesName(jc.Left, name)
             || FromReferencesName(jc.Right, name)
-            || ExpressionReferencesName(jc.OnCondition, name),
+            || (jc.OnCondition is not null && ExpressionReferencesName(jc.OnCondition, name)),
         _ => false,
     };
 
@@ -856,11 +858,21 @@ public sealed class Resolver
         return new ScanPlan(tr.TableName, new Schema(cols), lateness);
     }
 
-    private JoinPlan ResolveJoin(JoinClause join, IReadOnlyDictionary<string, CteRef> cteScope)
+    private LogicalPlan ResolveJoin(JoinClause join, IReadOnlyDictionary<string, CteRef> cteScope)
     {
         var left = ResolveFrom(join.Left, cteScope);
         var right = ResolveFrom(join.Right, cteScope);
         CheckNoDuplicateQualifiers(left.Schema, right.Schema);
+
+        var leftCount = left.Schema.Count;
+
+        // JOIN ... USING (c1, …): equi-join on the shared columns plus a
+        // projection that merges each shared column to a single unqualified
+        // copy. Handled before the ON path since OnCondition is null here.
+        if (join.UsingColumns is not null)
+        {
+            return ResolveUsingJoin(join, left, right, leftCount);
+        }
 
         // Combined schema for ON-clause resolution uses each side's declared
         // nullability. The OUTPUT schema may widen right-side columns to
@@ -868,10 +880,8 @@ public sealed class Resolver
         // declared — a right-side row that exists and matches never presents
         // as NULL inside the ON clause.
         var combined = left.Schema.Concat(right.Schema);
-        var onResolved = ResolveScalarExpression(join.OnCondition, combined);
+        var onResolved = ResolveScalarExpression(join.OnCondition!, combined);
         EnsureBooleanCoercible(onResolved, "JOIN ON");
-
-        var leftCount = left.Schema.Count;
         var equi = new List<JoinEquality>();
         var residuals = new List<ResolvedExpression>();
         foreach (var conjunct in SplitAnd(onResolved))
@@ -919,6 +929,85 @@ public sealed class Resolver
         };
 
         return new JoinPlan(left, right, join.Type, equi, residual, outputSchema);
+    }
+
+    /// <summary>
+    /// Resolve a <c>JOIN ... USING (c1, …)</c>. Each named column must exist
+    /// on both sides; it becomes an equi-key and is merged in the output to a
+    /// single unqualified copy (taken from the preserved side for outer
+    /// joins). Output order follows the SQL standard: the merged USING columns
+    /// first (in USING order), then the remaining left columns, then the
+    /// remaining right columns.
+    /// </summary>
+    private LogicalPlan ResolveUsingJoin(JoinClause join, LogicalPlan left, LogicalPlan right, int leftCount)
+    {
+        var equi = new List<JoinEquality>();
+        var usingLeftIdx = new List<int>();
+        var usingRightCombinedIdx = new List<int>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var col in join.UsingColumns!)
+        {
+            if (!seen.Add(col))
+            {
+                throw new ResolveException($"duplicate column '{col}' in JOIN USING");
+            }
+
+            var li = left.Schema.Resolve(null, col);
+            var ri = right.Schema.Resolve(null, col);
+            var keyType = TypeInference.CommonComparableType(left.Schema[li].Type, right.Schema[ri].Type);
+            equi.Add(new JoinEquality(li, ri, keyType));
+            usingLeftIdx.Add(li);
+            usingRightCombinedIdx.Add(leftCount + ri);
+        }
+
+        var joinOutputSchema = join.Type switch
+        {
+            JoinType.Inner => left.Schema.Concat(right.Schema),
+            JoinType.LeftOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: false),
+            JoinType.RightOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: true),
+            _ => throw new ResolveException($"unsupported join type {join.Type}"),
+        };
+
+        var joinPlan = new JoinPlan(left, right, join.Type, equi, Residual: null, joinOutputSchema);
+
+        // INNER and LEFT keep the (non-null) left copy of each shared column;
+        // RIGHT keeps the (non-null) right copy.
+        var takeLeftForMerged = join.Type != JoinType.RightOuter;
+        var mergedLeft = new HashSet<int>(usingLeftIdx);
+        var mergedRight = new HashSet<int>(usingRightCombinedIdx);
+
+        var projections = new List<ProjectionItem>();
+        for (var i = 0; i < join.UsingColumns!.Count; i++)
+        {
+            var idx = takeLeftForMerged ? usingLeftIdx[i] : usingRightCombinedIdx[i];
+            var c = joinOutputSchema[idx];
+            projections.Add(new ProjectionItem(new ResolvedColumn(idx, c.Type), join.UsingColumns[i], Qualifier: null));
+        }
+
+        for (var i = 0; i < leftCount; i++)
+        {
+            if (mergedLeft.Contains(i))
+            {
+                continue;
+            }
+
+            var c = joinOutputSchema[i];
+            projections.Add(new ProjectionItem(new ResolvedColumn(i, c.Type), c.Name, c.Qualifier));
+        }
+
+        for (var i = leftCount; i < joinOutputSchema.Count; i++)
+        {
+            if (mergedRight.Contains(i))
+            {
+                continue;
+            }
+
+            var c = joinOutputSchema[i];
+            projections.Add(new ProjectionItem(new ResolvedColumn(i, c.Type), c.Name, c.Qualifier));
+        }
+
+        return new ProjectPlan(joinPlan, projections, BuildProjectSchema(projections));
     }
 
     private static string JoinTypeName(JoinType t) => t switch

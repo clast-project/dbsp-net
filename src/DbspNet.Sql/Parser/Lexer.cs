@@ -34,6 +34,7 @@ public sealed class Lexer
         ["outer"] = TokenKind.Outer,
         ["join"] = TokenKind.Join,
         ["on"] = TokenKind.On,
+        ["using"] = TokenKind.Using,
         ["union"] = TokenKind.Union,
         ["all"] = TokenKind.All,
         ["intersect"] = TokenKind.Intersect,

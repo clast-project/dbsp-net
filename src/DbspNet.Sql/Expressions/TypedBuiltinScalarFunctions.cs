@@ -61,8 +61,54 @@ internal static class TypedBuiltinScalarFunctions
             "greatest" => BuildGreatestLeast(args, greatest: true),
             "least" => BuildGreatestLeast(args, greatest: false),
             "nullif" => BuildNullIf(args[0], args[1]),
+            "sign" => BuildSign(args[0]),
+            "ln" => BuildUnaryDouble(args[0], MathLog),
+            "exp" => BuildUnaryDouble(args[0], MathExp),
+            "log" => BuildLog(args),
+
+            // The multi-argument string functions (SUBSTRING / TRIM family /
+            // REPLACE / POSITION / STRPOS) are not lowered on the typed path;
+            // returning null falls the whole compile back to the structural
+            // pipeline (which handles them via SqlBuiltinRuntime). Listed
+            // explicitly so the intent is clear rather than hitting `default`.
+            "substring" or "substr" or "ltrim" or "rtrim" or "trim"
+                or "replace" or "position" or "strpos" => null,
             _ => null,
         };
+    }
+
+    // ---- Numeric (sign / ln / log / exp) ----
+    //
+    // The resolver casts every operand to DOUBLE, so on the typed path the
+    // argument expression is already double / double?; no per-type dispatch.
+
+    private static readonly MethodInfo MathSignDouble =
+        typeof(Math).GetMethod(nameof(Math.Sign), new[] { typeof(double) })!;
+    private static readonly MethodInfo MathLog =
+        typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double) })!;
+    private static readonly MethodInfo MathLog2 =
+        typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double), typeof(double) })!;
+    private static readonly MethodInfo MathLog10 =
+        typeof(Math).GetMethod(nameof(Math.Log10), new[] { typeof(double) })!;
+    private static readonly MethodInfo MathExp =
+        typeof(Math).GetMethod(nameof(Math.Exp), new[] { typeof(double) })!;
+
+    private static Expression BuildSign(Expression arg) =>
+        TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(MathSignDouble, v));
+
+    private static Expression BuildUnaryDouble(Expression arg, MethodInfo math) =>
+        TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(math, v));
+
+    private static Expression BuildLog(Expression[] args)
+    {
+        if (args.Length == 1)
+        {
+            return TypedExpressionCompiler.PropagateUnary(args[0], v => Expression.Call(MathLog10, v));
+        }
+
+        // LOG(b, x) = log_b(x) = Math.Log(x, b).
+        return TypedExpressionCompiler.PropagateBinary(
+            args[0], args[1], (b, x) => Expression.Call(MathLog2, x, b));
     }
 
     /// <summary>
