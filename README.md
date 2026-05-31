@@ -132,7 +132,9 @@ batch re-computation.
   to one shared subcircuit), and `WITH RECURSIVE … AS (base UNION ALL step)`
   for transitive-closure-style queries (semi-naïve incremental evaluation
   on pure-insert ticks; see `docs/skipped.md` for the retraction-fallback
-  caveat).
+  caveat). `ORDER BY … LIMIT [OFFSET]` (and `FETCH FIRST n ROWS ONLY`) compile
+  to an incremental TOP-K operator; a bare `ORDER BY` (no limit) is a no-op
+  since row order is unobservable in the output Z-set.
 - Scalar subqueries (uncorrelated, exactly one column) in `WHERE`, `SELECT`,
   and `HAVING` expressions. Empty subquery → `NULL`; changing subquery
   value correctly retracts and re-emits outer rows.
@@ -280,8 +282,10 @@ beyond "Feldera is much bigger":
   `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
 - `CROSS JOIN` / non-equi `INNER JOIN` (unit-key nested loop) and
   `FULL OUTER JOIN` (symmetric both-sides match-presence tracking) are
-  supported. Window functions, `ORDER BY` / `LIMIT`, and `LIKE` /
-  `SIMILAR TO` are deferred. `JOIN … USING` is supported (equi-join on the
+  supported. `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST` compile to
+  incremental TOP-K (global partition; ordering by non-selected columns and
+  windowed / partitioned `RANK` / `ROW_NUMBER` are deferred). Window functions
+  and `LIKE` / `SIMILAR TO` are deferred. `JOIN … USING` is supported (equi-join on the
   named columns + merged-column projection; FULL merges via `COALESCE`); the
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING| BOTH … FROM …)`
   keyword spellings are not (use the comma / char-set forms).

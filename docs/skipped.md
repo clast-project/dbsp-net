@@ -180,10 +180,32 @@ reflect that shape, not a backlog.
   Feldera supports neither `INTERSECT ALL` nor `EXCEPT ALL`.
 - **[P2]** `UNNEST`, `LATERAL`. Feldera supports both.
 - **[P2]** `GROUPING SETS`, `ROLLUP`, `CUBE`.
-- **[P1]** `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST`. No tokens
-  and no `SelectStatement` fields. Incremental TopK is a Feldera-
-  supported pattern (RANK / ROW_NUMBER restricted to TopK windows);
-  `LIMIT` without `ORDER BY` is also useful for snapshot queries.
+- `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST` (incremental TOP-K) —
+  **implemented**. The parser wraps any query expression in an
+  `OrderLimitQuery` (clauses bind to the whole expression, so they work on a
+  set-op result and inside a subquery / derived table); the resolver lowers
+  `ORDER BY … LIMIT/OFFSET` to a `TopKPlan` and both compiler paths wire a
+  `TopKOp` driven by a total-order `SortKeyComparer` (the `ORDER BY` keys plus
+  a full-row tiebreak — `StructuralRowComparer` structurally,
+  `Comparer<TRow>.Default` on the emitted typed struct). The operator keeps the
+  integrated input sorted, recomputes the `[offset, offset+limit)` window each
+  tick, and emits the delta against the previously-emitted window, honouring row
+  multiplicity at the window edge. `FETCH FIRST [n] { ROW | ROWS } ONLY` and
+  `LIMIT ALL` are accepted. Sort keys resolve against the query's **output**
+  columns: a select-list column / alias, an ordinal (`ORDER BY 2`), or an
+  expression over them. NULL ordering follows the PostgreSQL default (`ASC` ⇒
+  NULLS LAST, `DESC` ⇒ NULLS FIRST), overridable with `NULLS FIRST | LAST`.
+  Notes on semantics and what is deferred:
+  - A **bare** `ORDER BY` (no `LIMIT`/`OFFSET`) is a validated no-op — row order
+    is unobservable in the output Z-set, so the result set equals the inner
+    query. `LIMIT` without `ORDER BY` works, using the implicit full-row total
+    order so the chosen rows are deterministic.
+  - **[P2]** Ordering by a non-selected input column (e.g.
+    `SELECT a FROM t ORDER BY b`) — would need the sort scope to reach below the
+    projection, which the output-scope `TopKPlan` wrapper doesn't model.
+  - **[P2]** Partitioned TOP-K / windowed `RANK` / `ROW_NUMBER`
+    (`PARTITION BY … ORDER BY … LIMIT k` per group). The current operator is a
+    single global partition.
 - `SELECT DISTINCT` (SELECT-list form) — **implemented**. A `Distinct`
   flag on `SelectStatement` (parsed after `SELECT`; `ALL` is the
   bag-semantics no-op default); the resolver wraps the projection's

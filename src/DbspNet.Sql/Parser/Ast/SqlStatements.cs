@@ -55,6 +55,50 @@ public sealed record SelectStatement(
     IReadOnlyList<CteDefinition> Ctes,
     bool Distinct = false) : SqlQuery(Ctes);
 
+/// <summary>Sort direction for one <see cref="SortItem"/>.</summary>
+public enum SortDirection
+{
+    Ascending,
+    Descending,
+}
+
+/// <summary>
+/// Where NULLs sort relative to non-NULL values for one <see cref="SortItem"/>.
+/// <see cref="Default"/> means "unspecified" — the resolver applies the
+/// PostgreSQL convention (<c>ASC</c> ⇒ NULLS LAST, <c>DESC</c> ⇒ NULLS FIRST).
+/// </summary>
+public enum NullOrdering
+{
+    Default,
+    NullsFirst,
+    NullsLast,
+}
+
+/// <summary>One <c>ORDER BY</c> term: an expression plus its sort direction
+/// and NULL ordering.</summary>
+public sealed record SortItem(Expression Expression, SortDirection Direction, NullOrdering Nulls);
+
+/// <summary>
+/// A query expression with a trailing <c>ORDER BY</c> and/or
+/// <c>LIMIT</c>/<c>OFFSET</c>/<c>FETCH FIRST</c>. Wraps any inner
+/// <see cref="SqlQuery"/> (a <see cref="SelectStatement"/> or
+/// <see cref="SetOpQuery"/>) — these clauses bind to the whole query
+/// expression per the SQL grammar. <see cref="Limit"/>/<see cref="Offset"/>
+/// are null when absent (<c>LIMIT ALL</c> also yields a null limit).
+/// </summary>
+/// <remarks>
+/// In an incremental Z-set engine row order is unobservable in the output, so
+/// a bare <c>ORDER BY</c> (both <see cref="Limit"/> and <see cref="Offset"/>
+/// null) is a no-op the resolver discards; <c>ORDER BY … LIMIT/OFFSET</c>
+/// lowers to a <c>TopKPlan</c>.
+/// </remarks>
+public sealed record OrderLimitQuery(
+    SqlQuery Input,
+    IReadOnlyList<SortItem> OrderBy,
+    long? Limit,
+    long? Offset,
+    IReadOnlyList<CteDefinition> Ctes) : SqlQuery(Ctes);
+
 public enum SetOpKind
 {
     /// <summary>Bag semantics: weights add (duplicates preserved).</summary>

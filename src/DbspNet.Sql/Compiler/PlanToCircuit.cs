@@ -521,6 +521,9 @@ public static class PlanToCircuit
                 case DistinctPlan d:
                     Walk(d.Input);
                     break;
+                case TopKPlan t:
+                    Walk(t.Input);
+                    break;
                 case DifferencePlan diff:
                     Walk(diff.Left);
                     Walk(diff.Right);
@@ -623,9 +626,43 @@ public static class PlanToCircuit
             case RecursiveCtePlan rcp:
                 return CompileRecursiveCte(builder, rcp, ctx);
 
+            case TopKPlan t:
+                return CompileTopK(builder, t, ctx);
+
             default:
                 throw new InvalidOperationException($"unsupported plan node {plan.GetType().Name}");
         }
+    }
+
+    // ---- TOP-K (ORDER BY ... LIMIT/OFFSET) ----
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompileTopK(
+        CircuitBuilder builder,
+        TopKPlan plan,
+        CompileContext ctx)
+    {
+        var input = CompilePlan(builder, plan.Input, ctx);
+        var comparer = BuildStructuralSortComparer(plan.SortKeys);
+        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
+        return builder.TopK(input, comparer, plan.Offset ?? 0, plan.Limit, codec);
+    }
+
+    private static IComparer<StructuralRow> BuildStructuralSortComparer(IReadOnlyList<SortKey> sortKeys)
+    {
+        var keys = new Func<StructuralRow, object?>[sortKeys.Count];
+        var descending = new bool[sortKeys.Count];
+        var nullsFirst = new bool[sortKeys.Count];
+        for (var i = 0; i < sortKeys.Count; i++)
+        {
+            // StructuralRow is IReadOnlyList<object?>, which CompileScalar consumes directly.
+            var scalar = ExpressionCompiler.CompileScalar(sortKeys[i].Expression);
+            keys[i] = row => scalar(row);
+            descending[i] = sortKeys[i].Descending;
+            nullsFirst[i] = sortKeys[i].NullsFirst;
+        }
+
+        // Full-row tiebreak gives a total order so the window boundary is stable.
+        return new SortKeyComparer<StructuralRow>(keys, descending, nullsFirst, StructuralRowComparer.Instance);
     }
 
     // ---- Projection ----

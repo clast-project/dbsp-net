@@ -29,6 +29,9 @@ public enum TokenKind
     Create, Table, View, Inner, Left, Right, Full, Outer, Cross, Join, On, Using,
     Union, All, Intersect, Except,
 
+    // ORDER BY / LIMIT / OFFSET / FETCH keywords
+    Order, Limit, Offset, Fetch, First, Next, Row, Rows, Only, Asc, Desc, Nulls, Last,
+
     // Boolean / nullability keywords
     And, Or, Not, Is, Null, True, False, In, Exists, Between, Distinct,
 

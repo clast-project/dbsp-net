@@ -57,6 +57,31 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Incremental TOP-K (<c>ORDER BY … LIMIT [OFFSET]</c>): keep the rows
+    /// occupying sort positions <c>[offset, offset + limit)</c> under
+    /// <paramref name="comparer"/>'s total order, maintained as rows enter and
+    /// leave the window under retraction. A null <paramref name="limit"/> means
+    /// "to the end" (an <c>OFFSET</c> with no <c>LIMIT</c>).
+    /// </summary>
+    public static Stream<ZSet<TRow, Z64>> TopK<TRow>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TRow, Z64>> input,
+        IComparer<TRow> comparer,
+        long offset,
+        long? limit,
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        where TRow : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(comparer);
+
+        var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
+        builder.AddRawOperator(new TopKOp<TRow>(input, output, comparer, offset, limit, snapshotCodec));
+        return output;
+    }
+
+    /// <summary>
     /// Index a flat Z-set stream by a key-extraction function. The key
     /// extractor is applied tick-by-tick and results in an indexed Z-set
     /// stream with the same weights.

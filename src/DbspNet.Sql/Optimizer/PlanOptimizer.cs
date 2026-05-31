@@ -87,6 +87,10 @@ public static class PlanOptimizer
             AggregatePlan a => a with { Input = OptimizeNode(a.Input) },
             UnionAllPlan u => u with { Branches = OptimizeBranches(u.Branches) },
             DistinctPlan d => new DistinctPlan(OptimizeNode(d.Input)),
+            // TOP-K is a pushdown barrier: optimize the subtree below it, but no
+            // rule ever moves a filter/projection across it (that would change
+            // which rows fall inside the [offset, offset+limit) window).
+            TopKPlan t => t with { Input = OptimizeNode(t.Input) },
             DifferencePlan diff => new DifferencePlan(
                 OptimizeNode(diff.Left), OptimizeNode(diff.Right)),
             ScalarSubqueryJoinPlan s => s with

@@ -88,6 +88,35 @@ public sealed record FilterPlan(LogicalPlan Input, ResolvedExpression Predicate)
     : LogicalPlan(Input.Schema);
 
 /// <summary>
+/// One <c>ORDER BY</c> sort key for a <see cref="TopKPlan"/>: an expression
+/// evaluated over the input row, a direction, and where NULLs sort.
+/// <see cref="NullsFirst"/> is already resolved from the SQL default
+/// (<c>ASC</c> ⇒ NULLS LAST, <c>DESC</c> ⇒ NULLS FIRST) or the explicit
+/// <c>NULLS FIRST|LAST</c> the user wrote.
+/// </summary>
+public sealed record SortKey(ResolvedExpression Expression, bool Descending, bool NullsFirst);
+
+/// <summary>
+/// Incremental TOP-K: keep the rows of <see cref="Input"/> occupying sort
+/// positions <c>[Offset, Offset + Limit)</c> under the <see cref="SortKeys"/>
+/// order (a total order — ties broken by the full row). Maintained as rows
+/// enter/leave that window under retraction. <see cref="Limit"/> null means
+/// "to the end" (an <c>OFFSET</c> with no <c>LIMIT</c>); <see cref="Offset"/>
+/// null means 0. Schema is the input's, unchanged — TOP-K only restricts
+/// which rows survive, never their shape.
+/// </summary>
+/// <remarks>
+/// Row order is unobservable in the output Z-set, so a bare <c>ORDER BY</c>
+/// (no limit/offset) never produces this node — the resolver returns the input
+/// plan directly. This node is therefore only built when a bound is present.
+/// </remarks>
+public sealed record TopKPlan(
+    LogicalPlan Input,
+    IReadOnlyList<SortKey> SortKeys,
+    long? Limit,
+    long? Offset) : LogicalPlan(Input.Schema);
+
+/// <summary>
 /// <c>UNION ALL</c> of two or more branches. Every branch has been
 /// projection-aligned to <see cref="Schema"/> (same arity and per-column
 /// types). Compiles to successive Z-set additions in the runtime.

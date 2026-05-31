@@ -211,6 +211,7 @@ public static class TypedPlanCompiler
         CteScanPlan c => CompileCteScan(c, ctx),
         ScalarSubqueryJoinPlan s => CompileScalarSubqueryJoin(s, ctx),
         RecursiveCtePlan r => CompileRecursiveCte(r, ctx),
+        TopKPlan t => CompileTopK(t, ctx),
         _ => null,
     };
 
@@ -757,6 +758,49 @@ public static class TypedPlanCompiler
 
         var output = EmitDistinct(ctx, inner.RowType, inner.Stream, snapshotCodec);
         return new TypedNode(inner.RowType, plan.Schema, output);
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="TopKPlan"/> (<c>ORDER BY … LIMIT/OFFSET</c>). Each
+    /// sort-key expression is lowered against the emitted row struct and boxed
+    /// to <c>object?</c>, then a <see cref="SortKeyComparer{TRow}"/> (tie-broken
+    /// by <c>Comparer&lt;TRow&gt;.Default</c> — the emitted struct's
+    /// <c>IComparable&lt;TSelf&gt;</c>) drives the incremental TOP-K operator.
+    /// Falls back to structural if any sort expression is outside the typed
+    /// expression compiler's scope.
+    /// </summary>
+    private static TypedNode? CompileTopK(TopKPlan plan, CompileContext ctx)
+    {
+        var inner = TryCompileNode(plan.Input, ctx);
+        if (inner is null) return null;
+
+        var rowType = inner.RowType;
+        var count = plan.SortKeys.Count;
+        var extractors = new Delegate[count];
+        var descending = new bool[count];
+        var nullsFirst = new bool[count];
+        for (var i = 0; i < count; i++)
+        {
+            var sortKey = plan.SortKeys[i];
+            var rowParam = Expression.Parameter(rowType, "row");
+            var body = TypedExpressionCompiler.TryBuildInto(sortKey.Expression, rowParam);
+            if (body is null) return null; // unsupported sort expr — structural fallback
+
+            // Box to object? — Convert lifts value types and Nullable<T>
+            // correctly (a null Nullable boxes to a null reference), matching
+            // the SortKeyComparer's null handling.
+            var boxed = Expression.Convert(body, typeof(object));
+            var funcType = typeof(Func<,>).MakeGenericType(rowType, typeof(object));
+            extractors[i] = Expression.Lambda(funcType, boxed, rowParam).Compile();
+            descending[i] = sortKey.Descending;
+            nullsFirst[i] = sortKey.NullsFirst;
+        }
+
+        var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Schema, rowType);
+        var output = InvokeTopK(
+            ctx.Builder, rowType, inner.Stream, extractors, descending, nullsFirst,
+            plan.Offset ?? 0, plan.Limit, snapshotCodec);
+        return new TypedNode(rowType, inner.Schema, output);
     }
 
     /// <summary>
@@ -1888,6 +1932,46 @@ public static class TypedPlanCompiler
         // (frontier, monotoneKey); the typed path does not GC (LATENESS forces
         // the structural compile).
         return closed.Invoke(null, new object?[] { builder, input, snapshotCodec, null, null })!;
+    }
+
+    /// <summary>
+    /// <c>builder.TopK&lt;TRow&gt;(input, comparer, offset, limit, snapshotCodec)</c>,
+    /// building the typed <see cref="SortKeyComparer{TRow}"/> from the boxed
+    /// sort-key extractors first (TRow is only known at runtime).
+    /// </summary>
+    private static object InvokeTopK(
+        CircuitBuilder builder, Type rowType, object input, Delegate[] extractors,
+        bool[] descending, bool[] nullsFirst, long offset, long? limit, object? snapshotCodec)
+    {
+        var openMethod = typeof(TypedPlanCompiler)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Single(m => m.Name == nameof(BuildTopK) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(rowType);
+        return closed.Invoke(null, new object?[]
+        {
+            builder, input, extractors, descending, nullsFirst, offset, limit, snapshotCodec,
+        })!;
+    }
+
+    /// <summary>
+    /// Generic worker for <see cref="InvokeTopK"/> — closes the open generics so
+    /// the comparer, stream cast, and builder call are all statically typed.
+    /// </summary>
+    private static object BuildTopK<TRow>(
+        CircuitBuilder builder, object input, Delegate[] extractors,
+        bool[] descending, bool[] nullsFirst, long offset, long? limit, object? snapshotCodec)
+        where TRow : notnull
+    {
+        var keys = new Func<TRow, object?>[extractors.Length];
+        for (var i = 0; i < extractors.Length; i++)
+        {
+            keys[i] = (Func<TRow, object?>)extractors[i];
+        }
+
+        var comparer = new SortKeyComparer<TRow>(keys, descending, nullsFirst, Comparer<TRow>.Default);
+        var stream = (Stream<ZSet<TRow, Z64>>)input;
+        var codec = (IZSetTraceCodec<TRow, Z64>?)snapshotCodec;
+        return builder.TopK(stream, comparer, offset, limit, codec);
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>

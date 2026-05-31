@@ -263,7 +263,163 @@ public sealed class Parser
         }
 
         var query = ParseUnionLevel();
+        query = ParseOrderByLimit(query);
         return AttachCtes(query, ctes);
+    }
+
+    // Parse an optional trailing `ORDER BY` and/or `LIMIT`/`OFFSET`/`FETCH FIRST`
+    // tail. These bind to the whole query expression (per SQL grammar), so they
+    // sit above any set-op chain. Returns <paramref name="input"/> unchanged when
+    // no clause is present.
+    private SqlQuery ParseOrderByLimit(SqlQuery input)
+    {
+        IReadOnlyList<SortItem> orderBy = Array.Empty<SortItem>();
+        if (Peek().Kind == TokenKind.Order)
+        {
+            Advance();
+            Expect(TokenKind.By);
+            var items = new List<SortItem> { ParseSortItem() };
+            while (Peek().Kind == TokenKind.Comma)
+            {
+                Advance();
+                items.Add(ParseSortItem());
+            }
+
+            orderBy = items;
+        }
+
+        long? limit = null;
+        long? offset = null;
+        var sawLimit = false;
+        var sawOffset = false;
+        while (true)
+        {
+            var t = Peek();
+            if (t.Kind == TokenKind.Limit)
+            {
+                if (sawLimit)
+                {
+                    throw Error(t, "duplicate LIMIT/FETCH clause");
+                }
+
+                Advance();
+                sawLimit = true;
+                if (Peek().Kind == TokenKind.All)
+                {
+                    Advance(); // LIMIT ALL — no bound.
+                }
+                else
+                {
+                    limit = ParseNonNegativeLong("LIMIT count");
+                }
+            }
+            else if (t.Kind == TokenKind.Fetch)
+            {
+                if (sawLimit)
+                {
+                    throw Error(t, "duplicate LIMIT/FETCH clause");
+                }
+
+                // FETCH { FIRST | NEXT } [n] { ROW | ROWS } ONLY  (n defaults to 1).
+                Advance();
+                sawLimit = true;
+                if (Peek().Kind is TokenKind.First or TokenKind.Next)
+                {
+                    Advance();
+                }
+                else
+                {
+                    throw Error(Peek(), $"expected FIRST or NEXT after FETCH, got {Describe(Peek())}");
+                }
+
+                limit = Peek().Kind == TokenKind.IntegerLiteral ? ParseNonNegativeLong("FETCH count") : 1L;
+                if (Peek().Kind is TokenKind.Row or TokenKind.Rows)
+                {
+                    Advance();
+                }
+                else
+                {
+                    throw Error(Peek(), $"expected ROW or ROWS in FETCH clause, got {Describe(Peek())}");
+                }
+
+                Expect(TokenKind.Only);
+            }
+            else if (t.Kind == TokenKind.Offset)
+            {
+                if (sawOffset)
+                {
+                    throw Error(t, "duplicate OFFSET clause");
+                }
+
+                Advance();
+                sawOffset = true;
+                offset = ParseNonNegativeLong("OFFSET count");
+                if (Peek().Kind is TokenKind.Row or TokenKind.Rows)
+                {
+                    Advance();
+                }
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (orderBy.Count == 0 && limit is null && offset is null)
+        {
+            return input;
+        }
+
+        return new OrderLimitQuery(input, orderBy, limit, offset, Array.Empty<CteDefinition>());
+    }
+
+    private SortItem ParseSortItem()
+    {
+        var expr = ParseExpression();
+        var direction = SortDirection.Ascending;
+        if (Peek().Kind == TokenKind.Asc)
+        {
+            Advance();
+        }
+        else if (Peek().Kind == TokenKind.Desc)
+        {
+            Advance();
+            direction = SortDirection.Descending;
+        }
+
+        var nulls = NullOrdering.Default;
+        if (Peek().Kind == TokenKind.Nulls)
+        {
+            Advance();
+            if (Peek().Kind == TokenKind.First)
+            {
+                Advance();
+                nulls = NullOrdering.NullsFirst;
+            }
+            else if (Peek().Kind == TokenKind.Last)
+            {
+                Advance();
+                nulls = NullOrdering.NullsLast;
+            }
+            else
+            {
+                throw Error(Peek(), $"expected FIRST or LAST after NULLS, got {Describe(Peek())}");
+            }
+        }
+
+        return new SortItem(expr, direction, nulls);
+    }
+
+    private long ParseNonNegativeLong(string what)
+    {
+        var t = Peek();
+        var value = ExpectLongLiteral(what);
+        if (value < 0)
+        {
+            throw Error(t, $"{what} must be non-negative");
+        }
+
+        return value;
     }
 
     // union_level ::= intersect_level ( (UNION [ALL] | EXCEPT) intersect_level )*
@@ -350,6 +506,7 @@ public sealed class Parser
         {
             SelectStatement s => s with { Ctes = ctes },
             SetOpQuery set => set with { Ctes = ctes },
+            OrderLimitQuery o => o with { Ctes = ctes },
             _ => throw new InvalidOperationException($"cannot attach CTEs to {q.GetType().Name}"),
         };
     }

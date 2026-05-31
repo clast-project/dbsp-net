@@ -40,6 +40,7 @@ public sealed class Resolver
     {
         SelectStatement s => ResolveSelect(s, outerCteScope, outerSchema),
         SetOpQuery u => ResolveSetOp(u, outerCteScope),
+        OrderLimitQuery o => ResolveOrderLimit(o, outerCteScope, outerSchema),
         _ => throw new ResolveException($"unsupported query kind: {query.GetType().Name}"),
     };
 
@@ -663,6 +664,81 @@ public sealed class Resolver
             SetOpKind.Except => BuildExcept(aligned, unifiedSchema),
             _ => throw new ResolveException($"unsupported set-op kind {query.Kind}"),
         };
+    }
+
+    /// <summary>
+    /// Lower an <c>ORDER BY … LIMIT/OFFSET</c> wrapper to a <see cref="TopKPlan"/>.
+    /// Sort keys resolve against the inner query's <b>output</b> schema: a
+    /// top-level integer literal is a 1-based ordinal into the select list;
+    /// anything else is an expression over the output columns. A bare
+    /// <c>ORDER BY</c> (no bound) is validated then discarded — row order is
+    /// unobservable in the output Z-set, so it cannot affect the result.
+    /// </summary>
+    private LogicalPlan ResolveOrderLimit(
+        OrderLimitQuery query,
+        IReadOnlyDictionary<string, CteRef> outerCteScope,
+        Schema? outerSchema)
+    {
+        // Query-level CTEs declared on this wrapper are visible to the inner query.
+        Dictionary<string, CteRef>? cteScope = null;
+        foreach (var cte in query.Ctes)
+        {
+            cteScope ??= new Dictionary<string, CteRef>(outerCteScope, StringComparer.Ordinal);
+            if (cteScope.ContainsKey(cte.Name))
+            {
+                throw new ResolveException($"duplicate CTE name '{cte.Name}'");
+            }
+
+            cteScope[cte.Name] = cte.IsRecursive
+                ? ResolveRecursiveCte(cte, cteScope)
+                : new CteRef(cte.Name, ResolveQuery(cte.Query, cteScope));
+        }
+
+        IReadOnlyDictionary<string, CteRef> scope = cteScope ?? outerCteScope;
+        var inner = ResolveQuery(query.Input, scope, outerSchema);
+
+        // Resolve (and thereby validate) every sort key against the output schema,
+        // even when the clause turns out to be a no-op below.
+        var sortKeys = new List<SortKey>(query.OrderBy.Count);
+        foreach (var item in query.OrderBy)
+        {
+            ResolvedExpression expr;
+            if (item.Expression is LiteralExpression { Kind: LiteralKind.Integer, Value: long ordinal })
+            {
+                if (ordinal < 1 || ordinal > inner.Schema.Count)
+                {
+                    throw new ResolveException(
+                        $"ORDER BY position {ordinal} is out of range (1..{inner.Schema.Count})");
+                }
+
+                var idx = (int)(ordinal - 1);
+                expr = new ResolvedColumn(idx, inner.Schema[idx].Type);
+            }
+            else
+            {
+                expr = ResolveScalarExpression(item.Expression, inner.Schema);
+            }
+
+            var descending = item.Direction == SortDirection.Descending;
+            var nullsFirst = item.Nulls switch
+            {
+                NullOrdering.NullsFirst => true,
+                NullOrdering.NullsLast => false,
+                // SQL default (PostgreSQL): NULL is the "largest" value — so it
+                // sorts last under ASC and first under DESC.
+                _ => descending,
+            };
+            sortKeys.Add(new SortKey(expr, descending, nullsFirst));
+        }
+
+        // Bare ORDER BY (no LIMIT/OFFSET): the result set is identical to the
+        // inner query — return it directly.
+        if (query.Limit is null && query.Offset is null)
+        {
+            return inner;
+        }
+
+        return new TopKPlan(inner, sortKeys, query.Limit, query.Offset);
     }
 
     private static string KindName(SetOpKind k) => k switch
