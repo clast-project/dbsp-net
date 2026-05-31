@@ -666,13 +666,25 @@ public sealed class Resolver
         };
     }
 
+    /// <summary>A classified <c>ORDER BY</c> term. Exactly one of
+    /// <see cref="OutputExpr"/> (resolved against the inner query's output —
+    /// an ordinal, alias, or expression over selected columns) or
+    /// <see cref="HiddenPos"/> ≥ 0 (a reference to a non-selected column,
+    /// carried as a hidden projection at that position) is set.</summary>
+    private readonly record struct OrderTerm(
+        ResolvedExpression? OutputExpr, int HiddenPos, bool Descending, bool NullsFirst);
+
     /// <summary>
     /// Lower an <c>ORDER BY … LIMIT/OFFSET</c> wrapper to a <see cref="TopKPlan"/>.
-    /// Sort keys resolve against the inner query's <b>output</b> schema: a
-    /// top-level integer literal is a 1-based ordinal into the select list;
-    /// anything else is an expression over the output columns. A bare
-    /// <c>ORDER BY</c> (no bound) is validated then discarded — row order is
-    /// unobservable in the output Z-set, so it cannot affect the result.
+    /// Each sort key resolves against the inner query's <b>output</b> first (a
+    /// 1-based ordinal into the select list, an alias, or an expression over
+    /// selected columns). A term that references a column <em>not</em> in the
+    /// select list is carried as a hidden projection: the inner <c>SELECT</c> is
+    /// re-resolved with the ordering expression appended (so it resolves against
+    /// the FROM scope, with the resolver's normal aggregate / non-grouped-column
+    /// rules), TOP-K orders by the hidden column, and a final projection strips
+    /// it. A bare <c>ORDER BY</c> (no bound) is validated then discarded — row
+    /// order is unobservable in the output Z-set, so it cannot affect the result.
     /// </summary>
     private LogicalPlan ResolveOrderLimit(
         OrderLimitQuery query,
@@ -696,29 +708,15 @@ public sealed class Resolver
 
         IReadOnlyDictionary<string, CteRef> scope = cteScope ?? outerCteScope;
         var inner = ResolveQuery(query.Input, scope, outerSchema);
+        var outputSchema = inner.Schema;
 
-        // Resolve (and thereby validate) every sort key against the output schema,
-        // even when the clause turns out to be a no-op below.
-        var sortKeys = new List<SortKey>(query.OrderBy.Count);
-        foreach (var item in query.OrderBy)
+        // Classify each term against the output scope; collect the ASTs of the
+        // ones that need a hidden column (resolved later against the FROM scope).
+        var terms = new OrderTerm[query.OrderBy.Count];
+        var hiddenAsts = new List<Parser.Ast.Expression>();
+        for (var i = 0; i < query.OrderBy.Count; i++)
         {
-            ResolvedExpression expr;
-            if (item.Expression is LiteralExpression { Kind: LiteralKind.Integer, Value: long ordinal })
-            {
-                if (ordinal < 1 || ordinal > inner.Schema.Count)
-                {
-                    throw new ResolveException(
-                        $"ORDER BY position {ordinal} is out of range (1..{inner.Schema.Count})");
-                }
-
-                var idx = (int)(ordinal - 1);
-                expr = new ResolvedColumn(idx, inner.Schema[idx].Type);
-            }
-            else
-            {
-                expr = ResolveScalarExpression(item.Expression, inner.Schema);
-            }
-
+            var item = query.OrderBy[i];
             var descending = item.Direction == SortDirection.Descending;
             var nullsFirst = item.Nulls switch
             {
@@ -728,17 +726,144 @@ public sealed class Resolver
                 // sorts last under ASC and first under DESC.
                 _ => descending,
             };
-            sortKeys.Add(new SortKey(expr, descending, nullsFirst));
+
+            if (item.Expression is LiteralExpression { Kind: LiteralKind.Integer, Value: long ordinal })
+            {
+                if (ordinal < 1 || ordinal > outputSchema.Count)
+                {
+                    throw new ResolveException(
+                        $"ORDER BY position {ordinal} is out of range (1..{outputSchema.Count})");
+                }
+
+                var idx = (int)(ordinal - 1);
+                terms[i] = new OrderTerm(
+                    new ResolvedColumn(idx, outputSchema[idx].Type), -1, descending, nullsFirst);
+                continue;
+            }
+
+            // Output scope first (alias / selected column / expression over them);
+            // SQL resolves an ORDER BY name as an output alias ahead of a table
+            // column. A term that fails here references a non-selected column.
+            var outExpr = TryResolveAgainstOutput(item.Expression, outputSchema);
+            if (outExpr is not null)
+            {
+                terms[i] = new OrderTerm(outExpr, -1, descending, nullsFirst);
+            }
+            else
+            {
+                terms[i] = new OrderTerm(null, hiddenAsts.Count, descending, nullsFirst);
+                hiddenAsts.Add(item.Expression);
+            }
+        }
+
+        // The plan TOP-K orders over: the inner plan, or — when some term needs a
+        // non-selected column — the inner SELECT re-resolved with the ordering
+        // expressions appended as hidden trailing columns.
+        var basePlan = hiddenAsts.Count == 0
+            ? inner
+            : ResolveWithHiddenOrderColumns(query.Input, hiddenAsts, scope, outerSchema, outputSchema);
+        var baseSchema = basePlan.Schema;
+
+        var sortKeys = new List<SortKey>(terms.Length);
+        foreach (var term in terms)
+        {
+            var keyExpr = term.OutputExpr;
+            if (keyExpr is null)
+            {
+                var hiddenIdx = outputSchema.Count + term.HiddenPos;
+                keyExpr = new ResolvedColumn(hiddenIdx, baseSchema[hiddenIdx].Type);
+            }
+
+            sortKeys.Add(new SortKey(keyExpr, term.Descending, term.NullsFirst));
         }
 
         // Bare ORDER BY (no LIMIT/OFFSET): the result set is identical to the
-        // inner query — return it directly.
+        // inner query — return it directly (the hidden columns, if any, were
+        // built only to validate the ordering expressions and are discarded).
         if (query.Limit is null && query.Offset is null)
         {
             return inner;
         }
 
-        return new TopKPlan(inner, sortKeys, query.Limit, query.Offset);
+        var topK = new TopKPlan(basePlan, sortKeys, query.Limit, query.Offset);
+        if (hiddenAsts.Count == 0)
+        {
+            return topK;
+        }
+
+        // Strip the hidden ORDER BY columns back to the user's select list.
+        var projections = new List<ProjectionItem>(outputSchema.Count);
+        for (var j = 0; j < outputSchema.Count; j++)
+        {
+            var col = outputSchema[j];
+            projections.Add(new ProjectionItem(new ResolvedColumn(j, col.Type), col.Name, col.Qualifier));
+        }
+
+        return new ProjectPlan(topK, projections, outputSchema);
+    }
+
+    private static ResolvedExpression? TryResolveAgainstOutput(
+        Parser.Ast.Expression expr, Schema outputSchema)
+    {
+        try
+        {
+            return ResolveScalarExpression(expr, outputSchema);
+        }
+        catch (ResolveException)
+        {
+            // Not resolvable against the output — caller pushes it as a hidden
+            // column resolved against the inner query's FROM scope instead.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Re-resolve the inner <c>SELECT</c> with the <paramref name="hiddenAsts"/>
+    /// ordering expressions appended as trailing <c>__orderby_k</c> columns, so
+    /// they resolve against the FROM scope. Only a single (non-<c>DISTINCT</c>)
+    /// <c>SELECT</c> can carry hidden columns: <c>DISTINCT</c> forbids ordering by
+    /// a non-selected column (the value is ambiguous after dedup), and a set
+    /// operation's <c>ORDER BY</c> may reference only output columns. Aggregate /
+    /// non-grouped-column rules are enforced naturally by the re-resolution.
+    /// </summary>
+    private LogicalPlan ResolveWithHiddenOrderColumns(
+        SqlQuery input,
+        List<Parser.Ast.Expression> hiddenAsts,
+        IReadOnlyDictionary<string, CteRef> scope,
+        Schema? outerSchema,
+        Schema outputSchema)
+    {
+        if (input is not SelectStatement select)
+        {
+            throw new ResolveException(
+                "ORDER BY of a set operation may reference only its output columns " +
+                "(a selected column, alias, or ordinal)");
+        }
+
+        if (select.Distinct)
+        {
+            throw new ResolveException(
+                "for SELECT DISTINCT, ORDER BY items must appear in the select list");
+        }
+
+        var items = new List<SelectItem>(select.Items.Count + hiddenAsts.Count);
+        items.AddRange(select.Items);
+        for (var k = 0; k < hiddenAsts.Count; k++)
+        {
+            items.Add(new ExpressionSelectItem(hiddenAsts[k], $"__orderby_{k}"));
+        }
+
+        var augmented = ResolveQuery(select with { Items = items }, scope, outerSchema);
+
+        // The hidden columns must land immediately after the original output so
+        // the strip projection and hidden-index math hold.
+        if (augmented.Schema.Count != outputSchema.Count + hiddenAsts.Count)
+        {
+            throw new ResolveException(
+                "ORDER BY over non-selected columns is not supported for this query shape");
+        }
+
+        return augmented;
     }
 
     private static string KindName(SetOpKind k) => k switch

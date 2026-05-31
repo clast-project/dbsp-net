@@ -283,8 +283,9 @@ beyond "Feldera is much bigger":
 - `CROSS JOIN` / non-equi `INNER JOIN` (unit-key nested loop) and
   `FULL OUTER JOIN` (symmetric both-sides match-presence tracking) are
   supported. `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST` compile to
-  incremental TOP-K (global partition; ordering by non-selected columns and
-  windowed / partitioned `RANK` / `ROW_NUMBER` are deferred). Window functions
+  incremental TOP-K — including ordering by non-selected columns / expressions
+  (carried as hidden columns), but a single global partition (windowed /
+  partitioned `RANK` / `ROW_NUMBER` are deferred). Window functions
   and `LIKE` / `SIMILAR TO` are deferred. `JOIN … USING` is supported (equi-join on the
   named columns + merged-column projection; FULL merges via `COALESCE`); the
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING| BOTH … FROM …)`

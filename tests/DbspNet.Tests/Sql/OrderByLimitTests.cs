@@ -336,6 +336,135 @@ public class OrderByLimitTests
         Assert.Contains(topK, op => op.GetType().GetGenericArguments().Any(t => t == typeof(StructuralRow)));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void OrderBy_NonSelectedColumn(bool typed)
+    {
+        // `b` is not in the select list; carried as a hidden ORDER BY column.
+        var q = Compile(
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+            "SELECT a FROM t ORDER BY b LIMIT 2",
+            typed);
+        q.Table("t").Insert(10, 3);
+        q.Table("t").Insert(20, 1);
+        q.Table("t").Insert(30, 2);
+        q.Step();
+
+        // Sorted by b: (20,1), (30,2), (10,3) — take 2, project a.
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 20));
+        Assert.Equal(1, WeightOf(q.Current, 30));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void OrderBy_NonSelectedColumn_Desc(bool typed)
+    {
+        var q = Compile(
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+            "SELECT a FROM t ORDER BY b DESC LIMIT 1",
+            typed);
+        q.Table("t").Insert(10, 3);
+        q.Table("t").Insert(20, 1);
+        q.Table("t").Insert(30, 2);
+        q.Step();
+
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 10)); // largest b is 3 → row (10,3)
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void OrderBy_NonSelectedExpression_Mixed(bool typed)
+    {
+        // Expression mixes a selected (a) and non-selected (b) column.
+        var q = Compile(
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+            "SELECT a FROM t ORDER BY a + b DESC LIMIT 1",
+            typed);
+        q.Table("t").Insert(1, 5);  // 6
+        q.Table("t").Insert(2, 1);  // 3
+        q.Table("t").Insert(3, 10); // 13 — max
+        q.Step();
+
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 3));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void OrderBy_Aggregate_ByAggregateExpr(bool typed)
+    {
+        // ORDER BY an aggregate that is not in the select list.
+        var q = Compile(
+            "CREATE TABLE t (dept INT NOT NULL, amt INT NOT NULL)",
+            "SELECT dept FROM t GROUP BY dept ORDER BY SUM(amt) DESC LIMIT 1",
+            typed);
+        q.Table("t").Insert(1, 10);
+        q.Table("t").Insert(1, 20); // dept 1 sum = 30
+        q.Table("t").Insert(2, 5);  // dept 2 sum = 5
+        q.Step();
+
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BareOrderBy_NonSelectedColumn_IsNoOp(bool typed)
+    {
+        // No bound: validated (b exists) then discarded — full input survives.
+        var q = Compile(
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+            "SELECT a FROM t ORDER BY b",
+            typed);
+        q.Table("t").Insert(10, 3);
+        q.Table("t").Insert(20, 1);
+        q.Step();
+
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 10));
+        Assert.Equal(1, WeightOf(q.Current, 20));
+    }
+
+    [Fact]
+    public void OrderByDistinct_NonSelectedColumn_Throws()
+    {
+        var ex = Assert.Throws<ResolveException>(() =>
+            Compile(
+                "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+                "SELECT DISTINCT a FROM t ORDER BY b LIMIT 1",
+                typed: true));
+        Assert.Contains("DISTINCT", ex.Message);
+    }
+
+    [Fact]
+    public void OrderBySetOp_NonSelectedColumn_Throws()
+    {
+        var ex = Assert.Throws<ResolveException>(() =>
+            Compile(
+                "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+                "SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY b LIMIT 1",
+                typed: true));
+        Assert.Contains("set operation", ex.Message);
+    }
+
+    [Fact]
+    public void OrderByAggregate_NonGroupedColumn_Throws()
+    {
+        // amt is neither grouped nor aggregated — invalid even as an ORDER BY key.
+        Assert.Throws<ResolveException>(() =>
+            Compile(
+                "CREATE TABLE t (dept INT NOT NULL, amt INT NOT NULL)",
+                "SELECT dept FROM t GROUP BY dept ORDER BY amt LIMIT 1",
+                typed: true));
+    }
+
     [Fact]
     public void OrderByOrdinal_OutOfRange_Throws()
     {

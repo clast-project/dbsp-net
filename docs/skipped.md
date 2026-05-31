@@ -192,17 +192,24 @@ reflect that shape, not a backlog.
   tick, and emits the delta against the previously-emitted window, honouring row
   multiplicity at the window edge. `FETCH FIRST [n] { ROW | ROWS } ONLY` and
   `LIMIT ALL` are accepted. Sort keys resolve against the query's **output**
-  columns: a select-list column / alias, an ordinal (`ORDER BY 2`), or an
-  expression over them. NULL ordering follows the PostgreSQL default (`ASC` ⇒
-  NULLS LAST, `DESC` ⇒ NULLS FIRST), overridable with `NULLS FIRST | LAST`.
-  Notes on semantics and what is deferred:
+  first — a select-list column / alias, an ordinal (`ORDER BY 2`), or an
+  expression over selected columns. A key that references a **non-selected**
+  column (e.g. `SELECT a FROM t ORDER BY b`, or a mixed expression like
+  `ORDER BY a + b`) is carried as a hidden column: the inner `SELECT` is
+  re-resolved with the ordering expression appended (so it resolves against the
+  FROM scope, under the resolver's normal aggregate / non-grouped-column rules),
+  TOP-K orders by the hidden column, and a final projection strips it. NULL
+  ordering follows the PostgreSQL default (`ASC` ⇒ NULLS LAST, `DESC` ⇒ NULLS
+  FIRST), overridable with `NULLS FIRST | LAST`. Notes on semantics and what is
+  deferred:
   - A **bare** `ORDER BY` (no `LIMIT`/`OFFSET`) is a validated no-op — row order
     is unobservable in the output Z-set, so the result set equals the inner
     query. `LIMIT` without `ORDER BY` works, using the implicit full-row total
     order so the chosen rows are deterministic.
-  - **[P2]** Ordering by a non-selected input column (e.g.
-    `SELECT a FROM t ORDER BY b`) — would need the sort scope to reach below the
-    projection, which the output-scope `TopKPlan` wrapper doesn't model.
+  - Hidden ORDER BY columns apply only to a single `SELECT`. `SELECT DISTINCT`
+    rejects ordering by a non-selected column (ambiguous after dedup), and a set
+    operation's `ORDER BY` may reference only its output columns — both raise an
+    explicit resolver error (matching standard SQL).
   - **[P2]** Partitioned TOP-K / windowed `RANK` / `ROW_NUMBER`
     (`PARTITION BY … ORDER BY … LIMIT k` per group). The current operator is a
     single global partition.
