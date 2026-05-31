@@ -280,7 +280,16 @@ internal static class RandomQuery
         Gen.Const("SELECT k, v FROM n WHERE v IS NOT DISTINCT FROM k"),
 
         // 57. IS DISTINCT FROM as a (always-definite) boolean projection.
-        Gen.Const("SELECT k, k IS DISTINCT FROM v AS d FROM n"));
+        Gen.Const("SELECT k, k IS DISTINCT FROM v AS d FROM n"),
+
+        // ---- Non-equi / CROSS inner join (keyless unit-key nested loop) ----
+
+        // 58. Non-equi inner join — the whole ON predicate becomes the residual,
+        // filtered over the unit-key cross product.
+        Gen.Const("SELECT a.k, a.v, b.v FROM t a JOIN u b ON a.v > b.v"),
+
+        // 59. CROSS JOIN — full cartesian product (keyless inner, no residual).
+        Gen.Const("SELECT a.k, a.v, b.v FROM t a CROSS JOIN u b"));
 
     // ---- Data generator ----
 

@@ -236,9 +236,13 @@ See [`docs/skipped.md`](docs/skipped.md). The short list of v1 restrictions
 beyond "Feldera is much bigger":
 
 - `GROUP BY` takes bare column references only (no expression grouping).
-- `INNER` / `LEFT` / `RIGHT [OUTER] JOIN` require at least one equi-key in
-  `ON`. Non-equi conjuncts are allowed on `INNER JOIN` (applied as a
-  post-filter) but rejected on outer joins.
+- `INNER JOIN` supports any `ON` predicate, including non-equi
+  (`ON a.x > b.y`) and `CROSS JOIN` — with no equi-key the join runs as a
+  unit-key nested-loop cross product with the `ON` predicate applied as a
+  residual filter. `LEFT` / `RIGHT [OUTER] JOIN` still require at least one
+  equi-key in `ON` and reject non-equi residual conjuncts (keyed
+  match-presence tracking). Comma-join (`FROM a, b`) and `NATURAL JOIN` are
+  not yet parsed.
 - Subqueries cover all the row-filter shapes — scalar (one column),
   `IN (subquery)`, `NOT IN (subquery)` (full SQL 3VL including
   nullable operands), `EXISTS (subquery)`, and `NOT EXISTS (subquery)`
@@ -274,11 +278,12 @@ beyond "Feldera is much bigger":
   outer joins, or nested recursion inside the body.
 - Set ops: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` all supported;
   `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
-- `FULL OUTER JOIN`, `CROSS JOIN` / non-equi joins, window functions,
-  `ORDER BY` / `LIMIT`, and `LIKE` / `SIMILAR TO` are deferred. `JOIN …
-  USING` is supported (equi-join on the named columns + merged-column
-  projection); the `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|
-  BOTH … FROM …)` keyword spellings are not (use the comma / char-set forms).
+- `CROSS JOIN` / non-equi `INNER JOIN` are supported (unit-key nested loop).
+  `FULL OUTER JOIN`, window functions, `ORDER BY` / `LIMIT`, and `LIKE` /
+  `SIMILAR TO` are deferred. `JOIN … USING` is supported (equi-join on the
+  named columns + merged-column projection); the `SUBSTRING(s FROM a FOR b)`
+  and `TRIM(LEADING|TRAILING| BOTH … FROM …)` keyword spellings are not (use
+  the comma / char-set forms).
 - Scalar function library covers the common arithmetic / string set
   listed above; missing pieces include other math (`SIN`/`COS`/`TAN`,
   `MOD`), and anything involving dates/times.

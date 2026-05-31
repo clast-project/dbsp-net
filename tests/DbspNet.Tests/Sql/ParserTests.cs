@@ -120,6 +120,18 @@ public class ParserTests
         Assert.Equal(JoinType.Inner, join.Type);
     }
 
+    [Fact]
+    public void Select_CrossJoin_DesugarsToInnerWithTrueOn()
+    {
+        var s = (SelectStatement)Parse("SELECT * FROM a CROSS JOIN b");
+        var join = Assert.IsType<JoinClause>(s.From);
+        Assert.Equal(JoinType.Inner, join.Type);
+        Assert.Null(join.UsingColumns);
+        var lit = Assert.IsType<LiteralExpression>(join.OnCondition);
+        Assert.Equal(LiteralKind.Boolean, lit.Kind);
+        Assert.Equal(true, lit.Value);
+    }
+
     // --- Pratt expression parser: precedence and associativity ---
 
     private static Expression ParseExpr(string src)

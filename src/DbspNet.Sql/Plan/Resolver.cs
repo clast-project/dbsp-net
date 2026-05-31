@@ -896,7 +896,13 @@ public sealed class Resolver
             }
         }
 
-        if (equi.Count == 0)
+        // A zero-equi-key join is a nested-loop / cross join. INNER supports it
+        // (the compiler routes both sides through a single unit key, producing
+        // the full bilinear cross product, then applies the residual ON
+        // predicate). Outer joins still require an equi-key in v1 — their
+        // match-presence tracking is keyed, so a keyless outer join has no
+        // operator.
+        if (equi.Count == 0 && join.Type != JoinType.Inner)
         {
             throw new ResolveException($"{JoinTypeName(join.Type)} requires at least one equi-key (v1)");
         }

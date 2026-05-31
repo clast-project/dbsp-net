@@ -140,10 +140,21 @@ reflect that shape, not a backlog.
     deviation from strict `UNION ALL` bag semantics to guarantee termination
     on finite inputs; a 10,000-iteration safety cap throws if a query
     diverges regardless
-- **[P1]** `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN`. DbspNet
-  supports `INNER`, `LEFT [OUTER] JOIN`, and `RIGHT [OUTER] JOIN`.
-  `RIGHT JOIN` is a swap wrapper over `IncrementalLeftJoinOp`.
-  `FULL OUTER JOIN` needs symmetric match-presence tracking on both sides.
+- `CROSS JOIN` and non-equi `INNER JOIN` — **implemented**. A join with no
+  equi-key conjunct (`ON a.x > b.y`, `ON TRUE`, or the `CROSS JOIN` keyword,
+  which desugars to `INNER JOIN ... ON TRUE` at parse time) builds a
+  `JoinPlan` with empty `EquiKeys` and the whole `ON` predicate as `Residual`.
+  Both compiler paths route the two sides through a single unit (zero-column)
+  key, so `IncrementalJoinOp` produces the full bilinear cross product and the
+  residual filters it — same machinery, no new operator. The op stays bilinear,
+  so retractions are correct. Deferred:
+    - **[P1]** `FULL OUTER JOIN`, `NATURAL JOIN`. DbspNet supports `INNER`,
+      `LEFT [OUTER] JOIN`, and `RIGHT [OUTER] JOIN`. `RIGHT JOIN` is a swap
+      wrapper over `IncrementalLeftJoinOp`. `FULL OUTER JOIN` needs symmetric
+      match-presence tracking on both sides.
+    - **[P2]** Comma-join `FROM a, b` (implicit cross join). `ParseFromClause`
+      doesn't consume a comma-separated table list yet; the explicit
+      `CROSS JOIN` keyword and `ON`-predicate forms cover the same expressivity.
 - **[P1]** `LEFT/RIGHT/FULL JOIN` with a non-equi conjunct in the `ON`
   clause (e.g. `LEFT JOIN b ON a.k = b.k AND b.v > 0`). Semantically,
   failing the residual should drop the match but retain the preserved row
@@ -385,14 +396,12 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   "GROUP BY supports only bare column references in v1". The plan→circuit
   layer relies on `ResolvedColumn` to rekey; extending means generalising
   `ExtractKey` to run compiled delegates.
-- **[P1]** `INNER JOIN` requires at least one equi-key conjunct in the `ON`
-  clause. Pure-inequality joins (`ON a.x > b.y`) and cross joins
-  (`ON TRUE`) are rejected. v1 never materialises a cross product. The
-  v1 framing positioned this as a deliberate scope choice, but
-  Calcite-style cross-join-then-filter is standard SQL surface — TPC-H
-  Q3 and similar shapes need it — so loosening this is closer to a
-  completeness gap than a deferred niceness. Feldera handles it via
-  Calcite.
+- **Outer joins** (`LEFT` / `RIGHT [OUTER] JOIN`) still require at least one
+  equi-key conjunct in `ON`; their keyed match-presence tracking has no
+  keyless operator. `INNER JOIN` no longer has this restriction — pure-
+  inequality joins (`ON a.x > b.y`) and cross joins (`ON TRUE` / `CROSS JOIN`)
+  are supported via the unit-key nested-loop path (see the `CROSS JOIN` /
+  non-equi `INNER JOIN` entry under SQL surface → Query constructs).
 - **[P1]** `SELECT *` is forbidden with `GROUP BY` / aggregates. Feldera
   (via Calcite) rewrites to an explicit column list during resolution.
 - **[P1]** Scalar function library. Currently supported:

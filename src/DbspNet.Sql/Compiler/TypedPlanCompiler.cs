@@ -337,7 +337,13 @@ public static class TypedPlanCompiler
             return null;
         }
 
-        if (plan.EquiKeys.Count == 0) return null;
+        // A zero-equi-key INNER join is a nested-loop / cross join: broadcast
+        // both sides through a single unit (zero-column) key — the same
+        // Schema.Empty pattern CompileScalarSubqueryJoin uses — then the
+        // residual ON predicate (below) filters the cross product. Outer joins
+        // never reach here with zero equi-keys (the resolver rejects them).
+        var keyless = plan.EquiKeys.Count == 0;
+        if (keyless && plan.JoinType is not AstJoinType.Inner) return null;
 
         var left = TryCompileNode(plan.Left, ctx);
         if (left is null) return null;
@@ -362,7 +368,7 @@ public static class TypedPlanCompiler
             if (right.Schema[rightIndices[i]].Type.Nullable) return null;
         }
 
-        var keySchema = left.Schema.SubsetByIndex(leftIndices);
+        var keySchema = keyless ? Schema.Empty : left.Schema.SubsetByIndex(leftIndices);
         var keyRowType = TypedRowEmitter.EmitRowType(keySchema);
         if (keyRowType is null) return null;
 

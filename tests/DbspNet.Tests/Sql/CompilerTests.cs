@@ -174,6 +174,126 @@ public class CompilerTests
         Assert.Equal(1, WeightOf(q.Current, 200, 20));
     }
 
+    // ---- Cross / non-equi inner join (keyless, unit-key nested loop) ----
+
+    [Fact]
+    public void CrossJoin_ProducesCartesianProduct()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (v INT NOT NULL)",
+                "CREATE TABLE b (w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a CROSS JOIN b");
+
+        q.Table("a").Insert(1);
+        q.Table("a").Insert(2);
+        q.Table("b").Insert(10);
+        q.Table("b").Insert(20);
+        q.Step();
+
+        Assert.Equal(4, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1, 10));
+        Assert.Equal(1, WeightOf(q.Current, 1, 20));
+        Assert.Equal(1, WeightOf(q.Current, 2, 10));
+        Assert.Equal(1, WeightOf(q.Current, 2, 20));
+    }
+
+    [Fact]
+    public void NonEquiJoin_FiltersCrossProduct()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (x INT NOT NULL)",
+                "CREATE TABLE b (y INT NOT NULL)",
+            ],
+            "SELECT a.x, b.y FROM a JOIN b ON a.x > b.y");
+
+        q.Table("a").Insert(1);
+        q.Table("a").Insert(5);
+        q.Table("b").Insert(2);
+        q.Table("b").Insert(4);
+        q.Step();
+
+        // Only pairs with a.x > b.y survive: (5,2) and (5,4).
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 5, 2));
+        Assert.Equal(1, WeightOf(q.Current, 5, 4));
+    }
+
+    [Fact]
+    public void CrossJoin_IsIncremental()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (v INT NOT NULL)",
+                "CREATE TABLE b (w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a CROSS JOIN b");
+
+        q.Table("a").Insert(1);
+        q.Table("b").Insert(10);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 10));
+
+        // Add one row on each side: delta has the three cross-terms.
+        q.Table("a").Insert(2);
+        q.Table("b").Insert(20);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 20));
+        Assert.Equal(1, WeightOf(q.Current, 2, 10));
+        Assert.Equal(1, WeightOf(q.Current, 2, 20));
+
+        // Retract a left row: every pair it contributed retracts.
+        q.Table("a").Delete(1);
+        q.Step();
+        Assert.Equal(-1, WeightOf(q.Current, 1, 10));
+        Assert.Equal(-1, WeightOf(q.Current, 1, 20));
+    }
+
+    [Fact]
+    public void NonEquiJoin_TypedPathCompiles()
+    {
+        // The keyless inner join must compile on the typed fast path (the
+        // residual predicate a.x > b.y is typed-compilable).
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE a (x INT NOT NULL)"));
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE b (y INT NOT NULL)"));
+        var plan = ((SelectPlan)resolver.Resolve(
+            Parser.ParseStatement("SELECT a.x, b.y FROM a JOIN b ON a.x > b.y"))).Query;
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out _));
+    }
+
+    [Fact]
+    public void CrossJoin_SpineAndFlatAgree()
+    {
+        const string ddlA = "CREATE TABLE a (v INT NOT NULL)";
+        const string ddlB = "CREATE TABLE b (w INT NOT NULL)";
+        const string sql = "SELECT a.v, b.w FROM a CROSS JOIN b";
+
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement(ddlA));
+        resolver.Resolve(Parser.ParseStatement(ddlB));
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
+
+        var flat = PlanToCircuit.Compile(plan);
+        var spine = PlanToCircuit.Compile(plan, null, new CompileOptions { TraceFamily = TraceFamily.Spine });
+
+        foreach (var q in new[] { flat, spine })
+        {
+            q.Table("a").Insert(1);
+            q.Table("a").Insert(2);
+            q.Table("b").Insert(10);
+            q.Step();
+            Assert.Equal(2, q.Current.Count);
+            Assert.Equal(1, WeightOf(q.Current, 1, 10));
+            Assert.Equal(1, WeightOf(q.Current, 2, 10));
+        }
+    }
+
     // ---- Group-by aggregate ----
 
     [Fact]

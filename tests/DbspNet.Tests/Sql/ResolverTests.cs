@@ -123,13 +123,42 @@ public class ResolverTests
     }
 
     [Fact]
-    public void InnerJoin_WithoutEquiKey_Throws()
+    public void InnerJoin_WithoutEquiKey_BuildsKeylessJoin()
+    {
+        // A non-equi (or cross) INNER join: no equi-key, the whole ON predicate
+        // becomes the residual, evaluated over the unit-key cross product.
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y INT NOT NULL)");
+        var plan = ResolveQuery(r, "SELECT * FROM a JOIN b ON a.x > b.y");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Empty(join.EquiKeys);
+        Assert.NotNull(join.Residual);
+    }
+
+    [Fact]
+    public void CrossJoin_BuildsKeylessJoin()
     {
         var (_, r) = NewResolver(
             "CREATE TABLE a (x INT NOT NULL)",
             "CREATE TABLE b (y INT NOT NULL)");
+        var plan = ResolveQuery(r, "SELECT * FROM a CROSS JOIN b");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Empty(join.EquiKeys);
+        Assert.Equal(DbspNet.Sql.Parser.Ast.JoinType.Inner, join.JoinType);
+    }
+
+    [Fact]
+    public void LeftJoin_WithoutEquiKey_Throws()
+    {
+        // Outer joins still require an equi-key in v1 (keyed match-presence).
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y INT NOT NULL)");
         Assert.Throws<ResolveException>(
-            () => ResolveQuery(r, "SELECT * FROM a JOIN b ON a.x > b.y"));
+            () => ResolveQuery(r, "SELECT * FROM a LEFT JOIN b ON a.x > b.y"));
     }
 
     // --- Type inference ---

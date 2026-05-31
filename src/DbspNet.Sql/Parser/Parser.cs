@@ -493,6 +493,20 @@ public sealed class Parser
         {
             var t = Peek();
             JoinType joinType;
+
+            // CROSS JOIN: unconditional pairing, no ON/USING. Desugar to an
+            // INNER JOIN with a literal-true ON predicate so it rides the
+            // existing keyless (unit-key) inner-join path in the resolver.
+            if (t.Kind == TokenKind.Cross)
+            {
+                Advance();
+                Expect(TokenKind.Join);
+                var crossRight = ParsePrimaryTableRef();
+                var onTrue = new LiteralExpression(LiteralKind.Boolean, true);
+                left = new JoinClause(left, crossRight, JoinType.Inner, onTrue);
+                continue;
+            }
+
             if (t.Kind == TokenKind.Inner)
             {
                 Advance();
