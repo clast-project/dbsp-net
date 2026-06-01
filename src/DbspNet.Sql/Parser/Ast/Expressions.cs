@@ -32,26 +32,44 @@ public sealed record ColumnReference(string? Qualifier, string Name) : Expressio
 /// <summary>Which spelling of the advancing logical clock the user wrote.</summary>
 public enum NowFunction
 {
+    /// <summary><c>NOW()</c> — TIMESTAMP-valued (microseconds since epoch).</summary>
     Now,
+
+    /// <summary><c>CURRENT_TIMESTAMP</c> — TIMESTAMP-valued; synonym of <see cref="Now"/>.</summary>
     CurrentTimestamp,
+
+    /// <summary><c>CURRENT_DATE</c> — DATE-valued: the clock truncated to its day.
+    /// Monotone, so it has sound advancing-clock semantics, but lives in day units,
+    /// not microseconds (see <c>docs/now-and-temporal-filters.md</c>).</summary>
+    CurrentDate,
+
+    /// <summary><c>CURRENT_TIME</c> — TIME-valued: the clock modulo one day. Cyclic
+    /// (wraps every midnight), hence <b>not</b> monotone, so it has no sound
+    /// advancing-clock semantics and is rejected in a temporal filter.</summary>
+    CurrentTime,
 }
 
 /// <summary>
-/// The advancing logical clock — <c>NOW()</c> / <c>CURRENT_TIMESTAMP</c>.
-/// Deliberately <b>not</b> a <see cref="FunctionCallExpression"/>: <c>NOW()</c>
-/// is not a pure function of the row (its value is the logical time, not the
-/// row), so it must never route through the scalar-function registry, whose
-/// contract is purity. Both spellings denote the same <c>TIMESTAMP</c>-typed
-/// clock value (the <see cref="Function"/> is kept only for diagnostics).
+/// The advancing logical clock — <c>NOW()</c> / <c>CURRENT_TIMESTAMP</c> /
+/// <c>CURRENT_DATE</c> / <c>CURRENT_TIME</c>.
+/// Deliberately <b>not</b> a <see cref="FunctionCallExpression"/>: the clock is
+/// not a pure function of the row (its value is the logical time, not the row),
+/// so it must never route through the scalar-function registry, whose contract
+/// is purity. <see cref="Function"/> records both the spelling (for diagnostics)
+/// and the value space: <see cref="NowFunction.Now"/> /
+/// <see cref="NowFunction.CurrentTimestamp"/> are <c>TIMESTAMP</c>,
+/// <see cref="NowFunction.CurrentDate"/> is <c>DATE</c>, and
+/// <see cref="NowFunction.CurrentTime"/> is <c>TIME</c>.
 /// </summary>
 /// <remarks>
 /// Under the temporal-filter model (option B in
 /// <c>docs/now-and-temporal-filters.md</c>) this node is legal <i>only</i>
 /// inside a sanctioned temporal-filter predicate — a comparison of a
-/// <c>TIMESTAMP</c> expression against <c>NOW()</c> (optionally shifted by a
-/// constant day-time <c>INTERVAL</c>). The resolver folds such predicates into
-/// a <see cref="Plan.TemporalFilterPlan"/> and rejects <c>NOW()</c> in every
-/// other position.
+/// <c>TIMESTAMP</c> (or, for <c>CURRENT_DATE</c>, a <c>DATE</c>) expression
+/// against the clock, optionally shifted by a constant day-time <c>INTERVAL</c>.
+/// The resolver folds such predicates into a <see cref="Plan.TemporalFilterPlan"/>
+/// and rejects the clock in every other position. <c>CURRENT_TIME</c> is cyclic
+/// and so is rejected even inside a temporal filter.
 /// </remarks>
 public sealed record NowExpression(NowFunction Function) : Expression;
 

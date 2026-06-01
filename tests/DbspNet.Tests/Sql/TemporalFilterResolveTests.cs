@@ -23,8 +23,8 @@ public class TemporalFilterResolveTests
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
         resolver.Resolve(Parser.ParseStatement(
-            "CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP NOT NULL)"));
-        var stmt = Parser.ParseStatement($"SELECT id, ts FROM events WHERE {where}");
+            "CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP NOT NULL, d DATE NOT NULL)"));
+        var stmt = Parser.ParseStatement($"SELECT id, ts, d FROM events WHERE {where}");
         return ((SelectPlan)resolver.Resolve(stmt)).Query;
     }
 
@@ -73,9 +73,9 @@ public class TemporalFilterResolveTests
         // ts <= NOW(): the row appears (inclusive) at its own timestamp and
         // never disappears.
         var tf = SingleTemporalFilter(Resolve("ts <= NOW()"));
-        Assert.Equal(0, tf.AppearOffsetMicros);
+        Assert.Equal(0, tf.AppearOffset);
         Assert.True(tf.AppearInclusive);
-        Assert.Null(tf.DisappearOffsetMicros);
+        Assert.Null(tf.DisappearOffset);
         Assert.IsType<ScanPlan>(tf.Input);
     }
 
@@ -85,8 +85,8 @@ public class TemporalFilterResolveTests
         // ts > NOW() - INTERVAL '1' HOUR  <=>  NOW() < ts + 1h: disappears
         // (exclusive) at ts + 1 hour.
         var tf = SingleTemporalFilter(Resolve("ts > NOW() - INTERVAL '1' HOUR"));
-        Assert.Null(tf.AppearOffsetMicros);
-        Assert.Equal(MicrosPerHour, tf.DisappearOffsetMicros);
+        Assert.Null(tf.AppearOffset);
+        Assert.Equal(MicrosPerHour, tf.DisappearOffset);
         Assert.False(tf.DisappearInclusive);
     }
 
@@ -95,16 +95,16 @@ public class TemporalFilterResolveTests
     {
         // NOW() >= ts  <=>  ts <= NOW(): appear inclusive at ts.
         var tf = SingleTemporalFilter(Resolve("NOW() >= ts"));
-        Assert.Equal(0, tf.AppearOffsetMicros);
+        Assert.Equal(0, tf.AppearOffset);
         Assert.True(tf.AppearInclusive);
-        Assert.Null(tf.DisappearOffsetMicros);
+        Assert.Null(tf.DisappearOffset);
     }
 
     [Fact]
     public void CurrentTimestampSpelling_IsEquivalentToNow()
     {
         var tf = SingleTemporalFilter(Resolve("ts <= CURRENT_TIMESTAMP"));
-        Assert.Equal(0, tf.AppearOffsetMicros);
+        Assert.Equal(0, tf.AppearOffset);
         Assert.True(tf.AppearInclusive);
     }
 
@@ -114,7 +114,7 @@ public class TemporalFilterResolveTests
         // ts < NOW() + INTERVAL '1' DAY  <=>  NOW() > ts - 1d: appears
         // (exclusive) at ts - 1 day.
         var tf = SingleTemporalFilter(Resolve("ts < NOW() + INTERVAL '1' DAY"));
-        Assert.Equal(-MicrosPerDay, tf.AppearOffsetMicros);
+        Assert.Equal(-MicrosPerDay, tf.AppearOffset);
         Assert.False(tf.AppearInclusive);
     }
 
@@ -125,9 +125,9 @@ public class TemporalFilterResolveTests
     {
         var tf = SingleTemporalFilter(
             Resolve("ts > NOW() - INTERVAL '1' HOUR AND ts <= NOW()"));
-        Assert.Equal(0, tf.AppearOffsetMicros);
+        Assert.Equal(0, tf.AppearOffset);
         Assert.True(tf.AppearInclusive);
-        Assert.Equal(MicrosPerHour, tf.DisappearOffsetMicros);
+        Assert.Equal(MicrosPerHour, tf.DisappearOffset);
         Assert.False(tf.DisappearInclusive);
         // A single node, not two stacked filters.
         Assert.IsType<ScanPlan>(tf.Input);
@@ -141,9 +141,9 @@ public class TemporalFilterResolveTests
         //    AND ts <= NOW()    (appear incl at ts)
         var tf = SingleTemporalFilter(
             Resolve("ts BETWEEN NOW() - INTERVAL '1' HOUR AND NOW()"));
-        Assert.Equal(0, tf.AppearOffsetMicros);
+        Assert.Equal(0, tf.AppearOffset);
         Assert.True(tf.AppearInclusive);
-        Assert.Equal(MicrosPerHour, tf.DisappearOffsetMicros);
+        Assert.Equal(MicrosPerHour, tf.DisappearOffset);
         Assert.True(tf.DisappearInclusive);
     }
 
@@ -218,5 +218,81 @@ public class TemporalFilterResolveTests
         // window valid only at one instant); reject it.
         var ex = ResolveError("ts = NOW()");
         Assert.Contains("<, <=, >, >=", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ---------- CURRENT_DATE (day-space clock) ----------
+
+    [Fact]
+    public void Parser_CurrentDate_ParsesToNowExpression()
+    {
+        var expr = new Parser(Lexer.Tokenize("CURRENT_DATE")).ParseExpression();
+        Assert.Equal(NowFunction.CurrentDate, Assert.IsType<NowExpression>(expr).Function);
+    }
+
+    [Fact]
+    public void CurrentDate_UpperBound_BuildsDateClockAppearBound()
+    {
+        // d <= CURRENT_DATE: appears (inclusive) on its own day; offsets are in
+        // whole days, and the node carries the DATE clock.
+        var tf = SingleTemporalFilter(Resolve("d <= CURRENT_DATE"));
+        Assert.Equal(TemporalClock.Date, tf.Clock);
+        Assert.Equal(0, tf.AppearOffset);
+        Assert.True(tf.AppearInclusive);
+        Assert.Null(tf.DisappearOffset);
+    }
+
+    [Fact]
+    public void CurrentDate_MinusDays_GivesWholeDayDisappearOffset()
+    {
+        // d > CURRENT_DATE - INTERVAL '7' DAY: disappears (exclusive) 7 days
+        // after the row's date — the offset is 7 (days), not microseconds.
+        var tf = SingleTemporalFilter(Resolve("d > CURRENT_DATE - INTERVAL '7' DAY"));
+        Assert.Equal(TemporalClock.Date, tf.Clock);
+        Assert.Null(tf.AppearOffset);
+        Assert.Equal(7, tf.DisappearOffset);
+        Assert.False(tf.DisappearInclusive);
+    }
+
+    [Fact]
+    public void CurrentDate_AgainstTimestampKey_IsRejected()
+    {
+        var ex = ResolveError("ts <= CURRENT_DATE");
+        Assert.Contains("DATE", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CurrentDate_SubDayIntervalOffset_IsRejected()
+    {
+        // A sub-day shift can't be represented against the day-truncated clock.
+        var ex = ResolveError("d > CURRENT_DATE - INTERVAL '1' HOUR");
+        Assert.Contains("whole number of days", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ---------- CURRENT_TIME (cyclic — rejected everywhere) ----------
+
+    [Fact]
+    public void Parser_CurrentTime_ParsesToNowExpression()
+    {
+        var expr = new Parser(Lexer.Tokenize("CURRENT_TIME")).ParseExpression();
+        Assert.Equal(NowFunction.CurrentTime, Assert.IsType<NowExpression>(expr).Function);
+    }
+
+    [Fact]
+    public void CurrentTime_InTemporalFilter_IsRejectedAsCyclic()
+    {
+        var ex = ResolveError("d <= CURRENT_TIME");
+        Assert.Contains("cyclic", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void CurrentTime_InSelectList_IsRejectedAsCyclic()
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement(
+            "CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP NOT NULL)"));
+        var ex = Assert.Throws<ResolveException>(() =>
+            resolver.Resolve(Parser.ParseStatement("SELECT CURRENT_TIME FROM events")));
+        Assert.Contains("cyclic", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }

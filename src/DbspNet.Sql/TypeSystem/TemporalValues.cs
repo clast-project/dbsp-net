@@ -23,6 +23,23 @@ public readonly record struct Date32(int Days) : IComparable<Date32>, IComparabl
     public static Date32 Parse(string s) =>
         FromDateOnly(DateOnly.ParseExact(s, "yyyy-MM-dd", CultureInfo.InvariantCulture));
 
+    /// <summary>
+    /// The day-number (days since epoch) of the calendar day containing the
+    /// instant <paramref name="microsSinceEpoch"/> — i.e. <c>CURRENT_DATE</c> of
+    /// a logical clock at that instant. This is the monotone clock-to-day
+    /// transform a <c>CURRENT_DATE</c> temporal filter runs the µs clock through
+    /// (see <c>docs/now-and-temporal-filters.md</c>). Returns a 64-bit
+    /// day-number — the same value <see cref="Days"/> carries, widened — so it
+    /// composes with the 64-bit frontier machinery; floor (not truncate toward
+    /// zero) so pre-epoch instants map to the correct day.
+    /// </summary>
+    public static long DayNumberFloor(long microsSinceEpoch)
+    {
+        var q = microsSinceEpoch / Interval.MicrosPerDay;
+        var r = microsSinceEpoch % Interval.MicrosPerDay;
+        return r < 0 ? q - 1 : q;
+    }
+
     public int CompareTo(Date32 other) => Days.CompareTo(other.Days);
 
     int IComparable.CompareTo(object? obj) => obj switch

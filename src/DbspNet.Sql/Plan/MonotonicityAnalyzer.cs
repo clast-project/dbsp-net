@@ -149,7 +149,7 @@ public static class MonotonicityAnalyzer
                 // frontier so downstream GROUP BY / join / DISTINCT can GC.
                 var input = Visit(tf.Input, memo);
                 var cols = (MonotoneColumn?[])input.Clone();
-                if (tf.DisappearOffsetMicros is not null
+                if (tf.DisappearOffset is not null
                     && tf.TimeKey is ResolvedColumn rc
                     && tf.Input is ScanPlan scan
                     && rc.Index >= 0 && rc.Index < cols.Length)

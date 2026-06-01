@@ -22,6 +22,7 @@ namespace DbspNet.Tests.Sql;
 public class TemporalFilterCompilerTests : IDisposable
 {
     private const long Hour = 3_600_000_000L;
+    private const long Day = 86_400_000_000L;
     private readonly string _snapshotDir =
         Path.Combine(Path.GetTempPath(), "dbspnet-tf-snap-" + Guid.NewGuid().ToString("N"));
 
@@ -167,6 +168,117 @@ public class TemporalFilterCompilerTests : IDisposable
         q.Step();
         Accumulate(q, acc);
         Assert.Empty(Live(acc));
+    }
+
+    // ---------- CURRENT_DATE (day-truncated clock) ----------
+
+    private static CompiledQuery CompileDate(string query)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement(
+            "CREATE TABLE evd (id INT NOT NULL, d DATE NOT NULL)"));
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(query))).Query;
+        return PlanToCircuit.Compile(plan, ArrowSqlSnapshotCodecs.Instance);
+    }
+
+    private static void AccumulateDate(CompiledQuery q, Dictionary<(int Id, int Day), long> acc)
+    {
+        foreach (var (row, w) in q.Current)
+        {
+            var key = ((int)row[0]!, ((Date32)row[1]!).Days);
+            acc.TryGetValue(key, out var cur);
+            var next = cur + w.Value;
+            if (next == 0)
+            {
+                acc.Remove(key);
+            }
+            else
+            {
+                acc[key] = next;
+            }
+        }
+    }
+
+    private static HashSet<(int, int)> LiveDate(Dictionary<(int Id, int Day), long> acc) =>
+        acc.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToHashSet();
+
+    [Fact]
+    public void CurrentDate_AppearBound_RowEntersAtDayBoundary()
+    {
+        // d <= CURRENT_DATE: the row for day 10 becomes valid exactly when the
+        // logical clock crosses into day 10. Sub-day clock movement inside day 9
+        // doesn't admit it; movement inside day 10 doesn't churn it — the clock
+        // is truncated to its day before the comparison.
+        var q = CompileDate("SELECT id, d FROM evd WHERE d <= CURRENT_DATE");
+        var acc = new Dictionary<(int, int), long>();
+
+        // Late in day 9: CURRENT_DATE = 9, row (day 10) not yet valid.
+        q.AdvanceClock(9 * Day + 23 * Hour);
+        q.Table("evd").Insert(1, new Date32(10));
+        q.Step();
+        AccumulateDate(q, acc);
+        Assert.Empty(LiveDate(acc));
+
+        // Clock crosses into day 10 (midnight) with no new input: now valid.
+        q.AdvanceClock(10 * Day);
+        q.Step();
+        AccumulateDate(q, acc);
+        Assert.Equal(new HashSet<(int, int)> { (1, 10) }, LiveDate(acc));
+
+        // Sub-day movement inside day 10: still valid, no spurious delta.
+        q.AdvanceClock(10 * Day + 5 * Hour);
+        q.Step();
+        Assert.True(q.Current.IsEmpty, "no delta for sub-day clock movement within the same day");
+    }
+
+    [Fact]
+    public void CurrentDate_DisappearBound_RowAgesOutByWholeDays()
+    {
+        // d > CURRENT_DATE - INTERVAL '2' DAY  <=>  valid while CURRENT_DATE < d + 2.
+        var q = CompileDate("SELECT id, d FROM evd WHERE d > CURRENT_DATE - INTERVAL '2' DAY");
+        var acc = new Dictionary<(int, int), long>();
+
+        q.AdvanceClock(10 * Day);
+        q.Table("evd").Insert(1, new Date32(10)); // CURRENT_DATE 10 < 12: valid
+        q.Step();
+        AccumulateDate(q, acc);
+        Assert.Equal(new HashSet<(int, int)> { (1, 10) }, LiveDate(acc));
+
+        // CURRENT_DATE reaches day 11 (still < 12): stays valid.
+        q.AdvanceClock(11 * Day + 12 * Hour);
+        q.Step();
+        AccumulateDate(q, acc);
+        Assert.Equal(new HashSet<(int, int)> { (1, 10) }, LiveDate(acc));
+
+        // CURRENT_DATE reaches day 12 (exclusive upper bound): aged out.
+        q.AdvanceClock(12 * Day);
+        q.Step();
+        AccumulateDate(q, acc);
+        Assert.Empty(LiveDate(acc));
+    }
+
+    [Fact]
+    public void CurrentDate_DisappearBound_BoundsDownstreamAggregateState()
+    {
+        // The DATE clock advertises a day-space GC frontier (CURRENT_DATE − 10
+        // days) on its time-key, so a GROUP BY d above it keeps only the trailing
+        // ~10-day window even as 100 distinct days stream through.
+        var q = CompileDate(
+            "SELECT d, COUNT(*) AS c FROM evd WHERE d > CURRENT_DATE - INTERVAL '10' DAY GROUP BY d");
+
+        for (var i = 0; i <= 100; i++)
+        {
+            q.AdvanceClock(i * Day);                 // clock tracks the newest day
+            q.Table("evd").Insert(i, new Date32(i));
+            q.Step();
+        }
+
+        var agg = q.Circuit.Operators
+            .OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>()
+            .Single();
+        Assert.True(agg.RetainedGroupCount <= 12, $"retained {agg.RetainedGroupCount}");
+        Assert.True(agg.RetainedGroupCount >= 10, $"retained {agg.RetainedGroupCount}");
     }
 
     [Fact]

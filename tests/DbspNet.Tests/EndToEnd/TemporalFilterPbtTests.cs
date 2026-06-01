@@ -30,6 +30,8 @@ namespace DbspNet.Tests.EndToEnd;
 public class TemporalFilterPbtTests
 {
     private const long Sec = 1_000_000L; // microseconds per second
+    private const long Hour = 3_600_000_000L;
+    private const long Day = 86_400_000_000L;
 
     private static readonly Gen<string> GenShape = Gen.OneOfConst(
         "SELECT ts, v FROM a WHERE ts <= NOW()",
@@ -41,44 +43,74 @@ public class TemporalFilterPbtTests
 
     // One tick: insert-only events (ts in [0,20]s, v in [-2,5]) plus a
     // non-negative clock advance (seconds) applied before the tick steps.
-    private static readonly Gen<(InputEvent[] Events, int ClockDeltaSec)> GenTick =
+    private static readonly Gen<(InputEvent[] Events, long ClockDelta)> GenTick =
         Gen.Select(
             Gen.Select(Gen.Int[0, 20], Gen.Int[-2, 5])
                 .Select(p => new InputEvent("a", [new Timestamp(p.Item1 * Sec), p.Item2], 1L))
                 .Array[0, 4],
-            Gen.Int[0, 6]);
+            Gen.Int[0, 6].Select(s => s * Sec));
 
-    private static readonly Gen<(InputEvent[] Events, int ClockDeltaSec)[]> GenRun = GenTick.Array[1, 10];
+    private static readonly Gen<(InputEvent[] Events, long ClockDelta)[]> GenRun = GenTick.Array[1, 10];
 
     [Fact]
     public void TemporalFilterIncrementalEqualsBatchAtFinalClock()
     {
-        Gen.Select(GenShape, GenRun).Sample((sql, run) => CheckOne(sql, run), iter: 2000);
+        Gen.Select(GenShape, GenRun).Sample(
+            (sql, run) => CheckOne(sql, "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)", "a", run),
+            iter: 2000);
     }
 
-    private static bool CheckOne(string sql, (InputEvent[] Events, int ClockDeltaSec)[] run)
+    // CURRENT_DATE shapes over a DATE key. The clock advances in *hours*, so a
+    // tick can stay inside one calendar day or cross several day boundaries —
+    // exercising the day-truncation of the clock that makes CURRENT_DATE linear
+    // in floor(now/day), not in now.
+    private static readonly Gen<string> GenDateShape = Gen.OneOfConst(
+        "SELECT d, v FROM a WHERE d <= CURRENT_DATE",
+        "SELECT d, v FROM a WHERE d > CURRENT_DATE - INTERVAL '3' DAY",
+        "SELECT d, v FROM a WHERE d <= CURRENT_DATE AND d > CURRENT_DATE - INTERVAL '3' DAY",
+        "SELECT d, v FROM a WHERE d BETWEEN CURRENT_DATE - INTERVAL '3' DAY AND CURRENT_DATE",
+        "SELECT d, v FROM a WHERE d <= CURRENT_DATE AND v > 0",
+        "SELECT d, COUNT(*) AS c FROM a WHERE d > CURRENT_DATE - INTERVAL '4' DAY GROUP BY d");
+
+    private static readonly Gen<(InputEvent[] Events, long ClockDelta)> GenDateTick =
+        Gen.Select(
+            Gen.Select(Gen.Int[0, 20], Gen.Int[-2, 5])
+                .Select(p => new InputEvent("a", [new Date32(p.Item1), p.Item2], 1L))
+                .Array[0, 4],
+            Gen.Int[0, 50].Select(h => h * Hour));
+
+    private static readonly Gen<(InputEvent[] Events, long ClockDelta)[]> GenDateRun = GenDateTick.Array[1, 10];
+
+    [Fact]
+    public void CurrentDateTemporalFilterIncrementalEqualsBatchAtFinalClock()
     {
-        string[] ddl = ["CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)"];
+        // Start the clock part-way into a day (Hour/2) so the day boundaries the
+        // run crosses don't all coincide with tick boundaries.
+        Gen.Select(GenDateShape, GenDateRun).Sample(
+            (sql, run) => CheckOne(sql, "CREATE TABLE a (d DATE NOT NULL, v INT NOT NULL)", "a", run, start: Hour / 2),
+            iter: 2000);
+    }
+
+    private static bool CheckOne(
+        string sql, string ddl, string table, (InputEvent[] Events, long ClockDelta)[] run, long start = 0)
+    {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
-        foreach (var s in ddl)
-        {
-            resolver.Resolve(Parser.ParseStatement(s));
-        }
+        resolver.Resolve(Parser.ParseStatement(ddl));
 
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
         var compiled = PlanToCircuit.Compile(plan);
 
         var accumulated = ZSet<StructuralRow, Z64>.Empty;
         var allEvents = new List<InputEvent>();
-        long clock = 0;
-        foreach (var (events, deltaSec) in run)
+        long clock = start;
+        foreach (var (events, delta) in run)
         {
-            clock += deltaSec * Sec;
+            clock += delta;
             compiled.AdvanceClock(clock);
             foreach (var ev in events)
             {
-                compiled.Table("a").Insert(ev.Row);
+                compiled.Table(table).Insert(ev.Row);
                 allEvents.Add(ev);
             }
 
@@ -89,7 +121,7 @@ public class TemporalFilterPbtTests
         var finalClock = clock;
         var tableStates = new Dictionary<string, ZSet<StructuralRow, Z64>>(StringComparer.Ordinal)
         {
-            ["a"] = IncrementalOracle.NetTable(allEvents, "a"),
+            [table] = IncrementalOracle.NetTable(allEvents, table),
         };
         var ctx = new BatchEvalContext(
             tableStates, new Dictionary<CteRef, ZSet<StructuralRow, Z64>>(), now: finalClock);

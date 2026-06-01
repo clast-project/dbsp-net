@@ -1951,15 +1951,36 @@ public sealed class Resolver
     }
 
     /// <summary>One side of a temporal-filter window, recognised from a single
-    /// <c>key OP NOW()±d</c> conjunct.</summary>
+    /// <c>key OP clock±d</c> conjunct. <see cref="Offset"/> and the
+    /// <see cref="TimeKey"/> are in the unit fixed by <see cref="Clock"/>
+    /// (microseconds for <see cref="TemporalClock.Timestamp"/>, whole days for
+    /// <see cref="TemporalClock.Date"/>).</summary>
     private sealed record TemporalHalfBound(
         ResolvedExpression TimeKey,
         TemporalBoundKind Kind,
-        long OffsetMicros,
-        bool Inclusive);
+        long Offset,
+        bool Inclusive,
+        TemporalClock Clock);
 
-    private static string NowDisplay(NowExpression now) =>
-        now.Function == NowFunction.CurrentTimestamp ? "CURRENT_TIMESTAMP" : "NOW()";
+    private static string NowDisplay(NowExpression now) => now.Function switch
+    {
+        NowFunction.CurrentTimestamp => "CURRENT_TIMESTAMP",
+        NowFunction.CurrentDate => "CURRENT_DATE",
+        NowFunction.CurrentTime => "CURRENT_TIME",
+        _ => "NOW()",
+    };
+
+    /// <summary>The single advancing-clock niladic inside <paramref name="e"/>
+    /// (there is exactly one on the now-side of a recognised conjunct).</summary>
+    private static NowExpression FindNow(Expression e) => e switch
+    {
+        NowExpression n => n,
+        BinaryExpression b => MentionsNow(b.Left) ? FindNow(b.Left) : FindNow(b.Right),
+        UnaryExpression u => FindNow(u.Operand),
+        IsNullExpression isn => FindNow(isn.Operand),
+        CastExpression c => FindNow(c.Operand),
+        _ => throw new ResolveException("expected an advancing-clock expression (NOW())."),
+    };
 
     /// <summary>
     /// Does this expression reference <c>NOW()</c> / <c>CURRENT_TIMESTAMP</c>
@@ -1995,9 +2016,9 @@ public sealed class Resolver
                 or BinaryOperator.Greater or BinaryOperator.GreaterEqual))
         {
             throw new ResolveException(
-                "NOW() / CURRENT_TIMESTAMP is only allowed in a temporal-filter comparison " +
-                "(<, <=, >, >=) of a TIMESTAMP expression against NOW(), e.g. " +
-                "WHERE ts > NOW() - INTERVAL '1' HOUR.");
+                "the advancing clock (NOW() / CURRENT_TIMESTAMP / CURRENT_DATE) is only allowed " +
+                "in a temporal-filter comparison (<, <=, >, >=) of a TIMESTAMP (or, for " +
+                "CURRENT_DATE, a DATE) expression against it, e.g. WHERE ts > NOW() - INTERVAL '1' HOUR.");
         }
 
         var leftNow = MentionsNow(bin.Left);
@@ -2005,43 +2026,64 @@ public sealed class Resolver
         if (leftNow && rightNow)
         {
             throw new ResolveException(
-                "NOW() may appear on only one side of a temporal-filter comparison.");
+                "the advancing clock may appear on only one side of a temporal-filter comparison.");
         }
 
         var nowSide = leftNow ? bin.Left : bin.Right;
         var keySide = leftNow ? bin.Right : bin.Left;
 
-        // Offset (microseconds) added to NOW() on the now-side: NOW() -> 0,
-        // NOW() + INTERVAL d -> +d, NOW() - INTERVAL d -> -d.
-        var nowPlusK = ParseNowOffsetMicros(nowSide, schema);
+        // The clock spelling fixes the value space (TIMESTAMP µs vs DATE days)
+        // and is rejected outright if cyclic (CURRENT_TIME).
+        var clock = ClockOf(FindNow(nowSide));
+
+        // Offset (in clock units) added to the clock on the now-side: clock -> 0,
+        // clock + INTERVAL d -> +d, clock - INTERVAL d -> -d.
+        var nowPlusK = ParseNowOffset(nowSide, schema, clock);
 
         var timeKey = ResolveScalarExpression(keySide, schema);
-        if (timeKey.Type is not SqlTimestampType)
+        var keyOk = clock == TemporalClock.Date
+            ? timeKey.Type is SqlDateType
+            : timeKey.Type is SqlTimestampType;
+        if (!keyOk)
         {
+            var expected = clock == TemporalClock.Date ? "DATE" : "TIMESTAMP";
             throw new ResolveException(
-                "the non-NOW() side of a temporal filter must be a TIMESTAMP expression; got " +
-                $"{timeKey.Type.Display}.");
+                $"the non-clock side of a CURRENT_DATE/NOW() temporal filter must be a {expected} " +
+                $"expression; got {timeKey.Type.Display}.");
         }
 
-        // Normalise to `timeKey OP NOW()+k`; flip OP if NOW() was on the left.
-        // Solving for NOW() puts the threshold at key - k, so the offset from
+        // Normalise to `timeKey OP clock+k`; flip OP if the clock was on the left.
+        // Solving for the clock puts the threshold at key - k, so the offset from
         // the key is -k.
         var op = leftNow ? FlipComparison(bin.Operator) : bin.Operator;
         var offset = checked(-nowPlusK);
         return op switch
         {
             BinaryOperator.Less =>
-                new TemporalHalfBound(timeKey, TemporalBoundKind.Appear, offset, Inclusive: false),
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Appear, offset, Inclusive: false, clock),
             BinaryOperator.LessEqual =>
-                new TemporalHalfBound(timeKey, TemporalBoundKind.Appear, offset, Inclusive: true),
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Appear, offset, Inclusive: true, clock),
             BinaryOperator.Greater =>
-                new TemporalHalfBound(timeKey, TemporalBoundKind.Disappear, offset, Inclusive: false),
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Disappear, offset, Inclusive: false, clock),
             _ => // GreaterEqual
-                new TemporalHalfBound(timeKey, TemporalBoundKind.Disappear, offset, Inclusive: true),
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Disappear, offset, Inclusive: true, clock),
         };
     }
 
-    private static long ParseNowOffsetMicros(Expression nowSide, Schema schema)
+    /// <summary>The temporal-filter value space of an advancing-clock niladic.
+    /// <c>CURRENT_TIME</c> is cyclic (<c>now mod day</c>), so it is not monotone
+    /// and has no sound advancing semantics — rejected here.</summary>
+    private static TemporalClock ClockOf(NowExpression now) => now.Function switch
+    {
+        NowFunction.CurrentDate => TemporalClock.Date,
+        NowFunction.CurrentTime => throw new ResolveException(
+            "CURRENT_TIME is cyclic (it wraps every midnight) and so is not monotone; it has no " +
+            "sound advancing-clock semantics and cannot be used in a temporal filter. Use " +
+            "CURRENT_TIMESTAMP for an absolute-time window."),
+        _ => TemporalClock.Timestamp,
+    };
+
+    private static long ParseNowOffset(Expression nowSide, Schema schema, TemporalClock clock)
     {
         switch (nowSide)
         {
@@ -2050,46 +2092,62 @@ public sealed class Resolver
             case BinaryExpression { Operator: BinaryOperator.Add } add:
                 if (add.Left is NowExpression && !MentionsNow(add.Right))
                 {
-                    return IntervalOffsetMicros(add.Right, schema);
+                    return IntervalOffset(add.Right, schema, clock);
                 }
 
                 if (add.Right is NowExpression && !MentionsNow(add.Left))
                 {
-                    return IntervalOffsetMicros(add.Left, schema);
+                    return IntervalOffset(add.Left, schema, clock);
                 }
 
                 break;
             case BinaryExpression { Operator: BinaryOperator.Subtract } sub:
-                // NOW() - INTERVAL d only; `interval - NOW()` is type-invalid.
+                // clock - INTERVAL d only; `interval - clock` is type-invalid.
                 if (sub.Left is NowExpression && !MentionsNow(sub.Right))
                 {
-                    return checked(-IntervalOffsetMicros(sub.Right, schema));
+                    return checked(-IntervalOffset(sub.Right, schema, clock));
                 }
 
                 break;
         }
 
         throw new ResolveException(
-            "unsupported NOW() expression in a temporal filter; only NOW(), " +
-            "NOW() + INTERVAL <d>, and NOW() - INTERVAL <d> (a constant day-time interval) are allowed.");
+            "unsupported advancing-clock expression in a temporal filter; only the bare clock, " +
+            "clock + INTERVAL <d>, and clock - INTERVAL <d> (a constant day-time interval) are allowed.");
     }
 
     // (FlipComparison is shared with the partitioned TOP-K recogniser above.)
 
-    private static long IntervalOffsetMicros(Expression intervalExpr, Schema schema)
+    /// <summary>The constant INTERVAL offset, in the clock's unit (microseconds
+    /// for a TIMESTAMP clock, whole days for a DATE clock). A DATE offset must be
+    /// a whole number of days — a sub-day interval shifts the day-truncated clock
+    /// off a day boundary, which the day-space comparison cannot represent.</summary>
+    private static long IntervalOffset(Expression intervalExpr, Schema schema, TemporalClock clock)
     {
         var resolved = ResolveScalarExpression(intervalExpr, schema);
         if (resolved.Type is not SqlIntervalType || resolved is not ResolvedLiteral { Value: Interval interval })
         {
             throw new ResolveException(
-                "a NOW() offset in a temporal filter must be a constant INTERVAL literal.");
+                "an advancing-clock offset in a temporal filter must be a constant INTERVAL literal.");
         }
 
         if (interval.Months != 0)
         {
             throw new ResolveException(
-                "temporal-filter NOW() offsets must be day-time intervals (DAY / HOUR / MINUTE / " +
+                "temporal-filter clock offsets must be day-time intervals (DAY / HOUR / MINUTE / " +
                 "SECOND); month/year intervals are not a constant number of microseconds.");
+        }
+
+        if (clock == TemporalClock.Date)
+        {
+            if (interval.Micros % Interval.MicrosPerDay != 0)
+            {
+                throw new ResolveException(
+                    "a CURRENT_DATE temporal-filter offset must be a whole number of days " +
+                    "(INTERVAL '<n>' DAY); a sub-day interval has no meaning against a DATE clock.");
+            }
+
+            return interval.Micros / Interval.MicrosPerDay;
         }
 
         return interval.Micros;
@@ -2131,16 +2189,19 @@ public sealed class Resolver
             var disappearIncl = false;
             var extras = new List<TemporalHalfBound>();
 
+            // Every bound on a given key shares the same clock unit (the key's
+            // type fixes it), so the first bound's clock is the node's clock.
+            var clock = byKey[key][0].Clock;
             foreach (var b in byKey[key])
             {
                 if (b.Kind == TemporalBoundKind.Appear && appearOffset is null)
                 {
-                    appearOffset = b.OffsetMicros;
+                    appearOffset = b.Offset;
                     appearIncl = b.Inclusive;
                 }
                 else if (b.Kind == TemporalBoundKind.Disappear && disappearOffset is null)
                 {
-                    disappearOffset = b.OffsetMicros;
+                    disappearOffset = b.Offset;
                     disappearIncl = b.Inclusive;
                 }
                 else
@@ -2149,12 +2210,12 @@ public sealed class Resolver
                 }
             }
 
-            plan = new TemporalFilterPlan(plan, key, appearOffset, appearIncl, disappearOffset, disappearIncl);
+            plan = new TemporalFilterPlan(plan, key, appearOffset, appearIncl, disappearOffset, disappearIncl, clock);
             foreach (var ex in extras)
             {
                 plan = ex.Kind == TemporalBoundKind.Appear
-                    ? new TemporalFilterPlan(plan, key, ex.OffsetMicros, ex.Inclusive, null, false)
-                    : new TemporalFilterPlan(plan, key, null, false, ex.OffsetMicros, ex.Inclusive);
+                    ? new TemporalFilterPlan(plan, key, ex.Offset, ex.Inclusive, null, false, clock)
+                    : new TemporalFilterPlan(plan, key, null, false, ex.Offset, ex.Inclusive, clock);
             }
         }
 
@@ -3531,11 +3592,15 @@ public sealed class Resolver
                 "IN (subquery) is only supported as a top-level conjunct of WHERE, " +
                 "or in SELECT/HAVING with NOT NULL probe and subquery column"),
             ExistsExpression e => ResolveExistsAsScalar(e, schema, subqueryMap),
+            NowExpression { Function: NowFunction.CurrentTime } => throw new ResolveException(
+                "CURRENT_TIME is cyclic (it wraps every midnight) and so is not monotone; it has no " +
+                "sound advancing-clock semantics and is not supported. Use CURRENT_TIMESTAMP for an " +
+                "absolute-time value."),
             NowExpression now => throw new ResolveException(
                 $"{NowDisplay(now)} is only allowed inside a temporal-filter predicate in WHERE " +
-                "(a comparison of a TIMESTAMP expression against NOW(), optionally shifted by a " +
-                "constant day-time INTERVAL, e.g. WHERE ts > NOW() - INTERVAL '1' HOUR). It is not " +
-                "a general scalar function."),
+                "(a comparison of a TIMESTAMP — or, for CURRENT_DATE, a DATE — expression against it, " +
+                "optionally shifted by a constant day-time INTERVAL, e.g. WHERE ts > NOW() - " +
+                "INTERVAL '1' HOUR). It is not a general scalar function."),
             _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
         };
     }

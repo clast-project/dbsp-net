@@ -1,7 +1,9 @@
 # Design note: `NOW()` / `CURRENT_TIMESTAMP` and temporal filters
 
 **Status:** **implemented (option B — advancing temporal filters).** Shipped
-2026-05/06 in five phases on `main`. This note keeps the original design
+2026-05/06 in five phases on `main`; `CURRENT_DATE` (day-truncated clock) shipped
+2026-06 and `CURRENT_TIME` is rejected as cyclic (see
+"`CURRENT_DATE` (shipped) / `CURRENT_TIME` (rejected)"). This note keeps the original design
 rationale (why `NOW()` is not a registry entry, the correctness-oracle problem,
 the three features the keyword could mean) below, and records the as-built
 shape in **"Implementation status (shipped)"** immediately following. Captured
@@ -27,12 +29,15 @@ never advances).
 - **Grammar.** A dedicated `NowExpression` AST node (never a
   `FunctionCallExpression` — it bypasses the purity-contracted registry).
   `NOW()` needs its empty arg list (a column named `now` still resolves);
-  `CURRENT_TIMESTAMP` is parenless. Recognised only in WHERE conjuncts of the
-  form `key {<|<=|>|>=} NOW() [± constant day-time INTERVAL]` (both operand
-  orders; `BETWEEN` folds into one two-bound window). `NOW()` anywhere else —
-  SELECT, projection, HAVING, disjunctions, a non-`TIMESTAMP` key, a month/year
-  offset, both sides, `=` — is a `ResolveException`. Only day-time intervals are
-  valid offsets (they are a constant number of microseconds; month/year are not).
+  `CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME` are parenless. Recognised
+  only in WHERE conjuncts of the form `key {<|<=|>|>=} clock [± constant day-time
+  INTERVAL]` (both operand orders; `BETWEEN` folds into one two-bound window).
+  The clock anywhere else — SELECT, projection, HAVING, disjunctions, a key whose
+  type doesn't match the clock, a month/year offset, both sides, `=` — is a
+  `ResolveException`. Only day-time intervals are valid offsets (they are a
+  constant number of microseconds; month/year are not). `CURRENT_DATE` takes a
+  `DATE` key with whole-day offsets (see below); `CURRENT_TIME` is rejected
+  outright as cyclic.
 - **Plan / operator.** The resolver folds qualifying conjuncts into a
   `TemporalFilterPlan` (per-row validity window affine in the time-key);
   `PlanToCircuit` compiles it to `TemporalFilterOp<TRow>`, which integrates the
@@ -52,65 +57,74 @@ never advances).
   reusing the LATENESS source/frontier plumbing, so a downstream `GROUP BY` /
   join / `DISTINCT` on the time-key GCs the same way.
 
-**Deferred follow-ons:** `CURRENT_DATE` / `CURRENT_TIME` (see below); a
-spine sibling operator; a per-row transition-time index (the operator's per-tick
-recompute is O(integral size)); monotone-*expression* time-keys (e.g.
-`date_trunc(ts)`) and filters not directly over a scan, for the downstream-GC
-frontier; the typed fast path; and WAL (approach A) per-tick clock recording for
-pure-log replay (the snapshot path is correct today).
+- **`CURRENT_DATE` (shipped).** A `DATE`-keyed temporal filter; the µs clock is
+  truncated to its day-number before the comparison, so everything (clock, key,
+  offsets) lives in day units. See **"`CURRENT_DATE` (shipped)"** below.
+- **`CURRENT_TIME` (rejected).** Cyclic, not monotone, no sound advancing
+  semantics — rejected with a clear error. See below.
 
-### `CURRENT_DATE` / `CURRENT_TIME` considerations (not yet implemented)
+**Deferred follow-ons:** a `CURRENT_TIME` frozen-constant feature (a separate
+design, see below); a spine sibling operator; a per-row transition-time index
+(the operator's per-tick recompute is O(integral size)); monotone-*expression*
+time-keys (e.g. `date_trunc(ts)`) and filters not directly over a scan, for the
+downstream-GC frontier; the typed fast path; and WAL (approach A) per-tick clock
+recording for pure-log replay (the snapshot path is correct today).
 
-These are **not** a mechanical "add two more spellings" change — the
-advancing-clock model is built on a single monotone `Int64` clock in `TIMESTAMP`
-units (microseconds since epoch), and a comparison that is *linear in `now`*
-(`now {<|<=|>|>=} timeKey + offset`). The two other niladics break one of those
-assumptions each, so each needs a decision before code:
+### `CURRENT_DATE` (shipped) / `CURRENT_TIME` (rejected)
 
-- **`CURRENT_TIMESTAMP` (shipped) is the clean case.** Clock and key are both
+The advancing-clock model is built on a single monotone `Int64` clock in
+`TIMESTAMP` units (microseconds since epoch) and a comparison *linear in `now`*
+(`now {<|<=|>|>=} timeKey + offset`). The two other niladics each break one of
+those assumptions, so each was a decision, not a spelling:
+
+- **`CURRENT_TIMESTAMP` is the clean case.** Clock and key are both
   µs-since-epoch; the comparison is linear in `now`. Nothing below applies.
 
-- **`CURRENT_DATE` is monotone but *truncated* — needs a clock transform.**
+- **`CURRENT_DATE` is monotone but *truncated* — shipped via a day-space clock.**
   A `DATE` key is days; the clock is µs. `d <= CURRENT_DATE` means
   `d <= floor(now / µs_per_day)`, which is linear in `truncate_to_day(now)`, not
-  in `now`. So the operator can't compare against the raw clock. Two viable
-  shapes, both sound:
-  1. **Clock transform.** Give `TemporalFilterOp` an optional
-     `Func<long,long> clockTransform` (default identity) applied to the clock
-     value before the validity test; for `CURRENT_DATE` it is
-     `now ⇒ floor(now / µs_per_day)`, with the time-key extracted in *days* and
-     offsets in *days* (`CURRENT_DATE - INTERVAL '1' DAY` ⇒ offset 1 day). The
-     downstream-GC frontier needs the same transform (cf. the `date_trunc`
-     `TransformedFrontier` already used for monotone group keys).
-  2. **Scale the key to µs.** Keep the clock in µs and extract the key as the
-     day's midnight (`dayNumber × µs_per_day`); then `d ≤ CURRENT_DATE` ⟺
-     `dayₘₛ ≤ now` (valid because both sides are integer days when divided by
-     `µs_per_day`). This works for the bare `<= CURRENT_DATE` form, but a
-     *shifted* bound (`d > CURRENT_DATE - INTERVAL '1' DAY`) depends on
-     `floor(now/µs_per_day)`, not `now`, so it reintroduces the truncation — i.e.
-     option 1 is the general answer; option 2 only covers the unshifted case.
+  in `now`. The implementation runs the **whole filter in day-number space**
+  (the design's "option 1", chosen because `MonotoneKey.Extract` already reads a
+  `DATE` column as its day-number, so the downstream-GC frontier must be in
+  day-numbers too):
+  - A `TemporalClock` discriminator (`Timestamp` | `Date`) on `TemporalFilterPlan`
+    fixes the unit of the clock, the extracted time-key, and the offsets. It is
+    set by the resolver from the niladic spelling, which must match the key type
+    (`CURRENT_DATE` ⟺ `DATE` key; `NOW()`/`CURRENT_TIMESTAMP` ⟺ `TIMESTAMP` key).
+  - The compiler wraps the µs `LogicalClock` in a `TransformedFrontier` with
+    `Date32.DayNumberFloor` (`now ⇒ floor(now / µs_per_day)`) and extracts the
+    key as `Date32.Days`; offsets are whole days (`CURRENT_DATE - INTERVAL '1'
+    DAY` ⇒ offset `1`). **`TemporalFilterOp` itself is unchanged** — it only ever
+    compares `long`s in whatever shared unit it's handed, so the day case is just
+    a different clock frontier + key carrier.
+  - The downstream-GC frontier is `floor(clock / µs_per_day) − offsetDays`
+    (`ClockOffsetTransform(TemporalClock.Date, …)`), matching the day-number a
+    `DATE` column extracts — so a `GROUP BY`/join/`DISTINCT` on the date key GCs
+    by whole days.
+  - The batch oracle (`BatchPlanEvaluator.TemporalValid`) applies the same
+    day-floor to `now` and reads the key as a day-number, keeping
+    incremental-equals-batch (a dedicated `CURRENT_DATE` PBT drives hour-scale
+    clock jumps so day boundaries are crossed both within and across ticks).
+  - Sub-day `INTERVAL` offsets are rejected: a sub-day shift moves the
+    day-truncated clock off a day boundary, which the day-space comparison can't
+    represent. Only whole-day (`INTERVAL '<n>' DAY`) offsets are allowed.
 
-  Recommendation: option 1 (the clock transform), reusing the existing
-  frontier-transform machinery for GC. Tractable, but it's a new operator seam +
-  analyzer/`PlanToCircuit` plumbing, not a parser tweak.
+  Option 2 ("scale the key to µs, keep the clock raw") was *not* taken: a shifted
+  bound (`d > CURRENT_DATE - INTERVAL '1' DAY`) still depends on
+  `floor(now/µs_per_day)`, so the clock must be floored regardless — at which
+  point day-space is the simpler representation.
 
-- **`CURRENT_TIME` is *cyclic* — it does not fit the advancing-clock model.**
-  `TIME` is µs-since-midnight, i.e. `now mod µs_per_day`, which wraps every
-  midnight and is therefore **not monotone**. The whole feature — forward-only
-  retractions, the GC watermark, the telescoping `validAt(finalClock)` oracle —
-  rests on a non-decreasing clock, so a `CURRENT_TIME` temporal filter has no
-  sound advancing semantics. It is only meaningful as a *frozen-per-tick
-  constant* (options A/C from the rationale below), which this design
-  deliberately did not ship. So `CURRENT_TIME` is a **product decision**, not an
-  implementation detail: either reject it in a temporal filter with a clear
-  error ("CURRENT_TIME is cyclic and not supported in a temporal filter; use
-  CURRENT_TIMESTAMP"), or introduce an explicit opt-in frozen-constant semantics
-  — but the latter is a separate feature with its own equivalence caveats.
-  Default recommendation: **reject with a clear error** until a frozen-constant
-  feature is independently justified.
-
-In short: `CURRENT_DATE` is a tractable extension once the clock-transform seam
-exists; `CURRENT_TIME` needs a product call first. Scope them as their own pass.
+- **`CURRENT_TIME` is *cyclic* — rejected.** `TIME` is µs-since-midnight, i.e.
+  `now mod µs_per_day`, which wraps every midnight and is therefore **not
+  monotone**. The whole feature — forward-only retractions, the GC watermark, the
+  telescoping `validAt(finalClock)` oracle — rests on a non-decreasing clock, so
+  a `CURRENT_TIME` temporal filter has no sound advancing semantics. It is
+  rejected with a clear error everywhere (in a temporal filter and as a general
+  scalar): *"CURRENT_TIME is cyclic (it wraps every midnight) and so is not
+  monotone; … Use CURRENT_TIMESTAMP …"*. The only meaning it *could* have is a
+  *frozen-per-tick constant* (options A/C in the rationale below) — a separate
+  feature with its own equivalence caveats, deferred until independently
+  justified.
 
 ---
 

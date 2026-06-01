@@ -111,17 +111,38 @@ internal static class BatchPlanEvaluator
 
     // ---- Temporal filter ----
 
-    // Mirror of TemporalFilterOp.IsValidAt (+ its SaturatingAdd). Kept in
-    // lockstep: a divergence here breaks the incremental-equals-batch oracle.
+    // Mirror of TemporalFilterOp.IsValidAt (+ its SaturatingAdd), with the same
+    // clock/key/offset-unit handling PlanToCircuit.CompileTemporalFilter applies:
+    // a TIMESTAMP clock compares raw µs, a DATE clock floors `now` to its
+    // day-number and reads the key as a day-number (offsets are then whole days).
+    // Kept in lockstep: a divergence here breaks the incremental-equals-batch
+    // oracle.
     private static bool TemporalValid(object? keyValue, long now, TemporalFilterPlan tf)
     {
-        if (keyValue is not Timestamp ts)
+        long key;
+        if (tf.Clock == TemporalClock.Date)
         {
-            return false; // NULL time key is never valid
+            if (keyValue is not Date32 dk)
+            {
+                return false; // NULL time key is never valid
+            }
+
+            key = dk.Days;
+            // Floor the clock to its day-number; mirror TransformedFrontier in
+            // passing the unset sentinel (logical −∞) through untouched.
+            now = now == long.MinValue ? long.MinValue : Date32.DayNumberFloor(now);
+        }
+        else
+        {
+            if (keyValue is not Timestamp ts)
+            {
+                return false; // NULL time key is never valid
+            }
+
+            key = ts.Microseconds;
         }
 
-        var key = ts.Microseconds;
-        if (tf.AppearOffsetMicros is { } a)
+        if (tf.AppearOffset is { } a)
         {
             var lower = SaturatingAdd(key, a);
             if (tf.AppearInclusive ? now < lower : now <= lower)
@@ -130,7 +151,7 @@ internal static class BatchPlanEvaluator
             }
         }
 
-        if (tf.DisappearOffsetMicros is { } d)
+        if (tf.DisappearOffset is { } d)
         {
             var upper = SaturatingAdd(key, d);
             if (tf.DisappearInclusive ? now > upper : now >= upper)

@@ -88,11 +88,29 @@ public sealed record RecursiveCtePlan(
 public sealed record FilterPlan(LogicalPlan Input, ResolvedExpression Predicate)
     : LogicalPlan(Input.Schema);
 
+/// <summary>The value space an advancing-clock temporal filter compares in —
+/// fixed by the niladic clock spelling and the type of its time-key.</summary>
+public enum TemporalClock
+{
+    /// <summary><c>NOW()</c> / <c>CURRENT_TIMESTAMP</c> against a <c>TIMESTAMP</c>
+    /// key: clock, key, and offsets are all microseconds since epoch. The
+    /// comparison is linear in the raw clock.</summary>
+    Timestamp,
+
+    /// <summary><c>CURRENT_DATE</c> against a <c>DATE</c> key: clock, key, and
+    /// offsets are all <em>whole days</em> since epoch. The µs clock is floored
+    /// to its day-number (<see cref="DbspNet.Sql.TypeSystem.Date32.DayNumberFloor"/>)
+    /// before the comparison, so it is linear in <c>truncate_to_day(now)</c>, not
+    /// in <c>now</c> — which is why this needs its own clock unit rather than
+    /// being a third spelling of the timestamp case.</summary>
+    Date,
+}
+
 /// <summary>
 /// A temporal filter (the <c>mz_now()</c>-style advancing-clock predicate).
-/// Keeps each input row only while the logical clock <c>NOW()</c> lies inside
-/// the row's validity window, derived from the row's <see cref="TimeKey"/> and
-/// the constant offsets the user wrote (e.g.
+/// Keeps each input row only while the logical clock lies inside the row's
+/// validity window, derived from the row's <see cref="TimeKey"/> and the
+/// constant offsets the user wrote (e.g.
 /// <c>WHERE ts &gt; NOW() - INTERVAL '1' HOUR AND ts &lt;= NOW()</c>). Unlike an
 /// ordinary <see cref="FilterPlan"/>, validity changes <i>as the clock
 /// advances, with no new input</i>: a row is retracted on the tick the clock
@@ -100,25 +118,31 @@ public sealed record FilterPlan(LogicalPlan Input, ResolvedExpression Predicate)
 /// Compiles to the time-driven <c>TemporalFilterOp</c>.
 /// </summary>
 /// <remarks>
-/// <para>All bounds are affine in <see cref="TimeKey"/> (microseconds since the
-/// epoch, the <c>TIMESTAMP</c> unit). The row is valid at logical time
-/// <c>now</c> iff
-/// <c>now {&gt;|&gt;=} TimeKey + AppearOffsetMicros</c> (when an appear bound is
-/// present) <b>and</b> <c>now {&lt;|&lt;=} TimeKey + DisappearOffsetMicros</c>
+/// <para>All bounds are affine in <see cref="TimeKey"/>. The row is valid at
+/// logical time <c>now</c> iff
+/// <c>now {&gt;|&gt;=} TimeKey + AppearOffset</c> (when an appear bound is
+/// present) <b>and</b> <c>now {&lt;|&lt;=} TimeKey + DisappearOffset</c>
 /// (when a disappear bound is present); inclusivity is carried by
 /// <see cref="AppearInclusive"/> / <see cref="DisappearInclusive"/>. A null
 /// offset means that side is unbounded. A null <see cref="TimeKey"/> value at
 /// runtime (nullable key) is never valid.</para>
+/// <para><see cref="Clock"/> fixes the unit of <c>now</c>, the extracted
+/// <see cref="TimeKey"/>, and the offsets: microseconds since epoch for
+/// <see cref="TemporalClock.Timestamp"/>, whole days since epoch for
+/// <see cref="TemporalClock.Date"/>. The compiler runs the µs logical clock
+/// through the matching transform before the operator (and the downstream-GC
+/// frontier) sees it.</para>
 /// <para>Schema is the input's, unchanged — a temporal filter only restricts
 /// which rows survive, never their shape.</para>
 /// </remarks>
 public sealed record TemporalFilterPlan(
     LogicalPlan Input,
     ResolvedExpression TimeKey,
-    long? AppearOffsetMicros,
+    long? AppearOffset,
     bool AppearInclusive,
-    long? DisappearOffsetMicros,
-    bool DisappearInclusive) : LogicalPlan(Input.Schema);
+    long? DisappearOffset,
+    bool DisappearInclusive,
+    TemporalClock Clock) : LogicalPlan(Input.Schema);
 
 /// <summary>
 /// One <c>ORDER BY</c> sort key for a <see cref="TopKPlan"/>: an expression
