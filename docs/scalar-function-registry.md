@@ -1,12 +1,28 @@
 # Design note: a scalar-function registry (`IScalarFunction`)
 
-**Status:** proposed / deferred (not implemented). Captured 2026-05 while adding
-the `SUBSTRING` / `TRIM` / `REPLACE` / `POSITION` / `SIGN` / `LN` / `LOG` /
-`EXP` builtins, to record *why* the current hardcoded approach is fine for now
-and *what* a registration framework would (and would not) buy us.
+**Status:** *phase 1 landed* (2026-05). `IScalarFunction` +
+`ScalarFunctionRegistry` exist and are the single dispatch authority: all four
+sites (resolver scalar + post-aggregate, structural compiler, typed compiler)
+route through `ScalarFunctionRegistry`, which consults registered entries first
+and **falls through to the legacy `BuiltinScalarFunctions` /
+`TypedBuiltinScalarFunctions` switches** for not-yet-ported names. The first
+registry-native entries are the temporal functions `EXTRACT`/`DATE_PART`,
+`DATE_TRUNC`, `DATEADD`, `DATEDIFF` (see `TemporalScalarFunctions.cs`).
 
-This is a refactor + extension-point proposal, not a feature on the critical
-path. Read it before adding many more builtins, before wiring a monotone-
+**Remaining work** (the migration the rest of this note describes):
+- Port the ~25 existing builtins (COALESCE, the string family, the numeric
+  family, GREATEST/LEAST, NULLIF) into `IScalarFunction` entries
+  function-by-function, deleting each legacy switch arm as its entry lands
+  (phase 2), then delete the now-thin switch shells (phase 3). Mechanical;
+  keep `ScalarFunctionTests` + the random-query PBT green per batch.
+- Add the optional `Monotonicity()` hook + wire it into
+  `MonotonicityAnalyzer` (phase 4) — the LATENESS-GC payoff. **Not yet
+  modeled** on the interface (kept minimal: Resolve / BuildStructural /
+  BuildTyped only).
+- UDF surface (phase 5, deferred).
+
+The original proposal follows; it captures *why* a registry and *what* it
+buys us. Read it before porting the next builtin, before wiring the monotone-
 function catalog for LATENESS, or before considering user-defined functions
 (UDFs, tracked P2 in `skipped.md`).
 

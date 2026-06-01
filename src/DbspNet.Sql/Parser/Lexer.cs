@@ -92,6 +92,7 @@ public sealed class Lexer
         ["time"] = TokenKind.Time,
         ["timestamp"] = TokenKind.Timestamp,
         ["interval"] = TokenKind.Interval,
+        ["extract"] = TokenKind.Extract,
     };
 
     private readonly string _source;

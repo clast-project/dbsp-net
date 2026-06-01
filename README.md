@@ -302,8 +302,11 @@ beyond "Feldera is much bigger":
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING| BOTH … FROM …)`
   keyword spellings are not (use the comma / char-set forms).
 - Scalar function library covers the common arithmetic / string set
-  listed above; missing pieces include other math (`SIN`/`COS`/`TAN`,
-  `MOD`), and anything involving dates/times.
+  listed above plus temporal functions `EXTRACT(field FROM …)` /
+  `DATE_PART`, `DATE_TRUNC`, `DATEADD`, `DATEDIFF` (dispatched through an
+  `IScalarFunction` registry; `DATEADD`/`DATEDIFF` take a string-literal unit,
+  not SQL Server's bare keyword). Missing pieces include other math
+  (`SIN`/`COS`/`TAN`, `MOD`) and `NOW`/`CURRENT_TIMESTAMP` (non-deterministic).
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
   polymorphic "unknown" of PostgreSQL.
 - `INTERVAL` (core) and date/time arithmetic are supported; deferred pieces

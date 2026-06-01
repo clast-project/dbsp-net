@@ -1286,6 +1286,8 @@ public sealed class Parser
                 return inner;
             case TokenKind.Interval:
                 return ParseIntervalLiteral();
+            case TokenKind.Extract:
+                return ParseExtractExpression();
             case TokenKind.Cast:
                 return ParseCastExpression();
             case TokenKind.Coalesce:
@@ -1499,6 +1501,26 @@ public sealed class Parser
         return new CastExpression(
             new LiteralExpression(LiteralKind.String, strTok.Text),
             new SqlTypeSpec("INTERVAL", IntervalQualifier: qualifier));
+    }
+
+    /// <summary>
+    /// Parse <c>EXTRACT(field FROM source)</c>. The <c>field</c> is a bare
+    /// identifier (YEAR, MONTH, …, non-reserved) lowered to a string-literal
+    /// first argument, so the call shares the <c>extract</c> registry entry
+    /// with <c>DATE_PART('field', source)</c>.
+    /// </summary>
+    private Expression ParseExtractExpression()
+    {
+        Expect(TokenKind.Extract);
+        Expect(TokenKind.LParen);
+        var field = ExpectIdentifier("extract field");
+        Expect(TokenKind.From);
+        var source = ParseExpression();
+        Expect(TokenKind.RParen);
+        return new FunctionCallExpression(
+            "extract",
+            new Expression[] { new LiteralExpression(LiteralKind.String, field), source },
+            IsStar: false);
     }
 
     private FunctionCallExpression ParseCoalesceExpression()

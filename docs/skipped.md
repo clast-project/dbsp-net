@@ -499,17 +499,21 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   `SUBSTRING`/`SUBSTR`, `TRIM`/`LTRIM`/`RTRIM` (whitespace default or a
   custom char set), `REPLACE`, `POSITION(x IN y)`/`STRPOS`, `ABS`, `FLOOR`,
   `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG`
-  (base-10, or `LOG(b, x)`), `EXP`, `GREATEST`, `LEAST`, `NULLIF`. String
-  functions are native UTF-8 / code-point. `SIGN`/`LN`/`LOG`/`EXP` cast the
-  operand to DOUBLE in the resolver (sign included — exact for every
-  representable value), so the multi-arg string functions are the only ones
-  that fall back from the typed-row fast path to the structural compile.
+  (base-10, or `LOG(b, x)`), `EXP`, `GREATEST`, `LEAST`, `NULLIF`, and the
+  temporal functions `EXTRACT(field FROM …)` / `DATE_PART`, `DATE_TRUNC`,
+  `DATEADD`, `DATEDIFF`. String functions are native UTF-8 / code-point.
+  `SIGN`/`LN`/`LOG`/`EXP` cast the operand to DOUBLE in the resolver, so the
+  multi-arg string functions and the temporal functions fall back from the
+  typed-row fast path to the structural compile (matching temporal
+  arithmetic / comparison behaviour).
   Missing and commonly needed: other math (`SIN`/`COS`/`TAN`, `MOD`,
-  `TRUNC`) and anything involving dates/times. Adding one is a single entry
-  in <c>BuiltinScalarFunctions</c> (resolve + structural build + typed
-  build). Reifying that into an `IScalarFunction` registry — removing the
-  parallel-switch drift surface and adding a monotonicity hook for LATENESS
-  — is sketched in
+  `TRUNC`) and `NOW`/`CURRENT_TIMESTAMP` (non-deterministic — would need a
+  once-per-step evaluation, not per-row, to stay incrementally correct).
+  **Dispatch now routes through `ScalarFunctionRegistry`** (the
+  `IScalarFunction` framework — phase 1 landed; the temporal functions are its
+  first native entries); the ~25 legacy builtins still live in the
+  `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions` switches and are
+  reached by fallthrough, to be ported function-by-function. See
   [`scalar-function-registry.md`](scalar-function-registry.md). The keyword
   spellings
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|BOTH … FROM …)`

@@ -3813,7 +3813,7 @@ public sealed class Resolver
         Schema? outerSchema = null,
         IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
-        if (!BuiltinScalarFunctions.IsKnown(fn.FunctionName))
+        if (!ScalarFunctionRegistry.IsKnown(fn.FunctionName))
         {
             throw new ResolveException($"unknown function '{fn.FunctionName}'");
         }
@@ -3824,7 +3824,7 @@ public sealed class Resolver
             args.Add(ResolveScalarExpression(a, schema, subqueryMap, outerSchema, preBound));
         }
 
-        return BuiltinScalarFunctions.Resolve(fn.FunctionName, args);
+        return ScalarFunctionRegistry.Resolve(fn.FunctionName, args);
     }
 
     private static void EnsureBooleanCoercible(ResolvedExpression e, string context)
@@ -3974,7 +3974,7 @@ public sealed class Resolver
             BinaryExpression bin => BuildBinaryPost(bin, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
             IsNullExpression isn => BuildIsNullPost(isn, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
             CastExpression cast => BuildCastPost(cast, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
-            FunctionCallExpression fn when BuiltinScalarFunctions.IsKnown(fn.FunctionName) && !IsAggregateName(fn.FunctionName, fn.IsStar)
+            FunctionCallExpression fn when ScalarFunctionRegistry.IsKnown(fn.FunctionName) && !IsAggregateName(fn.FunctionName, fn.IsStar)
                 => BuildBuiltinCallPost(fn, preSchema, groupKeys, aggregates, aggIndex, aggStartColumn, subqueryMap, postSchema, preBound),
             ColumnReference cr => throw new ResolveException(
                 $"column '{(cr.Qualifier is null ? cr.Name : cr.Qualifier + "." + cr.Name)}' must appear in GROUP BY or in an aggregate"),
@@ -4089,7 +4089,7 @@ public sealed class Resolver
             args.Add(ResolvePostAggregateExpression(a, pre, gk, aggs, idx, start, subMap, postSchema, preBound));
         }
 
-        return BuiltinScalarFunctions.Resolve(fn.FunctionName, args);
+        return ScalarFunctionRegistry.Resolve(fn.FunctionName, args);
     }
 
     private static AggregateKind ToAggregateKind(FunctionCallExpression call)

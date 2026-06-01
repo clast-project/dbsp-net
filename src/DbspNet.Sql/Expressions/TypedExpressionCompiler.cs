@@ -802,7 +802,7 @@ public static class TypedExpressionCompiler
             args[i] = Build(fn.Arguments[i], row, rowType);
         }
 
-        return TypedBuiltinScalarFunctions.TryBuild(fn, fn.Arguments, args)
+        return ScalarFunctionRegistry.BuildTyped(fn, fn.Arguments, args)
             ?? throw Unsupported();
     }
 

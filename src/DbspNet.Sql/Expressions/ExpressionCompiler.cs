@@ -616,7 +616,7 @@ public static class ExpressionCompiler
 
     private static Expression BuildFunction(ResolvedFunctionCall fn, ParameterExpression row)
     {
-        return BuiltinScalarFunctions.Build(fn, arg => Build(arg, row));
+        return ScalarFunctionRegistry.BuildStructural(fn, arg => Build(arg, row));
     }
 
     /// <summary>
