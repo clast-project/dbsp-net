@@ -11,6 +11,7 @@ using DbspNet.Core.Operators.Stateful.Aggregators;
 using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Compiler;
 
@@ -511,6 +512,9 @@ public static class PlanToCircuit
                 case FilterPlan f:
                     Walk(f.Input);
                     break;
+                case TemporalFilterPlan tf:
+                    Walk(tf.Input);
+                    break;
                 case ProjectPlan pr:
                     Walk(pr.Input);
                     break;
@@ -604,6 +608,9 @@ public static class PlanToCircuit
                     return builder.Filter(input, row => predicate(row));
                 }
 
+            case TemporalFilterPlan tf:
+                return CompileTemporalFilter(builder, tf, ctx);
+
             case ProjectPlan p:
                 return CompileProjection(builder, p, ctx);
 
@@ -664,6 +671,33 @@ public static class PlanToCircuit
             default:
                 throw new InvalidOperationException($"unsupported plan node {plan.GetType().Name}");
         }
+    }
+
+    // ---- Temporal filter (NOW() / advancing-clock predicate) ----
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompileTemporalFilter(
+        CircuitBuilder builder,
+        TemporalFilterPlan plan,
+        CompileContext ctx)
+    {
+        var input = CompilePlan(builder, plan.Input, ctx);
+
+        // The time key is a TIMESTAMP-typed expression; extract its microseconds
+        // (the clock unit). A NULL value maps to null — never valid.
+        var timeKeyScalar = ExpressionCompiler.CompileScalar(plan.TimeKey);
+        Func<StructuralRow, long?> timeKey = row =>
+            timeKeyScalar(row) is Timestamp ts ? ts.Microseconds : null;
+
+        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
+        return builder.TemporalFilter(
+            input,
+            timeKey,
+            plan.AppearOffsetMicros,
+            plan.AppearInclusive,
+            plan.DisappearOffsetMicros,
+            plan.DisappearInclusive,
+            builder.LogicalClock,
+            codec);
     }
 
     // ---- TOP-K (ORDER BY ... LIMIT/OFFSET) ----

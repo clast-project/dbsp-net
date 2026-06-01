@@ -42,6 +42,13 @@ public sealed class CompiledQuery
     /// </summary>
     public void Step() => Circuit.Step();
 
+    /// <summary>
+    /// Convenience: advance the logical clock (<c>NOW()</c> for temporal filters)
+    /// to <paramref name="microsSinceEpoch"/> before the next <see cref="Step"/>.
+    /// Monotone non-decreasing; see <see cref="RootCircuit.AdvanceTime"/>.
+    /// </summary>
+    public void AdvanceClock(long microsSinceEpoch) => Circuit.AdvanceTime(microsSinceEpoch);
+
     public TableInput Table(string name) => Inputs[name];
 
     /// <summary>The current output Z-set (only meaningful after <see cref="Step"/>).</summary>

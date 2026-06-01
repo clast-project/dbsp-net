@@ -39,6 +39,39 @@ public static class StatefulOperators
         return output;
     }
 
+    /// <summary>
+    /// Temporal filter (the advancing-clock predicate): keep each input row
+    /// only while the logical clock <paramref name="clock"/> lies inside the
+    /// row's validity window — <c>now {&gt;|&gt;=} timeKey + appearOffset</c> and
+    /// <c>now {&lt;|&lt;=} timeKey + disappearOffset</c> — emitting inserts and
+    /// retractions as the clock advances with no new input. A null offset leaves
+    /// that side unbounded; a null <paramref name="timeKey"/> value is never
+    /// valid. Offsets are in the same unit as the clock (microseconds).
+    /// </summary>
+    public static Stream<ZSet<TRow, Z64>> TemporalFilter<TRow>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TRow, Z64>> input,
+        Func<TRow, long?> timeKey,
+        long? appearOffsetMicros,
+        bool appearInclusive,
+        long? disappearOffsetMicros,
+        bool disappearInclusive,
+        IFrontier clock,
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        where TRow : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(timeKey);
+        ArgumentNullException.ThrowIfNull(clock);
+
+        var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
+        builder.AddRawOperator(new TemporalFilterOp<TRow>(
+            input, output, timeKey, appearOffsetMicros, appearInclusive,
+            disappearOffsetMicros, disappearInclusive, clock, snapshotCodec));
+        return output;
+    }
+
     public static Stream<ZSet<TKey, TWeight>> Distinct<TKey, TWeight>(
         this CircuitBuilder builder,
         Stream<ZSet<TKey, TWeight>> input,

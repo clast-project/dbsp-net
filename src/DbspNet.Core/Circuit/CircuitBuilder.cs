@@ -19,6 +19,13 @@ public sealed class CircuitBuilder
     }
 
     /// <summary>
+    /// The circuit's logical clock as a read-only frontier — the <c>NOW()</c>
+    /// value temporal-filter operators read each tick. See
+    /// <see cref="RootCircuit.Clock"/>.
+    /// </summary>
+    internal DbspNet.Core.Operators.Stateful.IFrontier LogicalClock => _root.Clock;
+
+    /// <summary>
     /// Create an input port with a zero value (used if no push is made on a
     /// given tick) and a merge function (used when <see cref="InputHandle{T}.Push"/>
     /// is called multiple times between two <see cref="RootCircuit.Step"/> calls).

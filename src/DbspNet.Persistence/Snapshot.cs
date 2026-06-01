@@ -266,6 +266,13 @@ public static class Snapshot
                 $"match circuit's operator count {circuit.Operators.Count}");
         }
 
+        // Restore the tick counter and the logical clock *before* loading
+        // operators: a temporal-filter operator recomputes its emitted window
+        // against the clock during LoadAsync, so the clock must already hold its
+        // end-of-tick value or the post-load delta would be wrong.
+        circuit.RestoreTickCount(manifest.Tick);
+        circuit.RestoreLogicalTime(manifest.LogicalTime);
+
         var restored = 0;
         foreach (var i in manifest.SnapshottedIndices)
         {
@@ -281,8 +288,6 @@ public static class Snapshot
             restored++;
         }
 
-        circuit.RestoreTickCount(manifest.Tick);
-        circuit.RestoreLogicalTime(manifest.LogicalTime);
         return restored;
     }
 

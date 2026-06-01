@@ -1,5 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Operators.Stateful;
+
 namespace DbspNet.Core.Circuit;
 
 /// <summary>
@@ -38,6 +40,21 @@ public sealed class RootCircuit
     /// filter admits nothing until the host has advanced the clock at least once.
     /// </summary>
     public long LogicalTime => Interlocked.Read(ref _logicalTime);
+
+    /// <summary>
+    /// The logical clock exposed as a read-only <see cref="IFrontier"/>, for
+    /// temporal-filter operators that advance with it (and, in time, for
+    /// unification with LATENESS frontiers — the clock <em>is</em> a watermark).
+    /// Its <see cref="IFrontier.Value"/> tracks <see cref="LogicalTime"/> live.
+    /// </summary>
+    public IFrontier Clock => _clock ??= new ClockFrontier(this);
+
+    private ClockFrontier? _clock;
+
+    private sealed class ClockFrontier(RootCircuit owner) : IFrontier
+    {
+        public long Value => owner.LogicalTime;
+    }
 
     /// <summary>
     /// Advance the logical clock to <paramref name="microsSinceEpoch"/>
