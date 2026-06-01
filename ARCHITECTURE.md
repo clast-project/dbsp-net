@@ -243,8 +243,15 @@ bounded-memory. The mechanism spans the plan and the runtime:
 - **Plan.** `ScanPlan.ColumnLateness` carries the per-column bound (native
   units) from the catalog. `MonotonicityAnalyzer` (`DbspNet.Sql/Plan/`) walks
   the plan and records, per node/column, which `LatenessSource`s prove it
-  monotone — propagating through filters, bare-column projections, equi-joins,
+  monotone — propagating through filters, projections, equi-joins,
   group-key inheritance, and set ops (monotone iff monotone in *every* branch).
+  A projection stays monotone not only for a bare column but through a monotone
+  scalar function (`date_trunc`, `dateadd`, via the `IScalarFunction.Monotonicity`
+  hook) or a forward shift (`ts + interval`); such a column also carries a
+  `Func<long,long>` **frontier transform**. Because `date_trunc` lowers values,
+  the group-key GC site wraps its frontier in a `TransformedFrontier` so the
+  bound is mapped into the key space before it thresholds keys; forward shifts
+  use an identity transform (the raw frontier stays sound, just conservative).
   Soundness over completeness: anything unproven is non-monotone, so GC just
   doesn't engage.
 - **Input side.** `PlanToCircuit` interposes a `LatenessOperator` per

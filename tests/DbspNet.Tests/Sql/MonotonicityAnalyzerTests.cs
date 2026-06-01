@@ -171,6 +171,81 @@ public class MonotonicityAnalyzerTests
         Assert.True(MonotonicityAnalyzer.Analyze(distinct).IsMonotone(distinct, 0));
     }
 
+    // ---- Phase 4: monotone scalar functions / forward-shift arithmetic ----
+
+    private static readonly SqlType Ts = new SqlTimestampType(false);
+
+    private static ScanPlan TsScan() =>
+        new("t", new Schema(new[] { new SchemaColumn("ts", Ts), new SchemaColumn("v", Bigint) }),
+            new Dictionary<int, long> { { 0, 1000L } });
+
+    private static ResolvedLiteral Str(string s) =>
+        new(LiteralKind.String, Utf8String.Of(s), new SqlVarcharType(null, false));
+
+    [Fact]
+    public void Project_DateTrunc_StaysMonotone()
+    {
+        var scan = TsScan();
+        var dateTrunc = new ResolvedFunctionCall(
+            "date_trunc", new ResolvedExpression[] { Str("day"), new ResolvedColumn(0, Ts) }, Ts);
+        var project = new ProjectPlan(
+            scan, new[] { new ProjectionItem(dateTrunc, "day") }, new Schema(new[] { new SchemaColumn("day", Ts) }));
+        var info = MonotonicityAnalyzer.Analyze(project);
+
+        Assert.True(info.IsMonotone(project, 0));
+        Assert.Contains(new LatenessSource("t", 0), info.Sources(project, 0)!);
+    }
+
+    [Fact]
+    public void Project_Extract_IsNotMonotone()
+    {
+        // EXTRACT(HOUR FROM ts) wraps (0..23) — not monotone in ts.
+        var scan = TsScan();
+        var extract = new ResolvedFunctionCall(
+            "extract", new ResolvedExpression[] { Str("hour"), new ResolvedColumn(0, Ts) }, Bigint);
+        var project = new ProjectPlan(
+            scan, new[] { new ProjectionItem(extract, "h") }, new Schema(new[] { new SchemaColumn("h", Bigint) }));
+        Assert.False(MonotonicityAnalyzer.Analyze(project).IsMonotone(project, 0));
+    }
+
+    [Fact]
+    public void Project_ColumnPlusNonNegativeConstant_StaysMonotone()
+    {
+        var scan = Scan("t", new[] { "ts", "v" }, 0);
+        var shifted = new ResolvedBinary(
+            BinaryOperator.Add, Col(0), new ResolvedLiteral(LiteralKind.Integer, 5, Bigint), Bigint);
+        var project = new ProjectPlan(
+            scan, new[] { new ProjectionItem(shifted, "shifted") }, Sch("shifted"));
+        var info = MonotonicityAnalyzer.Analyze(project);
+
+        Assert.True(info.IsMonotone(project, 0));
+        Assert.Contains(new LatenessSource("t", 0), info.Sources(project, 0)!);
+    }
+
+    [Fact]
+    public void Project_ColumnMinusConstant_IsNotMonotone()
+    {
+        // Only forward shifts (Add of a non-negative constant) are recognised;
+        // subtraction is left unproven (it would need a non-identity frontier).
+        var scan = Scan("t", new[] { "ts", "v" }, 0);
+        var shifted = new ResolvedBinary(
+            BinaryOperator.Subtract, Col(0), new ResolvedLiteral(LiteralKind.Integer, 5, Bigint), Bigint);
+        var project = new ProjectPlan(
+            scan, new[] { new ProjectionItem(shifted, "shifted") }, Sch("shifted"));
+        Assert.False(MonotonicityAnalyzer.Analyze(project).IsMonotone(project, 0));
+    }
+
+    [Fact]
+    public void Project_ColumnPlusNegativeConstant_IsNotMonotone()
+    {
+        var scan = Scan("t", new[] { "ts", "v" }, 0);
+        var shifted = new ResolvedBinary(
+            BinaryOperator.Add, Col(0), new ResolvedLiteral(LiteralKind.Integer, -5, Bigint), Bigint);
+        var project = new ProjectPlan(
+            scan, new[] { new ProjectionItem(shifted, "shifted") }, Sch("shifted"));
+        Assert.False(MonotonicityAnalyzer.Analyze(project).IsMonotone(project, 0));
+    }
+
     [Fact]
     public void FullPropagation_FrontierSurvivesFilterAndProjectToGroupBy()
     {

@@ -2,7 +2,9 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
 using System.Linq;
+using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Parser.Ast;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Plan;
 
@@ -14,10 +16,21 @@ namespace DbspNet.Sql.Plan;
 public readonly record struct LatenessSource(string Table, int Column);
 
 /// <summary>
+/// A provably-monotone output column: the <see cref="LatenessSource"/>s whose
+/// advancing frontiers bound it, plus an optional <see cref="FrontierTransform"/>
+/// mapping a source-space frontier value into this column's value space.
+/// <c>null</c> transform means identity — the raw frontier is a sound (if
+/// conservative) GC threshold, which holds for forward shifts (<c>ts + interval</c>).
+/// A non-null transform (e.g. <c>date_trunc</c>) must be applied to the frontier
+/// before it can threshold this column's keys.
+/// </summary>
+internal sealed record MonotoneColumn(IReadOnlySet<LatenessSource> Sources, Func<long, long>? FrontierTransform);
+
+/// <summary>
 /// Per-node, per-output-column monotonicity verdicts produced by
 /// <see cref="MonotonicityAnalyzer"/>. A column maps to the set of
-/// <see cref="LatenessSource"/>s whose advancing frontiers bound it; a
-/// <c>null</c> entry means the column is not provably monotone (no GC).
+/// <see cref="LatenessSource"/>s whose advancing frontiers bound it (and an
+/// optional frontier transform); a non-monotone column has no entry (no GC).
 /// </summary>
 /// <remarks>
 /// Keyed by plan-node reference identity — two structurally-equal subplans are
@@ -25,19 +38,14 @@ public readonly record struct LatenessSource(string Table, int Column);
 /// </remarks>
 public sealed class MonotonicityInfo
 {
-    private readonly Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]> _byNode;
+    private readonly Dictionary<LogicalPlan, MonotoneColumn?[]> _byNode;
 
-    internal MonotonicityInfo(Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]> byNode)
+    internal MonotonicityInfo(Dictionary<LogicalPlan, MonotoneColumn?[]> byNode)
     {
         _byNode = byNode;
     }
 
-    /// <summary>
-    /// The <c>LATENESS</c> sources bounding output column <paramref name="column"/>
-    /// of <paramref name="node"/>, or <c>null</c> if the column is not provably
-    /// monotone.
-    /// </summary>
-    public IReadOnlySet<LatenessSource>? Sources(LogicalPlan node, int column)
+    private MonotoneColumn? Get(LogicalPlan node, int column)
     {
         ArgumentNullException.ThrowIfNull(node);
         return _byNode.TryGetValue(node, out var cols) && column >= 0 && column < cols.Length
@@ -45,15 +53,30 @@ public sealed class MonotonicityInfo
             : null;
     }
 
+    /// <summary>
+    /// The <c>LATENESS</c> sources bounding output column <paramref name="column"/>
+    /// of <paramref name="node"/>, or <c>null</c> if the column is not provably
+    /// monotone.
+    /// </summary>
+    public IReadOnlySet<LatenessSource>? Sources(LogicalPlan node, int column) => Get(node, column)?.Sources;
+
+    /// <summary>
+    /// The frontier transform for output column <paramref name="column"/> of
+    /// <paramref name="node"/> (see <see cref="MonotoneColumn"/>), or <c>null</c>
+    /// for identity / non-monotone.
+    /// </summary>
+    internal Func<long, long>? FrontierTransform(LogicalPlan node, int column) => Get(node, column)?.FrontierTransform;
+
     /// <summary>True iff output column <paramref name="column"/> of <paramref name="node"/> is provably monotone.</summary>
-    public bool IsMonotone(LogicalPlan node, int column) => Sources(node, column) is not null;
+    public bool IsMonotone(LogicalPlan node, int column) => Get(node, column) is not null;
 }
 
 /// <summary>
 /// Propagates each declared <c>LATENESS</c> column's monotonicity (and the
 /// advancing frontier behind it) through the logical plan, so that any stateful
 /// operator whose key is monotone — directly or via filters, projections,
-/// joins, unions, or aggregates — can be wired for frontier-driven GC.
+/// monotone scalar functions / forward-shift arithmetic, joins, unions, or
+/// aggregates — can be wired for frontier-driven GC.
 /// </summary>
 /// <remarks>
 /// <para><b>Soundness over completeness.</b> A column is marked monotone only
@@ -67,14 +90,14 @@ public static class MonotonicityAnalyzer
     public static MonotonicityInfo Analyze(LogicalPlan plan)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        var memo = new Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]>(ReferenceEqualityComparer.Instance);
+        var memo = new Dictionary<LogicalPlan, MonotoneColumn?[]>(ReferenceEqualityComparer.Instance);
         Visit(plan, memo);
         return new MonotonicityInfo(memo);
     }
 
-    private static IReadOnlySet<LatenessSource>?[] Visit(
+    private static MonotoneColumn?[] Visit(
         LogicalPlan node,
-        Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]> memo)
+        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
     {
         if (memo.TryGetValue(node, out var cached))
         {
@@ -86,22 +109,22 @@ public static class MonotonicityAnalyzer
         return result;
     }
 
-    private static IReadOnlySet<LatenessSource>?[] Compute(
+    private static MonotoneColumn?[] Compute(
         LogicalPlan node,
-        Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]> memo)
+        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
     {
         switch (node)
         {
             case ScanPlan s:
             {
-                var cols = new IReadOnlySet<LatenessSource>?[s.Schema.Count];
+                var cols = new MonotoneColumn?[s.Schema.Count];
                 if (s.ColumnLateness is { } lateness)
                 {
                     foreach (var i in lateness.Keys)
                     {
                         if (i >= 0 && i < cols.Length)
                         {
-                            cols[i] = new HashSet<LatenessSource> { new(s.TableName, i) };
+                            cols[i] = new MonotoneColumn(new HashSet<LatenessSource> { new(s.TableName, i) }, null);
                         }
                     }
                 }
@@ -117,19 +140,10 @@ public static class MonotonicityAnalyzer
             case ProjectPlan p:
             {
                 var input = Visit(p.Input, memo);
-                var cols = new IReadOnlySet<LatenessSource>?[p.Projections.Count];
+                var cols = new MonotoneColumn?[p.Projections.Count];
                 for (var i = 0; i < p.Projections.Count; i++)
                 {
-                    // A bare pass-through of a monotone input column stays
-                    // monotone. Transforming expressions are conservatively not
-                    // monotone — this is the monotone-function catalog extension
-                    // point (e.g. date_trunc, ts + const), deferred.
-                    if (p.Projections[i].Expression is ResolvedColumn rc
-                        && rc.Index >= 0 && rc.Index < input.Length
-                        && input[rc.Index] is { } src)
-                    {
-                        cols[i] = src;
-                    }
+                    cols[i] = FromExpr(p.Projections[i].Expression, input);
                 }
 
                 return cols;
@@ -142,15 +156,10 @@ public static class MonotonicityAnalyzer
             {
                 var input = Visit(a.Input, memo);
                 // Output = [group-key columns..., aggregate-result columns...].
-                var cols = new IReadOnlySet<LatenessSource>?[a.Schema.Count];
+                var cols = new MonotoneColumn?[a.Schema.Count];
                 for (var g = 0; g < a.GroupKeys.Count && g < cols.Length; g++)
                 {
-                    if (a.GroupKeys[g] is ResolvedColumn rc
-                        && rc.Index >= 0 && rc.Index < input.Length
-                        && input[rc.Index] is { } src)
-                    {
-                        cols[g] = src;
-                    }
+                    cols[g] = FromExpr(a.GroupKeys[g], input);
                 }
 
                 // Aggregate-result columns stay null (MIN/MAX-of-monotone is a
@@ -189,24 +198,93 @@ public static class MonotonicityAnalyzer
 
             // Recursion + frontier is unsolved here; conservatively not monotone.
             case RecursiveCtePlan r:
-                return new IReadOnlySet<LatenessSource>?[r.Schema.Count];
+                return new MonotoneColumn?[r.Schema.Count];
 
             default:
-                return new IReadOnlySet<LatenessSource>?[node.Schema.Count];
+                return new MonotoneColumn?[node.Schema.Count];
         }
     }
 
-    private static IReadOnlySet<LatenessSource>?[] ComputeJoin(
+    /// <summary>
+    /// Resolve a projection/group-key expression to a monotone column, if any.
+    /// Handles a bare column pass-through, a monotone scalar function
+    /// (per <see cref="ScalarFunctionRegistry.Monotonicity"/>, carrying its
+    /// frontier transform), and forward-shift arithmetic (monotone column +
+    /// non-negative constant). Transforms compose only over an identity carrier,
+    /// keeping the model sound and simple.
+    /// </summary>
+    private static MonotoneColumn? FromExpr(ResolvedExpression expr, MonotoneColumn?[] input)
+    {
+        switch (expr)
+        {
+            case ResolvedColumn rc:
+                return rc.Index >= 0 && rc.Index < input.Length ? input[rc.Index] : null;
+
+            case ResolvedFunctionCall fc:
+            {
+                if (ScalarFunctionRegistry.Monotonicity(fc) is { } m
+                    && m.CarrierArgIndex >= 0 && m.CarrierArgIndex < fc.Arguments.Count
+                    && FromExpr(fc.Arguments[m.CarrierArgIndex], input) is { FrontierTransform: null } carrier)
+                {
+                    return new MonotoneColumn(carrier.Sources, m.FrontierTransform);
+                }
+
+                return null;
+            }
+
+            case ResolvedBinary { Operator: BinaryOperator.Add, Left: var l, Right: var r }:
+            {
+                if (FromExpr(l, input) is { FrontierTransform: null } lc && IsNonNegativeConstant(r))
+                {
+                    return new MonotoneColumn(lc.Sources, null);
+                }
+
+                if (FromExpr(r, input) is { FrontierTransform: null } rc && IsNonNegativeConstant(l))
+                {
+                    return new MonotoneColumn(rc.Sources, null);
+                }
+
+                return null;
+            }
+
+            default:
+                return null;
+        }
+    }
+
+    private static bool IsNonNegativeConstant(ResolvedExpression e)
+    {
+        // See through a numeric-widening cast the resolver inserts on a mixed-type
+        // literal (e.g. BIGINT ts + INT 5 ⇒ ts + CAST(5 AS BIGINT)).
+        while (e is ResolvedCast c)
+        {
+            e = c.Operand;
+        }
+
+        return e is ResolvedLiteral lit && lit.Value switch
+        {
+            Interval iv => iv.Months >= 0 && iv.Micros >= 0,
+            int i => i >= 0,
+            long l => l >= 0,
+            float f => f >= 0,
+            double d => d >= 0,
+            _ => false,
+        };
+    }
+
+    private static MonotoneColumn?[] ComputeJoin(
         JoinPlan j,
-        Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]> memo)
+        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
     {
         var left = Visit(j.Left, memo);
         var right = Visit(j.Right, memo);
         var leftCount = j.Left.Schema.Count;
-        var cols = new IReadOnlySet<LatenessSource>?[j.Schema.Count]; // left ++ right
+        var cols = new MonotoneColumn?[j.Schema.Count]; // left ++ right
 
         // Only equi-key columns can stay monotone — non-key columns pair with
-        // arbitrarily-old rows on the other side, so they lose their bound.
+        // arbitrarily-old rows on the other side, so they lose their bound. A
+        // transformed (non-identity) key is not propagated through a join (the
+        // join GC site doesn't apply transforms); require identity.
         foreach (var eq in j.EquiKeys)
         {
             var leftOut = eq.LeftIndex;
@@ -216,9 +294,10 @@ public static class MonotonicityAnalyzer
                 case JoinType.Inner:
                     // Output key value = left.k = right.k; a key dies only once
                     // it is below both frontiers ⇒ frontier = min ⇒ union sources.
-                    if (left[eq.LeftIndex] is { } li && right[eq.RightIndex] is { } ri)
+                    if (left[eq.LeftIndex] is { FrontierTransform: null } li
+                        && right[eq.RightIndex] is { FrontierTransform: null } ri)
                     {
-                        var union = Union(li, ri);
+                        var union = new MonotoneColumn(Union(li.Sources, ri.Sources), null);
                         cols[leftOut] = union;
                         cols[rightOut] = union;
                     }
@@ -229,27 +308,26 @@ public static class MonotonicityAnalyzer
                     // Preserved side = left: its key carries the real value even
                     // for unmatched (NULL-padded) rows. The right key is NULL for
                     // unmatched rows ⇒ not monotone.
-                    if (left[eq.LeftIndex] is { } ls)
+                    if (left[eq.LeftIndex] is { FrontierTransform: null } ls)
                     {
-                        cols[leftOut] = ls;
+                        cols[leftOut] = new MonotoneColumn(ls.Sources, null);
                     }
 
                     break;
 
                 case JoinType.RightOuter:
-                    if (right[eq.RightIndex] is { } rs)
+                    if (right[eq.RightIndex] is { FrontierTransform: null } rs)
                     {
-                        cols[rightOut] = rs;
+                        cols[rightOut] = new MonotoneColumn(rs.Sources, null);
                     }
 
                     break;
 
                 case JoinType.FullOuter:
                     // Neither output key column is monotone: an unmatched row
-                    // NULLs out the absent side's key (left key NULL for a
-                    // right-only row, right key NULL for a left-only row), so
-                    // the projection loses its bound. (GC still works — it reads
-                    // the input-side sources directly, both-sides-monotone.)
+                    // NULLs out the absent side's key, so the projection loses its
+                    // bound. (GC still works — it reads the input-side sources
+                    // directly, both-sides-monotone.)
                     break;
             }
         }
@@ -257,33 +335,33 @@ public static class MonotonicityAnalyzer
         return cols;
     }
 
-    private static IReadOnlySet<LatenessSource>?[] ComputeUnion(
+    private static MonotoneColumn?[] ComputeUnion(
         UnionAllPlan u,
-        Dictionary<LogicalPlan, IReadOnlySet<LatenessSource>?[]> memo)
+        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
     {
         var branches = u.Branches.Select(b => Visit(b, memo)).ToList();
-        var cols = new IReadOnlySet<LatenessSource>?[u.Schema.Count];
+        var cols = new MonotoneColumn?[u.Schema.Count];
         for (var i = 0; i < cols.Length; i++)
         {
-            // Monotone iff monotone in every branch (any branch can emit a small
-            // value otherwise); union the contributing sources.
+            // Monotone iff monotone (with an identity transform) in every branch;
+            // union the contributing sources.
             HashSet<LatenessSource>? union = null;
             var allMonotone = true;
             foreach (var branch in branches)
             {
-                if (i >= branch.Length || branch[i] is not { } src)
+                if (i >= branch.Length || branch[i] is not { FrontierTransform: null } src)
                 {
                     allMonotone = false;
                     break;
                 }
 
                 union ??= new HashSet<LatenessSource>();
-                union.UnionWith(src);
+                union.UnionWith(src.Sources);
             }
 
             if (allMonotone && union is not null)
             {
-                cols[i] = union;
+                cols[i] = new MonotoneColumn(union, null);
             }
         }
 
@@ -298,14 +376,14 @@ public static class MonotonicityAnalyzer
         return s;
     }
 
-    private static IReadOnlySet<LatenessSource>?[] ResizeTo(IReadOnlySet<LatenessSource>?[] src, int length)
+    private static MonotoneColumn?[] ResizeTo(MonotoneColumn?[] src, int length)
     {
         if (src.Length == length)
         {
             return src;
         }
 
-        var resized = new IReadOnlySet<LatenessSource>?[length];
+        var resized = new MonotoneColumn?[length];
         Array.Copy(src, resized, Math.Min(src.Length, length));
         return resized;
     }

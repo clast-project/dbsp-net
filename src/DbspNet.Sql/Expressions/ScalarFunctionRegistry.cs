@@ -49,7 +49,29 @@ internal interface IScalarFunction
     /// </summary>
     Expression? BuildTyped(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs);
+
+    /// <summary>
+    /// LATENESS-GC hook: if this call is monotone non-decreasing in one of its
+    /// arguments, describe which argument carries the frontier and how the
+    /// frontier value must be transformed into the result's value space.
+    /// Default: not monotone (no GC propagation — always safe). See
+    /// <c>docs/scalar-function-registry.md</c> "Monotonicity payoff".
+    /// </summary>
+    ScalarMonotonicity? Monotonicity(ResolvedFunctionCall fn) => null;
 }
+
+/// <summary>
+/// Declares that a scalar call is monotone non-decreasing in argument
+/// <see cref="CarrierArgIndex"/>. <see cref="FrontierTransform"/> maps a
+/// frontier value (in the carrier argument's native-unit space) into the
+/// result's value space; <c>null</c> means identity (the raw frontier is a
+/// sound — if conservative — threshold, e.g. a forward shift like
+/// <c>ts + interval</c>). A non-null transform is required when the function
+/// can produce a value below its input (e.g. <c>date_trunc</c>), so the GC
+/// threshold must be the transformed bound. The transform must itself be
+/// non-decreasing.
+/// </summary>
+internal readonly record struct ScalarMonotonicity(int CarrierArgIndex, Func<long, long>? FrontierTransform);
 
 /// <summary>
 /// Single dispatch authority for builtin scalar functions. Every name lives in
@@ -78,6 +100,9 @@ internal static class ScalarFunctionRegistry
     public static Expression? BuildTyped(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) =>
         Lookup(fn.FunctionName).BuildTyped(fn, astArgs, typedArgs);
+
+    public static ScalarMonotonicity? Monotonicity(ResolvedFunctionCall fn) =>
+        ByName.TryGetValue(fn.FunctionName, out var f) ? f.Monotonicity(fn) : null;
 
     private static IScalarFunction Lookup(string name) =>
         ByName.TryGetValue(name, out var f)

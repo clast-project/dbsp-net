@@ -438,7 +438,10 @@ reflect that shape, not a backlog.
   column declared `LATENESS d` in `CREATE TABLE` is lifted to
   `ScanPlan.ColumnLateness`; `MonotonicityAnalyzer`
   (`DbspNet.Sql/Plan/MonotonicityAnalyzer.cs`) propagates monotonicity through
-  filters / projections / equi-joins / group keys / set ops; a per-column
+  filters / projections / equi-joins / group keys / set ops — including monotone
+  scalar functions (`date_trunc`, `dateadd`) and forward-shift arithmetic
+  (`ts + interval`), carrying a frontier transform so a `date_trunc` group key is
+  GC'd against the truncated bound; a per-column
   `LatenessOperator` drops late rows at the input and advertises a
   `max_seen − d` frontier; and the keyed stateful operators
   (`IncrementalAggregateOp`, inner / `LEFT` / `RIGHT` join, `DistinctOp`, and
@@ -455,13 +458,14 @@ reflect that shape, not a backlog.
 - **[P2]** `emit_final` view annotation. Feldera-specific.
 
 ### UDFs
-- **[P2]** User-defined scalar, table, and aggregate functions. A
+- **[P2]** User-defined scalar, table, and aggregate functions. The
   prerequisite refactor — reifying the builtin scalar library behind an
-  `IScalarFunction` registry (which also becomes the monotone-function
-  catalog hook for LATENESS) — is sketched in
-  [`scalar-function-registry.md`](scalar-function-registry.md). Note the
-  determinism contract: scalar functions must be pure for incremental
-  correctness, and the engine cannot verify a UDF's purity.
+  `IScalarFunction` registry (which also carries the monotone-function
+  catalog hook for LATENESS, now landed) — is done; see
+  [`scalar-function-registry.md`](scalar-function-registry.md). The remaining
+  UDF-specific work is the registration surface and the determinism contract:
+  scalar functions must be pure for incremental correctness, and the engine
+  cannot verify a UDF's purity.
 
 ### Surface syntax
 
@@ -513,8 +517,10 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   framework — phases 1–3 landed): every builtin is now a registry entry in
   `ScalarFunctionLibrary.cs`, the four parallel switches are gone, and
   `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions` remain only as
-  implementation-helper libraries the entries delegate to. Still deferred: the
-  `Monotonicity()` hook for LATENESS GC (phase 4) and UDFs (phase 5). See
+  implementation-helper libraries the entries delegate to. The
+  `Monotonicity()` hook for LATENESS GC (phase 4) is landed —
+  `date_trunc` / `dateadd` / `ts + interval` group keys keep bounded-history GC
+  via a frontier transform. Still deferred: UDFs (phase 5). See
   [`scalar-function-registry.md`](scalar-function-registry.md). The keyword
   spellings
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|BOTH … FROM …)`

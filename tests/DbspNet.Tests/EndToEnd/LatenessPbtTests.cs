@@ -44,7 +44,11 @@ public class LatenessPbtTests
         "SELECT a.v, b.v FROM a JOIN b ON a.ts = b.ts",
         "SELECT a.v, b.v FROM a LEFT JOIN b ON a.ts = b.ts",
         "SELECT a.v, b.v FROM a RIGHT JOIN b ON a.ts = b.ts",
-        "SELECT ts FROM a UNION SELECT ts FROM b");
+        "SELECT ts FROM a UNION SELECT ts FROM b",
+        // Phase 4: GROUP BY a forward-shifted (monotone) key — GC fires on the
+        // shifted group key via the identity frontier transform, and must stay
+        // output-invisible vs. the batch oracle (which shifts the same way).
+        "SELECT shifted, COUNT(*) AS c FROM (SELECT ts + 3 AS shifted, v FROM a) sub GROUP BY shifted");
 
     // ts is the BIGINT monotone column (range chosen so the moving frontier both
     // admits and drops across a run); v is a small INT with some ≤ 0 for WHERE.

@@ -14,12 +14,27 @@ thin adapter delegating to them, so resolve + build for a function stay
 co-located and can't drift. Aliases (`substr`→`substring`, `ceiling`→`ceil`,
 `date_part`→`extract`) register the same instance under another key.
 
+**Phase 4 (Monotonicity → LATENESS GC) — landed.** `IScalarFunction` has a
+`Monotonicity(fn)` hook returning a `ScalarMonotonicity(carrierArgIndex,
+frontierTransform)`; the analyzer's `ProjectPlan`/`AggregatePlan` cases route
+expressions through `FromExpr`, which now propagates a frontier source through a
+monotone scalar function (`date_trunc`, `dateadd` with n ≥ 0) and through
+forward-shift arithmetic (`monotone_col + nonneg_const`, including
+`ts + interval`). Because `date_trunc` *lowers* values, a monotone column carries
+an optional `Func<long,long>` **frontier transform**, and the group-key GC site
+wraps its frontier in a `Core` `TransformedFrontier` so the bound is truncated
+into the key space before it thresholds keys (join/distinct GC sites only accept
+identity-transform keys). Forward shifts keep an identity transform (the raw
+frontier stays a sound, if conservative, threshold — no runtime change).
+Verified by analyzer unit tests, end-to-end bounded-state + soundness-witness
+tests, an incremental-≡-batch oracle test for `date_trunc`, and a PBT shape for
+the shift path.
+
 **Remaining work:**
-- Add the optional `Monotonicity()` hook + wire it into
-  `MonotonicityAnalyzer` (phase 4) — the LATENESS-GC payoff. **Not yet
-  modeled** on the interface (kept minimal: Resolve / BuildStructural /
-  BuildTyped only).
 - UDF surface (phase 5, deferred).
+- More monotone catalog entries (e.g. `LEAST`/`GREATEST` of monotone args,
+  `MIN`/`MAX`-of-monotone aggregates), and subtraction with a non-identity
+  (`x − c`) transform.
 - Optional: collapse the implementation helpers into the entry classes so
   each function is fully self-contained (the bodies currently still live in
   `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions`). Cosmetic — the

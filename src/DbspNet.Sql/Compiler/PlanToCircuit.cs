@@ -354,6 +354,15 @@ public static class PlanToCircuit
 
             var keyIndex = g;
             IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
+
+            // A monotone-function group key (e.g. date_trunc(ts)) lives in a
+            // different value space than its source frontier; pass the bound
+            // through the same transform before it thresholds the keys.
+            if (ctx.Monotonicity.FrontierTransform(plan, g) is { } transform)
+            {
+                frontier = new TransformedFrontier(frontier, transform);
+            }
+
             return (frontier, keyRow => MonotoneKey.Extract(keyRow[keyIndex]));
         }
 
@@ -376,6 +385,14 @@ public static class PlanToCircuit
         {
             var sources = ctx.Monotonicity.Sources(plan, c);
             if (sources is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            // This site GCs against the raw frontier, so it can only use a column
+            // whose value IS the frontier value (identity transform). A
+            // transformed monotone column (e.g. date_trunc) is skipped here.
+            if (ctx.Monotonicity.FrontierTransform(plan, c) is not null)
             {
                 continue;
             }
@@ -419,6 +436,15 @@ public static class PlanToCircuit
             var leftSources = ctx.Monotonicity.Sources(plan.Left, eq.LeftIndex);
             var rightSources = ctx.Monotonicity.Sources(plan.Right, eq.RightIndex);
             if (leftSources is not { Count: > 0 } || rightSources is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            // Join GC uses the raw frontier; only identity-transform keys qualify
+            // (a transformed monotone key would need its bound transformed, which
+            // this site doesn't do).
+            if (ctx.Monotonicity.FrontierTransform(plan.Left, eq.LeftIndex) is not null
+                || ctx.Monotonicity.FrontierTransform(plan.Right, eq.RightIndex) is not null)
             {
                 continue;
             }

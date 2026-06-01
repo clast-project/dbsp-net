@@ -157,6 +157,16 @@ internal sealed class DateTruncFunction : IScalarFunction
 
     public Expression? BuildTyped(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) => null;
+
+    // date_trunc is non-decreasing in its source, but lowers values (truncates),
+    // so the frontier must pass through the same truncation to threshold the
+    // derived keys soundly.
+    public ScalarMonotonicity? Monotonicity(ResolvedFunctionCall fn)
+    {
+        var unit = TemporalFunctionSupport.ConstField(fn.Arguments, "DATE_TRUNC");
+        var src = fn.Arguments[1].Type;
+        return new ScalarMonotonicity(1, v => TemporalFunctions.DateTruncFrontier(v, src, unit));
+    }
 }
 
 /// <summary>
@@ -205,6 +215,22 @@ internal sealed class DateAddFunction : IScalarFunction
 
     public Expression? BuildTyped(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) => null;
+
+    // dateadd(unit, n, source) = source + n units. Monotone non-decreasing in
+    // source when n is a non-negative constant (a forward shift), and a forward
+    // shift keeps the raw frontier as a sound (conservative) threshold ⇒ identity
+    // transform. Non-constant or negative n: can't prove it, so no GC.
+    public ScalarMonotonicity? Monotonicity(ResolvedFunctionCall fn) =>
+        fn.Arguments.Count == 3 && fn.Arguments[1] is ResolvedLiteral lit && IsNonNegativeInteger(lit.Value)
+            ? new ScalarMonotonicity(2, null)
+            : null;
+
+    private static bool IsNonNegativeInteger(object? v) => v switch
+    {
+        int i => i >= 0,
+        long l => l >= 0,
+        _ => false,
+    };
 }
 
 /// <summary>
@@ -468,6 +494,20 @@ internal static class TemporalFunctions
         };
         return new Time64(micros / unitMicros * unitMicros);
     }
+
+    /// <summary>
+    /// DATE_TRUNC in the frontier's native-unit (<see cref="long"/>) space —
+    /// the monotone transform a LATENESS frontier passes through when the GC key
+    /// is <c>date_trunc(unit, col)</c>. <paramref name="src"/> selects the
+    /// carrier representation: TIMESTAMP/TIME = microseconds, DATE = days.
+    /// </summary>
+    internal static long DateTruncFrontier(long v, SqlType src, TemporalField unit) => src switch
+    {
+        SqlTimestampType => TruncTimestamp(new Timestamp(v), unit).Microseconds,
+        SqlDateType => TruncDate(new Date32((int)v), unit).Days,
+        SqlTimeType => TruncTime(new Time64(v), unit).Microseconds,
+        _ => v,
+    };
 
     // ---- DATEADD ----
 

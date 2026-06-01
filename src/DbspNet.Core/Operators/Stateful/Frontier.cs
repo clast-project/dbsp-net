@@ -91,3 +91,36 @@ public sealed class MinFrontier : IFrontier
         }
     }
 }
+
+/// <summary>
+/// A frontier whose value is an inner frontier passed through a monotone
+/// non-decreasing transform. Used when a GC key is a monotone <em>function</em>
+/// of a <c>LATENESS</c> column rather than the column itself: e.g. a group key
+/// of <c>date_trunc('day', ts)</c> lives in a different value space than the raw
+/// <c>ts</c> frontier, so the bound must be transformed by the same function
+/// (<c>date_trunc('day', maxSeen − lateness)</c>) before it can threshold the
+/// derived keys. The transform must be non-decreasing for the bound to stay
+/// sound. <see cref="long.MinValue"/> (no bound yet) passes through untouched.
+/// </summary>
+public sealed class TransformedFrontier : IFrontier
+{
+    private readonly IFrontier _inner;
+    private readonly Func<long, long> _transform;
+
+    public TransformedFrontier(IFrontier inner, Func<long, long> transform)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        ArgumentNullException.ThrowIfNull(transform);
+        _inner = inner;
+        _transform = transform;
+    }
+
+    public long Value
+    {
+        get
+        {
+            var v = _inner.Value;
+            return v == long.MinValue ? long.MinValue : _transform(v);
+        }
+    }
+}
