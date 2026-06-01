@@ -52,12 +52,65 @@ never advances).
   reusing the LATENESS source/frontier plumbing, so a downstream `GROUP BY` /
   join / `DISTINCT` on the time-key GCs the same way.
 
-**Deferred follow-ons:** `CURRENT_DATE` / `CURRENT_TIME` (different units); a
+**Deferred follow-ons:** `CURRENT_DATE` / `CURRENT_TIME` (see below); a
 spine sibling operator; a per-row transition-time index (the operator's per-tick
 recompute is O(integral size)); monotone-*expression* time-keys (e.g.
 `date_trunc(ts)`) and filters not directly over a scan, for the downstream-GC
 frontier; the typed fast path; and WAL (approach A) per-tick clock recording for
 pure-log replay (the snapshot path is correct today).
+
+### `CURRENT_DATE` / `CURRENT_TIME` considerations (not yet implemented)
+
+These are **not** a mechanical "add two more spellings" change — the
+advancing-clock model is built on a single monotone `Int64` clock in `TIMESTAMP`
+units (microseconds since epoch), and a comparison that is *linear in `now`*
+(`now {<|<=|>|>=} timeKey + offset`). The two other niladics break one of those
+assumptions each, so each needs a decision before code:
+
+- **`CURRENT_TIMESTAMP` (shipped) is the clean case.** Clock and key are both
+  µs-since-epoch; the comparison is linear in `now`. Nothing below applies.
+
+- **`CURRENT_DATE` is monotone but *truncated* — needs a clock transform.**
+  A `DATE` key is days; the clock is µs. `d <= CURRENT_DATE` means
+  `d <= floor(now / µs_per_day)`, which is linear in `truncate_to_day(now)`, not
+  in `now`. So the operator can't compare against the raw clock. Two viable
+  shapes, both sound:
+  1. **Clock transform.** Give `TemporalFilterOp` an optional
+     `Func<long,long> clockTransform` (default identity) applied to the clock
+     value before the validity test; for `CURRENT_DATE` it is
+     `now ⇒ floor(now / µs_per_day)`, with the time-key extracted in *days* and
+     offsets in *days* (`CURRENT_DATE - INTERVAL '1' DAY` ⇒ offset 1 day). The
+     downstream-GC frontier needs the same transform (cf. the `date_trunc`
+     `TransformedFrontier` already used for monotone group keys).
+  2. **Scale the key to µs.** Keep the clock in µs and extract the key as the
+     day's midnight (`dayNumber × µs_per_day`); then `d ≤ CURRENT_DATE` ⟺
+     `dayₘₛ ≤ now` (valid because both sides are integer days when divided by
+     `µs_per_day`). This works for the bare `<= CURRENT_DATE` form, but a
+     *shifted* bound (`d > CURRENT_DATE - INTERVAL '1' DAY`) depends on
+     `floor(now/µs_per_day)`, not `now`, so it reintroduces the truncation — i.e.
+     option 1 is the general answer; option 2 only covers the unshifted case.
+
+  Recommendation: option 1 (the clock transform), reusing the existing
+  frontier-transform machinery for GC. Tractable, but it's a new operator seam +
+  analyzer/`PlanToCircuit` plumbing, not a parser tweak.
+
+- **`CURRENT_TIME` is *cyclic* — it does not fit the advancing-clock model.**
+  `TIME` is µs-since-midnight, i.e. `now mod µs_per_day`, which wraps every
+  midnight and is therefore **not monotone**. The whole feature — forward-only
+  retractions, the GC watermark, the telescoping `validAt(finalClock)` oracle —
+  rests on a non-decreasing clock, so a `CURRENT_TIME` temporal filter has no
+  sound advancing semantics. It is only meaningful as a *frozen-per-tick
+  constant* (options A/C from the rationale below), which this design
+  deliberately did not ship. So `CURRENT_TIME` is a **product decision**, not an
+  implementation detail: either reject it in a temporal filter with a clear
+  error ("CURRENT_TIME is cyclic and not supported in a temporal filter; use
+  CURRENT_TIMESTAMP"), or introduce an explicit opt-in frozen-constant semantics
+  — but the latter is a separate feature with its own equivalence caveats.
+  Default recommendation: **reject with a clear error** until a frozen-constant
+  feature is independently justified.
+
+In short: `CURRENT_DATE` is a tractable extension once the clock-transform seam
+exists; `CURRENT_TIME` needs a product call first. Scope them as their own pass.
 
 ---
 
