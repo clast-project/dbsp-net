@@ -74,6 +74,33 @@ public sealed record FunctionCallExpression(
     bool IsStar) : Expression;
 
 /// <summary>
+/// The <c>OVER (...)</c> clause of a <see cref="WindowFunctionExpression"/>.
+/// <see cref="PartitionBy"/> may be empty (a single global partition);
+/// <see cref="OrderBy"/> reuses the same <see cref="SortItem"/> shape as a
+/// query-level <c>ORDER BY</c>.
+/// </summary>
+public sealed record WindowSpec(
+    IReadOnlyList<Expression> PartitionBy,
+    IReadOnlyList<SortItem> OrderBy);
+
+/// <summary>
+/// A ranking window-function call —
+/// <c>ROW_NUMBER() | RANK() | DENSE_RANK() OVER (PARTITION BY … ORDER BY …)</c>.
+/// </summary>
+/// <remarks>
+/// v1 supports these functions <b>only</b> in the incremental partitioned TOP-K
+/// filter pattern: the call appears in a derived table's select list and the
+/// enclosing query filters its alias with <c>&lt;= k</c> / <c>&lt; k</c>. The
+/// resolver recognises that shape and lowers it to a <c>PartitionedTopKPlan</c>;
+/// a window function used anywhere else (selected into the output, in an
+/// expression, an unsupported function, or with no qualifying filter) is
+/// rejected with an explicit error.
+/// </remarks>
+public sealed record WindowFunctionExpression(
+    string FunctionName,
+    WindowSpec Over) : Expression;
+
+/// <summary>
 /// A parenthesised query appearing in expression position — a scalar
 /// subquery. The inner query may be a bare <c>SELECT</c> or a
 /// <c>UNION ALL</c>. Resolution must confirm it returns exactly one column;

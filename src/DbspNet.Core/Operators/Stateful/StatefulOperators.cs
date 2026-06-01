@@ -82,6 +82,41 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Incremental partitioned TOP-K — <c>ROW_NUMBER</c> / <c>RANK</c> /
+    /// <c>DENSE_RANK</c> in the filter pattern
+    /// <c>… OVER (PARTITION BY p ORDER BY o) &lt;= limit</c>. Keeps, per
+    /// <paramref name="partitionOf"/> partition, the rows whose rank under
+    /// <paramref name="order"/> is <c>&lt;= limit</c>, maintained under
+    /// retraction. <paramref name="sortKeyOnly"/> orders by the <c>ORDER BY</c>
+    /// keys alone so <paramref name="function"/> <c>Rank</c> / <c>DenseRank</c>
+    /// can keep whole tie groups (ignored for <c>RowNumber</c>).
+    /// </summary>
+    public static Stream<ZSet<TRow, Z64>> PartitionedTopK<TRow, TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TRow, Z64>> input,
+        Func<TRow, TKey> partitionOf,
+        IComparer<TRow> order,
+        IComparer<TRow> sortKeyOnly,
+        RankFunction function,
+        long limit,
+        IEqualityComparer<TKey>? partitionComparer = null,
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        where TRow : notnull
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partitionOf);
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(sortKeyOnly);
+
+        var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedTopKOp<TRow, TKey>(
+            input, output, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec));
+        return output;
+    }
+
+    /// <summary>
     /// Index a flat Z-set stream by a key-extraction function. The key
     /// extractor is applied tick-by-tick and results in an indexed Z-set
     /// stream with the same weights.

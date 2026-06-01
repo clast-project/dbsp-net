@@ -210,9 +210,34 @@ reflect that shape, not a backlog.
     rejects ordering by a non-selected column (ambiguous after dedup), and a set
     operation's `ORDER BY` may reference only its output columns — both raise an
     explicit resolver error (matching standard SQL).
-  - **[P2]** Partitioned TOP-K / windowed `RANK` / `ROW_NUMBER`
-    (`PARTITION BY … ORDER BY … LIMIT k` per group). The current operator is a
-    single global partition.
+  - Partitioned TOP-K / windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` —
+    **implemented** for the standard filter pattern
+    `SELECT … FROM (SELECT …, {ROW_NUMBER|RANK|DENSE_RANK}() OVER (PARTITION BY p
+    ORDER BY o) AS rn FROM …) WHERE rn <= k` (also `< k`, and the reversed
+    `k >= rn`). Standard SQL evaluates window functions after `WHERE`, so the
+    derived-table-plus-outer-filter spelling is the portable one. A new
+    `WindowFunctionExpression` AST node carries the `OVER (…)` clause (`OVER` /
+    `PARTITION` are contextual, not reserved); the resolver recognises the shape
+    structurally (there is no general window plan node) and lowers it to a
+    `PartitionedTopKPlan` driven by a new `PartitionedTopKOp<TRow,TKey>` — the
+    per-partition generalisation of `TopKOp`, with one sorted window per
+    `PARTITION BY` key (an empty `PARTITION BY` ⇒ a single global partition).
+    `ROW_NUMBER` cuts at the limit position (multiplicity-counted); `RANK` /
+    `DENSE_RANK` keep whole tie groups, detected via a keys-only comparer
+    (`ConstantZeroComparer` tiebreak). Supported on both compiler paths and
+    snapshotable. PARTITION BY / ORDER BY may reference non-selected columns
+    (carried as hidden columns, reusing the ORDER BY machinery). Deferred:
+      - **[P2]** Selecting the rank value into the output (`SELECT …, rn …`).
+        Today the rank exists only to drive the `<= k` cut, so the output schema
+        is unchanged; emitting the rank as a column is a separate feature.
+        Rejected with an explicit error.
+      - **[P2]** `QUALIFY` (Snowflake/BigQuery/DuckDB sugar for the same pattern
+        without a derived table).
+      - **[P2]** A window function over a grouped/aggregated/`DISTINCT` inner
+        query, or more than one window per query. Rejected with explicit errors.
+      - See the general windowed-column form (a rank column on every row) under
+        Window functions below — deliberately not supported (unbounded
+        incremental churn).
 - `SELECT DISTINCT` (SELECT-list form) — **implemented**. A `Distinct`
   flag on `SelectStatement` (parsed after `SELECT`; `ALL` is the
   bag-semantics no-op default); the resolver wraps the projection's
@@ -302,9 +327,17 @@ reflect that shape, not a backlog.
   (e.g. `SUM(CASE WHEN MAX(x) ...)`). Rejected by `Resolver.HasAggregate`.
 
 ### Window functions
-- **[P2]** All of them. Feldera supports SUM/COUNT/AVG/MIN/MAX over windows,
-  plus RANK / DENSE_RANK / ROW_NUMBER (restricted to TopK patterns),
-  LAG / LEAD, FIRST_VALUE / LAST_VALUE (UNLIMITED RANGE frames).
+- `ROW_NUMBER` / `RANK` / `DENSE_RANK` **restricted to the TopK filter pattern**
+  are **implemented** (see "Partitioned TOP-K" under Query constructs above).
+  The rest are deferred:
+- **[P2]** The general windowed-column form — a rank/number emitted as an output
+  column on every row (`SELECT *, ROW_NUMBER() OVER (…) AS rn FROM t`, used
+  outside a `<= k` filter). Incrementally expensive: inserting one row shifts the
+  rank of every later row in the partition, so a single insert produces
+  O(partition-size) retractions. Feldera restricts the rank functions to TopK
+  patterns for the same reason; DbspNet does too.
+- **[P2]** Window aggregates (SUM/COUNT/AVG/MIN/MAX OVER), LAG / LEAD,
+  FIRST_VALUE / LAST_VALUE. Feldera supports these (UNLIMITED RANGE frames).
 - **[P3]** Full SQL frame spec: `ROWS`, `RANGE`, `GROUPS`; `PARTITION BY`;
   `BETWEEN … AND …` with named bounds.
 

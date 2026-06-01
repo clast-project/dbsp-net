@@ -91,6 +91,9 @@ public static class PlanOptimizer
             // rule ever moves a filter/projection across it (that would change
             // which rows fall inside the [offset, offset+limit) window).
             TopKPlan t => t with { Input = OptimizeNode(t.Input) },
+            // Partitioned TOP-K is likewise a pushdown barrier — a filter or
+            // projection moved across it would change per-partition rank.
+            PartitionedTopKPlan pt => pt with { Input = OptimizeNode(pt.Input) },
             DifferencePlan diff => new DifferencePlan(
                 OptimizeNode(diff.Left), OptimizeNode(diff.Right)),
             ScalarSubqueryJoinPlan s => s with

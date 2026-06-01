@@ -134,7 +134,12 @@ batch re-computation.
   on pure-insert ticks; see `docs/skipped.md` for the retraction-fallback
   caveat). `ORDER BY … LIMIT [OFFSET]` (and `FETCH FIRST n ROWS ONLY`) compile
   to an incremental TOP-K operator; a bare `ORDER BY` (no limit) is a no-op
-  since row order is unobservable in the output Z-set.
+  since row order is unobservable in the output Z-set. The ranking window
+  functions `ROW_NUMBER` / `RANK` / `DENSE_RANK` are supported in the
+  partitioned TOP-K filter pattern — `SELECT … FROM (SELECT …, ROW_NUMBER()
+  OVER (PARTITION BY p ORDER BY o) AS rn FROM …) WHERE rn <= k` — compiling to
+  a per-partition TOP-K operator (`RANK`/`DENSE_RANK` keep whole tie groups; an
+  empty `PARTITION BY` is a single global partition).
 - Scalar subqueries (uncorrelated, exactly one column) in `WHERE`, `SELECT`,
   and `HAVING` expressions. Empty subquery → `NULL`; changing subquery
   value correctly retracts and re-emits outer rows.
@@ -284,9 +289,10 @@ beyond "Feldera is much bigger":
   `FULL OUTER JOIN` (symmetric both-sides match-presence tracking) are
   supported. `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST` compile to
   incremental TOP-K — including ordering by non-selected columns / expressions
-  (carried as hidden columns), but a single global partition (windowed /
-  partitioned `RANK` / `ROW_NUMBER` are deferred). Window functions
-  and `LIKE` / `SIMILAR TO` are deferred. `JOIN … USING` is supported (equi-join on the
+  (carried as hidden columns). Windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` in
+  the partitioned TOP-K filter pattern are supported; the general windowed-column
+  form (a rank emitted on every row), window aggregates, and `LAG`/`LEAD` are
+  deferred, as are `LIKE` / `SIMILAR TO`. `JOIN … USING` is supported (equi-join on the
   named columns + merged-column projection; FULL merges via `COALESCE`); the
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING| BOTH … FROM …)`
   keyword spellings are not (use the comma / char-set forms).

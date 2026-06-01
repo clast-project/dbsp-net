@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
+using System.Linq;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser.Ast;
@@ -163,6 +165,15 @@ public sealed class Resolver
         }
 
         IReadOnlyDictionary<string, CteRef> scope = cteScope ?? outerCteScope;
+
+        // Partitioned TOP-K (ROW_NUMBER/RANK/DENSE_RANK in the `… OVER (…) <= k`
+        // filter pattern) is recognised structurally before normal resolution,
+        // because there is no general window-function plan node — only this
+        // shape is supported.
+        if (TryResolvePartitionedTopK(stmt, scope, outerSchema) is { } partitioned)
+        {
+            return partitioned;
+        }
 
         // FROM
         var plan = ResolveFrom(stmt.From, scope, outerSchema);
@@ -802,6 +813,280 @@ public sealed class Resolver
         return new ProjectPlan(topK, projections, outputSchema);
     }
 
+    /// <summary>A FROM relation that has already been resolved to a plan. Used
+    /// internally by <see cref="TryResolvePartitionedTopK"/> to re-enter
+    /// <see cref="ResolveSelect"/> for the enclosing query's remaining clauses
+    /// (projection, residual WHERE, GROUP BY, …) without re-resolving the
+    /// rewritten FROM.</summary>
+    private sealed record PreResolvedRelation(LogicalPlan Plan) : FromClause;
+
+    /// <summary>
+    /// Recognise the incremental partitioned TOP-K pattern —
+    /// <c>SELECT … FROM (SELECT …, {ROW_NUMBER|RANK|DENSE_RANK}() OVER
+    /// (PARTITION BY … ORDER BY …) AS rn FROM …) WHERE rn &lt;= k</c> — and lower
+    /// it to a <see cref="PartitionedTopKPlan"/>. Returns <c>null</c> when
+    /// <paramref name="stmt"/> is not a window query at all (ordinary resolution
+    /// proceeds); throws a <see cref="ResolveException"/> when a window function
+    /// is present but used outside the supported pattern.
+    /// </summary>
+    /// <remarks>
+    /// The rank value is never materialised: the derived table exposes only its
+    /// non-window columns, the rank alias is consumed by the <c>&lt;= k</c>
+    /// filter, and the rest of the enclosing query is resolved normally over the
+    /// TOP-K result via a <see cref="PreResolvedRelation"/>. Standard SQL forbids
+    /// referencing a window alias in the same query's WHERE, so the derived-table
+    /// spelling is the portable one; <c>QUALIFY</c> and selecting the rank value
+    /// are deferred (see <c>docs/skipped.md</c>).
+    /// </remarks>
+    private LogicalPlan? TryResolvePartitionedTopK(
+        SelectStatement stmt,
+        IReadOnlyDictionary<string, CteRef> scope,
+        Schema? outerSchema)
+    {
+        if (stmt.From is not DerivedTableReference { Query: SelectStatement innerSel } dt)
+        {
+            return null;
+        }
+
+        var windowItems = innerSel.Items
+            .OfType<ExpressionSelectItem>()
+            .Where(it => it.Expression is WindowFunctionExpression)
+            .ToList();
+        if (windowItems.Count == 0)
+        {
+            return null; // ordinary derived table.
+        }
+
+        if (windowItems.Count > 1)
+        {
+            throw new ResolveException("at most one window function per query is supported in v1");
+        }
+
+        var windowItem = windowItems[0];
+        var win = (WindowFunctionExpression)windowItem.Expression;
+        var rankAlias = windowItem.Alias ?? throw new ResolveException(
+            "a window function must be aliased so the TOP-K filter can reference it " +
+            "(e.g. ROW_NUMBER() OVER (...) AS rn)");
+
+        var func = win.FunctionName switch
+        {
+            "row_number" => RankFunction.RowNumber,
+            "rank" => RankFunction.Rank,
+            "dense_rank" => RankFunction.DenseRank,
+            _ => throw new ResolveException(
+                $"unsupported window function '{win.FunctionName}'; only ROW_NUMBER, RANK, " +
+                "and DENSE_RANK are supported (window aggregates, LAG/LEAD, etc. are deferred)"),
+        };
+
+        if (win.Over.OrderBy.Count == 0)
+        {
+            throw new ResolveException(
+                $"{win.FunctionName.ToUpperInvariant()}() OVER (...) requires an ORDER BY");
+        }
+
+        // Build the inner SELECT without the window item; everything below treats
+        // it as the derived table's real (rank-free) shape.
+        var innerItems = innerSel.Items.Where(it => !ReferenceEquals(it, windowItem)).ToList();
+        if (innerItems.Count == 0)
+        {
+            throw new ResolveException(
+                "the windowed derived table must select at least one column besides the ranking function");
+        }
+
+        var innerNoWindow = innerSel with { Items = innerItems };
+        if (innerSel.Distinct)
+        {
+            throw new ResolveException("a window function over SELECT DISTINCT is not supported in v1");
+        }
+
+        if (innerSel.GroupBy.Count > 0 || HasAggregate(innerNoWindow.Items)
+            || (innerSel.Having is not null && HasAggregate(innerSel.Having)))
+        {
+            throw new ResolveException(
+                "a window function over a grouped/aggregated query is not supported in v1");
+        }
+
+        // The enclosing query must filter the rank alias with `< k` / `<= k`
+        // (or the reversed `k >= rn` / `k > rn`) and use it nowhere else.
+        if (stmt.Where is null)
+        {
+            throw new ResolveException(
+                "a ranking window function requires a `" + rankAlias + " <= k` filter in the " +
+                "enclosing query (the incremental TOP-K pattern)");
+        }
+
+        long? limit = null;
+        var residual = new List<Expression>();
+        foreach (var c in SplitAndConjuncts(stmt.Where))
+        {
+            if (limit is null && TryMatchRankFilter(c, rankAlias, dt.Alias, out var k))
+            {
+                limit = k;
+            }
+            else
+            {
+                residual.Add(c);
+            }
+        }
+
+        if (limit is null)
+        {
+            throw new ResolveException(
+                "a ranking window function requires a `" + rankAlias + " <= k` (or `< k`) filter in " +
+                "the enclosing query; other comparisons on the rank are not the TOP-K pattern");
+        }
+
+        if (residual.Any(c => ExprReferencesRank(c, rankAlias, dt.Alias))
+            || stmt.Items.Any(it => it is ExpressionSelectItem esi && ExprReferencesRank(esi.Expression, rankAlias, dt.Alias))
+            || stmt.GroupBy.Any(g => ExprReferencesRank(g, rankAlias, dt.Alias))
+            || (stmt.Having is not null && ExprReferencesRank(stmt.Having, rankAlias, dt.Alias)))
+        {
+            throw new ResolveException(
+                "the window rank column may only be used in the TOP-K filter; selecting or otherwise " +
+                "referencing it is not supported in v1");
+        }
+
+        // Resolve the rank-free inner query (the derived table's visible schema),
+        // then re-resolve it with the PARTITION BY / ORDER BY expressions appended
+        // as hidden trailing columns so they resolve against the inner FROM scope.
+        var visiblePlan = ResolveQuery(innerNoWindow, scope, outerSchema);
+        var visibleSchema = visiblePlan.Schema;
+
+        var hiddenAsts = new List<Expression>(win.Over.PartitionBy.Count + win.Over.OrderBy.Count);
+        hiddenAsts.AddRange(win.Over.PartitionBy);
+        foreach (var s in win.Over.OrderBy)
+        {
+            hiddenAsts.Add(s.Expression);
+        }
+
+        var basePlan = ResolveWithHiddenOrderColumns(
+            innerNoWindow, hiddenAsts, scope, outerSchema, visibleSchema);
+        var baseSchema = basePlan.Schema;
+
+        var partitionKeys = new List<ResolvedExpression>(win.Over.PartitionBy.Count);
+        for (var j = 0; j < win.Over.PartitionBy.Count; j++)
+        {
+            var idx = visibleSchema.Count + j;
+            partitionKeys.Add(new ResolvedColumn(idx, baseSchema[idx].Type));
+        }
+
+        var sortKeys = new List<SortKey>(win.Over.OrderBy.Count);
+        for (var j = 0; j < win.Over.OrderBy.Count; j++)
+        {
+            var item = win.Over.OrderBy[j];
+            var idx = visibleSchema.Count + win.Over.PartitionBy.Count + j;
+            var descending = item.Direction == SortDirection.Descending;
+            var nullsFirst = item.Nulls switch
+            {
+                NullOrdering.NullsFirst => true,
+                NullOrdering.NullsLast => false,
+                _ => descending,
+            };
+            sortKeys.Add(new SortKey(new ResolvedColumn(idx, baseSchema[idx].Type), descending, nullsFirst));
+        }
+
+        var topk = new PartitionedTopKPlan(basePlan, partitionKeys, sortKeys, func, limit.Value);
+
+        // Strip the hidden columns back to the derived table's visible schema,
+        // re-qualified with the derived alias (mirrors ResolveDerivedTable).
+        var stripCols = new List<SchemaColumn>(visibleSchema.Count);
+        var stripProj = new List<ProjectionItem>(visibleSchema.Count);
+        for (var i = 0; i < visibleSchema.Count; i++)
+        {
+            var col = visibleSchema[i];
+            stripCols.Add(new SchemaColumn(col.Name, col.Type, dt.Alias));
+            stripProj.Add(new ProjectionItem(new ResolvedColumn(i, col.Type), col.Name, dt.Alias));
+        }
+
+        var topkRelation = new ProjectPlan(topk, stripProj, new Schema(stripCols));
+
+        // Re-enter ResolveSelect for the enclosing query's remaining clauses over
+        // the TOP-K result. CTEs were already folded into `scope`, so clear them
+        // and pass `scope` as the outer scope to avoid re-resolving them.
+        var rewritten = stmt with
+        {
+            From = new PreResolvedRelation(topkRelation),
+            Where = residual.Count == 0 ? null : JoinAnd(residual),
+            Ctes = System.Array.Empty<CteDefinition>(),
+        };
+
+        return ResolveSelect(rewritten, scope, outerSchema);
+    }
+
+    /// <summary>
+    /// Match a rank-filter conjunct <c>rank &lt;= k</c> / <c>rank &lt; k</c> (or
+    /// the reversed <c>k &gt;= rank</c> / <c>k &gt; rank</c>) where <c>rank</c> is
+    /// a column reference to <paramref name="rankAlias"/> (optionally qualified by
+    /// the derived alias) and <c>k</c> is an integer literal. Yields the TOP-K
+    /// <paramref name="limit"/> (<c>&lt; k</c> ⇒ <c>k − 1</c>).
+    /// </summary>
+    private static bool TryMatchRankFilter(Expression c, string rankAlias, string dtAlias, out long limit)
+    {
+        limit = 0;
+        if (c is not BinaryExpression be)
+        {
+            return false;
+        }
+
+        var leftIsRank = IsRankRef(be.Left, rankAlias, dtAlias);
+        var rightIsRank = IsRankRef(be.Right, rankAlias, dtAlias);
+        if (leftIsRank == rightIsRank)
+        {
+            return false; // need exactly one side to be the rank column.
+        }
+
+        // Normalise to `rank <op> kExpr`.
+        var op = leftIsRank ? be.Operator : FlipComparison(be.Operator);
+        var kExpr = leftIsRank ? be.Right : be.Left;
+        if (kExpr is not LiteralExpression { Kind: LiteralKind.Integer, Value: long k })
+        {
+            return false;
+        }
+
+        switch (op)
+        {
+            case BinaryOperator.LessEqual:
+                limit = k;
+                return true;
+            case BinaryOperator.Less:
+                limit = k - 1;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsRankRef(Expression e, string rankAlias, string dtAlias) =>
+        e is ColumnReference cr && cr.Name == rankAlias
+        && (cr.Qualifier is null || cr.Qualifier == dtAlias);
+
+    private static BinaryOperator FlipComparison(BinaryOperator op) => op switch
+    {
+        BinaryOperator.Less => BinaryOperator.Greater,
+        BinaryOperator.LessEqual => BinaryOperator.GreaterEqual,
+        BinaryOperator.Greater => BinaryOperator.Less,
+        BinaryOperator.GreaterEqual => BinaryOperator.LessEqual,
+        _ => op,
+    };
+
+    /// <summary>Conservative scan for a reference to the rank alias. A missed
+    /// node type simply falls through to ordinary resolution, which then fails
+    /// with "unknown column" (the rank column isn't in the visible schema) — so
+    /// this only needs to be complete enough for a friendlier error.</summary>
+    private static bool ExprReferencesRank(Expression e, string rankAlias, string dtAlias) => e switch
+    {
+        ColumnReference => IsRankRef(e, rankAlias, dtAlias),
+        BinaryExpression be => ExprReferencesRank(be.Left, rankAlias, dtAlias) || ExprReferencesRank(be.Right, rankAlias, dtAlias),
+        UnaryExpression u => ExprReferencesRank(u.Operand, rankAlias, dtAlias),
+        IsNullExpression isn => ExprReferencesRank(isn.Operand, rankAlias, dtAlias),
+        CastExpression cast => ExprReferencesRank(cast.Operand, rankAlias, dtAlias),
+        FunctionCallExpression fn => fn.Arguments.Any(a => ExprReferencesRank(a, rankAlias, dtAlias)),
+        InListExpression il => ExprReferencesRank(il.Probe, rankAlias, dtAlias) || il.Values.Any(v => ExprReferencesRank(v, rankAlias, dtAlias)),
+        CaseExpression ce => ce.Whens.Any(w => ExprReferencesRank(w.Condition, rankAlias, dtAlias) || ExprReferencesRank(w.Result, rankAlias, dtAlias))
+            || (ce.ElseResult is not null && ExprReferencesRank(ce.ElseResult, rankAlias, dtAlias)),
+        _ => false,
+    };
+
     private static ResolvedExpression? TryResolveAgainstOutput(
         Parser.Ast.Expression expr, Schema outputSchema)
     {
@@ -989,6 +1274,7 @@ public sealed class Resolver
         TableReference tr => ResolveTableReference(tr, cteScope),
         JoinClause jc => ResolveJoin(jc, cteScope),
         DerivedTableReference dt => ResolveDerivedTable(dt, cteScope, outerSchema),
+        PreResolvedRelation pr => pr.Plan,
         _ => throw new ResolveException($"unsupported FROM clause: {from.GetType().Name}"),
     };
 

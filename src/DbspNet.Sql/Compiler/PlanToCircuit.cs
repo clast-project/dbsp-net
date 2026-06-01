@@ -524,6 +524,9 @@ public static class PlanToCircuit
                 case TopKPlan t:
                     Walk(t.Input);
                     break;
+                case PartitionedTopKPlan pt:
+                    Walk(pt.Input);
+                    break;
                 case DifferencePlan diff:
                     Walk(diff.Left);
                     Walk(diff.Right);
@@ -629,6 +632,9 @@ public static class PlanToCircuit
             case TopKPlan t:
                 return CompileTopK(builder, t, ctx);
 
+            case PartitionedTopKPlan pt:
+                return CompilePartitionedTopK(builder, pt, ctx);
+
             default:
                 throw new InvalidOperationException($"unsupported plan node {plan.GetType().Name}");
         }
@@ -663,6 +669,58 @@ public static class PlanToCircuit
 
         // Full-row tiebreak gives a total order so the window boundary is stable.
         return new SortKeyComparer<StructuralRow>(keys, descending, nullsFirst, StructuralRowComparer.Instance);
+    }
+
+    // ---- Partitioned TOP-K (windowed ROW_NUMBER / RANK / DENSE_RANK <= k) ----
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompilePartitionedTopK(
+        CircuitBuilder builder,
+        PartitionedTopKPlan plan,
+        CompileContext ctx)
+    {
+        var input = CompilePlan(builder, plan.Input, ctx);
+
+        var keys = new Func<StructuralRow, object?>[plan.SortKeys.Count];
+        var descending = new bool[plan.SortKeys.Count];
+        var nullsFirst = new bool[plan.SortKeys.Count];
+        for (var i = 0; i < plan.SortKeys.Count; i++)
+        {
+            var scalar = ExpressionCompiler.CompileScalar(plan.SortKeys[i].Expression);
+            keys[i] = row => scalar(row);
+            descending[i] = plan.SortKeys[i].Descending;
+            nullsFirst[i] = plan.SortKeys[i].NullsFirst;
+        }
+
+        // `order` is the total order keeping the per-partition trace sorted;
+        // `sortKeyOnly` (zero tiebreak) detects equal-ORDER-BY-key tie groups for
+        // RANK / DENSE_RANK.
+        var order = new SortKeyComparer<StructuralRow>(
+            keys, descending, nullsFirst, StructuralRowComparer.Instance);
+        var sortKeyOnly = new SortKeyComparer<StructuralRow>(
+            keys, descending, nullsFirst, ConstantZeroComparer<StructuralRow>.Instance);
+
+        // Partition key: project the PARTITION BY expressions into a StructuralRow
+        // (an empty list ⇒ a constant key ⇒ a single global partition).
+        var partitionExtractors = new Func<IReadOnlyList<object?>, object?>[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            partitionExtractors[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
+        }
+
+        StructuralRow PartitionOf(StructuralRow row)
+        {
+            var values = new object?[partitionExtractors.Length];
+            for (var i = 0; i < partitionExtractors.Length; i++)
+            {
+                values[i] = partitionExtractors[i](row);
+            }
+
+            return new StructuralRow(values);
+        }
+
+        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
+        return builder.PartitionedTopK<StructuralRow, StructuralRow>(
+            input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec);
     }
 
     // ---- Projection ----

@@ -212,6 +212,7 @@ public static class TypedPlanCompiler
         ScalarSubqueryJoinPlan s => CompileScalarSubqueryJoin(s, ctx),
         RecursiveCtePlan r => CompileRecursiveCte(r, ctx),
         TopKPlan t => CompileTopK(t, ctx),
+        PartitionedTopKPlan pt => CompilePartitionedTopK(pt, ctx),
         _ => null,
     };
 
@@ -801,6 +802,65 @@ public static class TypedPlanCompiler
             ctx.Builder, rowType, inner.Stream, extractors, descending, nullsFirst,
             plan.Offset ?? 0, plan.Limit, snapshotCodec);
         return new TypedNode(rowType, inner.Schema, output);
+    }
+
+    /// <summary>
+    /// Compiles a <see cref="PartitionedTopKPlan"/> (windowed
+    /// <c>ROW_NUMBER</c> / <c>RANK</c> / <c>DENSE_RANK</c> &lt;= k). Mirrors
+    /// <see cref="CompileTopK"/> for the sort keys and additionally lowers the
+    /// PARTITION BY expressions to boxed extractors that build a
+    /// <see cref="StructuralRow"/> partition key. Falls back to the structural
+    /// compile if any sort or partition expression is outside the typed
+    /// expression compiler's scope.
+    /// </summary>
+    private static TypedNode? CompilePartitionedTopK(PartitionedTopKPlan plan, CompileContext ctx)
+    {
+        var inner = TryCompileNode(plan.Input, ctx);
+        if (inner is null) return null;
+
+        var rowType = inner.RowType;
+
+        var count = plan.SortKeys.Count;
+        var sortExtractors = new Delegate[count];
+        var descending = new bool[count];
+        var nullsFirst = new bool[count];
+        for (var i = 0; i < count; i++)
+        {
+            var sortKey = plan.SortKeys[i];
+            if (BuildBoxedExtractor(sortKey.Expression, rowType) is not { } ex) return null;
+            sortExtractors[i] = ex;
+            descending[i] = sortKey.Descending;
+            nullsFirst[i] = sortKey.NullsFirst;
+        }
+
+        var partitionExtractors = new Delegate[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            if (BuildBoxedExtractor(plan.PartitionKeys[i], rowType) is not { } ex) return null;
+            partitionExtractors[i] = ex;
+        }
+
+        var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Schema, rowType);
+        var output = InvokePartitionedTopK(
+            ctx.Builder, rowType, inner.Stream, sortExtractors, descending, nullsFirst,
+            partitionExtractors, plan.Function, plan.Limit, snapshotCodec);
+        return new TypedNode(rowType, inner.Schema, output);
+    }
+
+    /// <summary>Lower a resolved expression to a compiled <c>Func&lt;TRow,
+    /// object?&gt;</c> over the emitted row struct (boxed so a null
+    /// <c>Nullable&lt;T&gt;</c> becomes a null reference, matching
+    /// <see cref="SortKeyComparer{TRow}"/>). Returns null when the expression is
+    /// outside the typed expression compiler's scope.</summary>
+    private static Delegate? BuildBoxedExtractor(ResolvedExpression expr, Type rowType)
+    {
+        var rowParam = Expression.Parameter(rowType, "row");
+        var body = TypedExpressionCompiler.TryBuildInto(expr, rowParam);
+        if (body is null) return null;
+
+        var boxed = Expression.Convert(body, typeof(object));
+        var funcType = typeof(Func<,>).MakeGenericType(rowType, typeof(object));
+        return Expression.Lambda(funcType, boxed, rowParam).Compile();
     }
 
     /// <summary>
@@ -1972,6 +2032,65 @@ public static class TypedPlanCompiler
         var stream = (Stream<ZSet<TRow, Z64>>)input;
         var codec = (IZSetTraceCodec<TRow, Z64>?)snapshotCodec;
         return builder.TopK(stream, comparer, offset, limit, codec);
+    }
+
+    /// <summary>
+    /// <c>builder.PartitionedTopK&lt;TRow, StructuralRow&gt;(…)</c>, building the
+    /// typed order / sort-key-only comparers and the StructuralRow partition-key
+    /// extractor from the boxed delegates first (TRow is only known at runtime).
+    /// </summary>
+    private static object InvokePartitionedTopK(
+        CircuitBuilder builder, Type rowType, object input, Delegate[] sortExtractors,
+        bool[] descending, bool[] nullsFirst, Delegate[] partitionExtractors,
+        RankFunction function, long limit, object? snapshotCodec)
+    {
+        var openMethod = typeof(TypedPlanCompiler)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Single(m => m.Name == nameof(BuildPartitionedTopK) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(rowType);
+        return closed.Invoke(null, new object?[]
+        {
+            builder, input, sortExtractors, descending, nullsFirst, partitionExtractors, function, limit, snapshotCodec,
+        })!;
+    }
+
+    /// <summary>Generic worker for <see cref="InvokePartitionedTopK"/>.</summary>
+    private static object BuildPartitionedTopK<TRow>(
+        CircuitBuilder builder, object input, Delegate[] sortExtractors,
+        bool[] descending, bool[] nullsFirst, Delegate[] partitionExtractors,
+        RankFunction function, long limit, object? snapshotCodec)
+        where TRow : notnull
+    {
+        var keys = new Func<TRow, object?>[sortExtractors.Length];
+        for (var i = 0; i < sortExtractors.Length; i++)
+        {
+            keys[i] = (Func<TRow, object?>)sortExtractors[i];
+        }
+
+        var order = new SortKeyComparer<TRow>(keys, descending, nullsFirst, Comparer<TRow>.Default);
+        var sortKeyOnly = new SortKeyComparer<TRow>(keys, descending, nullsFirst, ConstantZeroComparer<TRow>.Instance);
+
+        var partKeys = new Func<TRow, object?>[partitionExtractors.Length];
+        for (var i = 0; i < partitionExtractors.Length; i++)
+        {
+            partKeys[i] = (Func<TRow, object?>)partitionExtractors[i];
+        }
+
+        StructuralRow PartitionOf(TRow row)
+        {
+            var values = new object?[partKeys.Length];
+            for (var i = 0; i < partKeys.Length; i++)
+            {
+                values[i] = partKeys[i](row);
+            }
+
+            return new StructuralRow(values);
+        }
+
+        var stream = (Stream<ZSet<TRow, Z64>>)input;
+        var codec = (IZSetTraceCodec<TRow, Z64>?)snapshotCodec;
+        return builder.PartitionedTopK<TRow, StructuralRow>(
+            stream, PartitionOf, order, sortKeyOnly, function, limit, null, codec);
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>

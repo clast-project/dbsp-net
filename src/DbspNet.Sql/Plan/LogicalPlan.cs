@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Plan;
@@ -115,6 +116,30 @@ public sealed record TopKPlan(
     IReadOnlyList<SortKey> SortKeys,
     long? Limit,
     long? Offset) : LogicalPlan(Input.Schema);
+
+/// <summary>
+/// Incremental partitioned TOP-K — the <c>ROW_NUMBER</c> / <c>RANK</c> /
+/// <c>DENSE_RANK</c> window functions restricted to the SQL filter pattern
+/// <c>… OVER (PARTITION BY p ORDER BY o) &lt;= Limit</c>. Within each partition
+/// (the <see cref="PartitionKeys"/> grouping) it keeps the rows whose rank under
+/// <see cref="SortKeys"/> is <c>&lt;= Limit</c>, maintained as rows enter and
+/// leave that window under retraction.
+/// </summary>
+/// <remarks>
+/// The rank value is never materialised — it only drives the cut at
+/// <see cref="Limit"/>, so the schema is the input's, unchanged (rows are
+/// filtered, never widened). <see cref="PartitionKeys"/> and the
+/// <see cref="SortKey.Expression"/>s are resolved against <see cref="Input"/>;
+/// any that reference a column not in the inner select list are carried as
+/// hidden trailing columns on <see cref="Input"/> and stripped by a projection
+/// the resolver places above this node.
+/// </remarks>
+public sealed record PartitionedTopKPlan(
+    LogicalPlan Input,
+    IReadOnlyList<ResolvedExpression> PartitionKeys,
+    IReadOnlyList<SortKey> SortKeys,
+    RankFunction Function,
+    long Limit) : LogicalPlan(Input.Schema);
 
 /// <summary>
 /// <c>UNION ALL</c> of two or more branches. Every branch has been

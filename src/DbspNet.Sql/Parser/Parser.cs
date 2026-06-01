@@ -1518,10 +1518,73 @@ public sealed class Parser
                 return BuildDecodeExpression(args, first);
             }
 
+            // A trailing OVER (...) turns the call into a window function. Only
+            // the ranking functions are supported (see WindowFunctionExpression);
+            // any others are caught and rejected at resolve time. OVER takes no
+            // arguments here (RANK/ROW_NUMBER/DENSE_RANK), so `args` is discarded.
+            if (IsContextualKeyword("over"))
+            {
+                Advance();
+                return new WindowFunctionExpression(first.Text, ParseWindowSpec());
+            }
+
             return new FunctionCallExpression(first.Text, args, IsStar: false);
         }
 
         return new ColumnReference(Qualifier: null, first.Text);
+    }
+
+    /// <summary>
+    /// Parse a window specification <c>( [PARTITION BY e, …] [ORDER BY s, …] )</c>;
+    /// the caller has already consumed the <c>OVER</c> token. <c>PARTITION</c> is
+    /// a contextual keyword (not reserved); <c>ORDER BY</c> reuses
+    /// <see cref="ParseSortItem"/>.
+    /// </summary>
+    private WindowSpec ParseWindowSpec()
+    {
+        Expect(TokenKind.LParen);
+
+        IReadOnlyList<Expression> partitionBy = Array.Empty<Expression>();
+        if (IsContextualKeyword("partition"))
+        {
+            Advance();
+            Expect(TokenKind.By);
+            var parts = new List<Expression> { ParseExpression() };
+            while (Peek().Kind == TokenKind.Comma)
+            {
+                Advance();
+                parts.Add(ParseExpression());
+            }
+
+            partitionBy = parts;
+        }
+
+        IReadOnlyList<SortItem> orderBy = Array.Empty<SortItem>();
+        if (Peek().Kind == TokenKind.Order)
+        {
+            Advance();
+            Expect(TokenKind.By);
+            var items = new List<SortItem> { ParseSortItem() };
+            while (Peek().Kind == TokenKind.Comma)
+            {
+                Advance();
+                items.Add(ParseSortItem());
+            }
+
+            orderBy = items;
+        }
+
+        Expect(TokenKind.RParen);
+        return new WindowSpec(partitionBy, orderBy);
+    }
+
+    /// <summary>A non-reserved word matched by text in a position where it acts
+    /// as a keyword (e.g. <c>OVER</c>, <c>PARTITION</c>). Quoted identifiers
+    /// never match, so <c>"over"</c> stays usable as an ordinary name.</summary>
+    private bool IsContextualKeyword(string word)
+    {
+        var t = Peek();
+        return t.Kind == TokenKind.Identifier && !t.QuotedIdentifier && t.Text == word;
     }
 
     // ---------------- Token helpers ----------------
