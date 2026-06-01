@@ -9,12 +9,13 @@ using DbspNet.Sql.TypeSystem;
 namespace DbspNet.Sql.Expressions;
 
 /// <summary>
-/// Typed-row counterpart to <see cref="BuiltinScalarFunctions"/>.
-/// Lowers a <see cref="ResolvedFunctionCall"/> against pre-compiled
-/// typed argument expressions, producing an expression whose CLR
-/// type matches the function's result. No boxing, no
-/// <c>object</c>-typed intermediate values; NULL-propagation logic
-/// collapses since every operand is non-null on the typed path.
+/// Typed-row counterpart to <see cref="BuiltinScalarFunctions"/>: the typed
+/// (fast-path) lowering for each builtin, against pre-compiled typed argument
+/// expressions, producing an expression whose CLR type matches the function's
+/// result. No boxing, no <c>object</c>-typed intermediate values. Dispatch
+/// lives in <see cref="ScalarFunctionRegistry"/>; each registry entry's
+/// <c>BuildTyped</c> delegates to a <c>BuildXxx</c> here (or returns null to
+/// fall the query back to the structural pipeline).
 /// </summary>
 /// <remarks>
 /// <para><b>NULL handling.</b> Functions that produce NULL by design
@@ -28,78 +29,36 @@ namespace DbspNet.Sql.Expressions;
 internal static class TypedBuiltinScalarFunctions
 {
     /// <summary>
-    /// Lower <paramref name="fn"/> with already-compiled typed
-    /// argument expressions <paramref name="args"/>. Returns the
-    /// result expression or <c>null</c> if the function is outside
-    /// the typed pipeline's scope.
+    /// LN / EXP on the typed path — chosen by <paramref name="exp"/>. The
+    /// registry entry delegates here (the multi-arg string functions return
+    /// null from their own entries to fall back to the structural pipeline).
     /// </summary>
-    public static Expression? TryBuild(
-        ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] args)
-    {
-        // Per-function NULL handling (Phase: per-function NULL
-        // propagation): each builder is responsible for handling
-        // nullable args either by wrapping in PropagateUnary /
-        // PropagateBinary (NULL-propagating functions) or by
-        // routing to a skip-null runtime helper (CONCAT, GREATEST,
-        // LEAST — PG semantics, matches structural). NULLIF and
-        // COALESCE produce NULL by design and have always handled
-        // nullable args themselves.
-        return fn.FunctionName switch
-        {
-            "coalesce" => BuildCoalesce(args),
-            "upper" => BuildUpperLower(args[0], isUpper: true),
-            "lower" => BuildUpperLower(args[0], isUpper: false),
-            "length" => BuildLength(args[0]),
-            "concat" => BuildConcat(args),
-            "||" => BuildConcatStrict(args),
-            "abs" => BuildAbs(args[0], astArgs[0].Type),
-            "floor" => BuildFloorCeil(args[0], astArgs[0].Type, floor: true),
-            "ceil" or "ceiling" => BuildFloorCeil(args[0], astArgs[0].Type, floor: false),
-            "round" => BuildRound(args, astArgs),
-            "power" => BuildPower(args[0], args[1]),
-            "sqrt" => BuildSqrt(args[0]),
-            "greatest" => BuildGreatestLeast(args, greatest: true),
-            "least" => BuildGreatestLeast(args, greatest: false),
-            "nullif" => BuildNullIf(args[0], args[1]),
-            "sign" => BuildSign(args[0]),
-            "ln" => BuildUnaryDouble(args[0], MathLog),
-            "exp" => BuildUnaryDouble(args[0], MathExp),
-            "log" => BuildLog(args),
-
-            // The multi-argument string functions (SUBSTRING / TRIM family /
-            // REPLACE / POSITION / STRPOS) are not lowered on the typed path;
-            // returning null falls the whole compile back to the structural
-            // pipeline (which handles them via SqlBuiltinRuntime). Listed
-            // explicitly so the intent is clear rather than hitting `default`.
-            "substring" or "substr" or "ltrim" or "rtrim" or "trim"
-                or "replace" or "position" or "strpos" => null,
-            _ => null,
-        };
-    }
+    internal static Expression BuildLnExp(Expression arg, bool exp) =>
+        BuildUnaryDouble(arg, exp ? MathExp : MathLog);
 
     // ---- Numeric (sign / ln / log / exp) ----
     //
     // The resolver casts every operand to DOUBLE, so on the typed path the
     // argument expression is already double / double?; no per-type dispatch.
 
-    private static readonly MethodInfo MathSignDouble =
+    internal static readonly MethodInfo MathSignDouble =
         typeof(Math).GetMethod(nameof(Math.Sign), new[] { typeof(double) })!;
-    private static readonly MethodInfo MathLog =
+    internal static readonly MethodInfo MathLog =
         typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double) })!;
-    private static readonly MethodInfo MathLog2 =
+    internal static readonly MethodInfo MathLog2 =
         typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double), typeof(double) })!;
-    private static readonly MethodInfo MathLog10 =
+    internal static readonly MethodInfo MathLog10 =
         typeof(Math).GetMethod(nameof(Math.Log10), new[] { typeof(double) })!;
-    private static readonly MethodInfo MathExp =
+    internal static readonly MethodInfo MathExp =
         typeof(Math).GetMethod(nameof(Math.Exp), new[] { typeof(double) })!;
 
-    private static Expression BuildSign(Expression arg) =>
+    internal static Expression BuildSign(Expression arg) =>
         TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(MathSignDouble, v));
 
-    private static Expression BuildUnaryDouble(Expression arg, MethodInfo math) =>
+    internal static Expression BuildUnaryDouble(Expression arg, MethodInfo math) =>
         TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(math, v));
 
-    private static Expression BuildLog(Expression[] args)
+    internal static Expression BuildLog(Expression[] args)
     {
         if (args.Length == 1)
         {
@@ -116,7 +75,7 @@ internal static class TypedBuiltinScalarFunctions
     /// otherwise returns x. Result is always nullable. Unblocked by
     /// Phase N2's NULL-aware typed expression compiler.
     /// </summary>
-    private static Expression BuildNullIf(Expression x, Expression y)
+    internal static Expression BuildNullIf(Expression x, Expression y)
     {
         // Lift both args to nullable to share a single result type.
         var xN = TypedExpressionCompiler.IsNullable(x.Type) || !x.Type.IsValueType
@@ -164,7 +123,7 @@ internal static class TypedBuiltinScalarFunctions
 
     // ---- COALESCE ----
 
-    private static Expression BuildCoalesce(Expression[] args)
+    internal static Expression BuildCoalesce(Expression[] args)
     {
         // Right-to-left fold: COALESCE(a, b, c) ≡ a ?? (b ?? c). For
         // non-null args, collapses to args[0]. For nullable args,
@@ -190,7 +149,7 @@ internal static class TypedBuiltinScalarFunctions
     /// <c>x.HasValue ? x : fallback</c> when fallback is nullable
     /// and we want to keep the nullable wrapper).
     /// </summary>
-    private static Expression CoalesceTwo(Expression x, Expression fallback)
+    internal static Expression CoalesceTwo(Expression x, Expression fallback)
     {
         if (!TypedExpressionCompiler.IsNullable(x.Type))
         {
@@ -223,34 +182,34 @@ internal static class TypedBuiltinScalarFunctions
 
     // ---- String ----
 
-    private static readonly MethodInfo Utf8ToUpperInvariant =
+    internal static readonly MethodInfo Utf8ToUpperInvariant =
         typeof(Utf8String).GetMethod(nameof(Utf8String.ToUpperInvariant))!;
-    private static readonly MethodInfo Utf8ToLowerInvariant =
+    internal static readonly MethodInfo Utf8ToLowerInvariant =
         typeof(Utf8String).GetMethod(nameof(Utf8String.ToLowerInvariant))!;
-    private static readonly MethodInfo Utf8CodePointCount =
+    internal static readonly MethodInfo Utf8CodePointCount =
         typeof(Utf8String).GetMethod(nameof(Utf8String.CodePointCount))!;
 
-    private static Expression BuildUpperLower(Expression arg, bool isUpper)
+    internal static Expression BuildUpperLower(Expression arg, bool isUpper)
     {
         return TypedExpressionCompiler.PropagateUnary(arg, v =>
             Expression.Call(v, isUpper ? Utf8ToUpperInvariant : Utf8ToLowerInvariant));
     }
 
-    private static Expression BuildLength(Expression arg)
+    internal static Expression BuildLength(Expression arg)
     {
         // PG semantics: LENGTH = number of code points.
         return TypedExpressionCompiler.PropagateUnary(arg, v =>
             Expression.Call(v, Utf8CodePointCount));
     }
 
-    private static readonly MethodInfo ConcatTyped =
+    internal static readonly MethodInfo ConcatTyped =
         typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatTyped))!;
-    private static readonly MethodInfo ConcatTypedNullable =
+    internal static readonly MethodInfo ConcatTypedNullable =
         typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatTypedNullable))!;
-    private static readonly MethodInfo ConcatStrictTypedNullable =
+    internal static readonly MethodInfo ConcatStrictTypedNullable =
         typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.ConcatStrictTypedNullable))!;
 
-    private static Expression BuildConcat(Expression[] args)
+    internal static Expression BuildConcat(Expression[] args)
     {
         // PG semantics: CONCAT skips NULL args, never returns NULL.
         // Fast path (all args non-null): pack as Utf8String[].
@@ -281,7 +240,7 @@ internal static class TypedBuiltinScalarFunctions
         return Expression.Call(ConcatTypedNullable, nullableArray);
     }
 
-    private static Expression BuildConcatStrict(Expression[] args)
+    internal static Expression BuildConcatStrict(Expression[] args)
     {
         // The `||` operator: NULL-propagating. All-non-null collapses to the
         // plain concat (non-null Utf8String). If any arg is nullable, route to
@@ -312,7 +271,7 @@ internal static class TypedBuiltinScalarFunctions
 
     // ---- Numeric ----
 
-    private static Expression BuildAbs(Expression arg, SqlType argType)
+    internal static Expression BuildAbs(Expression arg, SqlType argType)
     {
         if (argType is SqlDecimalType)
         {
@@ -326,7 +285,7 @@ internal static class TypedBuiltinScalarFunctions
         return TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(mathMethod, v));
     }
 
-    private static Expression BuildFloorCeil(Expression arg, SqlType argType, bool floor)
+    internal static Expression BuildFloorCeil(Expression arg, SqlType argType, bool floor)
     {
         if (argType is SqlIntegerType or SqlBigintType)
         {
@@ -350,7 +309,7 @@ internal static class TypedBuiltinScalarFunctions
         return TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(runtimeMethod, v));
     }
 
-    private static Expression BuildRound(Expression[] args, IReadOnlyList<ResolvedExpression> astArgs)
+    internal static Expression BuildRound(Expression[] args, IReadOnlyList<ResolvedExpression> astArgs)
     {
         var argType = astArgs[0].Type;
         if (argType is SqlIntegerType or SqlBigintType)
@@ -394,7 +353,7 @@ internal static class TypedBuiltinScalarFunctions
         });
     }
 
-    private static Expression BuildPower(Expression x, Expression y)
+    internal static Expression BuildPower(Expression x, Expression y)
     {
         // Both widen to double inside the propagate closure; result
         // is Nullable<double> iff either operand is nullable.
@@ -406,7 +365,7 @@ internal static class TypedBuiltinScalarFunctions
         });
     }
 
-    private static Expression BuildSqrt(Expression arg)
+    internal static Expression BuildSqrt(Expression arg)
     {
         return TypedExpressionCompiler.PropagateUnary(arg, v =>
         {
@@ -417,7 +376,7 @@ internal static class TypedBuiltinScalarFunctions
 
     // ---- GREATEST / LEAST ----
 
-    private static Expression? BuildGreatestLeast(Expression[] args, bool greatest)
+    internal static Expression? BuildGreatestLeast(Expression[] args, bool greatest)
     {
         // Resolver casts every arg to a common comparable type and
         // marks the result nullable iff any arg is nullable (all-NULL
@@ -474,7 +433,7 @@ internal static class TypedBuiltinScalarFunctions
 
     // ---- Helpers ----
 
-    private static Expression WidenToInt(Expression e)
+    internal static Expression WidenToInt(Expression e)
     {
         if (e.Type == typeof(int)) return e;
         return Expression.Convert(e, typeof(int));

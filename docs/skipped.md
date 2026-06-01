@@ -509,11 +509,12 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   Missing and commonly needed: other math (`SIN`/`COS`/`TAN`, `MOD`,
   `TRUNC`) and `NOW`/`CURRENT_TIMESTAMP` (non-deterministic — would need a
   once-per-step evaluation, not per-row, to stay incrementally correct).
-  **Dispatch now routes through `ScalarFunctionRegistry`** (the
-  `IScalarFunction` framework — phase 1 landed; the temporal functions are its
-  first native entries); the ~25 legacy builtins still live in the
-  `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions` switches and are
-  reached by fallthrough, to be ported function-by-function. See
+  **Dispatch routes through `ScalarFunctionRegistry`** (the `IScalarFunction`
+  framework — phases 1–3 landed): every builtin is now a registry entry in
+  `ScalarFunctionLibrary.cs`, the four parallel switches are gone, and
+  `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions` remain only as
+  implementation-helper libraries the entries delegate to. Still deferred: the
+  `Monotonicity()` hook for LATENESS GC (phase 4) and UDFs (phase 5). See
   [`scalar-function-registry.md`](scalar-function-registry.md). The keyword
   spellings
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|BOTH … FROM …)`

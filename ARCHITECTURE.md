@@ -296,10 +296,13 @@ linear-emission gate, and per-aggregate result types.
 
 If you want to add…
 
-- **A SQL scalar function (e.g. `SUBSTRING`).** One entry in
-  `DbspNet.Sql/Expressions/BuiltinScalarFunctions.cs`
-  (`IsKnown`, `Resolve` arm, `Build` arm). The typed pipeline picks it
-  up via `TypedBuiltinScalarFunctions` — add the matching entry there.
+- **A SQL scalar function (e.g. `SUBSTRING`).** One `IScalarFunction` entry
+  (`Resolve` + `BuildStructural` + `BuildTyped`) registered in
+  `DbspNet.Sql/Expressions/ScalarFunctionRegistry.cs`. Self-contained entries
+  (e.g. the temporal functions) live in their own file; entries that reuse the
+  existing helper bodies delegate to the internal `ResolveXxx`/`BuildXxx`
+  methods in `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions`. Return
+  null from `BuildTyped` to fall the query back to the structural pipeline.
   Test coverage convention: a fact per arity / per type-coercion edge
   in `tests/DbspNet.Tests/Sql/ScalarFunctionTests.cs`.
 

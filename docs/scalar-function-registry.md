@@ -1,30 +1,33 @@
 # Design note: a scalar-function registry (`IScalarFunction`)
 
-**Status:** *phase 1 landed* (2026-05). `IScalarFunction` +
-`ScalarFunctionRegistry` exist and are the single dispatch authority: all four
-sites (resolver scalar + post-aggregate, structural compiler, typed compiler)
-route through `ScalarFunctionRegistry`, which consults registered entries first
-and **falls through to the legacy `BuiltinScalarFunctions` /
-`TypedBuiltinScalarFunctions` switches** for not-yet-ported names. The first
-registry-native entries are the temporal functions `EXTRACT`/`DATE_PART`,
-`DATE_TRUNC`, `DATEADD`, `DATEDIFF` (see `TemporalScalarFunctions.cs`).
+**Status:** *phases 1–3 landed* (2026-05). `IScalarFunction` +
+`ScalarFunctionRegistry` are the **single dispatch authority**: all four sites
+(resolver scalar + post-aggregate, structural compiler, typed compiler) route
+through `ScalarFunctionRegistry`, and **every** builtin — the temporal functions
+(`EXTRACT`/`DATE_PART`, `DATE_TRUNC`, `DATEADD`, `DATEDIFF`) plus the original
+~25 (COALESCE, the string family, the numeric family, GREATEST/LEAST, NULLIF) —
+is now a registry entry in `ScalarFunctionLibrary.cs`. The four parallel
+switches are gone. `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions`
+remain as **implementation libraries** of internal `ResolveXxx` / `BuildXxx`
+helpers (bodies unchanged from the original switches); each registry entry is a
+thin adapter delegating to them, so resolve + build for a function stay
+co-located and can't drift. Aliases (`substr`→`substring`, `ceiling`→`ceil`,
+`date_part`→`extract`) register the same instance under another key.
 
-**Remaining work** (the migration the rest of this note describes):
-- Port the ~25 existing builtins (COALESCE, the string family, the numeric
-  family, GREATEST/LEAST, NULLIF) into `IScalarFunction` entries
-  function-by-function, deleting each legacy switch arm as its entry lands
-  (phase 2), then delete the now-thin switch shells (phase 3). Mechanical;
-  keep `ScalarFunctionTests` + the random-query PBT green per batch.
+**Remaining work:**
 - Add the optional `Monotonicity()` hook + wire it into
   `MonotonicityAnalyzer` (phase 4) — the LATENESS-GC payoff. **Not yet
   modeled** on the interface (kept minimal: Resolve / BuildStructural /
   BuildTyped only).
 - UDF surface (phase 5, deferred).
+- Optional: collapse the implementation helpers into the entry classes so
+  each function is fully self-contained (the bodies currently still live in
+  `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions`). Cosmetic — the
+  drift surface is already gone.
 
 The original proposal follows; it captures *why* a registry and *what* it
-buys us. Read it before porting the next builtin, before wiring the monotone-
-function catalog for LATENESS, or before considering user-defined functions
-(UDFs, tracked P2 in `skipped.md`).
+buys us. Read it before wiring the monotone-function catalog for LATENESS, or
+before considering user-defined functions (UDFs, tracked P2 in `skipped.md`).
 
 ## The load-bearing DBSP fact
 

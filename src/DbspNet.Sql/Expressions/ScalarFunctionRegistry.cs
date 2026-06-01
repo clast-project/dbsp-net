@@ -52,45 +52,79 @@ internal interface IScalarFunction
 }
 
 /// <summary>
-/// Single dispatch authority for builtin scalar functions. Registered
-/// <see cref="IScalarFunction"/> entries are consulted first; any name not yet
-/// ported to the registry falls through to the legacy
-/// <see cref="BuiltinScalarFunctions"/> / <see cref="TypedBuiltinScalarFunctions"/>
-/// switches. This keeps a single seam while the function library migrates onto
-/// the registry incrementally (each ported function deletes its legacy arms).
+/// Single dispatch authority for builtin scalar functions. Every name lives in
+/// exactly one <see cref="IScalarFunction"/> entry, which owns its arity/type
+/// inference and both lowerings — replacing the four parallel switches that
+/// previously had to be kept in lockstep. The resolver checks
+/// <see cref="IsKnown"/> before <see cref="Resolve"/>, and lowering only runs
+/// for resolved (hence known) calls, so the dictionary always contains the name
+/// by the time Build* is reached.
 /// </summary>
 internal static class ScalarFunctionRegistry
 {
     private static readonly Dictionary<string, IScalarFunction> ByName = Build();
 
-    public static bool IsKnown(string name) =>
-        ByName.ContainsKey(name) || BuiltinScalarFunctions.IsKnown(name);
+    public static bool IsKnown(string name) => ByName.ContainsKey(name);
 
     public static ResolvedFunctionCall Resolve(string name, IReadOnlyList<ResolvedExpression> args) =>
         ByName.TryGetValue(name, out var f)
             ? f.Resolve(args)
-            : BuiltinScalarFunctions.Resolve(name, args);
+            : throw new ResolveException($"unknown function '{name}'");
 
     public static Expression BuildStructural(
         ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
-        ByName.TryGetValue(fn.FunctionName, out var f)
-            ? f.BuildStructural(fn, buildArg)
-            : BuiltinScalarFunctions.Build(fn, buildArg);
+        Lookup(fn.FunctionName).BuildStructural(fn, buildArg);
 
     public static Expression? BuildTyped(
         ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) =>
-        ByName.TryGetValue(fn.FunctionName, out var f)
-            ? f.BuildTyped(fn, astArgs, typedArgs)
-            : TypedBuiltinScalarFunctions.TryBuild(fn, astArgs, typedArgs);
+        Lookup(fn.FunctionName).BuildTyped(fn, astArgs, typedArgs);
+
+    private static IScalarFunction Lookup(string name) =>
+        ByName.TryGetValue(name, out var f)
+            ? f
+            : throw new InvalidOperationException($"no registered scalar function '{name}'");
 
     private static Dictionary<string, IScalarFunction> Build()
     {
         var fns = new IScalarFunction[]
         {
+            // Temporal (registry-native).
             new ExtractFunction(),
             new DateTruncFunction(),
             new DateAddFunction(),
             new DateDiffFunction(),
+
+            // General.
+            new CoalesceFunction(),
+            new NullIfFunction(),
+            new GreatestLeastFunction("greatest", greatest: true),
+            new GreatestLeastFunction("least", greatest: false),
+
+            // String.
+            new UpperLowerFunction("upper", isUpper: true),
+            new UpperLowerFunction("lower", isUpper: false),
+            new LengthFunction(),
+            new ConcatFunction(),
+            new ConcatStrictFunction(),
+            new SubstringFunction(),
+            new TrimFunction("ltrim", BuiltinScalarFunctions.TrimSide.Left),
+            new TrimFunction("rtrim", BuiltinScalarFunctions.TrimSide.Right),
+            new TrimFunction("trim", BuiltinScalarFunctions.TrimSide.Both),
+            new ReplaceFunction(),
+            new PositionFunction("position", swapped: false),
+            new PositionFunction("strpos", swapped: true),
+
+            // Numeric.
+            new AbsFunction(),
+            new FloorCeilFunction("floor", floor: true),
+            new FloorCeilFunction("ceil", floor: false),
+            new RoundFunction(),
+            new PowerFunction(),
+            new SqrtFunction(),
+            new SignFunction(),
+            new LnExpFunction("ln", isExp: false),
+            new LnExpFunction("exp", isExp: true),
+            new LogFunction(),
         };
 
         var map = new Dictionary<string, IScalarFunction>(StringComparer.Ordinal);
@@ -99,9 +133,10 @@ internal static class ScalarFunctionRegistry
             map[f.Name] = f;
         }
 
-        // DATE_PART(field, source) is EXTRACT(field FROM source) with the field
-        // spelled as a string literal — the same registry entry.
-        map["date_part"] = map["extract"];
+        // Aliases (same instance under another spelling).
+        map["date_part"] = map["extract"]; // DATE_PART(field, source) ≡ EXTRACT(field FROM source)
+        map["substr"] = map["substring"];
+        map["ceiling"] = map["ceil"];
         return map;
     }
 }

@@ -11,10 +11,12 @@ using DbspNet.Sql.TypeSystem;
 namespace DbspNet.Sql.Expressions;
 
 /// <summary>
-/// Lookup / dispatch for the v1 scalar function library. Every function's
-/// resolver-side type-inference and compiler-side
-/// <see cref="System.Linq.Expressions.Expression"/> construction live together
-/// here so the two layers can't drift apart. Runtime helpers invoked from the
+/// Implementation library for the non-temporal builtin scalar functions:
+/// per-function resolve (type inference) + structural <see cref="Expression"/>
+/// construction. Dispatch lives in <see cref="ScalarFunctionRegistry"/> — each
+/// registry entry in <c>ScalarFunctionLibrary</c> delegates to the
+/// <c>ResolveXxx</c> / <c>BuildXxx</c> helpers here, so resolve and build for a
+/// function stay co-located and can't drift. Runtime helpers invoked from the
 /// generated expression trees are in <see cref="SqlBuiltinRuntime"/>.
 /// </summary>
 /// <remarks>
@@ -28,141 +30,11 @@ namespace DbspNet.Sql.Expressions;
 /// </remarks>
 internal static class BuiltinScalarFunctions
 {
-    private static readonly ConstantExpression NullObject = Expression.Constant(null, typeof(object));
+    internal static readonly ConstantExpression NullObject = Expression.Constant(null, typeof(object));
 
-    /// <summary>
-    /// <c>true</c> iff <paramref name="name"/> names a builtin scalar
-    /// function (so the resolver can skip the aggregate-dispatch path).
-    /// </summary>
-    public static bool IsKnown(string name) => name switch
-    {
-        "coalesce" or "upper" or "lower" or "length" or "concat" or "||"
-            or "abs" or "floor" or "ceil" or "ceiling" or "round" or "power" or "sqrt"
-            or "greatest" or "least" or "nullif"
-            or "substring" or "substr" or "ltrim" or "rtrim" or "trim" or "replace"
-            or "position" or "strpos" or "sign" or "ln" or "log" or "exp" => true,
-        _ => false,
-    };
-
-    /// <summary>
-    /// Resolver entry — validate arg counts/types, apply coercions, return
-    /// a <see cref="ResolvedFunctionCall"/> with the inferred result type.
-    /// </summary>
-    public static ResolvedFunctionCall Resolve(string name, IReadOnlyList<ResolvedExpression> args)
-    {
-        switch (name)
-        {
-            case "coalesce":
-                return ResolveCoalesce(args);
-            case "upper":
-            case "lower":
-                RequireArity(name, args, 1);
-                RequireString(name, args[0]);
-                return new ResolvedFunctionCall(name, args, args[0].Type);
-            case "length":
-                RequireArity(name, args, 1);
-                RequireString(name, args[0]);
-                return new ResolvedFunctionCall(name, args, new SqlIntegerType(args[0].Type.Nullable));
-            case "concat":
-                if (args.Count < 1)
-                {
-                    throw new ResolveException("CONCAT requires at least one argument");
-                }
-
-                foreach (var a in args)
-                {
-                    RequireString(name, a);
-                }
-
-                // PG semantics: CONCAT never returns NULL. NULL args are skipped.
-                return new ResolvedFunctionCall(name, args, new SqlVarcharType(null, Nullable: false));
-            case "||":
-                // String-concatenation operator. Unlike CONCAT it PROPAGATES
-                // NULL (any NULL operand → NULL result), per the SQL standard.
-                if (args.Count < 2)
-                {
-                    throw new ResolveException("|| requires at least two operands");
-                }
-
-                foreach (var a in args)
-                {
-                    RequireString("||", a);
-                }
-
-                var concatNullable = false;
-                foreach (var a in args)
-                {
-                    concatNullable |= a.Type.Nullable;
-                }
-
-                return new ResolvedFunctionCall("||", args, new SqlVarcharType(null, concatNullable));
-            case "abs":
-                RequireArity(name, args, 1);
-                RequireNumeric(name, args[0]);
-                return new ResolvedFunctionCall(name, args, args[0].Type);
-            case "floor":
-            case "ceil":
-            case "ceiling":
-                RequireArity(name, args, 1);
-                RequireNumeric(name, args[0]);
-                return new ResolvedFunctionCall(name, args, args[0].Type);
-            case "round":
-                return ResolveRound(name, args);
-            case "power":
-                RequireArity(name, args, 2);
-                RequireNumeric(name, args[0]);
-                RequireNumeric(name, args[1]);
-                return new ResolvedFunctionCall(
-                    name, args, new SqlDoubleType(args[0].Type.Nullable || args[1].Type.Nullable));
-            case "sqrt":
-                RequireArity(name, args, 1);
-                RequireNumeric(name, args[0]);
-                return new ResolvedFunctionCall(name, args, new SqlDoubleType(args[0].Type.Nullable));
-            case "greatest":
-            case "least":
-                return ResolveGreatestLeast(name, args);
-            case "nullif":
-                return ResolveNullIf(args);
-            case "substring":
-            case "substr":
-                return ResolveSubstring(args);
-            case "ltrim":
-            case "rtrim":
-            case "trim":
-                return ResolveTrim(name, args);
-            case "replace":
-                RequireArity(name, args, 3);
-                RequireString(name, args[0]);
-                RequireString(name, args[1]);
-                RequireString(name, args[2]);
-                return new ResolvedFunctionCall("replace", args, new SqlVarcharType(null, AnyNullable(args)));
-            case "position":
-            case "strpos":
-                RequireArity(name, args, 2);
-                RequireString(name, args[0]);
-                RequireString(name, args[1]);
-                return new ResolvedFunctionCall(name, args, new SqlIntegerType(AnyNullable(args)));
-            case "sign":
-                return ResolveSign(args);
-            case "ln":
-            case "exp":
-                return ResolveUnaryDouble(name, args);
-            case "log":
-                return ResolveLog(args);
-            default:
-                throw new ResolveException($"unknown function '{name}'");
-        }
-    }
-
-    /// <summary>
-    /// Compiler entry — emit a LINQ expression that evaluates the function.
-    /// <paramref name="buildArg"/> compiles an individual resolved arg
-    /// (using the enclosing row parameter) so this module doesn't need to
-    /// know about the row-parameter plumbing.
-    /// </summary>
-    public static Expression Build(
-        ResolvedFunctionCall fn,
-        Func<ResolvedExpression, Expression> buildArg)
+    /// <summary>Compile a function call's arguments against the enclosing row.</summary>
+    internal static Expression[] CompileArgs(
+        ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg)
     {
         var compiled = new Expression[fn.Arguments.Count];
         for (var i = 0; i < fn.Arguments.Count; i++)
@@ -170,43 +42,134 @@ internal static class BuiltinScalarFunctions
             compiled[i] = buildArg(fn.Arguments[i]);
         }
 
-        return fn.FunctionName switch
-        {
-            "coalesce" => BuildCoalesce(compiled),
-            "upper" => BuildUpperLower(compiled[0], isUpper: true),
-            "lower" => BuildUpperLower(compiled[0], isUpper: false),
-            "length" => BuildLength(compiled[0]),
-            "concat" => BuildConcat(compiled),
-            "||" => BuildConcatStrict(compiled),
-            "abs" => BuildAbs(compiled[0], fn.Arguments[0].Type),
-            "floor" => BuildFloorCeil(compiled[0], fn.Arguments[0].Type, floor: true),
-            "ceil" or "ceiling" => BuildFloorCeil(compiled[0], fn.Arguments[0].Type, floor: false),
-            "round" => BuildRound(compiled, fn.Arguments),
-            "power" => BuildPower(compiled[0], compiled[1], fn.Arguments[0].Type, fn.Arguments[1].Type),
-            "sqrt" => BuildSqrt(compiled[0], fn.Arguments[0].Type),
-            "greatest" => BuildGreatestLeast(compiled, greatest: true),
-            "least" => BuildGreatestLeast(compiled, greatest: false),
-            "nullif" => BuildNullIf(compiled[0], compiled[1], fn.Arguments[0].Type),
-            "substring" or "substr" => BuildSubstring(compiled),
-            "ltrim" => BuildTrim(compiled, TrimSide.Left),
-            "rtrim" => BuildTrim(compiled, TrimSide.Right),
-            "trim" => BuildTrim(compiled, TrimSide.Both),
-            "replace" => Expression.Call(ReplaceRuntime, compiled[0], compiled[1], compiled[2]),
-            // POSITION(sub IN str) → (needle=sub, haystack=str); STRPOS(str, sub)
-            // is the same with the arguments swapped.
-            "position" => Expression.Call(PositionRuntime, compiled[0], compiled[1]),
-            "strpos" => Expression.Call(PositionRuntime, compiled[1], compiled[0]),
-            "sign" => NullPropagatingUnary(compiled[0], typeof(double), v => Expression.Call(MathSignDouble, v)),
-            "ln" => NullPropagatingUnary(compiled[0], typeof(double), v => Expression.Call(MathLog, v)),
-            "exp" => NullPropagatingUnary(compiled[0], typeof(double), v => Expression.Call(MathExp, v)),
-            "log" => BuildLog(compiled),
-            _ => throw new InvalidOperationException($"unknown function '{fn.FunctionName}'"),
-        };
+        return compiled;
     }
+
+    // ---- Per-function resolve (one internal method per builtin; the registry
+    // entry for each name in ScalarFunctionLibrary delegates here, so the
+    // single source of truth for "which functions exist" is the registry). ----
+
+    internal static ResolvedFunctionCall ResolveUpperLower(string name, IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity(name, args, 1);
+        RequireString(name, args[0]);
+        return new ResolvedFunctionCall(name, args, args[0].Type);
+    }
+
+    internal static ResolvedFunctionCall ResolveLength(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("length", args, 1);
+        RequireString("length", args[0]);
+        return new ResolvedFunctionCall("length", args, new SqlIntegerType(args[0].Type.Nullable));
+    }
+
+    internal static ResolvedFunctionCall ResolveConcat(IReadOnlyList<ResolvedExpression> args)
+    {
+        if (args.Count < 1)
+        {
+            throw new ResolveException("CONCAT requires at least one argument");
+        }
+
+        foreach (var a in args)
+        {
+            RequireString("concat", a);
+        }
+
+        // PG semantics: CONCAT never returns NULL. NULL args are skipped.
+        return new ResolvedFunctionCall("concat", args, new SqlVarcharType(null, Nullable: false));
+    }
+
+    internal static ResolvedFunctionCall ResolveConcatStrict(IReadOnlyList<ResolvedExpression> args)
+    {
+        // The `||` operator: unlike CONCAT it PROPAGATES NULL (any NULL operand
+        // → NULL result), per the SQL standard.
+        if (args.Count < 2)
+        {
+            throw new ResolveException("|| requires at least two operands");
+        }
+
+        foreach (var a in args)
+        {
+            RequireString("||", a);
+        }
+
+        var concatNullable = false;
+        foreach (var a in args)
+        {
+            concatNullable |= a.Type.Nullable;
+        }
+
+        return new ResolvedFunctionCall("||", args, new SqlVarcharType(null, concatNullable));
+    }
+
+    internal static ResolvedFunctionCall ResolveAbs(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("abs", args, 1);
+        RequireNumeric("abs", args[0]);
+        return new ResolvedFunctionCall("abs", args, args[0].Type);
+    }
+
+    internal static ResolvedFunctionCall ResolveFloorCeil(string name, IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity(name, args, 1);
+        RequireNumeric(name, args[0]);
+        return new ResolvedFunctionCall(name, args, args[0].Type);
+    }
+
+    internal static ResolvedFunctionCall ResolvePower(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("power", args, 2);
+        RequireNumeric("power", args[0]);
+        RequireNumeric("power", args[1]);
+        return new ResolvedFunctionCall(
+            "power", args, new SqlDoubleType(args[0].Type.Nullable || args[1].Type.Nullable));
+    }
+
+    internal static ResolvedFunctionCall ResolveSqrt(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("sqrt", args, 1);
+        RequireNumeric("sqrt", args[0]);
+        return new ResolvedFunctionCall("sqrt", args, new SqlDoubleType(args[0].Type.Nullable));
+    }
+
+    internal static ResolvedFunctionCall ResolveReplace(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("replace", args, 3);
+        RequireString("replace", args[0]);
+        RequireString("replace", args[1]);
+        RequireString("replace", args[2]);
+        return new ResolvedFunctionCall("replace", args, new SqlVarcharType(null, AnyNullable(args)));
+    }
+
+    internal static ResolvedFunctionCall ResolvePosition(string name, IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity(name, args, 2);
+        RequireString(name, args[0]);
+        RequireString(name, args[1]);
+        return new ResolvedFunctionCall(name, args, new SqlIntegerType(AnyNullable(args)));
+    }
+
+    // ---- Build wrappers for the arms that were inline in the old dispatch ----
+
+    internal static Expression BuildReplace(Expression[] c) =>
+        Expression.Call(ReplaceRuntime, c[0], c[1], c[2]);
+
+    // POSITION(sub IN str) → (needle=sub, haystack=str); STRPOS(str, sub) is the
+    // same with the arguments swapped.
+    internal static Expression BuildPosition(Expression[] c, bool swapped) =>
+        swapped
+            ? Expression.Call(PositionRuntime, c[1], c[0])
+            : Expression.Call(PositionRuntime, c[0], c[1]);
+
+    internal static Expression BuildSign(Expression arg) =>
+        NullPropagatingUnary(arg, typeof(double), v => Expression.Call(MathSignDouble, v));
+
+    internal static Expression BuildLnExp(Expression arg, bool exp) =>
+        NullPropagatingUnary(arg, typeof(double), v => Expression.Call(exp ? MathExp : MathLog, v));
 
     // ---------------- Resolver helpers ----------------
 
-    private static void RequireArity(string name, IReadOnlyList<ResolvedExpression> args, int expected)
+    internal static void RequireArity(string name, IReadOnlyList<ResolvedExpression> args, int expected)
     {
         if (args.Count != expected)
         {
@@ -215,7 +178,7 @@ internal static class BuiltinScalarFunctions
         }
     }
 
-    private static void RequireString(string name, ResolvedExpression arg)
+    internal static void RequireString(string name, ResolvedExpression arg)
     {
         if (arg.Type is not SqlVarcharType)
         {
@@ -223,7 +186,7 @@ internal static class BuiltinScalarFunctions
         }
     }
 
-    private static void RequireNumeric(string name, ResolvedExpression arg)
+    internal static void RequireNumeric(string name, ResolvedExpression arg)
     {
         if (!TypeInference.IsNumeric(arg.Type))
         {
@@ -231,7 +194,7 @@ internal static class BuiltinScalarFunctions
         }
     }
 
-    private static ResolvedFunctionCall ResolveCoalesce(IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveCoalesce(IReadOnlyList<ResolvedExpression> args)
     {
         if (args.Count < 1)
         {
@@ -265,7 +228,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("coalesce", cast, common);
     }
 
-    private static ResolvedFunctionCall ResolveRound(string name, IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveRound(string name, IReadOnlyList<ResolvedExpression> args)
     {
         if (args.Count is < 1 or > 2)
         {
@@ -281,7 +244,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall(name, args, args[0].Type);
     }
 
-    private static ResolvedFunctionCall ResolveGreatestLeast(string name, IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveGreatestLeast(string name, IReadOnlyList<ResolvedExpression> args)
     {
         if (args.Count < 1)
         {
@@ -305,7 +268,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall(name, cast, resultType);
     }
 
-    private static ResolvedFunctionCall ResolveNullIf(IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveNullIf(IReadOnlyList<ResolvedExpression> args)
     {
         RequireArity("nullif", args, 2);
         var common = TypeInference.CommonComparableType(args[0].Type, args[1].Type);
@@ -319,7 +282,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("nullif", cast, args[0].Type.WithNullable(true));
     }
 
-    private static bool AnyNullable(IReadOnlyList<ResolvedExpression> args)
+    internal static bool AnyNullable(IReadOnlyList<ResolvedExpression> args)
     {
         foreach (var a in args)
         {
@@ -332,7 +295,7 @@ internal static class BuiltinScalarFunctions
         return false;
     }
 
-    private static void RequireInteger(string name, ResolvedExpression arg)
+    internal static void RequireInteger(string name, ResolvedExpression arg)
     {
         if (arg.Type is not (SqlIntegerType or SqlBigintType))
         {
@@ -340,7 +303,7 @@ internal static class BuiltinScalarFunctions
         }
     }
 
-    private static ResolvedFunctionCall ResolveSubstring(IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveSubstring(IReadOnlyList<ResolvedExpression> args)
     {
         if (args.Count is < 2 or > 3)
         {
@@ -358,7 +321,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("substring", args, new SqlVarcharType(null, AnyNullable(args)));
     }
 
-    private static ResolvedFunctionCall ResolveTrim(string name, IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveTrim(string name, IReadOnlyList<ResolvedExpression> args)
     {
         if (args.Count is < 1 or > 2)
         {
@@ -375,7 +338,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall(name, args, new SqlVarcharType(null, AnyNullable(args)));
     }
 
-    private static ResolvedFunctionCall ResolveSign(IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveSign(IReadOnlyList<ResolvedExpression> args)
     {
         RequireArity("sign", args, 1);
         RequireNumeric("sign", args[0]);
@@ -387,7 +350,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("sign", new[] { asDouble }, new SqlIntegerType(args[0].Type.Nullable));
     }
 
-    private static ResolvedFunctionCall ResolveUnaryDouble(string name, IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveUnaryDouble(string name, IReadOnlyList<ResolvedExpression> args)
     {
         // LN / EXP: widen the operand to DOUBLE and return DOUBLE.
         RequireArity(name, args, 1);
@@ -396,7 +359,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall(name, new[] { MaybeCast(args[0], d) }, d);
     }
 
-    private static ResolvedFunctionCall ResolveLog(IReadOnlyList<ResolvedExpression> args)
+    internal static ResolvedFunctionCall ResolveLog(IReadOnlyList<ResolvedExpression> args)
     {
         // LOG(x) — base-10 logarithm; LOG(b, x) — logarithm of x to base b.
         if (args.Count is < 1 or > 2)
@@ -414,7 +377,7 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("log", cast, new SqlDoubleType(AnyNullable(args)));
     }
 
-    private static ResolvedExpression MaybeCast(ResolvedExpression e, SqlType target)
+    internal static ResolvedExpression MaybeCast(ResolvedExpression e, SqlType target)
     {
         if (SameTypeIgnoringNullable(e.Type, target))
         {
@@ -424,12 +387,12 @@ internal static class BuiltinScalarFunctions
         return new ResolvedCast(e, target);
     }
 
-    private static bool SameTypeIgnoringNullable(SqlType a, SqlType b) =>
+    internal static bool SameTypeIgnoringNullable(SqlType a, SqlType b) =>
         a.WithNullable(false).Equals(b.WithNullable(false));
 
     // ---------------- Compiler helpers ----------------
 
-    private static Expression BuildCoalesce(Expression[] args)
+    internal static Expression BuildCoalesce(Expression[] args)
     {
         // Right-to-left fold: COALESCE(a, b, c) ≡ a ?? (b ?? c).
         Expression result = NullObject;
@@ -443,12 +406,12 @@ internal static class BuiltinScalarFunctions
         return result;
     }
 
-    private static readonly MethodInfo Utf8ToUpperInvariant =
+    internal static readonly MethodInfo Utf8ToUpperInvariant =
         typeof(Utf8String).GetMethod(nameof(Utf8String.ToUpperInvariant))!;
-    private static readonly MethodInfo Utf8ToLowerInvariant =
+    internal static readonly MethodInfo Utf8ToLowerInvariant =
         typeof(Utf8String).GetMethod(nameof(Utf8String.ToLowerInvariant))!;
 
-    private static Expression BuildUpperLower(Expression arg, bool isUpper)
+    internal static Expression BuildUpperLower(Expression arg, bool isUpper)
     {
         // Native UTF-8 case fold on Utf8String — no decode/encode round-trip.
         var method = isUpper ? Utf8ToUpperInvariant : Utf8ToLowerInvariant;
@@ -456,20 +419,20 @@ internal static class BuiltinScalarFunctions
             Expression.Call(s, method));
     }
 
-    private static readonly MethodInfo Utf8CodePointCount =
+    internal static readonly MethodInfo Utf8CodePointCount =
         typeof(Utf8String).GetMethod(nameof(Utf8String.CodePointCount))!;
 
-    private static Expression BuildLength(Expression arg)
+    internal static Expression BuildLength(Expression arg)
     {
         // PG semantics: LENGTH = number of code points (not bytes).
         return NullPropagatingUnary(arg, typeof(Utf8String),
             s => Expression.Call(s, Utf8CodePointCount));
     }
 
-    private static readonly MethodInfo ConcatRuntime =
+    internal static readonly MethodInfo ConcatRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Concat))!;
 
-    private static Expression BuildConcat(Expression[] args)
+    internal static Expression BuildConcat(Expression[] args)
     {
         // PG-style CONCAT: skip NULL args, concatenate the rest. Dispatched
         // at runtime since arity is variable.
@@ -477,10 +440,10 @@ internal static class BuiltinScalarFunctions
         return Expression.Convert(Expression.Call(ConcatRuntime, argArray), typeof(object));
     }
 
-    private static readonly MethodInfo ConcatStrictRuntime =
+    internal static readonly MethodInfo ConcatStrictRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.ConcatStrict))!;
 
-    private static Expression BuildConcatStrict(Expression[] args)
+    internal static Expression BuildConcatStrict(Expression[] args)
     {
         // The `||` operator: NULL-propagating concat. The runtime helper
         // already returns object? (null when any arg is null), so no boxing
@@ -489,7 +452,7 @@ internal static class BuiltinScalarFunctions
         return Expression.Call(ConcatStrictRuntime, argArray);
     }
 
-    private static Expression BuildAbs(Expression arg, SqlType argType)
+    internal static Expression BuildAbs(Expression arg, SqlType argType)
     {
         if (argType is SqlDecimalType)
         {
@@ -504,7 +467,7 @@ internal static class BuiltinScalarFunctions
         return NullPropagatingUnary(arg, clr, unboxed => Expression.Call(mathMethod, unboxed));
     }
 
-    private static Expression BuildFloorCeil(Expression arg, SqlType argType, bool floor)
+    internal static Expression BuildFloorCeil(Expression arg, SqlType argType, bool floor)
     {
         // Integer types: no-op (FLOOR(5) = 5, CEIL(5) = 5).
         if (argType is SqlIntegerType or SqlBigintType)
@@ -529,7 +492,7 @@ internal static class BuiltinScalarFunctions
         return NullPropagatingUnary(arg, clr, unboxed => Expression.Call(fallback, unboxed));
     }
 
-    private static Expression BuildRound(Expression[] args, IReadOnlyList<ResolvedExpression> argTypes)
+    internal static Expression BuildRound(Expression[] args, IReadOnlyList<ResolvedExpression> argTypes)
     {
         var argType = argTypes[0].Type;
         if (argType is SqlIntegerType or SqlBigintType)
@@ -588,7 +551,7 @@ internal static class BuiltinScalarFunctions
         return Expression.Condition(isNull, NullObject, Expression.Convert(call, typeof(object)));
     }
 
-    private static Expression BuildPower(Expression x, Expression y, SqlType xType, SqlType yType)
+    internal static Expression BuildPower(Expression x, Expression y, SqlType xType, SqlType yType)
     {
         // Both operands widen to double; Math.Pow returns double.
         var isNull = Expression.OrElse(
@@ -600,7 +563,7 @@ internal static class BuiltinScalarFunctions
         return Expression.Condition(isNull, NullObject, Expression.Convert(call, typeof(object)));
     }
 
-    private static Expression BuildSqrt(Expression arg, SqlType argType)
+    internal static Expression BuildSqrt(Expression arg, SqlType argType)
     {
         return NullPropagatingUnary(arg, typeof(double), unboxed =>
             Expression.Call(typeof(Math).GetMethod(nameof(Math.Sqrt))!, unboxed),
@@ -608,18 +571,18 @@ internal static class BuiltinScalarFunctions
             intermediateClr: ClrOf(argType) == typeof(double) ? null : ClrOf(argType));
     }
 
-    private static readonly MethodInfo GreatestRuntime =
+    internal static readonly MethodInfo GreatestRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Greatest))!;
-    private static readonly MethodInfo LeastRuntime =
+    internal static readonly MethodInfo LeastRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Least))!;
 
-    private static Expression BuildGreatestLeast(Expression[] args, bool greatest)
+    internal static Expression BuildGreatestLeast(Expression[] args, bool greatest)
     {
         var argArray = Expression.NewArrayInit(typeof(object), args);
         return Expression.Call(greatest ? GreatestRuntime : LeastRuntime, argArray);
     }
 
-    private static Expression BuildNullIf(Expression x, Expression y, SqlType argType)
+    internal static Expression BuildNullIf(Expression x, Expression y, SqlType argType)
     {
         // Semantics (matches PG):
         //   x IS NULL            → NULL
@@ -645,42 +608,42 @@ internal static class BuiltinScalarFunctions
 
     // ---------------- String / numeric builders ----------------
 
-    private enum TrimSide
+    internal enum TrimSide
     {
         Left = 0,
         Right = 1,
         Both = 2,
     }
 
-    private static readonly MethodInfo SubstringRuntime2 =
+    internal static readonly MethodInfo SubstringRuntime2 =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Substring), new[] { typeof(object), typeof(object) })!;
-    private static readonly MethodInfo SubstringRuntime3 =
+    internal static readonly MethodInfo SubstringRuntime3 =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Substring), new[] { typeof(object), typeof(object), typeof(object) })!;
-    private static readonly MethodInfo TrimRuntime1 =
+    internal static readonly MethodInfo TrimRuntime1 =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.TrimString), new[] { typeof(object), typeof(int) })!;
-    private static readonly MethodInfo TrimRuntime2 =
+    internal static readonly MethodInfo TrimRuntime2 =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.TrimString), new[] { typeof(object), typeof(object), typeof(int) })!;
-    private static readonly MethodInfo ReplaceRuntime =
+    internal static readonly MethodInfo ReplaceRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Replace))!;
-    private static readonly MethodInfo PositionRuntime =
+    internal static readonly MethodInfo PositionRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Position))!;
-    private static readonly MethodInfo MathSignDouble =
+    internal static readonly MethodInfo MathSignDouble =
         typeof(Math).GetMethod(nameof(Math.Sign), new[] { typeof(double) })!;
-    private static readonly MethodInfo MathLog =
+    internal static readonly MethodInfo MathLog =
         typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double) })!;
-    private static readonly MethodInfo MathLog2 =
+    internal static readonly MethodInfo MathLog2 =
         typeof(Math).GetMethod(nameof(Math.Log), new[] { typeof(double), typeof(double) })!;
-    private static readonly MethodInfo MathLog10 =
+    internal static readonly MethodInfo MathLog10 =
         typeof(Math).GetMethod(nameof(Math.Log10), new[] { typeof(double) })!;
-    private static readonly MethodInfo MathExp =
+    internal static readonly MethodInfo MathExp =
         typeof(Math).GetMethod(nameof(Math.Exp), new[] { typeof(double) })!;
 
-    private static Expression BuildSubstring(Expression[] args) =>
+    internal static Expression BuildSubstring(Expression[] args) =>
         args.Length == 2
             ? Expression.Call(SubstringRuntime2, args[0], args[1])
             : Expression.Call(SubstringRuntime3, args[0], args[1], args[2]);
 
-    private static Expression BuildTrim(Expression[] args, TrimSide side)
+    internal static Expression BuildTrim(Expression[] args, TrimSide side)
     {
         var sideConst = Expression.Constant((int)side);
         return args.Length == 1
@@ -688,7 +651,7 @@ internal static class BuiltinScalarFunctions
             : Expression.Call(TrimRuntime2, args[0], args[1], sideConst);
     }
 
-    private static Expression BuildLog(Expression[] args)
+    internal static Expression BuildLog(Expression[] args)
     {
         if (args.Length == 1)
         {
@@ -711,7 +674,7 @@ internal static class BuiltinScalarFunctions
     /// <summary>
     /// Build <c>operand == null ? null : (object)f((clr)operand)</c>.
     /// </summary>
-    private static Expression NullPropagatingUnary(
+    internal static Expression NullPropagatingUnary(
         Expression operand,
         Type clr,
         Func<Expression, Expression> f,
@@ -728,7 +691,7 @@ internal static class BuiltinScalarFunctions
         return Expression.Condition(isNull, NullObject, Expression.Convert(result, typeof(object)));
     }
 
-    private static Type ClrOf(SqlType t) => t switch
+    internal static Type ClrOf(SqlType t) => t switch
     {
         SqlIntegerType => typeof(int),
         SqlBigintType => typeof(long),
@@ -853,14 +816,14 @@ internal static class SqlBuiltinRuntime
             ? null
             : (object)PositionCore((Utf8String)haystack, (Utf8String)needle);
 
-    private static int AsInt(object o) => o switch
+    internal static int AsInt(object o) => o switch
     {
         int i => i,
         long l => checked((int)l),
         _ => Convert.ToInt32(o, CultureInfo.InvariantCulture),
     };
 
-    private static Utf8String SubstringCore(Utf8String s, int start1, int? length)
+    internal static Utf8String SubstringCore(Utf8String s, int start1, int? length)
     {
         var span = s.Span;
         var n = CodePointCount(span);
@@ -894,7 +857,7 @@ internal static class SqlBuiltinRuntime
         return Utf8String.FromBytes(span[byteStart..byteEnd].ToArray());
     }
 
-    private static Utf8String TrimCore(Utf8String s, Utf8String? chars, int side)
+    internal static Utf8String TrimCore(Utf8String s, Utf8String? chars, int side)
     {
         var set = new HashSet<Rune>();
         if (chars is null)
@@ -955,7 +918,7 @@ internal static class SqlBuiltinRuntime
         return byteStart >= byteEnd ? Utf8String.Empty : Utf8String.FromBytes(span[byteStart..byteEnd].ToArray());
     }
 
-    private static Utf8String ReplaceCore(Utf8String s, Utf8String from, Utf8String to)
+    internal static Utf8String ReplaceCore(Utf8String s, Utf8String from, Utf8String to)
     {
         var sp = s.Span;
         var f = from.Span;
@@ -994,7 +957,7 @@ internal static class SqlBuiltinRuntime
         return Utf8String.FromBytes(result.ToArray());
     }
 
-    private static int PositionCore(Utf8String haystack, Utf8String needle)
+    internal static int PositionCore(Utf8String haystack, Utf8String needle)
     {
         var h = haystack.Span;
         var ndl = needle.Span;
@@ -1022,7 +985,7 @@ internal static class SqlBuiltinRuntime
         return cp + 1;
     }
 
-    private static int CodePointCount(ReadOnlySpan<byte> span)
+    internal static int CodePointCount(ReadOnlySpan<byte> span)
     {
         var count = 0;
         for (var i = 0; i < span.Length; i++)
@@ -1038,7 +1001,7 @@ internal static class SqlBuiltinRuntime
 
     /// <summary>Byte offset where the <paramref name="cp"/>-th (0-based) code
     /// point starts; <c>span.Length</c> if past the end.</summary>
-    private static int CpToByte(ReadOnlySpan<byte> span, int cp)
+    internal static int CpToByte(ReadOnlySpan<byte> span, int cp)
     {
         if (cp <= 0)
         {

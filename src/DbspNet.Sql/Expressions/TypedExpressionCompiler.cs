@@ -790,9 +790,9 @@ public static class TypedExpressionCompiler
 
     /// <summary>
     /// Lowers a builtin scalar function call by recursively compiling
-    /// the args and delegating to <see cref="TypedBuiltinScalarFunctions.TryBuild"/>.
-    /// Functions outside the typed pipeline's scope cause the whole
-    /// compile to fall back.
+    /// the args and delegating to <see cref="ScalarFunctionRegistry.BuildTyped"/>.
+    /// Functions outside the typed pipeline's scope return null and cause the
+    /// whole compile to fall back.
     /// </summary>
     private static Expression BuildFunction(ResolvedFunctionCall fn, ParameterExpression row, Type rowType)
     {
