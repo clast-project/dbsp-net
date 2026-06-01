@@ -1,10 +1,70 @@
 # Design note: `NOW()` / `CURRENT_TIMESTAMP` and temporal filters
 
-**Status:** proposed / deferred (not implemented). Captured 2026-05 after the
-scalar-function registry (`scalar-function-registry.md`) and the temporal
-function / LATENESS-GC work landed, to record *why* `NOW()` is not just another
-registry entry, *what* it actually requires, and *which* of three substantially
-different features the SQL keyword could mean.
+**Status:** **implemented (option B — advancing temporal filters).** Shipped
+2026-05/06 in five phases on `main`. This note keeps the original design
+rationale (why `NOW()` is not a registry entry, the correctness-oracle problem,
+the three features the keyword could mean) below, and records the as-built
+shape in **"Implementation status (shipped)"** immediately following. Captured
+after the scalar-function registry (`scalar-function-registry.md`) and the
+temporal function / LATENESS-GC work landed.
+
+## Implementation status (shipped)
+
+Option **B** is implemented: `NOW()` / `CURRENT_TIMESTAMP` is an advancing,
+host-driven logical clock, legal only inside sanctioned temporal-filter
+predicates, compiled to a time-driven operator that emits retractions as the
+clock advances. Option A (per-tick stamping) was deliberately *not* shipped;
+option C (frozen constant) was subsumed (a frozen value is just a clock the host
+never advances).
+
+- **Clock.** `RootCircuit.LogicalTime` (microseconds since epoch, the `TIMESTAMP`
+  unit), advanced by the host via `RootCircuit.AdvanceTime` /
+  `CompiledQuery.AdvanceClock` before each `Step`; monotone non-decreasing
+  (backward move throws); `long.MinValue` is "unset" (logical −∞). Never reads
+  the wall clock. Persisted in the snapshot manifest (`logical_time`, schema
+  v3) and restored *before* operators load. Exposed as an `IFrontier`
+  (`RootCircuit.Clock`) so it unifies with the LATENESS frontier machinery.
+- **Grammar.** A dedicated `NowExpression` AST node (never a
+  `FunctionCallExpression` — it bypasses the purity-contracted registry).
+  `NOW()` needs its empty arg list (a column named `now` still resolves);
+  `CURRENT_TIMESTAMP` is parenless. Recognised only in WHERE conjuncts of the
+  form `key {<|<=|>|>=} NOW() [± constant day-time INTERVAL]` (both operand
+  orders; `BETWEEN` folds into one two-bound window). `NOW()` anywhere else —
+  SELECT, projection, HAVING, disjunctions, a non-`TIMESTAMP` key, a month/year
+  offset, both sides, `=` — is a `ResolveException`. Only day-time intervals are
+  valid offsets (they are a constant number of microseconds; month/year are not).
+- **Plan / operator.** The resolver folds qualifying conjuncts into a
+  `TemporalFilterPlan` (per-row validity window affine in the time-key);
+  `PlanToCircuit` compiles it to `TemporalFilterOp<TRow>`, which integrates the
+  input and each tick recomputes the valid set against the clock and emits the
+  delta against the previously-emitted set — so rows age in/out (including on
+  input-free ticks where only the clock moved). `ISnapshotable`. The typed fast
+  path falls back to structural, as for LATENESS.
+- **Correctness oracle.** A temporal filter at logical time `t` is exactly the
+  relational filter with `NOW = t`. `BatchPlanEvaluator` gained a `Now` and a
+  `TemporalFilterPlan` arm; the random-query oracle drives the circuit advancing
+  the clock per tick, accumulates the output, and checks equality with the batch
+  evaluated at the run's *final* clock (the emitted deltas telescope to
+  `validAt(finalClock)`). See `TemporalFilterPbtTests`.
+- **State GC (clock-as-watermark).** The operator self-GCs rows once the clock
+  passes their upper bound. A disappear-bounded filter on a bare time-key column
+  also advertises a clock-driven frontier (`clock − offset`) on that column,
+  reusing the LATENESS source/frontier plumbing, so a downstream `GROUP BY` /
+  join / `DISTINCT` on the time-key GCs the same way.
+
+**Deferred follow-ons:** `CURRENT_DATE` / `CURRENT_TIME` (different units); a
+spine sibling operator; a per-row transition-time index (the operator's per-tick
+recompute is O(integral size)); monotone-*expression* time-keys (e.g.
+`date_trunc(ts)`) and filters not directly over a scan, for the downstream-GC
+frontier; the typed fast path; and WAL (approach A) per-tick clock recording for
+pure-log replay (the snapshot path is correct today).
+
+---
+
+## Original design rationale
+
+*(Captured before implementation; retained for the reasoning. Where it says
+"proposed", read "shipped as described".)*
 
 Read this before adding `NOW()` / `CURRENT_TIMESTAMP` / `CURRENT_DATE`,
 `mz_now()`-style temporal filters, or any other time- or input-independent

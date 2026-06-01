@@ -453,6 +453,24 @@ reflect that shape, not a backlog.
   units); GC on the typed-row fast path (`LATENESS` forces the structural
   compile); and a `RecursiveCteOp` retain-keys story (its `_r` still grows
   unbounded — only joins / aggregates / distinct are bounded so far).
+- **Temporal filters (`NOW()` / `CURRENT_TIMESTAMP`)** — **implemented** (the
+  `mz_now()`-style advancing-clock model; the headline streaming feature). An
+  injected, monotone, persisted per-circuit logical clock (`RootCircuit.AdvanceTime`,
+  microseconds; persisted in the snapshot manifest as `logical_time`) that
+  `NOW()` resolves to, legal only in WHERE predicates of the form
+  `key {<|<=|>|>=} NOW() [± constant day-time INTERVAL]` (both operand orders;
+  `BETWEEN` folds into one window). The resolver folds these into a
+  `TemporalFilterPlan`; `PlanToCircuit` compiles it to a time-driven
+  `TemporalFilterOp` that emits inserts/retractions as the clock advances with
+  no new input (recompute-and-diff, like TOP-K). `NOW()` outside a sanctioned
+  predicate is a resolve error. Correctness is the redefined oracle
+  (incremental output at the final clock == batch with `NOW` = that clock); the
+  clock doubles as a watermark so a windowed (disappear-bounded) filter GCs both
+  its own state and a downstream `GROUP BY`/join/`DISTINCT` on the time-key. See
+  [`now-and-temporal-filters.md`](now-and-temporal-filters.md). Deferred:
+  `CURRENT_DATE`/`CURRENT_TIME`; spine sibling; a transition-time index (per-tick
+  recompute is O(state)); monotone-expression time-keys / non-direct-scan inputs
+  for downstream GC; typed fast path; WAL per-tick clock recording.
 - **[P3]** `WATERMARK` (experimental in Feldera).
 - **[P2]** `append_only` table annotation. Feldera-specific.
 - **[P2]** `emit_final` view annotation. Feldera-specific.
@@ -511,11 +529,15 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   typed-row fast path to the structural compile (matching temporal
   arithmetic / comparison behaviour).
   Missing and commonly needed: other math (`SIN`/`COS`/`TAN`, `MOD`,
-  `TRUNC`) and `NOW`/`CURRENT_TIMESTAMP`. The latter is **not** a scalar
-  function — it is non-deterministic (breaks the purity the registry and the
-  incremental≡batch oracle rest on) and is really one of three different
-  features (frozen constant / per-tick stamp / advancing temporal filters);
-  see the design note [`now-and-temporal-filters.md`](now-and-temporal-filters.md).
+  `TRUNC`). `NOW`/`CURRENT_TIMESTAMP` is **not** a scalar function — it is
+  non-deterministic (breaks the purity the registry and the incremental≡batch
+  oracle rest on) and is instead **implemented as advancing temporal filters**
+  (the `mz_now()` model): an injected, monotone, persisted logical clock legal
+  only in sanctioned WHERE predicates (`ts {<|<=|>|>=} NOW() [± day-time
+  INTERVAL]`), compiled to a time-driven operator that retracts rows as the
+  clock advances. See [`now-and-temporal-filters.md`](now-and-temporal-filters.md)
+  and the Streaming-extensions entry below. Deferred: `CURRENT_DATE` /
+  `CURRENT_TIME`.
   **Dispatch routes through `ScalarFunctionRegistry`** (the `IScalarFunction`
   framework — phases 1–3 landed): every builtin is now a registry entry in
   `ScalarFunctionLibrary.cs`, the four parallel switches are gone, and

@@ -188,6 +188,22 @@ batch re-computation.
   native units (µs for `TIMESTAMP`, days for `DATE`, the integer itself for
   `BIGINT`); duration-literal sugar (`'1' HOUR`) and a first-class
   `INTERVAL` type are deferred.
+- Temporal filters (`NOW()` / `CURRENT_TIMESTAMP`): the `mz_now()`-style
+  advancing-clock feature. `NOW()` is an injected, monotone, persisted logical
+  clock (host-driven via `RootCircuit.AdvanceTime` / `CompiledQuery.AdvanceClock`,
+  microseconds — never the wall clock, so replay is deterministic), legal only
+  in WHERE predicates of the form `ts {<|<=|>|>=} NOW() [± constant day-time
+  INTERVAL]` (e.g. `WHERE ts > NOW() - INTERVAL '1' HOUR`; both operand orders;
+  `BETWEEN` folds into one window). These lower to a time-driven
+  `TemporalFilterOp` that emits inserts and retractions as the clock advances
+  *with no new input* — a row is retracted on the tick the clock crosses its
+  upper bound. `NOW()` anywhere else is a resolve error. The clock doubles as a
+  watermark: a windowed (disappear-bounded) filter bounds both its own state and
+  a downstream `GROUP BY` / join / `DISTINCT` on the time-key, reusing the
+  LATENESS frontier machinery. Correctness is the redefined incremental≡batch
+  oracle (output accumulated at the final clock equals the batch evaluated with
+  `NOW` = that clock). Deferred: `CURRENT_DATE` / `CURRENT_TIME`, a spine
+  sibling, and the typed fast path. See `docs/now-and-temporal-filters.md`.
 - Plan optimizer (`DbspNet.Sql.Optimizer.PlanOptimizer`, explicit pass):
   predicate pushdown (through Project / Join / UnionAll / Distinct /
   Difference, respecting outer-join restrictions), projection
@@ -306,7 +322,9 @@ beyond "Feldera is much bigger":
   `DATE_PART`, `DATE_TRUNC`, `DATEADD`, `DATEDIFF` (dispatched through an
   `IScalarFunction` registry; `DATEADD`/`DATEDIFF` take a string-literal unit,
   not SQL Server's bare keyword). Missing pieces include other math
-  (`SIN`/`COS`/`TAN`, `MOD`) and `NOW`/`CURRENT_TIMESTAMP` (non-deterministic).
+  (`SIN`/`COS`/`TAN`, `MOD`). `NOW`/`CURRENT_TIMESTAMP` is not in the registry —
+  being non-deterministic, it ships instead as advancing temporal filters (see
+  the streaming-features list above).
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
   polymorphic "unknown" of PostgreSQL.
 - `INTERVAL` (core) and date/time arithmetic are supported; deferred pieces

@@ -289,6 +289,41 @@ compile — GC is wired only there. Equivalence is held by a property test: the
 incremental run with GC equals a batch evaluation over the non-late input,
 across both trace families.
 
+### Temporal filters (`NOW()` / advancing logical clock)
+
+`NOW()` / `CURRENT_TIMESTAMP` is **not** a scalar function (it is not pure in the
+row) — it is an advancing logical clock, the `mz_now()` model. The clock is a
+per-circuit `Int64` (microseconds since epoch), set by the host via
+`RootCircuit.AdvanceTime` before each `Step`, monotone non-decreasing, persisted
+in the snapshot manifest (`logical_time`) and exposed as an `IFrontier`
+(`RootCircuit.Clock`) — the same kind of object as a LATENESS frontier.
+
+- **Grammar / plan.** `NOW()` is a dedicated `NowExpression` AST node (it never
+  reaches `ScalarFunctionRegistry`). The resolver recognises WHERE conjuncts of
+  the form `key {<|<=|>|>=} NOW() [± constant day-time INTERVAL]` (both operand
+  orders; `BETWEEN` folds into one window) and lowers them to a
+  `TemporalFilterPlan` — a per-row validity window affine in the `TIMESTAMP`
+  time-key. `NOW()` in any other position is a resolve error.
+- **Operator.** `TemporalFilterOp` integrates the input and each tick recomputes
+  the set of rows valid at the current clock, emitting the delta against the
+  set it emitted last tick — so rows age in and out, *including on ticks with no
+  new input*, exactly like `TopKOp`'s recompute-and-diff. It self-GCs rows once
+  the clock passes their upper bound (the monotone clock guarantees they can't
+  return). `ISnapshotable`; the typed fast path falls back to structural.
+- **Clock as watermark.** A disappear-bounded filter on a bare time-key column
+  advertises a clock-driven frontier (`clock − offset`, a `TransformedFrontier`
+  over `RootCircuit.Clock`) on that column, registered under the column's
+  `LatenessSource` and marked monotone by `MonotonicityAnalyzer` — so the
+  *same* GC plumbing as LATENESS bounds a downstream `GROUP BY` / join /
+  `DISTINCT` on the time-key, with no new GC code paths.
+- **Correctness.** The redefined oracle: a temporal filter at logical time `t`
+  equals the relational filter with `NOW = t`. `BatchPlanEvaluator` takes a
+  `Now`; the property test drives the circuit advancing the clock per tick and
+  checks the accumulated output equals the batch at the run's final clock (the
+  emitted deltas telescope to `validAt(finalClock)`).
+
+See `docs/now-and-temporal-filters.md`.
+
 ### Aggregators
 
 `DbspNet.Core/Operators/Stateful/Aggregators/`. The
