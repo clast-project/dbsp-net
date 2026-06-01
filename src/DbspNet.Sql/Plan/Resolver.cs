@@ -3574,6 +3574,15 @@ public sealed class Resolver
     private static ResolvedExpression ResolveArithmetic(
         BinaryOperator op, ResolvedExpression left, ResolvedExpression right)
     {
+        // Temporal / interval arithmetic (date ± interval, ts − ts,
+        // interval ± interval, interval * n, …) is resolved separately —
+        // it doesn't follow the numeric-promotion lattice.
+        if (TypeInference.IsTemporal(left.Type) || TypeInference.IsTemporal(right.Type)
+            || left.Type is SqlIntervalType || right.Type is SqlIntervalType)
+        {
+            return ResolveTemporalArithmetic(op, left, right);
+        }
+
         // If neither side is decimal, and both are numeric, the existing
         // common-type promotion lattice produces an INT/BIGINT/REAL/DOUBLE
         // result that the compiler handles directly.
@@ -3625,6 +3634,141 @@ public sealed class Resolver
         return new ResolvedBinary(op, left, right, resultType);
     }
 
+    /// <summary>
+    /// Resolve arithmetic involving a temporal (DATE/TIME/TIMESTAMP) and/or
+    /// INTERVAL operand. The supported forms (operands kept at their natural
+    /// types; the expression compilers dispatch on the operand + result types):
+    /// <list type="bullet">
+    ///   <item>temporal ± interval → same temporal type</item>
+    ///   <item>interval + temporal → that temporal type</item>
+    ///   <item>temporal − temporal (same kind) → interval</item>
+    ///   <item>interval ± interval (same class) → interval</item>
+    ///   <item>interval × numeric / interval ÷ numeric → interval</item>
+    /// </list>
+    /// Anything else (e.g. DATE + DATE, temporal × numeric, modulo) is a
+    /// resolve error. DATE arithmetic is day-granular: a day-time interval
+    /// shifts a DATE by whole days, dropping any sub-day part.
+    /// </summary>
+    private static ResolvedExpression ResolveTemporalArithmetic(
+        BinaryOperator op, ResolvedExpression left, ResolvedExpression right)
+    {
+        var nullable = left.Type.Nullable || right.Type.Nullable;
+        var lt = left.Type;
+        var rt = right.Type;
+        var lTemporal = TypeInference.IsTemporal(lt);
+        var rTemporal = TypeInference.IsTemporal(rt);
+        var lInterval = lt is SqlIntervalType;
+        var rInterval = rt is SqlIntervalType;
+
+        ResolvedExpression Result(SqlType type) => new ResolvedBinary(op, left, right, type);
+
+        switch (op)
+        {
+            case BinaryOperator.Add:
+                // temporal + interval  (and the commuted interval + temporal)
+                if (lTemporal && rInterval)
+                {
+                    RejectMonthsOnTime(lt, rt);
+                    return Result(lt.WithNullable(nullable));
+                }
+
+                if (lInterval && rTemporal)
+                {
+                    RejectMonthsOnTime(rt, lt);
+                    return Result(rt.WithNullable(nullable));
+                }
+
+                if (lInterval && rInterval)
+                {
+                    return Result(CombineIntervalTypes(op, (SqlIntervalType)lt, (SqlIntervalType)rt, nullable));
+                }
+
+                break;
+
+            case BinaryOperator.Subtract:
+                if (lTemporal && rInterval)
+                {
+                    RejectMonthsOnTime(lt, rt);
+                    return Result(lt.WithNullable(nullable));
+                }
+
+                if (lTemporal && rTemporal)
+                {
+                    if (!SameTemporalKind(lt, rt))
+                    {
+                        throw new ResolveException(
+                            $"cannot subtract {rt.Display} from {lt.Display}");
+                    }
+
+                    // DATE − DATE → INTERVAL DAY; TIME/TIMESTAMP − same →
+                    // INTERVAL DAY TO SECOND (a microsecond span).
+                    var q = lt is SqlDateType ? IntervalQualifier.Day : IntervalQualifier.DayToSecond;
+                    return Result(new SqlIntervalType(q, nullable));
+                }
+
+                if (lInterval && rInterval)
+                {
+                    return Result(CombineIntervalTypes(op, (SqlIntervalType)lt, (SqlIntervalType)rt, nullable));
+                }
+
+                break;
+
+            case BinaryOperator.Multiply:
+                // interval × numeric (either order)
+                if (lInterval && IsScalableNumeric(rt))
+                {
+                    return Result(((SqlIntervalType)lt) with { Nullable = nullable });
+                }
+
+                if (rInterval && IsScalableNumeric(lt))
+                {
+                    return Result(((SqlIntervalType)rt) with { Nullable = nullable });
+                }
+
+                break;
+
+            case BinaryOperator.Divide:
+                if (lInterval && IsScalableNumeric(rt))
+                {
+                    return Result(((SqlIntervalType)lt) with { Nullable = nullable });
+                }
+
+                break;
+        }
+
+        throw new ResolveException(
+            $"operator {op} is not defined for operands {lt.Display} and {rt.Display}");
+    }
+
+    /// <summary>INT/BIGINT/REAL/DOUBLE may scale an interval (DECIMAL not yet).</summary>
+    private static bool IsScalableNumeric(SqlType t) =>
+        t is SqlIntegerType or SqlBigintType or SqlRealType or SqlDoubleType;
+
+    private static bool SameTemporalKind(SqlType a, SqlType b) =>
+        (a is SqlDateType && b is SqlDateType)
+        || (a is SqlTimeType && b is SqlTimeType)
+        || (a is SqlTimestampType && b is SqlTimestampType);
+
+    private static void RejectMonthsOnTime(SqlType temporal, SqlType interval)
+    {
+        if (temporal is SqlTimeType && interval is SqlIntervalType { IsYearMonth: true })
+        {
+            throw new ResolveException("cannot add a YEAR/MONTH interval to a TIME value");
+        }
+    }
+
+    private static SqlIntervalType CombineIntervalTypes(
+        BinaryOperator op, SqlIntervalType a, SqlIntervalType b, bool nullable)
+    {
+        if (a.IsYearMonth != b.IsYearMonth)
+        {
+            throw new ResolveException(
+                $"cannot {op} a year-month interval and a day-time interval");
+        }
+
+        return new SqlIntervalType(a.Qualifier, nullable);
+    }
+
     private static bool SameTypeIgnoringNullable(SqlType a, SqlType b) =>
         a.WithNullable(false).Equals(b.WithNullable(false));
 
@@ -3648,6 +3792,17 @@ public sealed class Resolver
     {
         var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap, outerSchema, preBound);
         var target = TypeInference.FromSpec(cast.TargetType, nullable: operand.Type.Nullable);
+
+        // Constant-fold CAST('<literal>' AS INTERVAL q) — the shape the parser
+        // emits for an INTERVAL literal — into a typed interval value so it is
+        // parsed once at compile time rather than per row.
+        if (target is SqlIntervalType intervalType
+            && operand is ResolvedLiteral { Kind: LiteralKind.String, Value: Utf8String text })
+        {
+            var value = Interval.Parse(text.ToStringDecoded(), intervalType.Qualifier);
+            return new ResolvedLiteral(LiteralKind.String, value, intervalType.WithNullable(false));
+        }
+
         return new ResolvedCast(operand, target);
     }
 

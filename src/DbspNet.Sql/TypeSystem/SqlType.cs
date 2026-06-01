@@ -113,3 +113,26 @@ public sealed record SqlTimestampType(bool Nullable) : SqlType(Nullable)
 
     public override SqlType WithNullable(bool nullable) => new SqlTimestampType(nullable);
 }
+
+/// <summary>
+/// A SQL <c>INTERVAL</c> type. The <see cref="Qualifier"/> records the field
+/// range the literal was written with (e.g. <c>DAY</c>, <c>YEAR TO MONTH</c>)
+/// and, crucially, which of SQL's two incompatible interval classes the value
+/// belongs to: <em>year-month</em> (a count of months — variable real length)
+/// or <em>day-time</em> (a fixed count of microseconds). The runtime value is
+/// a single <see cref="Interval"/> struct carrying both fields; only the field
+/// matching the class is non-zero. The two classes don't mix in arithmetic
+/// (you can't add months to microseconds), which is why the class travels on
+/// the type, not just the value.
+/// </summary>
+public sealed record SqlIntervalType(IntervalQualifier Qualifier, bool Nullable) : SqlType(Nullable)
+{
+    public override Type ClrType => typeof(Interval);
+
+    public override string Name => "INTERVAL " + IntervalQualifiers.Display(Qualifier);
+
+    public override SqlType WithNullable(bool nullable) => new SqlIntervalType(Qualifier, nullable);
+
+    /// <summary>True for the year-month class (months); false for day-time (microseconds).</summary>
+    public bool IsYearMonth => IntervalQualifiers.IsYearMonth(Qualifier);
+}

@@ -199,6 +199,11 @@ public static class ExpressionCompiler
             case BinOp.Multiply:
             case BinOp.Divide:
             case BinOp.Modulo:
+                if (IsTemporalOrInterval(bin.Left.Type) || IsTemporalOrInterval(bin.Right.Type))
+                {
+                    return BuildTemporalArith(bin, l, r);
+                }
+
                 return NullPropagatingNumericOp(
                     bin.Operator, l, r, bin.Left.Type, bin.Right.Type, bin.Type);
             case BinOp.Equal:
@@ -259,6 +264,86 @@ public static class ExpressionCompiler
             NullObject,
             Expression.Convert(compute, typeof(object)));
     }
+
+    /// <summary>
+    /// Build a NULL-propagating date/time/interval arithmetic op. Operands are
+    /// boxed <c>object</c>; the computed value is a temporal/interval struct
+    /// re-boxed to <c>object</c>. Dispatch on the resolved operand types
+    /// (which the resolver has already validated).
+    /// </summary>
+    private static Expression BuildTemporalArith(ResolvedBinary bin, Expression l, Expression r)
+    {
+        var isNull = Expression.OrElse(
+            Expression.Equal(l, NullObject),
+            Expression.Equal(r, NullObject));
+        var compute = EmitTemporalCompute(bin.Operator, l, bin.Left.Type, r, bin.Right.Type);
+        return Expression.Condition(isNull, NullObject, Expression.Convert(compute, typeof(object)));
+    }
+
+    private static Expression EmitTemporalCompute(
+        BinOp op, Expression l, SqlType lt, Expression r, SqlType rt)
+    {
+        var lInterval = lt is SqlIntervalType;
+        var rInterval = rt is SqlIntervalType;
+        var lTemporal = lt is SqlDateType or SqlTimeType or SqlTimestampType;
+        var rTemporal = rt is SqlDateType or SqlTimeType or SqlTimestampType;
+
+        Expression Temporal(Expression e, SqlType t) => Expression.Convert(e, ClrOf(t));
+        Expression Iv(Expression e) => Expression.Convert(e, typeof(Interval));
+        Expression ToDouble(Expression e, SqlType t) =>
+            Expression.Convert(Expression.Convert(e, ClrOf(t)), typeof(double));
+
+        switch (op)
+        {
+            case BinOp.Add:
+                if (lTemporal && rInterval) return AddTo(lt, Temporal(l, lt), Iv(r), sub: false);
+                if (lInterval && rTemporal) return AddTo(rt, Temporal(r, rt), Iv(l), sub: false);
+                if (lInterval && rInterval) return CallTemporal(nameof(TemporalArithmetic.AddIntervals), Iv(l), Iv(r));
+                break;
+            case BinOp.Subtract:
+                if (lTemporal && rInterval) return AddTo(lt, Temporal(l, lt), Iv(r), sub: true);
+                if (lTemporal && rTemporal) return Diff(lt, Temporal(l, lt), Temporal(r, rt));
+                if (lInterval && rInterval) return CallTemporal(nameof(TemporalArithmetic.SubIntervals), Iv(l), Iv(r));
+                break;
+            case BinOp.Multiply:
+                if (lInterval) return CallTemporal(nameof(TemporalArithmetic.MulInterval), Iv(l), ToDouble(r, rt));
+                if (rInterval) return CallTemporal(nameof(TemporalArithmetic.MulInterval), Iv(r), ToDouble(l, lt));
+                break;
+            case BinOp.Divide:
+                if (lInterval) return CallTemporal(nameof(TemporalArithmetic.DivInterval), Iv(l), ToDouble(r, rt));
+                break;
+        }
+
+        throw new InvalidOperationException(
+            $"unsupported temporal arithmetic {lt.Display} {op} {rt.Display}");
+    }
+
+    private static Expression AddTo(SqlType temporal, Expression t, Expression iv, bool sub)
+    {
+        var name = temporal switch
+        {
+            SqlDateType => sub ? nameof(TemporalArithmetic.SubFromDate) : nameof(TemporalArithmetic.AddToDate),
+            SqlTimeType => sub ? nameof(TemporalArithmetic.SubFromTime) : nameof(TemporalArithmetic.AddToTime),
+            SqlTimestampType => sub ? nameof(TemporalArithmetic.SubFromTimestamp) : nameof(TemporalArithmetic.AddToTimestamp),
+            _ => throw new InvalidOperationException(),
+        };
+        return CallTemporal(name, t, iv);
+    }
+
+    private static Expression Diff(SqlType temporal, Expression a, Expression b)
+    {
+        var name = temporal switch
+        {
+            SqlDateType => nameof(TemporalArithmetic.DiffDates),
+            SqlTimeType => nameof(TemporalArithmetic.DiffTimes),
+            SqlTimestampType => nameof(TemporalArithmetic.DiffTimestamps),
+            _ => throw new InvalidOperationException(),
+        };
+        return CallTemporal(name, a, b);
+    }
+
+    private static Expression CallTemporal(string method, params Expression[] args) =>
+        Expression.Call(typeof(TemporalArithmetic).GetMethod(method)!, args);
 
     /// <summary>
     /// Convert a boxed numeric operand expression to a typed
@@ -499,6 +584,27 @@ public static class ExpressionCompiler
                 toStr);
             converted = Expression.Convert(toUtf8, typeof(object));
         }
+        else if (srcClr == typeof(Utf8String) && cast.Type is SqlIntervalType targetInterval)
+        {
+            var unboxed = Expression.Convert(operand, typeof(Utf8String));
+            var asString = Expression.Call(unboxed,
+                typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
+            var parse = Expression.Call(
+                typeof(Interval).GetMethod(nameof(Interval.Parse), [typeof(string), typeof(IntervalQualifier)])!,
+                asString,
+                Expression.Constant(targetInterval.Qualifier));
+            converted = Expression.Convert(parse, typeof(object));
+        }
+        else if (srcClr == typeof(Interval) && dstClr == typeof(Utf8String))
+        {
+            var unboxed = Expression.Convert(operand, typeof(Interval));
+            var toStr = Expression.Call(unboxed,
+                typeof(Interval).GetMethod(nameof(object.ToString), Type.EmptyTypes)!);
+            var toUtf8 = Expression.Call(
+                typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
+                toStr);
+            converted = Expression.Convert(toUtf8, typeof(object));
+        }
         else
         {
             throw new InvalidOperationException(
@@ -649,6 +755,7 @@ public static class ExpressionCompiler
         SqlDateType => typeof(Date32),
         SqlTimeType => typeof(Time64),
         SqlTimestampType => typeof(Timestamp),
+        SqlIntervalType => typeof(Interval),
         _ => throw new InvalidOperationException($"no CLR mapping for {t.Display}"),
     };
 
@@ -658,6 +765,9 @@ public static class ExpressionCompiler
 
     private static bool IsTemporal(Type t) =>
         t == typeof(Date32) || t == typeof(Time64) || t == typeof(Timestamp);
+
+    private static bool IsTemporalOrInterval(SqlType t) =>
+        t is SqlDateType or SqlTimeType or SqlTimestampType or SqlIntervalType;
 }
 
 /// <summary>Thin helpers invoked from compiled Expression trees for CAST operations.</summary>

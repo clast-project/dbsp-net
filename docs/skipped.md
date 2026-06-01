@@ -342,13 +342,27 @@ reflect that shape, not a backlog.
   `BETWEEN … AND …` with named bounds.
 
 ### Type system
-- **[P1]** INTERVAL. Feldera has full support.
-- **[P2]** TIMESTAMP WITH TIME ZONE, typed temporal literals
-  (`DATE 'yyyy-mm-dd'` etc.), and date/time arithmetic
-  (`date + interval`, `timestamp - timestamp`). DATE / TIME / TIMESTAMP
-  base types now exist with Arrow-aligned representations
-  (`Date32`, `Time64[microsecond]`, `Timestamp[microsecond]` naive),
-  with `CAST` from string and ordering / equality.
+- **[DONE]** INTERVAL (core) and date/time arithmetic. `INTERVAL '…' <unit>`
+  literals (single-field `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`, plus
+  `YEAR TO MONTH` and `DAY TO SECOND` compounds) parse and resolve to an
+  `Interval` value (`(int Months, long Micros)` — the two SQL interval classes
+  carried side by side) typed by an `IntervalQualifier`. Arithmetic: `date`/
+  `time`/`timestamp ± interval`, `interval ± interval` (same class),
+  `interval × / ÷ numeric`, and `date − date` / `ts − ts` / `time − time`
+  → interval. Month addition is calendar-aware; DATE arithmetic is
+  day-granular (a day-time interval shifts a DATE by whole days). Both compile
+  paths supported: full support on the structural compiler (so the batch
+  reference and incremental agree); the typed fast path falls back to
+  structural for temporal/interval ops, matching temporal comparisons.
+  Deferred follow-ons: `INTERVAL` *stored columns* through the Arrow codec
+  (intervals are intermediate-only today — a persisted/snapshotted interval
+  output column would need an Arrow `MonthDayNano` mapping); `interval ×
+  decimal`; and typed-fast-path temporal arithmetic.
+- **[P2]** TIMESTAMP WITH TIME ZONE and typed temporal literals
+  (`DATE 'yyyy-mm-dd'` etc.). DATE / TIME / TIMESTAMP base types exist with
+  Arrow-aligned representations (`Date32`, `Time64[microsecond]`,
+  `Timestamp[microsecond]` naive), with `CAST` from string and ordering /
+  equality. (Temporal literals can be written as `CAST('…' AS DATE)` etc.)
 - VARCHAR is stored as `Utf8String` (Arrow-aligned
   `ReadOnlyMemory<byte>`) with native UTF-8 equality, ordering, hashing
   (XxHash3), `LENGTH` (code points), byte-wise `CONCAT`, and `Rune`-based
@@ -620,9 +634,10 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   and via a hybrid lift: aggregates, set ops, CTEs, recursive CTE,
   scalar subqueries).
 - **[P2]** Expression-compiler CAST matrix. v1 supports numeric↔numeric,
-  numeric↔string, and bool→string. Missing: string→bool (`'t'`/`'f'`),
-  decimal-precision-aware numeric narrowing, and anything involving the
-  deferred date/time/interval types.
+  numeric↔string, bool→string, string↔temporal (date/time/timestamp), and
+  string↔interval. Missing: string→bool (`'t'`/`'f'`),
+  decimal-precision-aware numeric narrowing, and cross-temporal casts
+  (e.g. `date ↔ timestamp`).
 
 ## Type system edge cases
 

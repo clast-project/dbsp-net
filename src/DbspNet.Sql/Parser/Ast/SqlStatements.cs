@@ -32,7 +32,8 @@ public sealed record ColumnDefinition(
 public sealed record SqlTypeSpec(
     string Name,
     int? Parameter1 = null,
-    int? Parameter2 = null);
+    int? Parameter2 = null,
+    DbspNet.Sql.TypeSystem.IntervalQualifier? IntervalQualifier = null);
 
 public sealed record CreateViewStatement(
     string ViewName,

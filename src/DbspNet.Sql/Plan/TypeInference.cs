@@ -28,6 +28,9 @@ internal static class TypeInference
         "DATE" => new SqlDateType(nullable),
         "TIME" => new SqlTimeType(nullable),
         "TIMESTAMP" => new SqlTimestampType(nullable),
+        "INTERVAL" => new SqlIntervalType(
+            spec.IntervalQualifier ?? throw new ResolveException("INTERVAL requires a field qualifier"),
+            nullable),
         _ => throw new ResolveException($"unsupported type '{spec.Name}'"),
     };
 
@@ -108,6 +111,17 @@ internal static class TypeInference
         if (a is SqlTimestampType && b is SqlTimestampType)
         {
             return new SqlTimestampType(a.Nullable || b.Nullable);
+        }
+
+        // Two intervals are comparable; the result keeps the left qualifier
+        // when both share an interval class, else falls back to a generic
+        // day-time qualifier (comparison itself is by (months, micros)).
+        if (a is SqlIntervalType ia && b is SqlIntervalType ib)
+        {
+            var nullable = a.Nullable || b.Nullable;
+            return ia.IsYearMonth == ib.IsYearMonth
+                ? new SqlIntervalType(ia.Qualifier, nullable)
+                : new SqlIntervalType(IntervalQualifier.DayToSecond, nullable);
         }
 
         throw new ResolveException($"types {a.Display} and {b.Display} are not comparable");

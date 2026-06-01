@@ -114,13 +114,18 @@ batch re-computation.
 
 - DDL: `CREATE TABLE` (with `NOT NULL`/`NULL`; `PRIMARY KEY` parsed but ignored), `CREATE VIEW`.
 - Types: `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `DECIMAL(p,s)`,
-  `VARCHAR`, `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP`. `DECIMAL` is Arrow-
+  `VARCHAR`, `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP`, `INTERVAL`. `DECIMAL` is Arrow-
   aligned `Decimal128` (Int128 mantissa) via `Clast.DatabaseDecimal` with
   native arithmetic and SQL-Server/Substrait result-type promotion;
   `VARCHAR` is `Utf8String` (Arrow-aligned `ReadOnlyMemory<byte>`) with
   native UTF-8 equality, ordering, hashing, code-point `LENGTH`, and
   `Rune`-based invariant `UPPER`/`LOWER`. Temporal types use Arrow's
   `Date32` / `Time64[microsecond]` / `Timestamp[microsecond]` (naive).
+  `INTERVAL` (`'…' YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`, `YEAR TO
+  MONTH`, `DAY TO SECOND`) is a `(months, microseconds)` value supporting
+  `date`/`time`/`timestamp ± interval` (calendar-aware month add; DATE
+  arithmetic is day-granular), `interval ± interval`, `interval ×/÷ numeric`,
+  and `date − date` / `ts − ts` → interval.
 - Queries: `SELECT` (list or `*`, with optional `DISTINCT`) with aliases and
   scalar expressions, `FROM`
   (single table, derived tables `(SELECT …) AS x`, `INNER JOIN … ON …`, or
@@ -301,7 +306,11 @@ beyond "Feldera is much bigger":
   `MOD`), and anything involving dates/times.
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
   polymorphic "unknown" of PostgreSQL.
-- `INTERVAL` type and date/time arithmetic are deferred.
+- `INTERVAL` (core) and date/time arithmetic are supported; deferred pieces
+  are `INTERVAL` *stored columns* through the Arrow codec (intervals are
+  intermediate-only today), `interval × decimal`, and typed-fast-path temporal
+  arithmetic (it falls back to the structural compiler, as temporal
+  comparisons do).
 
 ## What's next
 

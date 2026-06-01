@@ -44,7 +44,7 @@ public enum TokenKind
     // Type keywords
     Int, Integer, BigInt, Real, Double, Precision,
     Decimal, Numeric, Varchar, Char, Text, Boolean, Bool,
-    Date, Time, Timestamp,
+    Date, Time, Timestamp, Interval,
 
     // Punctuation
     LParen, RParen, Comma, Semicolon, Dot, Star,

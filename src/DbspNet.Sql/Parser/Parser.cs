@@ -1,7 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System;
 using System.Collections.Generic;
 using DbspNet.Sql.Parser.Ast;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Parser;
 
@@ -231,9 +233,46 @@ public sealed class Parser
             case TokenKind.Timestamp:
                 Advance();
                 return new SqlTypeSpec("TIMESTAMP");
+            case TokenKind.Interval:
+                Advance();
+                return new SqlTypeSpec("INTERVAL", IntervalQualifier: ParseIntervalQualifier());
             default:
                 throw Error(t, $"expected SQL type, got {Describe(t)}");
         }
+    }
+
+    /// <summary>
+    /// Parse an interval field qualifier — a single field (<c>DAY</c>,
+    /// <c>SECOND</c>, …) or one of the supported compound forms
+    /// (<c>YEAR TO MONTH</c>, <c>DAY TO SECOND</c>). The field words are
+    /// non-reserved (lexed as identifiers), so only <c>INTERVAL</c> itself is
+    /// a keyword — a column named <c>day</c> still parses.
+    /// </summary>
+    private IntervalQualifier ParseIntervalQualifier()
+    {
+        var leadTok = Peek();
+        var lead = ExpectIdentifier("interval field");
+        var field = IntervalQualifiers.ParseField(lead)
+            ?? throw Error(leadTok, $"unknown interval field '{lead}'");
+
+        if (Peek().Kind == TokenKind.Identifier
+            && string.Equals(Peek().Text, "to", StringComparison.OrdinalIgnoreCase))
+        {
+            Advance();
+            var trailTok = Peek();
+            var trail = ExpectIdentifier("interval field");
+            var trailField = IntervalQualifiers.ParseField(trail)
+                ?? throw Error(trailTok, $"unknown interval field '{trail}'");
+
+            return (field, trailField) switch
+            {
+                (IntervalQualifier.Year, IntervalQualifier.Month) => IntervalQualifier.YearToMonth,
+                (IntervalQualifier.Day, IntervalQualifier.Second) => IntervalQualifier.DayToSecond,
+                _ => throw Error(leadTok, $"unsupported interval qualifier '{lead} TO {trail}'"),
+            };
+        }
+
+        return field;
     }
 
     private CreateViewStatement ParseCreateView()
@@ -1245,6 +1284,8 @@ public sealed class Parser
                 var inner = ParseExpression();
                 Expect(TokenKind.RParen);
                 return inner;
+            case TokenKind.Interval:
+                return ParseIntervalLiteral();
             case TokenKind.Cast:
                 return ParseCastExpression();
             case TokenKind.Coalesce:
@@ -1434,6 +1475,30 @@ public sealed class Parser
         var type = ParseTypeSpec();
         Expect(TokenKind.RParen);
         return new CastExpression(expr, type);
+    }
+
+    /// <summary>
+    /// Parse an <c>INTERVAL '&lt;value&gt;' &lt;qualifier&gt;</c> literal.
+    /// Desugared to <c>CAST('&lt;value&gt;' AS INTERVAL &lt;qualifier&gt;)</c>
+    /// so every downstream AST walker (resolver, aggregate detection,
+    /// optimizer) handles it without a bespoke node; the resolver constant-
+    /// folds the cast of the literal string into a typed interval value, so
+    /// there is no per-row re-parse.
+    /// </summary>
+    private Expression ParseIntervalLiteral()
+    {
+        Expect(TokenKind.Interval);
+        var strTok = Peek();
+        if (strTok.Kind != TokenKind.StringLiteral)
+        {
+            throw Error(strTok, $"expected interval string literal, got {Describe(strTok)}");
+        }
+
+        Advance();
+        var qualifier = ParseIntervalQualifier();
+        return new CastExpression(
+            new LiteralExpression(LiteralKind.String, strTok.Text),
+            new SqlTypeSpec("INTERVAL", IntervalQualifier: qualifier));
     }
 
     private FunctionCallExpression ParseCoalesceExpression()
