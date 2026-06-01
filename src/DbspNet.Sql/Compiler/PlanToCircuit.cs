@@ -63,8 +63,9 @@ public static class PlanToCircuit
         CompileOptions options)
     {
         // Walk the plan to find every scanned table; each becomes a circuit input.
-        var tables = CollectScans(plan);
+        var (tables, temporalFrontierSpecs) = CollectScans(plan);
         var hasLateness = tables.Values.Any(t => t.Lateness is { Count: > 0 });
+        var hasTemporalFilter = temporalFrontierSpecs.Count > 0;
         var monotonicity = MonotonicityAnalyzer.Analyze(plan);
 
         RootCircuit? circuit = null;
@@ -75,7 +76,7 @@ public static class PlanToCircuit
         {
             var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
             inputs = new Dictionary<string, TableInput>(StringComparer.Ordinal);
-            var frontiers = new Dictionary<LatenessSource, MutableFrontier>();
+            var frontiers = new Dictionary<LatenessSource, IFrontier>();
             foreach (var (name, info) in tables)
             {
                 var (handle, stream) = builder.ZSetInput<StructuralRow, Z64>();
@@ -97,6 +98,20 @@ public static class PlanToCircuit
                 }
 
                 streams[name] = stream;
+            }
+
+            // Register each temporal filter's clock-driven frontier (clock −
+            // offset) on its time-key column, so downstream stateful operators
+            // GC the same way they do for a declared LATENESS column. A column
+            // already bounded by LATENESS keeps that frontier (skip on collision)
+            // — the late-drop bound is sound on its own.
+            foreach (var spec in temporalFrontierSpecs)
+            {
+                if (!frontiers.ContainsKey(spec.Source))
+                {
+                    frontiers[spec.Source] = new TransformedFrontier(
+                        builder.LogicalClock, ClockOffsetTransform(spec.Offset));
+                }
             }
 
             // Fast path: try the typed-row pipeline first. When the
@@ -124,7 +139,8 @@ public static class PlanToCircuit
             // queries).
             Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
             if (ReferenceEquals(codec, StructuralRowCodec.Instance)
-                && !hasLateness)
+                && !hasLateness
+                && !hasTemporalFilter)
             {
                 queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
                     builder, plan, streams, codec, snapshotCodecs, options);
@@ -153,7 +169,7 @@ public static class PlanToCircuit
             ISqlSnapshotCodecs? snapshotCodecs,
             CompileOptions options,
             MonotonicityInfo monotonicity,
-            IReadOnlyDictionary<LatenessSource, MutableFrontier> frontiers)
+            IReadOnlyDictionary<LatenessSource, IFrontier> frontiers)
         {
             Scans = scans;
             TableSchemas = tableSchemas;
@@ -200,9 +216,26 @@ public static class PlanToCircuit
         /// <summary>Per-node, per-column monotonicity verdicts for LATENESS GC.</summary>
         public MonotonicityInfo Monotonicity { get; }
 
-        /// <summary>One frontier per declared LATENESS source, advanced by its input operator.</summary>
-        public IReadOnlyDictionary<LatenessSource, MutableFrontier> Frontiers { get; }
+        /// <summary>
+        /// One frontier per GC source: a declared LATENESS column (advanced by its
+        /// input operator) or a temporal filter's time-key (clock-driven).
+        /// </summary>
+        public IReadOnlyDictionary<LatenessSource, IFrontier> Frontiers { get; }
     }
+
+    /// <summary>Saturating <c>v − offset</c> for a temporal filter's clock-driven
+    /// GC frontier. <see cref="TransformedFrontier"/> passes the unset sentinel
+    /// (<see cref="long.MinValue"/>) through before this runs.</summary>
+    private static Func<long, long> ClockOffsetTransform(long offset) => v =>
+    {
+        var r = unchecked(v - offset);
+        if (((v ^ offset) & (v ^ r)) < 0)
+        {
+            return offset > 0 ? long.MinValue : long.MaxValue;
+        }
+
+        return r;
+    };
 
     // ---- Stateful operator emission: flat vs spine trace family ----
     //
@@ -478,12 +511,21 @@ public static class PlanToCircuit
     /// <summary>A scanned base table's declared schema and per-column LATENESS bounds.</summary>
     private sealed record ScanInfo(Schema Schema, IReadOnlyDictionary<int, long>? Lateness);
 
-    private static Dictionary<string, ScanInfo> CollectScans(LogicalPlan plan)
+    /// <summary>
+    /// A clock-driven frontier a temporal filter advertises on its time-key
+    /// column: the column's <see cref="LatenessSource"/> and the disappear offset
+    /// (microseconds). The GC frontier is <c>clock − Offset</c>.
+    /// </summary>
+    private readonly record struct TemporalFrontierSpec(LatenessSource Source, long Offset);
+
+    private static (Dictionary<string, ScanInfo> Scans, List<TemporalFrontierSpec> Temporal) CollectScans(
+        LogicalPlan plan)
     {
         var result = new Dictionary<string, ScanInfo>(StringComparer.Ordinal);
+        var temporal = new List<TemporalFrontierSpec>();
         var visitedCtes = new HashSet<CteRef>();
         Walk(plan);
-        return result;
+        return (result, temporal);
 
         void Walk(LogicalPlan p)
         {
@@ -513,6 +555,18 @@ public static class PlanToCircuit
                     Walk(f.Input);
                     break;
                 case TemporalFilterPlan tf:
+                    // A disappear-bounded temporal filter on a bare time-key
+                    // column scanned directly below advertises a clock-driven GC
+                    // frontier on that column (clock − offset). Matches the source
+                    // MonotonicityAnalyzer marks for the same node.
+                    if (tf.DisappearOffsetMicros is { } off
+                        && tf.TimeKey is ResolvedColumn rc
+                        && tf.Input is ScanPlan tfScan)
+                    {
+                        temporal.Add(new TemporalFrontierSpec(
+                            new LatenessSource(tfScan.TableName, rc.Index), off));
+                    }
+
                     Walk(tf.Input);
                     break;
                 case ProjectPlan pr:

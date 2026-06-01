@@ -137,6 +137,30 @@ public static class MonotonicityAnalyzer
             case FilterPlan f:
                 return Visit(f.Input, memo);
 
+            case TemporalFilterPlan tf:
+            {
+                // Schema is the input's; monotonicity passes through. A disappear
+                // (upper) bound additionally means the advancing clock bounds the
+                // time-key column from below — rows whose key falls below
+                // clock − offset are expired and never re-emitted — so when the
+                // time key is a base-table column scanned directly below, mark it
+                // monotone. Its source identity reuses the column's
+                // LatenessSource; PlanToCircuit registers the matching clock-driven
+                // frontier so downstream GROUP BY / join / DISTINCT can GC.
+                var input = Visit(tf.Input, memo);
+                var cols = (MonotoneColumn?[])input.Clone();
+                if (tf.DisappearOffsetMicros is not null
+                    && tf.TimeKey is ResolvedColumn rc
+                    && tf.Input is ScanPlan scan
+                    && rc.Index >= 0 && rc.Index < cols.Length)
+                {
+                    cols[rc.Index] = new MonotoneColumn(
+                        new HashSet<LatenessSource> { new(scan.TableName, rc.Index) }, null);
+                }
+
+                return cols;
+            }
+
             case ProjectPlan p:
             {
                 var input = Visit(p.Input, memo);

@@ -74,6 +74,33 @@ public class TemporalFilterCompilerTests : IDisposable
     }
 
     [Fact]
+    public void DisappearBound_BoundsDownstreamAggregateState()
+    {
+        // A temporal filter with an upper bound advertises a clock-driven
+        // frontier (clock − 10s) on its time-key, so a GROUP BY ts above it GCs
+        // groups that have aged out — state stays bounded to the trailing window
+        // rather than growing with every distinct timestamp seen.
+        var q = Compile(
+            "SELECT ts, COUNT(*) AS c FROM events WHERE ts > NOW() - INTERVAL '10' SECOND GROUP BY ts");
+
+        for (long i = 0; i <= 100; i++)
+        {
+            q.AdvanceClock(i * 1_000_000L);          // clock tracks the newest event
+            q.Table("events").Insert((int)i, new Timestamp(i * 1_000_000L));
+            q.Step();
+        }
+
+        var agg = q.Circuit.Operators
+            .OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>()
+            .Single();
+
+        // 101 distinct group keys streamed, but the clock frontier (now − 10s)
+        // keeps only the trailing ~10-second window — bounded, far below 101.
+        Assert.True(agg.RetainedGroupCount <= 12, $"retained {agg.RetainedGroupCount}");
+        Assert.True(agg.RetainedGroupCount >= 10, $"retained {agg.RetainedGroupCount}");
+    }
+
+    [Fact]
     public void AppearBound_RowsEnterAsClockReachesTimestamp()
     {
         // ts <= NOW(): a row becomes valid once the clock reaches its timestamp.
