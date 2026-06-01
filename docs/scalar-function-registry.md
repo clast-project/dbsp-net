@@ -67,7 +67,9 @@ The only thing that breaks the linearity assumption is **non-determinism**
 (`NOW()`, `RANDOM()`, stateful state): those aren't pure functions of the row,
 so the delta computed at one tick wouldn't match a re-evaluation. Determinism
 is therefore the one property the engine must *assume* (and, for UDFs,
-*require by contract* — it can't verify it).
+*require by contract* — it can't verify it). This is exactly why `NOW()` is
+**not** a registry entry; it is a separate feature with its own design note,
+[`now-and-temporal-filters.md`](now-and-temporal-filters.md).
 
 Everything else about a scalar function is either **type inference** (resolve
 time) or **optional optimization metadata**. Contrast with:

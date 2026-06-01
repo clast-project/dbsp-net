@@ -511,8 +511,11 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   typed-row fast path to the structural compile (matching temporal
   arithmetic / comparison behaviour).
   Missing and commonly needed: other math (`SIN`/`COS`/`TAN`, `MOD`,
-  `TRUNC`) and `NOW`/`CURRENT_TIMESTAMP` (non-deterministic — would need a
-  once-per-step evaluation, not per-row, to stay incrementally correct).
+  `TRUNC`) and `NOW`/`CURRENT_TIMESTAMP`. The latter is **not** a scalar
+  function — it is non-deterministic (breaks the purity the registry and the
+  incremental≡batch oracle rest on) and is really one of three different
+  features (frozen constant / per-tick stamp / advancing temporal filters);
+  see the design note [`now-and-temporal-filters.md`](now-and-temporal-filters.md).
   **Dispatch routes through `ScalarFunctionRegistry`** (the `IScalarFunction`
   framework — phases 1–3 landed): every builtin is now a registry entry in
   `ScalarFunctionLibrary.cs`, the four parallel switches are gone, and
