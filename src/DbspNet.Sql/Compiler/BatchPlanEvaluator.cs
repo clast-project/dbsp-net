@@ -7,6 +7,7 @@ using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Aggregators;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Compiler;
 
@@ -42,6 +43,19 @@ internal static class BatchPlanEvaluator
                     var input = Evaluate(f.Input, ctx);
                     var pred = ExpressionCompiler.CompilePredicate(f.Predicate);
                     return input.Filter(row => pred(row));
+                }
+
+            case TemporalFilterPlan tf:
+                {
+                    // The temporal filter at logical time `now` is the plain
+                    // relational filter `validAt(now)` — this is what makes the
+                    // incremental-equals-batch oracle hold (with Now = the
+                    // circuit's final clock). Validity logic is kept identical to
+                    // TemporalFilterOp.IsValidAt.
+                    var input = Evaluate(tf.Input, ctx);
+                    var timeKey = ExpressionCompiler.CompileScalar(tf.TimeKey);
+                    var now = ctx.Now;
+                    return input.Filter(row => TemporalValid(timeKey(row), now, tf));
                 }
 
             case ProjectPlan p:
@@ -93,6 +107,50 @@ internal static class BatchPlanEvaluator
             default:
                 throw new InvalidOperationException($"unsupported plan node: {plan.GetType().Name}");
         }
+    }
+
+    // ---- Temporal filter ----
+
+    // Mirror of TemporalFilterOp.IsValidAt (+ its SaturatingAdd). Kept in
+    // lockstep: a divergence here breaks the incremental-equals-batch oracle.
+    private static bool TemporalValid(object? keyValue, long now, TemporalFilterPlan tf)
+    {
+        if (keyValue is not Timestamp ts)
+        {
+            return false; // NULL time key is never valid
+        }
+
+        var key = ts.Microseconds;
+        if (tf.AppearOffsetMicros is { } a)
+        {
+            var lower = SaturatingAdd(key, a);
+            if (tf.AppearInclusive ? now < lower : now <= lower)
+            {
+                return false;
+            }
+        }
+
+        if (tf.DisappearOffsetMicros is { } d)
+        {
+            var upper = SaturatingAdd(key, d);
+            if (tf.DisappearInclusive ? now > upper : now >= upper)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static long SaturatingAdd(long a, long b)
+    {
+        var sum = unchecked(a + b);
+        if (((a ^ sum) & (b ^ sum)) < 0)
+        {
+            return b > 0 ? long.MaxValue : long.MinValue;
+        }
+
+        return sum;
     }
 
     // ---- Project ----
@@ -826,15 +884,28 @@ internal sealed class BatchEvalContext
     public BatchEvalContext(
         IReadOnlyDictionary<string, ZSet<StructuralRow, Z64>> tables,
         Dictionary<CteRef, ZSet<StructuralRow, Z64>> ctes,
-        IRowCodec<StructuralRow>? codec = null)
+        IRowCodec<StructuralRow>? codec = null,
+        long now = long.MinValue)
     {
         _tables = tables;
         _ctes = ctes;
         Codec = codec ?? StructuralRowCodec.Instance;
+        Now = now;
     }
 
     /// <summary>Row codec for output-row construction across every plan node.</summary>
     public IRowCodec<StructuralRow> Codec { get; }
+
+    /// <summary>
+    /// The logical clock value (<c>NOW()</c>, microseconds since the epoch) a
+    /// <see cref="TemporalFilterPlan"/> is evaluated against. The temporal-filter
+    /// correctness oracle holds because the filter at logical time <c>t</c> is
+    /// exactly the relational filter with <c>NOW = t</c>: the circuit's
+    /// accumulated output at the final clock equals this batch evaluation with
+    /// <see cref="Now"/> set to that same final clock. <see cref="long.MinValue"/>
+    /// is "unset" (no temporal filters in play).
+    /// </summary>
+    public long Now { get; }
 
     public ZSet<StructuralRow, Z64> GetTable(string name) =>
         _tables.TryGetValue(name, out var z) ? z : ZSet<StructuralRow, Z64>.Empty;
