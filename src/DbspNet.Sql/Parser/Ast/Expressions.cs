@@ -29,6 +29,32 @@ public sealed record LiteralExpression(LiteralKind Kind, object? Value) : Expres
 
 public sealed record ColumnReference(string? Qualifier, string Name) : Expression;
 
+/// <summary>Which spelling of the advancing logical clock the user wrote.</summary>
+public enum NowFunction
+{
+    Now,
+    CurrentTimestamp,
+}
+
+/// <summary>
+/// The advancing logical clock — <c>NOW()</c> / <c>CURRENT_TIMESTAMP</c>.
+/// Deliberately <b>not</b> a <see cref="FunctionCallExpression"/>: <c>NOW()</c>
+/// is not a pure function of the row (its value is the logical time, not the
+/// row), so it must never route through the scalar-function registry, whose
+/// contract is purity. Both spellings denote the same <c>TIMESTAMP</c>-typed
+/// clock value (the <see cref="Function"/> is kept only for diagnostics).
+/// </summary>
+/// <remarks>
+/// Under the temporal-filter model (option B in
+/// <c>docs/now-and-temporal-filters.md</c>) this node is legal <i>only</i>
+/// inside a sanctioned temporal-filter predicate — a comparison of a
+/// <c>TIMESTAMP</c> expression against <c>NOW()</c> (optionally shifted by a
+/// constant day-time <c>INTERVAL</c>). The resolver folds such predicates into
+/// a <see cref="Plan.TemporalFilterPlan"/> and rejects <c>NOW()</c> in every
+/// other position.
+/// </remarks>
+public sealed record NowExpression(NowFunction Function) : Expression;
+
 public enum BinaryOperator
 {
     Add,

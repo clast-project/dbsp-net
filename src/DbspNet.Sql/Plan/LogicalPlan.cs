@@ -89,6 +89,38 @@ public sealed record FilterPlan(LogicalPlan Input, ResolvedExpression Predicate)
     : LogicalPlan(Input.Schema);
 
 /// <summary>
+/// A temporal filter (the <c>mz_now()</c>-style advancing-clock predicate).
+/// Keeps each input row only while the logical clock <c>NOW()</c> lies inside
+/// the row's validity window, derived from the row's <see cref="TimeKey"/> and
+/// the constant offsets the user wrote (e.g.
+/// <c>WHERE ts &gt; NOW() - INTERVAL '1' HOUR AND ts &lt;= NOW()</c>). Unlike an
+/// ordinary <see cref="FilterPlan"/>, validity changes <i>as the clock
+/// advances, with no new input</i>: a row is retracted on the tick the clock
+/// crosses its upper bound and inserted when the clock reaches its lower bound.
+/// Compiles to the time-driven <c>TemporalFilterOp</c>.
+/// </summary>
+/// <remarks>
+/// <para>All bounds are affine in <see cref="TimeKey"/> (microseconds since the
+/// epoch, the <c>TIMESTAMP</c> unit). The row is valid at logical time
+/// <c>now</c> iff
+/// <c>now {&gt;|&gt;=} TimeKey + AppearOffsetMicros</c> (when an appear bound is
+/// present) <b>and</b> <c>now {&lt;|&lt;=} TimeKey + DisappearOffsetMicros</c>
+/// (when a disappear bound is present); inclusivity is carried by
+/// <see cref="AppearInclusive"/> / <see cref="DisappearInclusive"/>. A null
+/// offset means that side is unbounded. A null <see cref="TimeKey"/> value at
+/// runtime (nullable key) is never valid.</para>
+/// <para>Schema is the input's, unchanged — a temporal filter only restricts
+/// which rows survive, never their shape.</para>
+/// </remarks>
+public sealed record TemporalFilterPlan(
+    LogicalPlan Input,
+    ResolvedExpression TimeKey,
+    long? AppearOffsetMicros,
+    bool AppearInclusive,
+    long? DisappearOffsetMicros,
+    bool DisappearInclusive) : LogicalPlan(Input.Schema);
+
+/// <summary>
 /// One <c>ORDER BY</c> sort key for a <see cref="TopKPlan"/>: an expression
 /// evaluated over the input row, a direction, and where NULLs sort.
 /// <see cref="NullsFirst"/> is already resolved from the SQL default

@@ -190,10 +190,25 @@ public sealed class Resolver
             var conjuncts = SplitAndConjuncts(stmt.Where);
             var inSubqueries = new List<InSubqueryExpression>();
             var existsConjuncts = new List<(ExistsExpression Sq, bool IsNegated)>();
+            var temporalBounds = new List<TemporalHalfBound>();
             var scalarConjuncts = new List<Expression>();
+
+            // Temporal filters resolve their time-key against the FROM schema;
+            // IN / EXISTS lifts below preserve that schema (semi-join / anti-
+            // join keep the input's columns), so the resolved column indices
+            // stay valid no matter the order the filters are stacked.
+            var fromSchema = plan.Schema;
             foreach (var c in conjuncts)
             {
-                if (c is InSubqueryExpression isq)
+                if (MentionsNow(c))
+                {
+                    // A conjunct that mentions NOW() must be a sanctioned
+                    // temporal-filter predicate; MatchTemporalConjunct throws a
+                    // precise error otherwise (rather than letting the generic
+                    // NowExpression guard fire later).
+                    temporalBounds.Add(MatchTemporalConjunct(c, fromSchema));
+                }
+                else if (c is InSubqueryExpression isq)
                 {
                     // Both IN and NOT IN go through the same lift; the lift
                     // builds a SemiJoinPlan with IsAnti=isNegated, and
@@ -223,6 +238,8 @@ public sealed class Resolver
             {
                 plan = LiftExistsOrDesugar(plan, e, isNegated, scope, scalarConjuncts);
             }
+
+            plan = ApplyTemporalFilters(plan, temporalBounds);
 
             if (scalarConjuncts.Count > 0)
             {
@@ -1920,6 +1937,230 @@ public sealed class Resolver
         return acc;
     }
 
+    // ---------- Temporal filters (NOW() / CURRENT_TIMESTAMP) ----------
+
+    private enum TemporalBoundKind
+    {
+        /// <summary>A lower bound on NOW(): the row appears (becomes valid)
+        /// when the clock reaches <c>TimeKey + OffsetMicros</c>.</summary>
+        Appear,
+
+        /// <summary>An upper bound on NOW(): the row disappears (is retracted)
+        /// once the clock passes <c>TimeKey + OffsetMicros</c>.</summary>
+        Disappear,
+    }
+
+    /// <summary>One side of a temporal-filter window, recognised from a single
+    /// <c>key OP NOW()±d</c> conjunct.</summary>
+    private sealed record TemporalHalfBound(
+        ResolvedExpression TimeKey,
+        TemporalBoundKind Kind,
+        long OffsetMicros,
+        bool Inclusive);
+
+    private static string NowDisplay(NowExpression now) =>
+        now.Function == NowFunction.CurrentTimestamp ? "CURRENT_TIMESTAMP" : "NOW()";
+
+    /// <summary>
+    /// Does this expression reference <c>NOW()</c> / <c>CURRENT_TIMESTAMP</c>
+    /// at this query level? A NOW() inside a subquery opens a new scope and is
+    /// that subquery's own concern (rejected there), so subquery-bearing nodes
+    /// report false.
+    /// </summary>
+    private static bool MentionsNow(Expression e) => e switch
+    {
+        NowExpression => true,
+        BinaryExpression b => MentionsNow(b.Left) || MentionsNow(b.Right),
+        UnaryExpression u => MentionsNow(u.Operand),
+        IsNullExpression isn => MentionsNow(isn.Operand),
+        CastExpression c => MentionsNow(c.Operand),
+        FunctionCallExpression f => f.Arguments.Any(MentionsNow),
+        InListExpression il => MentionsNow(il.Probe) || il.Values.Any(MentionsNow),
+        CaseExpression ce =>
+            ce.Whens.Any(w => MentionsNow(w.Condition) || MentionsNow(w.Result))
+            || (ce.ElseResult is not null && MentionsNow(ce.ElseResult)),
+        _ => false,
+    };
+
+    /// <summary>
+    /// Recognise a single sanctioned temporal-filter conjunct
+    /// (<c>key {&lt;|&lt;=|&gt;|&gt;=} NOW()±d</c>) and reduce it to a
+    /// <see cref="TemporalHalfBound"/>. Throws a precise
+    /// <see cref="ResolveException"/> for any other shape that mentions NOW().
+    /// </summary>
+    private static TemporalHalfBound MatchTemporalConjunct(Expression conjunct, Schema schema)
+    {
+        if (conjunct is not BinaryExpression bin
+            || bin.Operator is not (BinaryOperator.Less or BinaryOperator.LessEqual
+                or BinaryOperator.Greater or BinaryOperator.GreaterEqual))
+        {
+            throw new ResolveException(
+                "NOW() / CURRENT_TIMESTAMP is only allowed in a temporal-filter comparison " +
+                "(<, <=, >, >=) of a TIMESTAMP expression against NOW(), e.g. " +
+                "WHERE ts > NOW() - INTERVAL '1' HOUR.");
+        }
+
+        var leftNow = MentionsNow(bin.Left);
+        var rightNow = MentionsNow(bin.Right);
+        if (leftNow && rightNow)
+        {
+            throw new ResolveException(
+                "NOW() may appear on only one side of a temporal-filter comparison.");
+        }
+
+        var nowSide = leftNow ? bin.Left : bin.Right;
+        var keySide = leftNow ? bin.Right : bin.Left;
+
+        // Offset (microseconds) added to NOW() on the now-side: NOW() -> 0,
+        // NOW() + INTERVAL d -> +d, NOW() - INTERVAL d -> -d.
+        var nowPlusK = ParseNowOffsetMicros(nowSide, schema);
+
+        var timeKey = ResolveScalarExpression(keySide, schema);
+        if (timeKey.Type is not SqlTimestampType)
+        {
+            throw new ResolveException(
+                "the non-NOW() side of a temporal filter must be a TIMESTAMP expression; got " +
+                $"{timeKey.Type.Display}.");
+        }
+
+        // Normalise to `timeKey OP NOW()+k`; flip OP if NOW() was on the left.
+        // Solving for NOW() puts the threshold at key - k, so the offset from
+        // the key is -k.
+        var op = leftNow ? FlipComparison(bin.Operator) : bin.Operator;
+        var offset = checked(-nowPlusK);
+        return op switch
+        {
+            BinaryOperator.Less =>
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Appear, offset, Inclusive: false),
+            BinaryOperator.LessEqual =>
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Appear, offset, Inclusive: true),
+            BinaryOperator.Greater =>
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Disappear, offset, Inclusive: false),
+            _ => // GreaterEqual
+                new TemporalHalfBound(timeKey, TemporalBoundKind.Disappear, offset, Inclusive: true),
+        };
+    }
+
+    private static long ParseNowOffsetMicros(Expression nowSide, Schema schema)
+    {
+        switch (nowSide)
+        {
+            case NowExpression:
+                return 0;
+            case BinaryExpression { Operator: BinaryOperator.Add } add:
+                if (add.Left is NowExpression && !MentionsNow(add.Right))
+                {
+                    return IntervalOffsetMicros(add.Right, schema);
+                }
+
+                if (add.Right is NowExpression && !MentionsNow(add.Left))
+                {
+                    return IntervalOffsetMicros(add.Left, schema);
+                }
+
+                break;
+            case BinaryExpression { Operator: BinaryOperator.Subtract } sub:
+                // NOW() - INTERVAL d only; `interval - NOW()` is type-invalid.
+                if (sub.Left is NowExpression && !MentionsNow(sub.Right))
+                {
+                    return checked(-IntervalOffsetMicros(sub.Right, schema));
+                }
+
+                break;
+        }
+
+        throw new ResolveException(
+            "unsupported NOW() expression in a temporal filter; only NOW(), " +
+            "NOW() + INTERVAL <d>, and NOW() - INTERVAL <d> (a constant day-time interval) are allowed.");
+    }
+
+    // (FlipComparison is shared with the partitioned TOP-K recogniser above.)
+
+    private static long IntervalOffsetMicros(Expression intervalExpr, Schema schema)
+    {
+        var resolved = ResolveScalarExpression(intervalExpr, schema);
+        if (resolved.Type is not SqlIntervalType || resolved is not ResolvedLiteral { Value: Interval interval })
+        {
+            throw new ResolveException(
+                "a NOW() offset in a temporal filter must be a constant INTERVAL literal.");
+        }
+
+        if (interval.Months != 0)
+        {
+            throw new ResolveException(
+                "temporal-filter NOW() offsets must be day-time intervals (DAY / HOUR / MINUTE / " +
+                "SECOND); month/year intervals are not a constant number of microseconds.");
+        }
+
+        return interval.Micros;
+    }
+
+    /// <summary>
+    /// Fold the recognised temporal half-bounds into <see cref="TemporalFilterPlan"/>
+    /// nodes stacked on <paramref name="plan"/>. Half-bounds sharing a time key
+    /// merge into a single node (one appear + one disappear); any extra
+    /// same-direction bound on the same key is stacked as its own node — still
+    /// a sound conjunction, since stacked filters intersect.
+    /// </summary>
+    private static LogicalPlan ApplyTemporalFilters(LogicalPlan plan, IReadOnlyList<TemporalHalfBound> bounds)
+    {
+        if (bounds.Count == 0)
+        {
+            return plan;
+        }
+
+        var byKey = new Dictionary<ResolvedExpression, List<TemporalHalfBound>>();
+        var order = new List<ResolvedExpression>();
+        foreach (var b in bounds)
+        {
+            if (!byKey.TryGetValue(b.TimeKey, out var list))
+            {
+                list = new List<TemporalHalfBound>();
+                byKey[b.TimeKey] = list;
+                order.Add(b.TimeKey);
+            }
+
+            list.Add(b);
+        }
+
+        foreach (var key in order)
+        {
+            long? appearOffset = null;
+            var appearIncl = false;
+            long? disappearOffset = null;
+            var disappearIncl = false;
+            var extras = new List<TemporalHalfBound>();
+
+            foreach (var b in byKey[key])
+            {
+                if (b.Kind == TemporalBoundKind.Appear && appearOffset is null)
+                {
+                    appearOffset = b.OffsetMicros;
+                    appearIncl = b.Inclusive;
+                }
+                else if (b.Kind == TemporalBoundKind.Disappear && disappearOffset is null)
+                {
+                    disappearOffset = b.OffsetMicros;
+                    disappearIncl = b.Inclusive;
+                }
+                else
+                {
+                    extras.Add(b);
+                }
+            }
+
+            plan = new TemporalFilterPlan(plan, key, appearOffset, appearIncl, disappearOffset, disappearIncl);
+            foreach (var ex in extras)
+            {
+                plan = ex.Kind == TemporalBoundKind.Appear
+                    ? new TemporalFilterPlan(plan, key, ex.OffsetMicros, ex.Inclusive, null, false)
+                    : new TemporalFilterPlan(plan, key, null, false, ex.OffsetMicros, ex.Inclusive);
+            }
+        }
+
+        return plan;
+    }
+
     /// <summary>
     /// Build the COALESCE-desugar for <c>EXISTS (sq)</c>:
     /// <c>COALESCE(countSubquery, 0) &gt; 0</c>. The
@@ -3290,6 +3531,11 @@ public sealed class Resolver
                 "IN (subquery) is only supported as a top-level conjunct of WHERE, " +
                 "or in SELECT/HAVING with NOT NULL probe and subquery column"),
             ExistsExpression e => ResolveExistsAsScalar(e, schema, subqueryMap),
+            NowExpression now => throw new ResolveException(
+                $"{NowDisplay(now)} is only allowed inside a temporal-filter predicate in WHERE " +
+                "(a comparison of a TIMESTAMP expression against NOW(), optionally shifted by a " +
+                "constant day-time INTERVAL, e.g. WHERE ts > NOW() - INTERVAL '1' HOUR). It is not " +
+                "a general scalar function."),
             _ => throw new ResolveException($"unsupported expression: {expr.GetType().Name}"),
         };
     }

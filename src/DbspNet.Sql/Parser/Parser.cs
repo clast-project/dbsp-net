@@ -1546,6 +1546,27 @@ public sealed class Parser
         //   ident . ident               -> ColumnReference(ident, ident)
         //   ident ( ... )               -> FunctionCallExpression
         //   ident ( * )                 -> FunctionCallExpression (COUNT(*))
+
+        // NOW() / CURRENT_TIMESTAMP — the advancing logical clock. A dedicated
+        // NowExpression node, never a function call: NOW() is not a pure scalar
+        // and must not reach the scalar-function registry. Recognised
+        // contextually so existing identifiers aren't broken — `now` only
+        // becomes the clock when written with its empty arg list (a column
+        // literally named "now" still resolves), and `current_timestamp` only
+        // when used bare (a `current_timestamp.col` qualifier stays a column).
+        if (first.Text == "now" && Peek().Kind == TokenKind.LParen)
+        {
+            Advance();
+            Expect(TokenKind.RParen);
+            return new NowExpression(NowFunction.Now);
+        }
+
+        if (first.Text == "current_timestamp"
+            && Peek().Kind is not TokenKind.Dot and not TokenKind.LParen)
+        {
+            return new NowExpression(NowFunction.CurrentTimestamp);
+        }
+
         if (Peek().Kind == TokenKind.Dot)
         {
             Advance();
