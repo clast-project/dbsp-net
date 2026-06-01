@@ -223,7 +223,7 @@ public class SchemaDriftTests : IDisposable
 
         var snapDir = Path.Combine(_snapshotDir, "snap-" + producer.Circuit.TickCount);
         var manifest = await SnapshotManifest.ReadAsync(Path.Combine(snapDir, "manifest.json"));
-        Assert.Equal(2, manifest.SchemaVersion);
+        Assert.Equal(3, manifest.SchemaVersion);
         Assert.False(string.IsNullOrEmpty(manifest.SchemaFingerprint));
         Assert.Equal(16, manifest.SchemaFingerprint.Length);   // xxh3-64 hex
     }

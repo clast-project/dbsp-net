@@ -23,15 +23,22 @@ public sealed record SnapshotManifest(
     [property: JsonPropertyName("schema_fingerprint")] string SchemaFingerprint,
     [property: JsonPropertyName("tick")] long Tick,
     [property: JsonPropertyName("operator_count")] int OperatorCount,
-    [property: JsonPropertyName("snapshotted_indices")] IReadOnlyList<int> SnapshottedIndices)
+    [property: JsonPropertyName("snapshotted_indices")] IReadOnlyList<int> SnapshottedIndices,
+    [property: JsonPropertyName("logical_time")] long LogicalTime = long.MinValue)
 {
     /// <summary>
     /// v1 → v2: added <see cref="SchemaFingerprint"/>. v1 caught operator-
     /// type drift only; v2 also catches schema drift (VARCHAR length,
     /// DECIMAL precision/scale, intermediate column reorders) that the
     /// operator-type fingerprint misses.
+    /// <para>
+    /// v2 → v3: added <see cref="LogicalTime"/>, the temporal-filter logical
+    /// clock (<c>NOW()</c>) as of end-of-tick, so a restore reproduces the same
+    /// "now" rather than restarting unset. Snapshots with no temporal filters
+    /// carry <see cref="long.MinValue"/> and are unaffected.
+    /// </para>
     /// </summary>
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

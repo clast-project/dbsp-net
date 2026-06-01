@@ -223,4 +223,52 @@ public class RootCircuitTests
         c.Step();
         Assert.Equal(3, c.TickCount);
     }
+
+    [Fact]
+    public void LogicalTime_DefaultsToUnsetMinValue()
+    {
+        var c = RootCircuit.Build(_ => { });
+        Assert.Equal(long.MinValue, c.LogicalTime);
+    }
+
+    [Fact]
+    public void AdvanceTime_SetsLogicalTime()
+    {
+        var c = RootCircuit.Build(_ => { });
+        c.AdvanceTime(1_000);
+        Assert.Equal(1_000, c.LogicalTime);
+        c.AdvanceTime(5_000);
+        Assert.Equal(5_000, c.LogicalTime);
+    }
+
+    [Fact]
+    public void AdvanceTime_AllowsRepeatingTheSameValue()
+    {
+        // A tick where no logical time passed is legal — the clock is
+        // monotone non-decreasing, not strictly increasing.
+        var c = RootCircuit.Build(_ => { });
+        c.AdvanceTime(42);
+        c.AdvanceTime(42);
+        Assert.Equal(42, c.LogicalTime);
+    }
+
+    [Fact]
+    public void AdvanceTime_RejectsBackwardMove()
+    {
+        var c = RootCircuit.Build(_ => { });
+        c.AdvanceTime(100);
+        Assert.Throws<ArgumentOutOfRangeException>(() => c.AdvanceTime(99));
+        Assert.Equal(100, c.LogicalTime); // unchanged after the rejected move
+    }
+
+    [Fact]
+    public void AdvanceTime_FromUnset_AcceptsAnyValue()
+    {
+        // The "unset" sentinel is long.MinValue, so the first advance may set
+        // any value (including a negative pre-epoch timestamp) without tripping
+        // the monotonicity guard.
+        var c = RootCircuit.Build(_ => { });
+        c.AdvanceTime(-1_000);
+        Assert.Equal(-1_000, c.LogicalTime);
+    }
 }

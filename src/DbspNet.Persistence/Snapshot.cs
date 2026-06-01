@@ -90,7 +90,8 @@ public static class Snapshot
             SnapshotManifest.ComputeSchemaFingerprint(circuit),
             circuit.TickCount,
             circuit.Operators.Count,
-            snapshotted);
+            snapshotted,
+            circuit.LogicalTime);
         await manifest.WriteAsync(fs, snapName + "/manifest.json", cancellationToken).ConfigureAwait(false);
 
         // Commit. After this, the new snapshot is the latest; before, the
@@ -281,6 +282,7 @@ public static class Snapshot
         }
 
         circuit.RestoreTickCount(manifest.Tick);
+        circuit.RestoreLogicalTime(manifest.LogicalTime);
         return restored;
     }
 

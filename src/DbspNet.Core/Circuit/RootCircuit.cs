@@ -21,11 +21,64 @@ public sealed class RootCircuit
     private readonly List<IInputCommit> _inputs = [];
     private readonly List<IOperator> _operators = [];
     private long _tickCount;
+    private long _logicalTime = long.MinValue;
 
     internal object SyncRoot { get; } = new();
 
     /// <summary>Number of times <see cref="Step"/> has completed.</summary>
     public long TickCount => Interlocked.Read(ref _tickCount);
+
+    /// <summary>
+    /// The current logical time — the value <c>NOW()</c> resolves to inside
+    /// temporal filters — in microseconds since the Unix epoch, the same unit
+    /// as a <c>TIMESTAMP</c> value. The host advances it via
+    /// <see cref="AdvanceTime"/> before a <see cref="Step"/>; it is never read
+    /// from the wall clock, so replay is deterministic.
+    /// <see cref="long.MinValue"/> means "not yet set" (logical −∞): a temporal
+    /// filter admits nothing until the host has advanced the clock at least once.
+    /// </summary>
+    public long LogicalTime => Interlocked.Read(ref _logicalTime);
+
+    /// <summary>
+    /// Advance the logical clock to <paramref name="microsSinceEpoch"/>
+    /// (microseconds since the Unix epoch). Call before <see cref="Step"/> so
+    /// the tick's temporal filters see the new "now". The clock is a watermark:
+    /// it must be monotone non-decreasing — a backward move would make
+    /// already-emitted retractions unsound — so a value below the current one
+    /// throws. Re-setting the same value is allowed (a tick where no logical
+    /// time passed).
+    /// </summary>
+    public void AdvanceTime(long microsSinceEpoch)
+    {
+        lock (SyncRoot)
+        {
+            var current = _logicalTime;
+            if (current != long.MinValue && microsSinceEpoch < current)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(microsSinceEpoch),
+                    microsSinceEpoch,
+                    $"logical clock must be monotone non-decreasing; current is {current}");
+            }
+
+            Interlocked.Exchange(ref _logicalTime, microsSinceEpoch);
+        }
+    }
+
+    /// <summary>
+    /// Restore the logical clock to an absolute value when loading a snapshot.
+    /// Mirrors <see cref="RestoreTickCount"/>: a snapshot represents end-of-tick
+    /// T, so the clock jumps to the value it held then rather than restarting at
+    /// "unset". Not for general use — callers must guarantee operator state is
+    /// consistent with the supplied time.
+    /// </summary>
+    internal void RestoreLogicalTime(long value)
+    {
+        lock (SyncRoot)
+        {
+            Interlocked.Exchange(ref _logicalTime, value);
+        }
+    }
 
     /// <summary>
     /// Restore the tick counter to an absolute value. Used by the
