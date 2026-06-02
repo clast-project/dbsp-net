@@ -6,25 +6,29 @@ using DbspNet.Core.Collections;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 
-// Four canonical scenarios that together exercise every v1 SQL surface:
-// filter, inner join, group-by, and a joined group-by. Each scenario builds
-// a circuit, pushes a sequence of INSERT / DELETE deltas, prints the output
-// delta at every step, and asserts at the end that the accumulated output
-// matches a batch re-computation over the net input.
-//
-// The batch oracle is trivially correct (straight LINQ over the accumulated
-// rows); the property we're testing is the equivalence
+// Five scenarios. The first four exercise core v1 SQL surface — filter, inner
+// join, group-by, and a joined group-by — each building a circuit, pushing a
+// sequence of INSERT / DELETE deltas, printing the output delta at every step,
+// and asserting that the accumulated output matches a batch re-computation over
+// the net input. The property tested is the equivalence
 //     ∑ outputDeltas  ==  batch(∑ inputDeltas)
 // which is the "incremental ≡ batch" guarantee DBSP gives us.
+//
+// The fifth scenario showcases runtime observability + LATENESS: it streams a
+// monotone event-time series and prints CompiledQuery.CollectStats() each tick,
+// so you can watch the aggregate's retained state plateau (bounded memory) while
+// the input keeps growing and the GC frontier climbs.
 
 Scenario_Filter();
 Scenario_InnerJoin();
 Scenario_GroupBy();
 Scenario_JoinedGroupBy();
+Scenario_BoundedMemory();
 
 Console.WriteLine();
-Console.WriteLine("All four scenarios pass incremental == batch.");
+Console.WriteLine("All five scenarios pass incremental == batch.");
 
 static CompiledQuery Compile(string[] ddl, string query)
 {
@@ -270,9 +274,10 @@ static void Scenario_GroupBy()
         .Select(g => (row: g.Key, w: g.Sum(x => x.w)))
         .Where(x => x.w != 0)
         .ToArray();
+    // The engine stores VARCHAR as Utf8String, so the oracle must too.
     var oracleZ = ZSet.FromEntries(
         net.GroupBy(x => x.row.dept)
-           .Select(g => (new StructuralRow(g.Key, g.Sum(x => (long)x.row.salary * x.w)), new Z64(1))));
+           .Select(g => (new StructuralRow(Utf8String.Of(g.Key), g.Sum(x => (long)x.row.salary * x.w)), new Z64(1))));
 
     AssertIncrementalEqualsBatch(q, deltas, oracleZ);
 }
@@ -338,8 +343,47 @@ static void Scenario_JoinedGroupBy()
 
     var oracleZ = ZSet.FromEntries(
         joined.GroupBy(x => x.Item1.region)
-              .Select(g => (new StructuralRow(g.Key, g.Sum(x => (long)x.Item1.amt * x.W)), new Z64(1))));
+              .Select(g => (new StructuralRow(Utf8String.Of(g.Key), g.Sum(x => (long)x.Item1.amt * x.W)), new Z64(1))));
 
+    AssertIncrementalEqualsBatch(q, deltas, oracleZ);
+}
+
+static void Scenario_BoundedMemory()
+{
+    PrintBanner("Scenario 5 — bounded memory: COUNT(*) GROUP BY ts, LATENESS 5");
+
+    var q = Compile(
+        new[] { "CREATE TABLE events (ts BIGINT NOT NULL LATENESS 5, v INT NOT NULL)" },
+        "SELECT ts, COUNT(*) AS n FROM events GROUP BY ts");
+
+    var deltas = new List<ZSet<StructuralRow, Z64>>();
+    const int ticks = 12;
+
+    Console.WriteLine("  A monotone event-time stream (one new ts per tick). LATENESS 5 lets the");
+    Console.WriteLine("  aggregate GC groups older than max(ts) - 5, so retained state plateaus at 6");
+    Console.WriteLine("  even as the input grows without bound. CollectStats() reads it each tick:");
+    Console.WriteLine();
+    Console.WriteLine("    tick  inserted  agg-state  frontier  gc-dropped");
+
+    for (long ts = 0; ts < ticks; ts++)
+    {
+        q.Table("events").Insert(ts, 1);
+        q.Step();
+        deltas.Add(q.Current);
+
+        var agg = q.CollectStats().Single(s => s.Name == "IncrementalAggregate");
+        var frontier = agg.GcFrontier?.ToString(CultureInfo.InvariantCulture) ?? "—";
+        Console.WriteLine(string.Format(
+            CultureInfo.InvariantCulture,
+            "    {0,4}  {1,8}  {2,9}  {3,8}  {4,10}",
+            ts, ts + 1, agg.RetainedRows, frontier, agg.GcDroppedTotal));
+    }
+
+    // GC reduces state, never output: the accumulated output is still the full
+    // view — one (ts, count=1) row per event.
+    var oracleZ = ZSet.FromEntries(
+        Enumerable.Range(0, ticks).Select(i => (new StructuralRow((long)i, 1L), new Z64(1))));
+    Console.WriteLine();
     AssertIncrementalEqualsBatch(q, deltas, oracleZ);
 }
 

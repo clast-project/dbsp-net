@@ -105,10 +105,13 @@ rows. Positive weights are insertions, negative weights are retractions.
 Summing the deltas tick-by-tick reconstructs the full view; the cost of each
 `Step()` is proportional to the delta, not the size of `orders`.
 
-The four canonical scenarios in [`src/DbspNet.Demo/Program.cs`](src/DbspNet.Demo/Program.cs)
-(filter, inner join, group-by, joined group-by) run this loop with explicit
-printouts and an end-of-run assertion that the accumulated output matches a
-batch re-computation.
+The five scenarios in [`src/DbspNet.Demo/Program.cs`](src/DbspNet.Demo/Program.cs)
+run this loop with explicit printouts and an end-of-run assertion that the
+accumulated output matches a batch re-computation. The first four cover filter,
+inner join, group-by, and joined group-by; the fifth streams a monotone
+event-time series under `LATENESS` and prints `CollectStats()` each tick, so you
+can watch the aggregate's retained state plateau (bounded memory) while the input
+grows and the GC frontier climbs.
 
 ## What works today
 
