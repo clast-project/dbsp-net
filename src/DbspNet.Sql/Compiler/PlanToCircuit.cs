@@ -6,6 +6,7 @@ using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Linear;
+using DbspNet.Core.Operators.Nested;
 using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.Operators.Stateful.Aggregators;
 using DbspNet.Core.Operators.Stateful.Spine;
@@ -185,9 +186,9 @@ public static class PlanToCircuit
         public IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> Scans { get; }
 
         /// <summary>
-        /// Schema per declared base table — used by stateful operators
-        /// (currently <see cref="RecursiveCteOp"/>) that need to construct
-        /// per-table snapshot codecs at compile time.
+        /// Schema per declared base table — used when constructing per-table
+        /// snapshot codecs at compile time (e.g. a recursive CTE's imported
+        /// base tables in <see cref="CompileRecursiveCteFixpoint"/>).
         /// </summary>
         public IReadOnlyDictionary<string, Schema> TableSchemas { get; }
 
@@ -1233,105 +1234,179 @@ public static class PlanToCircuit
         return codec.BuildRow(schema, vs);
     }    // ---- Recursive CTE ----
     //
-    // The recursive CTE compiles to a single custom operator (RecursiveCteOp)
-    // that holds the base and step subplans as LogicalPlan and evaluates
-    // them at runtime via BatchPlanEvaluator. The operator receives the
-    // delta streams of every base table its body references and maintains an
-    // integrated trace per table so it can run a from-scratch batch
-    // fixed-point per outer tick.
+    // The recursive CTE compiles onto the Core nested-circuit (fixpoint)
+    // primitive: the base and step subplans are wired as real Z-set operators
+    // inside a NestedScopeBuilder, the self-reference resolves to the loop's
+    // feedback stream, and each referenced base table is imported once. The
+    // FixpointOperator drives the body to a least fixpoint per outer tick and
+    // emits the delta against the previous tick — behaviourally the same
+    // set-valued, recompute-per-tick semantics as before, now expressed through
+    // the reusable Core construct rather than a bespoke evaluation loop.
     //
     // Restrictions (v1):
     //   - body may reference only base tables (ScanPlan) and the self-ref.
     //     Other CTE references are rejected here.
     //   - body may not contain aggregates, subqueries, outer joins, or
-    //     nested recursive CTEs. The batch evaluator enforces this on the
-    //     fly with clearer errors.
+    //     nested recursive CTEs. CompileRecursiveBody rejects anything else.
 
     private static Stream<ZSet<StructuralRow, Z64>> CompileRecursiveCte(
         CircuitBuilder builder,
         RecursiveCtePlan plan,
-        CompileContext ctx)
+        CompileContext ctx) =>
+        CompileRecursiveCteFixpoint(builder, plan, ctx.Scans, ctx.TableSchemas, ctx.Codec, ctx.SnapshotCodecs);
+
+    /// <summary>
+    /// Build the recursive CTE on the Core nested-circuit (fixpoint) primitive.
+    /// Shared by the structural compile and the typed fast path (which compiles
+    /// the recursive body structurally and lifts the output to typed at the
+    /// boundary), so the iteration loop is identical on both.
+    /// </summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> CompileRecursiveCteFixpoint(
+        CircuitBuilder builder,
+        RecursiveCtePlan plan,
+        IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> scans,
+        IReadOnlyDictionary<string, Schema> tableSchemas,
+        IRowCodec<StructuralRow> codec,
+        ISqlSnapshotCodecs? snapshotCodecs)
     {
-        // Collect external base-table names referenced by either subplan.
-        var externalNames = new HashSet<string>(StringComparer.Ordinal);
-        CollectRecursiveExternalTables(plan.BasePlan, plan.SelfRef, externalNames);
-        CollectRecursiveExternalTables(plan.RecursivePlan, plan.SelfRef, externalNames);
+        var bodyCtx = new RecursiveBodyCtx(scans, tableSchemas, codec, snapshotCodecs);
 
-        // Wire the existing input streams for each referenced table. The
-        // operator integrates their deltas internally into ZSetTraces.
-        var externalStreams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
-        foreach (var name in externalNames)
-        {
-            externalStreams[name] = ctx.Scans[name];
-        }
+        // Result codec persists the previous-tick fixpoint; per-import codecs
+        // are built lazily as base tables are imported in CompileRecursiveBody.
+        var resultCodec = snapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
 
-        // Build snapshot codecs: one ZSet trace codec per external base
-        // table (using that table's row schema), plus one for the CTE
-        // result (used for both _r and _previousResult — they share a
-        // schema). When SnapshotCodecs is null, the operator gets null
-        // codecs and Snapshot.Write throws NotSupportedException at the
-        // operator boundary.
-        Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>? externalCodecs = null;
-        IZSetTraceCodec<StructuralRow, Z64>? resultCodec = null;
-        if (ctx.SnapshotCodecs is { } codecs)
-        {
-            externalCodecs = new Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>(StringComparer.Ordinal);
-            foreach (var name in externalNames)
+        // R = distinct(base ∪ step(R)). The semi-naive driver preserves R across
+        // ticks and extends it incrementally on inserts (recompute on
+        // retraction); both subplans share one import per base table, and the
+        // operator applies the set-collapse, so base and step are returned raw.
+        return builder.SemiNaiveFixpoint<StructuralRow>(
+            (scope, recRef) =>
             {
-                externalCodecs[name] = codecs.CreateZSetTraceCodec(ctx.TableSchemas[name]);
-            }
-
-            resultCodec = codecs.CreateZSetTraceCodec(plan.Schema);
-        }
-
-        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
-        var op = new RecursiveCteOp(
-            externalStreams,
-            output,
-            plan.BasePlan,
-            plan.RecursivePlan,
-            plan.SelfRef,
-            externalCodecs,
+                var imports = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+                var baseStream = CompileRecursiveBody(scope, recRef, plan.BasePlan, plan.SelfRef, bodyCtx, imports);
+                var stepStream = CompileRecursiveBody(scope, recRef, plan.RecursivePlan, plan.SelfRef, bodyCtx, imports);
+                return (baseStream, stepStream);
+            },
             resultCodec);
-        builder.AddRawOperator(op);
-        return output;
     }
 
-    private static void CollectRecursiveExternalTables(
+    /// <summary>Inputs the recursive-body compiler threads through its recursion.</summary>
+    private sealed record RecursiveBodyCtx(
+        IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> Scans,
+        IReadOnlyDictionary<string, Schema> TableSchemas,
+        IRowCodec<StructuralRow> Codec,
+        ISqlSnapshotCodecs? SnapshotCodecs);
+
+    /// <summary>
+    /// Wire one recursive-body subplan (base or step) into the nested scope,
+    /// reproducing the structural-compile row semantics: <see cref="ScanPlan"/>
+    /// imports a base table (once, via <paramref name="imports"/>), the self-ref
+    /// <see cref="CteScanPlan"/> resolves to <paramref name="recRef"/>, and
+    /// Filter / Project / Inner-Join / UnionAll map to the scope's operators.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> CompileRecursiveBody(
+        NestedScopeBuilder<StructuralRow> scope,
+        Stream<ZSet<StructuralRow, Z64>> recRef,
         LogicalPlan plan,
         CteRef selfRef,
-        HashSet<string> result)
+        RecursiveBodyCtx ctx,
+        Dictionary<string, Stream<ZSet<StructuralRow, Z64>>> imports)
     {
+        var codec = ctx.Codec;
         switch (plan)
         {
             case ScanPlan s:
-                result.Add(s.TableName);
-                break;
-            case CteScanPlan c:
-                if (ReferenceEquals(c.Cte, selfRef))
+            {
+                if (imports.TryGetValue(s.TableName, out var cached))
                 {
-                    return; // the self-reference — not an external input
+                    return cached;
                 }
 
+                var snapshotCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(ctx.TableSchemas[s.TableName]);
+                var inner = scope.Import(ctx.Scans[s.TableName], s.TableName, snapshotCodec);
+                imports[s.TableName] = inner;
+                return inner;
+            }
+
+            case CteScanPlan c when ReferenceEquals(c.Cte, selfRef):
+                return recRef;
+
+            case CteScanPlan c:
                 throw new InvalidOperationException(
                     $"recursive CTE body cannot reference other CTE '{c.Cte.Name}' in v1");
+
             case FilterPlan f:
-                CollectRecursiveExternalTables(f.Input, selfRef, result);
-                break;
+            {
+                var input = CompileRecursiveBody(scope, recRef, f.Input, selfRef, ctx, imports);
+                var predicate = ExpressionCompiler.CompilePredicate(f.Predicate);
+                return scope.Filter(input, row => predicate(row));
+            }
+
             case ProjectPlan p:
-                CollectRecursiveExternalTables(p.Input, selfRef, result);
-                break;
-            case JoinPlan j:
-                CollectRecursiveExternalTables(j.Left, selfRef, result);
-                CollectRecursiveExternalTables(j.Right, selfRef, result);
-                break;
-            case UnionAllPlan u:
-                foreach (var b in u.Branches)
+            {
+                var input = CompileRecursiveBody(scope, recRef, p.Input, selfRef, ctx, imports);
+                var delegates = new Func<IReadOnlyList<object?>, object?>[p.Projections.Count];
+                for (var i = 0; i < p.Projections.Count; i++)
                 {
-                    CollectRecursiveExternalTables(b, selfRef, result);
+                    delegates[i] = ExpressionCompiler.CompileScalar(p.Projections[i].Expression);
                 }
 
-                break;
+                var outSchema = p.Schema;
+                return scope.Map(input, row =>
+                {
+                    var vs = new object?[delegates.Length];
+                    for (var i = 0; i < delegates.Length; i++)
+                    {
+                        vs[i] = delegates[i](row);
+                    }
+
+                    return codec.BuildRow(outSchema, vs);
+                });
+            }
+
+            case JoinPlan { JoinType: DbspNet.Sql.Parser.Ast.JoinType.Inner } j:
+            {
+                var left = CompileRecursiveBody(scope, recRef, j.Left, selfRef, ctx, imports);
+                var right = CompileRecursiveBody(scope, recRef, j.Right, selfRef, ctx, imports);
+                var (leftIndices, rightIndices) = ExtractEquiKeyIndices(j);
+
+                // INNER: NULL-keyed rows never match (mirrors CompileInnerJoin).
+                var leftFiltered = j.AllowNullKeys ? left : scope.Filter(left, row => HasNoNullKey(row, leftIndices));
+                var rightFiltered = j.AllowNullKeys ? right : scope.Filter(right, row => HasNoNullKey(row, rightIndices));
+
+                var leftKeySchema = j.Left.Schema.SubsetByIndex(leftIndices);
+                var rightKeySchema = j.Right.Schema.SubsetByIndex(rightIndices);
+                var joinedSchema = j.Schema;
+                var leftCount = j.Left.Schema.Count;
+                var rightCount = j.Right.Schema.Count;
+
+                var joined = scope.Join(
+                    leftFiltered,
+                    rightFiltered,
+                    leftKey: row => ExtractKey(codec, leftKeySchema, row, leftIndices),
+                    rightKey: row => ExtractKey(codec, rightKeySchema, row, rightIndices),
+                    combine: (lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount));
+
+                if (j.Residual is { } residual)
+                {
+                    var residualPredicate = ExpressionCompiler.CompilePredicate(residual);
+                    joined = scope.Filter(joined, row => residualPredicate(row));
+                }
+
+                return joined;
+            }
+
+            case UnionAllPlan u:
+            {
+                var result = CompileRecursiveBody(scope, recRef, u.Branches[0], selfRef, ctx, imports);
+                for (var i = 1; i < u.Branches.Count; i++)
+                {
+                    result = scope.Union(result, CompileRecursiveBody(scope, recRef, u.Branches[i], selfRef, ctx, imports));
+                }
+
+                return result;
+            }
+
             default:
                 throw new InvalidOperationException(
                     $"{plan.GetType().Name} is not supported inside a recursive CTE body");

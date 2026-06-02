@@ -221,7 +221,7 @@ public class MultiOpSnapshotTests : IDisposable
     [Fact]
     public async Task RecursiveCtePlusGroupBy_BothOpsCompose()
     {
-        // Stateful ops: 1 RecursiveCteOp (driving fixed-point) + 1
+        // Stateful ops: 1 FixpointOperator (driving the recursive fixpoint) + 1
         // IncrementalAggregateOp (counting reachable nodes per source).
         string[] ddl =
         {

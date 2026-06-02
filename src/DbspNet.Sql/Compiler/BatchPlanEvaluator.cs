@@ -14,11 +14,9 @@ namespace DbspNet.Sql.Compiler;
 /// <summary>
 /// Pure (non-circuit) evaluator for a <see cref="LogicalPlan"/> against a
 /// snapshot of base-table Z-sets. Handles every plan node <b>except</b>
-/// <see cref="RecursiveCtePlan"/> (fixed-point evaluation lives in
-/// <see cref="RecursiveCteOp"/> itself). Two uses:
+/// <see cref="RecursiveCtePlan"/> (which compiles to the nested fixpoint
+/// circuit rather than being batch-evaluated). One use:
 /// <list type="bullet">
-/// <item>Recursive-CTE runtime: the base and step subplans are evaluated
-/// here each iteration of the fixed-point loop.</item>
 /// <item>Test oracle: a random-query PBT compares the circuit's accumulated
 /// output to what this evaluator produces over the accumulated input, for
 /// any plan the generator can produce.</item>
@@ -102,7 +100,7 @@ internal static class BatchPlanEvaluator
 
             case RecursiveCtePlan:
                 throw new InvalidOperationException(
-                    "RecursiveCtePlan cannot be batch-evaluated directly; it's handled by RecursiveCteOp.");
+                    "RecursiveCtePlan cannot be batch-evaluated directly; it compiles to the nested fixpoint circuit.");
 
             default:
                 throw new InvalidOperationException($"unsupported plan node: {plan.GetType().Name}");
@@ -244,7 +242,7 @@ internal static class BatchPlanEvaluator
 
     private static ZSet<StructuralRow, Z64> BatchLeftOuterJoin(JoinPlan plan, BatchEvalContext ctx)
     {
-        // Mirrors RecursiveCteOp-free semantics of the circuit's LEFT JOIN:
+        // Mirrors the circuit's LEFT JOIN semantics:
         //  * null-keyed left rows always emit NULL-padded.
         //  * null-keyed right rows are dropped.
         //  * left rows with no matching right → NULL-padded.
@@ -902,9 +900,8 @@ internal sealed class BatchEvalContext
 
     /// <summary>
     /// Construct a context. The <paramref name="ctes"/> dict is stored by
-    /// reference — <see cref="RecursiveCteOp"/> mutates it across iterations
-    /// to feed the evolving self-reference value, and lazy CTE evaluation
-    /// in this context likewise memoizes into the same dict.
+    /// reference — lazy CTE evaluation in this context memoizes into it, and a
+    /// caller may pre-bind entries (e.g. a self-reference) before evaluating.
     /// </summary>
     public BatchEvalContext(
         IReadOnlyDictionary<string, ZSet<StructuralRow, Z64>> tables,
@@ -943,11 +940,11 @@ internal sealed class BatchEvalContext
         }
 
         // Lazily evaluate this CTE's body. Rejects recursive CTEs, which
-        // must be pre-bound by RecursiveCteOp.
+        // compile to the nested fixpoint circuit rather than batch evaluation.
         if (cte.Plan is RecursiveCtePlan)
         {
             throw new InvalidOperationException(
-                $"recursive CTE '{cte.Name}' has no batch binding (should be handled by RecursiveCteOp)");
+                $"recursive CTE '{cte.Name}' has no batch binding (it compiles to the nested fixpoint circuit)");
         }
 
         var result = BatchPlanEvaluator.Evaluate(cte.Plan, this);

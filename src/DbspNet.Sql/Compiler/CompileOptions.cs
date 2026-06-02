@@ -37,10 +37,10 @@ public enum TraceFamily
 /// (the emitted struct row types implement <c>IComparable&lt;TSelf&gt;</c> via
 /// <c>TypedRowEmitter</c>'s <c>EmitTypedCompareTo</c>); the structural pipeline
 /// supplies <see cref="DbspNet.Core.Collections.StructuralRowComparer.Instance"/>.
-/// Recursive CTEs always use a flat trace regardless of this setting (no spine
-/// sibling exists for <c>RecursiveCteOp</c>); a query containing a recursive
-/// CTE still compiles fine in spine mode — only the recursive op's internal
-/// trace stays flat.
+/// Recursive CTEs always use flat traces regardless of this setting (the nested
+/// fixpoint circuit's import traces have no spine sibling yet); a query
+/// containing a recursive CTE still compiles fine in spine mode — only the
+/// recursion's internal traces stay flat.
 /// </remarks>
 public sealed record CompileOptions
 {

@@ -243,11 +243,10 @@ public class RecursiveCteTests
     // doesn't easily let us construct. So we just verify the guard is wired
     // up (reaching the iterations cap throws).
     //
-    // This test uses the internals of RecursiveCteOp.MaxIterations via
-    // a directly-constructed scenario that shouldn't terminate. Since all
-    // practical SQL recursive CTEs over finite inputs DO terminate under
-    // set semantics, a natural trigger is hard to construct; we skip a
-    // dedicated trigger test.
+    // The guard lives in the nested fixpoint driver (FixpointOperator's
+    // maxIterations). Since all practical SQL recursive CTEs over finite inputs
+    // DO terminate under set semantics, a natural trigger is hard to construct;
+    // we skip a dedicated trigger test.
 
     // ---- Non-recursive CTE still works ----
 

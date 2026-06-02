@@ -10,13 +10,12 @@ using DbspNet.Sql.Plan;
 namespace DbspNet.Tests.Persistence;
 
 /// <summary>
-/// End-to-end snapshot of <c>RecursiveCteOp</c>: every external base
-/// table's integrated trace plus the materialised CTE result <c>R</c>
-/// and prior-tick result round-trip through Arrow IPC. After restore,
-/// the consumer's next-tick output is the delta — exactly what the
-/// producer would have emitted continuing from the same point. Covers
-/// both the semi-naïve insert path and the full-recompute retraction
-/// path.
+/// End-to-end snapshot of the recursive CTE's nested fixpoint circuit
+/// (<c>FixpointOperator</c>): every imported base table's integrated trace
+/// plus the prior-tick fixpoint round-trip through Arrow IPC. After restore,
+/// the consumer's next-tick output is the delta — exactly what the producer
+/// would have emitted continuing from the same point. Covers chain extension
+/// and the retraction path.
 /// </summary>
 public class RecursiveCteSnapshotTests : IDisposable
 {
@@ -190,7 +189,7 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public async Task NoCodec_RecursiveCteOp_ThrowsOnSnapshot()
+    public async Task NoCodec_RecursiveCte_ThrowsOnSnapshot()
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);

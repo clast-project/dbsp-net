@@ -560,31 +560,15 @@ public static class TypedPlanCompiler
             externalStreams[name] = stream;
         }
 
-        // Per-table snapshot codecs + one for the result. Matches
-        // structural CompileRecursiveCte (PlanToCircuit.cs:601).
-        Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>? externalCodecs = null;
-        IZSetTraceCodec<StructuralRow, Z64>? resultCodec = null;
-        if (ctx.SnapshotCodecs is { } codecs)
-        {
-            externalCodecs = new Dictionary<string, IZSetTraceCodec<StructuralRow, Z64>>(StringComparer.Ordinal);
-            foreach (var (name, schema) in externalSchemas)
-            {
-                externalCodecs[name] = codecs.CreateZSetTraceCodec(schema);
-            }
-
-            resultCodec = codecs.CreateZSetTraceCodec(plan.Schema);
-        }
-
-        var structuralOutput = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
-        var op = new RecursiveCteOp(
+        // Compile the recursive body structurally onto the shared nested-circuit
+        // (fixpoint) primitive — the same construction the structural path uses.
+        var structuralOutput = PlanToCircuit.CompileRecursiveCteFixpoint(
+            ctx.Builder,
+            plan,
             externalStreams,
-            structuralOutput,
-            plan.BasePlan,
-            plan.RecursivePlan,
-            plan.SelfRef,
-            externalCodecs,
-            resultCodec);
-        ctx.Builder.AddRawOperator(op);
+            externalSchemas,
+            StructuralRowCodec.Instance,
+            ctx.SnapshotCodecs);
 
         // Lift the structural output to typed via MapRows. Cost is
         // paid only at the boundary between the recursive op and the

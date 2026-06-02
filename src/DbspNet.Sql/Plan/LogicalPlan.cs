@@ -64,8 +64,8 @@ public sealed record CteScanPlan(CteRef Cte, Schema Schema) : LogicalPlan(Schema
 /// A recursive CTE: <c>WITH RECURSIVE r AS (base UNION ALL step(r))</c>.
 /// <see cref="BasePlan"/> is the union of the non-self-referencing branches;
 /// <see cref="RecursivePlan"/> is the union of the branches that reference
-/// <see cref="SelfRef"/>. The circuit runtime evaluates this by a per-tick
-/// batch fixed-point (see <c>RecursiveCteOp</c>).
+/// <see cref="SelfRef"/>. This compiles onto the Core nested-circuit (fixpoint)
+/// primitive, which drives the body to a per-tick least fixpoint.
 /// </summary>
 /// <remarks>
 /// Equality on this record is reference-based to avoid cycles (the plan
