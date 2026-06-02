@@ -321,6 +321,7 @@ public enum AggregateKind
     Min,
     Max,
     Avg,
+    ApproxCountDistinct,
 }
 
 /// <summary>

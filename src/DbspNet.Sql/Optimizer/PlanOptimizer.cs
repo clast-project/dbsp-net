@@ -331,11 +331,15 @@ public static class PlanOptimizer
     /// </remarks>
     private static LogicalPlan NarrowAggregateInput(AggregatePlan agg)
     {
-        // Bail on MIN/MAX: narrowing can change which distinct
-        // values are visible to those aggregators.
+        // Bail on the non-linear aggregates (MIN / MAX / APPROX_COUNT_DISTINCT):
+        // they depend on which distinct values have positive weight, not on the
+        // weight sum, so narrowing can collapse two rows that share the kept
+        // columns into a single zero-weight entry and drop a value the
+        // aggregate would otherwise have seen.
         foreach (var call in agg.Aggregates)
         {
-            if (call.Kind is AggregateKind.Min or AggregateKind.Max)
+            if (call.Kind is AggregateKind.Min or AggregateKind.Max
+                or AggregateKind.ApproxCountDistinct)
             {
                 return agg;
             }

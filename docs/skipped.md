@@ -342,6 +342,16 @@ reflect that shape, not a backlog.
 
 ### Aggregate functions
 - **[P1]** `MIN`, `MAX` are included in v1 via per-group multiset tracking.
+- **[DONE]** `APPROX_COUNT_DISTINCT(expr)` — HyperLogLog (precision 12, 4&#160;KiB
+  per group) on both compile paths and both trace families. Non-linear (depends
+  on which distinct values have positive weight), so it bails out of
+  aggregate-input column pruning like `MIN`/`MAX`. Incremental on insert-only
+  ticks (merge into the running sketch); a tick carrying a retraction rebuilds
+  the sketch from the post-delta multiset. The sketch is a deterministic
+  function of the present value set, so the incremental result equals a
+  from-scratch batch recompute exactly (not merely within the error bound).
+  Other approximate / sketch aggregates (`APPROX_QUANTILES`/`PERCENTILE`,
+  heavy-hitters) remain **[P2]**.
 - **[P1]** `FILTER (WHERE …)` clause on aggregates.
 - **[P1]** `DISTINCT` in aggregates; `WITHIN DISTINCT`.
 - **[P2]** `ARG_MIN`, `ARG_MAX`, `ARRAY_AGG` (with `ORDER BY`,

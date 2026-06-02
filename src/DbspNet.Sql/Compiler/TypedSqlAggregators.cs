@@ -831,6 +831,66 @@ internal sealed class TypedSqlMinMaxNullableAggregator<TIn, T> : TypedSqlAggrega
 }
 
 /// <summary>
+/// Typed <c>APPROX_COUNT_DISTINCT</c>: HyperLogLog estimate of the distinct
+/// non-NULL argument values in the group. The argument extractor returns a
+/// boxed value (<c>null</c> for SQL NULL — a no-value <c>Nullable&lt;T&gt;</c>
+/// boxes to a null reference), so one implementation covers every argument
+/// type. Mirrors <see cref="SqlApproxCountDistinctAggregator"/>: insert-only
+/// ticks merge into the running sketch, retraction ticks rebuild from the
+/// post-delta multiset, and the result is identical to a batch recompute.
+/// </summary>
+internal sealed class TypedApproxCountDistinctAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, object?> _argExtract;
+
+    public TypedApproxCountDistinctAggregator(Func<TIn, object?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    public override Type ResultClrType => typeof(long);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        var sketch = new HyperLogLog();
+        HllSupport.FoldPositive(sketch, rows, _argExtract);
+        return sketch.EstimateCardinality();
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var sketch = state as HyperLogLog;
+        if (sketch is not null && IsInsertOnly(delta))
+        {
+            HllSupport.FoldPositive(sketch, delta, _argExtract);
+        }
+        else
+        {
+            sketch ??= new HyperLogLog();
+            sketch.Clear();
+            HllSupport.FoldPositive(sketch, after, _argExtract);
+        }
+
+        state = sketch;
+        return sketch.EstimateCardinality();
+    }
+
+    private static bool IsInsertOnly(ZSet<TIn, Z64> delta)
+    {
+        foreach (var (_, weight) in delta)
+        {
+            if (!Z64.IsPositive(weight))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+/// <summary>
 /// Typed composite that runs all of a query's aggregates over the
 /// per-group multiset and packs their results into the emitted
 /// aggregate-output row <typeparamref name="TAgg"/>.

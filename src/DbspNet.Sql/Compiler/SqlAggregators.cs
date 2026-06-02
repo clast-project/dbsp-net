@@ -583,6 +583,76 @@ internal sealed class SqlAvgAggregator : SqlAggregator
 }
 
 /// <summary>
+/// SQL <c>APPROX_COUNT_DISTINCT</c> — a HyperLogLog estimate of the number of
+/// distinct non-NULL argument values in the group. Returns a non-nullable
+/// <c>BIGINT</c> (0 for an all-NULL group, like <c>COUNT(col)</c>).
+/// </summary>
+/// <remarks>
+/// The sketch is non-invertible under retractions (a register holds a max and
+/// cannot be un-set), so <see cref="Update"/> is incremental only while a tick
+/// is insert-only — then it merges the new values into the running sketch.
+/// Any tick carrying a retraction rebuilds the sketch from the post-delta
+/// multiset. Because the sketch is a deterministic function of the present
+/// value set either way, the incremental result is identical to a from-scratch
+/// batch recompute — not merely within the estimator's error bound.
+/// </remarks>
+internal sealed class SqlApproxCountDistinctAggregator : SqlAggregator
+{
+    private readonly Func<StructuralRow, object?> _argExtract;
+
+    public SqlApproxCountDistinctAggregator(Func<StructuralRow, object?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    {
+        var sketch = new HyperLogLog();
+        HllSupport.FoldPositive(sketch, rows, _argExtract);
+        return sketch.EstimateCardinality();
+    }
+
+    public override object? Update(
+        ref object? state,
+        object? oldValue,
+        ZSet<StructuralRow, Z64> delta,
+        ZSet<StructuralRow, Z64> after)
+    {
+        var sketch = state as HyperLogLog;
+        if (sketch is not null && IsInsertOnly(delta))
+        {
+            // Present-value set only grows this tick — merge the new values
+            // (idempotent, so already-present values are harmless).
+            HllSupport.FoldPositive(sketch, delta, _argExtract);
+        }
+        else
+        {
+            // A retraction may have dropped a value; rebuild from the
+            // post-delta multiset.
+            sketch ??= new HyperLogLog();
+            sketch.Clear();
+            HllSupport.FoldPositive(sketch, after, _argExtract);
+        }
+
+        state = sketch;
+        return sketch.EstimateCardinality();
+    }
+
+    private static bool IsInsertOnly(ZSet<StructuralRow, Z64> delta)
+    {
+        foreach (var (_, weight) in delta)
+        {
+            if (!Z64.IsPositive(weight))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+/// <summary>
 /// Runs all of a query's aggregates in a single pass over the per-group
 /// multiset, packing the results into a <see cref="StructuralRow"/> whose
 /// columns line up with the resolver's declared aggregate order.

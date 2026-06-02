@@ -987,6 +987,7 @@ public static class TypedPlanCompiler
         {
             AggregateKind.CountStar => call.ResultType.WithNullable(false),
             AggregateKind.Count => call.ResultType.WithNullable(false),
+            AggregateKind.ApproxCountDistinct => call.ResultType.WithNullable(false),
             AggregateKind.Sum => call.ResultType.WithNullable(argNullable),
             AggregateKind.Avg => call.ResultType.WithNullable(argNullable),
             // MIN/MAX is *always* nullable in the emitted slot, even on
@@ -1041,6 +1042,9 @@ public static class TypedPlanCompiler
                     return Activator.CreateInstance(closedNull, presence);
                 }
 
+            case AggregateKind.ApproxCountDistinct:
+                return BuildApproxCountDistinctAggregator(call, inputRowType);
+
             case AggregateKind.Sum:
                 return BuildSumAggregator(call, inputRowType);
 
@@ -1087,6 +1091,28 @@ public static class TypedPlanCompiler
         var openNonNull = typeof(TypedSqlMinMaxAggregator<,>);
         var closedNonNull = openNonNull.MakeGenericType(inputRowType, underlyingClr);
         return Activator.CreateInstance(closedNonNull, argExtract, wantMin);
+    }
+
+    private static object? BuildApproxCountDistinctAggregator(AggregateCall call, Type inputRowType)
+    {
+        if (call.Argument is null) return null;
+
+        // Build a boxing extractor: the argument lowered to its CLR type, then
+        // converted to object. A no-value Nullable<T> boxes to a null
+        // reference, which the aggregator reads as SQL NULL — so one
+        // non-generic extractor handles both nullable and non-nullable args
+        // (and reference-typed args like Utf8String) uniformly.
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var built = TypedExpressionCompiler.TryBuildInto(call.Argument, inParam);
+        if (built is null) return null;
+
+        var boxed = Expression.Convert(built, typeof(object));
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, typeof(object));
+        var argExtract = Expression.Lambda(delegateType, boxed, inParam).Compile();
+
+        var open = typeof(TypedApproxCountDistinctAggregator<>);
+        var closed = open.MakeGenericType(inputRowType);
+        return Activator.CreateInstance(closed, argExtract);
     }
 
     /// <summary>

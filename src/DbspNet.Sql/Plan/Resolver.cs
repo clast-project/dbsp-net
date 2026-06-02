@@ -4173,7 +4173,7 @@ public sealed class Resolver
 
         return name switch
         {
-            "count" or "sum" or "min" or "max" or "avg" => true,
+            "count" or "sum" or "min" or "max" or "avg" or "approx_count_distinct" => true,
             _ => false,
         };
     }
@@ -4434,6 +4434,7 @@ public sealed class Resolver
             "min" => AggregateKind.Min,
             "max" => AggregateKind.Max,
             "avg" => AggregateKind.Avg,
+            "approx_count_distinct" => AggregateKind.ApproxCountDistinct,
             _ => throw new ResolveException($"unknown aggregate '{call.FunctionName}'"),
         };
     }
@@ -4445,6 +4446,13 @@ public sealed class Resolver
             case AggregateKind.CountStar:
                 return new SqlBigintType(false);
             case AggregateKind.Count:
+                return new SqlBigintType(false);
+            case AggregateKind.ApproxCountDistinct:
+                if (argType is null)
+                {
+                    throw new ResolveException("APPROX_COUNT_DISTINCT requires an argument");
+                }
+
                 return new SqlBigintType(false);
             case AggregateKind.Sum:
                 if (argType is null || !TypeInference.IsNumeric(argType))
