@@ -46,7 +46,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// NULL-padded-left branch): this operator works on non-null-keyed rows only.
 /// </para>
 /// </remarks>
-internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
+internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -69,6 +69,7 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public IncrementalFullJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
@@ -229,9 +230,19 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         }
 
         _lastGcFrontier = frontier;
-        _leftTrace.DropKeysBelow(frontier, _monotoneKey);
-        _rightTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
     }
+
+    public string MetricName => "IncrementalFullJoin";
+
+    public long RetainedRows => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 
     private void JoinInto(
         ZSetBuilder<TOut, TWeight> output,

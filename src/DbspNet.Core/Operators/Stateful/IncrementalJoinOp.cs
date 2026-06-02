@@ -24,7 +24,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// Equivalent to the <c>D(↑Q(I, I))</c> sandwich on the bilinear operator
 /// <c>Q(a,b) = a ⋈ b</c> by the DBSP bilinearity theorem.
 /// </summary>
-internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
+internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -45,6 +45,7 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public IncrementalJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
@@ -137,9 +138,19 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         }
 
         _lastGcFrontier = frontier;
-        _leftTrace.DropKeysBelow(frontier, _monotoneKey);
-        _rightTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
     }
+
+    public string MetricName => "IncrementalInnerJoin";
+
+    public long RetainedRows => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 
     private void JoinInto(
         IndexedZSet<TKey, TLeft, TWeight> a,

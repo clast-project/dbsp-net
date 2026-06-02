@@ -24,6 +24,7 @@ public sealed class RootCircuit
     private readonly List<IOperator> _operators = [];
     private long _tickCount;
     private long _logicalTime = long.MinValue;
+    private long _lastStepTicks;
 
     internal object SyncRoot { get; } = new();
 
@@ -132,6 +133,38 @@ public sealed class RootCircuit
     internal IReadOnlyList<IOperator> Operators => _operators;
 
     /// <summary>
+    /// Wall-clock duration of the most recent <see cref="Step"/> (the operator
+    /// firing loop only, not input commit), for per-tick throughput tracking.
+    /// <see cref="TimeSpan.Zero"/> before the first step.
+    /// </summary>
+    public TimeSpan LastStepDuration =>
+        new(Interlocked.Read(ref _lastStepTicks) * TimeSpan.TicksPerSecond / System.Diagnostics.Stopwatch.Frequency);
+
+    /// <summary>
+    /// Snapshot per-operator runtime metrics (state size, last-tick output size,
+    /// GC frontier and cumulative GC drops) for every stateful operator, in
+    /// registration order. Opt-in observability: call it whenever you want a
+    /// reading — e.g. after a <see cref="Step"/> to watch trace state shrink as a
+    /// LATENESS / clock frontier advances. Stateless operators are omitted. The
+    /// read is O(operators) plus each operator's own cost (O(1) for flat traces;
+    /// O(state) for a spine trace, which materialises to count).
+    /// </summary>
+    public IReadOnlyList<OperatorStat> CollectStats()
+    {
+        var stats = new List<OperatorStat>();
+        for (var i = 0; i < _operators.Count; i++)
+        {
+            if (_operators[i] is IIntrospectable m)
+            {
+                stats.Add(new OperatorStat(
+                    i, m.MetricName, m.RetainedRows, m.LastOutputRows, m.GcFrontier, m.GcDroppedTotal));
+            }
+        }
+
+        return stats;
+    }
+
+    /// <summary>
     /// Build a circuit by running <paramref name="configure"/> against a
     /// builder. The builder's methods register inputs, outputs and operators
     /// with this circuit.
@@ -159,11 +192,13 @@ public sealed class RootCircuit
                 input.Commit();
             }
 
+            var start = System.Diagnostics.Stopwatch.GetTimestamp();
             foreach (var op in _operators)
             {
                 op.Step();
             }
 
+            Interlocked.Exchange(ref _lastStepTicks, System.Diagnostics.Stopwatch.GetTimestamp() - start);
             Interlocked.Increment(ref _tickCount);
         }
     }

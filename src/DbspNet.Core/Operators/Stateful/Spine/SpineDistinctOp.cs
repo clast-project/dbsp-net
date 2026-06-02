@@ -36,7 +36,7 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// <see cref="SpineIncrementalJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/>,
 /// <see cref="SpineIncrementalLeftJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/>.
 /// </remarks>
-internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
+internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
@@ -47,6 +47,7 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public SpineDistinctOp(
         Stream<ZSet<TKey, TWeight>> input,
@@ -165,6 +166,16 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable
         }
 
         _lastGcFrontier = frontier;
-        _trace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _trace.DropKeysBelow(frontier, _monotoneKey);
     }
+
+    public string MetricName => "SpineDistinct";
+
+    public long RetainedRows => _trace.KeyCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 }

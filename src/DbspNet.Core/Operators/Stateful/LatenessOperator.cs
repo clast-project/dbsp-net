@@ -34,7 +34,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// the GC'd downstream traces that were restored alongside it.
 /// </para>
 /// </remarks>
-internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable
+internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntrospectable
     where TRow : notnull
 {
     private const string StateFile = "frontier.bin";
@@ -73,6 +73,18 @@ internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable
 
     /// <summary>Total rows dropped as late so far. Exposed for tests / observability.</summary>
     internal long DroppedCount => _droppedCount;
+
+    // Input-side, so it retains no trace; its GcFrontier is the watermark it
+    // advertises and GcDroppedTotal is the late-row drops it enforces.
+    public string MetricName => "Lateness";
+
+    public long RetainedRows => 0;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _droppedCount;
 
     public string SchemaFingerprint => string.Empty; // schemaless scalar state
 

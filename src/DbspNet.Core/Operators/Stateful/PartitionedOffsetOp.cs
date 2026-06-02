@@ -51,7 +51,7 @@ public readonly record struct OffsetSpec(
 /// recompute is currently whole-partition (a neighbourhood-only recompute and
 /// frontier GC are deferred).</para>
 /// </remarks>
-internal sealed class PartitionedOffsetOp<TKey> : IOperator, ISnapshotable
+internal sealed class PartitionedOffsetOp<TKey> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
 {
     private readonly Stream<ZSet<StructuralRow, Z64>> _input;
@@ -88,6 +88,28 @@ internal sealed class PartitionedOffsetOp<TKey> : IOperator, ISnapshotable
         _accum = new Dictionary<TKey, SortedDictionary<StructuralRow, long>>(partitionComparer);
         _window = new Dictionary<TKey, Dictionary<StructuralRow, long>>(partitionComparer);
     }
+
+    public string MetricName => "WindowOffset";
+
+    public long RetainedRows
+    {
+        get
+        {
+            long n = 0;
+            foreach (var bucket in _accum.Values)
+            {
+                n += bucket.Count;
+            }
+
+            return n;
+        }
+    }
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => null;
+
+    public long GcDroppedTotal => 0;
 
     public void Step()
     {

@@ -31,7 +31,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// <para>The per-tick recompute is O(integral size); a time-ordered transition
 /// index (only touch rows that crossed a bound) is a deferred optimisation.</para>
 /// </remarks>
-internal sealed class TemporalFilterOp<TRow> : IOperator, ISnapshotable
+internal sealed class TemporalFilterOp<TRow> : IOperator, ISnapshotable, IIntrospectable
     where TRow : notnull
 {
     private readonly Stream<ZSet<TRow, Z64>> _input;
@@ -82,6 +82,16 @@ internal sealed class TemporalFilterOp<TRow> : IOperator, ISnapshotable
         _clock = clock;
         _snapshotCodec = snapshotCodec;
     }
+
+    public string MetricName => "TemporalFilter";
+
+    public long RetainedRows => _accum.Count;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_clock);
+
+    public long GcDroppedTotal => 0;
 
     public void Step()
     {

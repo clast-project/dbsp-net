@@ -55,7 +55,7 @@ public enum RankFunction
 /// TOP-K under retraction — when a windowed row is retracted, the next row must
 /// already be known.</para>
 /// </remarks>
-internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable
+internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, IIntrospectable
     where TRow : notnull
     where TKey : notnull
 {
@@ -102,6 +102,28 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable
         _accum = new Dictionary<TKey, SortedDictionary<TRow, long>>(partitionComparer);
         _window = new Dictionary<TKey, Dictionary<TRow, long>>(partitionComparer);
     }
+
+    public string MetricName => "PartitionedTopK";
+
+    public long RetainedRows
+    {
+        get
+        {
+            long n = 0;
+            foreach (var bucket in _accum.Values)
+            {
+                n += bucket.Count;
+            }
+
+            return n;
+        }
+    }
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => null;
+
+    public long GcDroppedTotal => 0;
 
     public void Step()
     {

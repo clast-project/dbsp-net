@@ -19,7 +19,7 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// the spine trace — bloom-gated binary search across each batch — plus
 /// the same aggregator update logic as the flat operator.
 /// </remarks>
-internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperator, ISnapshotable
+internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TValue : notnull
     where TOut : notnull
@@ -34,6 +34,7 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public SpineIncrementalAggregateOp(
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
@@ -206,6 +207,17 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         {
             _aggCache.Remove(key);
             _stateCache.Remove(key);
+            _gcDropped++;
         }
     }
+
+    public string MetricName => "SpineIncrementalAggregate";
+
+    public long RetainedRows => _trace.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 }

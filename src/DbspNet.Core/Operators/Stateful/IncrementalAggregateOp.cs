@@ -22,7 +22,7 @@ namespace DbspNet.Core.Operators.Stateful;
 ///   <item>Drop cache entries for groups that became empty.</item>
 /// </list>
 /// </summary>
-internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, ISnapshotable
+internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TValue : notnull
     where TOut : notnull
@@ -37,6 +37,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public IncrementalAggregateOp(
         Stream<IndexedZSet<TKey, TValue, Z64>> input,
@@ -198,6 +199,17 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         {
             _aggCache.Remove(key);
             _stateCache.Remove(key);
+            _gcDropped++;
         }
     }
+
+    public string MetricName => "IncrementalAggregate";
+
+    public long RetainedRows => _trace.Current.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 }

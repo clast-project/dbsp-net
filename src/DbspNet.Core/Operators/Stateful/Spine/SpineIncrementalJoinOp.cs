@@ -24,7 +24,7 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// pay the wrong-side iteration cost. The flat operator would pick the
 /// smaller side dynamically.</para>
 /// </remarks>
-internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
+internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -42,6 +42,7 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public SpineIncrementalJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
@@ -202,7 +203,17 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
         }
 
         _lastGcFrontier = frontier;
-        _leftTrace.DropKeysBelow(frontier, _monotoneKey);
-        _rightTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
     }
+
+    public string MetricName => "SpineIncrementalInnerJoin";
+
+    public long RetainedRows => _leftTrace.GroupCount + _rightTrace.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 }

@@ -18,7 +18,7 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// spine version pays the per-key probe (bloom + binary search) and
 /// nothing more.
 /// </remarks>
-internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
+internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -37,6 +37,7 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public SpineIncrementalLeftJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
@@ -199,9 +200,19 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
         }
 
         _lastGcFrontier = frontier;
-        _leftTrace.DropKeysBelow(frontier, _monotoneKey);
-        _rightTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
     }
+
+    public string MetricName => "SpineIncrementalLeftJoin";
+
+    public long RetainedRows => _leftTrace.GroupCount + _rightTrace.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 
     private void JoinInto(
         ZSetBuilder<TOut, TWeight> output,

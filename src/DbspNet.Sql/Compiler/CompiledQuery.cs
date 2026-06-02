@@ -51,6 +51,13 @@ public sealed class CompiledQuery
 
     public TableInput Table(string name) => Inputs[name];
 
+    /// <summary>
+    /// Convenience: snapshot per-operator runtime metrics (state size, last-tick
+    /// output size, GC frontier and cumulative GC drops). See
+    /// <see cref="RootCircuit.CollectStats"/>.
+    /// </summary>
+    public IReadOnlyList<DbspNet.Core.Circuit.OperatorStat> CollectStats() => Circuit.CollectStats();
+
     /// <summary>The current output Z-set (only meaningful after <see cref="Step"/>).</summary>
     public ZSet<StructuralRow, Z64> Current => Output.Current;
 

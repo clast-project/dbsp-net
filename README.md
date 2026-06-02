@@ -263,6 +263,16 @@ batch re-computation.
   Recursive CTEs honour spine too: the nested fixpoint circuit's
   import-relation integrals use a `SpineZSetTrace` in spine mode (its loop
   body is stateless, so the import integral is the only trace).
+- Runtime observability (`RootCircuit.CollectStats()` /
+  `CompiledQuery.CollectStats()`): an opt-in, on-demand per-operator metrics
+  snapshot over the registered operators — each stateful operator reports its
+  retained-state size, last-tick output size, current GC frontier and cumulative
+  GC drops (as an `OperatorStat` keyed by the operator's registration index).
+  The headline use is watching trace state stay bounded as a `LATENESS` / clock
+  watermark advances — you can see groups GC'd and the frontier climb.
+  `RootCircuit.LastStepDuration` exposes the most recent tick's wall-clock cost
+  for throughput tracking. Stateless operators are omitted; reads never touch the
+  hot `Step` path (a spine trace's count materialises only when asked).
 - Correctness: 840+ unit tests plus property-based tests (≥3000 CsCheck
   iterations) across 40 query templates, run both with and without the
   optimizer and on both trace families — semantic equivalence is

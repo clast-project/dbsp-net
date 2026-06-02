@@ -27,7 +27,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// incremental TOP-K under retraction — when the current top row is retracted,
 /// the next row must already be known.</para>
 /// </remarks>
-internal sealed class TopKOp<TRow> : IOperator, ISnapshotable
+internal sealed class TopKOp<TRow> : IOperator, ISnapshotable, IIntrospectable
     where TRow : notnull
 {
     private readonly Stream<ZSet<TRow, Z64>> _input;
@@ -66,6 +66,16 @@ internal sealed class TopKOp<TRow> : IOperator, ISnapshotable
         _snapshotCodec = snapshotCodec;
         _accum = new SortedDictionary<TRow, long>(comparer);
     }
+
+    public string MetricName => "TopK";
+
+    public long RetainedRows => _accum.Count;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => null;
+
+    public long GcDroppedTotal => 0;
 
     public void Step()
     {

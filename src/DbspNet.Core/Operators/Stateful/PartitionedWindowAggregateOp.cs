@@ -37,7 +37,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// future row's backward frame nor be recomputed, so they are dropped from state
 /// silently.</para>
 /// </remarks>
-internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshotable
+internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
 {
     private readonly Stream<ZSet<StructuralRow, Z64>> _input;
@@ -52,6 +52,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
     private readonly IZSetTraceCodec<StructuralRow, Z64>? _snapshotCodec;
     private readonly IFrontier? _frontier;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     // Per-partition integrated input, sorted by the total-order comparer.
     private readonly Dictionary<TKey, SortedDictionary<StructuralRow, long>> _accum;
@@ -111,6 +112,16 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
             return n;
         }
     }
+
+    public string MetricName => "WindowAggregate";
+
+    public long RetainedRows => RetainedRowCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 
     public void Step()
     {
@@ -391,6 +402,8 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
             {
                 continue;
             }
+
+            _gcDropped += drop.Count;
 
             if (_window.TryGetValue(key, out var win))
             {

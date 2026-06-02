@@ -16,7 +16,7 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// symmetric right-pad cases (keyed on left-presence) — is identical to the flat
 /// operator and only touches keys that appear in <c>dl</c> or <c>dr</c>.
 /// </remarks>
-internal sealed class SpineIncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable
+internal sealed class SpineIncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -36,6 +36,7 @@ internal sealed class SpineIncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWei
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
     private long _lastGcFrontier = long.MinValue;
+    private long _gcDropped;
 
     public SpineIncrementalFullJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
@@ -217,9 +218,19 @@ internal sealed class SpineIncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWei
         }
 
         _lastGcFrontier = frontier;
-        _leftTrace.DropKeysBelow(frontier, _monotoneKey);
-        _rightTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
     }
+
+    public string MetricName => "SpineIncrementalFullJoin";
+
+    public long RetainedRows => _leftTrace.GroupCount + _rightTrace.GroupCount;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => Metric.Frontier(_frontier);
+
+    public long GcDroppedTotal => _gcDropped;
 
     private void JoinInto(
         ZSetBuilder<TOut, TWeight> output,

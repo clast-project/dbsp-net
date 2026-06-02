@@ -175,6 +175,21 @@ manifest entry that catches structural drift). `RootCircuit.Restore-
 TickCount` lets a snapshot reposition the tick counter to T so
 absolute tick numbers stay consistent across snapshot/WAL boundaries.
 
+**Observability.** `RootCircuit.CollectStats()` (and the
+`CompiledQuery.CollectStats()` convenience) walks the same `Operators` list and
+returns an `OperatorStat` per stateful operator: its registration index, a
+kind label, retained-state size, last-tick output size, current GC frontier, and
+cumulative GC drops. Operators opt in by implementing the internal
+`IIntrospectable` interface (`Circuit/OperatorStat.cs`); stateless linear
+operators don't, and are simply absent from the result. Reads are on-demand and
+never on the `Step` path — an O(1) field read for flat traces, O(state) for a
+spine trace (which materialises to count). `RootCircuit.LastStepDuration` records
+the most recent tick's operator-loop wall-clock (one `Stopwatch.GetTimestamp`
+pair per `Step`). The headline use is watching trace state stay bounded as a
+LATENESS / clock watermark advances. To instrument a new stateful operator,
+implement `IIntrospectable` (use `Metric.Frontier(...)` for the nullable frontier
+and bump a `_gcDropped` counter where the operator drops state).
+
 ## Operator catalog
 
 DBSP operators split cleanly into two families.

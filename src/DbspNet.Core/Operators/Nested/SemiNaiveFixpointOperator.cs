@@ -42,7 +42,7 @@ namespace DbspNet.Core.Operators.Nested;
 /// incremental≡batch recursive PBT over random insert/delete sequences.</para>
 /// </remarks>
 /// <typeparam name="TRow">The row type flowing on every inner stream.</typeparam>
-internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
+internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable, IIntrospectable
     where TRow : notnull
 {
     private const string ResultFileName = "r.arrows";
@@ -91,6 +91,18 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
         _resultCodec = resultCodec;
         _maxIterations = maxIterations;
     }
+
+    // The materialised fixpoint R; it grows unbounded (the recursive retain-keys
+    // story is deferred — see docs/skipped.md), so its size is worth watching.
+    public string MetricName => "RecursiveCte";
+
+    public long RetainedRows => _r.Count;
+
+    public long LastOutputRows => _output.Current.Count;
+
+    public long? GcFrontier => null;
+
+    public long GcDroppedTotal => 0;
 
     public void Step()
     {
