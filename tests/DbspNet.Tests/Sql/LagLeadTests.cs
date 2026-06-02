@@ -76,9 +76,19 @@ public class LagLeadTests
         ResolvePlan("SELECT g, LAG(v, ts) OVER (PARTITION BY g ORDER BY ts) AS p FROM w"));
 
     [Fact]
-    public void Rejects_MixedWithAggregate() => Assert.Throws<ResolveException>(() =>
-        ResolvePlan("SELECT g, LAG(v) OVER (PARTITION BY g ORDER BY ts) AS p, " +
+    public void Resolve_MixedWithAggregate_ChainsTwoNodes()
+    {
+        // An offset function and a window aggregate may coexist — each is its own
+        // node. LAG occurs first (offset group), SUM second (aggregate group), so
+        // the aggregate node is chained outermost.
+        var proj = Assert.IsType<ProjectPlan>(ResolvePlan(
+            "SELECT g, LAG(v) OVER (PARTITION BY g ORDER BY ts) AS p, " +
             "SUM(v) OVER (PARTITION BY g ORDER BY ts) AS s FROM w"));
+        var agg = Assert.IsType<WindowAggregatePlan>(proj.Input);
+        var off = Assert.IsType<WindowOffsetPlan>(agg.Input);
+        Assert.Single(off.Functions);
+        Assert.Single(agg.Aggregates);
+    }
 
     // ---- Behavioural ---------------------------------------------------------
 
@@ -185,6 +195,9 @@ public class LagLeadTests
     [InlineData("SELECT g, ts, v, LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS lv FROM w")]
     [InlineData("SELECT g, ts, v, FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS fv, " +
         "LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS lv FROM w")]
+    // Mixed families in one query — a window aggregate chained with an offset.
+    [InlineData("SELECT g, ts, v, SUM(v) OVER (PARTITION BY g ORDER BY ts) AS s, " +
+        "LAG(v) OVER (PARTITION BY g ORDER BY ts) AS p FROM w")]
     public void IncrementalEqualsBatch_RandomInsertsAndDeletes(string query)
     {
         for (var seed = 0; seed < 16; seed++)

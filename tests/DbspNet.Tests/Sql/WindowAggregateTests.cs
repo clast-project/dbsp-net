@@ -186,9 +186,37 @@ public class WindowAggregateTests
         "SELECT ts, NTILE(4) OVER (PARTITION BY cust ORDER BY ts) FROM orders");
 
     [Fact]
-    public void Rejects_DifferentSpecs() => Rejects(
-        "SELECT SUM(amount) OVER (PARTITION BY cust) AS s, " +
-        "SUM(amount) OVER (PARTITION BY ts) AS s2 FROM orders");
+    public void Resolve_DifferentSpecs_ChainsTwoNodes()
+    {
+        // Two distinct OVER specs (PARTITION BY cust vs PARTITION BY ts) lower to
+        // two chained WindowAggregatePlan nodes — one operator per spec.
+        var plan = ResolvePlan(Orders,
+            "SELECT SUM(amount) OVER (PARTITION BY cust) AS s, " +
+            "SUM(amount) OVER (PARTITION BY ts) AS s2 FROM orders");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var outer = Assert.IsType<WindowAggregatePlan>(proj.Input);
+        var inner = Assert.IsType<WindowAggregatePlan>(outer.Input);
+        Assert.Single(outer.Aggregates);
+        Assert.Single(inner.Aggregates);
+        Assert.Single(inner.PartitionKeys); // first group: PARTITION BY cust.
+        Assert.Single(outer.PartitionKeys); // second group: PARTITION BY ts.
+    }
+
+    [Fact]
+    public void Resolve_MixedFamilies_ChainsAggregateAndOffset()
+    {
+        // An aggregate and an offset function may now coexist — each becomes its
+        // own node. SUM occurs first (aggregate group), LAG second (offset group),
+        // so the offset node is chained outermost.
+        var plan = ResolvePlan(Orders,
+            "SELECT SUM(amount) OVER (PARTITION BY cust ORDER BY ts) AS s, " +
+            "LAG(amount) OVER (PARTITION BY cust ORDER BY ts) AS p FROM orders");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var off = Assert.IsType<WindowOffsetPlan>(proj.Input);
+        var agg = Assert.IsType<WindowAggregatePlan>(off.Input);
+        Assert.Single(off.Functions);
+        Assert.Single(agg.Aggregates);
+    }
 
     [Fact]
     public void Rejects_NestedWindow() => Rejects(
@@ -291,6 +319,24 @@ public class WindowAggregateTests
         Assert.Equal(2, WeightOf(q.Current, 1, 2L));
     }
 
+    [Fact]
+    public void TwoDistinctSpecs_BothColumnsComputed()
+    {
+        // A whole-partition SUM and a running SUM over the same partition are two
+        // distinct OVER specs — each its own chained operator, both columns landing
+        // on every row.
+        var q = Compile(S,
+            "SELECT g, ts, SUM(v) OVER (PARTITION BY g) AS tot, " +
+            "SUM(v) OVER (PARTITION BY g ORDER BY ts) AS run FROM s");
+        q.Table("s").Insert(1, 1, 10);
+        q.Table("s").Insert(1, 2, 20);
+        q.Table("s").Insert(1, 3, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 60L, 10L)); // tot=60, run=10
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 60L, 30L)); // tot=60, run=30
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 60L, 60L)); // tot=60, run=60
+    }
+
     // ---- Bounded-frame LATENESS GC -------------------------------------------
 
     private static int RetainedRows(CompiledQuery q) =>
@@ -331,6 +377,10 @@ public class WindowAggregateTests
     [InlineData("SELECT g, ts, v, SUM(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM w")]
     [InlineData("SELECT g, ts, v, MIN(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS m FROM w")]
     [InlineData("SELECT g, ts, v, MAX(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS m FROM w")]
+    // Multiple distinct OVER specs in one query — each a chained operator.
+    [InlineData("SELECT g, ts, v, SUM(v) OVER (PARTITION BY g) AS tot, SUM(v) OVER (PARTITION BY g ORDER BY ts) AS run FROM w")]
+    [InlineData("SELECT g, ts, v, SUM(v) OVER (PARTITION BY g) AS sg, COUNT(*) OVER (PARTITION BY ts) AS ct FROM w")]
+    [InlineData("SELECT g, ts, v, MAX(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS m, SUM(v) OVER (PARTITION BY g) AS s FROM w")]
     public void IncrementalEqualsBatch_RandomInsertsAndDeletes(string query)
     {
         for (var seed = 0; seed < 12; seed++)

@@ -410,20 +410,25 @@ reflect that shape, not a backlog.
   with the aggregate over its frame; only the output rows whose frame a tick
   changed are recomputed (a bounded value range for bounded frames; the suffix
   from the earliest change for running; the whole partition otherwise). RANGE uses
-  peer-group semantics (equal `ORDER BY` value ⇒ shared frame). Multiple
-  aggregates sharing one `OVER` spec fold into one operator (the existing
-  `CompositeAggregator`); the resolver synthesises the pre-window relation as a
-  `SELECT *` over `FROM`/`WHERE` so partition/order/argument expressions resolve
-  against the full source. A bounded ascending frame over a monotone (`LATENESS`
-  or temporal-filter-watermarked) key is GC-able — rows below `frontier −
-  preceding` are dropped from state. Structural compile only (typed/spine fall
-  back). Correctness is held by a randomized incremental≡batch test (including a
-  LATENESS-GC variant) plus a `BatchPlanEvaluator` arm. **Deferred:**
+  peer-group semantics (equal `ORDER BY` value ⇒ shared frame). The resolver
+  synthesises the pre-window relation as a `SELECT *` over `FROM`/`WHERE` so
+  partition/order/argument expressions resolve against the full source, then
+  groups the query's window items by `(family, OVER spec)`: aggregates sharing one
+  `OVER` spec fold into one operator (the existing `CompositeAggregator`), and each
+  distinct spec becomes its own operator, chained so each widens the rows the
+  previous one produced (base columns stay a fixed prefix, so every group resolves
+  against the same base indices). A query may therefore carry several different
+  `OVER` specs and freely mix aggregates with `LAG`/`LEAD`. A bounded ascending
+  frame over a monotone (`LATENESS` or temporal-filter-watermarked) key is GC-able
+  — rows below `frontier − preceding` are dropped from state. Structural compile
+  only (typed/spine fall back). Correctness is held by a randomized
+  incremental≡batch test (including multi-spec, mixed-family, and LATENESS-GC
+  variants) plus a `BatchPlanEvaluator` arm. **Deferred:**
     - **[P2]** `ROWS` / `GROUPS` frames; `FOLLOWING` bounds; variable-width
       (`YEAR`/`MONTH`) interval offsets; a non-integer/non-temporal `ORDER BY` key.
-    - **[P2]** More than one distinct `OVER` spec per query; a window function
-      nested in an expression or over a `GROUP BY` / `DISTINCT` inner query;
-      `SELECT *` alongside a window aggregate (list columns explicitly).
+    - **[P2]** A window function nested in an expression or over a `GROUP BY` /
+      `DISTINCT` inner query; `SELECT *` alongside a window aggregate (list columns
+      explicitly).
     - **[P2]** Neighborhood-only recompute for the running case (currently the
       affected suffix).
     - *N/A by design* — a **spine** variant. Like `TopKOp` / `PartitionedTopKOp`,
@@ -444,8 +449,10 @@ reflect that shape, not a backlog.
   RANGE — no frame clause). A `WindowOffsetPlan` + `PartitionedOffsetOp`
   recompute-and-diff the touched partition; the `ORDER BY` key may be any
   comparable type (unlike RANGE aggregates). Shares the window-function resolver
-  recognition (a query may not mix offset functions and window aggregates).
-  Structural compile only; randomized incremental≡batch coverage. **Deferred:**
+  recognition and per-`(family, OVER spec)` grouping, so offset functions and
+  window aggregates may coexist in one query (each its own chained operator).
+  Structural compile only; randomized incremental≡batch coverage (including a
+  mixed aggregate + offset query). **Deferred:**
     - **[P2]** A non-constant / per-row `default` expression; an `IGNORE NULLS`
       option; neighborhood-only recompute (currently whole touched partition) and
       frontier GC.

@@ -1249,36 +1249,23 @@ public sealed class Resolver
                 "a window function must be a top-level select item in v1 (it cannot be nested in an expression)");
         }
 
-        // Every top-level window item must be a supported window function sharing
-        // one OVER specification, and all of the same family — either window
-        // aggregates (SUM/COUNT/AVG/MIN/MAX) or offset functions (LAG/LEAD).
-        // Ranking functions ride the TOP-K pattern; FIRST_VALUE/LAST_VALUE are
-        // deferred.
-        var firstWin = (WindowFunctionExpression)windowItems[0].Expression;
-        var isOffset = IsOffsetFunctionName(firstWin.FunctionName);
+        // Every top-level window item must be a supported window function — a
+        // window aggregate (SUM/COUNT/AVG/MIN/MAX) or an offset function
+        // (LAG/LEAD/FIRST_VALUE/LAST_VALUE). Ranking functions ride the TOP-K
+        // pattern. The items are grouped below by family and OVER specification;
+        // each distinct group becomes its own operator, so a single query may
+        // carry several different OVER specs and freely mix aggregates with
+        // LAG / LEAD.
         foreach (var wi in windowItems)
         {
             var w = (WindowFunctionExpression)wi.Expression;
-            var thisOffset = IsOffsetFunctionName(w.FunctionName);
-            if (!IsAggregateName(w.FunctionName, w.IsStar) && !thisOffset)
+            if (!IsAggregateName(w.FunctionName, w.IsStar) && !IsOffsetFunctionName(w.FunctionName))
             {
                 throw new ResolveException(
                     $"window function '{w.FunctionName}' is not supported as an output column; only the " +
                     "window aggregates SUM / COUNT / AVG / MIN / MAX and the offset functions LAG / LEAD / " +
                     "FIRST_VALUE / LAST_VALUE are (ranking functions ROW_NUMBER / RANK / DENSE_RANK are " +
                     "supported only in the TOP-K filter pattern)");
-            }
-
-            if (thisOffset != isOffset)
-            {
-                throw new ResolveException(
-                    "a query cannot mix window aggregates and LAG / LEAD in v1");
-            }
-
-            if (!ReferenceEquals(w, firstWin) && !SameWindowSpec(firstWin.Over, w.Over))
-            {
-                throw new ResolveException(
-                    "all window functions in a query must share the same OVER specification in v1");
             }
         }
 
@@ -1310,6 +1297,71 @@ public sealed class Resolver
         var basePlan = ResolveQuery(baseQuery, scope, outerSchema);
         var baseSchema = basePlan.Schema;
 
+        // Group window items by (family, OVER spec), preserving first-occurrence
+        // order. Items in one group share a single operator (multiple result
+        // columns); each distinct group is chained on top of the previous,
+        // widening every row it receives.
+        var groups = new List<List<ExpressionSelectItem>>();
+        foreach (var wi in windowItems)
+        {
+            var w = (WindowFunctionExpression)wi.Expression;
+            var off = IsOffsetFunctionName(w.FunctionName);
+            var group = groups.FirstOrDefault(g =>
+            {
+                var head = (WindowFunctionExpression)g[0].Expression;
+                return IsOffsetFunctionName(head.FunctionName) == off
+                    && SameWindowSpec(head.Over, w.Over);
+            });
+
+            if (group is null)
+            {
+                group = new List<ExpressionSelectItem>();
+                groups.Add(group);
+            }
+
+            group.Add(wi);
+        }
+
+        // Chain one window operator per group. `preBound` maps each window
+        // expression to the (absolute) result column it lands in; `synth` keeps
+        // synthetic column names unique across the chain.
+        var preBound = new Dictionary<Expression, ResolvedExpression>(ReferenceEqualityComparer.Instance);
+        var synth = 0;
+        LogicalPlan windowPlan = basePlan;
+        foreach (var group in groups)
+        {
+            windowPlan = BuildWindowGroup(group, windowPlan, baseSchema, preBound, ref synth);
+        }
+
+        // Map the user's select list over the widened rows: non-window items
+        // resolve against the base columns (the schema prefix); window items
+        // resolve to their result column via `preBound`.
+        var projections = ResolveProjections(stmt.Items, windowPlan.Schema, subqueryMap: null, preBound);
+        LogicalPlan projected = new ProjectPlan(windowPlan, projections, BuildProjectSchema(projections));
+        return stmt.Distinct ? new DistinctPlan(projected) : projected;
+    }
+
+    /// <summary>
+    /// Lower one group of window items — all sharing a family (aggregate vs
+    /// offset) and OVER specification — into a single <see cref="WindowAggregatePlan"/>
+    /// or <see cref="WindowOffsetPlan"/> chained on <paramref name="inputPlan"/>.
+    /// Partition / order / argument expressions resolve against
+    /// <paramref name="baseSchema"/> (the pre-window columns, which remain an
+    /// unchanging prefix of every widened row), so chained groups all see the same
+    /// base column indices. Each item's result column is recorded in
+    /// <paramref name="preBound"/> at its absolute index in the widened schema, and
+    /// <paramref name="synth"/> advances so synthetic column names stay unique.
+    /// </summary>
+    private LogicalPlan BuildWindowGroup(
+        List<ExpressionSelectItem> group,
+        LogicalPlan inputPlan,
+        Schema baseSchema,
+        Dictionary<Expression, ResolvedExpression> preBound,
+        ref int synth)
+    {
+        var firstWin = (WindowFunctionExpression)group[0].Expression;
+        var isOffset = IsOffsetFunctionName(firstWin.FunctionName);
+
         // PARTITION BY.
         var partitionKeys = new List<ResolvedExpression>(firstWin.Over.PartitionBy.Count);
         foreach (var p in firstWin.Over.PartitionBy)
@@ -1339,9 +1391,8 @@ public sealed class Resolver
             orderKey = new SortKey(resolved, descending, nullsFirst);
         }
 
-        var resultCols = new List<SchemaColumn>(windowItems.Count);
-        var preBound = new Dictionary<Expression, ResolvedExpression>(ReferenceEqualityComparer.Instance);
-        LogicalPlan windowPlan;
+        var inputSchema = inputPlan.Schema;
+        var resultCols = new List<SchemaColumn>(group.Count);
 
         if (isOffset)
         {
@@ -1357,21 +1408,22 @@ public sealed class Resolver
                     "(FIRST_VALUE / LAST_VALUE span the whole partition — UNLIMITED RANGE)");
             }
 
-            var functions = new List<OffsetFunctionCall>(windowItems.Count);
-            for (var k = 0; k < windowItems.Count; k++)
+            var functions = new List<OffsetFunctionCall>(group.Count);
+            for (var k = 0; k < group.Count; k++)
             {
-                var wi = windowItems[k];
+                var wi = group[k];
                 var w = (WindowFunctionExpression)wi.Expression;
                 var (fn, resultType) = ResolveOffsetFunction(w, baseSchema);
                 functions.Add(fn);
 
                 var (name, _) = DeriveProjectionName(w, wi.Alias);
-                resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$woff{k}" : name), resultType));
-                preBound[wi.Expression] = new ResolvedColumn(baseSchema.Count + k, resultType);
+                resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$woff{synth}" : name), resultType));
+                preBound[wi.Expression] = new ResolvedColumn(inputSchema.Count + k, resultType);
+                synth++;
             }
 
-            var offsetSchema = new Schema([.. baseSchema.Columns, .. resultCols]);
-            windowPlan = new WindowOffsetPlan(basePlan, partitionKeys, orderKey, functions, offsetSchema);
+            var offsetSchema = new Schema([.. inputSchema.Columns, .. resultCols]);
+            return new WindowOffsetPlan(inputPlan, partitionKeys, orderKey, functions, offsetSchema);
         }
         else
         {
@@ -1393,10 +1445,10 @@ public sealed class Resolver
                 throw new ResolveException("a window frame (RANGE) requires an ORDER BY");
             }
 
-            var aggregates = new List<AggregateCall>(windowItems.Count);
-            for (var k = 0; k < windowItems.Count; k++)
+            var aggregates = new List<AggregateCall>(group.Count);
+            for (var k = 0; k < group.Count; k++)
             {
-                var wi = windowItems[k];
+                var wi = group[k];
                 var w = (WindowFunctionExpression)wi.Expression;
                 var asCall = new FunctionCallExpression(w.FunctionName, w.Arguments, w.IsStar);
                 var kind = ToAggregateKind(asCall);
@@ -1422,20 +1474,14 @@ public sealed class Resolver
                 aggregates.Add(new AggregateCall(kind, arg, resultType));
 
                 var (name, _) = DeriveProjectionName(w, wi.Alias);
-                resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$wagg{k}" : name), resultType));
-                preBound[wi.Expression] = new ResolvedColumn(baseSchema.Count + k, resultType);
+                resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$wagg{synth}" : name), resultType));
+                preBound[wi.Expression] = new ResolvedColumn(inputSchema.Count + k, resultType);
+                synth++;
             }
 
-            var windowSchema = new Schema([.. baseSchema.Columns, .. resultCols]);
-            windowPlan = new WindowAggregatePlan(basePlan, partitionKeys, orderKey, frame, aggregates, windowSchema);
+            var windowSchema = new Schema([.. inputSchema.Columns, .. resultCols]);
+            return new WindowAggregatePlan(inputPlan, partitionKeys, orderKey, frame, aggregates, windowSchema);
         }
-
-        // Map the user's select list over the widened rows: non-window items
-        // resolve against the base columns (the schema prefix); window items
-        // resolve to their result column via `preBound`.
-        var projections = ResolveProjections(stmt.Items, windowPlan.Schema, subqueryMap: null, preBound);
-        LogicalPlan projected = new ProjectPlan(windowPlan, projections, BuildProjectSchema(projections));
-        return stmt.Distinct ? new DistinctPlan(projected) : projected;
     }
 
     /// <summary>Resolve a parsed window <see cref="WindowFrame"/> into
