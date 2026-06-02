@@ -281,6 +281,19 @@ reflect that shape, not a backlog.
   (PostgreSQL-aligned); `ESCAPE ''` disables it. No typed fast path (returns
   null → structural compile), as with the other string predicates. *Deferred:*
   POSIX class names inside bracket expressions (`[[:alpha:]]`).
+- `REGEXP_LIKE` / `REGEXP_REPLACE` / `REGEXP_SUBSTR` — **implemented**.
+  POSIX-regex functions built on the same `SqlPatternMatch` regex cache as
+  LIKE, but **substring** matches (not whole-string anchored) — the pattern is
+  handed to .NET's engine directly (POSIX ERE ≈ a subset of .NET syntax for the
+  common constructs). Optional trailing `flags` string: `i` (ignore case), `c`
+  (case-sensitive, default; clears a prior `i`), `m` (multiline `^`/`$`), `s`
+  (dot matches newline), `g` (global — `REGEXP_REPLACE` only). `REGEXP_REPLACE`
+  follows PostgreSQL: replaces the **first** match by default, all with `g`;
+  the replacement string supports `\1`…`\9` and `\&` backreferences (translated
+  to .NET `$1`/`$0`). `REGEXP_SUBSTR` returns the first match or NULL. Regular
+  registry entries; ordinary function-call syntax (the `~` / `~*` / `!~` / `!~*`
+  match operators are *deferred* — they need new lexer tokens around `!`/`!=`).
+  Shares the `[[:alpha:]]` POSIX-class gap noted above.
 - `IN (literal_list)` / `NOT IN (literal_list)` — **implemented**.
   Modeled as a flat `InListExpression(probe, values, isNegated)` AST
   node, not a parser-time desugar to a left-leaning OR chain. The flat

@@ -226,6 +226,42 @@ internal sealed class SimilarToFunction : IScalarFunction
     public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
 }
 
+/// <summary><c>REGEXP_LIKE(value, pattern [, flags])</c> — POSIX-regex
+/// containment test (boolean). Constant patterns are precompiled.</summary>
+internal sealed class RegexpLikeFunction : IScalarFunction
+{
+    public string Name => "regexp_like";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveRegexpLike(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildRegexpLike(fn, BuiltinScalarFunctions.CompileArgs(fn, buildArg));
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
+/// <summary><c>REGEXP_REPLACE(value, pattern, replacement [, flags])</c> —
+/// first match (or all with the <c>g</c> flag), PostgreSQL semantics.</summary>
+internal sealed class RegexpReplaceFunction : IScalarFunction
+{
+    public string Name => "regexp_replace";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveRegexpReplace(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildRegexpReplace(fn, BuiltinScalarFunctions.CompileArgs(fn, buildArg));
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
+/// <summary><c>REGEXP_SUBSTR(value, pattern [, flags])</c> — first matching
+/// substring or NULL.</summary>
+internal sealed class RegexpSubstrFunction : IScalarFunction
+{
+    public string Name => "regexp_substr";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveRegexpSubstr(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildRegexpSubstr(fn, BuiltinScalarFunctions.CompileArgs(fn, buildArg));
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
 internal sealed class SignFunction : IScalarFunction
 {
     public string Name => "sign";

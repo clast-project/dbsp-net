@@ -135,6 +135,51 @@ internal static class BuiltinScalarFunctions
     private static string LikeDisplayName(string name) =>
         name == "similar_to" ? "SIMILAR TO" : name.ToUpperInvariant();
 
+    /// <summary>
+    /// <c>REGEXP_LIKE(value, pattern [, flags])</c> — POSIX-regex containment
+    /// test (not anchored, unlike LIKE). Result is BOOLEAN, NULL iff any
+    /// operand is NULL.
+    /// </summary>
+    internal static ResolvedFunctionCall ResolveRegexpLike(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireRegexpArgs("regexp_like", args, min: 2, max: 3);
+        return new ResolvedFunctionCall("regexp_like", args, new SqlBooleanType(AnyNullable(args)));
+    }
+
+    /// <summary>
+    /// <c>REGEXP_REPLACE(value, pattern, replacement [, flags])</c> — replaces
+    /// the first match (or all matches with the <c>g</c> flag, PostgreSQL
+    /// semantics). Result is VARCHAR, NULL iff any operand is NULL.
+    /// </summary>
+    internal static ResolvedFunctionCall ResolveRegexpReplace(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireRegexpArgs("regexp_replace", args, min: 3, max: 4);
+        return new ResolvedFunctionCall("regexp_replace", args, new SqlVarcharType(null, AnyNullable(args)));
+    }
+
+    /// <summary>
+    /// <c>REGEXP_SUBSTR(value, pattern [, flags])</c> — the first matching
+    /// substring, or NULL when there is no match. Always nullable.
+    /// </summary>
+    internal static ResolvedFunctionCall ResolveRegexpSubstr(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireRegexpArgs("regexp_substr", args, min: 2, max: 3);
+        return new ResolvedFunctionCall("regexp_substr", args, new SqlVarcharType(null, Nullable: true));
+    }
+
+    private static void RequireRegexpArgs(string name, IReadOnlyList<ResolvedExpression> args, int min, int max)
+    {
+        if (args.Count < min || args.Count > max)
+        {
+            throw new ResolveException($"{name.ToUpperInvariant()} takes {min} to {max} arguments");
+        }
+
+        foreach (var a in args)
+        {
+            RequireString(name, a);
+        }
+    }
+
     internal static ResolvedFunctionCall ResolveAbs(IReadOnlyList<ResolvedExpression> args)
     {
         RequireArity("abs", args, 1);
@@ -253,6 +298,82 @@ internal static class BuiltinScalarFunctions
 
         escChar = null;
         return false;
+    }
+
+    internal static readonly MethodInfo RegexpLikeRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexpLike))!;
+    internal static readonly MethodInfo RegexpLikeFlagsRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexpLikeFlags))!;
+    internal static readonly MethodInfo RegexpReplaceRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexpReplace))!;
+    internal static readonly MethodInfo RegexpReplaceFlagsRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexpReplaceFlags))!;
+    internal static readonly MethodInfo RegexpSubstrRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexpSubstr))!;
+    internal static readonly MethodInfo RegexpSubstrFlagsRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexpSubstrFlags))!;
+
+    /// <summary>
+    /// <c>REGEXP_LIKE</c>: a constant pattern (+ constant/absent flags) is
+    /// compiled once at build time and baked in; otherwise the pattern is
+    /// compiled (and cached) at runtime. NULL-propagating in every operand.
+    /// </summary>
+    internal static Expression BuildRegexpLike(ResolvedFunctionCall fn, Expression[] c)
+    {
+        var flagsArg = fn.Arguments.Count == 3 ? fn.Arguments[2] : null;
+        if (TryConstRegex(fn.Arguments[1], flagsArg, out var regex, out _))
+        {
+            return NullPropagatingUnary(c[0], typeof(Utf8String),
+                s => Expression.Call(RegexMatchRuntime, Expression.Constant(regex), s));
+        }
+
+        return flagsArg is null
+            ? Expression.Call(RegexpLikeRuntime, c[0], c[1])
+            : Expression.Call(RegexpLikeFlagsRuntime, c[0], c[1], c[2]);
+    }
+
+    // REGEXP_REPLACE / REGEXP_SUBSTR are projection functions (less hot than a
+    // WHERE predicate) and the replacement may itself be non-constant, so they
+    // take the runtime path unconditionally — the per-pattern Regex cache means
+    // a constant pattern is still compiled only once.
+    internal static Expression BuildRegexpReplace(ResolvedFunctionCall fn, Expression[] c) =>
+        fn.Arguments.Count == 4
+            ? Expression.Call(RegexpReplaceFlagsRuntime, c[0], c[1], c[2], c[3])
+            : Expression.Call(RegexpReplaceRuntime, c[0], c[1], c[2]);
+
+    internal static Expression BuildRegexpSubstr(ResolvedFunctionCall fn, Expression[] c) =>
+        fn.Arguments.Count == 3
+            ? Expression.Call(RegexpSubstrFlagsRuntime, c[0], c[1], c[2])
+            : Expression.Call(RegexpSubstrRuntime, c[0], c[1]);
+
+    // Build-time regex fold for REGEXP_LIKE: succeeds only when the pattern and
+    // (if present) the flags are non-NULL string literals. A non-literal or
+    // NULL flags/pattern falls to the runtime path, which NULL-propagates.
+    private static bool TryConstRegex(
+        ResolvedExpression patternArg, ResolvedExpression? flagsArg, out Regex? regex, out bool global)
+    {
+        regex = null;
+        global = false;
+        if (patternArg is not ResolvedLiteral { Value: Utf8String pat })
+        {
+            return false;
+        }
+
+        string? flags = null;
+        if (flagsArg is not null)
+        {
+            if (flagsArg is ResolvedLiteral { Value: Utf8String f })
+            {
+                flags = f.ToStringDecoded();
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        regex = SqlPatternMatch.CompileRegex(pat.ToStringDecoded(), SqlPatternMatch.ParseFlags(flags, out global));
+        return true;
     }
 
     internal static Expression BuildSign(Expression arg) =>
@@ -948,6 +1069,63 @@ internal static class SqlBuiltinRuntime
             similar).IsMatch(((Utf8String)value).ToStringDecoded());
     }
 
+    // ---- POSIX regex functions (runtime path; the build-time fold for a
+    // constant REGEXP_LIKE pattern uses RegexMatch above instead). ----
+
+    public static object? RegexpLike(object? value, object? pattern) =>
+        RegexpLikeCore(value, pattern, null);
+
+    public static object? RegexpLikeFlags(object? value, object? pattern, object? flags) =>
+        flags is null ? null : RegexpLikeCore(value, pattern, ((Utf8String)flags).ToStringDecoded());
+
+    private static object? RegexpLikeCore(object? value, object? pattern, string? flags) =>
+        value is null || pattern is null
+            ? null
+            : (object)RegexOf(pattern, flags).IsMatch(((Utf8String)value).ToStringDecoded());
+
+    public static object? RegexpReplace(object? value, object? pattern, object? replacement) =>
+        RegexpReplaceCore(value, pattern, replacement, null);
+
+    public static object? RegexpReplaceFlags(object? value, object? pattern, object? replacement, object? flags) =>
+        flags is null ? null : RegexpReplaceCore(value, pattern, replacement, ((Utf8String)flags).ToStringDecoded());
+
+    private static object? RegexpReplaceCore(object? value, object? pattern, object? replacement, string? flags)
+    {
+        if (value is null || pattern is null || replacement is null)
+        {
+            return null;
+        }
+
+        var re = SqlPatternMatch.CompileRegex(
+            ((Utf8String)pattern).ToStringDecoded(), SqlPatternMatch.ParseFlags(flags, out var global));
+        var input = ((Utf8String)value).ToStringDecoded();
+        var net = SqlPatternMatch.TranslateReplacement(((Utf8String)replacement).ToStringDecoded());
+
+        // PostgreSQL: without the `g` flag, only the first match is replaced.
+        var result = global ? re.Replace(input, net) : re.Replace(input, net, 1);
+        return Utf8String.Of(result);
+    }
+
+    public static object? RegexpSubstr(object? value, object? pattern) =>
+        RegexpSubstrCore(value, pattern, null);
+
+    public static object? RegexpSubstrFlags(object? value, object? pattern, object? flags) =>
+        flags is null ? null : RegexpSubstrCore(value, pattern, ((Utf8String)flags).ToStringDecoded());
+
+    private static object? RegexpSubstrCore(object? value, object? pattern, string? flags)
+    {
+        if (value is null || pattern is null)
+        {
+            return null;
+        }
+
+        var m = RegexOf(pattern, flags).Match(((Utf8String)value).ToStringDecoded());
+        return m.Success ? Utf8String.Of(m.Value) : null;
+    }
+
+    private static Regex RegexOf(object pattern, string? flags) =>
+        SqlPatternMatch.CompileRegex(((Utf8String)pattern).ToStringDecoded(), SqlPatternMatch.ParseFlags(flags, out _));
+
     internal static int AsInt(object o) => o switch
     {
         int i => i,
@@ -1244,10 +1422,106 @@ internal static class SqlPatternMatch
     private static readonly ConcurrentDictionary<(string Pattern, char? Escape, bool Ci, bool Similar), Regex> Cache =
         new();
 
+    private static readonly ConcurrentDictionary<(string Pattern, RegexOptions Options), Regex> PosixCache = new();
+
     public static Regex Compile(string pattern, char? escape, bool caseInsensitive, bool similar) =>
         Cache.GetOrAdd(
             (pattern, escape, caseInsensitive, similar),
             static k => Build(k.Pattern, k.Escape, k.Ci, k.Similar));
+
+    /// <summary>
+    /// Compile (and cache) a POSIX-style regex for the <c>REGEXP_*</c>
+    /// functions. Unlike LIKE / SIMILAR TO these are substring matches, so the
+    /// pattern is <b>not</b> anchored; it is handed to .NET's engine directly
+    /// (POSIX ERE is, for the common constructs, a subset of .NET's syntax).
+    /// </summary>
+    public static Regex CompileRegex(string pattern, RegexOptions options) =>
+        PosixCache.GetOrAdd((pattern, options), static k => new Regex(k.Pattern, k.Options));
+
+    /// <summary>
+    /// Parse a <c>REGEXP_*</c> flags string. Supported: <c>i</c> (ignore case),
+    /// <c>c</c> (case-sensitive — the default; clears a prior <c>i</c>),
+    /// <c>m</c> (multiline <c>^</c>/<c>$</c>), <c>s</c> (dot matches newline),
+    /// <c>g</c> (global, only meaningful for <c>REGEXP_REPLACE</c>). Unknown
+    /// flags raise an error.
+    /// </summary>
+    public static RegexOptions ParseFlags(string? flags, out bool global)
+    {
+        var options = RegexOptions.CultureInvariant;
+        global = false;
+        if (flags is null)
+        {
+            return options;
+        }
+
+        foreach (var ch in flags)
+        {
+            switch (ch)
+            {
+                case 'i': options |= RegexOptions.IgnoreCase; break;
+                case 'c': options &= ~RegexOptions.IgnoreCase; break;
+                case 'm': options |= RegexOptions.Multiline; break;
+                case 's': options |= RegexOptions.Singleline; break;
+                case 'g': global = true; break;
+                default: throw new InvalidOperationException($"unsupported regexp flag '{ch}'");
+            }
+        }
+
+        return options;
+    }
+
+    /// <summary>
+    /// Translate a PostgreSQL <c>REGEXP_REPLACE</c> replacement string into .NET
+    /// substitution syntax: <c>\1</c>…<c>\9</c> → <c>$1</c>…<c>$9</c>, <c>\&amp;</c>
+    /// (whole match) → <c>$0</c>, <c>\\</c> → <c>\</c>; a literal <c>$</c> is
+    /// escaped to <c>$$</c> so .NET does not read it as a group reference.
+    /// </summary>
+    public static string TranslateReplacement(string replacement)
+    {
+        var sb = new StringBuilder(replacement.Length + 4);
+        for (var i = 0; i < replacement.Length; i++)
+        {
+            var ch = replacement[i];
+            if (ch == '$')
+            {
+                sb.Append("$$");
+                continue;
+            }
+
+            if (ch == '\\')
+            {
+                if (i + 1 >= replacement.Length)
+                {
+                    sb.Append('\\');
+                    break;
+                }
+
+                var next = replacement[++i];
+                if (next is >= '1' and <= '9')
+                {
+                    sb.Append('$').Append(next);
+                }
+                else if (next == '&')
+                {
+                    sb.Append("$0");
+                }
+                else if (next == '\\')
+                {
+                    sb.Append('\\');
+                }
+                else
+                {
+                    sb.Append(next); // \x → literal x (PostgreSQL leniency)
+                }
+
+                continue;
+            }
+
+            sb.Append(ch);
+        }
+
+        return sb.ToString();
+    }
 
     /// <summary>
     /// The single-character escape carried by an explicit <c>ESCAPE</c> clause:

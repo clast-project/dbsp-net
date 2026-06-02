@@ -141,6 +141,9 @@ internal static class ScalarFunctionRegistry
             new LikeFunction("like", caseInsensitive: false),
             new LikeFunction("ilike", caseInsensitive: true),
             new SimilarToFunction(),
+            new RegexpLikeFunction(),
+            new RegexpReplaceFunction(),
+            new RegexpSubstrFunction(),
 
             // Numeric.
             new AbsFunction(),

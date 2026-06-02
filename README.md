@@ -323,8 +323,9 @@ beyond "Feldera is much bigger":
   listed above plus temporal functions `EXTRACT(field FROM …)` /
   `DATE_PART`, `DATE_TRUNC`, `DATEADD`, `DATEDIFF` (dispatched through an
   `IScalarFunction` registry; `DATEADD`/`DATEDIFF` take a string-literal unit,
-  not SQL Server's bare keyword). Missing pieces include other math
-  (`SIN`/`COS`/`TAN`, `MOD`). `NOW`/`CURRENT_TIMESTAMP` is not in the registry —
+  not SQL Server's bare keyword) and the POSIX-regex functions `REGEXP_LIKE` /
+  `REGEXP_REPLACE` / `REGEXP_SUBSTR` (optional `flags`, PostgreSQL replace
+  semantics). Missing pieces include other math (`SIN`/`COS`/`TAN`, `MOD`). `NOW`/`CURRENT_TIMESTAMP` is not in the registry —
   being non-deterministic, it ships instead as advancing temporal filters (see
   the streaming-features list above).
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
