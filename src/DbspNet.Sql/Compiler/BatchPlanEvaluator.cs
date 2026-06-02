@@ -448,19 +448,17 @@ internal static class BatchPlanEvaluator
         // trait contract.
         var input = Evaluate(plan.Input, ctx);
 
-        var groupIndices = new int[plan.GroupKeys.Count];
+        // Group key = any scalar expression, compiled to a per-row delegate
+        // (mirrors PlanToCircuit.CompileAggregate so the oracle keys identically).
+        var keyFns = new Func<IReadOnlyList<object?>, object?>[plan.GroupKeys.Count];
+        var keyCols = new SchemaColumn[plan.GroupKeys.Count];
         for (var i = 0; i < plan.GroupKeys.Count; i++)
         {
-            if (plan.GroupKeys[i] is ResolvedColumn rc)
-            {
-                groupIndices[i] = rc.Index;
-            }
-            else
-            {
-                throw new InvalidOperationException(
-                    "GROUP BY expression not a ResolvedColumn (resolver invariant)");
-            }
+            keyFns[i] = ExpressionCompiler.CompileScalar(plan.GroupKeys[i]);
+            keyCols[i] = new SchemaColumn("$gk" + i, plan.GroupKeys[i].Type);
         }
+
+        var groupKeySchema = new Schema(keyCols);
 
         var sqlAggs = new SqlAggregator[plan.Aggregates.Count];
         for (var i = 0; i < plan.Aggregates.Count; i++)
@@ -472,7 +470,13 @@ internal static class BatchPlanEvaluator
         var groups = new Dictionary<StructuralRow, ZSetBuilder<StructuralRow, Z64>>();
         foreach (var (row, w) in input)
         {
-            var key = ExtractKey(ctx.Codec, row, groupIndices);
+            var kvs = new object?[keyFns.Length];
+            for (var i = 0; i < keyFns.Length; i++)
+            {
+                kvs[i] = keyFns[i](row);
+            }
+
+            var key = ctx.Codec.BuildRow(groupKeySchema, kvs);
             if (!groups.TryGetValue(key, out var gb))
             {
                 gb = new ZSetBuilder<StructuralRow, Z64>();

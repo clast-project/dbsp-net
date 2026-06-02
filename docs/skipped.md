@@ -503,15 +503,15 @@ Short list of places where DbspNet v1 is deliberately stricter than SQL /
 Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
 `ResolveException`, so loosening is a localized change.
 
-- **[P1]** `GROUP BY` supports only bare column references. Expression
-  grouping (`GROUP BY a + b`, `GROUP BY LENGTH(name)`) rejects with
-  "GROUP BY supports only bare column references in v1". The plan→circuit
-  layer relies on `ResolvedColumn` to rekey; extending means generalising
-  `ExtractKey` to run compiled delegates. Motivating use case: `GROUP BY
-  CAST(ts AS DATE)` over a temporal filter currently needs a derived-table
-  workaround (project the date, group by its alias); expression grouping would
-  let it use the temporal-filter day-space GC frontier directly (see
-  `now-and-temporal-filters.md`, "the expression-key GC frontier").
+- ~~**[P1]** `GROUP BY` supports only bare column references.~~ **Done.**
+  Expression grouping (`GROUP BY a + b`, `GROUP BY LENGTH(name)`,
+  `GROUP BY CAST(ts AS DATE)`) is supported: the resolver accepts any scalar
+  group-key expression (aggregates rejected), non-aggregated SELECT/HAVING
+  sub-trees that equal a key read from its output column (matched by a
+  structural `AstEqual`), and `PlanToCircuit` / `BatchPlanEvaluator` rekey by
+  running compiled key delegates. A monotone key (e.g. `CAST(ts AS DATE)`) picks
+  up a temporal filter's day-space GC frontier directly — no derived-table
+  workaround.
 - **Outer joins** (`LEFT` / `RIGHT [OUTER] JOIN`) still require at least one
   equi-key conjunct in `ON`; their keyed match-presence tracking has no
   keyless operator. `INNER JOIN` no longer has this restriction — pure-

@@ -376,6 +376,85 @@ public class CompilerTests
     }
 
     [Fact]
+    public void GroupBy_ArithmeticExpression()
+    {
+        // GROUP BY a + b — an expression key, not a bare column.
+        var q = Compile(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT NOT NULL)"],
+            "SELECT a + b AS k, SUM(v) AS total FROM t GROUP BY a + b");
+
+        q.Table("t").Insert(1, 2, 10);   // k = 3
+        q.Table("t").Insert(3, 0, 20);   // k = 3
+        q.Table("t").Insert(2, 2, 5);    // k = 4
+        q.Step();
+
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 3, 30L));
+        Assert.Equal(1, WeightOf(q.Current, 4, 5L));
+    }
+
+    [Fact]
+    public void GroupBy_ScalarFunctionExpression()
+    {
+        // GROUP BY LENGTH(name) — group rows by the length of a string.
+        var q = Compile(
+            ["CREATE TABLE t (name VARCHAR NOT NULL)"],
+            "SELECT LENGTH(name) AS len, COUNT(*) AS c FROM t GROUP BY LENGTH(name)");
+
+        q.Table("t").Insert("ab");     // len 2
+        q.Table("t").Insert("cd");     // len 2
+        q.Table("t").Insert("efg");    // len 3
+        q.Step();
+
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 2, 2L));
+        Assert.Equal(1, WeightOf(q.Current, 3, 1L));
+    }
+
+    [Fact]
+    public void GroupBy_ExpressionKey_ReferencedDifferentlyInSelect()
+    {
+        // The group key (a + b) can be combined further in the SELECT list;
+        // sub-trees that equal the key read from the group-key column.
+        var q = Compile(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT (a + b) * 10 AS scaled, COUNT(*) AS c FROM t GROUP BY a + b");
+
+        q.Table("t").Insert(1, 2);   // a+b = 3
+        q.Table("t").Insert(2, 1);   // a+b = 3
+        q.Table("t").Insert(4, 0);   // a+b = 4
+        q.Step();
+
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 30, 2L));   // (3)*10, 2 rows
+        Assert.Equal(1, WeightOf(q.Current, 40, 1L));   // (4)*10, 1 row
+    }
+
+    [Fact]
+    public void GroupBy_ExpressionKey_HavingReferencesKey()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)"],
+            "SELECT a + b AS k, COUNT(*) AS c FROM t GROUP BY a + b HAVING a + b > 3");
+
+        q.Table("t").Insert(1, 2);   // k = 3 — filtered out by HAVING
+        q.Table("t").Insert(2, 2);   // k = 4
+        q.Step();
+
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 4, 1L));
+    }
+
+    [Fact]
+    public void GroupBy_AggregateInKey_Rejected()
+    {
+        var ex = Assert.Throws<ResolveException>(() => Compile(
+            ["CREATE TABLE t (v INT NOT NULL)"],
+            "SELECT SUM(v) FROM t GROUP BY SUM(v)"));
+        Assert.Contains("aggregate", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void GroupBy_CountAndCountStar_DifferOnNulls()
     {
         var q = Compile(

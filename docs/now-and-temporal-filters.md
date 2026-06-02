@@ -149,13 +149,13 @@ and keep state bounded:
   µs_per_day`. This is a sound lower bound on any timestamp the filter can still
   emit (conservative by at most one day; the GC predicate is `key < frontier`, so
   no live row is dropped). Downstream operators then GC:
-  - `GROUP BY ts` (a bare column — `GROUP BY` is bare-column-only in v1) uses the
-    frontier directly.
-  - A projected `CAST(ts AS DATE)` grouped via a derived table picks the frontier
-    up through the **forward** `FrontierTransform` machinery: `MonotonicityAnalyzer`
-    now recognises a monotone temporal `CAST` (alongside `date_trunc` and
-    `+ const`) and attaches the day-floor transform, so a frontier registered on
-    `ts` thresholds the derived day-keys.
+  - `GROUP BY ts` (the raw column) uses the frontier directly.
+  - `GROUP BY CAST(ts AS DATE)` (now that expression group keys are supported)
+    and a projected `CAST(ts AS DATE)` grouped via a derived table both pick the
+    frontier up through the **forward** `FrontierTransform` machinery:
+    `MonotonicityAnalyzer` recognises a monotone temporal `CAST` (alongside
+    `date_trunc` and `+ const`) and attaches the day-floor transform, so a
+    frontier registered on `ts` thresholds the derived day-keys.
 
   The recogniser (`MonotonicityAnalyzer.TemporalKeySource`, shared with
   `PlanToCircuit`) currently covers a bare column and `CAST(<ts column> AS DATE)`;

@@ -99,8 +99,12 @@ public class TemporalFilterPbtTests
     private static readonly Gen<string> GenCastDateShape = Gen.OneOfConst(
         "SELECT CAST(ts AS DATE) AS d, v FROM a WHERE CAST(ts AS DATE) <= CURRENT_DATE",
         "SELECT CAST(ts AS DATE) AS d, v FROM a WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '3' DAY",
-        // Derived table + GROUP BY on the projected date alias (GROUP BY takes only
-        // bare columns), exercising the projected-CAST monotone GC frontier.
+        // GROUP BY the date expression directly — exercises the expression-key
+        // GROUP BY path picking up the monotone day-floor GC frontier.
+        "SELECT CAST(ts AS DATE) AS d, COUNT(*) AS c FROM a "
+            + "WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '4' DAY GROUP BY CAST(ts AS DATE)",
+        // Derived table + GROUP BY on the projected date alias, exercising the
+        // projected-CAST monotone GC frontier through a ProjectPlan.
         "SELECT d, COUNT(*) AS c FROM "
             + "(SELECT CAST(ts AS DATE) AS d FROM a WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '4' DAY) s "
             + "GROUP BY d",

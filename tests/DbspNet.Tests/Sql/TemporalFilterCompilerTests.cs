@@ -282,6 +282,31 @@ public class TemporalFilterCompilerTests : IDisposable
     }
 
     [Fact]
+    public void CastTimestampToDate_DirectGroupBy_BoundsAggregateState()
+    {
+        // Now that GROUP BY accepts expression keys, the headline query needs no
+        // derived table: GROUP BY CAST(ts AS DATE) directly. The group key is a
+        // monotone function of ts, so it picks up the filter's day-space GC
+        // frontier and bounds state to the trailing ~10-day window.
+        var q = Compile(
+            "SELECT CAST(ts AS DATE) AS d, COUNT(*) AS c FROM events "
+            + "WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '10' DAY GROUP BY CAST(ts AS DATE)");
+
+        for (var i = 0; i <= 100; i++)
+        {
+            q.AdvanceClock(i * Day + 12 * Hour);
+            q.Table("events").Insert(i, new Timestamp(i * Day + 9 * Hour));
+            q.Step();
+        }
+
+        var agg = q.Circuit.Operators
+            .OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>()
+            .Single();
+        Assert.True(agg.RetainedGroupCount <= 12, $"retained {agg.RetainedGroupCount}");
+        Assert.True(agg.RetainedGroupCount >= 10, $"retained {agg.RetainedGroupCount}");
+    }
+
+    [Fact]
     public void CastTimestampToDate_ProjectedDateGroupBy_BoundsAggregateState()
     {
         // The headline CURRENT_DATE-over-a-TIMESTAMP-column pattern: filter events

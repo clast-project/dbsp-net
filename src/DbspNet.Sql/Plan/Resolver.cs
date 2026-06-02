@@ -303,30 +303,46 @@ public sealed class Resolver
             return stmt.Distinct ? new DistinctPlan(projected) : projected;
         }
 
-        // Aggregation path. Resolve GROUP BY keys against the pre-aggregate schema.
+        // Aggregation path. Resolve GROUP BY keys against the pre-aggregate
+        // schema. A key may be any scalar expression (e.g. CAST(ts AS DATE),
+        // a + b); a bare column keeps its name/qualifier so SELECT/HAVING can
+        // still reference it by name and the output column reads naturally.
         var groupKeyExprs = new List<ResolvedExpression>();
         var groupKeyAstItems = new List<(Expression Ast, int OutputIndex)>();
         var groupCols = new List<SchemaColumn>();
-        var seenKeys = new HashSet<(string? Qual, string Name)>();
+        var seenKeys = new HashSet<ResolvedExpression>();
         for (var i = 0; i < stmt.GroupBy.Count; i++)
         {
             var gb = stmt.GroupBy[i];
-            if (gb is not ColumnReference cref)
+            if (HasAggregate(gb))
             {
-                throw new ResolveException("GROUP BY supports only bare column references in v1");
+                throw new ResolveException("aggregate functions are not allowed in a GROUP BY key");
             }
 
-            var idx = plan.Schema.Resolve(cref.Qualifier, cref.Name);
-            var src = plan.Schema[idx];
-            var key = (src.Qualifier, src.Name);
-            if (!seenKeys.Add(key))
+            ResolvedExpression resolved;
+            SchemaColumn col;
+            if (gb is ColumnReference cref)
             {
-                throw new ResolveException($"duplicate GROUP BY column '{src.Name}'");
+                var idx = plan.Schema.Resolve(cref.Qualifier, cref.Name);
+                var src = plan.Schema[idx];
+                resolved = new ResolvedColumn(idx, src.Type);
+                col = new SchemaColumn(src.Name, src.Type, src.Qualifier);
+            }
+            else
+            {
+                resolved = ResolveScalarExpression(gb, plan.Schema);
+                var (name, _) = DeriveProjectionName(gb, null);
+                col = new SchemaColumn(name, resolved.Type);
             }
 
-            groupKeyExprs.Add(new ResolvedColumn(idx, src.Type));
-            groupKeyAstItems.Add((cref, i));
-            groupCols.Add(new SchemaColumn(src.Name, src.Type, src.Qualifier));
+            if (!seenKeys.Add(resolved))
+            {
+                throw new ResolveException("duplicate GROUP BY key");
+            }
+
+            groupKeyExprs.Add(resolved);
+            groupKeyAstItems.Add((gb, i));
+            groupCols.Add(col);
         }
 
         // Collect aggregates by a light pre-walk of SELECT + HAVING. Final
@@ -3478,7 +3494,7 @@ public sealed class Resolver
         // doesn't recurse looking for aggregates inside a group-key column.
         for (var i = 0; i < groupKeys.Count; i++)
         {
-            if (groupKeys[i].Ast.Equals(expr))
+            if (AstEqual(groupKeys[i].Ast, expr))
             {
                 return;
             }
@@ -4238,16 +4254,17 @@ public sealed class Resolver
             return ResolveSubqueryReference(sq, subqueryMap);
         }
 
-        // Match against GROUP BY keys first.
+        // Match against GROUP BY keys first — a whole SELECT/HAVING sub-tree that
+        // equals a group key (a bare column or an expression like CAST(ts AS DATE))
+        // reads straight from that key's output column. Its type is the resolved
+        // key's type; since `expr` is syntactically the key, resolving it against
+        // the pre-aggregate schema yields exactly that.
         for (var i = 0; i < groupKeys.Count; i++)
         {
             if (AstEqual(expr, groupKeys[i].Ast))
             {
-                if (expr is ColumnReference cref)
-                {
-                    var idx = preSchema.Resolve(cref.Qualifier, cref.Name);
-                    return new ResolvedColumn(groupKeys[i].OutputIndex, preSchema[idx].Type);
-                }
+                var keyType = ResolveScalarExpression(expr, preSchema).Type;
+                return new ResolvedColumn(groupKeys[i].OutputIndex, keyType);
             }
         }
 
@@ -4473,8 +4490,77 @@ public sealed class Resolver
         };
     }
 
-    // Syntactic equality on AST expressions — used to match SELECT/HAVING
-    // sub-trees against GROUP BY items. For v1 we only ever compare
-    // ColumnReferences, but this stays general so later we can extend.
-    private static bool AstEqual(Expression a, Expression b) => a.Equals(b);
+    // Syntactic equality on AST expressions — used to match SELECT/HAVING/ORDER BY
+    // sub-trees against GROUP BY items. Record auto-equality is unusable here:
+    // nodes with collection members (FunctionCallExpression.Arguments,
+    // InListExpression.Values, CaseExpression.Whens) compare those lists by
+    // reference, so two separately-parsed `LENGTH(name)` would compare unequal.
+    // Hence an explicit structural walk that compares list members element-wise.
+    private static bool AstEqual(Expression a, Expression b)
+    {
+        if (ReferenceEquals(a, b))
+        {
+            return true;
+        }
+
+        return (a, b) switch
+        {
+            (ColumnReference x, ColumnReference y) =>
+                x.Qualifier == y.Qualifier && string.Equals(x.Name, y.Name, StringComparison.Ordinal),
+            (LiteralExpression x, LiteralExpression y) => x.Equals(y),
+            (NowExpression x, NowExpression y) => x.Function == y.Function,
+            (UnaryExpression x, UnaryExpression y) =>
+                x.Operator == y.Operator && AstEqual(x.Operand, y.Operand),
+            (BinaryExpression x, BinaryExpression y) =>
+                x.Operator == y.Operator && AstEqual(x.Left, y.Left) && AstEqual(x.Right, y.Right),
+            (IsNullExpression x, IsNullExpression y) =>
+                x.Negated == y.Negated && AstEqual(x.Operand, y.Operand),
+            (CastExpression x, CastExpression y) =>
+                Equals(x.TargetType, y.TargetType) && AstEqual(x.Operand, y.Operand),
+            (FunctionCallExpression x, FunctionCallExpression y) =>
+                string.Equals(x.FunctionName, y.FunctionName, StringComparison.Ordinal)
+                && x.IsStar == y.IsStar && AstListEqual(x.Arguments, y.Arguments),
+            (InListExpression x, InListExpression y) =>
+                x.IsNegated == y.IsNegated && AstEqual(x.Probe, y.Probe) && AstListEqual(x.Values, y.Values),
+            (CaseExpression x, CaseExpression y) =>
+                (x.ElseResult is null) == (y.ElseResult is null)
+                && (x.ElseResult is null || AstEqual(x.ElseResult, y.ElseResult!))
+                && x.Whens.Count == y.Whens.Count
+                && WhenClausesEqual(x.Whens, y.Whens),
+            // Subqueries / window functions can't be GROUP BY keys; fall back to
+            // record identity (only reached for like-typed pairs).
+            _ => a.Equals(b),
+        };
+    }
+
+    private static bool AstListEqual(IReadOnlyList<Expression> a, IReadOnlyList<Expression> b)
+    {
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!AstEqual(a[i], b[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool WhenClausesEqual(IReadOnlyList<CaseWhenClause> a, IReadOnlyList<CaseWhenClause> b)
+    {
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!AstEqual(a[i].Condition, b[i].Condition) || !AstEqual(a[i].Result, b[i].Result))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }

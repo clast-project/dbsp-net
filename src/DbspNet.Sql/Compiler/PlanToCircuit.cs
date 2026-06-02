@@ -1743,20 +1743,20 @@ public static class PlanToCircuit
     {
         var input = CompilePlan(builder, plan.Input, ctx);
 
-        // Group-key indices. Resolver restricts v1 GROUP BY to bare column refs.
-        var groupIndices = new int[plan.GroupKeys.Count];
+        // Group-key extractors. A key is any scalar expression (bare column,
+        // CAST(ts AS DATE), a + b, …), compiled once to a delegate run per row —
+        // the same model JOIN / IN-subquery use for composite equi-keys.
+        var keyFns = new Func<IReadOnlyList<object?>, object?>[plan.GroupKeys.Count];
+        var groupKeyCols = new SchemaColumn[plan.GroupKeys.Count];
         for (var i = 0; i < plan.GroupKeys.Count; i++)
         {
-            if (plan.GroupKeys[i] is ResolvedColumn rc)
-            {
-                groupIndices[i] = rc.Index;
-            }
-            else
-            {
-                throw new InvalidOperationException(
-                    "internal: GROUP BY expression not reduced to a ResolvedColumn");
-            }
+            keyFns[i] = ExpressionCompiler.CompileScalar(plan.GroupKeys[i]);
+            // Synthetic key-row schema (the wrapping Project supplies the
+            // user-facing names from plan.Schema); only the types matter here.
+            groupKeyCols[i] = new SchemaColumn("$gk" + i, plan.GroupKeys[i].Type);
         }
+
+        var groupKeySchema = new Schema(groupKeyCols);
 
         // Build per-aggregate extractor/aggregator pairs in resolver order.
         var aggs = new SqlAggregator[plan.Aggregates.Count];
@@ -1770,7 +1770,6 @@ public static class PlanToCircuit
         // it surfaces as columns in plan.Schema (e.g. when the same aggregate
         // appears in both SELECT and HAVING and dedup happens at the schema
         // level), so plan.Schema may be narrower than the actual runtime row.
-        var groupKeySchema = plan.Input.Schema.SubsetByIndex(groupIndices);
         var aggColumns = new SchemaColumn[plan.Aggregates.Count];
         for (var i = 0; i < plan.Aggregates.Count; i++)
         {
@@ -1782,9 +1781,19 @@ public static class PlanToCircuit
 
         // Rekey input rows by the group key; value = the entire input row so each
         // aggregator can extract its argument independently.
+        var keyCodec = ctx.Codec;
         var indexed = builder.GroupProject(
             input,
-            row => ExtractKey(ctx.Codec, groupKeySchema, row, groupIndices),
+            row =>
+            {
+                var vs = new object?[keyFns.Length];
+                for (var i = 0; i < keyFns.Length; i++)
+                {
+                    vs[i] = keyFns[i](row);
+                }
+
+                return keyCodec.BuildRow(groupKeySchema, vs);
+            },
             row => row);
 
         // Snapshot codec for the IndexedZSet trace inside IncrementalAggregateOp.
