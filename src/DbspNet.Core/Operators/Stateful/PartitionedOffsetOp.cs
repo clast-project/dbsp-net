@@ -6,16 +6,32 @@ using DbspNet.Core.Collections;
 
 namespace DbspNet.Core.Operators.Stateful;
 
+/// <summary>Which positional row a <see cref="OffsetSpec"/> reads from.</summary>
+public enum OffsetKind
+{
+    /// <summary><c>LAG</c>: the row <c>Offset</c> positions before the current one.</summary>
+    Lag,
+
+    /// <summary><c>LEAD</c>: the row <c>Offset</c> positions after the current one.</summary>
+    Lead,
+
+    /// <summary><c>FIRST_VALUE</c>: the first row of the partition (UNLIMITED RANGE).</summary>
+    FirstValue,
+
+    /// <summary><c>LAST_VALUE</c>: the last row of the partition (UNLIMITED RANGE).</summary>
+    LastValue,
+}
+
 /// <summary>
-/// One <c>LAG</c> / <c>LEAD</c> output column: read <see cref="Value"/> from the
-/// row <see cref="Offset"/> positions before (<see cref="IsLead"/> false) or after
-/// (true) the current row, falling back to <see cref="Default"/> when that row is
-/// outside the partition.
+/// One <c>LAG</c> / <c>LEAD</c> / <c>FIRST_VALUE</c> / <c>LAST_VALUE</c> output
+/// column: read <see cref="Value"/> from the row selected by <see cref="Kind"/>
+/// (using <see cref="Offset"/> for the relative LAG/LEAD kinds), falling back to
+/// <see cref="Default"/> when that row is outside the partition.
 /// </summary>
 public readonly record struct OffsetSpec(
     Func<StructuralRow, object?> Value,
+    OffsetKind Kind,
     long Offset,
-    bool IsLead,
     object? Default);
 
 /// <summary>
@@ -190,7 +206,14 @@ internal sealed class PartitionedOffsetOp<TKey> : IOperator, ISnapshotable
             for (var s = 0; s < _specs.Length; s++)
             {
                 var spec = _specs[s];
-                var src = spec.IsLead ? j + spec.Offset : j - spec.Offset;
+                var src = spec.Kind switch
+                {
+                    OffsetKind.Lag => j - spec.Offset,
+                    OffsetKind.Lead => j + spec.Offset,
+                    OffsetKind.FirstValue => 0,
+                    OffsetKind.LastValue => slots.Count - 1,
+                    _ => j,
+                };
                 vs[n + s] = src >= 0 && src < slots.Count ? spec.Value(slots[(int)src]) : spec.Default;
             }
 

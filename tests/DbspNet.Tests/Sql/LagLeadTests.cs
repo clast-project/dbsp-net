@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
@@ -49,7 +50,7 @@ public class LagLeadTests
         var wo = OffsetPlanOf("SELECT g, ts, LAG(v) OVER (PARTITION BY g ORDER BY ts) AS p FROM w");
         Assert.Single(wo.Functions);
         Assert.Equal(1, wo.Functions[0].Offset);
-        Assert.False(wo.Functions[0].IsLead);
+        Assert.Equal(OffsetKind.Lag, wo.Functions[0].Kind);
         Assert.Null(wo.Functions[0].Default);
     }
 
@@ -57,7 +58,7 @@ public class LagLeadTests
     public void Resolve_LeadWithOffsetAndDefault()
     {
         var wo = OffsetPlanOf("SELECT g, ts, LEAD(v, 2, 0) OVER (PARTITION BY g ORDER BY ts) AS n FROM w");
-        Assert.True(wo.Functions[0].IsLead);
+        Assert.Equal(OffsetKind.Lead, wo.Functions[0].Kind);
         Assert.Equal(2, wo.Functions[0].Offset);
         Assert.Equal(0, wo.Functions[0].Default);
     }
@@ -121,6 +122,38 @@ public class LagLeadTests
     }
 
     [Fact]
+    public void FirstValue_LastValue_OverWholePartition()
+    {
+        var q = Compile(
+            "SELECT g, ts, FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS fv, " +
+            "LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS lv FROM w");
+        q.Table("w").Insert(1, 1, 10);
+        q.Table("w").Insert(1, 2, 20);
+        q.Table("w").Insert(1, 3, 30);
+        q.Step();
+        // Every row in partition 1 sees first=10 (ts=1) and last=30 (ts=3).
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 10, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 10, 30));
+
+        // A new max row shifts LAST_VALUE for the whole partition.
+        q.Table("w").Insert(1, 4, 40);
+        q.Step();
+        Assert.Equal(-1, WeightOf(q.Current, 1, 1, 10, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 40));
+        Assert.Equal(1, WeightOf(q.Current, 1, 4, 10, 40));
+    }
+
+    [Fact]
+    public void Rejects_FirstValueWithFrame() => Assert.Throws<ResolveException>(() =>
+        ResolvePlan("SELECT g, FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts " +
+            "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS fv FROM w"));
+
+    [Fact]
+    public void Rejects_FirstValueNoOrderBy() => Assert.Throws<ResolveException>(() =>
+        ResolvePlan("SELECT g, FIRST_VALUE(v) OVER (PARTITION BY g) AS fv FROM w"));
+
+    [Fact]
     public void MiddleInsert_ShiftsOnlyNeighbor()
     {
         var q = Compile("SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts) AS prev FROM w");
@@ -148,6 +181,10 @@ public class LagLeadTests
     [InlineData("SELECT g, ts, v, LEAD(v) OVER (PARTITION BY g ORDER BY ts) AS n FROM w")]
     [InlineData("SELECT g, ts, v, LAG(v, 2, -1) OVER (PARTITION BY g ORDER BY ts) AS p FROM w")]
     [InlineData("SELECT ts, v, LAG(v) OVER (ORDER BY ts) AS p, LEAD(v) OVER (ORDER BY ts) AS n FROM w")]
+    [InlineData("SELECT g, ts, v, FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS fv FROM w")]
+    [InlineData("SELECT g, ts, v, LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS lv FROM w")]
+    [InlineData("SELECT g, ts, v, FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS fv, " +
+        "LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS lv FROM w")]
     public void IncrementalEqualsBatch_RandomInsertsAndDeletes(string query)
     {
         for (var seed = 0; seed < 16; seed++)

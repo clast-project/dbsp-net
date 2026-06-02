@@ -1090,7 +1090,7 @@ public static class PlanToCircuit
         {
             var fn = plan.Functions[i];
             var valueScalar = ExpressionCompiler.CompileScalar(fn.Value);
-            specs[i] = new OffsetSpec(row => valueScalar(row), fn.Offset, fn.IsLead, fn.Default);
+            specs[i] = new OffsetSpec(row => valueScalar(row), fn.Kind, fn.Offset, fn.Default);
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);

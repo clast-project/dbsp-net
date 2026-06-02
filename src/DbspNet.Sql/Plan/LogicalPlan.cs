@@ -240,28 +240,30 @@ public sealed record WindowAggregatePlan(
     Schema Schema) : LogicalPlan(Schema);
 
 /// <summary>
-/// One <c>LAG</c> / <c>LEAD</c> offset-function call inside a
-/// <see cref="WindowOffsetPlan"/>. <see cref="Value"/> is the expression read
-/// from the offset row; <see cref="Offset"/> is the (non-negative) row distance
-/// (default 1); <see cref="IsLead"/> selects forward (<c>LEAD</c>) vs backward
-/// (<c>LAG</c>); <see cref="Default"/> is the constant returned when the offset
-/// row falls outside the partition (<c>null</c> ⇒ SQL NULL).
+/// One window offset-function call inside a <see cref="WindowOffsetPlan"/>.
+/// <see cref="Value"/> is the expression read from the selected row;
+/// <see cref="Kind"/> selects which row (LAG/LEAD use <see cref="Offset"/>, the
+/// non-negative row distance; FIRST_VALUE/LAST_VALUE read the partition's first /
+/// last row); <see cref="Default"/> is the constant returned when the selected
+/// row falls outside the partition (<c>null</c> ⇒ SQL NULL; unused by
+/// FIRST_VALUE/LAST_VALUE, whose row always exists).
 /// </summary>
 public sealed record OffsetFunctionCall(
     ResolvedExpression Value,
     long Offset,
-    bool IsLead,
+    OffsetKind Kind,
     object? Default,
     SqlType ResultType);
 
 /// <summary>
-/// Window offset functions — <c>LAG/LEAD(expr [, offset [, default]]) OVER
-/// (PARTITION BY p ORDER BY o)</c> — emitted as new output column(s) appended to
-/// every input row. Positional (by row, not value): the value is read from the
-/// row <see cref="OffsetFunctionCall.Offset"/> positions before (LAG) or after
-/// (LEAD) the current row in the partition's <see cref="OrderKey"/> ordering
-/// (ties broken by the full row; a weight-<c>w</c> row occupies <c>w</c> consecutive
-/// positions). Lowered to a <c>PartitionedOffsetOp</c>.
+/// Window offset functions — <c>LAG/LEAD(expr [, offset [, default]])</c> and
+/// <c>FIRST_VALUE/LAST_VALUE(expr)</c> <c>OVER (PARTITION BY p ORDER BY o)</c> —
+/// emitted as new output column(s) appended to every input row. Positional (by
+/// row, not value): the value is read from the row selected by each function's
+/// <see cref="OffsetFunctionCall.Kind"/> in the partition's <see cref="OrderKey"/>
+/// ordering (ties broken by the full row; a weight-<c>w</c> row occupies <c>w</c>
+/// consecutive positions). FIRST_VALUE/LAST_VALUE span the whole partition
+/// (UNLIMITED RANGE). Lowered to a <c>PartitionedOffsetOp</c>.
 /// </summary>
 public sealed record WindowOffsetPlan(
     LogicalPlan Input,

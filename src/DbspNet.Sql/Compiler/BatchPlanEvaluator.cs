@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.Operators.Stateful.Aggregators;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
@@ -686,7 +687,14 @@ internal static class BatchPlanEvaluator
                 for (var s = 0; s < plan.Functions.Count; s++)
                 {
                     var fn = plan.Functions[s];
-                    var src = fn.IsLead ? j + fn.Offset : j - fn.Offset;
+                    var src = fn.Kind switch
+                    {
+                        OffsetKind.Lag => j - fn.Offset,
+                        OffsetKind.Lead => j + fn.Offset,
+                        OffsetKind.FirstValue => 0,
+                        OffsetKind.LastValue => slots.Count - 1,
+                        _ => j,
+                    };
                     vs[baseRow.Count + s] = src >= 0 && src < slots.Count ? valueFns[s](slots[(int)src]) : fn.Default;
                 }
 

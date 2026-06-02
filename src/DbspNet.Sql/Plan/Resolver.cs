@@ -1263,9 +1263,9 @@ public sealed class Resolver
             {
                 throw new ResolveException(
                     $"window function '{w.FunctionName}' is not supported as an output column; only the " +
-                    "window aggregates SUM / COUNT / AVG / MIN / MAX and the offset functions LAG / LEAD " +
-                    "are (ranking functions ROW_NUMBER / RANK / DENSE_RANK are supported only in the TOP-K " +
-                    "filter pattern; FIRST_VALUE / LAST_VALUE are deferred)");
+                    "window aggregates SUM / COUNT / AVG / MIN / MAX and the offset functions LAG / LEAD / " +
+                    "FIRST_VALUE / LAST_VALUE are (ranking functions ROW_NUMBER / RANK / DENSE_RANK are " +
+                    "supported only in the TOP-K filter pattern)");
             }
 
             if (thisOffset != isOffset)
@@ -1346,12 +1346,14 @@ public sealed class Resolver
         {
             if (orderKey is null)
             {
-                throw new ResolveException("LAG / LEAD requires an ORDER BY");
+                throw new ResolveException("LAG / LEAD / FIRST_VALUE / LAST_VALUE requires an ORDER BY");
             }
 
             if (firstWin.Over.Frame is not null)
             {
-                throw new ResolveException("LAG / LEAD does not take a frame clause");
+                throw new ResolveException(
+                    "LAG / LEAD / FIRST_VALUE / LAST_VALUE does not take a frame clause in v1 " +
+                    "(FIRST_VALUE / LAST_VALUE span the whole partition — UNLIMITED RANGE)");
             }
 
             var functions = new List<OffsetFunctionCall>(windowItems.Count);
@@ -1529,7 +1531,8 @@ public sealed class Resolver
     private static long NonNegativeOffset(long v) =>
         v >= 0 ? v : throw new ResolveException("a RANGE frame PRECEDING offset must be non-negative");
 
-    private static bool IsOffsetFunctionName(string name) => name is "lag" or "lead";
+    private static bool IsOffsetFunctionName(string name) =>
+        name is "lag" or "lead" or "first_value" or "last_value";
 
     /// <summary>Fold a resolved constant — a literal or a unary negation of a
     /// numeric literal — to its value. Used for LAG/LEAD constant offsets and
@@ -1565,40 +1568,60 @@ public sealed class Resolver
         WindowFunctionExpression w, Schema baseSchema)
     {
         var fnUpper = w.FunctionName.ToUpperInvariant();
-        if (w.IsStar || w.Arguments.Count is < 1 or > 3)
+        var kind = w.FunctionName switch
         {
-            throw new ResolveException(
-                $"{fnUpper} takes 1 to 3 arguments (value [, offset [, default]])");
+            "lag" => OffsetKind.Lag,
+            "lead" => OffsetKind.Lead,
+            "first_value" => OffsetKind.FirstValue,
+            "last_value" => OffsetKind.LastValue,
+            _ => throw new ResolveException($"unsupported offset function '{w.FunctionName}'"),
+        };
+
+        long offset = 1;
+        object? def = null;
+
+        if (kind is OffsetKind.Lag or OffsetKind.Lead)
+        {
+            if (w.IsStar || w.Arguments.Count is < 1 or > 3)
+            {
+                throw new ResolveException(
+                    $"{fnUpper} takes 1 to 3 arguments (value [, offset [, default]])");
+            }
+
+            if (w.Arguments.Count >= 2)
+            {
+                if (!TryFoldConstant(ResolveScalarExpression(w.Arguments[1], baseSchema), out var ov)
+                    || ov is not (int or long))
+                {
+                    throw new ResolveException($"the {fnUpper} offset must be a constant integer");
+                }
+
+                offset = ov is int oi ? oi : (long)ov;
+                if (offset < 0)
+                {
+                    throw new ResolveException($"the {fnUpper} offset must be non-negative");
+                }
+            }
+
+            if (w.Arguments.Count == 3
+                && !TryFoldConstant(ResolveScalarExpression(w.Arguments[2], baseSchema), out def))
+            {
+                throw new ResolveException($"the {fnUpper} default must be a constant");
+            }
+        }
+        else
+        {
+            // FIRST_VALUE / LAST_VALUE — exactly one argument; the partition's
+            // first / last row always exists, so there is no offset or default.
+            if (w.IsStar || w.Arguments.Count != 1)
+            {
+                throw new ResolveException($"{fnUpper} takes exactly one argument");
+            }
         }
 
         var value = ResolveScalarExpression(w.Arguments[0], baseSchema);
-
-        long offset = 1;
-        if (w.Arguments.Count >= 2)
-        {
-            if (!TryFoldConstant(ResolveScalarExpression(w.Arguments[1], baseSchema), out var ov)
-                || ov is not (int or long))
-            {
-                throw new ResolveException($"the {fnUpper} offset must be a constant integer");
-            }
-
-            offset = ov is int oi ? oi : (long)ov;
-            if (offset < 0)
-            {
-                throw new ResolveException($"the {fnUpper} offset must be non-negative");
-            }
-        }
-
-        object? def = null;
-        if (w.Arguments.Count == 3
-            && !TryFoldConstant(ResolveScalarExpression(w.Arguments[2], baseSchema), out def))
-        {
-            throw new ResolveException($"the {fnUpper} default must be a constant");
-        }
-
         var resultType = value.Type.WithNullable(true);
-        var isLead = string.Equals(w.FunctionName, "lead", StringComparison.Ordinal);
-        return (new OffsetFunctionCall(value, offset, isLead, def, resultType), resultType);
+        return (new OffsetFunctionCall(value, offset, kind, def, resultType), resultType);
     }
 
     private static bool MentionsWindowFunction(Expression e) => e switch

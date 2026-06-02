@@ -183,7 +183,7 @@ public class WindowAggregateTests
 
     [Fact]
     public void Rejects_DeferredWindowFunction() => Rejects(
-        "SELECT ts, FIRST_VALUE(amount) OVER (PARTITION BY cust ORDER BY ts) FROM orders");
+        "SELECT ts, NTILE(4) OVER (PARTITION BY cust ORDER BY ts) FROM orders");
 
     [Fact]
     public void Rejects_DifferentSpecs() => Rejects(
