@@ -2129,10 +2129,7 @@ public static class PlanToCircuit
                 return new SqlApproxCountDistinctAggregator(
                     ExpressionCompiler.CompileScalar(call.Argument!));
             case AggregateKind.ApproxPercentile:
-                return new SqlApproxPercentileAggregator(
-                    ExpressionCompiler.CompileScalar(call.Argument!),
-                    call.Fraction!.Value,
-                    DdSketchSupport.DecimalScaleOf(call.Argument!.Type));
+                return DdSketchSupport.BuildStructuralPercentile(call);
             case AggregateKind.Sum:
                 return new SqlSumAggregator(
                     ExpressionCompiler.CompileScalar(call.Argument!),

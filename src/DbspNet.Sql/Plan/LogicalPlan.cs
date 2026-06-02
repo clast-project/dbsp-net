@@ -405,9 +405,14 @@ public enum AggregateKind
 /// <see cref="AggregateKind.CountStar"/>, <see cref="Argument"/> is null.
 /// <see cref="Fraction"/> is the requested quantile in [0, 1] for
 /// <see cref="AggregateKind.ApproxPercentile"/> and null otherwise.
+/// <see cref="Discrete"/> distinguishes <c>PERCENTILE_DISC</c> (true) from
+/// <c>PERCENTILE_CONT</c>/MEDIAN/APPROX_PERCENTILE (false); it is honoured only by
+/// the exact DATE/TIMESTAMP path (the DDSketch numeric/INTERVAL path is
+/// approximate either way).
 /// </summary>
 public sealed record AggregateCall(
-    AggregateKind Kind, ResolvedExpression? Argument, SqlType ResultType, double? Fraction = null);
+    AggregateKind Kind, ResolvedExpression? Argument, SqlType ResultType,
+    double? Fraction = null, bool Discrete = false);
 
 /// <summary>
 /// Group-by + aggregation. Output schema is

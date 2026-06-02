@@ -654,9 +654,13 @@ internal sealed class SqlApproxCountDistinctAggregator : SqlAggregator
 
 /// <summary>
 /// SQL <c>APPROX_PERCENTILE(expr, fraction)</c> / <c>MEDIAN</c> /
-/// <c>PERCENTILE_CONT</c> — a DDSketch estimate of the value at the requested
-/// <see cref="_fraction"/> quantile of the non-NULL argument values. Returns a
-/// nullable <c>DOUBLE</c> (NULL for an empty / all-NULL group, like MIN/MAX).
+/// <c>PERCENTILE_CONT</c> over a <b>numeric or INTERVAL</b> argument — a DDSketch
+/// estimate of the value at the requested <see cref="_fraction"/> quantile of
+/// the non-NULL argument values. <see cref="_toDouble"/> maps each value to the
+/// double the sketch folds (numeric rescale, or the interval class component);
+/// <see cref="_fromDouble"/> rebuilds the result type from the estimate (identity
+/// for numeric → <c>DOUBLE</c>, or an <c>INTERVAL</c> reconstruct). Returns NULL
+/// for an empty / all-NULL group, like MIN/MAX.
 /// </summary>
 /// <remarks>
 /// The sketch holds a signed per-bucket count, so it is fully invertible: a
@@ -670,21 +674,26 @@ internal sealed class SqlApproxPercentileAggregator : SqlAggregator
 {
     private readonly Func<StructuralRow, object?> _argExtract;
     private readonly double _fraction;
-    private readonly int _decimalScale;
+    private readonly Func<object, double> _toDouble;
+    private readonly Func<double, object> _fromDouble;
 
     public SqlApproxPercentileAggregator(
-        Func<StructuralRow, object?> argExtract, double fraction, int decimalScale)
+        Func<StructuralRow, object?> argExtract,
+        double fraction,
+        Func<object, double> toDouble,
+        Func<double, object> fromDouble)
     {
         _argExtract = argExtract;
         _fraction = fraction;
-        _decimalScale = decimalScale;
+        _toDouble = toDouble;
+        _fromDouble = fromDouble;
     }
 
     public override object? Compute(ZSet<StructuralRow, Z64> rows)
     {
         var sketch = new DdSketch();
-        DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _decimalScale);
-        return sketch.EstimateQuantile(_fraction);
+        DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _toDouble);
+        return sketch.EstimateQuantile(_fraction) is double d ? _fromDouble(d) : null;
     }
 
     public override object? Update(
@@ -694,9 +703,66 @@ internal sealed class SqlApproxPercentileAggregator : SqlAggregator
         ZSet<StructuralRow, Z64> after)
     {
         var sketch = state as DdSketch ?? new DdSketch();
-        DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _decimalScale);
+        DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _toDouble);
         state = sketch;
-        return sketch.EstimateQuantile(_fraction);
+        return sketch.EstimateQuantile(_fraction) is double d ? _fromDouble(d) : null;
+    }
+}
+
+/// <summary>
+/// SQL quantiles over a <b>DATE / TIMESTAMP</b> argument — answered <b>exactly</b>
+/// via an <see cref="OrderedQuantileSketch"/> over the value's integer day-/
+/// microsecond key (DDSketch's relative-error bound on the epoch-offset magnitude
+/// is useless for absolute dates/timestamps). <see cref="_discrete"/> selects
+/// <c>PERCENTILE_DISC</c> (a true set member) vs <c>PERCENTILE_CONT</c>/MEDIAN
+/// (interpolated). <see cref="_toKey"/>/<see cref="_fromKey"/> convert between the
+/// boxed temporal value and its sort key. Returns NULL for an empty / all-NULL
+/// group.
+/// </summary>
+/// <remarks>
+/// The sketch holds a signed per-value count, so — exactly like
+/// <see cref="SqlApproxPercentileAggregator"/> — it is fully invertible and the
+/// incremental result equals a from-scratch batch recompute exactly.
+/// </remarks>
+internal sealed class SqlExactQuantileAggregator : SqlAggregator
+{
+    private readonly Func<StructuralRow, object?> _argExtract;
+    private readonly double _fraction;
+    private readonly bool _discrete;
+    private readonly Func<object, long> _toKey;
+    private readonly Func<long, object> _fromKey;
+
+    public SqlExactQuantileAggregator(
+        Func<StructuralRow, object?> argExtract,
+        double fraction,
+        bool discrete,
+        Func<object, long> toKey,
+        Func<long, object> fromKey)
+    {
+        _argExtract = argExtract;
+        _fraction = fraction;
+        _discrete = discrete;
+        _toKey = toKey;
+        _fromKey = fromKey;
+    }
+
+    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    {
+        var sketch = new OrderedQuantileSketch();
+        DdSketchSupport.FoldSignedExact(sketch, rows, _argExtract, _toKey);
+        return sketch.EstimateQuantile(_fraction, _discrete) is long k ? _fromKey(k) : null;
+    }
+
+    public override object? Update(
+        ref object? state,
+        object? oldValue,
+        ZSet<StructuralRow, Z64> delta,
+        ZSet<StructuralRow, Z64> after)
+    {
+        var sketch = state as OrderedQuantileSketch ?? new OrderedQuantileSketch();
+        DdSketchSupport.FoldSignedExact(sketch, delta, _argExtract, _toKey);
+        state = sketch;
+        return sketch.EstimateQuantile(_fraction, _discrete) is long k ? _fromKey(k) : null;
     }
 }
 

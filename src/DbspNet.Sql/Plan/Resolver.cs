@@ -4014,13 +4014,13 @@ public sealed class Resolver
             case FunctionCallExpression call when IsAggregateName(call.FunctionName, call.IsStar):
                 {
                     var kind = ToAggregateKind(call);
-                    var (arg, fraction) = ResolveAggregateArgs(call, kind, preSchema);
+                    var (arg, fraction, discrete) = ResolveAggregateArgs(call, kind, preSchema);
                     var resultType = ComputeAggregateResultType(kind, arg?.Type);
-                    var key = new AggregateKey(kind, arg, fraction);
+                    var key = new AggregateKey(kind, arg, fraction, discrete);
                     if (!aggIndex.ContainsKey(key))
                     {
                         aggIndex[key] = aggregates.Count;
-                        aggregates.Add(new AggregateCall(kind, arg, resultType, fraction));
+                        aggregates.Add(new AggregateCall(kind, arg, resultType, fraction, discrete));
                     }
                 }
 
@@ -4719,25 +4719,27 @@ public sealed class Resolver
     }
 
     private readonly record struct AggregateKey(
-        AggregateKind Kind, ResolvedExpression? Argument, double? Fraction = null);
+        AggregateKind Kind, ResolvedExpression? Argument, double? Fraction = null, bool Discrete = false);
 
     /// <summary>
     /// Resolve an aggregate call's value argument and — for the quantile family
-    /// (<see cref="AggregateKind.ApproxPercentile"/>) — its constant fraction.
-    /// <c>COUNT(*)</c> has neither; every other aggregate takes a single value
-    /// argument and no fraction.
+    /// (<see cref="AggregateKind.ApproxPercentile"/>) — its constant fraction and
+    /// whether it is the discrete (<c>PERCENTILE_DISC</c>) spelling.
+    /// <c>COUNT(*)</c> has neither argument nor fraction; every other aggregate
+    /// takes a single value argument, no fraction, and is not discrete.
     /// </summary>
-    private static (ResolvedExpression? Argument, double? Fraction) ResolveAggregateArgs(
+    private static (ResolvedExpression? Argument, double? Fraction, bool Discrete) ResolveAggregateArgs(
         FunctionCallExpression call, AggregateKind kind, Schema schema)
     {
         if (kind == AggregateKind.CountStar)
         {
-            return (null, null);
+            return (null, null, false);
         }
 
         if (kind == AggregateKind.ApproxPercentile)
         {
-            return ResolvePercentileArgs(call, schema);
+            var (arg, fraction) = ResolvePercentileArgs(call, schema);
+            return (arg, fraction, call.FunctionName == "percentile_disc");
         }
 
         if (call.Arguments.Count != 1)
@@ -4746,7 +4748,7 @@ public sealed class Resolver
                 $"{call.FunctionName.ToUpperInvariant()} takes exactly 1 argument");
         }
 
-        return (ResolveScalarExpression(call.Arguments[0], schema), null);
+        return (ResolveScalarExpression(call.Arguments[0], schema), null, false);
     }
 
     /// <summary>
@@ -4879,13 +4881,13 @@ public sealed class Resolver
         if (expr is FunctionCallExpression call && IsAggregateName(call.FunctionName, call.IsStar))
         {
             var kind = ToAggregateKind(call);
-            var (arg, fraction) = ResolveAggregateArgs(call, kind, preSchema);
+            var (arg, fraction, discrete) = ResolveAggregateArgs(call, kind, preSchema);
             var resultType = ComputeAggregateResultType(kind, arg?.Type);
-            var key = new AggregateKey(kind, arg, fraction);
+            var key = new AggregateKey(kind, arg, fraction, discrete);
             if (!aggIndex.TryGetValue(key, out var idx))
             {
                 idx = aggregates.Count;
-                aggregates.Add(new AggregateCall(kind, arg, resultType, fraction));
+                aggregates.Add(new AggregateCall(kind, arg, resultType, fraction, discrete));
                 aggIndex[key] = idx;
             }
 
@@ -5054,14 +5056,26 @@ public sealed class Resolver
 
                 return new SqlBigintType(false);
             case AggregateKind.ApproxPercentile:
-                if (argType is null || !TypeInference.IsNumeric(argType))
+                if (argType is null)
                 {
-                    throw new ResolveException("APPROX_PERCENTILE requires a numeric argument");
+                    throw new ResolveException("APPROX_PERCENTILE requires an argument");
                 }
 
-                // Approximate quantile of an empty / all-NULL group is undefined
-                // (NULL), like MIN/MAX — hence a nullable DOUBLE.
-                return new SqlDoubleType(true);
+                // Numeric → nullable DOUBLE (DDSketch). DATE/TIMESTAMP (exact) and
+                // INTERVAL (DDSketch) return their own type. The quantile of an
+                // empty / all-NULL group is NULL, like MIN/MAX, so always nullable.
+                if (TypeInference.IsNumeric(argType))
+                {
+                    return new SqlDoubleType(true);
+                }
+
+                if (argType is SqlDateType or SqlTimestampType or SqlIntervalType)
+                {
+                    return argType.WithNullable(true);
+                }
+
+                throw new ResolveException(
+                    "APPROX_PERCENTILE requires a numeric, DATE, TIMESTAMP, or INTERVAL argument");
             case AggregateKind.Sum:
                 if (argType is null || !TypeInference.IsNumeric(argType))
                 {

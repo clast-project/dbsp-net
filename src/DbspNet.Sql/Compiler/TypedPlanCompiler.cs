@@ -1129,10 +1129,13 @@ public static class TypedPlanCompiler
     {
         if (call.Argument is null) return null;
 
-        // Same boxing-extractor strategy as APPROX_COUNT_DISTINCT: the numeric
-        // argument lowered to its CLR type then boxed (a no-value Nullable<T>
-        // boxes to null = SQL NULL). The aggregator converts the box to double
-        // and folds it into the DDSketch at the captured fraction / scale.
+        // Same boxing-extractor strategy as APPROX_COUNT_DISTINCT: the argument
+        // lowered to its CLR type then boxed (a no-value Nullable<T> boxes to
+        // null = SQL NULL). The aggregator unboxes and folds into its sketch.
+        // INTERVAL has no Arrow row-emit, so this path is reached only for
+        // numeric / DATE / TIMESTAMP results (an INTERVAL agg slot makes the
+        // typed row emit fail upstream and the whole compile falls back to
+        // structural — like INTERVAL arithmetic already does).
         var inParam = Expression.Parameter(inputRowType, "in");
         var built = TypedExpressionCompiler.TryBuildInto(call.Argument, inParam);
         if (built is null) return null;
@@ -1141,10 +1144,38 @@ public static class TypedPlanCompiler
         var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, typeof(object));
         var argExtract = Expression.Lambda(delegateType, boxed, inParam).Compile();
 
+        var argType = call.Argument.Type;
+        if (DdSketchSupport.IsExactQuantileType(argType))
+        {
+            var exactOpen = typeof(TypedExactQuantileAggregator<>);
+            var exactClosed = exactOpen.MakeGenericType(inputRowType);
+            return Activator.CreateInstance(
+                exactClosed,
+                argExtract,
+                call.Fraction!.Value,
+                call.Discrete,
+                DdSketchSupport.ExactToKey(argType),
+                DdSketchSupport.ExactFromKey(argType),
+                argType.ClrType);
+        }
+
+        Func<object, double> toDouble;
+        Func<double, object> fromDouble;
+        if (argType is SqlIntervalType iv)
+        {
+            toDouble = DdSketchSupport.IntervalToDouble(iv.Qualifier);
+            fromDouble = DdSketchSupport.IntervalFromDouble(iv.Qualifier);
+        }
+        else
+        {
+            toDouble = DdSketchSupport.NumericToDouble(argType);
+            fromDouble = DdSketchSupport.DoubleIdentity;
+        }
+
         var open = typeof(TypedApproxPercentileAggregator<>);
         var closed = open.MakeGenericType(inputRowType);
         return Activator.CreateInstance(
-            closed, argExtract, call.Fraction!.Value, DdSketchSupport.DecimalScaleOf(call.Argument.Type));
+            closed, argExtract, call.Fraction!.Value, toDouble, fromDouble, argType.ClrType);
     }
 
     /// <summary>

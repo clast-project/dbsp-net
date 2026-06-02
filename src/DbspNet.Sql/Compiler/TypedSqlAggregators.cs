@@ -891,10 +891,12 @@ internal sealed class TypedApproxCountDistinctAggregator<TIn> : TypedSqlAggregat
 }
 
 /// <summary>
-/// Typed <c>APPROX_PERCENTILE</c> / <c>MEDIAN</c> / <c>PERCENTILE_CONT</c>:
-/// DDSketch estimate of the requested quantile of the non-NULL argument values.
-/// The boxing argument extractor (<c>null</c> for SQL NULL) lets one
-/// implementation cover every numeric argument type. Mirrors
+/// Typed <c>APPROX_PERCENTILE</c> / <c>MEDIAN</c> / <c>PERCENTILE_CONT</c> over a
+/// <b>numeric or INTERVAL</b> argument: DDSketch estimate of the requested
+/// quantile of the non-NULL argument values. The boxing argument extractor
+/// (<c>null</c> for SQL NULL) plus the captured <c>toDouble</c>/<c>fromDouble</c>
+/// delegates let one implementation cover every numeric type (→ <c>DOUBLE</c>)
+/// and INTERVAL (→ <c>INTERVAL</c>). Mirrors
 /// <see cref="SqlApproxPercentileAggregator"/>: the sketch is invertible, so
 /// every tick folds the signed delta into the running state and the result
 /// equals a batch recompute exactly.
@@ -904,31 +906,87 @@ internal sealed class TypedApproxPercentileAggregator<TIn> : TypedSqlAggregator<
 {
     private readonly Func<TIn, object?> _argExtract;
     private readonly double _fraction;
-    private readonly int _decimalScale;
+    private readonly Func<object, double> _toDouble;
+    private readonly Func<double, object> _fromDouble;
 
     public TypedApproxPercentileAggregator(
-        Func<TIn, object?> argExtract, double fraction, int decimalScale)
+        Func<TIn, object?> argExtract,
+        double fraction,
+        Func<object, double> toDouble,
+        Func<double, object> fromDouble,
+        Type resultClrType)
     {
         _argExtract = argExtract;
         _fraction = fraction;
-        _decimalScale = decimalScale;
+        _toDouble = toDouble;
+        _fromDouble = fromDouble;
+        ResultClrType = resultClrType;
     }
 
-    public override Type ResultClrType => typeof(double);
+    public override Type ResultClrType { get; }
 
     public override object? Compute(ZSet<TIn, Z64> rows)
     {
         var sketch = new DdSketch();
-        DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _decimalScale);
-        return sketch.EstimateQuantile(_fraction);
+        DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _toDouble);
+        return sketch.EstimateQuantile(_fraction) is double d ? _fromDouble(d) : null;
     }
 
     public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
     {
         var sketch = state as DdSketch ?? new DdSketch();
-        DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _decimalScale);
+        DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _toDouble);
         state = sketch;
-        return sketch.EstimateQuantile(_fraction);
+        return sketch.EstimateQuantile(_fraction) is double d ? _fromDouble(d) : null;
+    }
+}
+
+/// <summary>
+/// Typed quantiles over a <b>DATE / TIMESTAMP</b> argument — answered exactly via
+/// an <see cref="OrderedQuantileSketch"/> over the integer sort key. Mirrors
+/// <see cref="SqlExactQuantileAggregator"/>; <c>discrete</c> selects
+/// <c>PERCENTILE_DISC</c> (a true member) vs interpolation.
+/// </summary>
+internal sealed class TypedExactQuantileAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, object?> _argExtract;
+    private readonly double _fraction;
+    private readonly bool _discrete;
+    private readonly Func<object, long> _toKey;
+    private readonly Func<long, object> _fromKey;
+
+    public TypedExactQuantileAggregator(
+        Func<TIn, object?> argExtract,
+        double fraction,
+        bool discrete,
+        Func<object, long> toKey,
+        Func<long, object> fromKey,
+        Type resultClrType)
+    {
+        _argExtract = argExtract;
+        _fraction = fraction;
+        _discrete = discrete;
+        _toKey = toKey;
+        _fromKey = fromKey;
+        ResultClrType = resultClrType;
+    }
+
+    public override Type ResultClrType { get; }
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        var sketch = new OrderedQuantileSketch();
+        DdSketchSupport.FoldSignedExact(sketch, rows, _argExtract, _toKey);
+        return sketch.EstimateQuantile(_fraction, _discrete) is long k ? _fromKey(k) : null;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var sketch = state as OrderedQuantileSketch ?? new OrderedQuantileSketch();
+        DdSketchSupport.FoldSignedExact(sketch, delta, _argExtract, _toKey);
+        state = sketch;
+        return sketch.EstimateQuantile(_fraction, _discrete) is long k ? _fromKey(k) : null;
     }
 }
 

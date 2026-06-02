@@ -360,8 +360,20 @@ reflect that shape, not a backlog.
   of the present multiset, the incremental result equals a batch recompute
   exactly. Bounded state (buckets ∝ dynamic range, not cardinality); the
   fraction is a constant in [0, 1] fixed at plan time. `WITHIN GROUP (ORDER BY x
-  DESC)` is supported (lowered to `1 − f`). Numeric arguments only; temporal-typed
-  quantiles and the array-returning `APPROX_QUANTILES(x, n)` are deferred.
+  DESC)` is supported (lowered to `1 − f`).
+- **[DONE]** Temporal-typed quantiles — the quantile family also accepts **DATE**,
+  **TIMESTAMP**, and **INTERVAL** arguments and returns that same type. **Hybrid**
+  strategy: DATE/TIMESTAMP are answered **exactly** by a new invertible
+  `OrderedQuantileSketch` (a signed count per distinct day-/microsecond key —
+  DDSketch's relative-error bound on the huge epoch-offset magnitude would be
+  useless for absolute dates/timestamps), so `PERCENTILE_DISC` returns a true set
+  member and `PERCENTILE_CONT`/`MEDIAN`/`APPROX_PERCENTILE` interpolate between
+  neighbours (rounded to the type's granularity); INTERVAL durations reuse the
+  DDSketch (relative error is the right model, state stays bounded), folding the
+  year-month / day-time class component. Both keep the exact incremental≡batch
+  property. `TIME` is not accepted. INTERVAL results run on the structural path
+  (the typed fast path falls back, as INTERVAL arithmetic already does). The
+  array-returning `APPROX_QUANTILES(x, n)` is still deferred.
   Heavy-hitters (Count-Min) remain **[P2]**.
 - **[P1]** `FILTER (WHERE …)` clause on aggregates.
 - **[P1]** `DISTINCT` in aggregates; `WITHIN DISTINCT`.
