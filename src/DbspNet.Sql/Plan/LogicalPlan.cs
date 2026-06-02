@@ -397,13 +397,17 @@ public enum AggregateKind
     Max,
     Avg,
     ApproxCountDistinct,
+    ApproxPercentile,
 }
 
 /// <summary>
 /// One aggregate call inside an <see cref="AggregatePlan"/>. For
 /// <see cref="AggregateKind.CountStar"/>, <see cref="Argument"/> is null.
+/// <see cref="Fraction"/> is the requested quantile in [0, 1] for
+/// <see cref="AggregateKind.ApproxPercentile"/> and null otherwise.
 /// </summary>
-public sealed record AggregateCall(AggregateKind Kind, ResolvedExpression? Argument, SqlType ResultType);
+public sealed record AggregateCall(
+    AggregateKind Kind, ResolvedExpression? Argument, SqlType ResultType, double? Fraction = null);
 
 /// <summary>
 /// Group-by + aggregation. Output schema is

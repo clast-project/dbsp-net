@@ -891,6 +891,48 @@ internal sealed class TypedApproxCountDistinctAggregator<TIn> : TypedSqlAggregat
 }
 
 /// <summary>
+/// Typed <c>APPROX_PERCENTILE</c> / <c>MEDIAN</c> / <c>PERCENTILE_CONT</c>:
+/// DDSketch estimate of the requested quantile of the non-NULL argument values.
+/// The boxing argument extractor (<c>null</c> for SQL NULL) lets one
+/// implementation cover every numeric argument type. Mirrors
+/// <see cref="SqlApproxPercentileAggregator"/>: the sketch is invertible, so
+/// every tick folds the signed delta into the running state and the result
+/// equals a batch recompute exactly.
+/// </summary>
+internal sealed class TypedApproxPercentileAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, object?> _argExtract;
+    private readonly double _fraction;
+    private readonly int _decimalScale;
+
+    public TypedApproxPercentileAggregator(
+        Func<TIn, object?> argExtract, double fraction, int decimalScale)
+    {
+        _argExtract = argExtract;
+        _fraction = fraction;
+        _decimalScale = decimalScale;
+    }
+
+    public override Type ResultClrType => typeof(double);
+
+    public override object? Compute(ZSet<TIn, Z64> rows)
+    {
+        var sketch = new DdSketch();
+        DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _decimalScale);
+        return sketch.EstimateQuantile(_fraction);
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    {
+        var sketch = state as DdSketch ?? new DdSketch();
+        DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _decimalScale);
+        state = sketch;
+        return sketch.EstimateQuantile(_fraction);
+    }
+}
+
+/// <summary>
 /// Typed composite that runs all of a query's aggregates over the
 /// per-group multiset and packs their results into the emitted
 /// aggregate-output row <typeparamref name="TAgg"/>.

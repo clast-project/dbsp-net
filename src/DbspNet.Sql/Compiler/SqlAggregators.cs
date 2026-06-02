@@ -653,6 +653,54 @@ internal sealed class SqlApproxCountDistinctAggregator : SqlAggregator
 }
 
 /// <summary>
+/// SQL <c>APPROX_PERCENTILE(expr, fraction)</c> / <c>MEDIAN</c> /
+/// <c>PERCENTILE_CONT</c> — a DDSketch estimate of the value at the requested
+/// <see cref="_fraction"/> quantile of the non-NULL argument values. Returns a
+/// nullable <c>DOUBLE</c> (NULL for an empty / all-NULL group, like MIN/MAX).
+/// </summary>
+/// <remarks>
+/// The sketch holds a signed per-bucket count, so it is fully invertible: a
+/// retraction folds in a negative weight rather than forcing a rebuild. The
+/// running estimate is therefore maintained incrementally on every tick (the
+/// SUM/COUNT pattern, not the rebuild-on-retraction HyperLogLog pattern), and
+/// because the bucket map is a deterministic function of the present multiset
+/// the incremental result equals a from-scratch batch recompute exactly.
+/// </remarks>
+internal sealed class SqlApproxPercentileAggregator : SqlAggregator
+{
+    private readonly Func<StructuralRow, object?> _argExtract;
+    private readonly double _fraction;
+    private readonly int _decimalScale;
+
+    public SqlApproxPercentileAggregator(
+        Func<StructuralRow, object?> argExtract, double fraction, int decimalScale)
+    {
+        _argExtract = argExtract;
+        _fraction = fraction;
+        _decimalScale = decimalScale;
+    }
+
+    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    {
+        var sketch = new DdSketch();
+        DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _decimalScale);
+        return sketch.EstimateQuantile(_fraction);
+    }
+
+    public override object? Update(
+        ref object? state,
+        object? oldValue,
+        ZSet<StructuralRow, Z64> delta,
+        ZSet<StructuralRow, Z64> after)
+    {
+        var sketch = state as DdSketch ?? new DdSketch();
+        DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _decimalScale);
+        state = sketch;
+        return sketch.EstimateQuantile(_fraction);
+    }
+}
+
+/// <summary>
 /// Runs all of a query's aggregates in a single pass over the per-group
 /// multiset, packing the results into a <see cref="StructuralRow"/> whose
 /// columns line up with the resolver's declared aggregate order.

@@ -346,10 +346,14 @@ See `docs/now-and-temporal-filters.md`.
 `DbspNet.Core/Operators/Stateful/Aggregators/`. The
 `IncrementalAggregateOp` is generic over an `IAggregator<TValue,
 TOut>` strategy. Built-ins: `SumAggregator`, `CountAggregator`,
-`AvgAggregator`, `MinMaxAggregator`. The SQL layer adds typed
-SQL-shaped wrappers in `DbspNet.Sql/Compiler/{SqlAggregators,
-TypedSqlAggregators}.cs` that handle NULL skipping, the
-linear-emission gate, and per-aggregate result types.
+`AvgAggregator`, `MinMaxAggregator`, plus two bounded-state sketch
+primitives — `HyperLogLog` (distinct-count, behind
+`APPROX_COUNT_DISTINCT`) and `DdSketch` (relative-error quantiles,
+behind `APPROX_PERCENTILE` / `MEDIAN` / `PERCENTILE_CONT`). The SQL
+layer adds typed SQL-shaped wrappers in
+`DbspNet.Sql/Compiler/{SqlAggregators, TypedSqlAggregators}.cs` that
+handle NULL skipping, the linear-emission gate, and per-aggregate
+result types.
 
 ## Extension points
 

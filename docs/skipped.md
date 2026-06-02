@@ -350,8 +350,19 @@ reflect that shape, not a backlog.
   the sketch from the post-delta multiset. The sketch is a deterministic
   function of the present value set, so the incremental result equals a
   from-scratch batch recompute exactly (not merely within the error bound).
-  Other approximate / sketch aggregates (`APPROX_QUANTILES`/`PERCENTILE`,
-  heavy-hitters) remain **[P2]**.
+- **[DONE]** Approximate quantiles — `APPROX_PERCENTILE(x, f)`, `MEDIAN(x)`, and
+  the ANSI ordered-set spellings `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)`
+  / `PERCENTILE_DISC` (all lowered to one DDSketch aggregator) on both compile
+  paths and both trace families. DDSketch keeps a signed per-bucket count with a
+  relative-error (~1%) bucket scheme, so it is **fully invertible** — every tick
+  folds the signed delta into the running sketch (the SUM/COUNT pattern, no
+  rebuild on retraction) and, because the bucket map is a deterministic function
+  of the present multiset, the incremental result equals a batch recompute
+  exactly. Bounded state (buckets ∝ dynamic range, not cardinality); the
+  fraction is a constant in [0, 1] fixed at plan time. Numeric arguments only;
+  `ORDER BY … DESC` in `WITHIN GROUP`, temporal-typed quantiles, and the
+  array-returning `APPROX_QUANTILES(x, n)` are deferred. Heavy-hitters
+  (Count-Min) remain **[P2]**.
 - **[P1]** `FILTER (WHERE …)` clause on aggregates.
 - **[P1]** `DISTINCT` in aggregates; `WITHIN DISTINCT`.
 - **[P2]** `ARG_MIN`, `ARG_MAX`, `ARRAY_AGG` (with `ORDER BY`,

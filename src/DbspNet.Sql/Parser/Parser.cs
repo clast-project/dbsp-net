@@ -1706,6 +1706,17 @@ public sealed class Parser
 
             Expect(TokenKind.RParen);
 
+            // PERCENTILE_CONT(f) / PERCENTILE_DISC(f) WITHIN GROUP (ORDER BY x):
+            // the ANSI ordered-set spelling of an approximate quantile. Lower to
+            // the same value-first, fraction-second call shape the resolver uses
+            // for APPROX_PERCENTILE(x, f) so both spellings share one DDSketch
+            // aggregator (no separate downstream support needed).
+            if (first.Text is "percentile_cont" or "percentile_disc"
+                && IsContextualKeyword("within"))
+            {
+                return ParseWithinGroup(first, args);
+            }
+
             // IIF / DECODE are conditional functions; desugar to CASE here so
             // they flow through resolution, aggregation, and both compilers
             // exactly like a hand-written CASE (no downstream support needed).
@@ -1735,6 +1746,40 @@ public sealed class Parser
         }
 
         return new ColumnReference(Qualifier: null, first.Text);
+    }
+
+    /// <summary>
+    /// Parse the <c>WITHIN GROUP (ORDER BY x)</c> tail of an ordered-set
+    /// aggregate. The caller has parsed <c>name ( fraction )</c> into
+    /// <paramref name="args"/> and the next token is the <c>within</c> contextual
+    /// keyword. Returns a <c>FunctionCallExpression(name, [x, fraction])</c>.
+    /// </summary>
+    private Expression ParseWithinGroup(Token nameToken, List<Expression> args)
+    {
+        if (args.Count != 1)
+        {
+            throw Error(nameToken,
+                $"{nameToken.Text.ToUpperInvariant()} WITHIN GROUP takes a single fraction argument");
+        }
+
+        Advance(); // `within`
+        Expect(TokenKind.Group);
+        Expect(TokenKind.LParen);
+        Expect(TokenKind.Order);
+        Expect(TokenKind.By);
+        var sort = ParseSortItem();
+        Expect(TokenKind.RParen);
+
+        // A DESC ordering would invert the quantile (f ↔ 1−f); rather than
+        // silently treat it as ascending, reject it in v1.
+        if (sort.Direction == SortDirection.Descending)
+        {
+            throw Error(nameToken,
+                $"{nameToken.Text.ToUpperInvariant()} WITHIN GROUP (ORDER BY … DESC) is not supported");
+        }
+
+        return new FunctionCallExpression(
+            nameToken.Text, new[] { sort.Expression, args[0] }, IsStar: false);
     }
 
     /// <summary>

@@ -992,6 +992,9 @@ public static class TypedPlanCompiler
             AggregateKind.CountStar => call.ResultType.WithNullable(false),
             AggregateKind.Count => call.ResultType.WithNullable(false),
             AggregateKind.ApproxCountDistinct => call.ResultType.WithNullable(false),
+            // APPROX_PERCENTILE returns NULL for an empty / all-NULL group, so
+            // the emitted slot is always nullable (like MIN/MAX).
+            AggregateKind.ApproxPercentile => call.ResultType.WithNullable(true),
             AggregateKind.Sum => call.ResultType.WithNullable(argNullable),
             AggregateKind.Avg => call.ResultType.WithNullable(argNullable),
             // MIN/MAX is *always* nullable in the emitted slot, even on
@@ -1048,6 +1051,9 @@ public static class TypedPlanCompiler
 
             case AggregateKind.ApproxCountDistinct:
                 return BuildApproxCountDistinctAggregator(call, inputRowType);
+
+            case AggregateKind.ApproxPercentile:
+                return BuildApproxPercentileAggregator(call, inputRowType);
 
             case AggregateKind.Sum:
                 return BuildSumAggregator(call, inputRowType);
@@ -1117,6 +1123,28 @@ public static class TypedPlanCompiler
         var open = typeof(TypedApproxCountDistinctAggregator<>);
         var closed = open.MakeGenericType(inputRowType);
         return Activator.CreateInstance(closed, argExtract);
+    }
+
+    private static object? BuildApproxPercentileAggregator(AggregateCall call, Type inputRowType)
+    {
+        if (call.Argument is null) return null;
+
+        // Same boxing-extractor strategy as APPROX_COUNT_DISTINCT: the numeric
+        // argument lowered to its CLR type then boxed (a no-value Nullable<T>
+        // boxes to null = SQL NULL). The aggregator converts the box to double
+        // and folds it into the DDSketch at the captured fraction / scale.
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var built = TypedExpressionCompiler.TryBuildInto(call.Argument, inParam);
+        if (built is null) return null;
+
+        var boxed = Expression.Convert(built, typeof(object));
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, typeof(object));
+        var argExtract = Expression.Lambda(delegateType, boxed, inParam).Compile();
+
+        var open = typeof(TypedApproxPercentileAggregator<>);
+        var closed = open.MakeGenericType(inputRowType);
+        return Activator.CreateInstance(
+            closed, argExtract, call.Fraction!.Value, DdSketchSupport.DecimalScaleOf(call.Argument.Type));
     }
 
     /// <summary>

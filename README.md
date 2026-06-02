@@ -182,10 +182,13 @@ grows and the GC frontier climbs.
   `LOG` (base-10, or `LOG(b, x)`), `EXP`. String functions are native UTF-8
   with code-point semantics. NULL semantics follow PostgreSQL (most propagate;
   `CONCAT`/`GREATEST`/`LEAST` skip NULLs).
-- Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`, and
+- Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`,
   `APPROX_COUNT_DISTINCT` (HyperLogLog; bounded state, exact in the
-  small-cardinality regime). NULL skipping per SQL semantics; `COUNT(*)`
-  counts all.
+  small-cardinality regime), and approximate quantiles —
+  `APPROX_PERCENTILE(x, f)`, `MEDIAN(x)`, and the ANSI ordered-set spellings
+  `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)` / `PERCENTILE_DISC` (DDSketch;
+  bounded state, ~1% relative error, fully invertible). NULL skipping per SQL
+  semantics; `COUNT(*)` counts all.
 - `LATENESS` bounded-history GC: a column declared `LATENESS d` in
   `CREATE TABLE` (e.g. `ts TIMESTAMP NOT NULL LATENESS 10000000`) promises no
   future row's value falls more than `d` below the running maximum. The engine

@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
 using System.Linq;
+using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Operators.Stateful;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Optimizer;
@@ -1399,6 +1400,12 @@ public sealed class Resolver
                 var w = (WindowFunctionExpression)wi.Expression;
                 var asCall = new FunctionCallExpression(w.FunctionName, w.Arguments, w.IsStar);
                 var kind = ToAggregateKind(asCall);
+                if (kind == AggregateKind.ApproxPercentile)
+                {
+                    throw new ResolveException(
+                        $"{w.FunctionName.ToUpperInvariant()} is not supported as a window function");
+                }
+
                 ResolvedExpression? arg = null;
                 if (kind != AggregateKind.CountStar)
                 {
@@ -4007,24 +4014,13 @@ public sealed class Resolver
             case FunctionCallExpression call when IsAggregateName(call.FunctionName, call.IsStar):
                 {
                     var kind = ToAggregateKind(call);
-                    ResolvedExpression? arg = null;
-                    if (kind != AggregateKind.CountStar)
-                    {
-                        if (call.Arguments.Count != 1)
-                        {
-                            throw new ResolveException(
-                                $"{call.FunctionName.ToUpperInvariant()} takes exactly 1 argument");
-                        }
-
-                        arg = ResolveScalarExpression(call.Arguments[0], preSchema);
-                    }
-
+                    var (arg, fraction) = ResolveAggregateArgs(call, kind, preSchema);
                     var resultType = ComputeAggregateResultType(kind, arg?.Type);
-                    var key = new AggregateKey(kind, arg);
+                    var key = new AggregateKey(kind, arg, fraction);
                     if (!aggIndex.ContainsKey(key))
                     {
                         aggIndex[key] = aggregates.Count;
-                        aggregates.Add(new AggregateCall(kind, arg, resultType));
+                        aggregates.Add(new AggregateCall(kind, arg, resultType, fraction));
                     }
                 }
 
@@ -4675,7 +4671,8 @@ public sealed class Resolver
 
         return name switch
         {
-            "count" or "sum" or "min" or "max" or "avg" or "approx_count_distinct" => true,
+            "count" or "sum" or "min" or "max" or "avg" or "approx_count_distinct"
+                or "approx_percentile" or "median" or "percentile_cont" or "percentile_disc" => true,
             _ => false,
         };
     }
@@ -4721,7 +4718,101 @@ public sealed class Resolver
         return false;
     }
 
-    private readonly record struct AggregateKey(AggregateKind Kind, ResolvedExpression? Argument);
+    private readonly record struct AggregateKey(
+        AggregateKind Kind, ResolvedExpression? Argument, double? Fraction = null);
+
+    /// <summary>
+    /// Resolve an aggregate call's value argument and — for the quantile family
+    /// (<see cref="AggregateKind.ApproxPercentile"/>) — its constant fraction.
+    /// <c>COUNT(*)</c> has neither; every other aggregate takes a single value
+    /// argument and no fraction.
+    /// </summary>
+    private static (ResolvedExpression? Argument, double? Fraction) ResolveAggregateArgs(
+        FunctionCallExpression call, AggregateKind kind, Schema schema)
+    {
+        if (kind == AggregateKind.CountStar)
+        {
+            return (null, null);
+        }
+
+        if (kind == AggregateKind.ApproxPercentile)
+        {
+            return ResolvePercentileArgs(call, schema);
+        }
+
+        if (call.Arguments.Count != 1)
+        {
+            throw new ResolveException(
+                $"{call.FunctionName.ToUpperInvariant()} takes exactly 1 argument");
+        }
+
+        return (ResolveScalarExpression(call.Arguments[0], schema), null);
+    }
+
+    /// <summary>
+    /// Resolve the value expression and constant fraction of an approximate
+    /// quantile call. <c>MEDIAN(x)</c> fixes the fraction at 0.5;
+    /// <c>APPROX_PERCENTILE(x, f)</c> / <c>PERCENTILE_CONT(f) WITHIN GROUP
+    /// (ORDER BY x)</c> (already lowered to <c>(x, f)</c> by the parser) carry an
+    /// explicit literal fraction in [0, 1].
+    /// </summary>
+    private static (ResolvedExpression? Argument, double? Fraction) ResolvePercentileArgs(
+        FunctionCallExpression call, Schema schema)
+    {
+        Expression valueExpr;
+        double fraction;
+        if (call.FunctionName == "median")
+        {
+            if (call.Arguments.Count != 1)
+            {
+                throw new ResolveException("MEDIAN takes exactly 1 argument");
+            }
+
+            valueExpr = call.Arguments[0];
+            fraction = 0.5;
+        }
+        else
+        {
+            if (call.Arguments.Count != 2)
+            {
+                throw new ResolveException(
+                    $"{call.FunctionName.ToUpperInvariant()} takes a value and a fraction argument");
+            }
+
+            valueExpr = call.Arguments[0];
+            fraction = ReadFractionLiteral(call.Arguments[1], call.FunctionName);
+        }
+
+        return (ResolveScalarExpression(valueExpr, schema), fraction);
+    }
+
+    /// <summary>
+    /// Read a percentile's fraction: a numeric constant literal in [0, 1]. The
+    /// fraction is fixed at plan time (it selects which quantile the DDSketch
+    /// reports), so a non-constant fraction is rejected here.
+    /// </summary>
+    private static double ReadFractionLiteral(Expression expr, string functionName)
+    {
+        var name = functionName.ToUpperInvariant();
+        if (expr is not LiteralExpression lit || lit.Value is null)
+        {
+            throw new ResolveException($"{name} fraction must be a numeric constant in [0, 1]");
+        }
+
+        var fraction = lit.Kind switch
+        {
+            LiteralKind.Integer or LiteralKind.Float => Convert.ToDouble(lit.Value, System.Globalization.CultureInfo.InvariantCulture),
+            LiteralKind.Decimal => (double)((Decimal128)lit.Value).Mantissa / Math.Pow(10, lit.DecimalScale),
+            _ => throw new ResolveException($"{name} fraction must be a numeric constant in [0, 1]"),
+        };
+
+        if (fraction is < 0.0 or > 1.0)
+        {
+            throw new ResolveException($"{name} fraction must be in [0, 1]");
+        }
+
+        return fraction;
+    }
 
     /// <summary>
     /// Resolve an expression in the post-aggregate context. Every sub-tree
@@ -4774,23 +4865,13 @@ public sealed class Resolver
         if (expr is FunctionCallExpression call && IsAggregateName(call.FunctionName, call.IsStar))
         {
             var kind = ToAggregateKind(call);
-            ResolvedExpression? arg = null;
-            if (kind != AggregateKind.CountStar)
-            {
-                if (call.Arguments.Count != 1)
-                {
-                    throw new ResolveException($"{call.FunctionName.ToUpperInvariant()} takes exactly 1 argument");
-                }
-
-                arg = ResolveScalarExpression(call.Arguments[0], preSchema);
-            }
-
+            var (arg, fraction) = ResolveAggregateArgs(call, kind, preSchema);
             var resultType = ComputeAggregateResultType(kind, arg?.Type);
-            var key = new AggregateKey(kind, arg);
+            var key = new AggregateKey(kind, arg, fraction);
             if (!aggIndex.TryGetValue(key, out var idx))
             {
                 idx = aggregates.Count;
-                aggregates.Add(new AggregateCall(kind, arg, resultType));
+                aggregates.Add(new AggregateCall(kind, arg, resultType, fraction));
                 aggIndex[key] = idx;
             }
 
@@ -4937,6 +5018,8 @@ public sealed class Resolver
             "max" => AggregateKind.Max,
             "avg" => AggregateKind.Avg,
             "approx_count_distinct" => AggregateKind.ApproxCountDistinct,
+            "approx_percentile" or "median" or "percentile_cont" or "percentile_disc"
+                => AggregateKind.ApproxPercentile,
             _ => throw new ResolveException($"unknown aggregate '{call.FunctionName}'"),
         };
     }
@@ -4956,6 +5039,15 @@ public sealed class Resolver
                 }
 
                 return new SqlBigintType(false);
+            case AggregateKind.ApproxPercentile:
+                if (argType is null || !TypeInference.IsNumeric(argType))
+                {
+                    throw new ResolveException("APPROX_PERCENTILE requires a numeric argument");
+                }
+
+                // Approximate quantile of an empty / all-NULL group is undefined
+                // (NULL), like MIN/MAX — hence a nullable DOUBLE.
+                return new SqlDoubleType(true);
             case AggregateKind.Sum:
                 if (argType is null || !TypeInference.IsNumeric(argType))
                 {
