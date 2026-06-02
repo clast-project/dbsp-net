@@ -94,6 +94,48 @@ public static class LinearOperators
     }
 
     /// <summary>
+    /// Fused map-and-filter in a single pass: <paramref name="step"/> returns
+    /// <c>(Keep, Value)</c> — <c>Keep == false</c> drops the row, otherwise
+    /// <c>Value</c> is the transformed row. Equivalent to a
+    /// <see cref="MapRows{TIn,TOut,TWeight}"/> / <see cref="Filter{TRow,TWeight}"/>
+    /// chain but allocates one output Z-set and iterates the input once instead
+    /// of materializing an intermediate Z-set between every stage. Rows that
+    /// resolve to the same output accumulate weights — identical to staging the
+    /// operators separately, since Z-set addition is associative/commutative.
+    /// The SQL compiler uses this to fuse adjacent Filter/Project plan nodes on
+    /// both the structural (<typeparamref name="TOut"/> = <c>StructuralRow</c>)
+    /// and typed (<typeparamref name="TOut"/> = an emitted struct) paths — hence
+    /// the tuple drop-flag rather than a <c>null</c> sentinel, which a value-type
+    /// row could not carry.
+    /// </summary>
+    public static Stream<ZSet<TOut, TWeight>> MapFilterRows<TIn, TOut, TWeight>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TIn, TWeight>> input,
+        Func<TIn, (bool Keep, TOut Value)> step)
+        where TIn : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(step);
+
+        return builder.Apply(input, z =>
+        {
+            var b = new ZSetBuilder<TOut, TWeight>();
+            foreach (var (row, w) in z)
+            {
+                var (keep, value) = step(row);
+                if (keep)
+                {
+                    b.Add(value, w);
+                }
+            }
+
+            return b.Build();
+        });
+    }
+
+    /// <summary>
     /// For every row, emit zero or more rows (sharing the source row's weight).
     /// Rows that resolve to the same output accumulate weights.
     /// </summary>

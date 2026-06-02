@@ -201,8 +201,10 @@ public static class TypedPlanCompiler
     private static TypedNode? TryCompileNode(LogicalPlan plan, CompileContext ctx) => plan switch
     {
         ScanPlan s => CompileScan(s, ctx),
-        FilterPlan f => CompileFilter(f, ctx),
-        ProjectPlan p => CompileProject(p, ctx),
+        // Filter / Project are pointwise and stateless; a maximal run of them
+        // fuses into one pass (see CompileLinearChain).
+        FilterPlan => CompileLinearChain(plan, ctx),
+        ProjectPlan => CompileLinearChain(plan, ctx),
         JoinPlan j => CompileJoin(j, ctx),
         AggregatePlan a => CompileAggregate(a, ctx),
         UnionAllPlan u => CompileUnionAll(u, ctx),
@@ -279,50 +281,175 @@ public static class TypedPlanCompiler
         return standaloneNode;
     }
 
-    private static TypedNode? CompileFilter(FilterPlan filter, CompileContext ctx)
+    private enum TypedStageKind
     {
-        var inner = TryCompileNode(filter.Input, ctx);
-        if (inner is null) return null;
-
-        // Nullable<bool> WHERE predicates are coerced to plain
-        // bool inside BuildTypedPredicateDelegate via
-        // Nullable<bool>.GetValueOrDefault() — SQL WHERE semantics:
-        // TRUE keeps the row; FALSE and NULL both drop it.
-        var predicate = BuildTypedPredicateDelegate(filter.Predicate, inner.RowType);
-        if (predicate is null) return null;
-
-        var stream = InvokeFilter(ctx.Builder, inner.RowType, inner.Stream, predicate);
-        return new TypedNode(inner.RowType, inner.Schema, stream);
+        Filter,
+        Map,
     }
 
-    private static TypedNode? CompileProject(ProjectPlan project, CompileContext ctx)
-    {
-        var inner = TryCompileNode(project.Input, ctx);
-        if (inner is null) return null;
+    /// <summary>One stage of a fused typed linear chain. <see cref="Delegate"/>
+    /// is a <c>Func&lt;TCur, bool&gt;</c> (filter) or <c>Func&lt;TCur, TNext&gt;</c>
+    /// (map); <see cref="RowTypeAfter"/> / <see cref="SchemaAfter"/> are the row
+    /// type and schema the stage leaves the stream in (unchanged for a filter).</summary>
+    private readonly record struct TypedStage(
+        TypedStageKind Kind, Delegate Delegate, Type RowTypeAfter, Schema SchemaAfter);
 
-        // Respect the resolver's per-column nullability on the
-        // projection's output schema so genuinely-nullable
-        // expressions (NULLIF, NULL literal) can be carried as
-        // Nullable<T> fields downstream. Aggregate output schemas
-        // continue to be stripped inside CompileAggregate where the
-        // operator's linear-emission gate guarantees non-null
-        // values.
-        var outputSchema = project.Schema;
-        if (IsIdentityProjection(project.Projections, inner.Schema, outputSchema))
+    /// <summary>
+    /// Compiles a maximal run of consecutive <see cref="FilterPlan"/> /
+    /// <see cref="ProjectPlan"/> nodes into a single fused pass. Both are
+    /// pointwise and stateless, so chaining them as separate typed operators
+    /// materializes an intermediate Z-set (one allocation + one full iteration)
+    /// between every stage. Folding the run into one
+    /// <see cref="LinearOperators.MapFilterRows{TIn,TOut,TWeight}"/> evaluates
+    /// every stage per row in a single iteration with one output allocation.
+    /// </summary>
+    /// <remarks>
+    /// Each stage reuses the exact per-stage typed delegate builders
+    /// (<see cref="BuildTypedPredicateDelegate"/> /
+    /// <see cref="BuildTypedProjectionDelegate"/>), so fusion succeeds precisely
+    /// when the un-fused stages each would have — any stage outside typed scope
+    /// returns <c>null</c> and the whole compile falls back to structural, same
+    /// as before. A single-stage chain lowers to the original dedicated operator
+    /// (<c>Filter</c> / <c>MapRows</c>) so common single-op queries keep their
+    /// exact prior layout; only genuine multi-stage chains fuse.
+    /// </remarks>
+    private static TypedNode? CompileLinearChain(LogicalPlan plan, CompileContext ctx)
+    {
+        // Walk outermost→innermost collecting the linear nodes; identity
+        // projections are pure renames and contribute no runtime stage.
+        var nodes = new List<LogicalPlan>();
+        var node = plan;
+        while (node is FilterPlan or ProjectPlan)
         {
-            return inner;
+            if (node is ProjectPlan ip
+                && IsIdentityProjection(ip.Projections, ip.Input.Schema, ip.Schema))
+            {
+                node = ip.Input;
+                continue;
+            }
+
+            nodes.Add(node);
+            node = node is FilterPlan f ? f.Input : ((ProjectPlan)node).Input;
         }
 
-        var outputRowType = TypedRowEmitter.EmitRowType(outputSchema);
-        if (outputRowType is null) return null;
+        var baseNode = TryCompileNode(node, ctx);
+        if (baseNode is null) return null;
 
-        var projDelegate = BuildTypedProjectionDelegate(
-            inner.RowType, outputRowType, outputSchema, project.Projections);
-        if (projDelegate is null) return null;
+        // All-identity (or empty) chain → pass the input through unchanged.
+        if (nodes.Count == 0)
+        {
+            return baseNode;
+        }
 
-        var stream = InvokeMapRows(
-            ctx.Builder, inner.RowType, outputRowType, inner.Stream, projDelegate);
-        return new TypedNode(outputRowType, outputSchema, stream);
+        // Collected outermost-first; data flows from the input upward, so build
+        // the stages innermost-first.
+        nodes.Reverse();
+
+        var stages = new List<TypedStage>(nodes.Count);
+        var currentRowType = baseNode.RowType;
+        var currentSchema = baseNode.Schema;
+        foreach (var n in nodes)
+        {
+            if (n is FilterPlan f)
+            {
+                // Nullable<bool> WHERE predicates are coerced to plain bool inside
+                // BuildTypedPredicateDelegate (GetValueOrDefault) — TRUE keeps the
+                // row; FALSE and NULL both drop it.
+                var predicate = BuildTypedPredicateDelegate(f.Predicate, currentRowType);
+                if (predicate is null) return null;
+                stages.Add(new TypedStage(TypedStageKind.Filter, predicate, currentRowType, currentSchema));
+            }
+            else
+            {
+                // Respect the resolver's per-column nullability on the output
+                // schema so genuinely-nullable expressions (NULLIF, NULL literal)
+                // are carried as Nullable<T> fields downstream.
+                var p = (ProjectPlan)n;
+                var outRowType = TypedRowEmitter.EmitRowType(p.Schema);
+                if (outRowType is null) return null;
+                var projDelegate = BuildTypedProjectionDelegate(
+                    currentRowType, outRowType, p.Schema, p.Projections);
+                if (projDelegate is null) return null;
+                stages.Add(new TypedStage(TypedStageKind.Map, projDelegate, outRowType, p.Schema));
+                currentRowType = outRowType;
+                currentSchema = p.Schema;
+            }
+        }
+
+        // Single stage: lower to the original dedicated operator so the common
+        // single-filter / single-project case keeps its exact prior shape.
+        if (stages.Count == 1)
+        {
+            var only = stages[0];
+            if (only.Kind == TypedStageKind.Filter)
+            {
+                var stream = InvokeFilter(ctx.Builder, baseNode.RowType, baseNode.Stream, only.Delegate);
+                return new TypedNode(baseNode.RowType, baseNode.Schema, stream);
+            }
+            else
+            {
+                var stream = InvokeMapRows(
+                    ctx.Builder, baseNode.RowType, only.RowTypeAfter, baseNode.Stream, only.Delegate);
+                return new TypedNode(only.RowTypeAfter, only.SchemaAfter, stream);
+            }
+        }
+
+        var fused = BuildFusedTypedDelegate(baseNode.RowType, currentRowType, stages);
+        var fusedStream = InvokeMapFilterRows(
+            ctx.Builder, baseNode.RowType, currentRowType, baseNode.Stream, fused);
+        return new TypedNode(currentRowType, currentSchema, fusedStream);
+    }
+
+    /// <summary>
+    /// Builds the fused per-row delegate
+    /// <c>(TInRoot in) =&gt; (Keep, Value)</c> that threads a row through every
+    /// stage: a filter that fails short-circuits to <c>(false, default)</c>; a
+    /// map assigns the projected row into a local and the next stage reads it.
+    /// The pre-compiled per-stage typed delegates are embedded as constants and
+    /// invoked, so each stage stays strongly typed (no boxing of the row structs).
+    /// </summary>
+    private static Delegate BuildFusedTypedDelegate(
+        Type inRootType, Type outFinalType, List<TypedStage> stages)
+    {
+        var tupleType = typeof(ValueTuple<,>).MakeGenericType(typeof(bool), outFinalType);
+        var tupleCtor = tupleType.GetConstructor(new[] { typeof(bool), outFinalType })!;
+        var returnLabel = Expression.Label(tupleType, "ret");
+        var inParam = Expression.Parameter(inRootType, "in");
+        var dropTuple = Expression.New(
+            tupleCtor, Expression.Constant(false), Expression.Default(outFinalType));
+
+        var vars = new List<ParameterExpression>();
+        var body = new List<Expression>();
+        Expression current = inParam;
+        var idx = 0;
+        foreach (var stage in stages)
+        {
+            if (stage.Kind == TypedStageKind.Filter)
+            {
+                var predFuncType = typeof(Func<,>).MakeGenericType(current.Type, typeof(bool));
+                var test = Expression.Not(
+                    Expression.Invoke(Expression.Constant(stage.Delegate, predFuncType), current));
+                body.Add(Expression.IfThen(test, Expression.Return(returnLabel, dropTuple)));
+            }
+            else
+            {
+                var projFuncType = typeof(Func<,>).MakeGenericType(current.Type, stage.RowTypeAfter);
+                var v = Expression.Variable(stage.RowTypeAfter, "r" + idx);
+                vars.Add(v);
+                body.Add(Expression.Assign(
+                    v, Expression.Invoke(Expression.Constant(stage.Delegate, projFuncType), current)));
+                current = v;
+            }
+
+            idx++;
+        }
+
+        body.Add(Expression.Return(
+            returnLabel, Expression.New(tupleCtor, Expression.Constant(true), current)));
+        body.Add(Expression.Label(returnLabel, Expression.Default(tupleType)));
+
+        var funcType = typeof(Func<,>).MakeGenericType(inRootType, tupleType);
+        return Expression.Lambda(funcType, Expression.Block(vars, body), inParam).Compile();
     }
 
     /// <summary>
@@ -2178,6 +2305,19 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(LinearOperators.MapRows) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(inputRowType, outputRowType, typeof(Z64));
         return closed.Invoke(null, new object[] { builder, inputStream, projection })!;
+    }
+
+    /// <summary><c>builder.MapFilterRows&lt;TIn, TOut, Z64&gt;(stream, step)</c> — the
+    /// fused map+filter pass for a typed linear chain.</summary>
+    private static object InvokeMapFilterRows(
+        CircuitBuilder builder, Type inputRowType, Type outputRowType,
+        object inputStream, Delegate step)
+    {
+        var openMethod = typeof(LinearOperators)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(LinearOperators.MapFilterRows) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(inputRowType, outputRowType, typeof(Z64));
+        return closed.Invoke(null, new object[] { builder, inputStream, step })!;
     }
 
     /// <summary>

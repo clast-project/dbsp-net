@@ -714,18 +714,14 @@ public static class PlanToCircuit
 
                 return cached;
 
-            case FilterPlan f:
-                {
-                    var input = CompilePlan(builder, f.Input, ctx);
-                    var predicate = ExpressionCompiler.CompilePredicate(f.Predicate);
-                    return builder.Filter(input, row => predicate(row));
-                }
+            case FilterPlan:
+            case ProjectPlan:
+                // Both lower to pointwise linear passes; fuse a maximal chain of
+                // consecutive Filter/Project nodes into one Apply.
+                return CompileLinearChain(builder, plan, ctx);
 
             case TemporalFilterPlan tf:
                 return CompileTemporalFilter(builder, tf, ctx);
-
-            case ProjectPlan p:
-                return CompileProjection(builder, p, ctx);
 
             case JoinPlan j:
                 return CompileJoin(builder, j, ctx);
@@ -1099,51 +1095,170 @@ public static class PlanToCircuit
 
     // ---- Projection ----
 
-    private static Stream<ZSet<StructuralRow, Z64>> CompileProjection(
+    // ---- Linear chain (fused Filter / Project) ----
+
+    private enum LinearStageKind
+    {
+        Filter,
+        Map,
+    }
+
+    /// <summary>One stage of a fused linear chain — either a row-dropping
+    /// predicate (<see cref="LinearStageKind.Filter"/>) or a row-rewriting
+    /// projection (<see cref="LinearStageKind.Map"/>).</summary>
+    private readonly record struct LinearStage(
+        LinearStageKind Kind,
+        Func<IReadOnlyList<object?>, bool>? Predicate,
+        Func<IReadOnlyList<object?>, object?>[]? Delegates,
+        Schema? OutSchema);
+
+    /// <summary>
+    /// Compiles a maximal run of consecutive <see cref="FilterPlan"/> /
+    /// <see cref="ProjectPlan"/> nodes into a single fused pass. Both are
+    /// pointwise and stateless, so chaining them as separate operators
+    /// materializes an intermediate Z-set (one allocation + one full iteration)
+    /// between every stage. Folding the whole run into one
+    /// <see cref="LinearOperators.MapFilterRows{TIn,TOut,TWeight}"/> evaluates
+    /// every stage per row in a single iteration with one output allocation.
+    /// </summary>
+    /// <remarks>
+    /// The fold is exactly equivalent to staging the operators: filters are pure
+    /// row predicates, projections are pure row functions, and accumulating into
+    /// one <c>ZSetBuilder</c> matches the staged <c>MapKeys</c>/<c>Filter</c>
+    /// because Z-set addition is associative and commutative. A single-stage
+    /// chain lowers to the original dedicated operator (<c>Filter</c> /
+    /// <c>MapRows</c>) so common single-op queries keep their exact prior
+    /// operator layout; only genuine multi-stage chains fuse.
+    /// </remarks>
+    private static Stream<ZSet<StructuralRow, Z64>> CompileLinearChain(
         CircuitBuilder builder,
-        ProjectPlan plan,
+        LogicalPlan plan,
         CompileContext ctx)
     {
-        var input = CompilePlan(builder, plan.Input, ctx);
-
-        // Fast path: pure identity projection (same-arity sequential column refs, no expressions).
-        // Skip the MapRows — schema is purely a rename, runtime rows are unchanged.
-        var identity = plan.Projections.Count == plan.Input.Schema.Count;
-        if (identity)
+        // Walk top→down collecting stages; the loop stops at the first
+        // non-linear node, which becomes the chain's compiled input.
+        var stages = new List<LinearStage>();
+        var node = plan;
+        while (true)
         {
-            for (var i = 0; i < plan.Projections.Count; i++)
+            if (node is FilterPlan f)
             {
-                if (plan.Projections[i].Expression is not ResolvedColumn rc || rc.Index != i)
+                stages.Add(new LinearStage(
+                    LinearStageKind.Filter,
+                    ExpressionCompiler.CompilePredicate(f.Predicate),
+                    null,
+                    null));
+                node = f.Input;
+            }
+            else if (node is ProjectPlan p)
+            {
+                // An identity projection is a pure rename — no runtime stage.
+                if (IsIdentityProjection(p))
                 {
-                    identity = false;
-                    break;
+                    node = p.Input;
+                    continue;
                 }
+
+                var delegates = new Func<IReadOnlyList<object?>, object?>[p.Projections.Count];
+                for (var i = 0; i < delegates.Length; i++)
+                {
+                    delegates[i] = ExpressionCompiler.CompileScalar(p.Projections[i].Expression);
+                }
+
+                stages.Add(new LinearStage(LinearStageKind.Map, null, delegates, p.Schema));
+                node = p.Input;
+            }
+            else
+            {
+                break;
             }
         }
 
-        if (identity)
+        var input = CompilePlan(builder, node, ctx);
+
+        // No runtime stages (e.g. a chain of identity projections) → pass through.
+        if (stages.Count == 0)
         {
             return input;
         }
 
-        var delegates = new Func<IReadOnlyList<object?>, object?>[plan.Projections.Count];
-        for (var i = 0; i < plan.Projections.Count; i++)
-        {
-            delegates[i] = ExpressionCompiler.CompileScalar(plan.Projections[i].Expression);
-        }
+        // Stages were collected outermost-first; data flows from the input
+        // upward, so apply them in reverse (innermost-first) order.
+        stages.Reverse();
 
         var codec = ctx.Codec;
-        var outSchema = plan.Schema;
-        return builder.MapRows(input, row =>
+
+        // Single stage: lower to the original dedicated operator so the common
+        // single-filter / single-project case keeps its exact prior shape.
+        if (stages.Count == 1)
         {
-            var values = new object?[delegates.Length];
-            for (var i = 0; i < delegates.Length; i++)
+            var only = stages[0];
+            if (only.Kind == LinearStageKind.Filter)
             {
-                values[i] = delegates[i](row);
+                var predicate = only.Predicate!;
+                return builder.Filter(input, row => predicate(row));
             }
 
-            return codec.BuildRow(outSchema, values);
+            return builder.MapRows(input, row => ApplyMap(only, row, codec));
+        }
+
+        var chain = stages.ToArray();
+        return builder.MapFilterRows<StructuralRow, StructuralRow, Z64>(input, row =>
+        {
+            IReadOnlyList<object?> current = row;
+            foreach (var stage in chain)
+            {
+                if (stage.Kind == LinearStageKind.Filter)
+                {
+                    if (!stage.Predicate!(current))
+                    {
+                        return (false, null!);
+                    }
+                }
+                else
+                {
+                    current = ApplyMap(stage, current, codec);
+                }
+            }
+
+            return (true, (StructuralRow)current);
         });
+    }
+
+    private static StructuralRow ApplyMap(
+        LinearStage stage, IReadOnlyList<object?> row, IRowCodec<StructuralRow> codec)
+    {
+        var delegates = stage.Delegates!;
+        var values = new object?[delegates.Length];
+        for (var i = 0; i < delegates.Length; i++)
+        {
+            values[i] = delegates[i](row);
+        }
+
+        return codec.BuildRow(stage.OutSchema, values);
+    }
+
+    /// <summary>
+    /// True when <paramref name="plan"/>'s projection is a pure identity — same
+    /// arity as its input with every column a sequential <see cref="ResolvedColumn"/>
+    /// (a rename only, no value change), so it needs no runtime stage.
+    /// </summary>
+    private static bool IsIdentityProjection(ProjectPlan plan)
+    {
+        if (plan.Projections.Count != plan.Input.Schema.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < plan.Projections.Count; i++)
+        {
+            if (plan.Projections[i].Expression is not ResolvedColumn rc || rc.Index != i)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // ---- Join ----

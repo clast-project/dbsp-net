@@ -137,6 +137,72 @@ public class LinearOperatorTests
         Assert.Equal(new Z64(3), oh!.Current.WeightOf(20));
     }
 
+    [Fact]
+    public void MapFilterRows_MapsAndDropsInOnePass()
+    {
+        InputHandle<ZSet<int, Z64>>? ih = null;
+        OutputHandle<ZSet<string, Z64>>? oh = null;
+        var c = RootCircuit.Build(b =>
+        {
+            var (h, s) = b.ZSetInput<int, Z64>();
+            ih = h;
+
+            // Keep positives, double them; Keep == false drops the row.
+            var fused = b.MapFilterRows<int, string, Z64>(
+                s, x => x > 0
+                    ? (true, (x * 2).ToString(System.Globalization.CultureInfo.InvariantCulture))
+                    : (false, string.Empty));
+            oh = b.Output(fused);
+        });
+
+        ih!.Push(ZSet.FromEntries(new[] { (-1, new Z64(1)), (0, new Z64(2)), (3, new Z64(4)) }));
+        c.Step();
+
+        Assert.Equal(1, oh!.Current.Count);
+        Assert.Equal(new Z64(4), oh!.Current.WeightOf("6"));
+    }
+
+    [Fact]
+    public void MapFilterRows_AccumulatesCollidingOutputs()
+    {
+        InputHandle<ZSet<int, Z64>>? ih = null;
+        OutputHandle<ZSet<string, Z64>>? oh = null;
+        var c = RootCircuit.Build(b =>
+        {
+            var (h, s) = b.ZSetInput<int, Z64>();
+            ih = h;
+
+            // Distinct inputs collapse to the same output key — weights must add.
+            var fused = b.MapFilterRows<int, string, Z64>(
+                s, x => (true, (x % 2).ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            oh = b.Output(fused);
+        });
+
+        ih!.Push(ZSet.FromEntries(new[] { (1, new Z64(2)), (3, new Z64(5)), (2, new Z64(4)) }));
+        c.Step();
+
+        Assert.Equal(new Z64(7), oh!.Current.WeightOf("1")); // 1 and 3
+        Assert.Equal(new Z64(4), oh!.Current.WeightOf("0")); // 2
+    }
+
+    [Fact]
+    public void MapFilterRows_EquivalentToStagedFilterThenMap()
+    {
+        // A fused map+filter must equal the staged Filter→MapRows chain on any
+        // input — the soundness guarantee the SQL compiler relies on.
+        static (bool, string) Step(string k) =>
+            k == "a" ? (false, string.Empty) : (true, k.ToUpperInvariant());
+
+        GenZSet.Sample(z =>
+        {
+            var fused = RunThroughBuilder(z, (b, s, emit) =>
+                emit(b.MapFilterRows<string, string, Z64>(s, Step)));
+            var staged = RunThroughBuilder(z, (b, s, emit) =>
+                emit(b.MapRows(b.Filter(s, k => k != "a"), k => k.ToUpperInvariant())));
+            return fused.Equals(staged);
+        });
+    }
+
     // --- Linearity laws: Q(a + b) = Q(a) + Q(b) and Q(n·a) = n·Q(a) ---
 
     private static ZSet<string, Z64> RunThroughBuilder(
