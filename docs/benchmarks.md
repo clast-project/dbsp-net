@@ -13,10 +13,21 @@ Pipelined filter over a flat table. No stateful operators — the per-update cos
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 148.5 µs | 1.80 µs | 82.5× |
-|       1000 | 1.24 ms | 2.00 µs | 620× |
-|      10000 | 8.17 ms | 1.70 µs | 4807× |
-|     100000 | 107.71 ms | 1.90 µs | 56689× |
+|        100 | 132.1 µs | 1.60 µs | 82.6× |
+|       1000 | 1.20 ms | 1.70 µs | 705× |
+|      10000 | 10.27 ms | 1.50 µs | 6849× |
+|     100000 | 76.38 ms | 1.00 µs | 76377× |
+
+## Operator fusion — `map → filter → map` chain
+
+A three-stage linear chain (`MapRows` → `Filter` → `MapRows`) wired as three separate operators versus folded into one `MapFilterRows` pass — the pre- and post-fusion shapes for a run of adjacent Filter/Project plan nodes. Rows are `StructuralRow`s built as the structural compile path builds them; the filter keeps ~half the rows. Each step pushes the same N-row batch through the stateless chain. **Latency** is the median per-step time; **alloc/step** is bytes allocated per step (the unfused chain allocates an intermediate Z-set per stage plus a row for every input at the first map, before the filter can drop it).
+
+| N (batch)  | Unfused       | Fused          | Speedup | Unfused alloc | Fused alloc | Alloc saved |
+|-----------:|--------------:|---------------:|--------:|--------------:|------------:|------------:|
+|        100 | 27.70 µs | 10.20 µs | 2.72× |   33.1 KB |    9.2 KB | 72% |
+|       1000 | 172.50 µs | 75.60 µs | 2.28× |  334.4 KB |   93.9 KB | 72% |
+|      10000 | 1.23 ms | 303.20 µs | 4.05× |    3.1 MB |  909.6 KB | 72% |
+|     100000 | 47.85 ms | 10.42 ms | 4.59× |   29.6 MB |    8.5 MB | 71% |
 
 ## Multi-aggregate — `SUM / COUNT / MIN / MAX` over 100 groups
 
@@ -24,10 +35,10 @@ Stateful composite aggregator with retractions on every group-key hit. All four 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 386.6 µs | 7.30 µs | 53.0× |
-|       1000 | 2.33 ms | 9.40 µs | 248× |
-|      10000 | 13.24 ms | 15.10 µs | 877× |
-|     100000 | 137.83 ms | 48.90 µs | 2819× |
+|        100 | 196.3 µs | 3.80 µs | 51.7× |
+|       1000 | 1.10 ms | 4.70 µs | 234× |
+|      10000 | 13.12 ms | 9.40 µs | 1395× |
+|     100000 | 138.61 ms | 18.50 µs | 7492× |
 
 ## Joined GROUP BY — `SUM(amount)` per region over `orders ⋈ customers`
 
@@ -35,10 +46,10 @@ Inner join feeding a SUM aggregator. Per-update cost = probing the fixed custome
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 196.3 µs | 7.10 µs | 27.6× |
-|       1000 | 1.47 ms | 16.60 µs | 88.6× |
-|      10000 | 8.96 ms | 71.20 µs | 126× |
-|     100000 | 53.87 ms | 102.30 µs | 527× |
+|        100 | 183.0 µs | 7.00 µs | 26.1× |
+|       1000 | 1.27 ms | 15.80 µs | 80.3× |
+|      10000 | 6.74 ms | 63.30 µs | 106× |
+|     100000 | 58.32 ms | 102.10 µs | 571× |
 
 ## Joined GROUP BY — flat vs spine trace family
 
@@ -46,10 +57,10 @@ The same query and data as the Joined GROUP BY benchmark above, compiled once on
 
 | N          | Flat batch    | Flat incr      | Spine batch   | Spine incr     | Spine incr vs flat |
 |-----------:|--------------:|---------------:|--------------:|---------------:|-------------------:|
-|        100 | 200.5 µs | 6.80 µs | 202.5 µs | 10.60 µs | 1.56× |
-|       1000 | 1.16 ms | 14.60 µs | 1.87 ms | 23.10 µs | 1.58× |
-|      10000 | 7.37 ms | 65.50 µs | 19.56 ms | 79.60 µs | 1.22× |
-|     100000 | 54.37 ms | 64.00 µs | 98.47 ms | 96.20 µs | 1.50× |
+|        100 | 180.3 µs | 6.70 µs | 236.7 µs | 17.80 µs | 2.66× |
+|       1000 | 1.08 ms | 14.40 µs | 1.65 ms | 46.10 µs | 3.20× |
+|      10000 | 9.26 ms | 65.40 µs | 10.29 ms | 141.80 µs | 2.17× |
+|     100000 | 51.91 ms | 64.50 µs | 75.49 ms | 126.10 µs | 1.96× |
 
 ## Joined GROUP BY (nullable `amount`) — same query shape
 
@@ -57,10 +68,10 @@ Identical query to Benchmark 3, but `orders.amount` is nullable and ~10% of inpu
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 201.0 µs | 6.10 µs | 33.0× |
-|       1000 | 1.47 ms | 15.60 µs | 94.1× |
-|      10000 | 7.92 ms | 64.30 µs | 123× |
-|     100000 | 69.97 ms | 53.10 µs | 1318× |
+|        100 | 182.2 µs | 5.80 µs | 31.4× |
+|       1000 | 1.43 ms | 14.90 µs | 95.9× |
+|      10000 | 9.62 ms | 65.20 µs | 147× |
+|     100000 | 60.22 ms | 72.70 µs | 828× |
 
 ## Joined GROUP BY (`EmittedEqualityCodec`) — same query shape
 
@@ -68,10 +79,10 @@ Identical query and circuit shape as the preceding Joined GROUP BY benchmark, bu
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 261.8 µs | 6.50 µs | 40.3× |
-|       1000 | 2.17 ms | 5.80 µs | 373× |
-|      10000 | 19.63 ms | 15.60 µs | 1258× |
-|     100000 | 89.73 ms | 23.50 µs | 3818× |
+|        100 | 268.5 µs | 5.80 µs | 46.3× |
+|       1000 | 2.42 ms | 9.90 µs | 245× |
+|      10000 | 23.75 ms | 32.60 µs | 728× |
+|     100000 | 82.00 ms | 19.60 µs | 4184× |
 
 ## Joined GROUP BY (typed rows, hand-wired) — same query shape
 
@@ -79,10 +90,10 @@ Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 99.6 µs | 4.30 µs | 23.2× |
-|       1000 | 946.9 µs | 12.90 µs | 73.4× |
-|      10000 | 3.77 ms | 45.90 µs | 82.2× |
-|     100000 | 12.78 ms | 66.80 µs | 191× |
+|        100 | 99.7 µs | 4.20 µs | 23.7× |
+|       1000 | 827.2 µs | 10.70 µs | 77.3× |
+|      10000 | 3.42 ms | 43.40 µs | 78.8× |
+|     100000 | 12.25 ms | 56.40 µs | 217× |
 
 ## Transitive closure — recursive CTE over a path graph
 
@@ -90,10 +101,10 @@ Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|         50 | 23.02 ms | 344.40 µs | 66.8× |
-|        100 | 162.29 ms | 479.30 µs | 339× |
-|        200 | 2.16 s | 1.53 ms | 1408× |
-|        500 | 33.84 s | 11.96 ms | 2831× |
+|         50 | 4.14 ms | 212.20 µs | 19.5× |
+|        100 | 27.33 ms | 635.00 µs | 43.0× |
+|        200 | 186.54 ms | 10.97 ms | 17.0× |
+|        500 | 3.62 s | 31.83 ms | 114× |
 
 ## Pure-trace microbench — `ZSetTrace` vs `SpineZSetTrace`
 
@@ -101,22 +112,22 @@ Direct comparison between the flat in-place trace and the LSM-style `SpineZSetTr
 
 | N          | Op                 | Flat        | Spine(N=4)  | Spine(N=2)  |
 |-----------:|:-------------------|------------:|------------:|------------:|
-|       1000 | WeightOf(present)  | 30.9 ns | 321.3 ns | 278.8 ns |
-|       1000 | WeightOf(absent)   | 18.0 ns | 242.3 ns | 217.6 ns |
-|       1000 | Integrate(1)       | 200.0 ns | 600.0 ns | 1.10 µs |
-|       1000 | Integrate(100)     | 14.70 µs | 15.60 µs | 17.20 µs |
-|      10000 | WeightOf(present)  | 25.8 ns | 264.5 ns | 300.4 ns |
-|      10000 | WeightOf(absent)   | 15.5 ns | 214.2 ns | 236.8 ns |
-|      10000 | Integrate(1)       | 200.0 ns | 600.0 ns | 1.20 µs |
-|      10000 | Integrate(100)     | 12.30 µs | 14.30 µs | 6.40 µs |
-|     100000 | WeightOf(present)  | 4.0 ns | 67.4 ns | 66.1 ns |
-|     100000 | WeightOf(absent)   | 2.7 ns | 35.8 ns | 31.2 ns |
-|     100000 | Integrate(1)       | 100.0 ns | 200.0 ns | 500.0 ns |
-|     100000 | Integrate(100)     | 1.30 µs | 4.30 µs | 2.70 µs |
-|    1000000 | WeightOf(present)  | 3.2 ns | 99.7 ns | 102.0 ns |
-|    1000000 | WeightOf(absent)   | 2.8 ns | 84.8 ns | 85.0 ns |
-|    1000000 | Integrate(1)       | 100.0 ns | 300.0 ns | 500.0 ns |
-|    1000000 | Integrate(100)     | 1.20 µs | 1.90 µs | 2.60 µs |
+|       1000 | WeightOf(present)  | 29.4 ns | 326.5 ns | 281.4 ns |
+|       1000 | WeightOf(absent)   | 17.2 ns | 246.8 ns | 214.5 ns |
+|       1000 | Integrate(1)       | 200.0 ns | 500.0 ns | 1.10 µs |
+|       1000 | Integrate(100)     | 14.60 µs | 15.60 µs | 16.90 µs |
+|      10000 | WeightOf(present)  | 25.7 ns | 268.0 ns | 296.6 ns |
+|      10000 | WeightOf(absent)   | 14.3 ns | 204.6 ns | 232.0 ns |
+|      10000 | Integrate(1)       | 200.0 ns | 600.0 ns | 1.10 µs |
+|      10000 | Integrate(100)     | 12.20 µs | 13.70 µs | 14.50 µs |
+|     100000 | WeightOf(present)  | 2.9 ns | 64.9 ns | 67.7 ns |
+|     100000 | WeightOf(absent)   | 2.4 ns | 33.0 ns | 29.9 ns |
+|     100000 | Integrate(1)       | 100.0 ns | 200.0 ns | 400.0 ns |
+|     100000 | Integrate(100)     | 1.40 µs | 1.50 µs | 2.00 µs |
+|    1000000 | WeightOf(present)  | 3.2 ns | 100.2 ns | 104.8 ns |
+|    1000000 | WeightOf(absent)   | 2.4 ns | 86.6 ns | 81.2 ns |
+|    1000000 | Integrate(1)       | 100.0 ns | 200.0 ns | 400.0 ns |
+|    1000000 | Integrate(100)     | 1.30 µs | 1.50 µs | 2.00 µs |
 
 ## Pure-trace microbench — `IndexedZSetTrace` vs `SpineIndexedZSetTrace`
 
@@ -124,37 +135,37 @@ Same shape, against the indexed trace that `IncrementalAggregateOp` and the join
 
 | N          | Op                 | Flat        | Spine(N=4)  | Spine(N=2)  |
 |-----------:|:-------------------|------------:|------------:|------------:|
-|       1000 | GroupFor(present)  | 6.3 ns | 438.4 ns | 389.1 ns |
-|       1000 | GroupFor(absent)   | 6.5 ns | 250.7 ns | 244.3 ns |
-|       1000 | Integrate(1)       | 200.0 ns | 700.0 ns | 1.30 µs |
-|       1000 | Integrate(100)     | 12.70 µs | 31.20 µs | 34.50 µs |
-|      10000 | GroupFor(present)  | 6.3 ns | 364.9 ns | 387.8 ns |
-|      10000 | GroupFor(absent)   | 6.4 ns | 228.5 ns | 34.6 ns |
-|      10000 | Integrate(1)       | 200.0 ns | 300.0 ns | 600.0 ns |
-|      10000 | Integrate(100)     | 6.30 µs | 16.70 µs | 9.30 µs |
-|     100000 | GroupFor(present)  | 6.3 ns | 126.6 ns | 135.7 ns |
-|     100000 | GroupFor(absent)   | 3.1 ns | 45.6 ns | 37.1 ns |
-|     100000 | Integrate(1)       | 100.0 ns | 400.0 ns | 600.0 ns |
-|     100000 | Integrate(100)     | 4.60 µs | 7.40 µs | 9.30 µs |
-|    1000000 | GroupFor(present)  | 2.9 ns | 175.8 ns | 167.7 ns |
-|    1000000 | GroupFor(absent)   | 1.8 ns | 91.9 ns | 93.5 ns |
+|       1000 | GroupFor(present)  | 35.2 ns | 420.6 ns | 372.2 ns |
+|       1000 | GroupFor(absent)   | 23.1 ns | 250.9 ns | 232.4 ns |
+|       1000 | Integrate(1)       | 300.0 ns | 800.0 ns | 1.20 µs |
+|       1000 | Integrate(100)     | 16.10 µs | 31.60 µs | 34.50 µs |
+|      10000 | GroupFor(present)  | 26.2 ns | 356.8 ns | 392.4 ns |
+|      10000 | GroupFor(absent)   | 24.7 ns | 275.3 ns | 212.5 ns |
+|      10000 | Integrate(1)       | 100.0 ns | 300.0 ns | 500.0 ns |
+|      10000 | Integrate(100)     | 6.20 µs | 16.40 µs | 9.50 µs |
+|     100000 | GroupFor(present)  | 10.6 ns | 131.9 ns | 130.2 ns |
+|     100000 | GroupFor(absent)   | 3.0 ns | 46.7 ns | 37.1 ns |
+|     100000 | Integrate(1)       | 100.0 ns | 300.0 ns | 600.0 ns |
+|     100000 | Integrate(100)     | 4.50 µs | 5.90 µs | 8.90 µs |
+|    1000000 | GroupFor(present)  | 2.8 ns | 167.5 ns | 167.7 ns |
+|    1000000 | GroupFor(absent)   | 1.8 ns | 101.6 ns | 88.2 ns |
 |    1000000 | Integrate(1)       | 100.0 ns | 400.0 ns | 600.0 ns |
-|    1000000 | Integrate(100)     | 4.50 µs | 5.80 µs | 7.20 µs |
+|    1000000 | Integrate(100)     | 14.10 µs | 6.00 µs | 7.10 µs |
 ## DistinctOp — flat vs spine (per-Step latency)
 
 Per-step latency of `DistinctOp` and `SpineDistinctOp` after the trace is pre-loaded with N distinct integer keys. Three delta shapes: a single **new key** (probe miss + integrate), a single **existing key** at +1 (probe hit + no-op integrate), and a **bulk-10** delta of mixed new + existing keys (probe + integrate work scaled 10×, swamping the per-step overhead that obscures the trace cost in singleton-delta measurements). Spine variants are tiered with 4 batches per level (default) and 2 batches per level (leveled-like).
 
 | N          | Op           | Flat        | Spine(N=4)  | Spine(N=2)  | Spine(4) vs Flat |
 |-----------:|:-------------|------------:|------------:|------------:|-----------------:|
-|       1000 | new key      | 100.0 ns | 400.0 ns | 600.0 ns | 4.00× |
-|       1000 | existing key | 100.0 ns | 400.0 ns | 600.0 ns | 4.00× |
-|       1000 | bulk-10 mixed | 600.0 ns | 1.50 µs | 1.70 µs | 2.50× |
-|      10000 | new key      | 200.0 ns | 400.0 ns | 600.0 ns | 2.00× |
-|      10000 | existing key | 200.0 ns | 400.0 ns | 600.0 ns | 2.00× |
-|      10000 | bulk-10 mixed | 600.0 ns | 1.60 µs | 2.00 µs | 2.67× |
-|     100000 | new key      | 200.0 ns | 400.0 ns | 700.0 ns | 2.00× |
-|     100000 | existing key | 200.0 ns | 500.0 ns | 700.0 ns | 2.50× |
-|     100000 | bulk-10 mixed | 400.0 ns | 1.50 µs | 1.70 µs | 3.75× |
+|       1000 | new key      | 200.0 ns | 400.0 ns | 600.0 ns | 2.00× |
+|       1000 | existing key | 200.0 ns | 400.0 ns | 600.0 ns | 2.00× |
+|       1000 | bulk-10 mixed | 700.0 ns | 1.40 µs | 1.70 µs | 2.00× |
+|      10000 | new key      | 200.0 ns | 400.0 ns | 700.0 ns | 2.00× |
+|      10000 | existing key | 200.0 ns | 500.0 ns | 700.0 ns | 2.50× |
+|      10000 | bulk-10 mixed | 700.0 ns | 1.70 µs | 1.80 µs | 2.43× |
+|     100000 | new key      | 200.0 ns | 500.0 ns | 700.0 ns | 2.50× |
+|     100000 | existing key | 100.0 ns | 400.0 ns | 700.0 ns | 4.00× |
+|     100000 | bulk-10 mixed | 300.0 ns | 1.50 µs | 1.80 µs | 5.00× |
 ## Interpretation
 
 The number to read is the **Speedup** column — how many times faster an incremental update is than a cold recompute. Absolute numbers vary by host; the shape of the curve is the interesting signal.
@@ -162,6 +173,7 @@ The number to read is the **Speedup** column — how many times faster an increm
 ### What went well
 
 - **Filter** matches the ideal shape exactly: batch scales linearly in N, incremental stays sub-microsecond regardless of N. Speedup grows ~linearly, and by 100k rows the incremental path is ~5 orders of magnitude faster. This is the easy case — a pipelined stateless operator, no trace to maintain.
+- **Operator fusion** turns a `map → filter → map` chain from three operators (each materializing an intermediate Z-set, and the first map allocating a row for every input before the filter can drop it) into one `MapFilterRows` pass. The result is a flat ~2–4.5× per-step speedup and a steady ~72% drop in bytes allocated per step, independent of N — the fused pass allocates one output Z-set and builds a row only for the survivors. This is what the SQL compiler now emits for any run of adjacent Filter/Project plan nodes, on both the structural and typed paths.
 - **Transitive closure** shows the quadratic-speedup shape the DBSP paper advertises: batch is ~O(n³) (n semi-naïve iterations × n² closure size at convergence), incremental is O(n) for one leaf-edge insertion, so speedup grows quadratically. By N=500 edges incremental is ~2500× faster.
 
 ### Where the curves end up

@@ -37,6 +37,7 @@ output.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCoun
 output.AppendLine();
 
 RunFilterBenchmark(output);
+FusionBenchmark.Run(output);
 RunMultiAggregateBenchmark(output);
 RunJoinedGroupByBenchmark(output);
 RunJoinedGroupBySpineBenchmark(output);
@@ -725,6 +726,15 @@ static void AppendInterpretation(StringBuilder output)
         "incremental stays sub-microsecond regardless of N. Speedup grows ~linearly, " +
         "and by 100k rows the incremental path is ~5 orders of magnitude faster. " +
         "This is the easy case — a pipelined stateless operator, no trace to maintain.");
+    output.AppendLine(
+        "- **Operator fusion** turns a `map → filter → map` chain from three " +
+        "operators (each materializing an intermediate Z-set, and the first map " +
+        "allocating a row for every input before the filter can drop it) into one " +
+        "`MapFilterRows` pass. The result is a flat ~2–4.5× per-step speedup and a " +
+        "steady ~72% drop in bytes allocated per step, independent of N — the fused " +
+        "pass allocates one output Z-set and builds a row only for the survivors. " +
+        "This is what the SQL compiler now emits for any run of adjacent " +
+        "Filter/Project plan nodes, on both the structural and typed paths.");
     output.AppendLine(
         "- **Transitive closure** shows the quadratic-speedup shape the DBSP paper " +
         "advertises: batch is ~O(n³) (n semi-naïve iterations × n² closure size at " +
