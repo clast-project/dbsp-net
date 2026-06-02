@@ -664,6 +664,9 @@ public static class PlanToCircuit
                 case PartitionedTopKPlan pt:
                     Walk(pt.Input);
                     break;
+                case WindowAggregatePlan wa:
+                    Walk(wa.Input);
+                    break;
                 case DifferencePlan diff:
                     Walk(diff.Left);
                     Walk(diff.Right);
@@ -774,6 +777,9 @@ public static class PlanToCircuit
 
             case PartitionedTopKPlan pt:
                 return CompilePartitionedTopK(builder, pt, ctx);
+
+            case WindowAggregatePlan wa:
+                return CompileWindowAggregate(builder, wa, ctx);
 
             default:
                 throw new InvalidOperationException($"unsupported plan node {plan.GetType().Name}");
@@ -902,6 +908,139 @@ public static class PlanToCircuit
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
         return builder.PartitionedTopK<StructuralRow, StructuralRow>(
             input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec);
+    }
+
+    // ---- Window aggregates (agg(x) OVER (PARTITION BY p [ORDER BY o RANGE …])) ----
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompileWindowAggregate(
+        CircuitBuilder builder,
+        WindowAggregatePlan plan,
+        CompileContext ctx)
+    {
+        var input = CompilePlan(builder, plan.Input, ctx);
+
+        // Partition key: project the PARTITION BY expressions into a StructuralRow
+        // (an empty list ⇒ a single global partition).
+        var partitionExtractors = new Func<IReadOnlyList<object?>, object?>[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            partitionExtractors[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
+        }
+
+        StructuralRow PartitionOf(StructuralRow row)
+        {
+            var values = new object?[partitionExtractors.Length];
+            for (var i = 0; i < partitionExtractors.Length; i++)
+            {
+                values[i] = partitionExtractors[i](row);
+            }
+
+            return new StructuralRow(values);
+        }
+
+        IComparer<StructuralRow> order;
+        Func<StructuralRow, long>? orderValueOf = null;
+        var descending = false;
+        if (plan.OrderKey is { } sk)
+        {
+            var scalar = ExpressionCompiler.CompileScalar(sk.Expression);
+            var keys = new Func<StructuralRow, object?>[] { row => scalar(row) };
+            var desc = new[] { sk.Descending };
+            var nullsFirst = new[] { sk.NullsFirst };
+            descending = sk.Descending;
+            order = new SortKeyComparer<StructuralRow>(keys, desc, nullsFirst, StructuralRowComparer.Instance);
+
+            // Ordered frames (running and bounded) use the numeric order value for
+            // the RANGE arithmetic; the resolver constrains the key to an integer
+            // or temporal type. A NULL key sorts to the low end of the value space.
+            orderValueOf = row => scalar(row) is { } v ? MonotoneKey.Extract(v) : long.MinValue;
+        }
+        else
+        {
+            // Whole-partition frame: ordering is irrelevant, but the per-partition
+            // store still needs a deterministic total order over distinct rows.
+            order = StructuralRowComparer.Instance;
+        }
+
+        // Build the composite aggregator over the result columns (the frame
+        // multiset is handed to it per row).
+        var aggs = new SqlAggregator[plan.Aggregates.Count];
+        var aggColumns = new SchemaColumn[plan.Aggregates.Count];
+        for (var i = 0; i < plan.Aggregates.Count; i++)
+        {
+            aggs[i] = BuildSqlAggregator(plan.Aggregates[i]);
+            aggColumns[i] = new SchemaColumn("$wagg" + i, plan.Aggregates[i].ResultType);
+        }
+
+        var composite = new CompositeAggregator(aggs, ctx.Codec, new Schema(aggColumns));
+
+        // Snapshot codec for the per-partition integrated input (base rows).
+        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
+
+        var frontier = ResolveWindowFrontier(plan, ctx);
+
+        return builder.PartitionedWindowAggregate<StructuralRow>(
+            input,
+            PartitionOf,
+            order,
+            orderValueOf,
+            plan.Frame?.Preceding,
+            descending,
+            composite,
+            plan.Aggregates.Count,
+            partitionComparer: null,
+            snapshotCodec: codec,
+            frontier: frontier);
+    }
+
+    /// <summary>
+    /// The GC frontier for a bounded ascending RANGE frame whose ORDER BY key is a
+    /// monotone base column (a LATENESS column or a temporal-filter watermark).
+    /// Rows whose order value falls below <c>frontier − preceding</c> can never
+    /// enter a future row's backward frame, so the operator drops them. Returns
+    /// <c>null</c> (no GC) for running / whole-partition frames, descending order,
+    /// a non-column order key, or an order key with no (full) frontier — all sound,
+    /// just unbounded.
+    /// </summary>
+    private static IFrontier? ResolveWindowFrontier(WindowAggregatePlan plan, CompileContext ctx)
+    {
+        if (plan.Frame?.Preceding is null || plan.OrderKey is not { } sk || sk.Descending)
+        {
+            return null;
+        }
+
+        if (sk.Expression is not ResolvedColumn col)
+        {
+            return null; // GC only for a bare monotone column in v1.
+        }
+
+        var sources = ctx.Monotonicity.Sources(plan.Input, col.Index);
+        if (sources is not { Count: > 0 })
+        {
+            return null;
+        }
+
+        var frontiers = new List<IFrontier>(sources.Count);
+        foreach (var source in sources)
+        {
+            if (ctx.Frontiers.TryGetValue(source, out var f))
+            {
+                frontiers.Add(f);
+            }
+        }
+
+        if (frontiers.Count != sources.Count)
+        {
+            return null; // a partial frontier set would be unsound.
+        }
+
+        IFrontier frontier = frontiers.Count == 1 ? frontiers[0] : new MinFrontier(frontiers);
+        if (ctx.Monotonicity.FrontierTransform(plan.Input, col.Index) is { } transform)
+        {
+            frontier = new TransformedFrontier(frontier, transform);
+        }
+
+        return frontier;
     }
 
     // ---- Projection ----

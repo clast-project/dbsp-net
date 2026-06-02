@@ -1667,6 +1667,13 @@ public sealed class Parser
             {
                 Advance();
                 Expect(TokenKind.RParen);
+                if (IsContextualKeyword("over"))
+                {
+                    Advance();
+                    return new WindowFunctionExpression(
+                        first.Text, Array.Empty<Expression>(), IsStar: true, ParseWindowSpec());
+                }
+
                 return new FunctionCallExpression(first.Text, Array.Empty<Expression>(), IsStar: true);
             }
 
@@ -1712,14 +1719,16 @@ public sealed class Parser
                 return BuildDecodeExpression(args, first);
             }
 
-            // A trailing OVER (...) turns the call into a window function. Only
-            // the ranking functions are supported (see WindowFunctionExpression);
-            // any others are caught and rejected at resolve time. OVER takes no
-            // arguments here (RANK/ROW_NUMBER/DENSE_RANK), so `args` is discarded.
+            // A trailing OVER (...) turns the call into a window function. The
+            // ranking functions (RANK/ROW_NUMBER/DENSE_RANK, no args) ride the
+            // TOP-K pattern; the aggregate functions (SUM/COUNT/AVG/MIN/MAX,
+            // with an argument) ride the window-aggregate path. The resolver
+            // routes each and rejects anything else. `args` is carried so the
+            // window-aggregate resolver can read the aggregate argument.
             if (IsContextualKeyword("over"))
             {
                 Advance();
-                return new WindowFunctionExpression(first.Text, ParseWindowSpec());
+                return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseWindowSpec());
             }
 
             return new FunctionCallExpression(first.Text, args, IsStar: false);
@@ -1768,8 +1777,106 @@ public sealed class Parser
             orderBy = items;
         }
 
+        var frame = ParseWindowFrameOrNull();
+
         Expect(TokenKind.RParen);
-        return new WindowSpec(partitionBy, orderBy);
+        return new WindowSpec(partitionBy, orderBy, frame);
+    }
+
+    /// <summary>
+    /// Parse an optional window frame clause —
+    /// <c>{RANGE|ROWS|GROUPS} {BETWEEN start AND end | start}</c>. The framing
+    /// keywords (<c>RANGE</c>, <c>GROUPS</c>, <c>PRECEDING</c>, <c>FOLLOWING</c>,
+    /// <c>UNBOUNDED</c>, <c>CURRENT</c>) are contextual; <c>ROWS</c>/<c>ROW</c>/
+    /// <c>BETWEEN</c>/<c>AND</c> are reserved tokens. The single-bound form
+    /// <c>RANGE start</c> implies an end bound of <c>CURRENT ROW</c>. Returns
+    /// <c>null</c> when no frame clause is present.
+    /// </summary>
+    private WindowFrame? ParseWindowFrameOrNull()
+    {
+        WindowFrameMode mode;
+        if (IsContextualKeyword("range"))
+        {
+            mode = WindowFrameMode.Range;
+            Advance();
+        }
+        else if (Peek().Kind == TokenKind.Rows)
+        {
+            mode = WindowFrameMode.Rows;
+            Advance();
+        }
+        else if (IsContextualKeyword("groups"))
+        {
+            mode = WindowFrameMode.Groups;
+            Advance();
+        }
+        else
+        {
+            return null;
+        }
+
+        if (Peek().Kind == TokenKind.Between)
+        {
+            Advance();
+            var start = ParseFrameBound();
+            Expect(TokenKind.And);
+            var end = ParseFrameBound();
+            return new WindowFrame(mode, start, end);
+        }
+
+        // Single-bound shorthand: the lone bound is the start; the end is
+        // implicitly CURRENT ROW.
+        var only = ParseFrameBound();
+        return new WindowFrame(mode, only, new FrameBound(FrameBoundKind.CurrentRow, null));
+    }
+
+    /// <summary>
+    /// Parse one window-frame bound — <c>UNBOUNDED PRECEDING</c>,
+    /// <c>UNBOUNDED FOLLOWING</c>, <c>CURRENT ROW</c>, or
+    /// <c>&lt;offset&gt; {PRECEDING|FOLLOWING}</c> (the offset is a constant or
+    /// <c>INTERVAL</c> literal).
+    /// </summary>
+    private FrameBound ParseFrameBound()
+    {
+        if (IsContextualKeyword("unbounded"))
+        {
+            Advance();
+            if (IsContextualKeyword("preceding"))
+            {
+                Advance();
+                return new FrameBound(FrameBoundKind.UnboundedPreceding, null);
+            }
+
+            if (IsContextualKeyword("following"))
+            {
+                Advance();
+                return new FrameBound(FrameBoundKind.UnboundedFollowing, null);
+            }
+
+            throw Error(Peek(), $"expected PRECEDING or FOLLOWING after UNBOUNDED, got {Describe(Peek())}");
+        }
+
+        if (IsContextualKeyword("current"))
+        {
+            Advance();
+            Expect(TokenKind.Row);
+            return new FrameBound(FrameBoundKind.CurrentRow, null);
+        }
+
+        var offset = ParseExpression();
+        if (IsContextualKeyword("preceding"))
+        {
+            Advance();
+            return new FrameBound(FrameBoundKind.Preceding, offset);
+        }
+
+        if (IsContextualKeyword("following"))
+        {
+            Advance();
+            return new FrameBound(FrameBoundKind.Following, offset);
+        }
+
+        throw Error(Peek(), $"expected PRECEDING or FOLLOWING after frame offset, got {Describe(Peek())}");
     }
 
     /// <summary>A non-reserved word matched by text in a position where it acts

@@ -175,6 +175,15 @@ public sealed class Resolver
             return partitioned;
         }
 
+        // Window aggregates (SUM/COUNT/AVG/MIN/MAX OVER (...) emitted as output
+        // columns). Recognised before normal resolution: the pre-window relation
+        // (FROM + WHERE) is resolved as a star query, this node widens each row
+        // with the aggregate result(s), and a projection maps the select list.
+        if (TryResolveWindowAggregate(stmt, scope, outerSchema) is { } windowed)
+        {
+            return windowed;
+        }
+
         // FROM
         var plan = ResolveFrom(stmt.From, scope, outerSchema);
 
@@ -1183,6 +1192,358 @@ public sealed class Resolver
 
         return augmented;
     }
+
+    /// <summary>
+    /// Recognise window aggregates — <c>SUM/COUNT/AVG/MIN/MAX(x) OVER
+    /// (PARTITION BY p [ORDER BY o [RANGE …]])</c> appearing as top-level select
+    /// items — and lower them to a <see cref="WindowAggregatePlan"/> followed by a
+    /// projection that maps the user's select list. Returns <c>null</c> when the
+    /// query has no window function at all (ordinary resolution proceeds); throws
+    /// a <see cref="ResolveException"/> when a window function is present but used
+    /// outside the supported shape.
+    /// </summary>
+    /// <remarks>
+    /// The pre-window relation (<c>FROM</c> + <c>WHERE</c>) is resolved as a star
+    /// query, so partition / order / argument expressions resolve against the full
+    /// source schema and the operator can widen each row. Standard SQL evaluates
+    /// window functions after <c>WHERE</c> and before <c>ORDER BY</c> / <c>LIMIT</c>
+    /// (the latter ride the enclosing <c>OrderLimitQuery</c>, so they wrap this
+    /// result naturally).
+    /// </remarks>
+    private LogicalPlan? TryResolveWindowAggregate(
+        SelectStatement stmt,
+        IReadOnlyDictionary<string, CteRef> scope,
+        Schema? outerSchema)
+    {
+        var windowItems = stmt.Items
+            .OfType<ExpressionSelectItem>()
+            .Where(it => it.Expression is WindowFunctionExpression)
+            .ToList();
+
+        var mentionedElsewhere =
+            (stmt.Where is not null && MentionsWindowFunction(stmt.Where))
+            || stmt.GroupBy.Any(MentionsWindowFunction)
+            || (stmt.Having is not null && MentionsWindowFunction(stmt.Having))
+            || stmt.Items.Any(it => it is ExpressionSelectItem esi
+                && esi.Expression is not WindowFunctionExpression
+                && MentionsWindowFunction(esi.Expression));
+
+        if (windowItems.Count == 0 && !mentionedElsewhere)
+        {
+            return null; // ordinary query — no window function anywhere.
+        }
+
+        if ((stmt.Where is not null && MentionsWindowFunction(stmt.Where))
+            || stmt.GroupBy.Any(MentionsWindowFunction)
+            || (stmt.Having is not null && MentionsWindowFunction(stmt.Having)))
+        {
+            throw new ResolveException("window functions are not allowed in WHERE / GROUP BY / HAVING");
+        }
+
+        if (stmt.Items.Any(it => it is ExpressionSelectItem esi
+            && esi.Expression is not WindowFunctionExpression
+            && MentionsWindowFunction(esi.Expression)))
+        {
+            throw new ResolveException(
+                "a window function must be a top-level select item in v1 (it cannot be nested in an expression)");
+        }
+
+        // Every top-level window item must be an aggregate function sharing one
+        // OVER specification (ranking functions ride the TOP-K pattern; LAG/LEAD/
+        // FIRST_VALUE/LAST_VALUE are deferred).
+        var firstWin = (WindowFunctionExpression)windowItems[0].Expression;
+        foreach (var wi in windowItems)
+        {
+            var w = (WindowFunctionExpression)wi.Expression;
+            if (!IsAggregateName(w.FunctionName, w.IsStar))
+            {
+                throw new ResolveException(
+                    $"window function '{w.FunctionName}' is not supported as an output column; only the " +
+                    "window aggregates SUM / COUNT / AVG / MIN / MAX are (ranking functions ROW_NUMBER / " +
+                    "RANK / DENSE_RANK are supported only in the TOP-K filter pattern; LAG / LEAD / " +
+                    "FIRST_VALUE / LAST_VALUE are deferred)");
+            }
+
+            if (!ReferenceEquals(w, firstWin) && !SameWindowSpec(firstWin.Over, w.Over))
+            {
+                throw new ResolveException(
+                    "all window aggregates in a query must share the same OVER specification in v1");
+            }
+        }
+
+        if (stmt.GroupBy.Count > 0 || stmt.Having is not null
+            || stmt.Items.Any(it => it is ExpressionSelectItem esi
+                && esi.Expression is not WindowFunctionExpression && HasAggregate(esi.Expression)))
+        {
+            throw new ResolveException(
+                "a window aggregate over a grouped / aggregated query is not supported in v1");
+        }
+
+        if (stmt.Items.Any(it => it is StarSelectItem))
+        {
+            throw new ResolveException(
+                "SELECT * is not allowed with a window aggregate; list the output columns explicitly");
+        }
+
+        // Resolve the pre-window relation (FROM + WHERE) as a star query so the
+        // partition / order / argument expressions resolve against the full
+        // source schema and the operator can compute them per row.
+        var baseQuery = new SelectStatement(
+            Items: new SelectItem[] { new StarSelectItem(null) },
+            From: stmt.From,
+            Where: stmt.Where,
+            GroupBy: System.Array.Empty<Expression>(),
+            Having: null,
+            Ctes: System.Array.Empty<CteDefinition>(),
+            Distinct: false);
+        var basePlan = ResolveQuery(baseQuery, scope, outerSchema);
+        var baseSchema = basePlan.Schema;
+
+        // PARTITION BY.
+        var partitionKeys = new List<ResolvedExpression>(firstWin.Over.PartitionBy.Count);
+        foreach (var p in firstWin.Over.PartitionBy)
+        {
+            partitionKeys.Add(ResolveScalarExpression(p, baseSchema));
+        }
+
+        // ORDER BY (a single key in v1) and the RANGE frame.
+        SortKey? orderKey = null;
+        WindowFrameBounds? frame = null;
+        if (firstWin.Over.OrderBy.Count > 0)
+        {
+            if (firstWin.Over.OrderBy.Count > 1)
+            {
+                throw new ResolveException(
+                    "a window aggregate supports a single ORDER BY key in v1");
+            }
+
+            var item = firstWin.Over.OrderBy[0];
+            var resolved = ResolveScalarExpression(item.Expression, baseSchema);
+            if (resolved.Type is not (SqlIntegerType or SqlBigintType or SqlDateType or SqlTimeType or SqlTimestampType))
+            {
+                throw new ResolveException(
+                    "an ordered window aggregate requires an integer (INT/BIGINT) or temporal " +
+                    "(DATE/TIME/TIMESTAMP) ORDER BY key in v1");
+            }
+
+            var descending = item.Direction == SortDirection.Descending;
+            var nullsFirst = item.Nulls switch
+            {
+                NullOrdering.NullsFirst => true,
+                NullOrdering.NullsLast => false,
+                _ => descending,
+            };
+            orderKey = new SortKey(resolved, descending, nullsFirst);
+            frame = ResolveWindowFrame(firstWin.Over.Frame, resolved.Type, baseSchema);
+        }
+        else if (firstWin.Over.Frame is not null)
+        {
+            throw new ResolveException("a window frame (RANGE) requires an ORDER BY");
+        }
+
+        // Aggregate calls + result columns (one per window item).
+        var aggregates = new List<AggregateCall>(windowItems.Count);
+        var resultCols = new List<SchemaColumn>(windowItems.Count);
+        var preBound = new Dictionary<Expression, ResolvedExpression>(ReferenceEqualityComparer.Instance);
+        for (var k = 0; k < windowItems.Count; k++)
+        {
+            var wi = windowItems[k];
+            var w = (WindowFunctionExpression)wi.Expression;
+            var asCall = new FunctionCallExpression(w.FunctionName, w.Arguments, w.IsStar);
+            var kind = ToAggregateKind(asCall);
+            ResolvedExpression? arg = null;
+            if (kind != AggregateKind.CountStar)
+            {
+                if (w.Arguments.Count != 1)
+                {
+                    throw new ResolveException(
+                        $"{w.FunctionName.ToUpperInvariant()} OVER takes exactly one argument");
+                }
+
+                arg = ResolveScalarExpression(w.Arguments[0], baseSchema);
+            }
+
+            var resultType = ComputeAggregateResultType(kind, arg?.Type);
+            aggregates.Add(new AggregateCall(kind, arg, resultType));
+
+            var (name, _) = DeriveProjectionName(w, wi.Alias);
+            resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$wagg{k}" : name), resultType));
+            preBound[wi.Expression] = new ResolvedColumn(baseSchema.Count + k, resultType);
+        }
+
+        var windowSchema = new Schema([.. baseSchema.Columns, .. resultCols]);
+        LogicalPlan windowPlan = new WindowAggregatePlan(
+            basePlan, partitionKeys, orderKey, frame, aggregates, windowSchema);
+
+        // Map the user's select list over the widened rows: non-window items
+        // resolve against the base columns (the schema prefix); window items
+        // resolve to their result column via `preBound`.
+        var projections = ResolveProjections(stmt.Items, windowSchema, subqueryMap: null, preBound);
+        LogicalPlan projected = new ProjectPlan(windowPlan, projections, BuildProjectSchema(projections));
+        return stmt.Distinct ? new DistinctPlan(projected) : projected;
+    }
+
+    /// <summary>Resolve a parsed window <see cref="WindowFrame"/> into
+    /// <see cref="WindowFrameBounds"/> (the lower bound in the ORDER BY key's
+    /// native units; the upper bound is always <c>CURRENT ROW</c> in v1). A
+    /// <c>null</c> frame defaults to <c>RANGE UNBOUNDED PRECEDING AND CURRENT
+    /// ROW</c> (a running aggregate).</summary>
+    private static WindowFrameBounds ResolveWindowFrame(WindowFrame? frame, SqlType orderType, Schema schema)
+    {
+        if (frame is null)
+        {
+            return new WindowFrameBounds(Preceding: null); // running (UNBOUNDED PRECEDING .. CURRENT ROW).
+        }
+
+        if (frame.Mode != WindowFrameMode.Range)
+        {
+            throw new ResolveException(
+                $"{frame.Mode.ToString().ToUpperInvariant()} frames are not supported in v1; only RANGE is");
+        }
+
+        if (frame.End.Kind != FrameBoundKind.CurrentRow)
+        {
+            throw new ResolveException(
+                "a window frame must end at CURRENT ROW in v1 (FOLLOWING / UNBOUNDED FOLLOWING bounds are deferred)");
+        }
+
+        return frame.Start.Kind switch
+        {
+            FrameBoundKind.UnboundedPreceding => new WindowFrameBounds(Preceding: null),
+            FrameBoundKind.CurrentRow => new WindowFrameBounds(Preceding: 0),
+            FrameBoundKind.Preceding => new WindowFrameBounds(
+                ResolveRangeOffset(frame.Start.Offset!, orderType, schema)),
+            _ => throw new ResolveException(
+                "a window frame start must be UNBOUNDED PRECEDING, <n> PRECEDING, or CURRENT ROW in v1"),
+        };
+    }
+
+    /// <summary>Evaluate a constant <c>PRECEDING</c> offset to a non-negative
+    /// <c>long</c> in <paramref name="orderType"/>'s native units — an integer for
+    /// <c>INT</c>/<c>BIGINT</c> keys, a day-time <c>INTERVAL</c> (µs, or whole days
+    /// for a <c>DATE</c> key) for temporal keys.</summary>
+    private static long ResolveRangeOffset(Expression offsetAst, SqlType orderType, Schema schema)
+    {
+        var resolved = ResolveScalarExpression(offsetAst, schema);
+        if (resolved is not ResolvedLiteral lit)
+        {
+            throw new ResolveException("a RANGE frame offset must be a constant");
+        }
+
+        switch (orderType)
+        {
+            case SqlDateType:
+                {
+                    if (lit.Value is not Interval iv || iv.Months != 0)
+                    {
+                        throw new ResolveException(
+                            "a RANGE frame over a DATE ORDER BY key requires a day-time INTERVAL offset " +
+                            "(month/year intervals are not a constant size)");
+                    }
+
+                    if (iv.Micros % Interval.MicrosPerDay != 0)
+                    {
+                        throw new ResolveException(
+                            "a RANGE frame offset over a DATE key must be a whole number of days");
+                    }
+
+                    return NonNegativeOffset(iv.Micros / Interval.MicrosPerDay);
+                }
+
+            case SqlTimestampType:
+            case SqlTimeType:
+                {
+                    if (lit.Value is not Interval iv || iv.Months != 0)
+                    {
+                        throw new ResolveException(
+                            "a RANGE frame over a TIMESTAMP/TIME ORDER BY key requires a day-time INTERVAL " +
+                            "offset (DAY / HOUR / MINUTE / SECOND)");
+                    }
+
+                    return NonNegativeOffset(iv.Micros);
+                }
+
+            case SqlIntegerType:
+            case SqlBigintType:
+                return lit.Value switch
+                {
+                    long n => NonNegativeOffset(n),
+                    int ni => NonNegativeOffset(ni),
+                    _ => throw new ResolveException(
+                        "a RANGE frame offset over an integer ORDER BY key must be an integer constant"),
+                };
+
+            default:
+                throw new ResolveException(
+                    "a bounded RANGE frame requires an integer (INT/BIGINT) or temporal (DATE/TIME/TIMESTAMP) " +
+                    "ORDER BY key");
+        }
+    }
+
+    private static long NonNegativeOffset(long v) =>
+        v >= 0 ? v : throw new ResolveException("a RANGE frame PRECEDING offset must be non-negative");
+
+    private static bool MentionsWindowFunction(Expression e) => e switch
+    {
+        WindowFunctionExpression => true,
+        BinaryExpression b => MentionsWindowFunction(b.Left) || MentionsWindowFunction(b.Right),
+        UnaryExpression u => MentionsWindowFunction(u.Operand),
+        IsNullExpression isn => MentionsWindowFunction(isn.Operand),
+        CastExpression c => MentionsWindowFunction(c.Operand),
+        FunctionCallExpression f => f.Arguments.Any(MentionsWindowFunction),
+        InListExpression il => MentionsWindowFunction(il.Probe) || il.Values.Any(MentionsWindowFunction),
+        CaseExpression ce =>
+            ce.Whens.Any(w => MentionsWindowFunction(w.Condition) || MentionsWindowFunction(w.Result))
+            || (ce.ElseResult is not null && MentionsWindowFunction(ce.ElseResult)),
+        _ => false,
+    };
+
+    /// <summary>Structural equality of two <see cref="WindowSpec"/>s — used to
+    /// require that all window aggregates in one query share a single OVER
+    /// specification (v1 emits one operator per query).</summary>
+    private static bool SameWindowSpec(WindowSpec a, WindowSpec b)
+    {
+        if (a.PartitionBy.Count != b.PartitionBy.Count || a.OrderBy.Count != b.OrderBy.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.PartitionBy.Count; i++)
+        {
+            if (!AstEqual(a.PartitionBy[i], b.PartitionBy[i]))
+            {
+                return false;
+            }
+        }
+
+        for (var i = 0; i < a.OrderBy.Count; i++)
+        {
+            if (a.OrderBy[i].Direction != b.OrderBy[i].Direction
+                || a.OrderBy[i].Nulls != b.OrderBy[i].Nulls
+                || !AstEqual(a.OrderBy[i].Expression, b.OrderBy[i].Expression))
+            {
+                return false;
+            }
+        }
+
+        return SameFrame(a.Frame, b.Frame);
+    }
+
+    private static bool SameFrame(WindowFrame? a, WindowFrame? b)
+    {
+        if (a is null || b is null)
+        {
+            return a is null && b is null;
+        }
+
+        return a.Mode == b.Mode
+            && SameBound(a.Start, b.Start)
+            && SameBound(a.End, b.End);
+    }
+
+    private static bool SameBound(FrameBound a, FrameBound b) =>
+        a.Kind == b.Kind
+        && ((a.Offset is null && b.Offset is null) || (a.Offset is not null && b.Offset is not null && AstEqual(a.Offset, b.Offset)));
 
     private static string KindName(SetOpKind k) => k switch
     {

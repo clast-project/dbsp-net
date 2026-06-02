@@ -213,6 +213,9 @@ public static class TypedPlanCompiler
         RecursiveCtePlan r => CompileRecursiveCte(r, ctx),
         TopKPlan t => CompileTopK(t, ctx),
         PartitionedTopKPlan pt => CompilePartitionedTopK(pt, ctx),
+        // Window aggregates widen rows to a new schema and use the structural
+        // CompositeAggregator; no typed fast path — fall back to structural.
+        WindowAggregatePlan => null,
         _ => null,
     };
 

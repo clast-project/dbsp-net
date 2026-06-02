@@ -117,31 +117,76 @@ public sealed record FunctionCallExpression(
     IReadOnlyList<Expression> Arguments,
     bool IsStar) : Expression;
 
+/// <summary>The framing mode of a window <see cref="WindowFrame"/>. Only
+/// <see cref="Range"/> is supported by the resolver in v1; <see cref="Rows"/> /
+/// <see cref="Groups"/> parse so the resolver can reject them with a precise
+/// message.</summary>
+public enum WindowFrameMode
+{
+    Range,
+    Rows,
+    Groups,
+}
+
+/// <summary>Which kind of window-frame bound.</summary>
+public enum FrameBoundKind
+{
+    UnboundedPreceding,
+    Preceding,
+    CurrentRow,
+    Following,
+    UnboundedFollowing,
+}
+
+/// <summary>
+/// One bound of a window frame. <see cref="Offset"/> carries the
+/// <c>PRECEDING</c> / <c>FOLLOWING</c> distance (a constant or <c>INTERVAL</c>
+/// literal) and is <c>null</c> for the <c>UNBOUNDED</c> and <c>CURRENT ROW</c>
+/// kinds.
+/// </summary>
+public sealed record FrameBound(FrameBoundKind Kind, Expression? Offset);
+
+/// <summary>
+/// A window frame clause — <c>{RANGE|ROWS|GROUPS} BETWEEN start AND end</c> (or
+/// the single-bound <c>RANGE start</c> shorthand, where <see cref="End"/> is
+/// <c>CURRENT ROW</c>).
+/// </summary>
+public sealed record WindowFrame(WindowFrameMode Mode, FrameBound Start, FrameBound End);
+
 /// <summary>
 /// The <c>OVER (...)</c> clause of a <see cref="WindowFunctionExpression"/>.
 /// <see cref="PartitionBy"/> may be empty (a single global partition);
 /// <see cref="OrderBy"/> reuses the same <see cref="SortItem"/> shape as a
-/// query-level <c>ORDER BY</c>.
+/// query-level <c>ORDER BY</c>; <see cref="Frame"/> is the optional frame clause
+/// (only meaningful with an <c>ORDER BY</c>).
 /// </summary>
 public sealed record WindowSpec(
     IReadOnlyList<Expression> PartitionBy,
-    IReadOnlyList<SortItem> OrderBy);
+    IReadOnlyList<SortItem> OrderBy,
+    WindowFrame? Frame = null);
 
 /// <summary>
-/// A ranking window-function call —
-/// <c>ROW_NUMBER() | RANK() | DENSE_RANK() OVER (PARTITION BY … ORDER BY …)</c>.
+/// A window-function call — <c>fn(args) OVER (PARTITION BY … ORDER BY … frame)</c>.
 /// </summary>
 /// <remarks>
-/// v1 supports these functions <b>only</b> in the incremental partitioned TOP-K
-/// filter pattern: the call appears in a derived table's select list and the
-/// enclosing query filters its alias with <c>&lt;= k</c> / <c>&lt; k</c>. The
-/// resolver recognises that shape and lowers it to a <c>PartitionedTopKPlan</c>;
-/// a window function used anywhere else (selected into the output, in an
-/// expression, an unsupported function, or with no qualifying filter) is
-/// rejected with an explicit error.
+/// Two shapes are supported, each by its own resolver path:
+/// <list type="bullet">
+/// <item>The ranking functions <c>ROW_NUMBER</c> / <c>RANK</c> / <c>DENSE_RANK</c>
+/// (no arguments) — supported <b>only</b> in the incremental partitioned TOP-K
+/// filter pattern (a derived table's select list filtered with <c>&lt;= k</c> by
+/// the enclosing query), lowered to a <c>PartitionedTopKPlan</c>.</item>
+/// <item>The aggregate functions <c>SUM</c> / <c>COUNT</c> / <c>AVG</c> /
+/// <c>MIN</c> / <c>MAX</c> (one argument, or <c>COUNT(*)</c>) — supported as a
+/// new output column, lowered to a <c>WindowAggregatePlan</c>.</item>
+/// </list>
+/// A window function used anywhere else (nested in an expression, an unsupported
+/// function, or a rank function with no qualifying filter) is rejected with an
+/// explicit error.
 /// </remarks>
 public sealed record WindowFunctionExpression(
     string FunctionName,
+    IReadOnlyList<Expression> Arguments,
+    bool IsStar,
     WindowSpec Over) : Expression;
 
 /// <summary>

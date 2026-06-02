@@ -374,10 +374,38 @@ reflect that shape, not a backlog.
   rank of every later row in the partition, so a single insert produces
   O(partition-size) retractions. Feldera restricts the rank functions to TopK
   patterns for the same reason; DbspNet does too.
-- **[P2]** Window aggregates (SUM/COUNT/AVG/MIN/MAX OVER), LAG / LEAD,
-  FIRST_VALUE / LAST_VALUE. Feldera supports these (UNLIMITED RANGE frames).
-- **[P3]** Full SQL frame spec: `ROWS`, `RANGE`, `GROUPS`; `PARTITION BY`;
-  `BETWEEN … AND …` with named bounds.
+- Window aggregates `SUM` / `COUNT` / `AVG` / `MIN` / `MAX` `OVER (PARTITION BY p
+  [ORDER BY o RANGE …])` emitted as a new output column — **implemented** for the
+  three `RANGE` frame shapes (Feldera-faithful, RANGE only):
+    - whole partition (`OVER (PARTITION BY p)`, no `ORDER BY`),
+    - running (`… ORDER BY o`, the default `RANGE UNBOUNDED PRECEDING AND CURRENT
+      ROW`),
+    - bounded (`… RANGE BETWEEN <const|day-time INTERVAL> PRECEDING AND CURRENT
+      ROW`).
+
+  A new `WindowAggregatePlan` + `PartitionedWindowAggregateOp` widens each row
+  with the aggregate over its frame; only the output rows whose frame a tick
+  changed are recomputed (a bounded value range for bounded frames; the suffix
+  from the earliest change for running; the whole partition otherwise). RANGE uses
+  peer-group semantics (equal `ORDER BY` value ⇒ shared frame). Multiple
+  aggregates sharing one `OVER` spec fold into one operator (the existing
+  `CompositeAggregator`); the resolver synthesises the pre-window relation as a
+  `SELECT *` over `FROM`/`WHERE` so partition/order/argument expressions resolve
+  against the full source. A bounded ascending frame over a monotone (`LATENESS`
+  or temporal-filter-watermarked) key is GC-able — rows below `frontier −
+  preceding` are dropped from state. Structural compile only (typed/spine fall
+  back). Correctness is held by a randomized incremental≡batch test (including a
+  LATENESS-GC variant) plus a `BatchPlanEvaluator` arm. **Deferred:**
+    - **[P2]** `LAG` / `LEAD`, `FIRST_VALUE` / `LAST_VALUE`.
+    - **[P2]** `ROWS` / `GROUPS` frames; `FOLLOWING` bounds; variable-width
+      (`YEAR`/`MONTH`) interval offsets; a non-integer/non-temporal `ORDER BY` key.
+    - **[P2]** More than one distinct `OVER` spec per query; a window function
+      nested in an expression or over a `GROUP BY` / `DISTINCT` inner query;
+      `SELECT *` alongside a window aggregate (list columns explicitly).
+    - **[P2]** Typed-fast-path and spine variants; neighborhood-only recompute for
+      the running case (currently the affected suffix).
+- **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`; multi-key
+  window `ORDER BY`; named `WINDOW` clauses.
 
 ### Type system
 - **[DONE]** INTERVAL (core) and date/time arithmetic. `INTERVAL '…' <unit>`

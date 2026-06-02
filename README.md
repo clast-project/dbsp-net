@@ -145,6 +145,15 @@ batch re-computation.
   OVER (PARTITION BY p ORDER BY o) AS rn FROM …) WHERE rn <= k` — compiling to
   a per-partition TOP-K operator (`RANK`/`DENSE_RANK` keep whole tie groups; an
   empty `PARTITION BY` is a single global partition).
+- Window aggregates `SUM` / `COUNT` / `AVG` / `MIN` / `MAX` `OVER (PARTITION BY p
+  [ORDER BY o RANGE …])`, emitted as a new column on every row, for the three
+  `RANGE` frame shapes: whole-partition (no `ORDER BY`), running (the default
+  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`), and bounded
+  (`RANGE BETWEEN <const | day-time INTERVAL> PRECEDING AND CURRENT ROW`). Lowered
+  to a `PartitionedWindowAggregateOp` that recomputes only the rows whose frame a
+  tick changed (RANGE peer-group semantics; a bounded ascending frame over a
+  `LATENESS` / temporal-filter key GCs old rows). `LAG`/`LEAD`/`FIRST_VALUE`/
+  `LAST_VALUE`, `ROWS`/`GROUPS` frames, and `FOLLOWING` bounds are deferred.
 - Scalar subqueries (uncorrelated, exactly one column) in `WHERE`, `SELECT`,
   and `HAVING` expressions. Empty subquery → `NULL`; changing subquery
   value correctly retracts and re-emits outer rows.
@@ -312,9 +321,11 @@ beyond "Feldera is much bigger":
   supported. `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST` compile to
   incremental TOP-K — including ordering by non-selected columns / expressions
   (carried as hidden columns). Windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` in
-  the partitioned TOP-K filter pattern are supported; the general windowed-column
-  form (a rank emitted on every row), window aggregates, and `LAG`/`LEAD` are
-  deferred. `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`, default
+  the partitioned TOP-K filter pattern are supported, as are window aggregates
+  (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER` with whole-partition / running / bounded
+  `RANGE` frames); the general windowed *rank*-column form (a rank emitted on
+  every row), `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, and `ROWS`/`GROUPS` frames
+  are deferred. `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`, default
   backslash) are supported — pattern matching lowered to a `Regex`, with the
   contextual keywords leaving `like`/`to`/`escape` usable as identifiers.
   `JOIN … USING` is supported (equi-join on the

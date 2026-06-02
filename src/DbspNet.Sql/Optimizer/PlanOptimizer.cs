@@ -94,6 +94,9 @@ public static class PlanOptimizer
             // Partitioned TOP-K is likewise a pushdown barrier — a filter or
             // projection moved across it would change per-partition rank.
             PartitionedTopKPlan pt => pt with { Input = OptimizeNode(pt.Input) },
+            // Window aggregate is likewise a pushdown barrier — a filter or
+            // projection moved across it would change frame membership.
+            WindowAggregatePlan wa => wa with { Input = OptimizeNode(wa.Input) },
             DifferencePlan diff => new DifferencePlan(
                 OptimizeNode(diff.Left), OptimizeNode(diff.Right)),
             ScalarSubqueryJoinPlan s => s with

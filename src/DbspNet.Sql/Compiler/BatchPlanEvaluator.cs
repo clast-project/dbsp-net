@@ -89,6 +89,9 @@ internal static class BatchPlanEvaluator
             case AggregatePlan a:
                 return BatchAggregate(a, ctx);
 
+            case WindowAggregatePlan wa:
+                return BatchWindowAggregate(wa, ctx);
+
             case ScalarSubqueryJoinPlan s:
                 return BatchScalarSubqueryJoin(s, ctx);
 
@@ -507,6 +510,104 @@ internal static class BatchPlanEvaluator
             }
 
             result.Add(ctx.Codec.BuildRow(plan.Schema, vs), Z64.One);
+        }
+
+        return result.Build();
+    }
+
+    // Batch window aggregate — the from-scratch oracle for
+    // PartitionedWindowAggregateOp. For each partition, each row's frame is the
+    // rows whose ORDER BY value lies in the (value-space) frame range; the
+    // aggregate over that multiset is appended to the row. Mirrors the operator's
+    // value-based frame geometry so the incremental run telescopes to this.
+    private static ZSet<StructuralRow, Z64> BatchWindowAggregate(WindowAggregatePlan plan, BatchEvalContext ctx)
+    {
+        var input = Evaluate(plan.Input, ctx);
+
+        var partFns = new Func<IReadOnlyList<object?>, object?>[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            partFns[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
+        }
+
+        var sqlAggs = new SqlAggregator[plan.Aggregates.Count];
+        for (var i = 0; i < plan.Aggregates.Count; i++)
+        {
+            sqlAggs[i] = BuildSqlAggregator(plan.Aggregates[i]);
+        }
+
+        var whole = plan.OrderKey is null;
+        Func<IReadOnlyList<object?>, object?>? orderFn =
+            plan.OrderKey is { } sk ? ExpressionCompiler.CompileScalar(sk.Expression) : null;
+        var descending = plan.OrderKey?.Descending ?? false;
+        var preceding = plan.Frame?.Preceding;
+        var aggCount = plan.Aggregates.Count;
+
+        // Partition rows (keyed by the partition tuple); carry each row's order
+        // value alongside.
+        var parts = new Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>();
+        foreach (var (row, w) in input)
+        {
+            var kvs = new object?[partFns.Length];
+            for (var i = 0; i < partFns.Length; i++)
+            {
+                kvs[i] = partFns[i](row);
+            }
+
+            var key = new StructuralRow(kvs);
+            var value = orderFn is null ? 0L : orderFn(row) is { } v ? MonotoneKey.Extract(v) : long.MinValue;
+            if (!parts.TryGetValue(key, out var lst))
+            {
+                lst = new List<(StructuralRow, long, long)>();
+                parts[key] = lst;
+            }
+
+            lst.Add((row, w.Value, value));
+        }
+
+        var result = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var (_, rows) in parts)
+        {
+            foreach (var r in rows)
+            {
+                ZSet<StructuralRow, Z64> frame;
+                if (whole)
+                {
+                    frame = ZSet.FromEntries(rows.Select(x => (x.Row, new Z64(x.Weight))));
+                }
+                else
+                {
+                    long lo, hi;
+                    if (preceding is null)
+                    {
+                        lo = descending ? r.Value : long.MinValue;
+                        hi = descending ? long.MaxValue : r.Value;
+                    }
+                    else
+                    {
+                        lo = descending ? r.Value : r.Value - preceding.Value;
+                        hi = descending ? r.Value + preceding.Value : r.Value;
+                    }
+
+                    frame = ZSet.FromEntries(rows
+                        .Where(x => x.Value >= lo && x.Value <= hi)
+                        .Select(x => (x.Row, new Z64(x.Weight))));
+                }
+
+                var nonEmpty = !Z64.IsZero(frame.SumWeights());
+                var vs = new object?[r.Row.Count + aggCount];
+                for (var i = 0; i < r.Row.Count; i++)
+                {
+                    vs[i] = r.Row[i];
+                }
+
+                for (var i = 0; i < aggCount; i++)
+                {
+                    vs[r.Row.Count + i] = nonEmpty ? sqlAggs[i].Compute(frame) : null;
+                }
+
+                result.Add(new StructuralRow(vs), new Z64(r.Weight));
+            }
         }
 
         return result.Build();

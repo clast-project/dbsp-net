@@ -198,6 +198,48 @@ public sealed record PartitionedTopKPlan(
     long Limit) : LogicalPlan(Input.Schema);
 
 /// <summary>
+/// Resolved <c>RANGE</c> frame for a <see cref="WindowAggregatePlan"/>. The upper
+/// bound is always <c>CURRENT ROW</c> in v1; <see cref="Preceding"/> is the lower
+/// bound's distance in the <see cref="WindowAggregatePlan.OrderKey"/>'s native
+/// units (µs for <c>TIMESTAMP</c>/<c>TIME</c>, whole days for <c>DATE</c>, the
+/// integer itself for <c>INT</c>/<c>BIGINT</c>), or <c>null</c> for
+/// <c>UNBOUNDED PRECEDING</c> (a running aggregate). Membership is by ORDER BY
+/// <em>value</em>, so equal-key peers — including the current row — share a frame.
+/// </summary>
+public sealed record WindowFrameBounds(long? Preceding);
+
+/// <summary>
+/// Window aggregates — <c>SUM/COUNT/AVG/MIN/MAX(x) OVER (PARTITION BY p
+/// [ORDER BY o RANGE …])</c> emitted as new output columns appended to every
+/// input row. The per-row window is one of three shapes:
+/// <list type="bullet">
+/// <item><see cref="OrderKey"/> null ⇒ the whole partition (every row gets the
+/// partition-wide aggregate).</item>
+/// <item><see cref="OrderKey"/> set, <see cref="Frame"/>.<see cref="WindowFrameBounds.Preceding"/>
+/// null ⇒ a running aggregate (<c>UNBOUNDED PRECEDING AND CURRENT ROW</c>).</item>
+/// <item><see cref="OrderKey"/> set, <see cref="WindowFrameBounds.Preceding"/>
+/// a constant ⇒ a bounded rolling aggregate (GC-able under LATENESS / clock
+/// watermarks).</item>
+/// </list>
+/// </summary>
+/// <remarks>
+/// <see cref="PartitionKeys"/>, the <see cref="SortKey.Expression"/>, and each
+/// <see cref="AggregateCall.Argument"/> are resolved against <see cref="Input"/>
+/// (which exposes the full pre-window FROM/WHERE schema, so they may be any
+/// scalar expression). <see cref="Schema"/> is <see cref="Input"/>'s columns
+/// followed by one result column per aggregate. The widened rows are mapped to
+/// the user's select list by a <see cref="ProjectPlan"/> the resolver places
+/// above this node.
+/// </remarks>
+public sealed record WindowAggregatePlan(
+    LogicalPlan Input,
+    IReadOnlyList<ResolvedExpression> PartitionKeys,
+    SortKey? OrderKey,
+    WindowFrameBounds? Frame,
+    IReadOnlyList<AggregateCall> Aggregates,
+    Schema Schema) : LogicalPlan(Schema);
+
+/// <summary>
 /// <c>UNION ALL</c> of two or more branches. Every branch has been
 /// projection-aligned to <see cref="Schema"/> (same arity and per-column
 /// types). Compiles to successive Z-set additions in the runtime.

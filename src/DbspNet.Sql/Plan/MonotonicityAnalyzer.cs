@@ -228,6 +228,13 @@ public static class MonotonicityAnalyzer
             case RecursiveCtePlan r:
                 return new MonotoneColumn?[r.Schema.Count];
 
+            case WindowAggregatePlan wa:
+                // Base (input) columns pass through unchanged — including a
+                // monotone ORDER BY key, which the operator GCs against and which
+                // a downstream operator can keep GCing. The appended window-result
+                // columns are non-monotone.
+                return ResizeTo(Visit(wa.Input, memo), wa.Schema.Count);
+
             default:
                 return new MonotoneColumn?[node.Schema.Count];
         }

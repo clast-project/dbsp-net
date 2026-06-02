@@ -150,6 +150,42 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Incremental partitioned window aggregate — <c>agg(x) OVER (PARTITION BY p
+    /// [ORDER BY o RANGE …])</c> emitted as new column(s) appended to every row.
+    /// <paramref name="orderValueOf"/> null ⇒ a whole-partition frame;
+    /// <paramref name="orderValueOf"/> set with <paramref name="preceding"/> null
+    /// ⇒ a running frame; a non-null <paramref name="preceding"/> ⇒ a bounded
+    /// RANGE frame (GC-able via <paramref name="frontier"/> for an ascending key).
+    /// </summary>
+    public static Stream<ZSet<StructuralRow, Z64>> PartitionedWindowAggregate<TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, TKey> partitionOf,
+        IComparer<StructuralRow> order,
+        Func<StructuralRow, long>? orderValueOf,
+        long? preceding,
+        bool descending,
+        IAggregator<StructuralRow, StructuralRow> aggregator,
+        int aggCount,
+        IEqualityComparer<TKey>? partitionComparer = null,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null,
+        IFrontier? frontier = null)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partitionOf);
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(aggregator);
+
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedWindowAggregateOp<TKey>(
+            input, output, partitionOf, order, orderValueOf, preceding, descending,
+            aggregator, aggCount, partitionComparer, snapshotCodec, frontier));
+        return output;
+    }
+
+    /// <summary>
     /// Index a flat Z-set stream by a key-extraction function. The key
     /// extractor is applied tick-by-tick and results in an indexed Z-set
     /// stream with the same weights.
