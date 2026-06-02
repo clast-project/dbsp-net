@@ -507,7 +507,11 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   grouping (`GROUP BY a + b`, `GROUP BY LENGTH(name)`) rejects with
   "GROUP BY supports only bare column references in v1". The plan→circuit
   layer relies on `ResolvedColumn` to rekey; extending means generalising
-  `ExtractKey` to run compiled delegates.
+  `ExtractKey` to run compiled delegates. Motivating use case: `GROUP BY
+  CAST(ts AS DATE)` over a temporal filter currently needs a derived-table
+  workaround (project the date, group by its alias); expression grouping would
+  let it use the temporal-filter day-space GC frontier directly (see
+  `now-and-temporal-filters.md`, "the expression-key GC frontier").
 - **Outer joins** (`LEFT` / `RIGHT [OUTER] JOIN`) still require at least one
   equi-key conjunct in `ON`; their keyed match-presence tracking has no
   keyless operator. `INNER JOIN` no longer has this restriction — pure-
