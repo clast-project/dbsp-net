@@ -1770,16 +1770,17 @@ public sealed class Parser
         var sort = ParseSortItem();
         Expect(TokenKind.RParen);
 
-        // A DESC ordering would invert the quantile (f ↔ 1−f); rather than
-        // silently treat it as ascending, reject it in v1.
-        if (sort.Direction == SortDirection.Descending)
-        {
-            throw Error(nameToken,
-                $"{nameToken.Text.ToUpperInvariant()} WITHIN GROUP (ORDER BY … DESC) is not supported");
-        }
+        // DESC inverts the quantile: the f-th percentile measured from the top
+        // is the (1 − f)-th from the bottom. Lower to `1 − f` so the resolver and
+        // the sketch stay ordering-agnostic (they always measure from the
+        // bottom); the resolver constant-folds the subtraction.
+        var fraction = sort.Direction == SortDirection.Descending
+            ? new BinaryExpression(
+                BinaryOperator.Subtract, new LiteralExpression(LiteralKind.Integer, 1L), args[0])
+            : args[0];
 
         return new FunctionCallExpression(
-            nameToken.Text, new[] { sort.Expression, args[0] }, IsStar: false);
+            nameToken.Text, new[] { sort.Expression, fraction }, IsStar: false);
     }
 
     /// <summary>

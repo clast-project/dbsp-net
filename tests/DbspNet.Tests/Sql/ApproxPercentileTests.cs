@@ -407,10 +407,55 @@ public class ApproxPercentileTests
         Assert.Contains("window function", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public void Parser_WithinGroup_DescendingOrder_Throws()
+    [Theory]
+    [InlineData(CompileMode.Typed)]
+    [InlineData(CompileMode.Structural)]
+    [InlineData(CompileMode.Spine)]
+    public void PercentileCont_WithinGroup_Descending_InvertsFraction(CompileMode mode)
     {
-        Assert.Throws<ParseException>(() => Parser.ParseStatement(
-            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v DESC) FROM t"));
+        var q = Compile(
+            ["CREATE TABLE t (v INT NOT NULL)"],
+            "SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY v DESC) AS p FROM t",
+            mode);
+
+        for (var v = 1; v <= 100; v++)
+        {
+            q.Table("t").Insert(v);
+        }
+
+        q.Step();
+        // The 90th percentile measured from the top is the 10th from the bottom.
+        AssertClose(10, ScalarPercentile(q));
+    }
+
+    [Fact]
+    public void PercentileCont_WithinGroup_Ascending_And_DescendingComplement_Agree()
+    {
+        // PERCENTILE_CONT(0.75) ASC must equal PERCENTILE_CONT(0.25) DESC.
+        static double Run(string order)
+        {
+            var q = Compile(
+                ["CREATE TABLE t (v INT NOT NULL)"],
+                $"SELECT PERCENTILE_CONT({(order == "DESC" ? "0.25" : "0.75")}) " +
+                $"WITHIN GROUP (ORDER BY v {order}) AS p FROM t");
+            for (var v = 1; v <= 100; v++)
+            {
+                q.Table("t").Insert(v);
+            }
+
+            q.Step();
+            double? found = null;
+            foreach (var (row, weight) in q.Current)
+            {
+                if (weight.Value > 0)
+                {
+                    found = Convert.ToDouble(row[0], System.Globalization.CultureInfo.InvariantCulture);
+                }
+            }
+
+            return found!.Value;
+        }
+
+        Assert.Equal(Run("ASC"), Run("DESC"));
     }
 }

@@ -4794,15 +4794,14 @@ public sealed class Resolver
     private static double ReadFractionLiteral(Expression expr, string functionName)
     {
         var name = functionName.ToUpperInvariant();
-        if (expr is not LiteralExpression lit || lit.Value is null)
+        var fraction = expr switch
         {
-            throw new ResolveException($"{name} fraction must be a numeric constant in [0, 1]");
-        }
-
-        var fraction = lit.Kind switch
-        {
-            LiteralKind.Integer or LiteralKind.Float => Convert.ToDouble(lit.Value, System.Globalization.CultureInfo.InvariantCulture),
-            LiteralKind.Decimal => (double)((Decimal128)lit.Value).Mantissa / Math.Pow(10, lit.DecimalScale),
+            LiteralExpression lit => ReadNumericLiteral(lit, name),
+            // The parser lowers `WITHIN GROUP (ORDER BY x DESC)` to `1 - f`; fold
+            // that (and any constant `literal - literal`) so the fraction is
+            // measured from the bottom like the ascending case.
+            BinaryExpression { Operator: BinaryOperator.Subtract, Left: LiteralExpression l, Right: LiteralExpression r }
+                => ReadNumericLiteral(l, name) - ReadNumericLiteral(r, name),
             _ => throw new ResolveException($"{name} fraction must be a numeric constant in [0, 1]"),
         };
 
@@ -4812,6 +4811,21 @@ public sealed class Resolver
         }
 
         return fraction;
+    }
+
+    private static double ReadNumericLiteral(LiteralExpression lit, string functionName)
+    {
+        if (lit.Value is null)
+        {
+            throw new ResolveException($"{functionName} fraction must be a numeric constant in [0, 1]");
+        }
+
+        return lit.Kind switch
+        {
+            LiteralKind.Integer or LiteralKind.Float => Convert.ToDouble(lit.Value, System.Globalization.CultureInfo.InvariantCulture),
+            LiteralKind.Decimal => (double)((Decimal128)lit.Value).Mantissa / Math.Pow(10, lit.DecimalScale),
+            _ => throw new ResolveException($"{functionName} fraction must be a numeric constant in [0, 1]"),
+        };
     }
 
     /// <summary>

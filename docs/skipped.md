@@ -359,10 +359,10 @@ reflect that shape, not a backlog.
   rebuild on retraction) and, because the bucket map is a deterministic function
   of the present multiset, the incremental result equals a batch recompute
   exactly. Bounded state (buckets ∝ dynamic range, not cardinality); the
-  fraction is a constant in [0, 1] fixed at plan time. Numeric arguments only;
-  `ORDER BY … DESC` in `WITHIN GROUP`, temporal-typed quantiles, and the
-  array-returning `APPROX_QUANTILES(x, n)` are deferred. Heavy-hitters
-  (Count-Min) remain **[P2]**.
+  fraction is a constant in [0, 1] fixed at plan time. `WITHIN GROUP (ORDER BY x
+  DESC)` is supported (lowered to `1 − f`). Numeric arguments only; temporal-typed
+  quantiles and the array-returning `APPROX_QUANTILES(x, n)` are deferred.
+  Heavy-hitters (Count-Min) remain **[P2]**.
 - **[P1]** `FILTER (WHERE …)` clause on aggregates.
 - **[P1]** `DISTINCT` in aggregates; `WITHIN DISTINCT`.
 - **[P2]** `ARG_MIN`, `ARG_MAX`, `ARRAY_AGG` (with `ORDER BY`,
