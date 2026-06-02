@@ -401,8 +401,14 @@ reflect that shape, not a backlog.
     - **[P2]** More than one distinct `OVER` spec per query; a window function
       nested in an expression or over a `GROUP BY` / `DISTINCT` inner query;
       `SELECT *` alongside a window aggregate (list columns explicitly).
-    - **[P2]** Typed-fast-path and spine variants; neighborhood-only recompute for
-      the running case (currently the affected suffix).
+    - **[P2]** Neighborhood-only recompute for the running case (currently the
+      affected suffix).
+    - *N/A by design* — a **spine** variant. Like `TopKOp` / `PartitionedTopKOp`,
+      this is a recompute-and-diff operator holding plain per-partition
+      `SortedDictionary` state, not a `Trace`, so there is nothing to swap for a
+      `SpineZSetTrace`. The **typed fast path** is possible but not pursued: a
+      window query compiles structurally (one boundary conversion); a full
+      typed-generic rewrite was judged not worth the cost over that.
 - Window offset / value functions `LAG` / `LEAD(expr [, offset [, default]])` and
   `FIRST_VALUE` / `LAST_VALUE(expr)` `OVER (PARTITION BY p ORDER BY o)` emitted as
   a new output column — **implemented**. Positional (by row, not value): the value
@@ -419,7 +425,10 @@ reflect that shape, not a backlog.
   Structural compile only; randomized incremental≡batch coverage. **Deferred:**
     - **[P2]** A non-constant / per-row `default` expression; an `IGNORE NULLS`
       option; neighborhood-only recompute (currently whole touched partition) and
-      frontier GC; typed-fast-path and spine variants.
+      frontier GC.
+    - *N/A by design* — a **spine** variant (recompute-and-diff, like `TopKOp`,
+      holds no `Trace`). The **typed fast path** is possible but not pursued —
+      structural compile is correct and pays only one boundary conversion.
 - **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`; multi-key
   window `ORDER BY`; named `WINDOW` clauses.
 
