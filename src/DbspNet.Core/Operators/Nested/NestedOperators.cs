@@ -69,6 +69,11 @@ public static class NestedOperators
     /// every <see cref="NestedScopeBuilder{TRow}.Import"/>) to make the loop
     /// snapshottable; omit it for a non-persisted loop.
     /// </param>
+    /// <param name="spineConfig">
+    /// When supplied, holds each import's integral in an LSM-style spine trace
+    /// (sorted batches, per-batch snapshot) instead of a flat dictionary; omit
+    /// for flat traces.
+    /// </param>
     /// <param name="maxIterations">Divergence guard for the inner loop.</param>
     /// <typeparam name="TRow">The row type flowing on every inner stream.</typeparam>
     public static Stream<ZSet<TRow, Z64>> SemiNaiveFixpoint<TRow>(
@@ -76,6 +81,7 @@ public static class NestedOperators
         Func<NestedScopeBuilder<TRow>, Stream<ZSet<TRow, Z64>>,
              (Stream<ZSet<TRow, Z64>> Base, Stream<ZSet<TRow, Z64>> Step)> body,
         IZSetTraceCodec<TRow, Z64>? resultSnapshotCodec = null,
+        SpineImportConfig<TRow>? spineConfig = null,
         int maxIterations = 10_000)
         where TRow : notnull
     {
@@ -90,7 +96,8 @@ public static class NestedOperators
 
         var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
         builder.AddRawOperator(new SemiNaiveFixpointOperator<TRow>(
-            scope.Operators, scope.Imports, recRef, baseStream, stepStream, output, resultSnapshotCodec, maxIterations));
+            scope.Operators, scope.Imports, recRef, baseStream, stepStream, output,
+            resultSnapshotCodec, spineConfig, maxIterations));
         return output;
     }
 }

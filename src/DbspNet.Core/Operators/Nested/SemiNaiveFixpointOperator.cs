@@ -65,6 +65,7 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
         Stream<ZSet<TRow, Z64>> stepStream,
         Stream<ZSet<TRow, Z64>> output,
         IZSetTraceCodec<TRow, Z64>? resultCodec,
+        SpineImportConfig<TRow>? spineConfig,
         int maxIterations)
     {
         ArgumentNullException.ThrowIfNull(body);
@@ -76,7 +77,13 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxIterations);
 
         _body = body;
-        _imports = imports.Select(i => new Import(i.Outer, i.Inner, new ZSetTrace<TRow, Z64>(), i.Name, i.SnapshotCodec)).ToArray();
+        _imports = imports.Select(i => new Import(
+            i.Outer,
+            i.Inner,
+            spineConfig is null
+                ? new FlatImportTrace<TRow>(i.SnapshotCodec)
+                : new SpineImportTrace<TRow>(spineConfig, i.SnapshotCodec),
+            i.Name)).ToArray();
         _recRef = recRef;
         _baseStream = baseStream;
         _stepStream = stepStream;
@@ -373,8 +380,7 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
 
         foreach (var import in _imports)
         {
-            await import.SnapshotCodec!.SaveAsync(
-                writer, ImportFileName(import.Name!), import.Trace.Current, cancellationToken).ConfigureAwait(false);
+            await import.Trace.SaveAsync(writer, ImportPrefix(import.Name!), cancellationToken).ConfigureAwait(false);
         }
 
         await _resultCodec!.SaveAsync(writer, ResultFileName, _r, cancellationToken).ConfigureAwait(false);
@@ -387,8 +393,7 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
 
         foreach (var import in _imports)
         {
-            import.Trace.Integrate(
-                await import.SnapshotCodec!.LoadAsync(reader, ImportFileName(import.Name!), cancellationToken).ConfigureAwait(false));
+            await import.Trace.LoadAsync(reader, ImportPrefix(import.Name!), cancellationToken).ConfigureAwait(false);
         }
 
         _r = await _resultCodec!.LoadAsync(reader, ResultFileName, cancellationToken).ConfigureAwait(false);
@@ -406,7 +411,7 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
             var sb = new StringBuilder();
             foreach (var import in _imports.OrderBy(i => i.Name, StringComparer.Ordinal))
             {
-                sb.Append(import.Name).Append('=').Append(import.SnapshotCodec!.SchemaFingerprint).Append(';');
+                sb.Append(import.Name).Append('=').Append(import.Trace.SchemaFingerprint).Append(';');
             }
 
             sb.Append("result=").Append(_resultCodec!.SchemaFingerprint);
@@ -415,7 +420,7 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
     }
 
     private bool IsSnapshottable =>
-        _resultCodec is not null && _imports.All(i => i.Name is not null && i.SnapshotCodec is not null);
+        _resultCodec is not null && _imports.All(i => i.Name is not null && i.Trace.CanSnapshot);
 
     private void EnsureSnapshottable()
     {
@@ -427,12 +432,11 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
         }
     }
 
-    private static string ImportFileName(string name) => "import_" + name + ".arrows";
+    private static string ImportPrefix(string name) => "import_" + name;
 
     private sealed record Import(
         Stream<ZSet<TRow, Z64>> Outer,
         Stream<ZSet<TRow, Z64>> Inner,
-        ZSetTrace<TRow, Z64> Trace,
-        string? Name,
-        IZSetTraceCodec<TRow, Z64>? SnapshotCodec);
+        IImportTrace<TRow> Trace,
+        string? Name);
 }

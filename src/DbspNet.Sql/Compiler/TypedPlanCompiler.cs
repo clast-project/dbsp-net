@@ -561,14 +561,16 @@ public static class TypedPlanCompiler
         }
 
         // Compile the recursive body structurally onto the shared nested-circuit
-        // (fixpoint) primitive — the same construction the structural path uses.
+        // (fixpoint) primitive — the same construction the structural path uses,
+        // including the spine import-trace family when in spine mode.
         var structuralOutput = PlanToCircuit.CompileRecursiveCteFixpoint(
             ctx.Builder,
             plan,
             externalStreams,
             externalSchemas,
             StructuralRowCodec.Instance,
-            ctx.SnapshotCodecs);
+            ctx.SnapshotCodecs,
+            PlanToCircuit.RecursiveSpineConfig(ctx.Options));
 
         // Lift the structural output to typed via MapRows. Cost is
         // paid only at the boundary between the recursive op and the

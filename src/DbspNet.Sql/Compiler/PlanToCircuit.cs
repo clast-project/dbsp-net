@@ -1253,7 +1253,20 @@ public static class PlanToCircuit
         CircuitBuilder builder,
         RecursiveCtePlan plan,
         CompileContext ctx) =>
-        CompileRecursiveCteFixpoint(builder, plan, ctx.Scans, ctx.TableSchemas, ctx.Codec, ctx.SnapshotCodecs);
+        CompileRecursiveCteFixpoint(
+            builder, plan, ctx.Scans, ctx.TableSchemas, ctx.Codec, ctx.SnapshotCodecs,
+            RecursiveSpineConfig(ctx.Options));
+
+    /// <summary>
+    /// Spine import-trace config for a recursive CTE when the query is compiled
+    /// in <see cref="TraceFamily.Spine"/> mode — the import integrals get the
+    /// same LSM trace family as every other stateful site (structural rows are
+    /// ordered by <see cref="StructuralRowComparer"/>); null for flat mode.
+    /// </summary>
+    internal static SpineImportConfig<StructuralRow>? RecursiveSpineConfig(CompileOptions options) =>
+        options.TraceFamily == TraceFamily.Spine
+            ? new SpineImportConfig<StructuralRow>(StructuralRowComparer.Instance, options.Compaction)
+            : null;
 
     /// <summary>
     /// Build the recursive CTE on the Core nested-circuit (fixpoint) primitive.
@@ -1267,7 +1280,8 @@ public static class PlanToCircuit
         IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> scans,
         IReadOnlyDictionary<string, Schema> tableSchemas,
         IRowCodec<StructuralRow> codec,
-        ISqlSnapshotCodecs? snapshotCodecs)
+        ISqlSnapshotCodecs? snapshotCodecs,
+        SpineImportConfig<StructuralRow>? spineConfig = null)
     {
         var bodyCtx = new RecursiveBodyCtx(scans, tableSchemas, codec, snapshotCodecs);
 
@@ -1287,7 +1301,8 @@ public static class PlanToCircuit
                 var stepStream = CompileRecursiveBody(scope, recRef, plan.RecursivePlan, plan.SelfRef, bodyCtx, imports);
                 return (baseStream, stepStream);
             },
-            resultCodec);
+            resultCodec,
+            spineConfig);
     }
 
     /// <summary>Inputs the recursive-body compiler threads through its recursion.</summary>

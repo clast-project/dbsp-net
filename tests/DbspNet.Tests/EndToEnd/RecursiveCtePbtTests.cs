@@ -27,17 +27,26 @@ public class RecursiveCtePbtTests
         "    SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src) " +
         "SELECT src, dst FROM reach";
 
-    private static CompiledQuery CompileReach()
+    private static CompiledQuery CompileReach(TraceFamily traceFamily)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
         resolver.Resolve(Parser.ParseStatement("CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)"));
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(ReachQuery))).Query;
-        return PlanToCircuit.Compile(plan);
+        return PlanToCircuit.Compile(plan, snapshotCodecs: null, new CompileOptions { TraceFamily = traceFamily });
     }
 
     [Fact]
-    public void TransitiveClosure_RandomInsertDeleteTicks_EqualsBatchEachTick()
+    public void TransitiveClosure_RandomInsertDeleteTicks_EqualsBatchEachTick_Flat() =>
+        RunInsertDeleteProperty(TraceFamily.Flat);
+
+    // Same oracle over the spine import-trace family — the LSM batches must
+    // integrate and consolidate identically to the flat dictionary.
+    [Fact]
+    public void TransitiveClosure_RandomInsertDeleteTicks_EqualsBatchEachTick_Spine() =>
+        RunInsertDeleteProperty(TraceFamily.Spine);
+
+    private static void RunInsertDeleteProperty(TraceFamily traceFamily)
     {
         // Small node space so closures are dense and cyclic; each op is an
         // edge plus an insert(true)/delete(false) flag, applied with set-guards
@@ -51,7 +60,7 @@ public class RecursiveCtePbtTests
 
         genPlan.Sample(plan =>
         {
-            var q = CompileReach();
+            var q = CompileReach(traceFamily);
             var edges = new HashSet<(int Src, int Dst)>();
             var accumulated = new Dictionary<(int, int), long>();
 

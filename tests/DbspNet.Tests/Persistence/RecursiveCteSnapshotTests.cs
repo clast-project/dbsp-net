@@ -49,7 +49,7 @@ public class RecursiveCteSnapshotTests : IDisposable
         "CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)",
     };
 
-    private static CompiledQuery Compile()
+    private static CompiledQuery Compile(TraceFamily traceFamily = TraceFamily.Flat)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
@@ -59,7 +59,8 @@ public class RecursiveCteSnapshotTests : IDisposable
         }
 
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(ReachQuery))).Query;
-        return PlanToCircuit.Compile(plan, ArrowSqlSnapshotCodecs.Instance);
+        return PlanToCircuit.Compile(
+            plan, ArrowSqlSnapshotCodecs.Instance, new CompileOptions { TraceFamily = traceFamily });
     }
 
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
@@ -91,6 +92,34 @@ public class RecursiveCteSnapshotTests : IDisposable
         Assert.Equal(1, WeightOf(consumer.Current, 1, 4));
         // The pre-existing pairs must NOT re-emit — that's what _previousResult
         // restoration guarantees.
+        Assert.Equal(0, WeightOf(consumer.Current, 1, 2));
+        Assert.Equal(0, WeightOf(consumer.Current, 2, 3));
+        Assert.Equal(0, WeightOf(consumer.Current, 1, 3));
+        Assert.Equal(3, consumer.Current.Count);
+    }
+
+    [Fact]
+    public async Task SpineMode_RestoredState_ExtendingChain_EmitsOnlyNewlyReachablePairs()
+    {
+        // Same round-trip as the flat case but with the spine import-trace family:
+        // the per-batch manifest snapshot must reconstitute the integral so the
+        // restored consumer extends the chain incrementally.
+        var producer = Compile(TraceFamily.Spine);
+        producer.Table("edges").Insert(1, 2);
+        producer.Table("edges").Insert(2, 3);
+        producer.Step();
+
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
+
+        var consumer = Compile(TraceFamily.Spine);
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
+
+        consumer.Table("edges").Insert(3, 4);
+        consumer.Step();
+
+        Assert.Equal(1, WeightOf(consumer.Current, 3, 4));
+        Assert.Equal(1, WeightOf(consumer.Current, 2, 4));
+        Assert.Equal(1, WeightOf(consumer.Current, 1, 4));
         Assert.Equal(0, WeightOf(consumer.Current, 1, 2));
         Assert.Equal(0, WeightOf(consumer.Current, 2, 3));
         Assert.Equal(0, WeightOf(consumer.Current, 1, 3));
