@@ -118,20 +118,22 @@ reflect that shape, not a backlog.
       correlation in JOIN ON / HAVING / GROUP BY / aggregates.
       Rejected with explicit "only equi-correlation in inner WHERE
       supported" errors.
-- **[P2]** DBSP-paper-faithful retraction propagation for recursive CTEs.
-  `WITH RECURSIVE` uses semi-naïve incremental evaluation on pure-insert
-  ticks: <c>R</c> is preserved across outer ticks, and each tick's external
-  delta triggers only the newly-derivable rows to propagate through
-  <c>step</c>. For insert-only workloads (e.g. a growing graph), per-tick
-  cost is proportional to the newly-reachable output, not to the full
-  closure. On any tick containing a retraction (negative-weight external
-  delta), the operator falls back to full batch recomputation — correct but
-  at the cost of re-running the fixed point from scratch. The proper
-  solution is DRED-style delete propagation / DBSP-weight arithmetic
-  through the recursion, which needs bag-semantic fixed-point termination
-  arguments we haven't worked through here.
+- ~~**[P2]** DBSP-paper-faithful retraction propagation for recursive CTEs.~~
+  **Done.** `WITH RECURSIVE` evaluation is fully incremental on both trace
+  families. Insert ticks extend the preserved fixpoint `R` semi-naïvely (per-tick
+  cost proportional to the newly-reachable output, not the full closure).
+  Retraction ticks use Delete-and-Re-Derive: over-delete the R-tuples whose
+  derivation used a deleted input (propagated transitively through the old
+  graph), then re-derive those still reachable from the survivors via surviving
+  edges — correct under cycles and alternative derivation paths. Recursion
+  compiles onto a reusable Core nested-circuit (fixpoint) primitive
+  (`SemiNaiveFixpointOperator`); the old `RecursiveCteOp` is gone.
+  Correctness is held by a random insert/delete incremental≡batch PBT
+  (`RecursiveCtePbtTests`, flat and spine). Multiset input deltas
+  (a weight magnitude &gt; 1) fall outside the set model and keep a from-scratch
+  recompute.
   <br/>
-  Additional v1 restrictions on the recursive body:
+  Remaining v1 restrictions on the recursive body:
   - body must be a `UNION ALL` with at least one base case and one recursive branch
   - body may reference only base tables and the self-reference (not other CTEs)
   - no aggregates, no subqueries, no outer joins inside the recursive body
@@ -398,7 +400,7 @@ reflect that shape, not a backlog.
   built-in `LocalFileBlobStore` and `InMemoryBlobStore`. Every
   stateful SQL operator — `DistinctOp`, `IncrementalAggregateOp`,
   `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `IncrementalFullJoinOp`,
-  `RecursiveCteOp` —
+  `SemiNaiveFixpointOperator` (recursive CTEs) —
   implements `ISnapshotable` and round-trips its trace(s) as Arrow IPC
   via the `ArrowSqlSnapshotCodecs` registry. Snapshot manifests carry
   both a plan fingerprint (operator-type sequence with generic args)
@@ -451,8 +453,9 @@ reflect that shape, not a backlog.
   Deferred follow-ons: duration-literal sugar (`'1' HOUR`) and a first-class
   `INTERVAL` type (the bound is written today as a plain integer in native
   units); GC on the typed-row fast path (`LATENESS` forces the structural
-  compile); and a `RecursiveCteOp` retain-keys story (its `_r` still grows
-  unbounded — only joins / aggregates / distinct are bounded so far).
+  compile); and a recursive-fixpoint retain-keys story
+  (`SemiNaiveFixpointOperator`'s materialised `_r` still grows unbounded — only
+  joins / aggregates / distinct are bounded so far).
 - **Temporal filters (`NOW()` / `CURRENT_TIMESTAMP`)** — **implemented** (the
   `mz_now()`-style advancing-clock model; the headline streaming feature). An
   injected, monotone, persisted per-circuit logical clock (`RootCircuit.AdvanceTime`,
@@ -611,10 +614,13 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   spine-PBT and SQL compile tests plus dedicated
   `SpineCompileTests.Spine{Distinct,Aggregate,InnerJoin,LeftJoin}_ClosesOverTypedRow`
   that inspect the spine ops' closed generic args. Deferred follow-ons:
-    - **[P1]** `RecursiveCteOp` has no spine sibling — recursive CTEs
-      inside a spine-mode query still use a flat trace for the
-      self-reference (the external base-table inputs honour spine
-      via the surrounding pipeline). Tied to the DRED retraction work.
+    - ~~**[P1]** `RecursiveCteOp` has no spine sibling.~~ **Done.** Recursive
+      CTEs honour `TraceFamily.Spine`: the nested fixpoint circuit's import-
+      relation integrals use a `SpineZSetTrace` (via the `IImportTrace`
+      abstraction, with per-batch snapshot), the same family as every other
+      stateful site. The recursive body itself is stateless, so the import
+      integral is the only trace. Covered by the spine arm of
+      `RecursiveCtePbtTests` and a spine snapshot round-trip.
     - **[P2]** Trace-size-driven automatic flat/spine decision — today
       it's an explicit caller toggle.
 - Trace compaction / waterline — **implemented** for the spine traces.

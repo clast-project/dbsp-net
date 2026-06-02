@@ -135,9 +135,9 @@ batch re-computation.
   with per-column type unification (INTERSECT binds tighter; NULL=NULL for
   matching), `WITH … AS (…)` CTEs (a CTE referenced twice compiles
   to one shared subcircuit), and `WITH RECURSIVE … AS (base UNION ALL step)`
-  for transitive-closure-style queries (semi-naïve incremental evaluation
-  on pure-insert ticks; see `docs/skipped.md` for the retraction-fallback
-  caveat). `ORDER BY … LIMIT [OFFSET]` (and `FETCH FIRST n ROWS ONLY`) compile
+  for transitive-closure-style queries (fully incremental — semi-naïve on
+  inserts, delete-and-re-derive on deletes — on both flat and spine traces).
+  `ORDER BY … LIMIT [OFFSET]` (and `FETCH FIRST n ROWS ONLY`) compile
   to an incremental TOP-K operator; a bare `ORDER BY` (no limit) is a no-op
   since row order is unobservable in the output Z-set. The ranking window
   functions `ROW_NUMBER` / `RANK` / `DENSE_RANK` are supported in the
@@ -226,7 +226,7 @@ batch re-computation.
   on an `IBlobStore` abstraction modelled on S3 / GCS / Azure Blob, with
   built-in `LocalFileBlobStore` and `InMemoryBlobStore`. Every stateful
   SQL operator (`DistinctOp`, `IncrementalAggregateOp`,
-  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `RecursiveCteOp`)
+  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `SemiNaiveFixpointOperator`)
   round-trips its trace as Arrow IPC; manifests carry plan + schema
   fingerprints so drift is caught on `Load`. See
   [`docs/persistence.md`](docs/persistence.md).
@@ -246,8 +246,9 @@ batch re-computation.
   `TypedRowEmitter`, so `Comparer<TRow>.Default` drives the sort
   without a per-schema comparer object. Snapshot round-trips and the
   random-query equivalence PBT both run green on the spine path.
-  `RecursiveCteOp` has no spine sibling, so a recursive CTE inside a
-  spine-mode query still uses a flat trace for its self-reference.
+  Recursive CTEs honour spine too: the nested fixpoint circuit's
+  import-relation integrals use a `SpineZSetTrace` in spine mode (its loop
+  body is stateless, so the import integral is the only trace).
 - Correctness: 840+ unit tests plus property-based tests (≥3000 CsCheck
   iterations) across 40 query templates, run both with and without the
   optimizer and on both trace families — semantic equivalence is
@@ -263,7 +264,6 @@ batch re-computation.
 See [`docs/skipped.md`](docs/skipped.md). The short list of v1 restrictions
 beyond "Feldera is much bigger":
 
-- `GROUP BY` takes bare column references only (no expression grouping).
 - `INNER JOIN` supports any `ON` predicate, including non-equi
   (`ON a.x > b.y`) and `CROSS JOIN` — with no equi-key the join runs as a
   unit-key nested-loop cross product with the `ON` predicate applied as a
@@ -299,11 +299,10 @@ beyond "Feldera is much bigger":
   `NOT IN` the three-valued negation.
   **Deferred**: nested correlation (subquery-inside-subquery
   referencing grand-outer columns).
-- `WITH RECURSIVE` evaluates semi-naïvely on pure-insert ticks (preserves
-  `R` across ticks, propagates only newly-derivable rows), and falls back
-  to full recomputation on any tick containing a retraction. Body may
-  reference only base tables and the self-ref; no aggregates, subqueries,
-  outer joins, or nested recursion inside the body.
+- `WITH RECURSIVE` evaluation is fully incremental (semi-naïve on inserts,
+  delete-and-re-derive on deletes), but the body may reference only base tables
+  and the self-ref — no aggregates, subqueries, outer joins, or nested recursion
+  inside the body.
 - Set ops: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` all supported;
   `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
 - `CROSS JOIN` / non-equi `INNER JOIN` (unit-key nested loop) and
@@ -332,17 +331,6 @@ beyond "Feldera is much bigger":
   intermediate-only today), `interval × decimal`, and typed-fast-path temporal
   arithmetic (it falls back to the structural compiler, as temporal
   comparisons do).
-
-## What's next
-
-The biggest tracked-but-not-yet-shipped pieces:
-
-- **DRED-style retraction propagation for recursive CTEs**, so the
-  full recomputation fallback on retraction-containing ticks goes
-  away. `RecursiveCteOp` also has no spine sibling, so a recursive-CTE
-  body inside a `TraceFamily.Spine` query keeps a flat trace; the
-  spine integration sketched here unblocks the same on its
-  retraction-aware successor.
 
 ## License
 
