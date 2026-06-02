@@ -42,9 +42,12 @@ public class RecursiveCtePbtTests
         // Small node space so closures are dense and cyclic; each op is an
         // edge plus an insert(true)/delete(false) flag, applied with set-guards
         // at run time so the circuit only ever sees clean +1 / -1 transitions.
-        var genNode = Gen.Int[0, 3];
-        var genOp = Gen.Select(genNode, genNode, Gen.Bool);
-        var genPlan = genOp.Array[0, 4].Array[1, 6];
+        // Deletes are biased to fire often (2-in-5 ops) so the retraction /
+        // re-derivation path is exercised heavily, not just inserts.
+        var genNode = Gen.Int[0, 4];
+        var genIsInsert = Gen.Int[0, 4].Select(n => n < 3); // ~3/5 inserts, 2/5 deletes
+        var genOp = Gen.Select(genNode, genNode, genIsInsert);
+        var genPlan = genOp.Array[0, 5].Array[1, 8];
 
         genPlan.Sample(plan =>
         {
@@ -90,7 +93,7 @@ public class RecursiveCtePbtTests
             }
 
             return true;
-        }, iter: 1000);
+        }, iter: 2000);
     }
 
     private static HashSet<(int, int)> BatchTransitiveClosure(IEnumerable<(int Src, int Dst)> edges)

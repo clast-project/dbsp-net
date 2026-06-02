@@ -98,7 +98,7 @@ public class RecursiveCteSnapshotTests : IDisposable
     }
 
     [Fact]
-    public async Task RestoredState_RetractionTriggersFullRecompute()
+    public async Task RestoredState_RetractionAfterRestore_RetractsCorrectly()
     {
         // Producer: chain 1 -> 2 -> 3, snapshot.
         var producer = Compile();
@@ -108,9 +108,9 @@ public class RecursiveCteSnapshotTests : IDisposable
 
         await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
 
-        // Consumer: restore, then retract the bridge edge. Retraction
-        // forces FullRecompute, which uses the *integrated* external
-        // traces — those must be restored from the snapshot.
+        // Consumer: restore, then retract the bridge edge. The incremental
+        // delete (DRED) walks the restored R and import traces — both must be
+        // restored from the snapshot for the retraction to be correct.
         var consumer = Compile();
         await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
 

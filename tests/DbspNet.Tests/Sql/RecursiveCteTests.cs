@@ -308,9 +308,8 @@ public class RecursiveCteTests
     [Fact]
     public void TransitiveClosure_InsertThenRetractThenInsert_StaysCorrect()
     {
-        // Exercise the retraction fallback: after semi-naïve extension,
-        // retract an edge (forcing full recompute), then extend again
-        // (semi-naïve again from a correctly-rebuilt R).
+        // Exercise the retraction path: after semi-naïve extension, retract an
+        // edge (incremental delete-and-re-derive), then extend again.
         var q = Compile(
             ["CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)"],
             "WITH RECURSIVE reach AS ( " +
@@ -325,7 +324,7 @@ public class RecursiveCteTests
         q.Table("edges").Insert(2, 3);
         q.Step();
 
-        // Tick 3: retract the bridge → R drops to {(1,2)} via full recompute.
+        // Tick 3: retract the bridge → R drops to {(1,2)} via DRED.
         q.Table("edges").Delete(2, 3);
         q.Step();
         Assert.Equal(-1, q.Current.WeightOf(new StructuralRow(2, 3)).Value);

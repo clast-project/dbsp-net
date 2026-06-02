@@ -1238,10 +1238,10 @@ public static class PlanToCircuit
     // primitive: the base and step subplans are wired as real Z-set operators
     // inside a NestedScopeBuilder, the self-reference resolves to the loop's
     // feedback stream, and each referenced base table is imported once. The
-    // FixpointOperator drives the body to a least fixpoint per outer tick and
-    // emits the delta against the previous tick — behaviourally the same
-    // set-valued, recompute-per-tick semantics as before, now expressed through
-    // the reusable Core construct rather than a bespoke evaluation loop.
+    // SemiNaiveFixpointOperator preserves the fixpoint across ticks and updates
+    // it incrementally — semi-naive extension on inserts, delete-and-re-derive
+    // on deletes — through the reusable Core construct rather than a bespoke
+    // evaluation loop.
     //
     // Restrictions (v1):
     //   - body may reference only base tables (ScanPlan) and the self-ref.
@@ -1275,10 +1275,10 @@ public static class PlanToCircuit
         // are built lazily as base tables are imported in CompileRecursiveBody.
         var resultCodec = snapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
 
-        // R = distinct(base ∪ step(R)). The semi-naive driver preserves R across
-        // ticks and extends it incrementally on inserts (recompute on
-        // retraction); both subplans share one import per base table, and the
-        // operator applies the set-collapse, so base and step are returned raw.
+        // R = distinct(base ∪ step(R)). The driver preserves R across ticks and
+        // updates it incrementally (semi-naive inserts, DRED deletes); both
+        // subplans share one import per base table, and the operator applies the
+        // set-collapse, so base and step are returned raw.
         return builder.SemiNaiveFixpoint<StructuralRow>(
             (scope, recRef) =>
             {

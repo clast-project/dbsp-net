@@ -13,33 +13,33 @@ namespace DbspNet.Core.Operators.Nested;
 /// Cross-tick-incremental nested fixpoint for a <em>linear</em> recursion
 /// <c>R = distinct(base(I) ∪ step(I, R))</c> — the shape of a SQL
 /// <c>WITH RECURSIVE</c> whose recursive branch is linear in the self-reference
-/// (Filter / Project / Inner-Join / UnionAll). Unlike the naive
-/// <see cref="FixpointOperator{TRow}"/>, it preserves the materialised fixpoint
-/// <c>R</c> across outer ticks and, on an insert-only tick, extends it
-/// semi-naively — cost proportional to the newly-derivable rows rather than to
-/// the whole closure. Any tick containing a retraction falls back to a
-/// from-scratch recompute (still correct; the integrated import traces reflect
-/// the deletion). Removing that fallback — fully incremental retraction
-/// propagation (DRED) — is the next stage.
+/// (Filter / Project / Inner-Join / UnionAll). It preserves the materialised
+/// fixpoint <c>R</c> across outer ticks and updates it incrementally — cost
+/// proportional to the affected region rather than to the whole closure — for
+/// both insertions (semi-naive extension) and deletions (Delete-and-Re-Derive).
 /// </summary>
 /// <remarks>
 /// <para>
 /// The body is wired once into a single scope and exposes two output streams:
 /// <c>base</c> (the non-recursive branch) and <c>step</c> (the recursive branch,
 /// reading the feedback). The operator fires the whole body and reads whichever
-/// streams a pass needs, switching each import between this tick's delta
-/// (<c>ΔI</c>) and the running integral (<c>I</c>):
+/// streams a pass needs, presenting each import as a computed Z-set — this
+/// tick's insertions (ΔI⁺), the running integral (I), the surviving edges
+/// (I∖ΔI⁺), the pre-tick edges (I_old), or the deletions (ΔI⁻).
 /// </para>
 /// <list type="bullet">
-/// <item><b>δ-pass</b> (imports = ΔI, self = R): the rows this tick's input
-/// change newly admits — <c>base(ΔI) ∪ step(R, ΔI)</c> — seed the frontier.</item>
-/// <item><b>iteration</b> (imports = I, self = frontier): feed only the frontier
-/// back through <c>step</c> to a fixpoint, by linearity of <c>step</c> in the
-/// self-reference.</item>
+/// <item><b>Insertion</b> (semi-naive): seed <c>base(ΔI⁺) ∪ step(R, ΔI⁺)</c>,
+/// then iterate the frontier through <c>step</c> against full <c>I</c>, by
+/// linearity of <c>step</c> in the self-reference.</item>
+/// <item><b>Deletion</b> (DRED): <i>over-delete</i> the R-tuples whose
+/// derivation used a deleted input, propagated transitively through the old
+/// graph; then <i>re-derive</i> the ones still reachable from the survivors via
+/// surviving edges. Correct under alternative derivation paths and cycles.</item>
 /// </list>
-/// <para>This is the algorithm the prior recursive-CTE operator ran via batch
-/// re-evaluation, now expressed through wired operators on the Core nested
-/// primitive. Correctness is held by the incremental≡batch recursive PBT.</para>
+/// <para>A tick is processed delete-then-insert, each from a correct fixpoint to
+/// the next. Multiset input deltas (a weight magnitude &gt; 1) fall outside the
+/// set model and trigger a from-scratch recompute. Correctness is held by the
+/// incremental≡batch recursive PBT over random insert/delete sequences.</para>
 /// </remarks>
 /// <typeparam name="TRow">The row type flowing on every inner stream.</typeparam>
 internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
@@ -87,35 +87,74 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
 
     public void Step()
     {
-        var hasRetraction = _imports.Any(i => ContainsNegativeWeight(i.Outer.Current));
+        var n = _imports.Length;
 
-        // Integrate this tick's deltas; ΔI stays on the outer streams, I is the
-        // trace integral. Both are needed below.
+        // Multiset input deltas are outside DRED's set model — recompute instead.
+        var multiset = false;
+        for (var i = 0; i < n; i++)
+        {
+            if (AnyWeightMagnitudeAboveOne(_imports[i].Outer.Current))
+            {
+                multiset = true;
+            }
+        }
+
         foreach (var import in _imports)
         {
             import.Trace.Integrate(import.Outer.Current);
         }
 
         var previousResult = _r;
-        if (hasRetraction || _r.IsEmpty)
+
+        if (multiset)
         {
-            FullRecompute();
+            var raw = new ZSet<TRow, Z64>[n];
+            for (var i = 0; i < n; i++)
+            {
+                raw[i] = _imports[i].Trace.Current;
+            }
+
+            FullRecompute(raw);
         }
         else
         {
-            IncrementalExtend();
+            // Per-import set views: inserted (ΔI⁺), deleted (ΔI⁻), the integral
+            // I, the survivors I∖ΔI⁺, and the pre-tick edges I_old = survivors∪ΔI⁻.
+            var inserted = new ZSet<TRow, Z64>[n];
+            var deleted = new ZSet<TRow, Z64>[n];
+            var integral = new ZSet<TRow, Z64>[n];
+            var surviving = new ZSet<TRow, Z64>[n];
+            var old = new ZSet<TRow, Z64>[n];
+            var hasDeletion = false;
+            for (var i = 0; i < n; i++)
+            {
+                var delta = _imports[i].Outer.Current;
+                inserted[i] = AsSet(delta);
+                deleted[i] = NegativePartAsSet(delta);
+                integral[i] = AsSet(_imports[i].Trace.Current);
+                surviving[i] = SetDifference(integral[i], inserted[i]);
+                old[i] = SetUnion(surviving[i], deleted[i]);
+                hasDeletion |= !deleted[i].IsEmpty;
+            }
+
+            if (hasDeletion)
+            {
+                DredDelete(deleted, old, surviving);
+            }
+
+            InsertExtend(inserted, integral);
         }
 
         _output.SetCurrent(_r - previousResult);
     }
 
     // R₀ = ∅; Rₙ₊₁ = distinct(base(I) ∪ step(I, Rₙ)); stop at the first fixpoint.
-    private void FullRecompute()
+    private void FullRecompute(ZSet<TRow, Z64>[] importValues)
     {
         var r = ZSet<TRow, Z64>.Empty;
         for (var i = 0; i < _maxIterations; i++)
         {
-            EvalBody(r, useDelta: false);
+            EvalBody(r, importValues);
             var next = AsSet(_baseStream.Current + _stepStream.Current);
             if (next.Equals(r))
             {
@@ -130,14 +169,13 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
             $"recursive fixpoint did not converge after {_maxIterations} iterations");
     }
 
-    // Semi-naive extension from the preserved R on an insert-only tick.
-    private void IncrementalExtend()
+    // Semi-naive extension of the preserved R by this tick's insertions.
+    private void InsertExtend(ZSet<TRow, Z64>[] inserted, ZSet<TRow, Z64>[] integral)
     {
-        // δ-pass: rows newly admitted by this tick's input change.
-        EvalBody(_r, useDelta: true);
-        var frontier = SetDifference(AsSet(_baseStream.Current + _stepStream.Current), _r);
+        // Seed: rows newly admitted by the inserted inputs.
+        var frontier = SetDifference(BaseUnionStep(_r, inserted), _r);
 
-        // Iteration: feed only the frontier back through step against full I.
+        // Iterate the frontier through step against the full integral.
         for (var i = 0; i < _maxIterations; i++)
         {
             if (frontier.IsEmpty)
@@ -145,22 +183,85 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
                 return;
             }
 
-            _r = AsSet(_r + frontier);
-            EvalBody(frontier, useDelta: false);
-            frontier = SetDifference(AsSet(_stepStream.Current), _r);
+            _r = SetUnion(_r, frontier);
+            frontier = SetDifference(StepOnly(frontier, integral), _r);
         }
 
         throw new InvalidOperationException(
             $"recursive fixpoint did not converge after {_maxIterations} iterations");
     }
 
-    // Present each import as ΔI or the running integral I, bind the feedback,
-    // then fire the whole body so both base and step streams are current.
-    private void EvalBody(ZSet<TRow, Z64> self, bool useDelta)
+    // Delete-and-Re-Derive: bring R from the fixpoint over I_old to the fixpoint
+    // over the surviving edges, incrementally.
+    private void DredDelete(ZSet<TRow, Z64>[] deleted, ZSet<TRow, Z64>[] old, ZSet<TRow, Z64>[] surviving)
     {
-        foreach (var import in _imports)
+        // Over-delete: every R-tuple whose derivation used a deleted input,
+        // propagated transitively through the old graph (tentatively removed).
+        var overDeleted = ZSet<TRow, Z64>.Empty;
+        var frontier = SetIntersection(BaseUnionStep(_r, deleted), _r);
+        for (var i = 0; i < _maxIterations; i++)
         {
-            import.Inner.SetCurrent(useDelta ? import.Outer.Current : import.Trace.Current);
+            frontier = SetDifference(frontier, overDeleted);
+            if (frontier.IsEmpty)
+            {
+                break;
+            }
+
+            overDeleted = SetUnion(overDeleted, frontier);
+            frontier = SetIntersection(StepOnly(frontier, old), _r);
+            if (i == _maxIterations - 1)
+            {
+                throw new InvalidOperationException(
+                    $"recursive over-deletion did not converge after {_maxIterations} iterations");
+            }
+        }
+
+        // Re-derive: over-deleted tuples still reachable from the survivors via
+        // surviving edges are restored.
+        var survivors = SetDifference(_r, overDeleted);
+        var rederived = ZSet<TRow, Z64>.Empty;
+        var rfront = SetIntersection(BaseUnionStep(survivors, surviving), overDeleted);
+        for (var i = 0; i < _maxIterations; i++)
+        {
+            rfront = SetDifference(rfront, rederived);
+            if (rfront.IsEmpty)
+            {
+                break;
+            }
+
+            rederived = SetUnion(rederived, rfront);
+            rfront = SetIntersection(StepOnly(SetUnion(survivors, rederived), surviving), overDeleted);
+            if (i == _maxIterations - 1)
+            {
+                throw new InvalidOperationException(
+                    $"recursive re-derivation did not converge after {_maxIterations} iterations");
+            }
+        }
+
+        _r = SetUnion(survivors, rederived);
+    }
+
+    // base(imports) ∪ step(imports, self), as a set.
+    private ZSet<TRow, Z64> BaseUnionStep(ZSet<TRow, Z64> self, ZSet<TRow, Z64>[] importValues)
+    {
+        EvalBody(self, importValues);
+        return AsSet(_baseStream.Current + _stepStream.Current);
+    }
+
+    // step(imports, self), as a set.
+    private ZSet<TRow, Z64> StepOnly(ZSet<TRow, Z64> self, ZSet<TRow, Z64>[] importValues)
+    {
+        EvalBody(self, importValues);
+        return AsSet(_stepStream.Current);
+    }
+
+    // Present each import as the supplied value, bind the feedback, then fire the
+    // whole body so both base and step streams are current.
+    private void EvalBody(ZSet<TRow, Z64> self, ZSet<TRow, Z64>[] importValues)
+    {
+        for (var i = 0; i < _imports.Length; i++)
+        {
+            _imports[i].Inner.SetCurrent(importValues[i]);
         }
 
         _recRef.SetCurrent(self);
@@ -189,6 +290,29 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
         return builder.Build();
     }
 
+    // Deleted rows (negative weight in the signed delta) as a positive set.
+    private static ZSet<TRow, Z64> NegativePartAsSet(ZSet<TRow, Z64> z)
+    {
+        if (z.IsEmpty)
+        {
+            return z;
+        }
+
+        var builder = new ZSetBuilder<TRow, Z64>();
+        foreach (var (row, w) in z)
+        {
+            if (w.Value < 0)
+            {
+                builder.Add(row, Z64.One);
+            }
+        }
+
+        return builder.Build();
+    }
+
+    // A ∪ B as sets.
+    private static ZSet<TRow, Z64> SetUnion(ZSet<TRow, Z64> a, ZSet<TRow, Z64> b) => AsSet(a + b);
+
     // A − B as sets: positive-weight rows of A absent (zero-weight) from B.
     private static ZSet<TRow, Z64> SetDifference(ZSet<TRow, Z64> a, ZSet<TRow, Z64> b)
     {
@@ -209,11 +333,31 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
         return builder.Build();
     }
 
-    private static bool ContainsNegativeWeight(ZSet<TRow, Z64> z)
+    // A ∩ B as sets: positive-weight rows of A that are also positive in B.
+    private static ZSet<TRow, Z64> SetIntersection(ZSet<TRow, Z64> a, ZSet<TRow, Z64> b)
+    {
+        if (a.IsEmpty || b.IsEmpty)
+        {
+            return ZSet<TRow, Z64>.Empty;
+        }
+
+        var builder = new ZSetBuilder<TRow, Z64>();
+        foreach (var (row, w) in a)
+        {
+            if (Z64.IsPositive(w) && Z64.IsPositive(b.WeightOf(row)))
+            {
+                builder.Add(row, Z64.One);
+            }
+        }
+
+        return builder.Build();
+    }
+
+    private static bool AnyWeightMagnitudeAboveOne(ZSet<TRow, Z64> z)
     {
         foreach (var (_, w) in z)
         {
-            if (w.Value < 0)
+            if (w.Value is > 1 or < -1)
             {
                 return true;
             }
