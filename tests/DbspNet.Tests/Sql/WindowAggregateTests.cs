@@ -182,8 +182,8 @@ public class WindowAggregateTests
         "SELECT cust FROM orders WHERE SUM(amount) OVER (PARTITION BY cust) > 5");
 
     [Fact]
-    public void Rejects_LagFunction() => Rejects(
-        "SELECT ts, LAG(amount) OVER (PARTITION BY cust ORDER BY ts) FROM orders");
+    public void Rejects_DeferredWindowFunction() => Rejects(
+        "SELECT ts, FIRST_VALUE(amount) OVER (PARTITION BY cust ORDER BY ts) FROM orders");
 
     [Fact]
     public void Rejects_DifferentSpecs() => Rejects(

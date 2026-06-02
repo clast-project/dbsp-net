@@ -97,6 +97,9 @@ public static class PlanOptimizer
             // Window aggregate is likewise a pushdown barrier — a filter or
             // projection moved across it would change frame membership.
             WindowAggregatePlan wa => wa with { Input = OptimizeNode(wa.Input) },
+            // LAG/LEAD is likewise a pushdown barrier — a filter or projection
+            // moved across it would change per-partition row positions.
+            WindowOffsetPlan wo => wo with { Input = OptimizeNode(wo.Input) },
             DifferencePlan diff => new DifferencePlan(
                 OptimizeNode(diff.Left), OptimizeNode(diff.Right)),
             ScalarSubqueryJoinPlan s => s with

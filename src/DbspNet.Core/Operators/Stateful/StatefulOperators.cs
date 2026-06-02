@@ -186,6 +186,34 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Incremental partitioned <c>LAG</c> / <c>LEAD</c> — positional offset
+    /// functions (<paramref name="specs"/>) emitted as new column(s) appended to
+    /// every row, keyed by <paramref name="partitionOf"/> and ordered by
+    /// <paramref name="order"/> (a total order).
+    /// </summary>
+    public static Stream<ZSet<StructuralRow, Z64>> PartitionedOffset<TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, TKey> partitionOf,
+        IComparer<StructuralRow> order,
+        OffsetSpec[] specs,
+        IEqualityComparer<TKey>? partitionComparer = null,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partitionOf);
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(specs);
+
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedOffsetOp<TKey>(
+            input, output, partitionOf, order, specs, partitionComparer, snapshotCodec));
+        return output;
+    }
+
+    /// <summary>
     /// Index a flat Z-set stream by a key-extraction function. The key
     /// extractor is applied tick-by-tick and results in an indexed Z-set
     /// stream with the same weights.

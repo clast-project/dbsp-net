@@ -667,6 +667,9 @@ public static class PlanToCircuit
                 case WindowAggregatePlan wa:
                     Walk(wa.Input);
                     break;
+                case WindowOffsetPlan wo:
+                    Walk(wo.Input);
+                    break;
                 case DifferencePlan diff:
                     Walk(diff.Left);
                     Walk(diff.Right);
@@ -780,6 +783,9 @@ public static class PlanToCircuit
 
             case WindowAggregatePlan wa:
                 return CompileWindowAggregate(builder, wa, ctx);
+
+            case WindowOffsetPlan wo:
+                return CompileWindowOffset(builder, wo, ctx);
 
             default:
                 throw new InvalidOperationException($"unsupported plan node {plan.GetType().Name}");
@@ -1041,6 +1047,54 @@ public static class PlanToCircuit
         }
 
         return frontier;
+    }
+
+    // ---- Window offset functions (LAG / LEAD) ----
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompileWindowOffset(
+        CircuitBuilder builder,
+        WindowOffsetPlan plan,
+        CompileContext ctx)
+    {
+        var input = CompilePlan(builder, plan.Input, ctx);
+
+        var partitionExtractors = new Func<IReadOnlyList<object?>, object?>[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            partitionExtractors[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
+        }
+
+        StructuralRow PartitionOf(StructuralRow row)
+        {
+            var values = new object?[partitionExtractors.Length];
+            for (var i = 0; i < partitionExtractors.Length; i++)
+            {
+                values[i] = partitionExtractors[i](row);
+            }
+
+            return new StructuralRow(values);
+        }
+
+        // Total order: the ORDER BY key (any comparable type — LAG/LEAD is
+        // positional) then a full-row tiebreak so positions are deterministic.
+        var sortScalar = ExpressionCompiler.CompileScalar(plan.OrderKey.Expression);
+        var keys = new Func<StructuralRow, object?>[] { row => sortScalar(row) };
+        var order = new SortKeyComparer<StructuralRow>(
+            keys,
+            new[] { plan.OrderKey.Descending },
+            new[] { plan.OrderKey.NullsFirst },
+            StructuralRowComparer.Instance);
+
+        var specs = new OffsetSpec[plan.Functions.Count];
+        for (var i = 0; i < plan.Functions.Count; i++)
+        {
+            var fn = plan.Functions[i];
+            var valueScalar = ExpressionCompiler.CompileScalar(fn.Value);
+            specs[i] = new OffsetSpec(row => valueScalar(row), fn.Offset, fn.IsLead, fn.Default);
+        }
+
+        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
+        return builder.PartitionedOffset<StructuralRow>(input, PartitionOf, order, specs, null, codec);
     }
 
     // ---- Projection ----

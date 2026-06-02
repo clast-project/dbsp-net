@@ -235,6 +235,10 @@ public static class MonotonicityAnalyzer
                 // columns are non-monotone.
                 return ResizeTo(Visit(wa.Input, memo), wa.Schema.Count);
 
+            case WindowOffsetPlan wo:
+                // Base columns pass through; appended LAG/LEAD columns are non-monotone.
+                return ResizeTo(Visit(wo.Input, memo), wo.Schema.Count);
+
             default:
                 return new MonotoneColumn?[node.Schema.Count];
         }

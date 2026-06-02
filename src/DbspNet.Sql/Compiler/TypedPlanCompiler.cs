@@ -216,6 +216,7 @@ public static class TypedPlanCompiler
         // Window aggregates widen rows to a new schema and use the structural
         // CompositeAggregator; no typed fast path — fall back to structural.
         WindowAggregatePlan => null,
+        WindowOffsetPlan => null,
         _ => null,
     };
 

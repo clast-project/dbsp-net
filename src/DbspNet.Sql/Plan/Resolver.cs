@@ -1248,26 +1248,36 @@ public sealed class Resolver
                 "a window function must be a top-level select item in v1 (it cannot be nested in an expression)");
         }
 
-        // Every top-level window item must be an aggregate function sharing one
-        // OVER specification (ranking functions ride the TOP-K pattern; LAG/LEAD/
-        // FIRST_VALUE/LAST_VALUE are deferred).
+        // Every top-level window item must be a supported window function sharing
+        // one OVER specification, and all of the same family — either window
+        // aggregates (SUM/COUNT/AVG/MIN/MAX) or offset functions (LAG/LEAD).
+        // Ranking functions ride the TOP-K pattern; FIRST_VALUE/LAST_VALUE are
+        // deferred.
         var firstWin = (WindowFunctionExpression)windowItems[0].Expression;
+        var isOffset = IsOffsetFunctionName(firstWin.FunctionName);
         foreach (var wi in windowItems)
         {
             var w = (WindowFunctionExpression)wi.Expression;
-            if (!IsAggregateName(w.FunctionName, w.IsStar))
+            var thisOffset = IsOffsetFunctionName(w.FunctionName);
+            if (!IsAggregateName(w.FunctionName, w.IsStar) && !thisOffset)
             {
                 throw new ResolveException(
                     $"window function '{w.FunctionName}' is not supported as an output column; only the " +
-                    "window aggregates SUM / COUNT / AVG / MIN / MAX are (ranking functions ROW_NUMBER / " +
-                    "RANK / DENSE_RANK are supported only in the TOP-K filter pattern; LAG / LEAD / " +
-                    "FIRST_VALUE / LAST_VALUE are deferred)");
+                    "window aggregates SUM / COUNT / AVG / MIN / MAX and the offset functions LAG / LEAD " +
+                    "are (ranking functions ROW_NUMBER / RANK / DENSE_RANK are supported only in the TOP-K " +
+                    "filter pattern; FIRST_VALUE / LAST_VALUE are deferred)");
+            }
+
+            if (thisOffset != isOffset)
+            {
+                throw new ResolveException(
+                    "a query cannot mix window aggregates and LAG / LEAD in v1");
             }
 
             if (!ReferenceEquals(w, firstWin) && !SameWindowSpec(firstWin.Over, w.Over))
             {
                 throw new ResolveException(
-                    "all window aggregates in a query must share the same OVER specification in v1");
+                    "all window functions in a query must share the same OVER specification in v1");
             }
         }
 
@@ -1276,13 +1286,13 @@ public sealed class Resolver
                 && esi.Expression is not WindowFunctionExpression && HasAggregate(esi.Expression)))
         {
             throw new ResolveException(
-                "a window aggregate over a grouped / aggregated query is not supported in v1");
+                "a window function over a grouped / aggregated query is not supported in v1");
         }
 
         if (stmt.Items.Any(it => it is StarSelectItem))
         {
             throw new ResolveException(
-                "SELECT * is not allowed with a window aggregate; list the output columns explicitly");
+                "SELECT * is not allowed with a window function; list the output columns explicitly");
         }
 
         // Resolve the pre-window relation (FROM + WHERE) as a star query so the
@@ -1306,26 +1316,18 @@ public sealed class Resolver
             partitionKeys.Add(ResolveScalarExpression(p, baseSchema));
         }
 
-        // ORDER BY (a single key in v1) and the RANGE frame.
+        // ORDER BY (a single key in v1).
         SortKey? orderKey = null;
-        WindowFrameBounds? frame = null;
         if (firstWin.Over.OrderBy.Count > 0)
         {
             if (firstWin.Over.OrderBy.Count > 1)
             {
                 throw new ResolveException(
-                    "a window aggregate supports a single ORDER BY key in v1");
+                    "a window function supports a single ORDER BY key in v1");
             }
 
             var item = firstWin.Over.OrderBy[0];
             var resolved = ResolveScalarExpression(item.Expression, baseSchema);
-            if (resolved.Type is not (SqlIntegerType or SqlBigintType or SqlDateType or SqlTimeType or SqlTimestampType))
-            {
-                throw new ResolveException(
-                    "an ordered window aggregate requires an integer (INT/BIGINT) or temporal " +
-                    "(DATE/TIME/TIMESTAMP) ORDER BY key in v1");
-            }
-
             var descending = item.Direction == SortDirection.Descending;
             var nullsFirst = item.Nulls switch
             {
@@ -1334,51 +1336,95 @@ public sealed class Resolver
                 _ => descending,
             };
             orderKey = new SortKey(resolved, descending, nullsFirst);
-            frame = ResolveWindowFrame(firstWin.Over.Frame, resolved.Type, baseSchema);
-        }
-        else if (firstWin.Over.Frame is not null)
-        {
-            throw new ResolveException("a window frame (RANGE) requires an ORDER BY");
         }
 
-        // Aggregate calls + result columns (one per window item).
-        var aggregates = new List<AggregateCall>(windowItems.Count);
         var resultCols = new List<SchemaColumn>(windowItems.Count);
         var preBound = new Dictionary<Expression, ResolvedExpression>(ReferenceEqualityComparer.Instance);
-        for (var k = 0; k < windowItems.Count; k++)
-        {
-            var wi = windowItems[k];
-            var w = (WindowFunctionExpression)wi.Expression;
-            var asCall = new FunctionCallExpression(w.FunctionName, w.Arguments, w.IsStar);
-            var kind = ToAggregateKind(asCall);
-            ResolvedExpression? arg = null;
-            if (kind != AggregateKind.CountStar)
-            {
-                if (w.Arguments.Count != 1)
-                {
-                    throw new ResolveException(
-                        $"{w.FunctionName.ToUpperInvariant()} OVER takes exactly one argument");
-                }
+        LogicalPlan windowPlan;
 
-                arg = ResolveScalarExpression(w.Arguments[0], baseSchema);
+        if (isOffset)
+        {
+            if (orderKey is null)
+            {
+                throw new ResolveException("LAG / LEAD requires an ORDER BY");
             }
 
-            var resultType = ComputeAggregateResultType(kind, arg?.Type);
-            aggregates.Add(new AggregateCall(kind, arg, resultType));
+            if (firstWin.Over.Frame is not null)
+            {
+                throw new ResolveException("LAG / LEAD does not take a frame clause");
+            }
 
-            var (name, _) = DeriveProjectionName(w, wi.Alias);
-            resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$wagg{k}" : name), resultType));
-            preBound[wi.Expression] = new ResolvedColumn(baseSchema.Count + k, resultType);
+            var functions = new List<OffsetFunctionCall>(windowItems.Count);
+            for (var k = 0; k < windowItems.Count; k++)
+            {
+                var wi = windowItems[k];
+                var w = (WindowFunctionExpression)wi.Expression;
+                var (fn, resultType) = ResolveOffsetFunction(w, baseSchema);
+                functions.Add(fn);
+
+                var (name, _) = DeriveProjectionName(w, wi.Alias);
+                resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$woff{k}" : name), resultType));
+                preBound[wi.Expression] = new ResolvedColumn(baseSchema.Count + k, resultType);
+            }
+
+            var offsetSchema = new Schema([.. baseSchema.Columns, .. resultCols]);
+            windowPlan = new WindowOffsetPlan(basePlan, partitionKeys, orderKey, functions, offsetSchema);
         }
+        else
+        {
+            WindowFrameBounds? frame = null;
+            if (orderKey is not null)
+            {
+                if (orderKey.Expression.Type is not (SqlIntegerType or SqlBigintType
+                    or SqlDateType or SqlTimeType or SqlTimestampType))
+                {
+                    throw new ResolveException(
+                        "an ordered window aggregate requires an integer (INT/BIGINT) or temporal " +
+                        "(DATE/TIME/TIMESTAMP) ORDER BY key in v1");
+                }
 
-        var windowSchema = new Schema([.. baseSchema.Columns, .. resultCols]);
-        LogicalPlan windowPlan = new WindowAggregatePlan(
-            basePlan, partitionKeys, orderKey, frame, aggregates, windowSchema);
+                frame = ResolveWindowFrame(firstWin.Over.Frame, orderKey.Expression.Type, baseSchema);
+            }
+            else if (firstWin.Over.Frame is not null)
+            {
+                throw new ResolveException("a window frame (RANGE) requires an ORDER BY");
+            }
+
+            var aggregates = new List<AggregateCall>(windowItems.Count);
+            for (var k = 0; k < windowItems.Count; k++)
+            {
+                var wi = windowItems[k];
+                var w = (WindowFunctionExpression)wi.Expression;
+                var asCall = new FunctionCallExpression(w.FunctionName, w.Arguments, w.IsStar);
+                var kind = ToAggregateKind(asCall);
+                ResolvedExpression? arg = null;
+                if (kind != AggregateKind.CountStar)
+                {
+                    if (w.Arguments.Count != 1)
+                    {
+                        throw new ResolveException(
+                            $"{w.FunctionName.ToUpperInvariant()} OVER takes exactly one argument");
+                    }
+
+                    arg = ResolveScalarExpression(w.Arguments[0], baseSchema);
+                }
+
+                var resultType = ComputeAggregateResultType(kind, arg?.Type);
+                aggregates.Add(new AggregateCall(kind, arg, resultType));
+
+                var (name, _) = DeriveProjectionName(w, wi.Alias);
+                resultCols.Add(new SchemaColumn(wi.Alias ?? (name == "$col" ? $"$wagg{k}" : name), resultType));
+                preBound[wi.Expression] = new ResolvedColumn(baseSchema.Count + k, resultType);
+            }
+
+            var windowSchema = new Schema([.. baseSchema.Columns, .. resultCols]);
+            windowPlan = new WindowAggregatePlan(basePlan, partitionKeys, orderKey, frame, aggregates, windowSchema);
+        }
 
         // Map the user's select list over the widened rows: non-window items
         // resolve against the base columns (the schema prefix); window items
         // resolve to their result column via `preBound`.
-        var projections = ResolveProjections(stmt.Items, windowSchema, subqueryMap: null, preBound);
+        var projections = ResolveProjections(stmt.Items, windowPlan.Schema, subqueryMap: null, preBound);
         LogicalPlan projected = new ProjectPlan(windowPlan, projections, BuildProjectSchema(projections));
         return stmt.Distinct ? new DistinctPlan(projected) : projected;
     }
@@ -1482,6 +1528,78 @@ public sealed class Resolver
 
     private static long NonNegativeOffset(long v) =>
         v >= 0 ? v : throw new ResolveException("a RANGE frame PRECEDING offset must be non-negative");
+
+    private static bool IsOffsetFunctionName(string name) => name is "lag" or "lead";
+
+    /// <summary>Fold a resolved constant — a literal or a unary negation of a
+    /// numeric literal — to its value. Used for LAG/LEAD constant offsets and
+    /// defaults (a bare <c>-1</c> resolves to <c>Negate(1)</c>, not a literal).</summary>
+    private static bool TryFoldConstant(ResolvedExpression e, out object? value)
+    {
+        switch (e)
+        {
+            case ResolvedLiteral lit:
+                value = lit.Value;
+                return true;
+            case ResolvedUnary { Operator: UnaryOperator.Negate, Operand: ResolvedLiteral lit }:
+                value = lit.Value switch
+                {
+                    int i => -i,
+                    long l => -l,
+                    double d => -d,
+                    _ => null,
+                };
+                return value is not null;
+            default:
+                value = null;
+                return false;
+        }
+    }
+
+    /// <summary>Resolve a <c>LAG</c> / <c>LEAD</c> call —
+    /// <c>fn(value [, offset [, default]])</c> — against the pre-window schema.
+    /// The offset is a non-negative integer constant (default 1); the default is a
+    /// constant returned when the offset row falls outside the partition (default
+    /// NULL). The result type is the value's type, made nullable.</summary>
+    private static (OffsetFunctionCall Call, SqlType ResultType) ResolveOffsetFunction(
+        WindowFunctionExpression w, Schema baseSchema)
+    {
+        var fnUpper = w.FunctionName.ToUpperInvariant();
+        if (w.IsStar || w.Arguments.Count is < 1 or > 3)
+        {
+            throw new ResolveException(
+                $"{fnUpper} takes 1 to 3 arguments (value [, offset [, default]])");
+        }
+
+        var value = ResolveScalarExpression(w.Arguments[0], baseSchema);
+
+        long offset = 1;
+        if (w.Arguments.Count >= 2)
+        {
+            if (!TryFoldConstant(ResolveScalarExpression(w.Arguments[1], baseSchema), out var ov)
+                || ov is not (int or long))
+            {
+                throw new ResolveException($"the {fnUpper} offset must be a constant integer");
+            }
+
+            offset = ov is int oi ? oi : (long)ov;
+            if (offset < 0)
+            {
+                throw new ResolveException($"the {fnUpper} offset must be non-negative");
+            }
+        }
+
+        object? def = null;
+        if (w.Arguments.Count == 3
+            && !TryFoldConstant(ResolveScalarExpression(w.Arguments[2], baseSchema), out def))
+        {
+            throw new ResolveException($"the {fnUpper} default must be a constant");
+        }
+
+        var resultType = value.Type.WithNullable(true);
+        var isLead = string.Equals(w.FunctionName, "lead", StringComparison.Ordinal);
+        return (new OffsetFunctionCall(value, offset, isLead, def, resultType), resultType);
+    }
 
     private static bool MentionsWindowFunction(Expression e) => e switch
     {

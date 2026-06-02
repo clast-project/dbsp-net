@@ -152,7 +152,9 @@ batch re-computation.
   (`RANGE BETWEEN <const | day-time INTERVAL> PRECEDING AND CURRENT ROW`). Lowered
   to a `PartitionedWindowAggregateOp` that recomputes only the rows whose frame a
   tick changed (RANGE peer-group semantics; a bounded ascending frame over a
-  `LATENESS` / temporal-filter key GCs old rows). `LAG`/`LEAD`/`FIRST_VALUE`/
+  `LATENESS` / temporal-filter key GCs old rows). The offset functions
+  `LAG`/`LEAD(expr [, offset [, default]]) OVER (PARTITION BY p ORDER BY o)` are
+  also supported (positional, via `PartitionedOffsetOp`). `FIRST_VALUE`/
   `LAST_VALUE`, `ROWS`/`GROUPS` frames, and `FOLLOWING` bounds are deferred.
 - Scalar subqueries (uncorrelated, exactly one column) in `WHERE`, `SELECT`,
   and `HAVING` expressions. Empty subquery → `NULL`; changing subquery
@@ -323,9 +325,9 @@ beyond "Feldera is much bigger":
   (carried as hidden columns). Windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` in
   the partitioned TOP-K filter pattern are supported, as are window aggregates
   (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER` with whole-partition / running / bounded
-  `RANGE` frames); the general windowed *rank*-column form (a rank emitted on
-  every row), `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, and `ROWS`/`GROUPS` frames
-  are deferred. `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`, default
+  `RANGE` frames) and the offset functions `LAG`/`LEAD`; the general windowed
+  *rank*-column form (a rank emitted on every row), `FIRST_VALUE`/`LAST_VALUE`,
+  and `ROWS`/`GROUPS` frames are deferred. `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`, default
   backslash) are supported — pattern matching lowered to a `Regex`, with the
   contextual keywords leaving `like`/`to`/`escape` usable as identifiers.
   `JOIN … USING` is supported (equi-join on the

@@ -396,7 +396,7 @@ reflect that shape, not a backlog.
   preceding` are dropped from state. Structural compile only (typed/spine fall
   back). Correctness is held by a randomized incremental≡batch test (including a
   LATENESS-GC variant) plus a `BatchPlanEvaluator` arm. **Deferred:**
-    - **[P2]** `LAG` / `LEAD`, `FIRST_VALUE` / `LAST_VALUE`.
+    - **[P2]** `FIRST_VALUE` / `LAST_VALUE`.
     - **[P2]** `ROWS` / `GROUPS` frames; `FOLLOWING` bounds; variable-width
       (`YEAR`/`MONTH`) interval offsets; a non-integer/non-temporal `ORDER BY` key.
     - **[P2]** More than one distinct `OVER` spec per query; a window function
@@ -404,6 +404,22 @@ reflect that shape, not a backlog.
       `SELECT *` alongside a window aggregate (list columns explicitly).
     - **[P2]** Typed-fast-path and spine variants; neighborhood-only recompute for
       the running case (currently the affected suffix).
+- Window offset functions `LAG` / `LEAD(expr [, offset [, default]]) OVER
+  (PARTITION BY p ORDER BY o)` emitted as a new output column — **implemented**.
+  Positional (by row, not value): the value is read from the row `offset`
+  positions before (`LAG`) or after (`LEAD`) the current row in the partition's
+  total order (the `ORDER BY` key then a full-row tiebreak; a weight-`w` row
+  occupies `w` consecutive positions). `offset` is a non-negative integer
+  constant (default 1); `default` is a constant returned when the offset row
+  falls outside the partition (default NULL). A new `WindowOffsetPlan` +
+  `PartitionedOffsetOp` recompute-and-diff the touched partition; the `ORDER BY`
+  key may be any comparable type (unlike RANGE aggregates). Shares the
+  window-function resolver recognition (a query may not mix offset functions and
+  window aggregates). Structural compile only; randomized incremental≡batch
+  coverage. **Deferred:**
+    - **[P2]** A non-constant / per-row `default` expression; an `IGNORE NULLS`
+      option; neighborhood-only recompute (currently whole touched partition) and
+      frontier GC; typed-fast-path and spine variants.
 - **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`; multi-key
   window `ORDER BY`; named `WINDOW` clauses.
 

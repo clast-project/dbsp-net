@@ -92,6 +92,9 @@ internal static class BatchPlanEvaluator
             case WindowAggregatePlan wa:
                 return BatchWindowAggregate(wa, ctx);
 
+            case WindowOffsetPlan wo:
+                return BatchWindowOffset(wo, ctx);
+
             case ScalarSubqueryJoinPlan s:
                 return BatchScalarSubqueryJoin(s, ctx);
 
@@ -607,6 +610,87 @@ internal static class BatchPlanEvaluator
                 }
 
                 result.Add(new StructuralRow(vs), new Z64(r.Weight));
+            }
+        }
+
+        return result.Build();
+    }
+
+    // Batch LAG/LEAD — the from-scratch oracle for PartitionedOffsetOp. Sort each
+    // partition by the total order, expand weights into positional slots, and read
+    // each function's value from its offset slot. Mirrors the operator exactly.
+    private static ZSet<StructuralRow, Z64> BatchWindowOffset(WindowOffsetPlan plan, BatchEvalContext ctx)
+    {
+        var input = Evaluate(plan.Input, ctx);
+
+        var partFns = new Func<IReadOnlyList<object?>, object?>[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            partFns[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
+        }
+
+        var sortScalar = ExpressionCompiler.CompileScalar(plan.OrderKey.Expression);
+        var order = new SortKeyComparer<StructuralRow>(
+            new Func<StructuralRow, object?>[] { row => sortScalar(row) },
+            new[] { plan.OrderKey.Descending },
+            new[] { plan.OrderKey.NullsFirst },
+            StructuralRowComparer.Instance);
+
+        var valueFns = new Func<StructuralRow, object?>[plan.Functions.Count];
+        for (var i = 0; i < plan.Functions.Count; i++)
+        {
+            valueFns[i] = ExpressionCompiler.CompileScalar(plan.Functions[i].Value);
+        }
+
+        var parts = new Dictionary<StructuralRow, List<(StructuralRow Row, long Weight)>>();
+        foreach (var (row, w) in input)
+        {
+            var kvs = new object?[partFns.Length];
+            for (var i = 0; i < partFns.Length; i++)
+            {
+                kvs[i] = partFns[i](row);
+            }
+
+            var key = new StructuralRow(kvs);
+            if (!parts.TryGetValue(key, out var lst))
+            {
+                lst = new List<(StructuralRow, long)>();
+                parts[key] = lst;
+            }
+
+            lst.Add((row, w.Value));
+        }
+
+        var result = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var (_, rows) in parts)
+        {
+            rows.Sort((a, b) => order.Compare(a.Row, b.Row));
+            var slots = new List<StructuralRow>();
+            foreach (var (row, weight) in rows)
+            {
+                for (var c = 0L; c < weight; c++)
+                {
+                    slots.Add(row);
+                }
+            }
+
+            for (var j = 0; j < slots.Count; j++)
+            {
+                var baseRow = slots[j];
+                var vs = new object?[baseRow.Count + plan.Functions.Count];
+                for (var i = 0; i < baseRow.Count; i++)
+                {
+                    vs[i] = baseRow[i];
+                }
+
+                for (var s = 0; s < plan.Functions.Count; s++)
+                {
+                    var fn = plan.Functions[s];
+                    var src = fn.IsLead ? j + fn.Offset : j - fn.Offset;
+                    vs[baseRow.Count + s] = src >= 0 && src < slots.Count ? valueFns[s](slots[(int)src]) : fn.Default;
+                }
+
+                result.Add(new StructuralRow(vs), Z64.One);
             }
         }
 

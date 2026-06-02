@@ -240,6 +240,37 @@ public sealed record WindowAggregatePlan(
     Schema Schema) : LogicalPlan(Schema);
 
 /// <summary>
+/// One <c>LAG</c> / <c>LEAD</c> offset-function call inside a
+/// <see cref="WindowOffsetPlan"/>. <see cref="Value"/> is the expression read
+/// from the offset row; <see cref="Offset"/> is the (non-negative) row distance
+/// (default 1); <see cref="IsLead"/> selects forward (<c>LEAD</c>) vs backward
+/// (<c>LAG</c>); <see cref="Default"/> is the constant returned when the offset
+/// row falls outside the partition (<c>null</c> ⇒ SQL NULL).
+/// </summary>
+public sealed record OffsetFunctionCall(
+    ResolvedExpression Value,
+    long Offset,
+    bool IsLead,
+    object? Default,
+    SqlType ResultType);
+
+/// <summary>
+/// Window offset functions — <c>LAG/LEAD(expr [, offset [, default]]) OVER
+/// (PARTITION BY p ORDER BY o)</c> — emitted as new output column(s) appended to
+/// every input row. Positional (by row, not value): the value is read from the
+/// row <see cref="OffsetFunctionCall.Offset"/> positions before (LAG) or after
+/// (LEAD) the current row in the partition's <see cref="OrderKey"/> ordering
+/// (ties broken by the full row; a weight-<c>w</c> row occupies <c>w</c> consecutive
+/// positions). Lowered to a <c>PartitionedOffsetOp</c>.
+/// </summary>
+public sealed record WindowOffsetPlan(
+    LogicalPlan Input,
+    IReadOnlyList<ResolvedExpression> PartitionKeys,
+    SortKey OrderKey,
+    IReadOnlyList<OffsetFunctionCall> Functions,
+    Schema Schema) : LogicalPlan(Schema);
+
+/// <summary>
 /// <c>UNION ALL</c> of two or more branches. Every branch has been
 /// projection-aligned to <see cref="Schema"/> (same arity and per-column
 /// types). Compiles to successive Z-set additions in the runtime.
