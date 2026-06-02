@@ -196,6 +196,36 @@ internal sealed class PositionFunction(string name, bool swapped) : IScalarFunct
     public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
 }
 
+/// <summary>
+/// <c>value [NOT] {LIKE|ILIKE} pattern [ESCAPE esc]</c>. <c>ilike</c> sets the
+/// case-insensitive flag; both translate to a regex (precompiled when the
+/// pattern is constant). No typed fast path — returns null to fall the query
+/// back to the structural pipeline, like the other string predicates.
+/// </summary>
+internal sealed class LikeFunction(string name, bool caseInsensitive) : IScalarFunction
+{
+    public string Name => name;
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveLike(name, args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildLike(
+            fn, BuiltinScalarFunctions.CompileArgs(fn, buildArg), caseInsensitive, similar: false);
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
+/// <summary><c>value [NOT] SIMILAR TO pattern [ESCAPE esc]</c> — SQL-regex
+/// pattern matching (a superset of LIKE); case-sensitive.</summary>
+internal sealed class SimilarToFunction : IScalarFunction
+{
+    public string Name => "similar_to";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveLike("similar_to", args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildLike(
+            fn, BuiltinScalarFunctions.CompileArgs(fn, buildArg), caseInsensitive: false, similar: true);
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
 internal sealed class SignFunction : IScalarFunction
 {
     public string Name => "sign";

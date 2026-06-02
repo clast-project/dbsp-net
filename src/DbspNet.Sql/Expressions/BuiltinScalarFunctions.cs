@@ -1,10 +1,13 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
 
@@ -102,6 +105,36 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("||", args, new SqlVarcharType(null, concatNullable));
     }
 
+    /// <summary>
+    /// <c>value {LIKE|ILIKE|SIMILAR TO} pattern [ESCAPE esc]</c> — all operands
+    /// are VARCHAR; the result is BOOLEAN, NULL iff any operand is NULL (each
+    /// arg is a NULL-propagating operand, so the predicate is NULL when any of
+    /// value / pattern / escape is NULL).
+    /// </summary>
+    internal static ResolvedFunctionCall ResolveLike(string name, IReadOnlyList<ResolvedExpression> args)
+    {
+        if (args.Count is not (2 or 3))
+        {
+            throw new ResolveException($"{LikeDisplayName(name)} takes 2 or 3 arguments");
+        }
+
+        foreach (var a in args)
+        {
+            RequireString(name, a);
+        }
+
+        var nullable = false;
+        foreach (var a in args)
+        {
+            nullable |= a.Type.Nullable;
+        }
+
+        return new ResolvedFunctionCall(name, args, new SqlBooleanType(nullable));
+    }
+
+    private static string LikeDisplayName(string name) =>
+        name == "similar_to" ? "SIMILAR TO" : name.ToUpperInvariant();
+
     internal static ResolvedFunctionCall ResolveAbs(IReadOnlyList<ResolvedExpression> args)
     {
         RequireArity("abs", args, 1);
@@ -160,6 +193,67 @@ internal static class BuiltinScalarFunctions
         swapped
             ? Expression.Call(PositionRuntime, c[1], c[0])
             : Expression.Call(PositionRuntime, c[0], c[1]);
+
+    internal static readonly MethodInfo RegexMatchRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexMatch))!;
+    internal static readonly MethodInfo PatternMatchRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.PatternMatch))!;
+    internal static readonly MethodInfo PatternMatchEscRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.PatternMatchEsc))!;
+
+    /// <summary>
+    /// Lower a LIKE / ILIKE / SIMILAR TO predicate. The common case — a
+    /// constant pattern with a constant (or absent) escape — compiles the
+    /// regex once at build time and bakes it in; otherwise the pattern is
+    /// translated and matched per row through a cached runtime helper.
+    /// </summary>
+    internal static Expression BuildLike(
+        ResolvedFunctionCall fn, Expression[] c, bool caseInsensitive, bool similar)
+    {
+        var escapeArg = fn.Arguments.Count == 3 ? fn.Arguments[2] : null;
+
+        // Fast path: constant pattern + constant/absent escape → precompile.
+        if (fn.Arguments[1] is ResolvedLiteral { Value: Utf8String patLit }
+            && TryConstEscape(escapeArg, out var escChar))
+        {
+            var regex = SqlPatternMatch.Compile(patLit.ToStringDecoded(), escChar, caseInsensitive, similar);
+            return NullPropagatingUnary(c[0], typeof(Utf8String),
+                s => Expression.Call(RegexMatchRuntime, Expression.Constant(regex), s));
+        }
+
+        // General path: NULL-propagating runtime translate-and-match.
+        var ci = Expression.Constant(caseInsensitive);
+        var sim = Expression.Constant(similar);
+        return escapeArg is null
+            ? Expression.Call(PatternMatchRuntime, c[0], c[1], ci, sim)
+            : Expression.Call(PatternMatchEscRuntime, c[0], c[1], c[2], ci, sim);
+    }
+
+    // The escape clause defaults to backslash (PostgreSQL-aligned); a literal
+    // empty escape string disables escaping. Only a single-BMP-char literal (or
+    // empty) can be folded at build time — anything else (non-literal, multi
+    // char, surrogate pair) falls to the runtime path, which validates it.
+    private static bool TryConstEscape(ResolvedExpression? escapeArg, out char? escChar)
+    {
+        if (escapeArg is null)
+        {
+            escChar = SqlPatternMatch.DefaultEscape;
+            return true;
+        }
+
+        if (escapeArg is ResolvedLiteral { Value: Utf8String escLit })
+        {
+            var s = escLit.ToStringDecoded();
+            switch (s.Length)
+            {
+                case 0: escChar = null; return true;   // ESCAPE '' disables it
+                case 1: escChar = s[0]; return true;
+            }
+        }
+
+        escChar = null;
+        return false;
+    }
 
     internal static Expression BuildSign(Expression arg) =>
         NullPropagatingUnary(arg, typeof(double), v => Expression.Call(MathSignDouble, v));
@@ -816,6 +910,44 @@ internal static class SqlBuiltinRuntime
             ? null
             : (object)PositionCore((Utf8String)haystack, (Utf8String)needle);
 
+    /// <summary>
+    /// Match against a pattern compiled at build time (the constant-pattern fast
+    /// path). The caller's <see cref="BuiltinScalarFunctions.NullPropagatingUnary"/>
+    /// has already guaranteed a non-NULL value.
+    /// </summary>
+    public static bool RegexMatch(Regex re, Utf8String value) => re.IsMatch(value.ToStringDecoded());
+
+    /// <summary>
+    /// LIKE / ILIKE / SIMILAR TO with a runtime (non-constant) pattern and the
+    /// default backslash escape. NULL in either operand → NULL.
+    /// </summary>
+    public static object? PatternMatch(object? value, object? pattern, bool caseInsensitive, bool similar) =>
+        value is null || pattern is null
+            ? null
+            : (object)SqlPatternMatch.Compile(
+                ((Utf8String)pattern).ToStringDecoded(), SqlPatternMatch.DefaultEscape, caseInsensitive, similar)
+                .IsMatch(((Utf8String)value).ToStringDecoded());
+
+    /// <summary>
+    /// LIKE / ILIKE / SIMILAR TO with an explicit ESCAPE clause. The escape
+    /// string must be empty (escaping disabled) or a single character; NULL in
+    /// any operand → NULL.
+    /// </summary>
+    public static object? PatternMatchEsc(
+        object? value, object? pattern, object? escape, bool caseInsensitive, bool similar)
+    {
+        if (value is null || pattern is null || escape is null)
+        {
+            return null;
+        }
+
+        return SqlPatternMatch.Compile(
+            ((Utf8String)pattern).ToStringDecoded(),
+            SqlPatternMatch.EscapeCharOf((Utf8String)escape),
+            caseInsensitive,
+            similar).IsMatch(((Utf8String)value).ToStringDecoded());
+    }
+
     internal static int AsInt(object o) => o switch
     {
         int i => i,
@@ -1083,4 +1215,158 @@ internal static class SqlBuiltinRuntime
     // this file's Math.Round / Math.Floor overloads don't directly need it.
     // Left in place for when future number parsing helpers move here.
     internal static CultureInfo Invariant => CultureInfo.InvariantCulture;
+}
+
+/// <summary>
+/// Translates SQL <c>LIKE</c> / <c>ILIKE</c> / <c>SIMILAR TO</c> patterns into
+/// .NET regular expressions and caches the compiled result. Both forms are
+/// whole-string matches (implicitly anchored), so the body is wrapped in
+/// <c>\A(?:…)\z</c>; <see cref="RegexOptions.Singleline"/> makes <c>_</c>
+/// (→ <c>.</c>) match any character including newline, matching SQL semantics.
+/// </summary>
+/// <remarks>
+/// The escape character defaults to backslash (<see cref="DefaultEscape"/>),
+/// matching PostgreSQL; an explicit <c>ESCAPE ''</c> disables it. The cache is
+/// a pure memoization — a translated pattern is a deterministic function of its
+/// inputs — so it does not affect incremental correctness.
+/// <para>
+/// <b>Scope note (v1).</b> <c>SIMILAR TO</c> covers the SQL-regex
+/// metacharacters <c>% _ | * + ? ( ) { } [ ]</c>; bracket expressions are
+/// passed through to .NET, so POSIX class names (<c>[[:alpha:]]</c>) are not
+/// supported yet.
+/// </para>
+/// </remarks>
+internal static class SqlPatternMatch
+{
+    /// <summary>PostgreSQL-aligned default escape character.</summary>
+    public const char DefaultEscape = '\\';
+
+    private static readonly ConcurrentDictionary<(string Pattern, char? Escape, bool Ci, bool Similar), Regex> Cache =
+        new();
+
+    public static Regex Compile(string pattern, char? escape, bool caseInsensitive, bool similar) =>
+        Cache.GetOrAdd(
+            (pattern, escape, caseInsensitive, similar),
+            static k => Build(k.Pattern, k.Escape, k.Ci, k.Similar));
+
+    /// <summary>
+    /// The single-character escape carried by an explicit <c>ESCAPE</c> clause:
+    /// empty disables escaping (<c>null</c>); anything longer than one .NET char
+    /// is an error.
+    /// </summary>
+    public static char? EscapeCharOf(Utf8String escape)
+    {
+        var s = escape.ToStringDecoded();
+        return s.Length switch
+        {
+            0 => null,
+            1 => s[0],
+            _ => throw new InvalidOperationException("ESCAPE must be a single-character string"),
+        };
+    }
+
+    private static Regex Build(string pattern, char? escape, bool caseInsensitive, bool similar)
+    {
+        var body = similar ? TranslateSimilar(pattern, escape) : TranslateLike(pattern, escape);
+        var options = RegexOptions.Singleline | RegexOptions.CultureInvariant;
+        if (caseInsensitive)
+        {
+            options |= RegexOptions.IgnoreCase;
+        }
+
+        return new Regex(@"\A(?:" + body + @")\z", options);
+    }
+
+    private static string TranslateLike(string pattern, char? escape)
+    {
+        var sb = new StringBuilder(pattern.Length + 8);
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            var ch = pattern[i];
+            if (escape is char e && ch == e)
+            {
+                i++;
+                if (i >= pattern.Length)
+                {
+                    throw new InvalidOperationException("LIKE pattern may not end with the escape character");
+                }
+
+                sb.Append(Regex.Escape(pattern[i].ToString()));
+                continue;
+            }
+
+            switch (ch)
+            {
+                case '%': sb.Append(".*"); break;
+                case '_': sb.Append('.'); break;
+                default: sb.Append(Regex.Escape(ch.ToString())); break;
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private static string TranslateSimilar(string pattern, char? escape)
+    {
+        var sb = new StringBuilder(pattern.Length + 8);
+        var inBracket = false;
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            var ch = pattern[i];
+            if (escape is char e && ch == e)
+            {
+                i++;
+                if (i >= pattern.Length)
+                {
+                    throw new InvalidOperationException("SIMILAR TO pattern may not end with the escape character");
+                }
+
+                sb.Append(Regex.Escape(pattern[i].ToString()));
+                continue;
+            }
+
+            if (inBracket)
+            {
+                // Bracket expressions pass through to .NET verbatim until ']'.
+                sb.Append(ch);
+                if (ch == ']')
+                {
+                    inBracket = false;
+                }
+
+                continue;
+            }
+
+            switch (ch)
+            {
+                case '%': sb.Append(".*"); break;
+                case '_': sb.Append('.'); break;
+                case '[': sb.Append('['); inBracket = true; break;
+
+                // SQL-regex metacharacters that coincide with .NET's.
+                case '|':
+                case '*':
+                case '+':
+                case '?':
+                case '(':
+                case ')':
+                case '{':
+                case '}':
+                    sb.Append(ch);
+                    break;
+
+                // Everything else — including '.', '^', '$', '\' — is literal.
+                default:
+                    sb.Append(Regex.Escape(ch.ToString()));
+                    break;
+            }
+        }
+
+        if (inBracket)
+        {
+            throw new InvalidOperationException("SIMILAR TO pattern has an unterminated bracket expression");
+        }
+
+        return sb.ToString();
+    }
 }

@@ -138,6 +138,9 @@ internal static class ScalarFunctionRegistry
             new ReplaceFunction(),
             new PositionFunction("position", swapped: false),
             new PositionFunction("strpos", swapped: true),
+            new LikeFunction("like", caseInsensitive: false),
+            new LikeFunction("ilike", caseInsensitive: true),
+            new SimilarToFunction(),
 
             // Numeric.
             new AbsFunction(),

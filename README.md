@@ -312,7 +312,10 @@ beyond "Feldera is much bigger":
   (carried as hidden columns). Windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` in
   the partitioned TOP-K filter pattern are supported; the general windowed-column
   form (a rank emitted on every row), window aggregates, and `LAG`/`LEAD` are
-  deferred, as are `LIKE` / `SIMILAR TO`. `JOIN … USING` is supported (equi-join on the
+  deferred. `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`, default
+  backslash) are supported — pattern matching lowered to a `Regex`, with the
+  contextual keywords leaving `like`/`to`/`escape` usable as identifiers.
+  `JOIN … USING` is supported (equi-join on the
   named columns + merged-column projection; FULL merges via `COALESCE`); the
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING| BOTH … FROM …)`
   keyword spellings are not (use the comma / char-set forms).

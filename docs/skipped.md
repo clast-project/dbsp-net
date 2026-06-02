@@ -266,8 +266,21 @@ reflect that shape, not a backlog.
   Morgan dual that agrees under 3VL); no new AST node or runtime work. A
   subquery as the test operand is rejected (it would be reference-
   duplicated across the two bounds).
-- **[P1]** `LIKE`, `ILIKE`, `SIMILAR TO`. No keyword. Runtime story
-  ties into the Utf8String roadmap noted under Type system.
+- `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`) — **implemented**.
+  Parse-time desugar to boolean scalar-function calls (`like` / `ilike` /
+  `similar_to`) resolved and lowered through `ScalarFunctionRegistry`; the
+  `[NOT]` form wraps in a unary `NOT`, inheriting SQL three-valued NULL
+  handling. The keywords are *contextual* (matched by identifier text like
+  `OVER`/`PARTITION`), so none of `like`/`ilike`/`similar`/`to`/`escape` is
+  reserved. Lowering translates the pattern to a .NET `Regex` — `%`→`.*`,
+  `_`→`.`, whole-string anchored, `Singleline` so `_`/`%` span newlines; a
+  constant pattern is compiled once at build time and baked in, otherwise it is
+  translated + cached per pattern at runtime. `SIMILAR TO` additionally passes
+  the SQL-regex metacharacters `| * + ? ( ) { } [ ]` through (with `.` etc.
+  treated as literals). The escape character defaults to backslash
+  (PostgreSQL-aligned); `ESCAPE ''` disables it. No typed fast path (returns
+  null → structural compile), as with the other string predicates. *Deferred:*
+  POSIX class names inside bracket expressions (`[[:alpha:]]`).
 - `IN (literal_list)` / `NOT IN (literal_list)` — **implemented**.
   Modeled as a flat `InListExpression(probe, values, isNegated)` AST
   node, not a parser-time desugar to a left-leaning OR chain. The flat
@@ -372,7 +385,9 @@ reflect that shape, not a backlog.
   `REPLACE`, and `POSITION`/`STRPOS` are implemented with native UTF-8 /
   code-point semantics (substring offsets and POSITION results are in code
   points; REPLACE / POSITION search is byte-wise, which is correct for
-  valid UTF-8). `LIKE` / `SIMILAR TO` pattern matching is still deferred.
+  valid UTF-8). `LIKE` / `ILIKE` / `SIMILAR TO` pattern matching is
+  implemented by decoding to a .NET string and matching a translated `Regex`
+  (see the SQL-features section above).
 - Apache Arrow boundary: `DbspNet.Arrow` exposes `CompiledQuery.ToArrowDelta()`
   (returns a `RecordBatch` + parallel weights array — positive for inserts,
   negative for retractions) and `TableInput.PushArrow(RecordBatch[, weights])`

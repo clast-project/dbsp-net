@@ -952,6 +952,59 @@ public sealed class Parser
                 continue;
             }
 
+            // value [NOT] {LIKE | ILIKE | SIMILAR TO} pattern [ESCAPE esc].
+            // LIKE / ILIKE / SIMILAR / TO / ESCAPE are contextual keywords
+            // (never reserved), matched by identifier text, so they stay usable
+            // as ordinary names everywhere else — mirroring OVER / PARTITION.
+            if (IsContextualKeyword("like"))
+            {
+                Advance();
+                left = ParseLikeRhs(left, "like", isNegated: false);
+                continue;
+            }
+
+            if (IsContextualKeyword("ilike"))
+            {
+                Advance();
+                left = ParseLikeRhs(left, "ilike", isNegated: false);
+                continue;
+            }
+
+            if (IsContextualKeyword("similar") && IsContextualKeywordAt(1, "to"))
+            {
+                Advance(); // SIMILAR
+                Advance(); // TO
+                left = ParseLikeRhs(left, "similar_to", isNegated: false);
+                continue;
+            }
+
+            if (t.Kind == TokenKind.Not && IsContextualKeywordAt(1, "like"))
+            {
+                Advance(); // NOT
+                Advance(); // LIKE
+                left = ParseLikeRhs(left, "like", isNegated: true);
+                continue;
+            }
+
+            if (t.Kind == TokenKind.Not && IsContextualKeywordAt(1, "ilike"))
+            {
+                Advance(); // NOT
+                Advance(); // ILIKE
+                left = ParseLikeRhs(left, "ilike", isNegated: true);
+                continue;
+            }
+
+            if (t.Kind == TokenKind.Not
+                && IsContextualKeywordAt(1, "similar")
+                && IsContextualKeywordAt(2, "to"))
+            {
+                Advance(); // NOT
+                Advance(); // SIMILAR
+                Advance(); // TO
+                left = ParseLikeRhs(left, "similar_to", isNegated: true);
+                continue;
+            }
+
             BinaryOperator op;
             switch (t.Kind)
             {
@@ -978,6 +1031,33 @@ public sealed class Parser
     /// at <see cref="ParseIsNull"/> level so the separating <c>AND</c> binds to
     /// BETWEEN rather than the boolean-AND above this precedence level.
     /// </summary>
+    /// <summary>
+    /// <c>value [NOT] {LIKE|ILIKE|SIMILAR TO} pattern [ESCAPE esc]</c> — a
+    /// parse-time desugar to a boolean scalar-function call (<c>like</c> /
+    /// <c>ilike</c> / <c>similar_to</c>), with the negated form wrapped in a
+    /// unary <c>NOT</c>. The wrap inherits SQL three-valued NULL handling from
+    /// the unary-NOT lowering (NULL stays NULL), exactly as the comparison ops
+    /// do, so <c>x NOT LIKE NULL</c> is NULL rather than TRUE. Resolution and
+    /// lowering live in <c>ScalarFunctionRegistry</c>; only the keyword syntax
+    /// stays here. The pattern (and optional escape) parse at
+    /// <see cref="ParseIsNull"/> level so a trailing boolean <c>AND</c>/<c>OR</c>
+    /// closes the predicate rather than being swallowed.
+    /// </summary>
+    private Expression ParseLikeRhs(Expression value, string functionName, bool isNegated)
+    {
+        var pattern = ParseIsNull();
+        var args = new List<Expression> { value, pattern };
+
+        if (IsContextualKeyword("escape"))
+        {
+            Advance();
+            args.Add(ParseIsNull());
+        }
+
+        Expression call = new FunctionCallExpression(functionName, args, IsStar: false);
+        return isNegated ? new UnaryExpression(UnaryOperator.Not, call) : call;
+    }
+
     private Expression ParseBetweenRhs(Expression probe, bool isNegated)
     {
         // The probe is fanned out across both bounds, so a subquery there
@@ -1698,6 +1778,22 @@ public sealed class Parser
     private bool IsContextualKeyword(string word)
     {
         var t = Peek();
+        return t.Kind == TokenKind.Identifier && !t.QuotedIdentifier && t.Text == word;
+    }
+
+    /// <summary>
+    /// <see cref="IsContextualKeyword"/> with a lookahead offset — used for the
+    /// two-token <c>NOT LIKE</c> / <c>SIMILAR TO</c> forms.
+    /// </summary>
+    private bool IsContextualKeywordAt(int offset, string word)
+    {
+        var i = _pos + offset;
+        if (i >= _tokens.Count)
+        {
+            return false;
+        }
+
+        var t = _tokens[i];
         return t.Kind == TokenKind.Identifier && !t.QuotedIdentifier && t.Text == word;
     }
 
