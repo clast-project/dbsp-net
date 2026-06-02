@@ -91,6 +91,40 @@ public class TemporalFilterPbtTests
             iter: 2000);
     }
 
+    // CURRENT_DATE over CAST(ts AS DATE) of a TIMESTAMP column — the natural
+    // "filter timestamped events by calendar date" pattern. The GROUP BY shapes
+    // exercise the downstream-GC frontier: if the source-column frontier were
+    // unsound (dropped a still-live row), the accumulated incremental output
+    // would diverge from the batch oracle and fail here.
+    private static readonly Gen<string> GenCastDateShape = Gen.OneOfConst(
+        "SELECT CAST(ts AS DATE) AS d, v FROM a WHERE CAST(ts AS DATE) <= CURRENT_DATE",
+        "SELECT CAST(ts AS DATE) AS d, v FROM a WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '3' DAY",
+        // Derived table + GROUP BY on the projected date alias (GROUP BY takes only
+        // bare columns), exercising the projected-CAST monotone GC frontier.
+        "SELECT d, COUNT(*) AS c FROM "
+            + "(SELECT CAST(ts AS DATE) AS d FROM a WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '4' DAY) s "
+            + "GROUP BY d",
+        // GROUP BY the raw ts column, exercising the source-column (midnight-µs) frontier.
+        "SELECT ts, COUNT(*) AS c FROM a "
+            + "WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '4' DAY GROUP BY ts");
+
+    private static readonly Gen<(InputEvent[] Events, long ClockDelta)> GenCastDateTick =
+        Gen.Select(
+            Gen.Select(Gen.Int[0, 20], Gen.Int[0, 23], Gen.Int[-2, 5])
+                .Select(t => new InputEvent("a", [new Timestamp(t.Item1 * Day + t.Item2 * Hour), t.Item3], 1L))
+                .Array[0, 4],
+            Gen.Int[0, 50].Select(h => h * Hour));
+
+    private static readonly Gen<(InputEvent[] Events, long ClockDelta)[]> GenCastDateRun = GenCastDateTick.Array[1, 10];
+
+    [Fact]
+    public void CastTimestampToDateTemporalFilterIncrementalEqualsBatchAtFinalClock()
+    {
+        Gen.Select(GenCastDateShape, GenCastDateRun).Sample(
+            (sql, run) => CheckOne(sql, "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)", "a", run, start: Hour / 2),
+            iter: 2000);
+    }
+
     private static bool CheckOne(
         string sql, string ddl, string table, (InputEvent[] Events, long ClockDelta)[] run, long start = 0)
     {

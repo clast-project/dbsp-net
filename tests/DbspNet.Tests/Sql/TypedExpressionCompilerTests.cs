@@ -644,6 +644,36 @@ public class TypedExpressionCompilerTests
     }
 
     [Fact]
+    public void Cast_TimestampToDate_TruncatesTimeOfDay()
+    {
+        var schema = new Schema(new[] { new SchemaColumn("ts", new SqlTimestampType(false)) });
+        var rowType = TypedRowEmitter.EmitRowType(schema)!;
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL)"], "CAST(ts AS DATE)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var input = factory(new object?[] { Timestamp.Parse("2026-05-19 23:30:00") });
+        Assert.Equal(Date32.Parse("2026-05-19"), (Date32)Invoke(del!, input));
+    }
+
+    [Fact]
+    public void Cast_DateToTimestamp_IsMidnight()
+    {
+        var schema = new Schema(new[] { new SchemaColumn("d", new SqlDateType(false)) });
+        var rowType = TypedRowEmitter.EmitRowType(schema)!;
+        var factory = TypedRowEmitter.BuildBoxedFactory(schema)!;
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (d DATE NOT NULL)"], "CAST(d AS TIMESTAMP)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var input = factory(new object?[] { Date32.Parse("2026-05-19") });
+        Assert.Equal(Timestamp.Parse("2026-05-19 00:00:00"), (Timestamp)Invoke(del!, input));
+    }
+
+    [Fact]
     public void Cast_DecimalToVarchar()
     {
         var (rowType, factory) = RowFor(("p", new SqlDecimalType(10, 2, false)));

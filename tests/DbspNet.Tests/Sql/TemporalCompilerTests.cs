@@ -151,6 +151,53 @@ public class TemporalCompilerTests
         Assert.Equal(1, WeightOf(q.Current, "2026-04-27 12:00:00.000000"));
     }
 
+    // ---- CAST between DATE and TIMESTAMP ----
+
+    [Fact]
+    public void Cast_TimestampToDate_TruncatesTimeOfDay()
+    {
+        // CAST(ts AS DATE) keeps the calendar day and discards the time.
+        var q = Compile(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL)"],
+            "SELECT CAST(ts AS DATE) AS d FROM t");
+
+        q.Table("t").Insert(Timestamp.Parse("2026-04-27 00:00:00"));
+        q.Table("t").Insert(Timestamp.Parse("2026-04-27 23:59:59.999999"));
+        q.Step();
+
+        // Both timestamps fall on 2026-04-27, so the projected date is identical
+        // — one row, weight 2.
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(2, WeightOf(q.Current, Date32.Parse("2026-04-27")));
+    }
+
+    [Fact]
+    public void Cast_DateToTimestamp_IsMidnight()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (d DATE NOT NULL)"],
+            "SELECT CAST(d AS TIMESTAMP) AS ts FROM t");
+
+        q.Table("t").Insert(Date32.Parse("2026-04-27"));
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, Timestamp.Parse("2026-04-27 00:00:00")));
+    }
+
+    [Fact]
+    public void Cast_TimestampToDate_RoundTripsToMidnight()
+    {
+        // CAST(CAST(ts AS DATE) AS TIMESTAMP) zeroes the time-of-day.
+        var q = Compile(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL)"],
+            "SELECT CAST(CAST(ts AS DATE) AS TIMESTAMP) AS midnight FROM t");
+
+        q.Table("t").Insert(Timestamp.Parse("2026-04-27 13:45:12"));
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, Timestamp.Parse("2026-04-27 00:00:00")));
+    }
+
     // ---- Codec smoke test: rows with temporal columns are equatable ----
 
     [Fact]

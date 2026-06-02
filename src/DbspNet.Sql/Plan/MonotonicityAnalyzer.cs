@@ -150,12 +150,16 @@ public static class MonotonicityAnalyzer
                 var input = Visit(tf.Input, memo);
                 var cols = (MonotoneColumn?[])input.Clone();
                 if (tf.DisappearOffset is not null
-                    && tf.TimeKey is ResolvedColumn rc
                     && tf.Input is ScanPlan scan
-                    && rc.Index >= 0 && rc.Index < cols.Length)
+                    && TemporalKeySource(tf.TimeKey) is { } src
+                    && src.Column >= 0 && src.Column < cols.Length)
                 {
-                    cols[rc.Index] = new MonotoneColumn(
-                        new HashSet<LatenessSource> { new(scan.TableName, rc.Index) }, null);
+                    // Mark the *source* column monotone (identity transform); the
+                    // frontier PlanToCircuit registers for it is already in that
+                    // column's value space, and a derived key like
+                    // CAST(ts AS DATE) picks up its own transform via FromExpr.
+                    cols[src.Column] = new MonotoneColumn(
+                        new HashSet<LatenessSource> { new(scan.TableName, src.Column) }, null);
                 }
 
                 return cols;
@@ -271,10 +275,51 @@ public static class MonotonicityAnalyzer
                 return null;
             }
 
+            case ResolvedCast { Operand: var inner } cast
+                when TemporalCastFrontier(inner.Type, cast.Type) is { } transform
+                    && FromExpr(inner, input) is { FrontierTransform: null } carrier:
+                // A monotone temporal cast (e.g. CAST(ts AS DATE)) lowers the
+                // carrier into a different value space, so — like date_trunc — the
+                // frontier must pass through the same map before it thresholds the
+                // derived keys.
+                return new MonotoneColumn(carrier.Sources, transform);
+
             default:
                 return null;
         }
     }
+
+    /// <summary>The frontier transform of a monotone temporal CAST (the map a
+    /// source-space frontier passes through to land in the cast result's value
+    /// space), or <c>null</c> if the cast is not monotone-recognised. Both
+    /// supported directions are monotone non-decreasing: timestamp→date floors µs
+    /// to its day-number; date→timestamp scales a day-number to its midnight µs.</summary>
+    private static Func<long, long>? TemporalCastFrontier(SqlType src, SqlType dst) => (src, dst) switch
+    {
+        (SqlTimestampType, SqlDateType) => Date32.DayNumberFloor,
+        (SqlDateType, SqlTimestampType) => v => v * Interval.MicrosPerDay,
+        _ => null,
+    };
+
+    /// <summary>The base-scan source column a temporal-filter time-key reduces to,
+    /// for advertising the downstream-GC clock frontier — a bare column, or
+    /// <c>CAST(&lt;timestamp column&gt; AS DATE)</c> (the natural CURRENT_DATE-over-a-
+    /// TIMESTAMP-event-column shape). <see cref="CastTimestampToDate"/> tells
+    /// <c>PlanToCircuit</c> the frontier's value space: the column's own unit for a
+    /// bare column, vs. midnight-µs for the cast (the source column is the µs
+    /// timestamp, not the day-number key). Other expression keys are not yet
+    /// source-bearing — the filter is still correct, it just advertises no
+    /// frontier. Shared with <c>PlanToCircuit</c> so the two stay in lockstep.</summary>
+    internal readonly record struct TemporalKeySourceInfo(int Column, bool CastTimestampToDate);
+
+    internal static TemporalKeySourceInfo? TemporalKeySource(ResolvedExpression key) => key switch
+    {
+        ResolvedColumn rc => new TemporalKeySourceInfo(rc.Index, false),
+        ResolvedCast { Operand: ResolvedColumn rc } cast
+            when cast.Type is SqlDateType && rc.Type is SqlTimestampType
+            => new TemporalKeySourceInfo(rc.Index, true),
+        _ => null,
+    };
 
     private static bool IsNonNegativeConstant(ResolvedExpression e)
     {

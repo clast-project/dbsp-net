@@ -644,6 +644,20 @@ public static class TypedExpressionCompiler
             return PropagateUnary(operand, op => BuildTemporalToUtf8(op, srcClr));
         }
 
+        if (srcClr == typeof(Timestamp) && dstClr == typeof(Date32))
+        {
+            // CAST(timestamp AS date): discard the time-of-day (floor to the day).
+            return PropagateUnary(operand, op => Expression.Call(
+                typeof(Date32).GetMethod(nameof(Date32.FromTimestamp), [typeof(Timestamp)])!, op));
+        }
+
+        if (srcClr == typeof(Date32) && dstClr == typeof(Timestamp))
+        {
+            // CAST(date AS timestamp): midnight (00:00:00) of that day.
+            return PropagateUnary(operand, op => Expression.Call(
+                typeof(Timestamp).GetMethod(nameof(Timestamp.FromDate), [typeof(Date32)])!, op));
+        }
+
         throw Unsupported();
     }
 

@@ -65,10 +65,12 @@ never advances).
 
 **Deferred follow-ons:** a `CURRENT_TIME` frozen-constant feature (a separate
 design, see below); a spine sibling operator; a per-row transition-time index
-(the operator's per-tick recompute is O(integral size)); monotone-*expression*
-time-keys (e.g. `date_trunc(ts)`) and filters not directly over a scan, for the
-downstream-GC frontier; the typed fast path; and WAL (approach A) per-tick clock
-recording for pure-log replay (the snapshot path is correct today).
+(the operator's per-tick recompute is O(integral size)); filters not directly
+over a scan, for the downstream-GC frontier; the typed fast path; and WAL
+(approach A) per-tick clock recording for pure-log replay (the snapshot path is
+correct today). **Done since:** `CAST(timestamp ↔ date)` casts and the
+monotone-*expression* time-key downstream-GC frontier for `CAST(ts AS DATE)` (see
+"`CAST(timestamp ↔ date)` and the expression-key GC frontier" below).
 
 ### `CURRENT_DATE` (shipped) / `CURRENT_TIME` (rejected)
 
@@ -125,6 +127,45 @@ those assumptions, so each was a decision, not a spelling:
   *frozen-per-tick constant* (options A/C in the rationale below) — a separate
   feature with its own equivalence caveats, deferred until independently
   justified.
+
+### `CAST(timestamp ↔ date)` and the expression-key GC frontier
+
+`CURRENT_DATE` over a bare `DATE` column is sound but rarely how data arrives —
+most tables store event times as `TIMESTAMP`. The natural query is *"filter
+timestamped events by calendar date, then aggregate"*. Two pieces make it work
+and keep state bounded:
+
+- **`CAST(timestamp ↔ date)` casts.** `CAST(ts AS DATE)` floors a timestamp to
+  its day-number (`Date32.FromTimestamp` / `Date32.DayNumberFloor`); `CAST(d AS
+  TIMESTAMP)` is that day's midnight (`Timestamp.FromDate`). Both directions are
+  added to the structural and typed compilers; both are monotone non-decreasing.
+  This is what lets a `TIMESTAMP` column be compared against `CURRENT_DATE` —
+  `WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '30' DAY`.
+
+- **Expression-key downstream-GC frontier.** A `CAST(ts AS DATE)` temporal-filter
+  key reduces to the base-scan `ts` column, so the filter advertises a
+  clock-driven GC frontier on `ts` in the column's own (µs) space — the **midnight
+  µs of the day-space frontier day**, `(floor(clock/µs_per_day) − offsetDays) ×
+  µs_per_day`. This is a sound lower bound on any timestamp the filter can still
+  emit (conservative by at most one day; the GC predicate is `key < frontier`, so
+  no live row is dropped). Downstream operators then GC:
+  - `GROUP BY ts` (a bare column — `GROUP BY` is bare-column-only in v1) uses the
+    frontier directly.
+  - A projected `CAST(ts AS DATE)` grouped via a derived table picks the frontier
+    up through the **forward** `FrontierTransform` machinery: `MonotonicityAnalyzer`
+    now recognises a monotone temporal `CAST` (alongside `date_trunc` and
+    `+ const`) and attaches the day-floor transform, so a frontier registered on
+    `ts` thresholds the derived day-keys.
+
+  The recogniser (`MonotonicityAnalyzer.TemporalKeySource`, shared with
+  `PlanToCircuit`) currently covers a bare column and `CAST(<ts column> AS DATE)`;
+  a general monotone-key inverse (arbitrary `f(col)`) remains deferred. A filter
+  whose key is some other expression is still **correct** — it just advertises no
+  frontier (no downstream GC).
+
+  Soundness is pinned by the PBT: a derived-table `GROUP BY` over a `CAST(ts AS
+  DATE)` filter is one of the random shapes, so an over-aggressive frontier would
+  surface as incremental ≠ batch.
 
 ---
 

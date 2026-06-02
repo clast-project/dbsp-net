@@ -40,6 +40,12 @@ public readonly record struct Date32(int Days) : IComparable<Date32>, IComparabl
         return r < 0 ? q - 1 : q;
     }
 
+    /// <summary>The calendar date of a <c>TIMESTAMP</c> — `CAST(ts AS DATE)`. The
+    /// time-of-day is discarded (floored to the day, via
+    /// <see cref="DayNumberFloor"/>), so this is monotone non-decreasing in the
+    /// timestamp but not injective.</summary>
+    public static Date32 FromTimestamp(Timestamp ts) => new((int)DayNumberFloor(ts.Microseconds));
+
     public int CompareTo(Date32 other) => Days.CompareTo(other.Days);
 
     int IComparable.CompareTo(object? obj) => obj switch
@@ -125,6 +131,11 @@ public readonly record struct Timestamp(long Microseconds) : IComparable<Timesta
 
     public DateTime ToDateTime() =>
         new(Microseconds * 10 + UnixEpochTicks, DateTimeKind.Unspecified);
+
+    /// <summary>The midnight <c>TIMESTAMP</c> of a <c>DATE</c> — `CAST(d AS
+    /// TIMESTAMP)`: the start of that day (00:00:00). Strictly monotone in the
+    /// date.</summary>
+    public static Timestamp FromDate(Date32 d) => new(d.Days * Interval.MicrosPerDay);
 
     public static Timestamp Parse(string s)
     {

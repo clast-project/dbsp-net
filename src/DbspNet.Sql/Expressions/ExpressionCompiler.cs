@@ -605,6 +605,22 @@ public static class ExpressionCompiler
                 toStr);
             converted = Expression.Convert(toUtf8, typeof(object));
         }
+        else if (srcClr == typeof(Timestamp) && dstClr == typeof(Date32))
+        {
+            // CAST(timestamp AS date): discard the time-of-day (floor to the day).
+            var unboxed = Expression.Convert(operand, typeof(Timestamp));
+            var toDate = Expression.Call(
+                typeof(Date32).GetMethod(nameof(Date32.FromTimestamp), [typeof(Timestamp)])!, unboxed);
+            converted = Expression.Convert(toDate, typeof(object));
+        }
+        else if (srcClr == typeof(Date32) && dstClr == typeof(Timestamp))
+        {
+            // CAST(date AS timestamp): midnight (00:00:00) of that day.
+            var unboxed = Expression.Convert(operand, typeof(Date32));
+            var toTs = Expression.Call(
+                typeof(Timestamp).GetMethod(nameof(Timestamp.FromDate), [typeof(Date32)])!, unboxed);
+            converted = Expression.Convert(toTs, typeof(object));
+        }
         else
         {
             throw new InvalidOperationException(

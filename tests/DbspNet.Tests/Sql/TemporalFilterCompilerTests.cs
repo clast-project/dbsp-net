@@ -282,6 +282,61 @@ public class TemporalFilterCompilerTests : IDisposable
     }
 
     [Fact]
+    public void CastTimestampToDate_ProjectedDateGroupBy_BoundsAggregateState()
+    {
+        // The headline CURRENT_DATE-over-a-TIMESTAMP-column pattern: filter events
+        // by calendar date, project CAST(ts AS DATE), then aggregate per day.
+        // GROUP BY accepts only bare columns, so the date is projected in a derived
+        // table and grouped by its alias. The filter advertises a day-space GC
+        // frontier on the underlying `ts` column; the projected column d —
+        // recognised as a monotone function of ts — carries the day-floor transform
+        // so the GROUP BY d GCs to the trailing ~5-day window.
+        var q = Compile(
+            "SELECT d, COUNT(*) AS c FROM "
+            + "(SELECT CAST(ts AS DATE) AS d FROM events "
+            + " WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '5' DAY) sub GROUP BY d");
+
+        for (var i = 0; i <= 100; i++)
+        {
+            q.AdvanceClock(i * Day + 12 * Hour);            // midday of day i
+            q.Table("events").Insert(i, new Timestamp(i * Day + 9 * Hour)); // 09:00 on day i
+            q.Step();
+        }
+
+        var agg = q.Circuit.Operators
+            .OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>()
+            .Single();
+        // 101 distinct days streamed; the clock frontier (CURRENT_DATE − 5 days)
+        // keeps only the trailing window.
+        Assert.True(agg.RetainedGroupCount <= 7, $"retained {agg.RetainedGroupCount}");
+        Assert.True(agg.RetainedGroupCount >= 5, $"retained {agg.RetainedGroupCount}");
+    }
+
+    [Fact]
+    public void CastTimestampToDate_FilterBoundsRawTimestampGroupBy()
+    {
+        // Same filter, but grouping on the raw `ts` column: the source-column
+        // frontier is midnight-µs of the frontier day, so a GROUP BY ts also GCs
+        // (one group per distinct ts, bounded to the trailing ~10 days).
+        var q = Compile(
+            "SELECT ts, COUNT(*) AS c FROM events " +
+            "WHERE CAST(ts AS DATE) > CURRENT_DATE - INTERVAL '10' DAY GROUP BY ts");
+
+        for (var i = 0; i <= 100; i++)
+        {
+            q.AdvanceClock(i * Day + 12 * Hour);
+            q.Table("events").Insert(i, new Timestamp(i * Day + 9 * Hour));
+            q.Step();
+        }
+
+        var agg = q.Circuit.Operators
+            .OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>()
+            .Single();
+        Assert.True(agg.RetainedGroupCount <= 12, $"retained {agg.RetainedGroupCount}");
+        Assert.True(agg.RetainedGroupCount >= 10, $"retained {agg.RetainedGroupCount}");
+    }
+
+    [Fact]
     public void SnapshotRestore_ContinuesIdenticallyToNonRestartRun()
     {
         // Drive a window filter through a scripted sequence; compare a run that
