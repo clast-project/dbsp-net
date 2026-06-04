@@ -197,11 +197,20 @@ public sealed class RootCircuit
     /// builder. The builder's methods register inputs, outputs and operators
     /// with this circuit.
     /// </summary>
-    public static RootCircuit Build(Action<CircuitBuilder> configure)
+    public static RootCircuit Build(Action<CircuitBuilder> configure) => Build(configure, parallel: null);
+
+    /// <summary>
+    /// Build a circuit replica for a <see cref="ParallelCircuit"/>, threading the
+    /// per-replica <paramref name="parallel"/> context so the builder can wire
+    /// this replica's <c>exchange</c> operators to their worker identity and
+    /// shared coordinators. With a <see langword="null"/> context (the public
+    /// overload) exchanges degrade to the identity.
+    /// </summary>
+    internal static RootCircuit Build(Action<CircuitBuilder> configure, ParallelBuildContext? parallel)
     {
         ArgumentNullException.ThrowIfNull(configure);
         var circuit = new RootCircuit();
-        configure(new CircuitBuilder(circuit));
+        configure(new CircuitBuilder(circuit, parallel));
         return circuit;
     }
 

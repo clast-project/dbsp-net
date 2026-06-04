@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit.Operators;
+using DbspNet.Core.Collections;
 
 namespace DbspNet.Core.Circuit;
 
@@ -12,10 +14,12 @@ namespace DbspNet.Core.Circuit;
 public sealed class CircuitBuilder
 {
     private readonly RootCircuit _root;
+    private readonly ParallelBuildContext? _parallel;
 
-    internal CircuitBuilder(RootCircuit root)
+    internal CircuitBuilder(RootCircuit root, ParallelBuildContext? parallel = null)
     {
         _root = root;
+        _parallel = parallel;
     }
 
     /// <summary>
@@ -129,6 +133,43 @@ public sealed class CircuitBuilder
         ArgumentNullException.ThrowIfNull(input);
         var output = new Stream<T>(initial);
         _root.AddOperator(new DelayOp<T>(input, output, initial));
+        return output;
+    }
+
+    /// <summary>
+    /// The all-to-all shuffle: re-partition a sharded Z-set stream by
+    /// <c>hash(key) % W</c> so that, downstream, every row for a given key is
+    /// co-located on one worker — what a key-sensitive operator (join,
+    /// group-by, distinct) needs when its key differs from the current
+    /// sharding. <paramref name="partition"/> maps a key to a hash; the operator
+    /// takes it modulo the worker count.
+    /// </summary>
+    /// <remarks>
+    /// Outside a <see cref="ParallelCircuit"/>, or with a single worker, there
+    /// is nothing to shuffle — every key already lives on the only shard — so
+    /// this returns <paramref name="input"/> unchanged and adds no operator,
+    /// keeping the single-threaded path free of exchange overhead.
+    /// </remarks>
+    public Stream<ZSet<TKey, TWeight>> Exchange<TKey, TWeight>(
+        Stream<ZSet<TKey, TWeight>> input,
+        Func<TKey, int> partition)
+        where TKey : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partition);
+
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return input;
+        }
+
+        var workers = _parallel.Workers;
+        var coordinator = _parallel.NextCoordinator(
+            () => new ExchangeCoordinator<ZSet<TKey, TWeight>>(workers));
+        var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
+        _root.AddOperator(new ExchangeOp<TKey, TWeight>(
+            input, output, partition, coordinator, _parallel.WorkerId, _parallel.Abort));
         return output;
     }
 }

@@ -37,15 +37,21 @@ namespace DbspNet.Core.Circuit;
 public sealed class ParallelCircuit : IDisposable
 {
     private readonly RootCircuit[] _replicas;
+    private readonly IReadOnlyList<IExchangeCoordinator> _coordinators;
+    private readonly CancellationTokenSource _abort;
     private readonly Thread[]? _threads;
     private readonly Barrier? _barrier;
     private readonly Exception?[] _stepErrors;
     private volatile bool _stopping;
+    private bool _faulted;
     private bool _disposed;
 
-    private ParallelCircuit(RootCircuit[] replicas)
+    private ParallelCircuit(
+        RootCircuit[] replicas, IReadOnlyList<IExchangeCoordinator> coordinators, CancellationTokenSource abort)
     {
         _replicas = replicas;
+        _coordinators = coordinators;
+        _abort = abort;
         _stepErrors = new Exception?[replicas.Length];
 
         if (replicas.Length == 1)
@@ -94,13 +100,19 @@ public sealed class ParallelCircuit : IDisposable
         ArgumentNullException.ThrowIfNull(configure);
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
 
+        // One coordinator registry and one abort signal shared across replicas;
+        // the per-replica context carries the worker id. Replicas are built
+        // sequentially so the registry fills without locking.
+        var coordinators = new List<IExchangeCoordinator>();
+        var abort = new CancellationTokenSource();
         var replicas = new RootCircuit[workers];
         for (var w = 0; w < workers; w++)
         {
-            replicas[w] = RootCircuit.Build(configure);
+            var context = new ParallelBuildContext(w, workers, coordinators, abort.Token);
+            replicas[w] = RootCircuit.Build(configure, context);
         }
 
-        return new ParallelCircuit(replicas);
+        return new ParallelCircuit(replicas, coordinators, abort);
     }
 
     /// <summary>Number of replicas (the <c>W</c> the driver coordinates).</summary>
@@ -142,10 +154,17 @@ public sealed class ParallelCircuit : IDisposable
     public void Step()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_faulted)
+        {
+            throw new InvalidOperationException(
+                "The parallel circuit faulted on a previous step and can no longer be stepped.");
+        }
 
         if (_barrier is null)
         {
-            // W == 1: run inline, no handoff.
+            // W == 1: run inline, no handoff. A throw propagates directly — the
+            // single replica's state is no more inconsistent than a plain
+            // RootCircuit's would be, so there is nothing extra to poison.
             _replicas[0].Step();
             return;
         }
@@ -154,20 +173,45 @@ public sealed class ParallelCircuit : IDisposable
         _barrier.SignalAndWait();   // "go": release the parked workers
         _barrier.SignalAndWait();   // "done": rendezvous after every worker's Step
 
-        List<Exception>? failures = null;
-        foreach (var error in _stepErrors)
-        {
-            if (error is not null)
-            {
-                (failures ??= []).Add(error);
-            }
-        }
-
+        var failures = CollectFailures();
         if (failures is not null)
         {
+            // A mid-tick fault means the replicas have diverged (some operators
+            // ran, some did not); the run is unrecoverable.
+            _faulted = true;
             throw new AggregateException(
                 "One or more workers threw while stepping the parallel circuit.", failures);
         }
+    }
+
+    /// <summary>
+    /// The worker exceptions from the last step, or <see langword="null"/> if
+    /// none. Cascaded cancellations — peers released from an exchange barrier by
+    /// the first fault's abort — are dropped in favor of the root cause(s); only
+    /// if every recorded fault is a cancellation are those returned.
+    /// </summary>
+    private List<Exception>? CollectFailures()
+    {
+        List<Exception>? roots = null;
+        List<Exception>? cancellations = null;
+        foreach (var error in _stepErrors)
+        {
+            if (error is null)
+            {
+                continue;
+            }
+
+            if (error is OperationCanceledException)
+            {
+                (cancellations ??= []).Add(error);
+            }
+            else
+            {
+                (roots ??= []).Add(error);
+            }
+        }
+
+        return roots ?? cancellations;
     }
 
     /// <summary>
@@ -225,9 +269,13 @@ public sealed class ParallelCircuit : IDisposable
             }
             catch (Exception ex)
             {
-                // Record and keep going to the "done" barrier — a throwing
-                // worker must not strand the controller waiting forever.
+                // Record, then trip the abort so any peers parked on an exchange
+                // barrier this tick are released (they would otherwise wait for
+                // a worker that has bailed out of the tick). Keep going to the
+                // "done" barrier — a throwing worker must not strand the
+                // controller waiting forever.
                 _stepErrors[worker] = ex;
+                _abort.Cancel();
             }
 
             barrier.SignalAndWait();   // "done"
@@ -258,5 +306,14 @@ public sealed class ParallelCircuit : IDisposable
 
             _barrier.Dispose();
         }
+
+        // Threads are joined (or never started, for W == 1), so no worker can be
+        // inside an exchange; safe to release the coordinators and abort signal.
+        foreach (var coordinator in _coordinators)
+        {
+            coordinator.Dispose();
+        }
+
+        _abort.Dispose();
     }
 }
