@@ -1,5 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Algebra;
+using DbspNet.Core.Collections;
+
 namespace DbspNet.Core.Circuit;
 
 /// <summary>
@@ -231,6 +234,45 @@ public sealed class ParallelCircuit : IDisposable
     /// </summary>
     public OutputHandle<T> WorkerOutput<T>(string name, int worker) =>
         Port<OutputHandle<T>>(name, worker);
+
+    /// <summary>
+    /// A single sharded input over all workers' copies of the input named
+    /// <paramref name="name"/>: <see cref="ShardedInputHandle{TKey,TWeight}.Push"/>
+    /// splits a Z-set across the replicas by <paramref name="partition"/> (use
+    /// <see cref="StableHash"/> for a recovery-stable hash). The host pushes one
+    /// logical input instead of addressing each worker by hand.
+    /// </summary>
+    public ShardedInputHandle<TKey, TWeight> ShardedInput<TKey, TWeight>(string name, Func<TKey, int> partition)
+        where TKey : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(partition);
+        var shards = new InputHandle<ZSet<TKey, TWeight>>[_replicas.Length];
+        for (var w = 0; w < _replicas.Length; w++)
+        {
+            shards[w] = WorkerInput<ZSet<TKey, TWeight>>(name, w);
+        }
+
+        return new ShardedInputHandle<TKey, TWeight>(shards, partition);
+    }
+
+    /// <summary>
+    /// A single sharded output over all workers' copies of the output named
+    /// <paramref name="name"/>: <see cref="ShardedOutputHandle{TKey,TWeight}.Current"/>
+    /// gathers the per-replica outputs (Z-set sum) into the single-circuit result.
+    /// </summary>
+    public ShardedOutputHandle<TKey, TWeight> ShardedOutput<TKey, TWeight>(string name)
+        where TKey : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        var shards = new OutputHandle<ZSet<TKey, TWeight>>[_replicas.Length];
+        for (var w = 0; w < _replicas.Length; w++)
+        {
+            shards[w] = WorkerOutput<ZSet<TKey, TWeight>>(name, w);
+        }
+
+        return new ShardedOutputHandle<TKey, TWeight>(shards);
+    }
 
     private TPort Port<TPort>(string name, int worker)
         where TPort : class
