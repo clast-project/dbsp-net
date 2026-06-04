@@ -39,11 +39,43 @@ public sealed class CircuitBuilder
         return (handle, stream);
     }
 
+    /// <summary>
+    /// As <see cref="Input{T}(T, Func{T, T, T})"/>, but also registers the input
+    /// under a logical <paramref name="name"/>. Naming is inert for a plain
+    /// single circuit; it exists so <see cref="ParallelCircuit"/> can reach each
+    /// worker's copy of this input by name (see
+    /// <see cref="ParallelCircuit.WorkerInput{T}"/>). Duplicate names within one
+    /// circuit are a build error. (A separate overload, not an optional
+    /// parameter, so the original arity stays stable for reflection-based
+    /// callers such as the SQL compiler.)
+    /// </summary>
+    public (InputHandle<T> Handle, Stream<T> Stream) Input<T>(T zero, Func<T, T, T> merge, string name)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        var port = Input(zero, merge);
+        _root.RegisterNamedPort(name, port.Handle);
+        return port;
+    }
+
     /// <summary>Create an output handle observing the given stream.</summary>
     public OutputHandle<T> Output<T>(Stream<T> source)
     {
         ArgumentNullException.ThrowIfNull(source);
         return new OutputHandle<T>(source);
+    }
+
+    /// <summary>
+    /// As <see cref="Output{T}(Stream{T})"/>, but also registers the output
+    /// under a logical <paramref name="name"/>; see the named
+    /// <see cref="Input{T}(T, Func{T, T, T}, string)"/> overload. Reachable per
+    /// worker via <see cref="ParallelCircuit.WorkerOutput{T}"/>.
+    /// </summary>
+    public OutputHandle<T> Output<T>(Stream<T> source, string name)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        var handle = Output(source);
+        _root.RegisterNamedPort(name, handle);
+        return handle;
     }
 
     /// <summary>

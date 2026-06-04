@@ -22,6 +22,7 @@ public sealed class RootCircuit
 {
     private readonly List<IInputCommit> _inputs = [];
     private readonly List<IOperator> _operators = [];
+    private Dictionary<string, object>? _namedPorts;
     private long _tickCount;
     private long _logicalTime = long.MinValue;
     private long _lastStepTicks;
@@ -123,6 +124,33 @@ public sealed class RootCircuit
     {
         _operators.Add(op);
     }
+
+    /// <summary>
+    /// Register an input or output handle under a stable, build-independent
+    /// <paramref name="name"/>. The name is a logical identity for a circuit
+    /// port: because <see cref="Build"/> runs the same constructor closure for
+    /// every replica, the same name resolves to "the same logical port" on
+    /// every replica — which is how <see cref="ParallelCircuit"/> reaches each
+    /// worker's copy of an input/output without relying on closure capture.
+    /// Names are optional and unused by a plain single circuit; duplicates
+    /// within one circuit are a build error.
+    /// </summary>
+    internal void RegisterNamedPort(string name, object port)
+    {
+        _namedPorts ??= [];
+        if (!_namedPorts.TryAdd(name, port))
+        {
+            throw new ArgumentException(
+                $"A circuit port named '{name}' is already registered.", nameof(name));
+        }
+    }
+
+    /// <summary>
+    /// Look up a port previously registered via <see cref="RegisterNamedPort"/>,
+    /// or <see langword="null"/> if no port carries that name.
+    /// </summary>
+    internal object? FindNamedPort(string name) =>
+        _namedPorts is not null && _namedPorts.TryGetValue(name, out var port) ? port : null;
 
     /// <summary>
     /// Operators registered with this circuit, in topological-/registration-
