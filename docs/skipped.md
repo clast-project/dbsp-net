@@ -766,8 +766,32 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
       `ICompactionStrategy` only sees `SpineState`-of-counts; a strategy
       that proactively merges sub-frontier-heavy levels would compact
       hot keys faster than batch-count alone.
-- **[P2]** Multi-threaded circuit execution. v1 is single-threaded per
-  `step()` call.
+- **[P2]** Multi-threaded circuit execution *within* a single replica's
+  `step()` — operators in one circuit still run serially. The cross-replica
+  data-parallel path is separate (next entry).
+- Data-parallel execution (`ParallelCircuit`) — **implemented**. W identical
+  replicas, each on its own thread, advanced in lockstep; the SQL planner places
+  an `exchange` at every key-sensitive boundary (`TypedPlanCompiler.CompileParallel`)
+  so the gathered result is independent of W. Ingest and egest are parallel too:
+  `ParallelIngestor` encodes + shards a pushed batch on the worker threads (two
+  phases over `ParallelCircuit.RunDataParallel`, above a 4096-row threshold), and
+  egest decodes per-worker and concatenates when the compiler proves the output
+  shards are key-disjoint (`ShardDisjoint` propagation: scan → filter → injective
+  projection), falling back to the serial Z-set sum otherwise. Deferred follow-ons:
+    - **[P2]** Disjoint gather for non-linear outputs. Today only the
+      exchange-free linear path (scan/filter/injective-projection) is proven
+      disjoint; terminal GROUP BY / DISTINCT / join outputs are disjoint by their
+      exchange key too but are conservatively serial-combined. Tracking the shard
+      key through those operators (or a terminal whole-output-row exchange) would
+      let large join/distinct outputs gather in parallel. Group-by aggregate
+      outputs are small, so they don't gate wall-clock.
+    - **[P3]** Server GC is effectively required for the parallel ingest/egest to
+      scale — the encode/decode allocates on every worker thread, and workstation
+      GC stops them all on each collection. The benchmark project sets
+      `ServerGarbageCollection`; a host embedding `ParallelCircuit` should too.
+    - **[P3]** Typed (unboxed) staging arrays in `ParallelIngestor` — the encode
+      phase boxes each emitted row into an `object[]`; a reflection-allocated
+      `TRow[]` would drop the per-row box.
 - **[P3]** Dynamic / polymorphic operators (Feldera's `dynamic` module).
 
 ## Compiler

@@ -124,15 +124,14 @@ public static class TypedPlanCompiler
             var outputRowType = topNode!.RowType;
             var outputSchema = topNode.Schema;
 
-            // One sharded input per table, reusing the handle-agnostic
-            // TypedTableInput. Input sharding is arbitrary (a downstream exchange
-            // re-shards by op key), so split by whole-row hash for balance.
+            // One parallel ingestor per table. Input sharding is arbitrary (a
+            // downstream exchange re-shards by op key), so split by whole-row hash
+            // for balance; the encode runs on the worker threads.
             var inputs = new Dictionary<string, TypedTableInput>(StringComparer.Ordinal);
             foreach (var (tableName, m) in meta)
             {
-                var shardedInput = InvokeShardedInput(
-                    circuit, m.RowType, tableName, BuildRowHashPartition(m.RowType));
-                inputs[tableName] = new TypedTableInput(m.Schema, m.RowType, m.Factory, shardedInput);
+                var ingestor = BuildParallelIngestor(circuit, tableName, m.RowType, m.Schema, m.Factory);
+                inputs[tableName] = new TypedTableInput(m.Schema, m.RowType, ingestor);
             }
 
             var shardedOutput = InvokeShardedOutput(circuit, outputRowType, OutputPortName);
@@ -141,8 +140,20 @@ public static class TypedPlanCompiler
             var factory = TypedRowEmitter.BuildBoxedFactory(outputSchema)!;
             var weightOf = BuildWeightOf(outputRowType, factory, currentGetter);
 
+            // When the output shards are provably key-disjoint, gather them in
+            // parallel (per-worker decode + concat) instead of the serial Z-set
+            // sum. Only worth the parallel hand-off for W > 1; W == 1 keeps the
+            // lazy serial decode. A non-disjoint output keeps the summing path.
+            IOutputGather? disjointGather = null;
+            if (workers > 1 && topNode!.ShardDisjoint)
+            {
+                var getters = TypedRowEmitter.BuildFieldGetters(outputSchema)
+                    ?? throw new UnsupportedPlanException();
+                disjointGather = BuildDisjointGather(circuit, outputRowType, OutputPortName, getters);
+            }
+
             compiled = new ParallelTypedCompiledQuery(
-                circuit, inputs, outputSchema, outputRowType, currentGetter, currentReader, weightOf);
+                circuit, inputs, outputSchema, outputRowType, currentGetter, currentReader, weightOf, disjointGather);
             return true;
         }
         catch (UnsupportedPlanException)
@@ -157,7 +168,17 @@ public static class TypedPlanCompiler
     /// stream, the SQL schema of that row, and the (boxed) typed
     /// stream object.
     /// </summary>
-    private sealed record TypedNode(Type RowType, Schema Schema, object Stream);
+    /// <param name="ShardDisjoint">
+    /// In a parallel build, <see langword="true"/> when this stream's per-worker
+    /// shards are provably key-disjoint — i.e. the stream is hash-partitioned by
+    /// columns that the row still carries by identity, so equal rows always land
+    /// on one worker. The output gather can then concatenate the shards in parallel
+    /// instead of a serial Z-set sum. Conservatively <see langword="false"/>
+    /// (the safe default) for any operator whose sharding we don't track; a wrong
+    /// <see langword="true"/> would emit duplicate output keys, so it is only set
+    /// where disjointness is certain.
+    /// </param>
+    private sealed record TypedNode(Type RowType, Schema Schema, object Stream, bool ShardDisjoint = false);
 
     /// <summary>
     /// Boundary-adapter entry point: compile <paramref name="plan"/>
@@ -402,7 +423,9 @@ public static class TypedPlanCompiler
             // handle itself is reached by name, not captured here.
             var (_, parallelStream) = InvokeZSetInput(ctx.Builder, rowType, scan.TableName);
             ctx.ParallelInputs[scan.TableName] = new ParallelInputMeta(scan.Schema, rowType, factory);
-            var parallelNode = new TypedNode(rowType, scan.Schema, parallelStream);
+            // The sharded input partitions by whole-row hash (BuildParallelIngestor),
+            // so equal rows co-locate: the scan stream is shard-disjoint.
+            var parallelNode = new TypedNode(rowType, scan.Schema, parallelStream, ShardDisjoint: true);
             ctx.LiftedScanCache[scan.TableName] = parallelNode;
             return parallelNode;
         }
@@ -478,6 +501,20 @@ public static class TypedPlanCompiler
         // the stages innermost-first.
         nodes.Reverse();
 
+        // Disjointness is preserved by filters and by injective projections (those
+        // that keep every input column by identity, so the output row still
+        // determines the shard key). A projection that drops a shard column breaks
+        // it. Identity projections were skipped above and are injective, so they
+        // never appear here. (Skipped identity projections preserve it for free.)
+        var shardDisjoint = baseNode.ShardDisjoint;
+        foreach (var n in nodes)
+        {
+            if (n is ProjectPlan p && !RetainsAllInputColumns(p.Projections, p.Input.Schema))
+            {
+                shardDisjoint = false;
+            }
+        }
+
         var stages = new List<TypedStage>(nodes.Count);
         var currentRowType = baseNode.RowType;
         var currentSchema = baseNode.Schema;
@@ -517,20 +554,20 @@ public static class TypedPlanCompiler
             if (only.Kind == TypedStageKind.Filter)
             {
                 var stream = InvokeFilter(ctx.Builder, baseNode.RowType, baseNode.Stream, only.Delegate);
-                return new TypedNode(baseNode.RowType, baseNode.Schema, stream);
+                return new TypedNode(baseNode.RowType, baseNode.Schema, stream, shardDisjoint);
             }
             else
             {
                 var stream = InvokeMapRows(
                     ctx.Builder, baseNode.RowType, only.RowTypeAfter, baseNode.Stream, only.Delegate);
-                return new TypedNode(only.RowTypeAfter, only.SchemaAfter, stream);
+                return new TypedNode(only.RowTypeAfter, only.SchemaAfter, stream, shardDisjoint);
             }
         }
 
         var fused = BuildFusedTypedDelegate(baseNode.RowType, currentRowType, stages);
         var fusedStream = InvokeMapFilterRows(
             ctx.Builder, baseNode.RowType, currentRowType, baseNode.Stream, fused);
-        return new TypedNode(currentRowType, currentSchema, fusedStream);
+        return new TypedNode(currentRowType, currentSchema, fusedStream, shardDisjoint);
     }
 
     /// <summary>
@@ -1752,6 +1789,41 @@ public static class TypedPlanCompiler
     }
 
     // ---- Helpers: identity / projection / predicate ----
+
+    /// <summary>
+    /// True when <paramref name="projections"/> keeps every input column by
+    /// identity (each input column index appears as a bare <see cref="ResolvedColumn"/>
+    /// somewhere in the output) — so the projection is injective and the output row
+    /// determines the input row. Computed/renamed columns are ignored; they neither
+    /// help nor hurt. Used to decide whether a projection preserves shard
+    /// disjointness — must stay sound (never report true when a column is dropped).
+    /// </summary>
+    private static bool RetainsAllInputColumns(IReadOnlyList<ProjectionItem> projections, Schema inputSchema)
+    {
+        var inputCount = inputSchema.Count;
+        if (inputCount == 0)
+        {
+            return true;
+        }
+
+        var seen = new bool[inputCount];
+        var remaining = inputCount;
+        foreach (var item in projections)
+        {
+            if (item.Expression is ResolvedColumn rc
+                && (uint)rc.Index < (uint)inputCount
+                && !seen[rc.Index])
+            {
+                seen[rc.Index] = true;
+                if (--remaining == 0)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return remaining == 0;
+    }
 
     private static bool IsIdentityProjection(
         IReadOnlyList<ProjectionItem> projections, Schema inputSchema, Schema outputSchema)
@@ -2991,14 +3063,18 @@ public static class TypedPlanCompiler
         return closed.Invoke(builder, new[] { stream, (object)name })!;
     }
 
-    /// <summary><c>circuit.ShardedInput&lt;TRow, Z64&gt;(name, partition)</c>.</summary>
-    private static object InvokeShardedInput(
-        ParallelCircuit circuit, Type rowType, string name, Delegate partition)
+    /// <summary>
+    /// Build a <see cref="ParallelIngestor{TRow}"/> closed over the table's emitted
+    /// row type: it shards a pushed batch across the replicas by whole-row hash,
+    /// encoding on the worker threads (see <see cref="ParallelIngestor{TRow}"/>).
+    /// </summary>
+    private static ITableIngestor BuildParallelIngestor(
+        ParallelCircuit circuit, string name, Type rowType, Schema schema, Func<object?[], object> factory)
     {
-        var open = typeof(ParallelCircuit).GetMethods()
-            .Single(m => m.Name == nameof(ParallelCircuit.ShardedInput) && m.IsGenericMethodDefinition);
-        var closed = open.MakeGenericMethod(rowType, typeof(Z64));
-        return closed.Invoke(circuit, new object[] { name, partition })!;
+        var ingestorType = typeof(ParallelIngestor<>).MakeGenericType(rowType);
+        var partition = BuildRowHashPartition(rowType);   // Func<TRow, int>
+        return (ITableIngestor)Activator.CreateInstance(
+            ingestorType, circuit, name, schema, factory, partition)!;
     }
 
     /// <summary><c>circuit.ShardedOutput&lt;TRow, Z64&gt;(name)</c>.</summary>
@@ -3008,6 +3084,18 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(ParallelCircuit.ShardedOutput) && m.IsGenericMethodDefinition);
         var closed = open.MakeGenericMethod(rowType, typeof(Z64));
         return closed.Invoke(circuit, new object[] { name })!;
+    }
+
+    /// <summary>
+    /// Build a <see cref="DisjointOutputGather{TRow}"/> closed over the output row
+    /// type: a parallel per-worker decode + concat used only when the output shards
+    /// are key-disjoint (see <c>ShardDisjoint</c>).
+    /// </summary>
+    private static IOutputGather BuildDisjointGather(
+        ParallelCircuit circuit, Type rowType, string outputName, Func<object, object?>[] getters)
+    {
+        var gatherType = typeof(DisjointOutputGather<>).MakeGenericType(rowType);
+        return (IOutputGather)Activator.CreateInstance(gatherType, circuit, outputName, getters)!;
     }
 
     /// <summary>Reads <c>ShardedOutputHandle&lt;TRow, Z64&gt;.Current</c> (the gathered Z-set), boxed.</summary>
@@ -3033,16 +3121,22 @@ public static class TypedPlanCompiler
     }
 
     private static Func<object, IEnumerable<KeyValuePair<object, Z64>>> BuildBoxedEntriesReader(Type rowType)
-        => EnumerateBoxedEntries;
-
-    private static IEnumerable<KeyValuePair<object, Z64>> EnumerateBoxedEntries(object zset)
     {
-        foreach (var kv in (System.Collections.IEnumerable)zset)
+        // A typed enumerator (one boxing per key, no per-entry reflection — the old
+        // GetProperty-per-row reflection dominated the egest wall-clock on large
+        // outputs). ZSet<TRow, Z64> enumerates as KeyValuePair<TRow, Z64>.
+        var method = typeof(TypedPlanCompiler)
+            .GetMethod(nameof(EnumerateTypedEntries), BindingFlags.Static | BindingFlags.NonPublic)!
+            .MakeGenericMethod(rowType);
+        return method.CreateDelegate<Func<object, IEnumerable<KeyValuePair<object, Z64>>>>();
+    }
+
+    private static IEnumerable<KeyValuePair<object, Z64>> EnumerateTypedEntries<TRow>(object zset)
+        where TRow : notnull
+    {
+        foreach (var kv in (ZSet<TRow, Z64>)zset)
         {
-            var kvType = kv!.GetType();
-            var key = kvType.GetProperty(nameof(KeyValuePair<int, int>.Key))!.GetValue(kv)!;
-            var value = (Z64)kvType.GetProperty(nameof(KeyValuePair<int, int>.Value))!.GetValue(kv)!;
-            yield return new KeyValuePair<object, Z64>(key, value);
+            yield return new KeyValuePair<object, Z64>(kv.Key!, kv.Value);
         }
     }
 

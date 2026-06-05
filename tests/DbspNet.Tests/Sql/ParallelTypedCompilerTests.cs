@@ -305,6 +305,135 @@ public class ParallelTypedCompilerTests
     }
 
     [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void LargeBatchFilter_ParallelIngestEgest_MatchesSingle(int workers)
+    {
+        // A single Push above the 4096-row threshold engages the two-phase parallel
+        // ingest (encode on the worker threads, then scatter), and the wide filter
+        // output engages the parallel decode. The gathered result must still equal
+        // the single-circuit query after every tick.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)"],
+            "SELECT id, v FROM t WHERE v > 100",
+            workers,
+            tbl =>
+            {
+                var batch = new List<(object?[] Values, long Weight)>(6000);
+                for (var i = 0; i < 6000; i++)
+                {
+                    batch.Add((new object?[] { i, i % 1000 }, 1L));
+                }
+
+                tbl("t").Push(batch);
+            },
+            tbl =>
+            {
+                // Retract a large slice in one push (mixed effect; same batch both ways).
+                var batch = new List<(object?[] Values, long Weight)>(6000);
+                for (var i = 0; i < 6000; i++)
+                {
+                    batch.Add((new object?[] { i, i % 1000 }, i % 3 == 0 ? -1L : 0L));
+                }
+
+                tbl("t").Push(batch);
+            });
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void LargeBatchStringDecimal_ParallelEncodeDecode_MatchesSingle(int workers)
+    {
+        // VARCHAR + DECIMAL columns make the boundary encode (string→Utf8String,
+        // decimal→Decimal128) and decode the expensive part — both now run on the
+        // worker threads. > 4096 distinct output rows engages the parallel decode.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (region VARCHAR NOT NULL, amount DECIMAL(10, 2) NOT NULL)"],
+            "SELECT region, amount FROM t",
+            workers,
+            tbl =>
+            {
+                var regions = new[] { "north", "south", "east", "west" };
+                var batch = new List<(object?[] Values, long Weight)>(9000);
+                for (var i = 0; i < 9000; i++)
+                {
+                    // DECIMAL values cross the boundary as strings (BoundaryEncoder parses them).
+                    batch.Add((new object?[] { regions[i % 4], $"{i % 2200}.25" }, 1L));
+                }
+
+                tbl("t").Push(batch);
+            });
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void LargeBatchInjectiveProjection_DisjointGather_MatchesSingle(int workers)
+    {
+        // Reorders both source columns and adds a computed one — injective (keeps
+        // every input column by identity), so RetainsAllInputColumns marks the
+        // output shard-disjoint and the gather concatenates per-worker. A large
+        // batch engages both the parallel ingest and the parallel concat gather.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT v, k, k + v AS s FROM t",
+            workers,
+            tbl =>
+            {
+                var batch = new List<(object?[] Values, long Weight)>(7000);
+                for (var i = 0; i < 7000; i++)
+                {
+                    batch.Add((new object?[] { i, 7000 - i }, 1L));   // distinct (k, v) pairs
+                }
+
+                tbl("t").Push(batch);
+            });
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void ColumnDroppingProjection_GatherMergesCrossWorkerDuplicates(int workers)
+    {
+        // SELECT v drops the unique id, so rows distinct by the whole-row shard key
+        // collapse to equal output rows that were sharded onto *different* workers.
+        // The gather must SUM their weights (not concatenate), so each output key
+        // appears exactly once. The AssertParallelMatchesSingle harness sums weights
+        // in its comparison and would mask a concat bug, so check the raw output.
+        var plan = CompilePlan(["CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)"], "SELECT v FROM t");
+        Assert.True(TypedPlanCompiler.TryCompileParallel(plan, workers, out var parallel), "parallel compile failed");
+
+        using (parallel)
+        {
+            const int rows = 6000;
+            const int distinct = 50;
+            var batch = new List<(object?[] Values, long Weight)>(rows);
+            for (var i = 0; i < rows; i++)
+            {
+                batch.Add((new object?[] { i, i % distinct }, 1L));   // unique id, v in [0, 50)
+            }
+
+            parallel!.Table("t").Push(batch);
+            parallel.Step();
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var emitted = 0;
+            foreach (var (values, weight) in parallel.Current)
+            {
+                emitted++;
+                Assert.True(seen.Add(values[0]!.ToString()!), $"duplicate key {values[0]} in gathered output");
+                Assert.Equal(rows / distinct, weight);   // every v appears rows/distinct times
+            }
+
+            Assert.Equal(distinct, emitted);
+        }
+    }
+
+    [Theory]
     [InlineData(2)]
     [InlineData(4)]
     [InlineData(8)]

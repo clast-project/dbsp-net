@@ -21,6 +21,7 @@ public sealed class ParallelTypedCompiledQuery : IDisposable
     private readonly Func<object> _currentZSetGetter;
     private readonly Func<object, IEnumerable<KeyValuePair<object, Z64>>> _currentReader;
     private readonly Func<object?[], Z64> _outputWeightOf;
+    private readonly IOutputGather? _disjointGather;
 
     internal ParallelTypedCompiledQuery(
         ParallelCircuit circuit,
@@ -29,7 +30,8 @@ public sealed class ParallelTypedCompiledQuery : IDisposable
         Type outputRowType,
         Func<object> currentZSetGetter,
         Func<object, IEnumerable<KeyValuePair<object, Z64>>> currentReader,
-        Func<object?[], Z64> outputWeightOf)
+        Func<object?[], Z64> outputWeightOf,
+        IOutputGather? disjointGather)
     {
         Circuit = circuit;
         Inputs = inputs;
@@ -38,6 +40,7 @@ public sealed class ParallelTypedCompiledQuery : IDisposable
         _currentZSetGetter = currentZSetGetter;
         _currentReader = currentReader;
         _outputWeightOf = outputWeightOf;
+        _disjointGather = disjointGather;
     }
 
     public ParallelCircuit Circuit { get; }
@@ -59,11 +62,22 @@ public sealed class ParallelTypedCompiledQuery : IDisposable
 
     /// <summary>
     /// The current gathered output as <c>(values, weight)</c> tuples, decoded to
-    /// the public CLR representation — the union (Z-set sum) of the replicas'
-    /// shards, equal to the single-circuit query's output.
+    /// the public CLR representation — the union of the replicas' shards, equal to
+    /// the single-circuit query's output.
     /// </summary>
+    /// <remarks>
+    /// When the compiler proved the per-worker output shards are key-disjoint (the
+    /// stream is partitioned by columns the output still carries — e.g. a filter or
+    /// an injective projection), the gather is a parallel per-worker decode +
+    /// concat: each worker decodes its own shard on its own thread, no serial
+    /// Z-set combine. Otherwise (e.g. a column-dropping projection that can land
+    /// equal output rows on different workers) the gather falls back to the serial
+    /// Z-set sum, which merges those duplicates — correctness over speed.
+    /// </remarks>
     public IEnumerable<(object?[] Values, long Weight)> Current =>
-        TypedOutputDecoder.Decode(OutputSchema, _currentZSetGetter, _currentReader);
+        _disjointGather is not null
+            ? _disjointGather.Gather()
+            : TypedOutputDecoder.Decode(OutputSchema, _currentZSetGetter, _currentReader);
 
     /// <summary>Look up the weight of a specific row in the current gathered output.</summary>
     public Z64 WeightOf(params object?[] values) =>

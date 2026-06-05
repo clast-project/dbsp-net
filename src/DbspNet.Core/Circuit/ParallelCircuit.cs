@@ -44,7 +44,11 @@ public sealed class ParallelCircuit : IDisposable
     private readonly CancellationTokenSource _abort;
     private readonly Thread[]? _threads;
     private readonly Barrier? _barrier;
+    private readonly Barrier? _workerBarrier;
+    private readonly IPhaseSync? _phaseSync;
+    private readonly Action<int> _stepJob;
     private readonly Exception?[] _stepErrors;
+    private volatile Action<int>? _job;
     private volatile bool _stopping;
     private bool _faulted;
     private bool _disposed;
@@ -56,6 +60,7 @@ public sealed class ParallelCircuit : IDisposable
         _coordinators = coordinators;
         _abort = abort;
         _stepErrors = new Exception?[replicas.Length];
+        _stepJob = StepJob;
 
         if (replicas.Length == 1)
         {
@@ -70,6 +75,14 @@ public sealed class ParallelCircuit : IDisposable
         // calls Step. Each tick is two rendezvous — "go" then "done" — so the
         // controller and workers stay in lockstep with no scheduler.
         _barrier = new Barrier(replicas.Length + 1);
+
+        // A workers-only barrier (the controller is not a participant) lets a
+        // RunDataParallel job rendezvous its W workers between phases — e.g. the
+        // encode→scatter boundary of a parallel ingest. It is abort-aware (the
+        // same CancellationToken the exchange uses) so a worker that throws in an
+        // early phase releases its peers instead of stranding them.
+        _workerBarrier = new Barrier(replicas.Length);
+        _phaseSync = new WorkerPhaseSync(_workerBarrier, _abort.Token);
         _threads = new Thread[replicas.Length];
         for (var w = 0; w < replicas.Length; w++)
         {
@@ -194,18 +207,75 @@ public sealed class ParallelCircuit : IDisposable
             return;
         }
 
-        Array.Clear(_stepErrors);
-        _barrier.SignalAndWait();   // "go": release the parked workers
-        _barrier.SignalAndWait();   // "done": rendezvous after every worker's Step
+        Dispatch(_stepJob);
 
+        // A mid-tick fault means the replicas have diverged (some operators ran,
+        // some did not); the run is unrecoverable.
+        ThrowOnFailures("One or more workers threw while stepping the parallel circuit.");
+    }
+
+    /// <summary>
+    /// Run a data-parallel job across the workers: each worker <c>w</c> runs
+    /// <paramref name="job"/><c>(w, sync)</c> on its own thread, with
+    /// <paramref name="job"/> free to call <see cref="IPhaseSync.Sync"/> to
+    /// rendezvous all workers between phases (every worker must call it the same
+    /// number of times). Used for parallel ingest (encode then scatter) and
+    /// egest (decode). Returns once all workers finish; faults are collected and
+    /// rethrown as an <see cref="AggregateException"/> exactly like
+    /// <see cref="Step"/>. As with <see cref="Step"/>, <c>W == 1</c> runs inline
+    /// on the caller with a no-op <see cref="IPhaseSync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Intended to run between steps, when the worker threads are parked — drive
+    /// it from the same thread that calls <see cref="Step"/>, not concurrently.
+    /// </remarks>
+    public void RunDataParallel(Action<int, IPhaseSync> job)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_faulted)
+        {
+            throw new InvalidOperationException(
+                "The parallel circuit faulted on a previous step and can no longer be stepped.");
+        }
+
+        if (_barrier is null)
+        {
+            // W == 1: inline, no handoff, no barrier — the single-threaded path
+            // is preserved and Sync() is a no-op.
+            job(0, NoopPhaseSync.Instance);
+            return;
+        }
+
+        Dispatch(worker => job(worker, _phaseSync!));
+        ThrowOnFailures("One or more workers threw while running a data-parallel job.");
+    }
+
+    /// <summary>
+    /// Hand <paramref name="job"/> to the parked workers and block until every one
+    /// has finished it: clear the error slots, set the job, then the two
+    /// "go"/"done" rendezvous. Only valid when <see cref="_barrier"/> is non-null
+    /// (W &gt; 1).
+    /// </summary>
+    private void Dispatch(Action<int> job)
+    {
+        _job = job;
+        Array.Clear(_stepErrors);
+        _barrier!.SignalAndWait();   // "go": release the parked workers
+        _barrier.SignalAndWait();    // "done": rendezvous after every worker's job
+        _job = null;
+    }
+
+    private void StepJob(int worker) => _replicas[worker].Step();
+
+    /// <summary>Poison the run and rethrow if the last dispatch recorded any fault.</summary>
+    private void ThrowOnFailures(string message)
+    {
         var failures = CollectFailures();
         if (failures is not null)
         {
-            // A mid-tick fault means the replicas have diverged (some operators
-            // ran, some did not); the run is unrecoverable.
             _faulted = true;
-            throw new AggregateException(
-                "One or more workers threw while stepping the parallel circuit.", failures);
+            throw new AggregateException(message, failures);
         }
     }
 
@@ -318,7 +388,6 @@ public sealed class ParallelCircuit : IDisposable
     private void WorkerLoop(int worker)
     {
         var barrier = _barrier!;
-        var replica = _replicas[worker];
         while (true)
         {
             barrier.SignalAndWait();   // "go"
@@ -329,14 +398,14 @@ public sealed class ParallelCircuit : IDisposable
 
             try
             {
-                replica.Step();
+                _job!(worker);
             }
             catch (Exception ex)
             {
                 // Record, then trip the abort so any peers parked on an exchange
-                // barrier this tick are released (they would otherwise wait for
-                // a worker that has bailed out of the tick). Keep going to the
-                // "done" barrier — a throwing worker must not strand the
+                // (or this job's inter-phase) barrier are released — they would
+                // otherwise wait for a worker that has bailed out. Keep going to
+                // the "done" barrier — a throwing worker must not strand the
                 // controller waiting forever.
                 _stepErrors[worker] = ex;
                 _abort.Cancel();
@@ -369,6 +438,7 @@ public sealed class ParallelCircuit : IDisposable
             }
 
             _barrier.Dispose();
+            _workerBarrier!.Dispose();
         }
 
         // Threads are joined (or never started, for W == 1), so no worker can be
@@ -380,4 +450,51 @@ public sealed class ParallelCircuit : IDisposable
 
         _abort.Dispose();
     }
+}
+
+/// <summary>
+/// A mid-job rendezvous handed to a <see cref="ParallelCircuit.RunDataParallel"/>
+/// job: calling <see cref="Sync"/> blocks until every worker has reached the same
+/// point, separating one data-parallel phase from the next (e.g. an ingest's
+/// parallel encode from its scatter). Every worker must call it the same number
+/// of times. A no-op when <c>W == 1</c>, where the job runs inline.
+/// </summary>
+public interface IPhaseSync
+{
+    /// <summary>Block until all workers reach this point.</summary>
+    void Sync();
+}
+
+/// <summary>The <c>W == 1</c> phase sync: nothing to wait for.</summary>
+internal sealed class NoopPhaseSync : IPhaseSync
+{
+    internal static readonly NoopPhaseSync Instance = new();
+
+    private NoopPhaseSync()
+    {
+    }
+
+    public void Sync()
+    {
+    }
+}
+
+/// <summary>
+/// The <c>W &gt; 1</c> phase sync: a workers-only <see cref="Barrier"/> waited on
+/// with the run's abort token, so a worker that faults before the rendezvous
+/// releases its peers (which then throw <see cref="OperationCanceledException"/>)
+/// rather than deadlocking them.
+/// </summary>
+internal sealed class WorkerPhaseSync : IPhaseSync
+{
+    private readonly Barrier _barrier;
+    private readonly CancellationToken _abort;
+
+    internal WorkerPhaseSync(Barrier barrier, CancellationToken abort)
+    {
+        _barrier = barrier;
+        _abort = abort;
+    }
+
+    public void Sync() => _barrier.SignalAndWait(_abort);
 }

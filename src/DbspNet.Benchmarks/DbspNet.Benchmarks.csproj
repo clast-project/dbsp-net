@@ -6,6 +6,12 @@
          strings) is noise for ASCII-only numeric report text. -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CA1305</NoWarn>
+    <!-- Data-parallel ingest/egest encode/decode allocates heavily on every
+         worker thread; workstation GC stops all of them on each collection and
+         serializes the very work we parallelized. Server GC gives per-core heaps
+         and parallel collection so the split/gather scaling shows. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />

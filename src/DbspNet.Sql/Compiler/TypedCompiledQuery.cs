@@ -88,10 +88,11 @@ public sealed class TypedCompiledQuery
 /// </summary>
 public sealed class TypedTableInput
 {
-    private readonly Func<object?[], object> _factory;
-    private readonly Action<object> _pushOneBoxedRowPositive;
-    private readonly Action<object> _pushOneBoxedRowNegative;
-    private readonly Action<IEnumerable<(object Row, long Weight)>> _pushBatch;
+    private readonly Func<object?[], object>? _factory;
+    private readonly Action<object>? _pushOneBoxedRowPositive;
+    private readonly Action<object>? _pushOneBoxedRowNegative;
+    private readonly Action<IEnumerable<(object Row, long Weight)>>? _pushBatch;
+    private readonly ITableIngestor? _ingestor;
 
     internal TypedTableInput(
         Schema schema,
@@ -107,6 +108,19 @@ public sealed class TypedTableInput
         _pushBatch = BuildPushBatch(rowType, handle);
     }
 
+    /// <summary>
+    /// Parallel-circuit variant: routes Insert / Delete / Push through an
+    /// <see cref="ITableIngestor"/> that shards the rows across the replicas, with
+    /// the boundary encode running on the worker threads (see
+    /// <see cref="ParallelIngestor{TRow}"/>).
+    /// </summary>
+    internal TypedTableInput(Schema schema, Type rowType, ITableIngestor ingestor)
+    {
+        Schema = schema;
+        RowType = rowType;
+        _ingestor = ingestor;
+    }
+
     public Schema Schema { get; }
 
     /// <summary>The closed emitted row type carried through the input handle.</summary>
@@ -115,28 +129,50 @@ public sealed class TypedTableInput
     public void Insert(params object?[] values)
     {
         ValidateArity(values);
-        var row = _factory(BoundaryEncoder.Encode(Schema, values));
-        _pushOneBoxedRowPositive(row);
+        if (_ingestor is not null)
+        {
+            _ingestor.PushOne(values, +1L);
+            return;
+        }
+
+        var row = _factory!(BoundaryEncoder.Encode(Schema, values));
+        _pushOneBoxedRowPositive!(row);
     }
 
     public void Delete(params object?[] values)
     {
         ValidateArity(values);
-        var row = _factory(BoundaryEncoder.Encode(Schema, values));
-        _pushOneBoxedRowNegative(row);
+        if (_ingestor is not null)
+        {
+            _ingestor.PushOne(values, -1L);
+            return;
+        }
+
+        var row = _factory!(BoundaryEncoder.Encode(Schema, values));
+        _pushOneBoxedRowNegative!(row);
     }
 
     public void Push(IEnumerable<(object?[] Values, long Weight)> deltas)
     {
         ArgumentNullException.ThrowIfNull(deltas);
+        if (_ingestor is not null)
+        {
+            // Hand the raw rows straight to the ingestor — it encodes on the
+            // worker threads. Reuse the caller's list when it is already one
+            // (the common large-batch case), else materialize once.
+            var raw = deltas as IReadOnlyList<(object?[] Values, long Weight)> ?? new List<(object?[], long)>(deltas);
+            _ingestor.Push(raw);
+            return;
+        }
+
         var rows = new List<(object Row, long Weight)>();
         foreach (var (vs, w) in deltas)
         {
             ValidateArity(vs);
-            rows.Add((_factory(BoundaryEncoder.Encode(Schema, vs)), w));
+            rows.Add((_factory!(BoundaryEncoder.Encode(Schema, vs)), w));
         }
 
-        _pushBatch(rows);
+        _pushBatch!(rows);
     }
 
     private void ValidateArity(object?[] values)

@@ -212,4 +212,90 @@ public class ParallelCircuitTests
             b.Input<int>(0, (x, y) => x + y, name: "dup");
         }));
     }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void RunDataParallel_RunsEveryWorkerOnce(int workers)
+    {
+        using var pc = ParallelCircuit.Build(workers, _ => { });
+
+        var ran = new int[workers];
+        pc.RunDataParallel((worker, _) => Interlocked.Increment(ref ran[worker]));
+
+        Assert.All(ran, count => Assert.Equal(1, count));
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void RunDataParallel_PhaseSync_SeparatesPhases(int workers)
+    {
+        // Phase 1: each worker publishes a value. Sync. Phase 2: each worker reads
+        // the whole array and sums it. The barrier guarantees every phase-1 write
+        // is visible before any phase-2 read, so every worker must see the full sum.
+        using var pc = ParallelCircuit.Build(workers, _ => { });
+
+        var published = new int[workers];
+        var sums = new int[workers];
+        var expected = workers * (workers + 1) / 2;   // sum of 1..workers
+
+        pc.RunDataParallel((worker, sync) =>
+        {
+            published[worker] = worker + 1;
+            sync.Sync();
+            var total = 0;
+            for (var i = 0; i < workers; i++)
+            {
+                total += published[i];
+            }
+
+            sums[worker] = total;
+        });
+
+        Assert.All(sums, s => Assert.Equal(expected, s));
+    }
+
+    [Fact]
+    public async Task RunDataParallel_FaultBeforeSync_SurfacesWithoutHanging()
+    {
+        // Worker 0 throws in phase 1, before the rendezvous; the others are parked
+        // at Sync(). The abort must release them (else the worker barrier deadlocks),
+        // and the controller must surface the root cause. The timeout guards a hang.
+        using var pc = ParallelCircuit.Build(3, _ => { });
+
+        var agg = await Assert.ThrowsAsync<AggregateException>(() => Task.Run(() =>
+            pc.RunDataParallel((worker, sync) =>
+            {
+                if (worker == 0)
+                {
+                    throw new InvalidOperationException("boom");
+                }
+
+                sync.Sync();
+            })).WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.Single(agg.InnerExceptions);
+        Assert.IsType<InvalidOperationException>(agg.InnerExceptions[0]);
+
+        // A faulted circuit can no longer be driven.
+        Assert.Throws<InvalidOperationException>(() => pc.Step());
+    }
+
+    [Fact]
+    public void RunDataParallel_SingleWorker_RunsInlineWithNoopSync()
+    {
+        using var pc = ParallelCircuit.Build(1, _ => { });
+
+        var ran = false;
+        pc.RunDataParallel((worker, sync) =>
+        {
+            Assert.Equal(0, worker);
+            sync.Sync();   // no-op for W == 1, must not block
+            ran = true;
+        });
+
+        Assert.True(ran);
+    }
 }
