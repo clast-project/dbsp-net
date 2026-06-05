@@ -16,6 +16,15 @@ if (args.Length > 0 && args[0] == "profile")
     return DbspNet.Benchmarks.ProfileHotPath.Run(args);
 }
 
+// Cross-system comparison sub-commands (Feldera-compatible workloads).
+//   dotnet run -- nexmark    [totalEvents] [batchSize] [runs]
+//   dotnet run -- fraud      [historyTxns] [customers] [batchSize]
+//   dotnet run -- comparison                       (runs both with defaults)
+if (args.Length > 0 && args[0] is "nexmark" or "fraud" or "comparison")
+{
+    return DbspNet.Benchmarks.ComparisonBenchmarks.Run(args);
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();

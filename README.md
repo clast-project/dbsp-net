@@ -33,7 +33,8 @@ src/
   DbspNet.Persistence  WAL, end-of-tick snapshots, snapshot+WAL hybrid
                        over an IBlobStore abstraction
   DbspNet.Demo         runnable end-to-end scenarios
-  DbspNet.Benchmarks   regenerates docs/benchmarks.md
+  DbspNet.Benchmarks   regenerates docs/benchmarks.md; also hosts the
+                       Feldera-compatible comparison workloads (Nexmark, fraud)
 tests/
   DbspNet.Tests        unit + property-based tests
 ARCHITECTURE.md        codebase map: pipeline, operators, extension points
@@ -41,6 +42,7 @@ docs/
   design-notes.md      DBSP primer and implementation notes
   persistence.md       persistence/recovery design and what shipped
   benchmarks.md        regenerated; cold-batch vs incremental latency
+  benchmarks-comparison.md  Feldera-compatible Nexmark + fraud-detection runs
   skipped.md           deferred features tracked against Feldera
 ```
 
@@ -56,6 +58,26 @@ dotnet run --project src/DbspNet.Benchmarks -c Release
 Requires .NET 10 SDK. See [`docs/benchmarks.md`](docs/benchmarks.md) for
 performance numbers (cold-batch vs. steady-state incremental latency across
 four query shapes).
+
+### Feldera comparison workloads
+
+Feldera-compatible workloads for cross-system performance comparison (the
+plan lives in `research/dbsp/performance_test.md`). Both systems run the
+same SQL over in-process generated data:
+
+```
+# Nexmark throughput (q0–q4, q9): events, batch size, runs
+dotnet run --project src/DbspNet.Benchmarks -c Release -- nexmark 1000000 10000 3
+
+# Fraud detection rolling-window features: history txns, customers, batch
+dotnet run --project src/DbspNet.Benchmarks -c Release -- fraud 500000 10000 10000
+
+# Both, with defaults, into docs/benchmarks-comparison.md
+dotnet run --project src/DbspNet.Benchmarks -c Release -- comparison
+```
+
+See [`docs/benchmarks-comparison.md`](docs/benchmarks-comparison.md) for the
+DbspNet-side numbers and the queries that do / don't yet compile.
 
 ## Walkthrough: one SQL query, running incrementally
 
