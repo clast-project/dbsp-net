@@ -25,6 +25,12 @@ if (args.Length > 0 && args[0] is "nexmark" or "fraud" or "comparison")
     return DbspNet.Benchmarks.ComparisonBenchmarks.Run(args);
 }
 
+// Parallel-scaling sub-command: `dotnet run -- parallel [maxWorkers]`
+if (args.Length > 0 && args[0] == "parallel")
+{
+    return DbspNet.Benchmarks.ParallelScalingBenchmark.RunConsole(args);
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();
@@ -56,6 +62,7 @@ RunJoinedGroupByTypedBenchmark(output);
 RunTransitiveClosureBenchmark(output);
 PureTraceBenchmark.Run(output);
 DistinctBenchmark.Run(output);
+ParallelScalingBenchmark.Run(output);
 
 AppendInterpretation(output);
 

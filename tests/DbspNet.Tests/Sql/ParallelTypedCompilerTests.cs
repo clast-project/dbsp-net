@@ -211,4 +211,96 @@ public class ParallelTypedCompilerTests
             },
             tbl => tbl("t").Delete(10));
     }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void GroupByStringKey_MatchesSingle(int workers)
+    {
+        // String group key: the exchange must co-locate equal strings on one worker
+        // via the stable per-column hash. (object.GetHashCode for string is
+        // per-process-randomized — if the partition used it, a group could still
+        // land coherently within one run, but recovery would re-shard wrongly; the
+        // stable hash is what this test pins for the within-run path.)
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (region VARCHAR NOT NULL, amount INT NOT NULL)"],
+            "SELECT region, SUM(amount) AS s, COUNT(*) AS c FROM t GROUP BY region",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert("north", 10);
+                tbl("t").Insert("south", 5);
+                tbl("t").Insert("north", 7);
+                tbl("t").Insert("east", 3);
+            },
+            tbl =>
+            {
+                tbl("t").Insert("south", 2);
+                tbl("t").Delete("north", 10);
+                tbl("t").Insert("west", 1);
+            });
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void GroupByCompositeKey_MatchesSingle(int workers)
+    {
+        // Two-column group key exercises StableHash.Combine — both columns must
+        // feed the partition so equal (a, b) pairs co-locate.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (a INT NOT NULL, b VARCHAR NOT NULL, v INT NOT NULL)"],
+            "SELECT a, b, SUM(v) AS s FROM t GROUP BY a, b",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, "x", 10);
+                tbl("t").Insert(1, "y", 20);
+                tbl("t").Insert(2, "x", 5);
+                tbl("t").Insert(1, "x", 1);   // same (1,x) group
+            },
+            tbl =>
+            {
+                tbl("t").Insert(2, "x", 4);
+                tbl("t").Delete(1, "y", 20);  // empties (1,y)
+            });
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void SkewedGroupKey_MatchesSingle(int workers)
+    {
+        // Extreme skew: one hot key carries the bulk of the rows, so it serializes
+        // onto a single worker while the others stay near-idle. Correctness is
+        // W-independent regardless of partition balance — only throughput suffers.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)"],
+            "SELECT k, SUM(v) AS s, COUNT(*) AS c FROM t GROUP BY k",
+            workers,
+            tbl =>
+            {
+                for (var i = 0; i < 200; i++)
+                {
+                    tbl("t").Insert(0, i);     // hot key 0
+                }
+
+                tbl("t").Insert(1, 1);
+                tbl("t").Insert(2, 2);
+            },
+            tbl =>
+            {
+                for (var i = 0; i < 50; i++)
+                {
+                    tbl("t").Insert(0, 1000 + i);
+                }
+
+                tbl("t").Delete(1, 1);         // empties the cold group
+            });
+    }
 }
