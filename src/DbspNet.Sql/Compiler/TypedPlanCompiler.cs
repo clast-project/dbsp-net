@@ -85,12 +85,25 @@ public static class TypedPlanCompiler
     /// fallback contract as <see cref="TryCompile"/>: returns <c>false</c> for any
     /// plan outside the typed pipeline. The caller owns the returned query and
     /// must dispose it (it holds the replica worker threads).
+    /// <para>
+    /// Pass <paramref name="snapshotCodecs"/> to make the replicas' stateful
+    /// operators snapshottable — each replica is a plain <see cref="RootCircuit"/>,
+    /// so <see cref="DbspNet.Persistence.ParallelSnapshot"/> snapshots the W
+    /// replicas into per-worker subtrees. Recovery requires the same W (the stable
+    /// hash partition is part of the persisted state).
+    /// </para>
     /// </summary>
-    public static bool TryCompileParallel(LogicalPlan plan, int workers, out ParallelTypedCompiledQuery? compiled)
+    public static bool TryCompileParallel(
+        LogicalPlan plan,
+        int workers,
+        out ParallelTypedCompiledQuery? compiled,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
+        CompileOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
         compiled = null;
+        var compileOptions = options ?? CompileOptions.Default;
 
         // Shared across replicas; CompileScan fills it idempotently (the row
         // types/schemas are replica-independent — same schema fingerprint).
@@ -102,7 +115,7 @@ public static class TypedPlanCompiler
         {
             circuit = ParallelCircuit.Build(workers, builder =>
             {
-                var ctx = new CompileContext(builder, meta, workers);
+                var ctx = new CompileContext(builder, meta, workers, snapshotCodecs, compileOptions);
                 var top = TryCompileNode(plan, ctx) ?? throw new UnsupportedPlanException();
                 InvokeNamedOutput(builder, top.RowType, top.Stream, OutputPortName);
                 topNode = top;
@@ -279,14 +292,18 @@ public static class TypedPlanCompiler
         }
 
         public CompileContext(
-            CircuitBuilder builder, Dictionary<string, ParallelInputMeta> parallelInputs, int workers)
+            CircuitBuilder builder,
+            Dictionary<string, ParallelInputMeta> parallelInputs,
+            int workers,
+            ISqlSnapshotCodecs? snapshotCodecs,
+            CompileOptions options)
         {
             Builder = builder;
             Inputs = null;
             ParallelInputs = parallelInputs;
             StructuralScans = null;
-            SnapshotCodecs = null;
-            Options = CompileOptions.Default;
+            SnapshotCodecs = snapshotCodecs;
+            Options = options;
             Workers = workers;
         }
     }
@@ -2322,36 +2339,111 @@ public static class TypedPlanCompiler
     }
 
     /// <summary>
-    /// Builds the exchange partition <c>(TRow r) =&gt; keyExtractor(r).GetHashCode()</c>
+    /// Builds the exchange partition <c>(TRow r) =&gt; stableHash(keyExtractor(r))</c>
     /// over an emitted key type — co-locating rows whose key columns are equal.
     /// </summary>
     /// <remarks>
-    /// Process-local hashing: correct for parallel execution within one run (every
-    /// replica is in the same process, so equal keys hash identically). Cross-
-    /// process-stable partitioning (required once snapshots/recovery land) is a
-    /// later concern — swap this and <see cref="BuildRowHashPartition"/> to a
-    /// <see cref="StableHash"/>-based projection then. Isolated here for that swap.
+    /// The hash is a per-column <see cref="StablePartitionHash"/> projection rather
+    /// than <see cref="object.GetHashCode"/>: it depends only on the column values,
+    /// so equal keys map to the same worker across runs and across a
+    /// snapshot/recovery cycle (a recovered replica must own the same keys it held
+    /// before). <see cref="BuildRowHashPartition"/> is the whole-row counterpart.
     /// </remarks>
     private static Delegate BuildKeyHashPartition(Type rowType, Type keyRowType, Delegate keyExtractor)
     {
         var rowParam = Expression.Parameter(rowType, "r");
-        var key = Expression.Invoke(Expression.Constant(keyExtractor), rowParam);
-        var hash = Expression.Call(key, keyRowType.GetMethod(nameof(object.GetHashCode), Type.EmptyTypes)!);
+        var keyVar = Expression.Variable(keyRowType, "k");
+        var assign = Expression.Assign(keyVar, Expression.Invoke(Expression.Constant(keyExtractor), rowParam));
+        var body = Expression.Block(new[] { keyVar }, assign, BuildStableRowHash(keyVar, keyRowType));
         var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
-        return Expression.Lambda(delegateType, hash, rowParam).Compile();
+        return Expression.Lambda(delegateType, body, rowParam).Compile();
     }
 
     /// <summary>
-    /// Builds the whole-row exchange partition <c>(TRow r) =&gt; r.GetHashCode()</c>,
-    /// used by DISTINCT (the entire row is the key). See
-    /// <see cref="BuildKeyHashPartition"/> on hashing stability.
+    /// Builds the whole-row exchange partition <c>(TRow r) =&gt; stableHash(r)</c>,
+    /// used by DISTINCT (the entire row is the key) and to balance sharded input.
+    /// See <see cref="BuildKeyHashPartition"/> on hashing stability.
     /// </summary>
     private static Delegate BuildRowHashPartition(Type rowType)
     {
         var rowParam = Expression.Parameter(rowType, "r");
-        var hash = Expression.Call(rowParam, rowType.GetMethod(nameof(object.GetHashCode), Type.EmptyTypes)!);
+        var body = BuildStableRowHash(rowParam, rowType);
         var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
-        return Expression.Lambda(delegateType, hash, rowParam).Compile();
+        return Expression.Lambda(delegateType, body, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds an <c>int</c>-typed expression hashing every column of an emitted
+    /// row (<paramref name="rowValue"/> of type <paramref name="rowType"/>) via
+    /// <see cref="StablePartitionHash"/>, then folding the per-column hashes with
+    /// <see cref="StableHash.Combine"/>. A single-column row skips the combine.
+    /// </summary>
+    private static Expression BuildStableRowHash(Expression rowValue, Type rowType)
+    {
+        var fields = OrderedRowFields(rowType);
+        var hashes = new Expression[fields.Length];
+        for (var i = 0; i < fields.Length; i++)
+        {
+            hashes[i] = BuildStableFieldHash(Expression.Field(rowValue, fields[i]), fields[i].FieldType);
+        }
+
+        if (hashes.Length == 1)
+        {
+            return hashes[0];
+        }
+
+        var combine = typeof(StableHash).GetMethod(nameof(StableHash.Combine), new[] { typeof(int[]) })!;
+        return Expression.Call(combine, Expression.NewArrayInit(typeof(int), hashes));
+    }
+
+    /// <summary>
+    /// Hashes one emitted-row field via the matching <see cref="StablePartitionHash"/>
+    /// overload. A <see cref="Nullable{T}"/> field hashes its value when present and
+    /// collapses to <see cref="StablePartitionHash.NullHash"/> when null, so two
+    /// null keys co-locate (matching the typed Nullable equality).
+    /// </summary>
+    private static Expression BuildStableFieldHash(Expression field, Type fieldType)
+    {
+        var underlying = Nullable.GetUnderlyingType(fieldType);
+        if (underlying is not null)
+        {
+            var hasValue = Expression.Property(field, "HasValue");
+            var value = Expression.Property(field, "Value");
+            return Expression.Condition(
+                hasValue,
+                StableHashOfCall(value, underlying),
+                Expression.Constant(StablePartitionHash.NullHash));
+        }
+
+        return StableHashOfCall(field, fieldType);
+    }
+
+    /// <summary>
+    /// <c>StablePartitionHash.Of(value)</c>, resolving the overload by the value's
+    /// (non-nullable) CLR type. Reference-type columns (e.g. <c>string</c>) bind the
+    /// nullable-aware overload, which handles a null value itself.
+    /// </summary>
+    private static Expression StableHashOfCall(Expression value, Type valueType)
+    {
+        var method = typeof(StablePartitionHash).GetMethod(
+            nameof(StablePartitionHash.Of), BindingFlags.Public | BindingFlags.Static, new[] { valueType })
+            ?? throw new NotSupportedException(
+                $"no stable partition hash for typed-row column type {valueType}");
+        return Expression.Call(method, value);
+    }
+
+    /// <summary>
+    /// The emitted row's <c>F0..Fn</c> fields in declaration order. Reflection's
+    /// field order is unspecified, so sort by the numeric suffix the emitter assigns
+    /// (<see cref="TypedRowEmitter"/>).
+    /// </summary>
+    private static FieldInfo[] OrderedRowFields(Type rowType)
+    {
+        var fields = rowType.GetFields(BindingFlags.Public | BindingFlags.Instance);
+        Array.Sort(fields, static (a, b) =>
+            int.Parse(a.Name.AsSpan(1), System.Globalization.CultureInfo.InvariantCulture)
+                .CompareTo(int.Parse(b.Name.AsSpan(1), System.Globalization.CultureInfo.InvariantCulture)));
+        return fields;
     }
 
     /// <summary><c>builder.Filter&lt;TRow, Z64&gt;(stream, predicate)</c>.</summary>

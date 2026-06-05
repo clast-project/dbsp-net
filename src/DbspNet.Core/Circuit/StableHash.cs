@@ -68,6 +68,21 @@ public static class StableHash
         }
     }
 
+    /// <summary>Stable hash of a byte span (FNV-1a, folded to 32 bits).</summary>
+    public static int Of(ReadOnlySpan<byte> value)
+    {
+        unchecked
+        {
+            var h = FnvOffset;
+            foreach (var b in value)
+            {
+                h = (h ^ b) * FnvPrime;
+            }
+
+            return (int)(h ^ (h >> 32));
+        }
+    }
+
     /// <summary>
     /// Combine component hashes into one stable hash (FNV-1a over the components),
     /// for composite keys such as multi-column SQL group/join keys. Order matters.

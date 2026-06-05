@@ -122,6 +122,28 @@ public sealed class ParallelCircuit : IDisposable
     public int Workers => _replicas.Length;
 
     /// <summary>
+    /// The <c>W</c> replica circuits, in worker order. Exposed to the persistence
+    /// layer so it can snapshot/restore each replica's operator state into a
+    /// per-worker subtree. Only safe to read between <see cref="Step"/>s, when the
+    /// worker threads are parked on the barrier and no replica is mutating.
+    /// </summary>
+    internal IReadOnlyList<RootCircuit> Replicas
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_faulted)
+            {
+                throw new InvalidOperationException(
+                    "The parallel circuit faulted on a previous step; its replicas have diverged " +
+                    "and cannot be snapshotted.");
+            }
+
+            return _replicas;
+        }
+    }
+
+    /// <summary>
     /// Number of completed ticks. Every replica advances identically, so this
     /// reads replica 0.
     /// </summary>

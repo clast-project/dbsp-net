@@ -63,4 +63,14 @@ public class StableHashTests
         Assert.NotEqual(StableHash.Of("abc"), StableHash.Of("abd"));
         Assert.NotEqual(StableHash.Of("ab"), StableHash.Of("ba"));
     }
+
+    [Fact]
+    public void Of_ByteSpan_IsDeterministicAndContentSensitive()
+    {
+        ReadOnlySpan<byte> a = "orders"u8;
+        ReadOnlySpan<byte> b = "orders"u8;
+        ReadOnlySpan<byte> c = "orderz"u8;
+        Assert.Equal(StableHash.Of(a), StableHash.Of(b));
+        Assert.NotEqual(StableHash.Of(a), StableHash.Of(c));
+    }
 }
