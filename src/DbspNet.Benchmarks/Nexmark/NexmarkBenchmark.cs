@@ -19,10 +19,12 @@ namespace DbspNet.Benchmarks.Nexmark;
 /// </summary>
 internal static class NexmarkBenchmark
 {
-    public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs)
+    public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs, int workers = 1)
     {
+        workers = Math.Clamp(workers, 1, Environment.ProcessorCount);
         Console.WriteLine();
-        Console.WriteLine($"=== Nexmark throughput (events={totalEvents:N0}, batch={batchSize:N0}, runs={runs}) ===");
+        Console.WriteLine(
+            $"=== Nexmark throughput (events={totalEvents:N0}, batch={batchSize:N0}, runs={runs}, W={workers}) ===");
         Console.WriteLine("Generating event stream…");
         var events = Generate(totalEvents);
 
@@ -45,17 +47,39 @@ internal static class NexmarkBenchmark
             "majority) reports a higher events/s — it is keeping up with that much " +
             "stream rate, not doing that much per-row work.");
         output.AppendLine();
+        if (workers > 1)
+        {
+            output.AppendLine(
+                $"**Parallel** runs each query across W={workers} data-parallel replicas " +
+                "(`ParallelCircuit`, hash-sharded input + exchanges at join / group-by / " +
+                "partitioned-TOP-K boundaries). The W>1 output is cross-checked against the " +
+                "W=1 replica run; a query whose plan has no correct parallel form (e.g. a " +
+                "global TOP-K) is marked *single-only*. Feldera-style comparison: pin W to " +
+                "Feldera's worker count.");
+            output.AppendLine();
+        }
+
         output.AppendLine(
             $"Stream: {totalEvents:N0} events " +
             $"({counts.Person:N0} person, {counts.Auction:N0} auction, {counts.Bid:N0} bid). " +
             $"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
         output.AppendLine();
-        output.AppendLine("| Query | Description | Throughput (events/s) | Last Δ rows | Status |");
-        output.AppendLine("|:------|:------------|----------------------:|------------:|:-------|");
+        if (workers > 1)
+        {
+            output.AppendLine(
+                $"| Query | Description | W=1 (events/s) | W={workers} (events/s) | Speedup | Last Δ rows | Status |");
+            output.AppendLine(
+                "|:------|:------------|---------------:|---------------:|--------:|------------:|:-------|");
+        }
+        else
+        {
+            output.AppendLine("| Query | Description | Throughput (events/s) | Last Δ rows | Status |");
+            output.AppendLine("|:------|:------------|----------------------:|------------:|:-------|");
+        }
 
         foreach (var query in NexmarkQueries.All)
         {
-            RunOne(output, query, events, batchSize, runs);
+            RunOne(output, query, events, batchSize, runs, workers);
         }
 
         output.AppendLine();
@@ -68,32 +92,64 @@ internal static class NexmarkBenchmark
             "> Queries q5 / q7 / q8 (tumbling / sliding event-time windows) are " +
             "omitted: they require TUMBLE / HOP windowing table functions that " +
             "DbspNet does not yet expose. q9 uses `ROW_NUMBER() OVER (PARTITION … " +
-            "ORDER …)` which compiles to a partitioned incremental TOP-K.");
+            "ORDER …)` which compiles to a partitioned incremental TOP-K (and, " +
+            "in parallel, an exchange on the partition key).");
         output.AppendLine();
     }
 
     private static void RunOne(
-        StringBuilder output, NexmarkQueries.Query query, List<Event> events, int batchSize, int runs)
+        StringBuilder output, NexmarkQueries.Query query, List<Event> events, int batchSize, int runs, int workers)
     {
-        CompiledQuery? probe;
         try
         {
-            probe = Compile(NexmarkQueries.Ddl, query.Sql);
+            _ = Compile(NexmarkQueries.Ddl, query.Sql); // probe; measured runs compile fresh.
         }
         catch (Exception ex)
         {
             Console.WriteLine($"  {query.Id}: DID NOT COMPILE — {Short(ex)}");
-            output.AppendLine(
-                $"| {query.Id} | {query.Description} | — | — | not compiled: {Short(ex)} |");
+            var cols = workers > 1 ? "— | — | — | —" : "— | —";
+            output.AppendLine($"| {query.Id} | {query.Description} | {cols} | not compiled: {Short(ex)} |");
             return;
         }
 
-        _ = probe; // compile probe discarded; each measured run compiles fresh.
-
         var consumed = query.Tables.ToHashSet();
+        var (single, outputRows) = MeasureSingle(query, events, batchSize, runs, consumed);
+
+        if (workers <= 1)
+        {
+            Console.WriteLine($"  {query.Id}: {single,12:N0} events/s   lastΔ={outputRows:N0}");
+            output.AppendLine($"| {query.Id} | {query.Description} | {single:N0} | {outputRows:N0} | ok |");
+            return;
+        }
+
+        // Parallel: attempt to compile at W; if the plan has no correct parallel
+        // form, TryCompileParallel returns false and we report single-only.
+        var parallel = MeasureParallel(query, events, batchSize, runs, workers, consumed);
+        if (parallel is null)
+        {
+            Console.WriteLine($"  {query.Id}: {single,12:N0} events/s  (single-only)");
+            output.AppendLine(
+                $"| {query.Id} | {query.Description} | {single:N0} | — | — | {outputRows:N0} | single-only (no parallel plan) |");
+            return;
+        }
+
+        var (par, parOutput, correct) = parallel.Value;
+        var speedup = par > 0 ? par / single : 0.0;
+        var status = correct ? "ok" : "**PARALLEL MISMATCH**";
+        Console.WriteLine(
+            $"  {query.Id}: W1={single,12:N0}  W{workers}={par,12:N0} events/s  " +
+            $"{BenchmarkHarness.FormatRatio(speedup)}  {(correct ? "ok" : "MISMATCH")}");
+        output.AppendLine(
+            $"| {query.Id} | {query.Description} | {single:N0} | {par:N0} | " +
+            $"{BenchmarkHarness.FormatRatio(speedup).Trim()} | {parOutput:N0} | {status} |");
+    }
+
+    /// <summary>Single-circuit throughput (events/s) + final output row count.</summary>
+    private static (double EventsPerSec, long OutputRows) MeasureSingle(
+        NexmarkQueries.Query query, List<Event> events, int batchSize, int runs, HashSet<NexmarkTable> consumed)
+    {
         var times = new List<double>();
         long outputRows = 0;
-
         for (var run = 0; run < runs + 1; run++) // first run is warmup.
         {
             var q = Compile(NexmarkQueries.Ddl, query.Sql);
@@ -110,7 +166,7 @@ internal static class NexmarkBenchmark
 
                 if (++sinceStep >= batchSize)
                 {
-                    Flush(q, buffers);
+                    FlushSingle(q, buffers);
                     q.Step();
                     sinceStep = 0;
                 }
@@ -118,29 +174,109 @@ internal static class NexmarkBenchmark
 
             if (sinceStep > 0)
             {
-                Flush(q, buffers);
+                FlushSingle(q, buffers);
                 q.Step();
             }
 
             sw.Stop();
-
             if (run > 0)
             {
                 times.Add(events.Count / sw.Elapsed.TotalSeconds);
             }
 
-            outputRows = CountOutput(q);
+            outputRows = CountSingleOutput(q);
         }
 
         times.Sort();
-        var median = times[times.Count / 2];
-        Console.WriteLine(
-            $"  {query.Id}: {median,12:N0} events/s   lastΔ={outputRows:N0}");
-        output.AppendLine(
-            $"| {query.Id} | {query.Description} | {median:N0} | {outputRows:N0} | ok |");
+        return (times[times.Count / 2], outputRows);
     }
 
-    private static void Flush(CompiledQuery q, Dictionary<NexmarkTable, List<(object?[], long)>> buffers)
+    /// <summary>
+    /// Parallel throughput (events/s) at W workers, the final output row count, and
+    /// whether that output matched the W=1 replica run. Returns <c>null</c> when the
+    /// query has no parallel plan (TryCompileParallel fails).
+    /// </summary>
+    private static (double EventsPerSec, long OutputRows, bool Correct)? MeasureParallel(
+        NexmarkQueries.Query query, List<Event> events, int batchSize, int runs, int workers,
+        HashSet<NexmarkTable> consumed)
+    {
+        var plan = BuildPlan(NexmarkQueries.Ddl, query.Sql);
+        if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var probe))
+        {
+            return null;
+        }
+
+        probe!.Dispose();
+
+        // Reference: W=1 replica output (apples-to-apples with the W>1 row shape).
+        var reference = RunParallelStream(plan, 1, events, batchSize, consumed, out _);
+
+        var times = new List<double>();
+        long outputRows = 0;
+        var correct = true;
+        for (var run = 0; run < runs + 1; run++)
+        {
+            var output = RunParallelStream(plan, workers, events, batchSize, consumed, out var elapsedSec);
+            if (run > 0)
+            {
+                times.Add(events.Count / elapsedSec);
+            }
+
+            outputRows = output.Values.Count(w => w != 0);
+            correct = SameMultiset(reference, output);
+        }
+
+        times.Sort();
+        return (times[times.Count / 2], outputRows, correct);
+    }
+
+    /// <summary>
+    /// Runs the whole event stream through a fresh W-worker parallel circuit and
+    /// returns its final materialized output (row-string → net weight). Reports the
+    /// wall-clock seconds via <paramref name="elapsedSec"/>.
+    /// </summary>
+    private static Dictionary<string, long> RunParallelStream(
+        LogicalPlan plan, int workers, List<Event> events, int batchSize,
+        HashSet<NexmarkTable> consumed, out double elapsedSec)
+    {
+        if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q))
+        {
+            throw new InvalidOperationException("parallel compile unexpectedly failed");
+        }
+
+        using (q)
+        {
+            var buffers = consumed.ToDictionary(t => t, _ => new List<(object?[], long)>());
+            var sw = Stopwatch.StartNew();
+            var sinceStep = 0;
+            foreach (var e in events)
+            {
+                if (consumed.Contains(e.Table))
+                {
+                    buffers[e.Table].Add((e.Row, 1L));
+                }
+
+                if (++sinceStep >= batchSize)
+                {
+                    FlushParallel(q!, buffers);
+                    q!.Step();
+                    sinceStep = 0;
+                }
+            }
+
+            if (sinceStep > 0)
+            {
+                FlushParallel(q!, buffers);
+                q!.Step();
+            }
+
+            sw.Stop();
+            elapsedSec = sw.Elapsed.TotalSeconds;
+            return MaterializeParallel(q!);
+        }
+    }
+
+    private static void FlushSingle(CompiledQuery q, Dictionary<NexmarkTable, List<(object?[], long)>> buffers)
     {
         foreach (var (table, rows) in buffers)
         {
@@ -154,7 +290,22 @@ internal static class NexmarkBenchmark
         }
     }
 
-    private static long CountOutput(CompiledQuery q)
+    private static void FlushParallel(
+        ParallelTypedCompiledQuery q, Dictionary<NexmarkTable, List<(object?[], long)>> buffers)
+    {
+        foreach (var (table, rows) in buffers)
+        {
+            if (rows.Count == 0)
+            {
+                continue;
+            }
+
+            q.Table(TableName(table)).Push(rows);
+            rows.Clear();
+        }
+    }
+
+    private static long CountSingleOutput(CompiledQuery q)
     {
         long n = 0;
         foreach (var (_, w) in q.Current)
@@ -166,6 +317,40 @@ internal static class NexmarkBenchmark
         }
 
         return n;
+    }
+
+    private static Dictionary<string, long> MaterializeParallel(ParallelTypedCompiledQuery q)
+    {
+        var map = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var (values, weight) in q.Current)
+        {
+            var key = string.Join("", values.Select(v => v?.ToString() ?? " "));
+            map[key] = map.GetValueOrDefault(key) + weight;
+            if (map[key] == 0)
+            {
+                map.Remove(key);
+            }
+        }
+
+        return map;
+    }
+
+    private static bool SameMultiset(Dictionary<string, long> a, Dictionary<string, long> b)
+    {
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+
+        foreach (var (k, v) in a)
+        {
+            if (!b.TryGetValue(k, out var bv) || bv != v)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static (long Person, long Auction, long Bid) CountByTable(List<Event> events)
@@ -197,7 +382,10 @@ internal static class NexmarkBenchmark
         return msg.Length > 120 ? msg[..120] + "…" : msg;
     }
 
-    private static CompiledQuery Compile(string[] ddl, string sql)
+    private static CompiledQuery Compile(string[] ddl, string sql) =>
+        PlanToCircuit.Compile(BuildPlan(ddl, sql));
+
+    private static LogicalPlan BuildPlan(string[] ddl, string sql)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
@@ -207,6 +395,6 @@ internal static class NexmarkBenchmark
         }
 
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
-        return PlanToCircuit.Compile(PlanOptimizer.Optimize(plan));
+        return PlanOptimizer.Optimize(plan);
     }
 }

@@ -271,6 +271,40 @@ public class ParallelTypedCompilerTests
     }
 
     [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void PartitionedTopK_MatchesSingle(int workers)
+    {
+        // ROW_NUMBER() OVER (PARTITION BY g ORDER BY v DESC) <= 1 — the Nexmark-q9
+        // shape. The partitioned TOP-K must be preceded by an exchange on the
+        // PARTITION BY key, or a group's rows split across workers and each worker
+        // emits its own local winner (too many rows). This pins the exchange.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (g INT NOT NULL, v INT NOT NULL, tag INT NOT NULL)"],
+            "SELECT g, v, tag FROM (" +
+            "  SELECT g, v, tag, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v DESC, tag ASC) AS rn" +
+            "  FROM t) ranked " +
+            "WHERE rn <= 1",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 10, 100);
+                tbl("t").Insert(1, 30, 101);   // current winner of group 1
+                tbl("t").Insert(1, 20, 102);
+                tbl("t").Insert(2, 5, 200);
+                tbl("t").Insert(2, 5, 199);     // tie on v=5 broken by tag ASC -> 199
+            },
+            tbl =>
+            {
+                tbl("t").Insert(1, 40, 103);    // new winner of group 1
+                tbl("t").Insert(3, 7, 300);     // new group
+                tbl("t").Delete(2, 5, 199);     // retract the group-2 winner -> 200 wins
+            });
+    }
+
+    [Theory]
     [InlineData(2)]
     [InlineData(4)]
     [InlineData(8)]

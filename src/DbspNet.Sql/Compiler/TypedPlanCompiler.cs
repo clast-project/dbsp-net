@@ -929,6 +929,13 @@ public static class TypedPlanCompiler
     /// </summary>
     private static TypedNode? CompileScalarSubqueryJoin(ScalarSubqueryJoinPlan plan, CompileContext ctx)
     {
+        // Broadcast join on a unit key: every outer row must see the whole
+        // subquery result. Sharding splits the subquery rows across workers, so a
+        // replica would join against only its fraction — wrong. A correct parallel
+        // form needs the subquery side replicated (broadcast), not sharded; refuse
+        // for now.
+        if (ctx.Workers > 1) return null;
+
         var current = TryCompileNode(plan.Input, ctx);
         if (current is null) return null;
 
@@ -996,6 +1003,13 @@ public static class TypedPlanCompiler
     /// </summary>
     private static TypedNode? CompileDifference(DifferencePlan plan, CompileContext ctx)
     {
+        // left − right is per-row key-sensitive: a row's left and right copies must
+        // co-locate, which whole-row sharding alone doesn't guarantee once the
+        // sub-plans carry their own (key-based) exchanges. Refuse parallel rather
+        // than risk a wrong difference; a both-sides whole-row exchange could make
+        // this safe later (mirroring DISTINCT).
+        if (ctx.Workers > 1) return null;
+
         var left = TryCompileNode(plan.Left, ctx);
         if (left is null) return null;
         var right = TryCompileNode(plan.Right, ctx);
@@ -1046,6 +1060,13 @@ public static class TypedPlanCompiler
     /// </summary>
     private static TypedNode? CompileTopK(TopKPlan plan, CompileContext ctx)
     {
+        // A global (un-partitioned) TOP-K is a single ranking over the whole
+        // input; sharding + Z-set gather can't reconstruct it (each worker would
+        // keep its own local top-k, and Plus would union up to W×k rows rather
+        // than re-ranking). Refuse the parallel compile so the caller falls back,
+        // rather than emit a silently-wrong circuit.
+        if (ctx.Workers > 1) return null;
+
         var inner = TryCompileNode(plan.Input, ctx);
         if (inner is null) return null;
 
@@ -1114,9 +1135,29 @@ public static class TypedPlanCompiler
             partitionExtractors[i] = ex;
         }
 
+        // Parallel: co-locate each partition's rows on one worker so the
+        // per-partition ranking is global, not per-shard. Exchange by the same
+        // PARTITION BY key the operator ranks within. A partition key outside the
+        // stable-hash type surface refuses the parallel compile (falls back).
+        var topKInput = inner.Stream;
+        if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
+        {
+            if (BuildExprListHashPartition(rowType, plan.PartitionKeys) is not { } partition)
+            {
+                return null;
+            }
+
+            topKInput = InvokeExchange(ctx.Builder, rowType, inner.Stream, partition);
+        }
+        else if (ctx.Workers > 1)
+        {
+            // No PARTITION BY ⇒ a single global ranking; same hazard as CompileTopK.
+            return null;
+        }
+
         var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Schema, rowType);
         var output = InvokePartitionedTopK(
-            ctx.Builder, rowType, inner.Stream, sortExtractors, descending, nullsFirst,
+            ctx.Builder, rowType, topKInput, sortExtractors, descending, nullsFirst,
             partitionExtractors, plan.Function, plan.Limit, snapshotCodec);
         return new TypedNode(rowType, inner.Schema, output);
     }
@@ -2370,6 +2411,47 @@ public static class TypedPlanCompiler
         var body = BuildStableRowHash(rowParam, rowType);
         var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
         return Expression.Lambda(delegateType, body, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds <c>(TRow r) =&gt; stableHash(key0(r), key1(r), …)</c> from a list of
+    /// resolved partition-key expressions (e.g. an <c>OVER (PARTITION BY …)</c>
+    /// key), each lowered over the emitted row and stable-hashed per column, folded
+    /// with <see cref="StableHash.Combine"/>. Returns <c>null</c> if any key is
+    /// outside the typed expression compiler or the stable-hash type surface — the
+    /// caller then refuses the parallel compile.
+    /// </summary>
+    private static Delegate? BuildExprListHashPartition(Type rowType, IReadOnlyList<ResolvedExpression> keys)
+    {
+        var rowParam = Expression.Parameter(rowType, "r");
+        var hashes = new Expression[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+        {
+            var body = TypedExpressionCompiler.TryBuildInto(keys[i], rowParam);
+            if (body is null) return null;
+            try
+            {
+                hashes[i] = BuildStableFieldHash(body, body.Type);
+            }
+            catch (NotSupportedException)
+            {
+                return null;
+            }
+        }
+
+        Expression combined;
+        if (hashes.Length == 1)
+        {
+            combined = hashes[0];
+        }
+        else
+        {
+            var combine = typeof(StableHash).GetMethod(nameof(StableHash.Combine), new[] { typeof(int[]) })!;
+            combined = Expression.Call(combine, Expression.NewArrayInit(typeof(int), hashes));
+        }
+
+        var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
+        return Expression.Lambda(delegateType, combined, rowParam).Compile();
     }
 
     /// <summary>

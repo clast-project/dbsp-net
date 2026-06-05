@@ -66,15 +66,23 @@ plan lives in `research/dbsp/performance_test.md`). Both systems run the
 same SQL over in-process generated data:
 
 ```
-# Nexmark throughput (q0–q4, q9): events, batch size, runs
-dotnet run --project src/DbspNet.Benchmarks -c Release -- nexmark 1000000 10000 3
+# Nexmark throughput (q0–q4, q9): events, batch size, runs, [workers]
+dotnet run --project src/DbspNet.Benchmarks -c Release -- nexmark 1000000 10000 3 8
 
-# Fraud detection rolling-window features: history txns, customers, batch
-dotnet run --project src/DbspNet.Benchmarks -c Release -- fraud 500000 10000 10000
+# Fraud detection rolling-window features: history txns, customers, batch, [workers]
+dotnet run --project src/DbspNet.Benchmarks -c Release -- fraud 500000 10000 10000 8
 
 # Both, with defaults, into docs/benchmarks-comparison.md
 dotnet run --project src/DbspNet.Benchmarks -c Release -- comparison
 ```
+
+The optional trailing `workers` arg (default: host core count) runs the
+data-parallel path (`ParallelCircuit`) alongside W=1 and reports the speedup —
+pin it to Feldera's worker count for an apples-to-apples comparison. Each
+parallel result is cross-checked against the W=1 replica run; queries with no
+correct parallel form (a global TOP-K, or the fraud window-aggregate feature
+view) are reported as *single-only*, and for fraud the parallelizable
+`transactions ⋈ customers` slice is measured instead.
 
 See [`docs/benchmarks-comparison.md`](docs/benchmarks-comparison.md) for the
 DbspNet-side numbers and the queries that do / don't yet compile.

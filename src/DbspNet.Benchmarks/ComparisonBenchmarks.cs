@@ -33,6 +33,11 @@ internal static class ComparisonBenchmarks
             $"`{System.Runtime.InteropServices.RuntimeInformation.OSDescription.Trim()}`.");
         output.AppendLine();
 
+        // W>1 measures the data-parallel path alongside W=1. Default to the host
+        // core count so the report is parallel-aware out of the box; pass an
+        // explicit value to pin Feldera's worker count.
+        var defaultWorkers = Environment.ProcessorCount;
+
         string defaultOut;
         switch (mode)
         {
@@ -41,7 +46,8 @@ internal static class ComparisonBenchmarks
                 var totalEvents = ArgInt(args, 1, 1_000_000);
                 var batchSize = ArgInt(args, 2, 10_000);
                 var runs = ArgInt(args, 3, 3);
-                NexmarkBenchmark.Run(output, totalEvents, batchSize, runs);
+                var workers = ArgInt(args, 4, defaultWorkers);
+                NexmarkBenchmark.Run(output, totalEvents, batchSize, runs, workers);
                 defaultOut = "benchmarks-nexmark.md";
                 break;
             }
@@ -51,15 +57,17 @@ internal static class ComparisonBenchmarks
                 var history = ArgInt(args, 1, 500_000);
                 var customers = ArgInt(args, 2, 10_000);
                 var batchSize = ArgInt(args, 3, 10_000);
-                FraudBenchmark.Run(output, history, customers, batchSize);
+                var workers = ArgInt(args, 4, defaultWorkers);
+                FraudBenchmark.Run(output, history, customers, batchSize, workers);
                 defaultOut = "benchmarks-fraud.md";
                 break;
             }
 
             default: // "comparison" — run both with defaults.
             {
-                NexmarkBenchmark.Run(output, totalEvents: 1_000_000, batchSize: 10_000, runs: 3);
-                FraudBenchmark.Run(output, historyTxns: 500_000, customers: 10_000, batchSize: 10_000);
+                var workers = ArgInt(args, 1, defaultWorkers);
+                NexmarkBenchmark.Run(output, totalEvents: 1_000_000, batchSize: 10_000, runs: 3, workers);
+                FraudBenchmark.Run(output, historyTxns: 500_000, customers: 10_000, batchSize: 10_000, workers);
                 defaultOut = "benchmarks-comparison.md";
                 break;
             }

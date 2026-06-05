@@ -50,10 +50,18 @@ internal static class FraudBenchmark
             SUM(t.amount)   OVER (PARTITION BY t.cust_id ORDER BY t.ts RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW) AS sum_30d
           FROM transactions t JOIN customers c ON t.cust_id = c.id";
 
-    public static void Run(StringBuilder output, int historyTxns, int customers, int batchSize)
+    // The join that feeds the window features — the parallelizable slice of the
+    // pipeline (the windowed aggregates themselves have no typed/parallel path).
+    private const string JoinSliceSql =
+        @"SELECT t.txn_id, t.cust_id, c.zip
+          FROM transactions t JOIN customers c ON t.cust_id = c.id";
+
+    public static void Run(StringBuilder output, int historyTxns, int customers, int batchSize, int workers = 1)
     {
+        workers = Math.Clamp(workers, 1, Environment.ProcessorCount);
         Console.WriteLine();
-        Console.WriteLine($"=== Fraud detection (customers={customers:N0}, history={historyTxns:N0}) ===");
+        Console.WriteLine(
+            $"=== Fraud detection (customers={customers:N0}, history={historyTxns:N0}, W={workers}) ===");
 
         output.AppendLine("## Fraud detection — rolling-window features");
         output.AppendLine();
@@ -136,6 +144,153 @@ internal static class FraudBenchmark
             "property that makes DBSP suitable for per-transaction fraud scoring. " +
             "Compare this against a from-scratch recompute of the same feature view.");
         output.AppendLine();
+
+        if (workers > 1)
+        {
+            RunParallelSection(output, custRows, historyTxns, customers, batchSize, workers);
+        }
+    }
+
+    /// <summary>
+    /// Data-parallel throughput for the fraud pipeline. The windowed feature view
+    /// itself has no typed/parallel path (window aggregates fall back to the
+    /// structural compile, which the parallel driver does not run), so we report
+    /// that honestly and instead measure the **parallelizable slice** — the
+    /// <c>transactions ⋈ customers</c> join that feeds the window features — at
+    /// W=1 vs W, cross-checking the W-output against the W=1 replica run.
+    /// </summary>
+    private static void RunParallelSection(
+        StringBuilder output, List<(object?[], long)> custRows,
+        int historyTxns, int customers, int batchSize, int workers)
+    {
+        Console.WriteLine($"  -- parallel (W={workers}) --");
+        output.AppendLine("### Parallel scaling");
+        output.AppendLine();
+
+        var featureSupported = TypedPlanCompiler.TryCompileParallel(
+            BuildPlan(Ddl, FeatureSql), workers, out var featureProbe);
+        featureProbe?.Dispose();
+
+        output.AppendLine(
+            "The full rolling-window feature view " +
+            (featureSupported
+                ? "compiles to a parallel circuit."
+                : "**does not** have a data-parallel form yet: its `RANGE … INTERVAL` " +
+                  "window aggregates compile through the structural path, which the " +
+                  "`ParallelCircuit` driver (typed pipeline only) does not run. The " +
+                  "join that feeds them does parallelize, so the table below measures " +
+                  "that slice — `transactions ⋈ customers` — as the throughput a " +
+                  "parallel window-aggregate path would build on.") +
+            " W>1 output is cross-checked against the W=1 replica run.");
+        output.AppendLine();
+
+        var plan = BuildPlan(Ddl, JoinSliceSql);
+        if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var sliceProbe))
+        {
+            output.AppendLine("> The join slice has no parallel plan on this build — skipped.");
+            output.AppendLine();
+            return;
+        }
+
+        sliceProbe!.Dispose();
+
+        output.AppendLine($"Join slice `{JoinSliceSql.Replace("\n", " ").Trim()}`:");
+        output.AppendLine();
+        output.AppendLine($"| History txns | W=1 (events/s) | W={workers} (events/s) | Speedup | Status |");
+        output.AppendLine("|-------------:|---------------:|---------------:|--------:|:-------|");
+
+        foreach (var hist in HistorySizes(historyTxns))
+        {
+            var txnRows = BuildTransactions(hist, customers, seed: 7);
+
+            var reference = RunJoinSliceParallel(plan, 1, custRows, txnRows, batchSize, out var single);
+            var output1 = RunJoinSliceParallel(plan, workers, custRows, txnRows, batchSize, out var par);
+            var correct = SameMultiset(reference, output1);
+
+            var speedup = single > 0 ? par / single : 0.0;
+            var status = correct ? "ok" : "**PARALLEL MISMATCH**";
+            Console.WriteLine(
+                $"  history={hist,8:N0}  W1={single,12:N0}  W{workers}={par,12:N0} events/s  " +
+                $"{BenchmarkHarness.FormatRatio(speedup)}  {(correct ? "ok" : "MISMATCH")}");
+            output.AppendLine(
+                $"| {hist:N0} | {single:N0} | {par:N0} | {BenchmarkHarness.FormatRatio(speedup).Trim()} | {status} |");
+        }
+
+        output.AppendLine();
+    }
+
+    /// <summary>
+    /// Streams <paramref name="txnRows"/> in micro-batches through a fresh W-worker
+    /// parallel circuit (customers loaded once first), returns the final
+    /// materialized output and the throughput via <paramref name="eventsPerSec"/>.
+    /// </summary>
+    private static Dictionary<string, long> RunJoinSliceParallel(
+        LogicalPlan plan, int workers, List<(object?[], long)> custRows,
+        List<(object?[], long)> txnRows, int batchSize, out double eventsPerSec)
+    {
+        if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q))
+        {
+            throw new InvalidOperationException("join-slice parallel compile unexpectedly failed");
+        }
+
+        using (q)
+        {
+            q!.Table("customers").Push(custRows);
+            q.Step();
+
+            var sw = Stopwatch.StartNew();
+            var batch = new List<(object?[], long)>(batchSize);
+            foreach (var row in txnRows)
+            {
+                batch.Add(row);
+                if (batch.Count >= batchSize)
+                {
+                    q.Table("transactions").Push(batch);
+                    q.Step();
+                    batch.Clear();
+                }
+            }
+
+            if (batch.Count > 0)
+            {
+                q.Table("transactions").Push(batch);
+                q.Step();
+            }
+
+            sw.Stop();
+            eventsPerSec = txnRows.Count / sw.Elapsed.TotalSeconds;
+
+            var map = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var (values, weight) in q.Current)
+            {
+                var key = string.Join("", values.Select(v => v?.ToString() ?? " "));
+                map[key] = map.GetValueOrDefault(key) + weight;
+                if (map[key] == 0)
+                {
+                    map.Remove(key);
+                }
+            }
+
+            return map;
+        }
+    }
+
+    private static bool SameMultiset(Dictionary<string, long> a, Dictionary<string, long> b)
+    {
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+
+        foreach (var (k, v) in a)
+        {
+            if (!b.TryGetValue(k, out var bv) || bv != v)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static double MeasureThroughput(
@@ -238,7 +393,10 @@ internal static class FraudBenchmark
         public long NextTs { get; set; } = nextTs;
     }
 
-    private static CompiledQuery Compile(string[] ddl, string sql)
+    private static CompiledQuery Compile(string[] ddl, string sql) =>
+        PlanToCircuit.Compile(BuildPlan(ddl, sql));
+
+    private static LogicalPlan BuildPlan(string[] ddl, string sql)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
@@ -248,6 +406,6 @@ internal static class FraudBenchmark
         }
 
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
-        return PlanToCircuit.Compile(PlanOptimizer.Optimize(plan));
+        return PlanOptimizer.Optimize(plan);
     }
 }
