@@ -65,28 +65,8 @@ public sealed class TypedCompiledQuery
     /// matching the input shape passed to
     /// <see cref="TypedTableInput.Insert"/>.
     /// </summary>
-    public IEnumerable<(object?[] Values, long Weight)> Current
-    {
-        get
-        {
-            // The closure captures the output handle; the reader
-            // produces (boxed-typed-row, weight) pairs which we
-            // decode to object?[] via the cached field getters.
-            var getters = TypedRowEmitter.BuildFieldGetters(OutputSchema)
-                ?? throw new InvalidOperationException("output schema unexpectedly unsupported by TypedRowEmitter");
-
-            foreach (var kv in CurrentBoxed())
-            {
-                var values = new object?[OutputSchema.Count];
-                for (var i = 0; i < OutputSchema.Count; i++)
-                {
-                    values[i] = getters[i](kv.Key);
-                }
-
-                yield return (values, kv.Value.Value);
-            }
-        }
-    }
+    public IEnumerable<(object?[] Values, long Weight)> Current =>
+        TypedOutputDecoder.Decode(OutputSchema, _currentZSetGetter, _currentReader);
 
     /// <summary>
     /// Look up the weight of a specific row in the current output. As
@@ -95,17 +75,16 @@ public sealed class TypedCompiledQuery
     /// </summary>
     public Z64 WeightOf(params object?[] values) =>
         _outputWeightOf(BoundaryEncoder.Encode(OutputSchema, values));
-
-    private IEnumerable<KeyValuePair<object, Z64>> CurrentBoxed() =>
-        _currentReader(_currentZSetGetter());
 }
 
 /// <summary>
-/// Typed-row variant of <see cref="TableInput"/>. Wraps an
-/// <see cref="InputHandle{ZSet{TEmitted, Z64}}"/> closed over the
-/// emitted row type. Insert / Delete / Push at the boundary take
+/// Typed-row variant of <see cref="TableInput"/>. Wraps a handle whose
+/// <c>Push(ZSet&lt;TEmitted, Z64&gt;)</c> accepts the emitted row type — either an
+/// <see cref="InputHandle{T}"/> (single circuit) or a
+/// <see cref="ShardedInputHandle{TKey,TWeight}"/> (parallel circuit), which share
+/// that signature. Insert / Delete / Push at the boundary take
 /// <c>object?[]</c>; internally the typed row struct is constructed
-/// once per row and pushed through the typed input handle.
+/// once per row and pushed through the handle.
 /// </summary>
 public sealed class TypedTableInput
 {
@@ -185,8 +164,9 @@ public sealed class TypedTableInput
         var singletonClosed = singletonOpen.MakeGenericMethod(rowType, typeof(Z64));
 
         var zsetType = typeof(ZSet<,>).MakeGenericType(rowType, typeof(Z64));
-        var handleType = typeof(InputHandle<>).MakeGenericType(zsetType);
-        var pushMethod = handleType.GetMethod(nameof(InputHandle<int>.Push))!;
+        // Bind against the handle's runtime type, not InputHandle specifically, so
+        // a ShardedInputHandle (same Push(ZSet) signature) works unchanged.
+        var pushMethod = handle.GetType().GetMethod("Push", [zsetType])!;
 
         var boxedRowParam = Expression.Parameter(typeof(object), "boxed");
         var castRow = Expression.Convert(boxedRowParam, rowType);
@@ -209,8 +189,8 @@ public sealed class TypedTableInput
         var addMethod = builderType.GetMethod(nameof(ZSetBuilder<int, Z64>.Add), [rowType, typeof(Z64)])!;
         var buildMethod = builderType.GetMethod(nameof(ZSetBuilder<int, Z64>.Build))!;
         var z64Ctor = typeof(Z64).GetConstructor([typeof(long)])!;
-        var handleType = typeof(InputHandle<>).MakeGenericType(zsetType);
-        var pushMethod = handleType.GetMethod(nameof(InputHandle<int>.Push))!;
+        // Bind against the handle's runtime type (InputHandle or ShardedInputHandle).
+        var pushMethod = handle.GetType().GetMethod("Push", [zsetType])!;
 
         // (rows) => {
         //   var b = new ZSetBuilder<TRow, Z64>();

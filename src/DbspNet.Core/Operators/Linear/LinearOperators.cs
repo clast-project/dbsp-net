@@ -29,6 +29,20 @@ public static class LinearOperators
     }
 
     /// <summary>
+    /// As <see cref="ZSetInput{TRow,TWeight}(CircuitBuilder)"/>, but registers the
+    /// input under a logical <paramref name="name"/> so a
+    /// <see cref="ParallelCircuit"/> can shard it across workers by name.
+    /// </summary>
+    public static (InputHandle<ZSet<TRow, TWeight>> Handle, Stream<ZSet<TRow, TWeight>> Stream) ZSetInput<TRow, TWeight>(
+        this CircuitBuilder builder, string name)
+        where TRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        return builder.Input(ZSet<TRow, TWeight>.Empty, (a, b) => a + b, name);
+    }
+
+    /// <summary>
     /// Pointwise row transform. Rows that map to the same target accumulate
     /// weights in the output.
     /// </summary>

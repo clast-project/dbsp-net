@@ -73,6 +73,72 @@ public static class TypedPlanCompiler
         }
     }
 
+    /// <summary>The logical name the single query output is registered under in parallel mode.</summary>
+    private const string OutputPortName = "$result";
+
+    /// <summary>
+    /// Data-parallel variant of <see cref="TryCompile"/>: compiles
+    /// <paramref name="plan"/> into <paramref name="workers"/> identical circuit
+    /// replicas driven by a <see cref="ParallelCircuit"/>, inserting an
+    /// <c>exchange</c> before each key-sensitive operator so the result is
+    /// independent of <paramref name="workers"/>. The same plan-shape support and
+    /// fallback contract as <see cref="TryCompile"/>: returns <c>false</c> for any
+    /// plan outside the typed pipeline. The caller owns the returned query and
+    /// must dispose it (it holds the replica worker threads).
+    /// </summary>
+    public static bool TryCompileParallel(LogicalPlan plan, int workers, out ParallelTypedCompiledQuery? compiled)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
+        compiled = null;
+
+        // Shared across replicas; CompileScan fills it idempotently (the row
+        // types/schemas are replica-independent — same schema fingerprint).
+        var meta = new Dictionary<string, ParallelInputMeta>(StringComparer.Ordinal);
+        TypedNode? topNode = null;
+
+        ParallelCircuit? circuit = null;
+        try
+        {
+            circuit = ParallelCircuit.Build(workers, builder =>
+            {
+                var ctx = new CompileContext(builder, meta, workers);
+                var top = TryCompileNode(plan, ctx) ?? throw new UnsupportedPlanException();
+                InvokeNamedOutput(builder, top.RowType, top.Stream, OutputPortName);
+                topNode = top;
+            });
+
+            var outputRowType = topNode!.RowType;
+            var outputSchema = topNode.Schema;
+
+            // One sharded input per table, reusing the handle-agnostic
+            // TypedTableInput. Input sharding is arbitrary (a downstream exchange
+            // re-shards by op key), so split by whole-row hash for balance.
+            var inputs = new Dictionary<string, TypedTableInput>(StringComparer.Ordinal);
+            foreach (var (tableName, m) in meta)
+            {
+                var shardedInput = InvokeShardedInput(
+                    circuit, m.RowType, tableName, BuildRowHashPartition(m.RowType));
+                inputs[tableName] = new TypedTableInput(m.Schema, m.RowType, m.Factory, shardedInput);
+            }
+
+            var shardedOutput = InvokeShardedOutput(circuit, outputRowType, OutputPortName);
+            var currentGetter = BuildShardedCurrentZSetGetter(outputRowType, shardedOutput);
+            var currentReader = BuildBoxedEntriesReader(outputRowType);
+            var factory = TypedRowEmitter.BuildBoxedFactory(outputSchema)!;
+            var weightOf = BuildWeightOf(outputRowType, factory, currentGetter);
+
+            compiled = new ParallelTypedCompiledQuery(
+                circuit, inputs, outputSchema, outputRowType, currentGetter, currentReader, weightOf);
+            return true;
+        }
+        catch (UnsupportedPlanException)
+        {
+            circuit?.Dispose();
+            return false;
+        }
+    }
+
     /// <summary>
     /// One node's compiled output: the closed CLR type of rows on the
     /// stream, the SQL schema of that row, and the (boxed) typed
@@ -173,6 +239,21 @@ public static class TypedPlanCompiler
         /// </summary>
         public CompileOptions Options { get; }
 
+        /// <summary>
+        /// Replica count when compiling for a <see cref="ParallelCircuit"/>; 1 for
+        /// a single circuit. When &gt; 1 the lowering emits an <c>exchange</c>
+        /// before each key-sensitive operator (join / aggregate / distinct).
+        /// </summary>
+        public int Workers { get; }
+
+        /// <summary>
+        /// In parallel standalone mode, collects per-table metadata (schema, row
+        /// type, boxed factory) as scans are compiled, so the caller can build a
+        /// sharded input per table after the replicas are built. <c>null</c>
+        /// otherwise; its presence also marks "name the input/output ports".
+        /// </summary>
+        public Dictionary<string, ParallelInputMeta>? ParallelInputs { get; }
+
         public CompileContext(CircuitBuilder builder, Dictionary<string, TypedTableInput> inputs)
         {
             Builder = builder;
@@ -180,6 +261,7 @@ public static class TypedPlanCompiler
             StructuralScans = null;
             SnapshotCodecs = null;
             Options = CompileOptions.Default;
+            Workers = 1;
         }
 
         public CompileContext(
@@ -193,8 +275,28 @@ public static class TypedPlanCompiler
             StructuralScans = structuralScans;
             SnapshotCodecs = snapshotCodecs;
             Options = options;
+            Workers = 1;
+        }
+
+        public CompileContext(
+            CircuitBuilder builder, Dictionary<string, ParallelInputMeta> parallelInputs, int workers)
+        {
+            Builder = builder;
+            Inputs = null;
+            ParallelInputs = parallelInputs;
+            StructuralScans = null;
+            SnapshotCodecs = null;
+            Options = CompileOptions.Default;
+            Workers = workers;
         }
     }
+
+    /// <summary>
+    /// Per-table metadata captured during a parallel compile so the
+    /// caller can build a <see cref="ShardedInputHandle{TKey,TWeight}"/>-backed
+    /// <see cref="TypedTableInput"/> once the replicas exist.
+    /// </summary>
+    internal sealed record ParallelInputMeta(Schema Schema, Type RowType, Func<object?[], object> Factory);
 
     private sealed class UnsupportedPlanException : Exception;
 
@@ -274,6 +376,20 @@ public static class TypedPlanCompiler
         }
 
         var factory = TypedRowEmitter.BuildBoxedFactory(scan.Schema)!;
+
+        if (ctx.ParallelInputs is not null)
+        {
+            // Parallel build: name the input port (so the caller can reach every
+            // replica's copy via ShardedInput) and record the metadata needed to
+            // build the sharded input after the replicas exist. The per-replica
+            // handle itself is reached by name, not captured here.
+            var (_, parallelStream) = InvokeZSetInput(ctx.Builder, rowType, scan.TableName);
+            ctx.ParallelInputs[scan.TableName] = new ParallelInputMeta(scan.Schema, rowType, factory);
+            var parallelNode = new TypedNode(rowType, scan.Schema, parallelStream);
+            ctx.LiftedScanCache[scan.TableName] = parallelNode;
+            return parallelNode;
+        }
+
         var (handle, stream) = InvokeZSetInput(ctx.Builder, rowType);
         ctx.Inputs![scan.TableName] = new TypedTableInput(scan.Schema, rowType, factory, handle);
         var standaloneNode = new TypedNode(rowType, scan.Schema, stream);
@@ -520,10 +636,25 @@ public static class TypedPlanCompiler
             keyRowType, left.RowType, right.RowType, outputRowType,
             outputSchema, left.Schema.Count, right.Schema.Count);
 
+        // Parallel: re-shard both sides by the join key so matching rows
+        // co-locate on one worker before the (local) join. Both sides hash the
+        // same key type, so equal keys land on the same worker. No-op for W=1.
+        var leftStream = left.Stream;
+        var rightStream = right.Stream;
+        if (ctx.Workers > 1)
+        {
+            leftStream = InvokeExchange(
+                ctx.Builder, left.RowType, leftStream,
+                BuildKeyHashPartition(left.RowType, keyRowType, leftKeyExtractor));
+            rightStream = InvokeExchange(
+                ctx.Builder, right.RowType, rightStream,
+                BuildKeyHashPartition(right.RowType, keyRowType, rightKeyExtractor));
+        }
+
         var leftIndexed = InvokeGroupProject(
-            ctx.Builder, left.RowType, keyRowType, left.Stream, leftKeyExtractor);
+            ctx.Builder, left.RowType, keyRowType, leftStream, leftKeyExtractor);
         var rightIndexed = InvokeGroupProject(
-            ctx.Builder, right.RowType, keyRowType, right.Stream, rightKeyExtractor);
+            ctx.Builder, right.RowType, keyRowType, rightStream, rightKeyExtractor);
 
         var leftSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, left.Schema, keyRowType, left.RowType);
@@ -874,7 +1005,16 @@ public static class TypedPlanCompiler
         var snapshotCodec = BuildAdaptedZSetCodec(
             ctx.SnapshotCodecs, plan.Schema, inner.RowType);
 
-        var output = EmitDistinct(ctx, inner.RowType, inner.Stream, snapshotCodec);
+        // Parallel: re-shard by the whole row (DISTINCT's key) so identical rows
+        // co-locate and dedup on one worker; the gather unions disjoint rows.
+        var distinctStream = inner.Stream;
+        if (ctx.Workers > 1)
+        {
+            distinctStream = InvokeExchange(
+                ctx.Builder, inner.RowType, distinctStream, BuildRowHashPartition(inner.RowType));
+        }
+
+        var output = EmitDistinct(ctx, inner.RowType, distinctStream, snapshotCodec);
         return new TypedNode(inner.RowType, plan.Schema, output);
     }
 
@@ -1061,9 +1201,20 @@ public static class TypedPlanCompiler
         var compositeClosed = compositeOpen.MakeGenericType(inner.RowType, aggRowType);
         var composite = Activator.CreateInstance(compositeClosed, aggArray, typedPack)!;
 
+        // Parallel: re-shard by the group key so every row of a group co-locates
+        // on one worker — that worker then computes the group's complete
+        // aggregate, and the gather just unions the disjoint groups. No-op for W=1.
+        var groupedStream = inner.Stream;
+        if (ctx.Workers > 1)
+        {
+            groupedStream = InvokeExchange(
+                ctx.Builder, inner.RowType, groupedStream,
+                BuildKeyHashPartition(inner.RowType, keyRowType, keyExtractor));
+        }
+
         // GroupProject<TKey, TIn, TIn, Z64>(inner, keyExtractor, identity)
         var indexed = InvokeGroupProject(
-            ctx.Builder, inner.RowType, keyRowType, inner.Stream, keyExtractor);
+            ctx.Builder, inner.RowType, keyRowType, groupedStream, keyExtractor);
 
         // IncrementalAggregate<TKey, TIn, TAgg>(indexed, composite)
         // Output: Stream<ZSet<(TKey, TAgg), Z64>>
@@ -2135,17 +2286,72 @@ public static class TypedPlanCompiler
     // ---- Reflection-built generic calls ----
 
     /// <summary>builder.ZSetInput&lt;TRow, Z64&gt;()</summary>
-    private static (object Handle, object Stream) InvokeZSetInput(CircuitBuilder builder, Type rowType)
+    private static (object Handle, object Stream) InvokeZSetInput(
+        CircuitBuilder builder, Type rowType, string? name = null)
     {
+        // ZSetInput has two generic overloads (with/without a name); select by
+        // parameter count so adding the named one didn't make this ambiguous.
+        var paramCount = name is null ? 1 : 2;
         var openMethod = typeof(LinearOperators)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
-            .Single(m => m.Name == nameof(LinearOperators.ZSetInput) && m.IsGenericMethodDefinition);
+            .Single(m => m.Name == nameof(LinearOperators.ZSetInput)
+                && m.IsGenericMethodDefinition
+                && m.GetParameters().Length == paramCount);
         var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
-        var tuple = closed.Invoke(null, new object[] { builder })!;
+        var args = name is null ? new object[] { builder } : new object[] { builder, name };
+        var tuple = closed.Invoke(null, args)!;
         var tupleType = tuple.GetType();
         var item1 = tupleType.GetField("Item1")!.GetValue(tuple)!;
         var item2 = tupleType.GetField("Item2")!.GetValue(tuple)!;
         return (item1, item2);
+    }
+
+    /// <summary>
+    /// <c>builder.Exchange&lt;TRow, Z64&gt;(stream, partition)</c> — re-shards the
+    /// row stream so rows with the same key co-locate on one worker. A no-op
+    /// (returns the stream unchanged) unless the circuit is a parallel one.
+    /// </summary>
+    private static object InvokeExchange(
+        CircuitBuilder builder, Type rowType, object stream, Delegate partition)
+    {
+        var openMethod = typeof(CircuitBuilder)
+            .GetMethods()
+            .Single(m => m.Name == nameof(CircuitBuilder.Exchange) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(rowType, typeof(Z64));
+        return closed.Invoke(builder, new[] { stream, partition })!;
+    }
+
+    /// <summary>
+    /// Builds the exchange partition <c>(TRow r) =&gt; keyExtractor(r).GetHashCode()</c>
+    /// over an emitted key type — co-locating rows whose key columns are equal.
+    /// </summary>
+    /// <remarks>
+    /// Process-local hashing: correct for parallel execution within one run (every
+    /// replica is in the same process, so equal keys hash identically). Cross-
+    /// process-stable partitioning (required once snapshots/recovery land) is a
+    /// later concern — swap this and <see cref="BuildRowHashPartition"/> to a
+    /// <see cref="StableHash"/>-based projection then. Isolated here for that swap.
+    /// </remarks>
+    private static Delegate BuildKeyHashPartition(Type rowType, Type keyRowType, Delegate keyExtractor)
+    {
+        var rowParam = Expression.Parameter(rowType, "r");
+        var key = Expression.Invoke(Expression.Constant(keyExtractor), rowParam);
+        var hash = Expression.Call(key, keyRowType.GetMethod(nameof(object.GetHashCode), Type.EmptyTypes)!);
+        var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
+        return Expression.Lambda(delegateType, hash, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds the whole-row exchange partition <c>(TRow r) =&gt; r.GetHashCode()</c>,
+    /// used by DISTINCT (the entire row is the key). See
+    /// <see cref="BuildKeyHashPartition"/> on hashing stability.
+    /// </summary>
+    private static Delegate BuildRowHashPartition(Type rowType)
+    {
+        var rowParam = Expression.Parameter(rowType, "r");
+        var hash = Expression.Call(rowParam, rowType.GetMethod(nameof(object.GetHashCode), Type.EmptyTypes)!);
+        var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
+        return Expression.Lambda(delegateType, hash, rowParam).Compile();
     }
 
     /// <summary><c>builder.Filter&lt;TRow, Z64&gt;(stream, predicate)</c>.</summary>
@@ -2597,6 +2803,48 @@ public static class TypedPlanCompiler
                 && m.GetParameters().Length == 1);
         var closed = outputOpenMethod.MakeGenericMethod(zsetType);
         return closed.Invoke(builder, new[] { stream })!;
+    }
+
+    /// <summary><c>builder.Output&lt;ZSet&lt;TRow, Z64&gt;&gt;(stream, name)</c> — the named overload.</summary>
+    private static object InvokeNamedOutput(CircuitBuilder builder, Type rowType, object stream, string name)
+    {
+        var zsetType = typeof(ZSet<,>).MakeGenericType(rowType, typeof(Z64));
+        var outputOpenMethod = typeof(CircuitBuilder).GetMethods()
+            .Single(m => m.Name == nameof(CircuitBuilder.Output)
+                && m.IsGenericMethodDefinition
+                && m.GetParameters().Length == 2);
+        var closed = outputOpenMethod.MakeGenericMethod(zsetType);
+        return closed.Invoke(builder, new[] { stream, (object)name })!;
+    }
+
+    /// <summary><c>circuit.ShardedInput&lt;TRow, Z64&gt;(name, partition)</c>.</summary>
+    private static object InvokeShardedInput(
+        ParallelCircuit circuit, Type rowType, string name, Delegate partition)
+    {
+        var open = typeof(ParallelCircuit).GetMethods()
+            .Single(m => m.Name == nameof(ParallelCircuit.ShardedInput) && m.IsGenericMethodDefinition);
+        var closed = open.MakeGenericMethod(rowType, typeof(Z64));
+        return closed.Invoke(circuit, new object[] { name, partition })!;
+    }
+
+    /// <summary><c>circuit.ShardedOutput&lt;TRow, Z64&gt;(name)</c>.</summary>
+    private static object InvokeShardedOutput(ParallelCircuit circuit, Type rowType, string name)
+    {
+        var open = typeof(ParallelCircuit).GetMethods()
+            .Single(m => m.Name == nameof(ParallelCircuit.ShardedOutput) && m.IsGenericMethodDefinition);
+        var closed = open.MakeGenericMethod(rowType, typeof(Z64));
+        return closed.Invoke(circuit, new object[] { name })!;
+    }
+
+    /// <summary>Reads <c>ShardedOutputHandle&lt;TRow, Z64&gt;.Current</c> (the gathered Z-set), boxed.</summary>
+    private static Func<object> BuildShardedCurrentZSetGetter(Type rowType, object shardedOutput)
+    {
+        var handleType = typeof(ShardedOutputHandle<,>).MakeGenericType(rowType, typeof(Z64));
+        var currentProp = handleType.GetProperty(nameof(ShardedOutputHandle<int, Z64>.Current))!;
+        var getCurrent = currentProp.GetGetMethod()!;
+        var call = Expression.Call(Expression.Constant(shardedOutput), getCurrent);
+        var boxed = Expression.Convert(call, typeof(object));
+        return Expression.Lambda<Func<object>>(boxed).Compile();
     }
 
     private static Func<object> BuildCurrentZSetGetter(Type rowType, object outputHandle)
