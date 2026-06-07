@@ -1,0 +1,105 @@
+diff --git a/crates/nexmark/benches/nexmark/main.rs b/crates/nexmark/benches/nexmark/main.rs
+index 7fe61901b..7ce16929d 100644
+--- a/crates/nexmark/benches/nexmark/main.rs
++++ b/crates/nexmark/benches/nexmark/main.rs
+@@ -89,6 +89,7 @@ fn spawn_source_producer(
+     step_do_rx: mpsc::Receiver<()>,
+     step_done_tx: mpsc::SyncSender<usize>,
+     source_exhausted_tx: mpsc::SyncSender<InputStats>,
++    gen_done_tx: mpsc::SyncSender<()>,
+ ) {
+     thread::Builder::new()
+         .name("benchmark producer".into())
+@@ -97,18 +98,61 @@ fn spawn_source_producer(
+             let mut source = NexmarkSource::new(nexmark_config.generator_options);
+             let mut num_events: u64 = 0;
+ 
++            // LOCAL PATCH (engine-only comparison vs DbspNet): when NEXMARK_PREGEN
++            // is set, generate the ENTIRE stream up front, before signaling
++            // `gen_done` (and therefore before the caller starts the timer). The
++            // timed window then measures append + step only — compute, not event
++            // generation — to match DbspNet's pre-generated Nexmark harness.
++            // Unset (default) preserves upstream behavior: generation is inline in
++            // the timed loop and `gen_done` fires immediately. Revert with
++            // `git checkout crates/nexmark/benches/nexmark/main.rs`.
++            let pregen = std::env::var("NEXMARK_PREGEN").map(|v| v != "0").unwrap_or(false);
++            let mut prebuilt: Option<std::vec::IntoIter<Vec<Tup2<Event, ZWeight>>>> = None;
++            if pregen {
++                let mut batches: Vec<Vec<Tup2<Event, ZWeight>>> = Vec::new();
++                loop {
++                    let mut events: Vec<Tup2<Event, ZWeight>> = Vec::with_capacity(batch_size);
++                    let mut batch_count = 0;
++                    for event in &mut source {
++                        events.push(Tup2(event, 1));
++                        batch_count += 1;
++                        if batch_count == batch_size {
++                            break;
++                        }
++                    }
++                    let is_last = batch_count < batch_size;
++                    batches.push(events);
++                    if is_last {
++                        break;
++                    }
++                }
++                prebuilt = Some(batches.into_iter());
++            }
++
++            // Signal that any pre-generation is complete; the caller starts the
++            // timer after receiving this. With NEXMARK_PREGEN unset this is a no-op
++            // barrier (fires immediately, upstream timing preserved).
++            gen_done_tx.send(()).unwrap();
++
+             // Start iterating by loading up the first batch of input ready for processing,
+             // then waiting for further instructions.
+             let last_batch_count = loop {
+-                let mut events: Vec<Tup2<Event, ZWeight>> = Vec::with_capacity(batch_size);
+-                let mut batch_count = 0;
+-                for event in &mut source {
+-                    events.push(Tup2(event, 1));
+-                    batch_count += 1;
+-                    if batch_count == batch_size {
+-                        break;
++                // Pre-generated: pop a ready batch (no work). Otherwise: generate now.
++                let mut events: Vec<Tup2<Event, ZWeight>> = if let Some(it) = prebuilt.as_mut() {
++                    it.next().unwrap_or_default()
++                } else {
++                    let mut events: Vec<Tup2<Event, ZWeight>> = Vec::with_capacity(batch_size);
++                    let mut batch_count = 0;
++                    for event in &mut source {
++                        events.push(Tup2(event, 1));
++                        batch_count += 1;
++                        if batch_count == batch_size {
++                            break;
++                        }
+                     }
+-                }
++                    events
++                };
++                let batch_count = events.len();
+                 input_handle.append(&mut events);
+                 num_events += batch_count as u64;
+ 
+@@ -282,14 +326,22 @@ fn run_query(config: &NexmarkConfig, query: Query) -> NexmarkResult {
+     let (source_step_tx, source_step_rx): (mpsc::SyncSender<()>, mpsc::Receiver<()>) =
+         mpsc::sync_channel(1);
+     let (source_exhausted_tx, source_exhausted_rx) = mpsc::sync_channel(1);
++    // LOCAL PATCH: barrier so the timer starts only after the producer finishes any
++    // up-front event generation (NEXMARK_PREGEN). Unset => fires immediately.
++    let (gen_done_tx, gen_done_rx) = mpsc::sync_channel(1);
+     spawn_source_producer(
+         config.clone(),
+         input_handle,
+         source_step_rx,
+         source_step_done_tx,
+         source_exhausted_tx,
++        gen_done_tx,
+     );
+ 
++    // Wait for pre-generation (if any) to complete before timing, so the measured
++    // window is compute-only when NEXMARK_PREGEN is set.
++    gen_done_rx.recv().unwrap();
++
+     ALLOC.reset_stats();
+     let before_stats = ALLOC.stats();
+     let start = Instant::now();

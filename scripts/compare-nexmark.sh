@@ -16,18 +16,23 @@
 # Env overrides (same names, upper-case): EVENTS, CORES, BATCH, RUNS, GENERATORS,
 #   QUERIES, FELDERA_DIR
 #
-# IMPORTANT — the two harnesses do NOT measure the same thing, so read the ratio
-# with care:
+# METHODOLOGY — both sides measure engine compute only (apples-to-apples):
 #   * DbspNet pre-generates the whole event stream, then times push + Step() only.
-#   * Feldera's bench generates events *inside* the timed window (a streaming
-#     pipeline), so its elapsed includes event generation overlapped with compute.
-#     With too few generator threads it becomes generation-bound and understates
-#     the engine — hence --generators defaults to the core count here. It is still
-#     a pipeline number: fairest for compute-heavy queries (q4, q9); for light
-#     queries (q0-q2) Feldera's figure still carries generation overhead.
-#   * Small --events understates Feldera (per-query DBSP runtime setup/teardown is
-#     amortized over the stream; Feldera's published runs use 100M events). Raise
-#     --events for a steadier read, and cross-check Feldera's published numbers.
+#   * Feldera's bench is run with NEXMARK_PREGEN=1, which (via a local patch to
+#     crates/nexmark/benches/nexmark/main.rs) generates the whole stream before the
+#     timer too, so its elapsed is append + step only. Without that patch the var
+#     is ignored and the run reverts to the upstream generation+compute pipeline,
+#     which understates the engine (the table would then over-credit DbspNet).
+#   * Neither side times circuit construction. DbspNet's push also pays a boundary
+#     encode (object[] -> typed row) that Feldera's native-struct append skips, so
+#     if anything DbspNet's ingest is mildly penalized, not flattered.
+#   * Small --events still understates Feldera a little (per-query DBSP setup is
+#     amortized over the stream); raise --events for a steadier read.
+#
+# Feldera patch: the engine-only mode needs scripts/feldera-nexmark-pregen.patch
+# applied to the Feldera checkout (NEXMARK_PREGEN gate). The script warns and tells
+# you how to `git apply` it if it's missing. Without it, the run is the upstream
+# generation+compute pipeline and DbspNet looks ~2x better than it is.
 #
 # Other notes:
 #   * The first Feldera run compiles the DBSP workspace in release — minutes.
@@ -94,10 +99,24 @@ fi
 if [ "$DBSP_ONLY" -eq 0 ]; then
   echo "-- Feldera (cargo bench dbsp_nexmark, --cpu-cores $CORES) ---------------------"
   echo "   (first build compiles the DBSP workspace in release — may take minutes)"
+  # The engine-only comparison needs the local pregen patch (see
+  # scripts/feldera-nexmark-pregen.patch). Warn loudly if it's missing — without
+  # it Feldera measures generation+compute and the table over-credits DbspNet.
+  FELDERA_BENCH="$FELDERA_DIR/crates/nexmark/benches/nexmark/main.rs"
+  if ! grep -q NEXMARK_PREGEN "$FELDERA_BENCH" 2>/dev/null; then
+    echo "!! Feldera bench is NOT patched for engine-only timing (NEXMARK_PREGEN)."
+    echo "   Apply: (cd \"$FELDERA_DIR\" && git apply \"$REPO/scripts/feldera-nexmark-pregen.patch\")"
+    echo "   Revert: (cd \"$FELDERA_DIR\" && git checkout crates/nexmark/benches/nexmark/main.rs)"
+    echo "   Continuing — but Feldera's numbers will include event generation."
+  fi
   rm -f "$FELDERA_CSV"
   qargs=()
   for q in $QUERIES; do qargs+=(--query "$q"); done
-  ( cd "$FELDERA_DIR" && cargo bench -p dbsp_nexmark --bench nexmark -- \
+  # NEXMARK_PREGEN=1 makes the patched bench generate the whole stream before the
+  # timer (engine-only), matching DbspNet's pre-generated harness. Requires the
+  # local patch to crates/nexmark/benches/nexmark/main.rs; without it the var is
+  # ignored and the run is the upstream generation+compute pipeline.
+  ( cd "$FELDERA_DIR" && NEXMARK_PREGEN=1 cargo bench -p dbsp_nexmark --bench nexmark -- \
       --max-events="$EVENTS" \
       --cpu-cores "$CORES" \
       --input-batch-size "$BATCH" \
@@ -174,12 +193,9 @@ if not have_feld:
     print("\n(Feldera side skipped — --dbsp-only or repo not found.)")
 else:
     print(f"\nW={cores}/Feldera = DbspNet W={cores} ÷ Feldera at {cores} cores (>1.0x = DbspNet faster).")
-    print("\nCAVEAT — different harnesses, read with care:")
-    print("  * DbspNet times push+Step() over a PRE-GENERATED stream; Feldera times")
-    print("    event generation + compute together (a streaming pipeline).")
-    print("  * So the ratio is fairest for compute-heavy queries (q4, q9). For light")
-    print("    queries (q0-q2) Feldera's figure still carries event-generation cost and")
-    print(f"    understates its engine. Small --events ({events}) also understates Feldera")
-    print("    (per-query DBSP setup isn't amortized); raise --events and cross-check")
-    print("    Feldera's published Nexmark numbers for an absolute read.")
+    print("\nMethodology: engine-only on both sides (events pre-generated before the")
+    print("timer; circuit build excluded). Feldera needs the NEXMARK_PREGEN patch to")
+    print("its nexmark bench — if its numbers look ~2x low and flat, the patch isn't")
+    print(f"applied. Small --events ({events}) still slightly understates Feldera (per-")
+    print("query DBSP setup); raise --events for a steadier read.")
 PY
