@@ -73,12 +73,35 @@ internal static class ComparisonBenchmarks
             }
         }
 
-        var outPath = Path.Combine("..", "..", "docs", defaultOut);
+        var outPath = Path.Combine(ResolveDocsDir(), defaultOut);
         File.WriteAllText(outPath, output.ToString());
         Console.WriteLine();
         Console.WriteLine($"Report written to {Path.GetFullPath(outPath)}");
         _ = CultureInfo.InvariantCulture;
         return 0;
+    }
+
+    /// <summary>
+    /// Locate the repo's <c>docs/</c> directory independent of the process working
+    /// directory (so the documented <c>dotnet run --project … -- comparison</c>
+    /// from the repo root works, not only from the project folder). Walks up from
+    /// the build output looking for a folder that has both <c>src/</c> and
+    /// <c>docs/</c>; falls back to a <c>docs/</c> under the current directory.
+    /// </summary>
+    private static string ResolveDocsDir()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            if (Directory.Exists(Path.Combine(dir.FullName, "src"))
+                && Directory.Exists(Path.Combine(dir.FullName, "docs")))
+            {
+                return Path.Combine(dir.FullName, "docs");
+            }
+        }
+
+        var fallback = Path.Combine(Directory.GetCurrentDirectory(), "docs");
+        Directory.CreateDirectory(fallback);
+        return fallback;
     }
 
     private static int ArgInt(string[] args, int index, int fallback) =>
