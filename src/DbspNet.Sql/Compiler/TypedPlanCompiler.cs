@@ -178,7 +178,33 @@ public static class TypedPlanCompiler
     /// <see langword="true"/> would emit duplicate output keys, so it is only set
     /// where disjointness is certain.
     /// </param>
-    private sealed record TypedNode(Type RowType, Schema Schema, object Stream, bool ShardDisjoint = false);
+    /// <param name="PartitionKey">
+    /// In a parallel build, the column indices (into this node's <see cref="Schema"/>)
+    /// by which the stream is hash-partitioned across workers — i.e. any two rows
+    /// agreeing on these columns are guaranteed co-located on one worker. An
+    /// exchange sets it to the shuffle key; a join/aggregate inherits or refines
+    /// it. <see langword="null"/> means "not usefully partitioned" (e.g. a raw
+    /// whole-row-hashed scan, or after a column-dropping projection). Used to elide
+    /// a redundant exchange: an operator keyed on <c>K</c> needs no shuffle when the
+    /// input is already partitioned by a subset of <c>K</c> (so every <c>K</c>-group
+    /// already lives wholly on one worker). Only meaningful for W &gt; 1.
+    /// </param>
+    private sealed record TypedNode(
+        Type RowType, Schema Schema, object Stream,
+        bool ShardDisjoint = false, int[]? PartitionKey = null);
+
+    /// <summary>True when every column in <paramref name="sub"/> appears in
+    /// <paramref name="super"/> — i.e. the data's partition key is a subset of the
+    /// operator's key, so each operator-key group is already on one worker.</summary>
+    private static bool IsKeySubset(int[] sub, int[] super)
+    {
+        foreach (var c in sub)
+        {
+            if (Array.IndexOf(super, c) < 0) return false;
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// Boundary-adapter entry point: compile <paramref name="plan"/>
@@ -515,6 +541,16 @@ public static class TypedPlanCompiler
             }
         }
 
+        // The upstream partition key (column indices) survives a filter unchanged,
+        // but any projection may drop or reorder columns and invalidate the
+        // indices. Identity projections are skipped above, so a projection here is
+        // always non-identity — conservatively drop the partition tracking.
+        var partitionKey = baseNode.PartitionKey;
+        foreach (var n in nodes)
+        {
+            if (n is ProjectPlan) partitionKey = null;
+        }
+
         var stages = new List<TypedStage>(nodes.Count);
         var currentRowType = baseNode.RowType;
         var currentSchema = baseNode.Schema;
@@ -554,20 +590,20 @@ public static class TypedPlanCompiler
             if (only.Kind == TypedStageKind.Filter)
             {
                 var stream = InvokeFilter(ctx.Builder, baseNode.RowType, baseNode.Stream, only.Delegate);
-                return new TypedNode(baseNode.RowType, baseNode.Schema, stream, shardDisjoint);
+                return new TypedNode(baseNode.RowType, baseNode.Schema, stream, shardDisjoint, partitionKey);
             }
             else
             {
                 var stream = InvokeMapRows(
                     ctx.Builder, baseNode.RowType, only.RowTypeAfter, baseNode.Stream, only.Delegate);
-                return new TypedNode(only.RowTypeAfter, only.SchemaAfter, stream, shardDisjoint);
+                return new TypedNode(only.RowTypeAfter, only.SchemaAfter, stream, shardDisjoint, partitionKey);
             }
         }
 
         var fused = BuildFusedTypedDelegate(baseNode.RowType, currentRowType, stages);
         var fusedStream = InvokeMapFilterRows(
             ctx.Builder, baseNode.RowType, currentRowType, baseNode.Stream, fused);
-        return new TypedNode(currentRowType, currentSchema, fusedStream, shardDisjoint);
+        return new TypedNode(currentRowType, currentSchema, fusedStream, shardDisjoint, partitionKey);
     }
 
     /// <summary>
@@ -782,7 +818,11 @@ public static class TypedPlanCompiler
                 leftSnapshotCodec, rightSnapshotCodec);
         }
 
-        var node = new TypedNode(outputRowType, outputSchema, joined);
+        // Output is partitioned by the join key. Left columns lead the output
+        // schema, so the left key indices are the key's output positions — a
+        // downstream GROUP BY on (those keys ∪ more) needs no re-shuffle.
+        var joinPartition = ctx.Workers > 1 ? leftIndices : null;
+        var node = new TypedNode(outputRowType, outputSchema, joined, PartitionKey: joinPartition);
 
         if (plan.Residual is not null)
         {
@@ -790,7 +830,7 @@ public static class TypedPlanCompiler
             var residual = BuildTypedPredicateDelegate(plan.Residual, outputRowType);
             if (residual is null) return null;
             var filtered = InvokeFilter(ctx.Builder, outputRowType, joined, residual);
-            node = new TypedNode(outputRowType, outputSchema, filtered);
+            node = new TypedNode(outputRowType, outputSchema, filtered, PartitionKey: joinPartition);
         }
 
         return node;
@@ -1299,8 +1339,14 @@ public static class TypedPlanCompiler
         // Parallel: re-shard by the group key so every row of a group co-locates
         // on one worker — that worker then computes the group's complete
         // aggregate, and the gather just unions the disjoint groups. No-op for W=1.
+        // Elide the shuffle when the input is already partitioned by a subset of
+        // the group key (e.g. a join on a.id feeding GROUP BY a.id, a.category):
+        // every group already lives wholly on one worker, so a re-shard would just
+        // move rows to the same place. This removes a full Barrier(W) + ZSet
+        // rebuild over the (often large) input — the dominant exchange tax.
         var groupedStream = inner.Stream;
-        if (ctx.Workers > 1)
+        if (ctx.Workers > 1
+            && !(inner.PartitionKey is { } p && IsKeySubset(p, groupIndices)))
         {
             groupedStream = InvokeExchange(
                 ctx.Builder, inner.RowType, groupedStream,
@@ -1342,7 +1388,19 @@ public static class TypedPlanCompiler
         var pairType = typeof(ValueTuple<,>).MakeGenericType(keyRowType, aggRowType);
         var flatStream = InvokeMapRows(ctx.Builder, pairType, finalRowType, aggregated, flattenDelegate);
 
-        return new TypedNode(finalRowType, finalSchema, flatStream);
+        // Output is partitioned by the group key, which the flatten lays out as
+        // the first keySchema.Count columns — whether we exchanged or inherited a
+        // finer partition, equal group keys are co-located (see PartitionKey).
+        var outPartition = ctx.Workers > 1 ? BuildIota(keySchema.Count) : null;
+        return new TypedNode(finalRowType, finalSchema, flatStream, PartitionKey: outPartition);
+    }
+
+    /// <summary><c>[0, 1, …, n-1]</c>.</summary>
+    private static int[] BuildIota(int n)
+    {
+        var a = new int[n];
+        for (var i = 0; i < n; i++) a[i] = i;
+        return a;
     }
 
     /// <summary>

@@ -193,6 +193,47 @@ public class ParallelTypedCompilerTests
 
     [Theory]
     [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void JoinThenGroupBySupersetKey_ElidesExchange_MatchesSingle(int workers)
+    {
+        // The Nexmark-q4 shape: a join partitions by a.k, then a GROUP BY on
+        // (a.k, a.g) — a superset of the join key — so the second exchange is
+        // elided (each group already lives wholly on one worker). A residual
+        // (BETWEEN-style) filter and a non-key aggregate exercise the same path
+        // q4 takes. Output must still match the single-circuit result, including
+        // after a delete that moves a group's MAX.
+        AssertParallelMatchesSingle(
+            [
+                "CREATE TABLE a (k INT NOT NULL, g INT NOT NULL, lo INT NOT NULL, hi INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, v INT NOT NULL)",
+            ],
+            "SELECT a.k, a.g, MAX(b.v) AS m FROM a JOIN b ON a.k = b.k " +
+            "WHERE b.v BETWEEN a.lo AND a.hi GROUP BY a.k, a.g",
+            workers,
+            tbl =>
+            {
+                tbl("a").Insert(1, 100, 0, 50);
+                tbl("a").Insert(2, 100, 0, 50);
+                tbl("a").Insert(3, 200, 10, 20);
+                tbl("b").Insert(1, 10);
+                tbl("b").Insert(1, 40);
+                tbl("b").Insert(1, 99); // filtered out (> hi)
+                tbl("b").Insert(2, 25);
+                tbl("b").Insert(3, 15);
+            },
+            tbl =>
+            {
+                tbl("b").Delete(1, 40); // group (1,100) MAX drops 40 -> 10
+                tbl("b").Insert(2, 45);
+                tbl("a").Insert(4, 200, 0, 50);
+                tbl("b").Insert(4, 30);
+            });
+    }
+
+    [Theory]
+    [InlineData(1)]
     [InlineData(4)]
     public void FilterProject_NoExchange_MatchesSingle(int workers)
     {
