@@ -727,24 +727,17 @@ public static class TypedPlanCompiler
             outputSchema, left.Schema.Count, right.Schema.Count);
 
         // Parallel: re-shard both sides by the join key so matching rows
-        // co-locate on one worker before the (local) join. Both sides hash the
-        // same key type, so equal keys land on the same worker. No-op for W=1.
-        var leftStream = left.Stream;
-        var rightStream = right.Stream;
-        if (ctx.Workers > 1)
-        {
-            leftStream = InvokeExchange(
-                ctx.Builder, left.RowType, leftStream,
-                BuildKeyHashPartition(left.RowType, keyRowType, leftKeyExtractor));
-            rightStream = InvokeExchange(
-                ctx.Builder, right.RowType, rightStream,
-                BuildKeyHashPartition(right.RowType, keyRowType, rightKeyExtractor));
-        }
-
-        var leftIndexed = InvokeGroupProject(
-            ctx.Builder, left.RowType, keyRowType, leftStream, leftKeyExtractor);
-        var rightIndexed = InvokeGroupProject(
-            ctx.Builder, right.RowType, keyRowType, rightStream, rightKeyExtractor);
+        // co-locate on one worker, then index by that key for the (local) join —
+        // both in one fused ExchangeIndex pass (no throwaway flat Z-set between
+        // the shuffle and the re-index). Both sides hash the same key type, so
+        // equal keys land on the same worker. At W=1 ExchangeIndex is a plain
+        // GroupProject, so the single-thread shape is unchanged.
+        var leftIndexed = InvokeExchangeIndex(
+            ctx.Builder, left.RowType, keyRowType, left.Stream,
+            BuildKeyHashPartition(left.RowType, keyRowType, leftKeyExtractor), leftKeyExtractor);
+        var rightIndexed = InvokeExchangeIndex(
+            ctx.Builder, right.RowType, keyRowType, right.Stream,
+            BuildKeyHashPartition(right.RowType, keyRowType, rightKeyExtractor), rightKeyExtractor);
 
         var leftSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, left.Schema, keyRowType, left.RowType);
@@ -1344,18 +1337,18 @@ public static class TypedPlanCompiler
         // every group already lives wholly on one worker, so a re-shard would just
         // move rows to the same place. This removes a full Barrier(W) + ZSet
         // rebuild over the (often large) input — the dominant exchange tax.
-        var groupedStream = inner.Stream;
-        if (ctx.Workers > 1
-            && !(inner.PartitionKey is { } p && IsKeySubset(p, groupIndices)))
-        {
-            groupedStream = InvokeExchange(
-                ctx.Builder, inner.RowType, groupedStream,
-                BuildKeyHashPartition(inner.RowType, keyRowType, keyExtractor));
-        }
-
-        // GroupProject<TKey, TIn, TIn, Z64>(inner, keyExtractor, identity)
-        var indexed = InvokeGroupProject(
-            ctx.Builder, inner.RowType, keyRowType, groupedStream, keyExtractor);
+        // When a shuffle is needed, fuse it with the re-index (ExchangeIndex)
+        // so the gather builds the indexed Z-set directly. When the input is
+        // already co-partitioned (elided) there is no gather, so a plain
+        // GroupProject over the inherited stream is all that's needed.
+        var needsExchange = ctx.Workers > 1
+            && !(inner.PartitionKey is { } p && IsKeySubset(p, groupIndices));
+        var indexed = needsExchange
+            ? InvokeExchangeIndex(
+                ctx.Builder, inner.RowType, keyRowType, inner.Stream,
+                BuildKeyHashPartition(inner.RowType, keyRowType, keyExtractor), keyExtractor)
+            : InvokeGroupProject(
+                ctx.Builder, inner.RowType, keyRowType, inner.Stream, keyExtractor);
 
         // IncrementalAggregate<TKey, TIn, TAgg>(indexed, composite)
         // Output: Stream<ZSet<(TKey, TAgg), Z64>>
@@ -2849,6 +2842,26 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(StatefulOperators.GroupProject) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(keyRowType, rowType, rowType, typeof(Z64));
         return closed.Invoke(null, new object[] { builder, stream, keyExtractor, identity })!;
+    }
+
+    /// <summary>
+    /// <c>builder.ExchangeIndex&lt;TKey, TRow, Z64&gt;(stream, partition, keyOf)</c>
+    /// — the fused shuffle + re-index that replaces an
+    /// <see cref="InvokeExchange"/> immediately followed by an
+    /// <see cref="InvokeGroupProject"/>, producing the same
+    /// <c>IndexedZSet&lt;TKey, TRow, Z64&gt;</c> in one pass. At W=1 the builder
+    /// method degrades to a plain GroupProject, so the single-thread shape is
+    /// unchanged.
+    /// </summary>
+    private static object InvokeExchangeIndex(
+        CircuitBuilder builder, Type rowType, Type keyRowType,
+        object stream, Delegate partition, Delegate keyExtractor)
+    {
+        var openMethod = typeof(CircuitBuilder)
+            .GetMethods()
+            .Single(m => m.Name == nameof(CircuitBuilder.ExchangeIndex) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, rowType, typeof(Z64));
+        return closed.Invoke(builder, new[] { stream, partition, keyExtractor })!;
     }
 
     /// <summary>

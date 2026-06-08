@@ -3,6 +3,7 @@
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit.Operators;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 
 namespace DbspNet.Core.Circuit;
 
@@ -170,6 +171,47 @@ public sealed class CircuitBuilder
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
         _root.AddOperator(new ExchangeOp<TKey, TWeight>(
             input, output, partition, coordinator, _parallel.WorkerId, _parallel.Abort));
+        return output;
+    }
+
+    /// <summary>
+    /// Fused <see cref="Exchange{TKey,TWeight}"/> + <c>GroupProject(keyOf,
+    /// identity)</c>: re-partition a sharded Z-set by <paramref name="partition"/>
+    /// and group the result by <paramref name="keyOf"/> into an indexed Z-set,
+    /// ready for a join or aggregate — without materializing the intermediate
+    /// flat Z-set the two-operator form would. The row becomes the inner value.
+    /// </summary>
+    /// <remarks>
+    /// Outside a <see cref="ParallelCircuit"/>, or with a single worker, there is
+    /// nothing to shuffle, so this degrades to a plain
+    /// <see cref="StatefulOperators.GroupProject{TKey,TRow,TValue,TWeight}"/> —
+    /// keeping the single-threaded path byte-for-byte what it was before the fused
+    /// operator existed.
+    /// </remarks>
+    public Stream<IndexedZSet<TKey, TRow, TWeight>> ExchangeIndex<TKey, TRow, TWeight>(
+        Stream<ZSet<TRow, TWeight>> input,
+        Func<TRow, int> partition,
+        Func<TRow, TKey> keyOf)
+        where TKey : notnull
+        where TRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partition);
+        ArgumentNullException.ThrowIfNull(keyOf);
+
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return this.GroupProject(input, keyOf, static row => row);
+        }
+
+        var workers = _parallel.Workers;
+        var coordinator = _parallel.NextCoordinator(
+            () => new ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>>(workers));
+        var output = new Stream<IndexedZSet<TKey, TRow, TWeight>>(
+            IndexedZSet<TKey, TRow, TWeight>.Empty);
+        _root.AddOperator(new ExchangeIndexOp<TKey, TRow, TWeight>(
+            input, output, partition, keyOf, coordinator, _parallel.WorkerId, _parallel.Abort));
         return output;
     }
 }
