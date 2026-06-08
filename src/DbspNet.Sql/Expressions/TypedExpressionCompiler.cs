@@ -825,7 +825,7 @@ public static class TypedExpressionCompiler
 
     private static bool IsComparable(Type t) =>
         IsNumericNonDecimal(t) || t == typeof(bool) || t == typeof(Utf8String)
-        || t == typeof(Decimal128);
+        || t == typeof(Decimal128) || IsTemporal(t);
 
     private static UnsupportedExpressionException Unsupported() => new();
 
