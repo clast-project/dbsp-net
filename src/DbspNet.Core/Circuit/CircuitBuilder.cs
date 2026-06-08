@@ -166,7 +166,7 @@ public sealed class CircuitBuilder
 
         var workers = _parallel.Workers;
         var coordinator = _parallel.NextCoordinator(
-            () => new ExchangeCoordinator<ZSet<TKey, TWeight>>(workers));
+            () => new ExchangeCoordinator<List<KeyValuePair<TKey, TWeight>>>(workers));
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
         _root.AddOperator(new ExchangeOp<TKey, TWeight>(
             input, output, partition, coordinator, _parallel.WorkerId, _parallel.Abort));

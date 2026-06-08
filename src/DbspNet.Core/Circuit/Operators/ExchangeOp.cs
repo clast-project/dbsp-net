@@ -25,7 +25,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
     private readonly Stream<ZSet<TKey, TWeight>> _input;
     private readonly Stream<ZSet<TKey, TWeight>> _output;
     private readonly Func<TKey, int> _partition;
-    private readonly ExchangeCoordinator<ZSet<TKey, TWeight>> _coordinator;
+    private readonly ExchangeCoordinator<List<KeyValuePair<TKey, TWeight>>> _coordinator;
     private readonly int _worker;
     private readonly int _workers;
     private readonly CancellationToken _abort;
@@ -34,7 +34,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         Stream<ZSet<TKey, TWeight>> input,
         Stream<ZSet<TKey, TWeight>> output,
         Func<TKey, int> partition,
-        ExchangeCoordinator<ZSet<TKey, TWeight>> coordinator,
+        ExchangeCoordinator<List<KeyValuePair<TKey, TWeight>>> coordinator,
         int worker,
         CancellationToken abort)
     {
@@ -51,34 +51,43 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
     {
         var workers = _workers;
 
-        // Split this shard's rows into one bucket per destination worker.
-        var buckets = new ZSetBuilder<TKey, TWeight>[workers];
-        for (var j = 0; j < workers; j++)
-        {
-            buckets[j] = new ZSetBuilder<TKey, TWeight>();
-        }
-
-        foreach (var (key, weight) in _input.Current)
+        // Split this shard's rows into one bucket per destination worker. The
+        // input is a Z-set, so its keys are already distinct — a bucket never
+        // merges, so a plain append-only list suffices (no per-row hash/probe
+        // into a builder dictionary). Buckets are allocated lazily; an empty
+        // destination publishes null. The key hash is paid once, here, at the
+        // gather (vs. the previous build-then-rebuild which hashed every row
+        // twice — once per bucket, once at the gather).
+        var buckets = new List<KeyValuePair<TKey, TWeight>>?[workers];
+        foreach (var kv in _input.Current)
         {
             // Non-negative modulo: partition() may return a negative hash.
-            var j = ((_partition(key) % workers) + workers) % workers;
-            buckets[j].Add(key, weight);
+            var j = ((_partition(kv.Key) % workers) + workers) % workers;
+            (buckets[j] ??= new List<KeyValuePair<TKey, TWeight>>()).Add(kv);
         }
 
         // Publish our row of the grid, then rendezvous: after the barrier every
         // worker's row is visible, so reading our column below is race-free.
+        // Publishing null for empty cells still overwrites last tick's payload.
         for (var j = 0; j < workers; j++)
         {
-            _coordinator.Publish(_worker, j, buckets[j].Build());
+            _coordinator.Publish(_worker, j, buckets[j]!);
         }
 
         _coordinator.Wait(_abort);
 
         // Gather our column: the buckets every worker addressed to us, summed.
+        // The sum still goes through a builder because a column-dropping map
+        // upstream can place the same row on two source workers, so distinct
+        // sources may carry the same key.
         var gathered = new ZSetBuilder<TKey, TWeight>();
         for (var src = 0; src < workers; src++)
         {
-            gathered.AddRange(_coordinator.Read(src, _worker));
+            var bucket = _coordinator.Read(src, _worker);
+            if (bucket is not null)
+            {
+                gathered.AddRange(bucket);
+            }
         }
 
         _output.SetCurrent(gathered.Build());
