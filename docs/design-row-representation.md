@@ -542,6 +542,54 @@ Wire D, then measure the q4 Nexmark **step** (not the microbench) via the
 at W=14. Ship only if the q4 step improves without regressing the existing
 flat-vs-spine benchmark or the `D==1`/small-group cases.
 
+### 8.3 — End-to-end gate RAN — spine loses to flat on q4; do NOT flip the default
+
+The gate was built (`dotnet run -- q4spine [events] [W] [runs]`,
+`Q4SpineBenchmark`, report [q4-spine-bench.md](q4-spine-bench.md)) and run. It
+compiles q4's **whole parallel pipeline** three ways at the host core count and
+times the **step** phase apart from split/gather, cross-checking every config's
+output against flat:
+
+- **flat** — `TraceFamily.Flat` (today's default).
+- **spine·point** — `TraceFamily.Spine` with the merge probe forced off
+  (`SpineJoinProbeMode`/`SpineAggregateProbeMode.ForcePointProbe`): the LSM
+  substrate *without* the merge win. Isolates the substrate's own cost.
+- **spine·merge** — `TraceFamily.Spine` with the merge probe live.
+
+**Result (W=24, 1M events, median-of-3, two runs, stable):**
+
+| Batch | flat step | spine·point | spine·merge | merge↑ vs flat | merge↑ vs point |
+|------:|----------:|------------:|------------:|---------------:|----------------:|
+| 10k   | ~675 ms   | ~1720 ms    | ~1650 ms    | **0.40–0.42×** | ~1.04×          |
+| 100k  | ~675 ms   | ~1070 ms    | ~955 ms     | **0.68–0.73×** | ~1.11×          |
+
+**Verdict: the merge probe is confirmed end-to-end but the spine substrate is
+not.** Two findings, cleanly separated by the three-way A/B:
+
+1. **The merge probe carries its operator-level win all the way through** —
+   spine·merge beats spine·point at every batch (1.04× at 10k, ~1.11× at 100k),
+   reproducing the `joinprobe`/`aggprobe` microbench direction in the full
+   parallel pipeline. The wiring is sound and worth keeping.
+2. **But the spine *substrate* loses to the flat dictionary on q4** —
+   spine·merge is **1.4–2.5× slower than flat**, and the gap is driven entirely
+   by spine·point (the substrate), not the probe. The cause is structural and
+   matches §5: at W=24 each replica's per-tick delta is `batch/24` rows, so the
+   spine rebuilds many *tiny* sorted-columnar batches per tick (build + bloom +
+   compaction churn) where the flat dictionary just does in-place hash updates.
+   The merge probe makes that overhead cheaper but cannot erase it. The gap
+   narrows as the batch widens (0.41× → 0.68×, exactly §5's "merge only wins
+   with larger batches"), but never crosses 1.0× at realistic q4 tick sizes.
+
+**Consequence for the roadmap.** Do **not** flip `TraceFamily.Spine` toward the
+typed default — the gate's ship condition ("beats flat at W=14") is not met. The
+bottleneck is no longer the probe (Option 1 is done and validated); it is the
+**per-operator, zero-sharing substrate cost** the design doc flagged as the next
+gap. The next increment is therefore **Option 2 — shared arrangements**
+(§6.2): build the indexed batch once and share it across operators / amortize it
+across ticks, so the substrate's build cost is paid once instead of every tick
+per replica. The merge probe stays in place (committed, behind the `D==1` guard)
+as the execution model that shared arrangements will read through.
+
 ---
 
 ## Appendix — sources

@@ -85,6 +85,29 @@ if (args.Length > 0 && args[0] == "aggprobe")
     return 0;
 }
 
+// q4 spine merge-probe gate: `dotnet run -- q4spine [totalEvents] [workers] [runs]`
+// End-to-end test of the spine merge-probe on Nexmark q4 at the host core count
+// (docs/design-row-representation.md §8 — the deferred "q4 gate").
+if (args.Length > 0 && args[0] == "q4spine")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var totalEvents = Arg(1, 1_000_000);
+    int? workers = args.Length > 2 && int.TryParse(args[2], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var w) ? w : null;
+    var runs = Arg(3, 3);
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Q4SpineBenchmark.Run(sb, totalEvents, workers, runs);
+    var q4Path = Path.Combine(FindDocsDir(), "q4-spine-bench.md");
+    File.WriteAllText(q4Path, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(q4Path)}");
+    return 0;
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();
