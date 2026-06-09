@@ -8,6 +8,19 @@ using DbspNet.Core.Operators.Stateful.Aggregators;
 namespace DbspNet.Core.Operators.Stateful.Spine;
 
 /// <summary>
+/// Benchmark seam for <see cref="SpineIncrementalAggregateOp{TKey,TValue,TOut}"/>.
+/// When set, the aggregate takes the per-key point-probe path (today's
+/// <c>GroupFor</c> + Z-set rebuild, also the production path for single-key
+/// ticks) for every tick instead of the batched galloping merge, so
+/// <c>AggregateProbeBenchmark</c> can A/B both strategies in one process. Never
+/// set in production code — the operator picks the path by tick width.
+/// </summary>
+internal static class SpineAggregateProbeMode
+{
+    internal static bool ForcePointProbe;
+}
+
+/// <summary>
 /// Spine-backed incremental aggregate. Observable behaviour matches
 /// <see cref="IncrementalAggregateOp{TKey,TValue,TOut}"/>; the only
 /// difference is that the per-key value multisets are stored in a
@@ -27,6 +40,9 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
     private readonly Stream<IndexedZSet<TKey, TValue, Z64>> _input;
     private readonly Stream<ZSet<(TKey Key, TOut Value), Z64>> _output;
     private readonly IAggregator<TValue, TOut> _aggregator;
+    private readonly IComparer<TKey> _keyComparer;
+    private readonly IComparer<TValue> _valueComparer;
+    private readonly Comparison<(TValue Value, Z64 Weight)> _runComparison;
     private readonly SpineIndexedZSetTrace<TKey, TValue, Z64> _trace;
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
@@ -51,6 +67,9 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         _input = input;
         _output = output;
         _aggregator = aggregator;
+        _keyComparer = keyComparer ?? Comparer<TKey>.Default;
+        _valueComparer = valueComparer ?? Comparer<TValue>.Default;
+        _runComparison = (a, b) => _valueComparer.Compare(a.Value, b.Value);
         _trace = new SpineIndexedZSetTrace<TKey, TValue, Z64>(
             compactionStrategy ?? TieredCompactionStrategy.Default,
             keyComparer,
@@ -133,53 +152,190 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         }
 
         var builder = new ZSetBuilder<(TKey, TOut), Z64>();
-        foreach (var key in delta.Keys)
+
+        if (SpineAggregateProbeMode.ForcePointProbe || delta.GroupCount == 1)
         {
-            var groupDelta = delta.GroupFor(key);
-            var beforeGroup = _trace.GroupFor(key);
-            var afterGroup = beforeGroup + groupDelta;
-
-            var oldAgg = _aggCache.TryGetValue(key, out var cached)
-                ? cached
-                : Optional<TOut>.None;
-            _stateCache.TryGetValue(key, out var state);
-
-            var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
-
-            // Cache-pruning keyed on dict-shape IsEmpty (no trace
-            // entries) — see the matching comment in
-            // IncrementalAggregateOp.Step for why the linear gate
-            // can't be used here.
-            if (afterGroup.IsEmpty)
+            // Point-probe path: one GroupFor per key, rebuilding the after-group
+            // as a Z-set (which hashes every value row). Kept for single-key
+            // ticks — the trace-level D==1 soft spot from merge-probe-bench.md.
+            foreach (var key in delta.Keys)
             {
-                _aggCache.Remove(key);
-                _stateCache.Remove(key);
+                var groupDelta = delta.GroupFor(key);
+                var afterGroup = _trace.GroupFor(key) + groupDelta;
+                EmitForKey(key, groupDelta, afterGroup, builder);
             }
-            else
+        }
+        else
+        {
+            // Merge path: sort the delta keys once, batch-probe the before-groups
+            // as sorted runs (GroupForManySorted — no per-probe rehash), merge
+            // each with its delta into a sorted after-run, and hand the
+            // aggregator a SortedRunMultiset. Value rows are compared, never
+            // hashed (docs/design-row-representation.md §8).
+            var sortedKeys = SortedKeysOf(delta);
+            var beforeRuns = _trace.GroupForManySorted(sortedKeys);
+            var bi = 0;
+            foreach (var key in sortedKeys)
             {
-                _aggCache[key] = newAgg;
-                _stateCache[key] = state;
-            }
+                // beforeRuns is the present-key subsequence of sortedKeys, in the
+                // same order, so a single advancing cursor pairs them up.
+                var beforeRun = Array.Empty<(TValue Value, Z64 Weight)>();
+                if (bi < beforeRuns.Count && _keyComparer.Compare(beforeRuns[bi].Key, key) == 0)
+                {
+                    beforeRun = beforeRuns[bi].Group;
+                    bi++;
+                }
 
-            if (oldAgg == newAgg)
-            {
-                continue;
-            }
-
-            if (oldAgg.HasValue)
-            {
-                builder.Add((key, oldAgg.Value), new Z64(-1));
-            }
-
-            if (newAgg.HasValue)
-            {
-                builder.Add((key, newAgg.Value), new Z64(1));
+                var groupDelta = delta.GroupFor(key);
+                var afterRun = MergeDeltaIntoRun(beforeRun, groupDelta);
+                EmitForKey(key, groupDelta, new SortedRunMultiset<TValue>(afterRun, _valueComparer), builder);
             }
         }
 
         _output.SetCurrent(builder.Build());
         _trace.Integrate(delta);
         CollectGarbage();
+    }
+
+    /// <summary>
+    /// Applies one group's update: runs the aggregator over the post-delta
+    /// multiset, prunes or refreshes the per-key caches, and emits the
+    /// retract/insert pair for any changed aggregate value. Shared by the
+    /// point-probe and merge paths — they differ only in how
+    /// <paramref name="afterGroup"/> is represented (a rebuilt <see cref="ZSet{TKey,TWeight}"/>
+    /// vs a <see cref="SortedRunMultiset{T}"/>), which is exactly what the
+    /// <see cref="IMultiset{TKey,TWeight}"/> abstraction hides.
+    /// </summary>
+    private void EmitForKey(
+        TKey key,
+        ZSet<TValue, Z64> groupDelta,
+        IMultiset<TValue, Z64> afterGroup,
+        ZSetBuilder<(TKey, TOut), Z64> builder)
+    {
+        var oldAgg = _aggCache.TryGetValue(key, out var cached)
+            ? cached
+            : Optional<TOut>.None;
+        _stateCache.TryGetValue(key, out var state);
+
+        var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
+
+        // Cache-pruning keyed on dict-shape IsEmpty (no trace entries) — see the
+        // matching comment in IncrementalAggregateOp.Step for why the linear
+        // gate can't be used here. A fully cancelled group merges to a length-0
+        // run, so SortedRunMultiset.IsEmpty agrees with the rebuilt Z-set's.
+        if (afterGroup.IsEmpty)
+        {
+            _aggCache.Remove(key);
+            _stateCache.Remove(key);
+        }
+        else
+        {
+            _aggCache[key] = newAgg;
+            _stateCache[key] = state;
+        }
+
+        if (oldAgg == newAgg)
+        {
+            return;
+        }
+
+        if (oldAgg.HasValue)
+        {
+            builder.Add((key, oldAgg.Value), new Z64(-1));
+        }
+
+        if (newAgg.HasValue)
+        {
+            builder.Add((key, newAgg.Value), new Z64(1));
+        }
+    }
+
+    /// <summary>
+    /// The delta's distinct outer keys, sorted by this op's key comparer (the
+    /// order the spine batches are sorted by) — the contract
+    /// <see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}.GroupForManySorted"/>
+    /// requires.
+    /// </summary>
+    private TKey[] SortedKeysOf(IndexedZSet<TKey, TValue, Z64> delta)
+    {
+        var keys = new TKey[delta.GroupCount];
+        var i = 0;
+        foreach (var key in delta.Keys)
+        {
+            keys[i++] = key;
+        }
+
+        Array.Sort(keys, _keyComparer);
+        return keys;
+    }
+
+    /// <summary>
+    /// Merges a sorted, distinct, zero-free before-run (from
+    /// <c>GroupForManySorted</c>) with this tick's flat <paramref name="groupDelta"/>
+    /// into the sorted, distinct, zero-free after-run — summing weights on equal
+    /// values and dropping any that cancel to zero. Values are only compared,
+    /// never hashed.
+    /// </summary>
+    private (TValue Value, Z64 Weight)[] MergeDeltaIntoRun(
+        (TValue Value, Z64 Weight)[] beforeRun,
+        ZSet<TValue, Z64> groupDelta)
+    {
+        // Sort the (small, flat) delta group into the trace's value order once.
+        var deltaArr = new (TValue Value, Z64 Weight)[groupDelta.Count];
+        var di = 0;
+        foreach (var (v, w) in groupDelta)
+        {
+            deltaArr[di++] = (v, w);
+        }
+
+        Array.Sort(deltaArr, _runComparison);
+
+        if (beforeRun.Length == 0)
+        {
+            // New group: the after-run is just the (already distinct, zero-free)
+            // sorted delta.
+            return deltaArr;
+        }
+
+        var merged = new List<(TValue Value, Z64 Weight)>(beforeRun.Length + deltaArr.Length);
+        int bi = 0, dj = 0;
+        while (bi < beforeRun.Length && dj < deltaArr.Length)
+        {
+            var c = _valueComparer.Compare(beforeRun[bi].Value, deltaArr[dj].Value);
+            if (c < 0)
+            {
+                merged.Add(beforeRun[bi]);
+                bi++;
+            }
+            else if (c > 0)
+            {
+                merged.Add(deltaArr[dj]);
+                dj++;
+            }
+            else
+            {
+                var sum = Z64.Add(beforeRun[bi].Weight, deltaArr[dj].Weight);
+                if (!Z64.IsZero(sum))
+                {
+                    merged.Add((beforeRun[bi].Value, sum));
+                }
+
+                bi++;
+                dj++;
+            }
+        }
+
+        while (bi < beforeRun.Length)
+        {
+            merged.Add(beforeRun[bi++]);
+        }
+
+        while (dj < deltaArr.Length)
+        {
+            merged.Add(deltaArr[dj++]);
+        }
+
+        return merged.ToArray();
     }
 
     /// <summary>

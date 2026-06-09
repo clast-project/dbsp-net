@@ -115,6 +115,53 @@ public class SpineIncrementalAggregateOpTests
         }
     }
 
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void MinMatchesFlatAggregateOnMultiKeyTicks(int batchesPerLevel)
+    {
+        // MIN is the non-linear / point-probe consumer: it forces the merge
+        // path's empty-group detection and Compute-over-SortedRunMultiset to
+        // agree with the flat op across new groups and retractions-to-empty.
+        // Wide ticks (up to 6 entries over 4 depts) keep GroupCount > 1 so the
+        // merge path — not the D==1 fallback — is what is exercised.
+        var rng = new Random(Seed: 91 + batchesPerLevel);
+
+        InputHandle<ZSet<Row, Z64>>? flatIn = null;
+        OutputHandle<ZSet<(string Key, long Value), Z64>>? flatOut = null;
+        var flatCircuit = RootCircuit.Build(b =>
+        {
+            var (h, s) = b.ZSetInput<Row, Z64>();
+            flatIn = h;
+            var grouped = b.GroupProject(s, r => r.Dept, r => r.Salary);
+            flatOut = b.Output(b.IncrementalAggregate(grouped, MinMaxAggregator<long>.Min()));
+        });
+
+        InputHandle<ZSet<Row, Z64>>? spineIn = null;
+        OutputHandle<ZSet<(string Key, long Value), Z64>>? spineOut = null;
+        var spineCircuit = RootCircuit.Build(b =>
+        {
+            var (h, s) = b.ZSetInput<Row, Z64>();
+            spineIn = h;
+            var grouped = b.GroupProject(s, r => r.Dept, r => r.Salary);
+            spineOut = b.Output(b.SpineIncrementalAggregate(
+                grouped, MinMaxAggregator<long>.Min(),
+                compactionStrategy: new TieredCompactionStrategy(batchesPerLevel)));
+        });
+
+        for (var step = 0; step < 200; step++)
+        {
+            var delta = RandomRowDelta(rng, deptCount: 4, salaryRange: 50, maxEntries: 6);
+            flatIn!.Push(delta);
+            spineIn!.Push(delta);
+            flatCircuit.Step();
+            spineCircuit.Step();
+
+            Assert.Equal(flatOut!.Current, spineOut!.Current);
+        }
+    }
+
     private static ZSet<Row, Z64> RandomRowDelta(Random rng, int deptCount, int salaryRange, int maxEntries)
     {
         var entries = rng.Next(maxEntries + 1);

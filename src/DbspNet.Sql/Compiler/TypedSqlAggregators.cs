@@ -44,9 +44,9 @@ internal abstract class TypedSqlAggregator<TIn>
     /// no positive contributions (SQL NULL); non-nullable variants
     /// always return a definite value.
     /// </summary>
-    public abstract object? Compute(ZSet<TIn, Z64> rows);
+    public abstract object? Compute(IMultiset<TIn, Z64> rows);
 
-    public virtual object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public virtual object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
         => Compute(after);
 }
 
@@ -60,7 +60,7 @@ internal sealed class TypedCountStarAggregator<TIn> : TypedSqlAggregator<TIn>
 {
     public override Type ResultClrType => typeof(long);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         var total = 0L;
         foreach (var (_, w) in rows)
@@ -71,7 +71,7 @@ internal sealed class TypedCountStarAggregator<TIn> : TypedSqlAggregator<TIn>
         return total;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state is long prior ? prior : 0L;
         foreach (var (_, w) in delta)
@@ -101,7 +101,7 @@ internal sealed class TypedSumLongAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(long);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         long sum = 0;
         foreach (var (row, w) in rows)
@@ -112,7 +112,7 @@ internal sealed class TypedSumLongAggregator<TIn> : TypedSqlAggregator<TIn>
         return sum;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state is long prior ? prior : 0L;
         foreach (var (row, w) in delta)
@@ -138,7 +138,7 @@ internal sealed class TypedSumDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(double);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         double sum = 0;
         foreach (var (row, w) in rows)
@@ -149,7 +149,7 @@ internal sealed class TypedSumDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
         return sum;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state is double prior ? prior : 0.0;
         foreach (var (row, w) in delta)
@@ -183,7 +183,7 @@ internal sealed class TypedSumDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(Decimal128);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         Int256 sum = Int256.Zero;
         foreach (var (row, w) in rows)
@@ -194,7 +194,7 @@ internal sealed class TypedSumDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
         return DecimalRuntime.NarrowToDecimal128(sum);
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state is Int256 prior ? prior : Int256.Zero;
         foreach (var (row, w) in delta)
@@ -230,7 +230,7 @@ internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(Decimal128);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         Int256 sum = Int256.Zero;
         long count = 0;
@@ -243,7 +243,7 @@ internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
         return DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as AvgState ?? new AvgState();
         foreach (var (row, w) in delta)
@@ -280,7 +280,7 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(double);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         double sum = 0;
         long count = 0;
@@ -294,7 +294,7 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
         return sum / count;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as AvgState ?? new AvgState();
         foreach (var (row, w) in delta)
@@ -330,7 +330,7 @@ internal sealed class TypedCountNullableAggregator<TIn> : TypedSqlAggregator<TIn
 
     public override Type ResultClrType => typeof(long);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         var total = 0L;
         foreach (var (row, w) in rows)
@@ -341,7 +341,7 @@ internal sealed class TypedCountNullableAggregator<TIn> : TypedSqlAggregator<TIn
         return total;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state is long prior ? prior : 0L;
         foreach (var (row, w) in delta)
@@ -379,7 +379,7 @@ internal sealed class TypedSumLongNullableAggregator<TIn> : TypedSqlAggregator<T
 
     public override Type ResultClrType => typeof(long);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         long sum = 0;
         var any = false;
@@ -394,7 +394,7 @@ internal sealed class TypedSumLongNullableAggregator<TIn> : TypedSqlAggregator<T
         return any ? (object)sum : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as SumState ?? new SumState();
         foreach (var (row, w) in delta)
@@ -432,7 +432,7 @@ internal sealed class TypedSumDoubleNullableAggregator<TIn> : TypedSqlAggregator
 
     public override Type ResultClrType => typeof(double);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         double sum = 0;
         var any = false;
@@ -447,7 +447,7 @@ internal sealed class TypedSumDoubleNullableAggregator<TIn> : TypedSqlAggregator
         return any ? (object)sum : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as SumState ?? new SumState();
         foreach (var (row, w) in delta)
@@ -485,7 +485,7 @@ internal sealed class TypedSumDecimalNullableAggregator<TIn> : TypedSqlAggregato
 
     public override Type ResultClrType => typeof(Decimal128);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         Int256 sum = Int256.Zero;
         var any = false;
@@ -500,7 +500,7 @@ internal sealed class TypedSumDecimalNullableAggregator<TIn> : TypedSqlAggregato
         return any ? (object)DecimalRuntime.NarrowToDecimal128(sum) : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as SumState ?? new SumState();
         foreach (var (row, w) in delta)
@@ -540,7 +540,7 @@ internal sealed class TypedAvgDoubleNullableAggregator<TIn> : TypedSqlAggregator
 
     public override Type ResultClrType => typeof(double);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         double sum = 0;
         long count = 0;
@@ -555,7 +555,7 @@ internal sealed class TypedAvgDoubleNullableAggregator<TIn> : TypedSqlAggregator
         return count == 0 ? null : (object)(sum / count);
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as AvgState ?? new AvgState();
         foreach (var (row, w) in delta)
@@ -590,7 +590,7 @@ internal sealed class TypedAvgDecimalNullableAggregator<TIn> : TypedSqlAggregato
 
     public override Type ResultClrType => typeof(Decimal128);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         Int256 sum = Int256.Zero;
         long count = 0;
@@ -607,7 +607,7 @@ internal sealed class TypedAvgDecimalNullableAggregator<TIn> : TypedSqlAggregato
             : (object)DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as AvgState ?? new AvgState();
         foreach (var (row, w) in delta)
@@ -659,7 +659,7 @@ internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
 
     public override Type ResultClrType => typeof(T);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         T best = default!;
         var hasBest = false;
@@ -688,7 +688,7 @@ internal sealed class TypedSqlMinMaxAggregator<TIn, T> : TypedSqlAggregator<TIn>
         return hasBest ? (object)best! : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as State ?? new State();
         foreach (var (row, w) in delta)
@@ -765,7 +765,7 @@ internal sealed class TypedSqlMinMaxNullableAggregator<TIn, T> : TypedSqlAggrega
 
     public override Type ResultClrType => typeof(T);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         T best = default;
         var hasBest = false;
@@ -789,7 +789,7 @@ internal sealed class TypedSqlMinMaxNullableAggregator<TIn, T> : TypedSqlAggrega
         return hasBest ? (object)best : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var s = state as State ?? new State();
         foreach (var (row, w) in delta)
@@ -851,14 +851,14 @@ internal sealed class TypedApproxCountDistinctAggregator<TIn> : TypedSqlAggregat
 
     public override Type ResultClrType => typeof(long);
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         var sketch = new HyperLogLog();
         HllSupport.FoldPositive(sketch, rows, _argExtract);
         return sketch.EstimateCardinality();
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var sketch = state as HyperLogLog;
         if (sketch is not null && IsInsertOnly(delta))
@@ -925,14 +925,14 @@ internal sealed class TypedApproxPercentileAggregator<TIn> : TypedSqlAggregator<
 
     public override Type ResultClrType { get; }
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         var sketch = new DdSketch();
         DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _toDouble);
         return sketch.EstimateQuantile(_fraction) is double d ? _fromDouble(d) : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var sketch = state as DdSketch ?? new DdSketch();
         DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _toDouble);
@@ -974,14 +974,14 @@ internal sealed class TypedExactQuantileAggregator<TIn> : TypedSqlAggregator<TIn
 
     public override Type ResultClrType { get; }
 
-    public override object? Compute(ZSet<TIn, Z64> rows)
+    public override object? Compute(IMultiset<TIn, Z64> rows)
     {
         var sketch = new OrderedQuantileSketch();
         DdSketchSupport.FoldSignedExact(sketch, rows, _argExtract, _toKey);
         return sketch.EstimateQuantile(_fraction, _discrete) is long k ? _fromKey(k) : null;
     }
 
-    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, ZSet<TIn, Z64> after)
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
     {
         var sketch = state as OrderedQuantileSketch ?? new OrderedQuantileSketch();
         DdSketchSupport.FoldSignedExact(sketch, delta, _argExtract, _toKey);
@@ -1017,7 +1017,7 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
         _packResults = packResults;
     }
 
-    public Optional<TAgg> Compute(ZSet<TIn, Z64> multiset)
+    public Optional<TAgg> Compute(IMultiset<TIn, Z64> multiset)
     {
         if (Z64.IsZero(multiset.SumWeights()))
         {
@@ -1037,7 +1037,7 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
         ref object? state,
         Optional<TAgg> oldValue,
         ZSet<TIn, Z64> delta,
-        ZSet<TIn, Z64> afterMultiset)
+        IMultiset<TIn, Z64> afterMultiset)
     {
         // Advance the sub-aggregators' state unconditionally — they
         // track weight transitions across ticks; short-circuiting on

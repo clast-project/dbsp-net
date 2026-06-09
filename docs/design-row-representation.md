@@ -389,6 +389,13 @@ interning, which the evidence says are the wrong targets.
 > structural `SumAggregator`/`MinMaxAggregator` below *do* scan, so Option D
 > still fits the structural path. Treat §8 as the **aggregate** plan; the join
 > (a pure cross-product consumer of the probed group) needed none of this.
+>
+> **Update 2 (2026-06): the aggregate is now LANDED via Option B — see §8.2.**
+> The `IMultiset` abstraction shipped; both compile paths' aggregators consume
+> the post-delta multiset through it, so the spine aggregate hands them a
+> sorted-run-backed view instead of a rebuilt Z-set. The detailed Option-D
+> discussion below is kept as the design record but is **superseded by Option
+> B**, which fit the real (point-probe) consumption pattern.
 
 ### 8.1 — Join increment LANDED (this session)
 
@@ -415,6 +422,44 @@ join probe-side (absent-key) win is the biggest.
   rollout step that flips `TraceFamily.Spine` toward the typed default. The
   spine LEFT/FULL joins were left on the point probe (same drop-in applies when
   needed).
+
+### 8.2 — Aggregate increment LANDED via Option B / `IMultiset` (this session)
+
+The aggregate needed the abstraction §8 anticipated. Why Option D (a sorted span
+to scan) was wrong: the **typed** and **structural** SQL aggregators are already
+incremental and read the after-group by **point-probe** — `after.WeightOf(row)`
+per delta row (MIN/MAX, nullable-SUM) plus the composite's `SumWeights()` gate —
+not a full scan. The right abstraction is therefore one that answers
+`WeightOf`/`SumWeights`/enumerate off a sorted run *without hashing*.
+
+- **`IMultiset<TKey,TWeight>`** (`src/DbspNet.Core/Collections/IMultiset.cs`):
+  `IsEmpty` + `WeightOf` + `SumWeights` + `IEnumerable<KVP>`. `ZSet` implements
+  it (every member already existed), so **widening aggregator `Compute`/`Update`
+  `after`/`multiset` parameters from `ZSet` to `IMultiset` is caller-transparent**
+  — the flat op, window op and `LoadAsync` keep passing Z-sets unchanged. `delta`
+  stays a concrete `ZSet` (small, flat, no win). The swap touched the interface,
+  the four Core aggregators, every `SqlAggregator`/`TypedSqlAggregator` +
+  both composites, and the Hll/DdSketch fold helpers — all mechanical, bodies
+  unchanged (they only use interface members). **No builder signature changed**,
+  so the reflective typed-compiler call is untouched ([[typed-compiler-reflection-gotcha]]).
+- **`SortedRunMultiset<T>`** (Spine folder): the sorted-run-backed implementation
+  — `WeightOf` is a binary search (compare the key), `SumWeights`/enumerate are a
+  linear pass. Built per changed group from the `GroupForManySorted` before-run
+  merged with the tick's delta.
+- **`SpineIncrementalAggregateOp.Step`.** Multi-key ticks now: sort the delta
+  keys, `GroupForManySorted` the before-runs, merge each with its delta into a
+  sorted after-run, wrap in `SortedRunMultiset`, call `Update`. The shared
+  `EmitForKey` does the cache/emit (empty-group detection off `IMultiset.IsEmpty`,
+  which a fully-cancelled run reports as length 0). `D == 1` and the
+  `SpineAggregateProbeMode.ForcePointProbe` seam keep the old `GroupFor` + Z-set
+  rebuild path.
+- **Verified.** Full suite green incl. the existing flat-vs-spine SUM PBT and a
+  new MIN multi-key PBT (the non-linear / point-probe consumer), plus the SQL
+  spine-compile + random-query PBTs that exercise the typed `WeightOf`-on-run.
+- **Gate ([aggregate-probe-bench.md](aggregate-probe-bench.md), `aggprobe`).**
+  **1.3–5.5× faster `Step` on multi-key ticks, ~1.0× at `D == 1`.** Beats the
+  join's margin because the point-probe path here hashes the whole group *twice*
+  (build the before-Z-set, then the after-Z-set) — both passes the merge removes.
 
 ### What the code actually does today (verified)
 

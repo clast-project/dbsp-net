@@ -14,7 +14,7 @@ namespace DbspNet.Core.Operators.Stateful.Aggregators;
 public sealed class SumAggregator<T> : IAggregator<T, T>
     where T : struct, INumber<T>
 {
-    public Optional<T> Compute(ZSet<T, Z64> multiset)
+    public Optional<T> Compute(IMultiset<T, Z64> multiset)
     {
         ArgumentNullException.ThrowIfNull(multiset);
         if (multiset.IsEmpty)

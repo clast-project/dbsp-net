@@ -13,7 +13,7 @@ namespace DbspNet.Core.Operators.Stateful.Aggregators;
 public sealed class CountStarAggregator<T> : IAggregator<T, long>
     where T : notnull
 {
-    public Optional<long> Compute(ZSet<T, Z64> multiset)
+    public Optional<long> Compute(IMultiset<T, Z64> multiset)
     {
         ArgumentNullException.ThrowIfNull(multiset);
         var total = 0L;

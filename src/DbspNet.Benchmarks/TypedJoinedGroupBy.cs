@@ -39,7 +39,7 @@ internal static class TypedJoinedGroupBy
             public long DistinctRows;
         }
 
-        public Optional<long> Compute(ZSet<JoinedRow, Z64> multiset)
+        public Optional<long> Compute(IMultiset<JoinedRow, Z64> multiset)
         {
             if (multiset.IsEmpty)
             {
@@ -61,7 +61,7 @@ internal static class TypedJoinedGroupBy
             ref object? state,
             Optional<long> oldValue,
             ZSet<JoinedRow, Z64> delta,
-            ZSet<JoinedRow, Z64> after)
+            IMultiset<JoinedRow, Z64> after)
         {
             var s = state as SumState ?? new SumState();
             foreach (var (row, w) in delta)

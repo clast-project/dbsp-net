@@ -24,7 +24,7 @@ internal static class HllSupport
     /// a value present in any positive-weight row counts exactly once.
     /// </summary>
     public static void FoldPositive<TRow>(
-        HyperLogLog sketch, ZSet<TRow, Z64> rows, Func<TRow, object?> argExtract)
+        HyperLogLog sketch, IMultiset<TRow, Z64> rows, Func<TRow, object?> argExtract)
         where TRow : notnull
     {
         foreach (var (row, weight) in rows)

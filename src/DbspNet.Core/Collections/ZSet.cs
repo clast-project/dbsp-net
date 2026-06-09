@@ -11,7 +11,7 @@ namespace DbspNet.Core.Collections;
 /// the single mutation path (<see cref="ZSetBuilder{TKey,TWeight}"/>) drops
 /// them automatically and public operators preserve that invariant.
 /// </summary>
-public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IEnumerable<KeyValuePair<TKey, TWeight>>
+public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMultiset<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {

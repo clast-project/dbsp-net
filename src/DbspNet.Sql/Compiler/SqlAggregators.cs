@@ -26,7 +26,7 @@ namespace DbspNet.Sql.Compiler;
 /// </remarks>
 internal abstract class SqlAggregator
 {
-    public abstract object? Compute(ZSet<StructuralRow, Z64> rows);
+    public abstract object? Compute(IMultiset<StructuralRow, Z64> rows);
 
     /// <summary>
     /// Produce the new aggregate given the prior value, per-group delta, and
@@ -37,7 +37,7 @@ internal abstract class SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after) => Compute(after);
+        IMultiset<StructuralRow, Z64> after) => Compute(after);
 }
 
 internal sealed class SqlCountStarAggregator : SqlAggregator
@@ -47,7 +47,7 @@ internal sealed class SqlCountStarAggregator : SqlAggregator
         public long Count;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         var total = 0L;
         foreach (var (_, w) in rows)
@@ -62,7 +62,7 @@ internal sealed class SqlCountStarAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         var s = state as CountState ?? new CountState();
         foreach (var (_, w) in delta)
@@ -89,7 +89,7 @@ internal sealed class SqlCountAggregator : SqlAggregator
         public long Count;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         var total = 0L;
         foreach (var (row, w) in rows)
@@ -109,7 +109,7 @@ internal sealed class SqlCountAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         var s = state as CountState ?? new CountState();
         foreach (var (row, w) in delta)
@@ -169,7 +169,7 @@ internal sealed class SqlSumAggregator : SqlAggregator
         public long DistinctNonNullRows;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         switch (_resultType)
         {
@@ -241,7 +241,7 @@ internal sealed class SqlSumAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         switch (_resultType)
         {
@@ -370,7 +370,7 @@ internal sealed class SqlMinMaxAggregator : SqlAggregator
         public int Compare(object? x, object? y) => ((IComparable)x!).CompareTo(y);
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         object? best = null;
         foreach (var (row, w) in rows)
@@ -406,7 +406,7 @@ internal sealed class SqlMinMaxAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         var s = state as State ?? new State();
         foreach (var (row, w) in delta)
@@ -490,7 +490,7 @@ internal sealed class SqlAvgAggregator : SqlAggregator
         public long NonNullCount;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         if (_resultType is SqlDecimalType)
         {
@@ -539,7 +539,7 @@ internal sealed class SqlAvgAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         if (_resultType is SqlDecimalType)
         {
@@ -605,7 +605,7 @@ internal sealed class SqlApproxCountDistinctAggregator : SqlAggregator
         _argExtract = argExtract;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         var sketch = new HyperLogLog();
         HllSupport.FoldPositive(sketch, rows, _argExtract);
@@ -616,7 +616,7 @@ internal sealed class SqlApproxCountDistinctAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         var sketch = state as HyperLogLog;
         if (sketch is not null && IsInsertOnly(delta))
@@ -689,7 +689,7 @@ internal sealed class SqlApproxPercentileAggregator : SqlAggregator
         _fromDouble = fromDouble;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         var sketch = new DdSketch();
         DdSketchSupport.FoldSigned(sketch, rows, _argExtract, _toDouble);
@@ -700,7 +700,7 @@ internal sealed class SqlApproxPercentileAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         var sketch = state as DdSketch ?? new DdSketch();
         DdSketchSupport.FoldSigned(sketch, delta, _argExtract, _toDouble);
@@ -746,7 +746,7 @@ internal sealed class SqlExactQuantileAggregator : SqlAggregator
         _fromKey = fromKey;
     }
 
-    public override object? Compute(ZSet<StructuralRow, Z64> rows)
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
         var sketch = new OrderedQuantileSketch();
         DdSketchSupport.FoldSignedExact(sketch, rows, _argExtract, _toKey);
@@ -757,7 +757,7 @@ internal sealed class SqlExactQuantileAggregator : SqlAggregator
         ref object? state,
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> after)
+        IMultiset<StructuralRow, Z64> after)
     {
         var sketch = state as OrderedQuantileSketch ?? new OrderedQuantileSketch();
         DdSketchSupport.FoldSignedExact(sketch, delta, _argExtract, _toKey);
@@ -787,7 +787,7 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
         _outputSchema = outputSchema;
     }
 
-    public Optional<StructuralRow> Compute(ZSet<StructuralRow, Z64> multiset)
+    public Optional<StructuralRow> Compute(IMultiset<StructuralRow, Z64> multiset)
     {
         ArgumentNullException.ThrowIfNull(multiset);
         // Linear-preserving emission gate (DBSP paper §7.2-7.4 plus
@@ -816,7 +816,7 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
         ref object? state,
         Optional<StructuralRow> oldValue,
         ZSet<StructuralRow, Z64> delta,
-        ZSet<StructuralRow, Z64> afterMultiset)
+        IMultiset<StructuralRow, Z64> afterMultiset)
     {
         ArgumentNullException.ThrowIfNull(delta);
         ArgumentNullException.ThrowIfNull(afterMultiset);

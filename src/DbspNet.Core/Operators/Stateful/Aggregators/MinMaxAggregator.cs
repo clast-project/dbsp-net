@@ -29,7 +29,7 @@ public sealed class MinMaxAggregator<T> : IAggregator<T, T>
     public static MinMaxAggregator<T> Max(IComparer<T>? comparer = null)
         => new(wantMin: false, comparer ?? Comparer<T>.Default);
 
-    public Optional<T> Compute(ZSet<T, Z64> multiset)
+    public Optional<T> Compute(IMultiset<T, Z64> multiset)
     {
         ArgumentNullException.ThrowIfNull(multiset);
 

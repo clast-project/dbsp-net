@@ -67,6 +67,24 @@ if (args.Length > 0 && args[0] == "joinprobe")
     return 0;
 }
 
+// Aggregate merge-probe sub-command: `dotnet run -- aggprobe`
+// Point probe vs galloping merge driving SpineIncrementalAggregateOp.Step
+// (docs/design-row-representation.md §8, the IMultiset increment).
+if (args.Length > 0 && args[0] == "aggprobe")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — aggregate merge-probe");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.AggregateProbeBenchmark.Run(sb);
+    var apPath = Path.Combine(FindDocsDir(), "aggregate-probe-bench.md");
+    File.WriteAllText(apPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(apPath)}");
+    return 0;
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();

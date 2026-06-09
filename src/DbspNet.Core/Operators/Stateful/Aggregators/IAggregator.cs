@@ -21,7 +21,7 @@ public interface IAggregator<TValue, TOut>
     /// Non-optional for every aggregator — the fallback path when there is
     /// no incremental state available.
     /// </summary>
-    Optional<TOut> Compute(ZSet<TValue, Z64> multiset);
+    Optional<TOut> Compute(IMultiset<TValue, Z64> multiset);
 
     /// <summary>
     /// Produce the new aggregate value given the prior cached value
@@ -37,6 +37,6 @@ public interface IAggregator<TValue, TOut>
         ref object? state,
         Optional<TOut> oldValue,
         ZSet<TValue, Z64> delta,
-        ZSet<TValue, Z64> afterMultiset)
+        IMultiset<TValue, Z64> afterMultiset)
         => Compute(afterMultiset);
 }

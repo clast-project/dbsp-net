@@ -14,7 +14,7 @@ namespace DbspNet.Core.Operators.Stateful.Aggregators;
 public sealed class AvgAggregator<T> : IAggregator<T, double>
     where T : struct, INumber<T>
 {
-    public Optional<double> Compute(ZSet<T, Z64> multiset)
+    public Optional<double> Compute(IMultiset<T, Z64> multiset)
     {
         ArgumentNullException.ThrowIfNull(multiset);
         if (multiset.IsEmpty)

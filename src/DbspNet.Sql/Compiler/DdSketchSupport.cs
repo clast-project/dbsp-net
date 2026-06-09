@@ -43,7 +43,7 @@ internal static class DdSketchSupport
     /// per-tick delta into the running sketch agree exactly.
     /// </summary>
     public static void FoldSigned<TRow>(
-        DdSketch sketch, ZSet<TRow, Z64> rows, Func<TRow, object?> argExtract, Func<object, double> toDouble)
+        DdSketch sketch, IMultiset<TRow, Z64> rows, Func<TRow, object?> argExtract, Func<object, double> toDouble)
         where TRow : notnull
     {
         foreach (var (row, weight) in rows)
@@ -64,7 +64,7 @@ internal static class DdSketchSupport
     /// <see cref="OrderedQuantileSketch"/> with its signed weight.
     /// </summary>
     public static void FoldSignedExact<TRow>(
-        OrderedQuantileSketch sketch, ZSet<TRow, Z64> rows, Func<TRow, object?> argExtract, Func<object, long> toKey)
+        OrderedQuantileSketch sketch, IMultiset<TRow, Z64> rows, Func<TRow, object?> argExtract, Func<object, long> toKey)
         where TRow : notnull
     {
         foreach (var (row, weight) in rows)
