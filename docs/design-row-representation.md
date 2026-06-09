@@ -685,6 +685,60 @@ prize.
    to leave out of the first increment. The arrangement retains full history;
    adding coordinated frontier GC is a later step.
 
+### 9.5 — Spine arrangement increment (LANDED) — and an honest correction to §8.3
+
+Follow-up (1) above — the spine arrangement, expected to be "the bigger prize"
+because it would deduplicate the expensive sorted-batch build — was built and
+gated. **The expectation was wrong: spine sharing is real and correct, but its
+speedup is comparable to (often slightly below) the flat win, not larger.**
+
+**What landed.**
+- **`ISpineArrangement<TKey,TValue,TWeight>`** + **`SpineArrangeOp`**
+  (`Spine/SpineArrangement.cs`): unlike the flat handle (which exposes a
+  materialised `Current`), the spine handle exposes the
+  `SpineIndexedZSetTrace` **itself** plus its key comparer, so consumers probe
+  it by sorted-merge (`GroupForManySorted`) and never materialise the whole
+  integral.
+- **`SpineIncrementalJoinSharedRightOp`** (`Spine/SpineIncrementalJoinSharedRightOp.cs`):
+  probes the shared trace for `R_t` and owns only the delayed left trace. The
+  probe kernel was factored into **`SpineJoinProbe`** (shared by the
+  private-trace `SpineIncrementalJoinOp` and this one — no behaviour change,
+  `D==1`/`ForcePointProbe` seam preserved). Builder API (internal):
+  `SpineArrange` + `SpineIncrementalInnerJoinSharedRight`.
+- `SharedArrangementTests` is now parameterised over **both** substrates
+  (14 cases, all green; full suite 1655 passing); the `sharedarr` gate verifies
+  spine equivalence before timing.
+
+**Gate result (`sharedarr`, both substrate tables in
+[shared-arrangement-bench.md](shared-arrangement-bench.md)).** Across repeated
+runs, both substrates win and scale with fan-out — ~1.0–1.1× at `F=2`, climbing
+to ~1.2–1.4× at `F=8`. **Spine is not bigger than flat.** The absolutes explain
+why: at a given `F`/`D`, sharing removes a *similar absolute* per-tick cost on
+both substrates, but the spine's total Step is ~1.5–2× the flat Step (its
+`GroupForManySorted` probe across batches is heavier than a dict lookup), so the
+same saving is a *smaller fraction* of the spine baseline — the ratio is diluted.
+
+**Why the §8.3 hypothesis was wrong.** Sharing removes a relation's per-tick
+**maintenance** (the integrate). But that is not the dominant per-tick term: the
+per-consumer **probe** of `R_t` (each join probes with its own left delta), plus
+the cross-product / output build / left integrate, stay per-consumer and
+unshared. So deduplicating the integrate — even the expensive spine batch build —
+moves the total only modestly. More fundamentally, §8.3 conflated two levers:
+the spine substrate's q4 disadvantage is the per-tick **rebuild paid even with no
+reuse** (a *cross-tick / amortisation* problem), whereas arrangement sharing is a
+*cross-operator* lever that only fires when a relation is genuinely arranged by
+the same key for ≥2 consumers — which **q4 does not have** (§6.2). Cross-operator
+sharing is therefore a real, broad-surface win for fan-out / star-schema /
+repeated-CTE shapes, but it is **not** the lever that flips the spine substrate
+past flat on q4.
+
+**Net for the roadmap.** The shared-arrangement abstraction is complete and
+correct on both substrates. Its realistic payoff is a modest fan-out-scaling
+win, not a step change. The remaining follow-up that makes it reachable from SQL
+is the **arrangement-CSE optimizer rule** (§9.4 item 2). Closing the spine
+substrate's q4 gap is a *different* problem (cross-tick rebuild amortisation /
+larger ticks per replica), not addressed by sharing — see §5 and §8.3.
+
 ---
 
 ## Appendix — sources

@@ -30,8 +30,8 @@ internal static class SpineJoinProbeMode
 /// <para>The asymmetric two-pass form — <c>dl ⋈ R_t + L_{t-1} ⋈ dr</c>
 /// — is unchanged. The integrate ordering (right before, left after)
 /// matters identically; the bilinearity argument still holds.</para>
-/// <para><b>Probe direction.</b> Each <see cref="JoinInto"/> call
-/// iterates the delta side and probes the spine trace via
+/// <para><b>Probe direction.</b> Each <see cref="SpineJoinProbe.ProbeAndJoin"/>
+/// call iterates the delta side and probes the spine trace via
 /// <c>GroupFor</c>. This is the steady-state shape (delta &lt;&lt;
 /// trace); workloads where the delta is larger than the trace will
 /// pay the wrong-side iteration cost. The flat operator would pick the
@@ -160,102 +160,16 @@ internal sealed class SpineIncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>
 
         // dl ⋈ R_t — iterate dl, probe right spine. delta value is the left
         // side, so _combine takes (key, deltaValue, probeValue) directly.
-        ProbeAndJoin(dl, _rightTrace, _combine, builder);
+        SpineJoinProbe.ProbeAndJoin(dl, _rightTrace, _combine, _keyComparer, builder);
 
         // L_{t-1} ⋈ dr — iterate dr, probe left spine. delta value is the
         // right side now, so the probe value fills _combine's left slot.
-        ProbeAndJoin(dr, _leftTrace, _combineSwapped, builder);
+        SpineJoinProbe.ProbeAndJoin(dr, _leftTrace, _combineSwapped, _keyComparer, builder);
 
         _output.SetCurrent(builder.Build());
 
         _leftTrace.Integrate(dl);
         CollectGarbage();
-    }
-
-    /// <summary>
-    /// Joins one delta side against the integrated <paramref name="trace"/> on
-    /// the other side. Replaces the per-key <c>GroupFor</c> point-probe with a
-    /// single batched galloping merge (<see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}.GroupForManySorted"/>):
-    /// the delta keys are sorted once and each sorted batch's outer-key column
-    /// is walked once, so probe-side misses skip in ~one comparison instead of
-    /// a full bloom + binary search per key. Matched groups arrive as sorted
-    /// <c>(value, weight)</c> runs sliced straight from the batch columns — the
-    /// cross-product consumes them by iteration exactly like the dictionary
-    /// group it replaces, so the output is identical (see
-    /// docs/design-row-representation.md §8 and docs/merge-probe-bench.md).
-    /// </summary>
-    /// <remarks>
-    /// The merge only pays off once the tick spans more than one key — at
-    /// <c>D == 1</c> a single point probe beats the per-batch cursor setup
-    /// (merge-probe-bench.md), so single-key ticks keep today's path.
-    /// </remarks>
-    private void ProbeAndJoin<TDelta, TProbe>(
-        IndexedZSet<TKey, TDelta, TWeight> delta,
-        SpineIndexedZSetTrace<TKey, TProbe, TWeight> trace,
-        Func<TKey, TDelta, TProbe, TOut> combine,
-        ZSetBuilder<TOut, TWeight> builder)
-        where TDelta : notnull
-        where TProbe : notnull
-    {
-        if (delta.IsEmpty)
-        {
-            return;
-        }
-
-        if (SpineJoinProbeMode.ForcePointProbe || delta.GroupCount == 1)
-        {
-            foreach (var (key, dGroup) in delta)
-            {
-                var pGroup = trace.GroupFor(key);
-                if (pGroup.IsEmpty)
-                {
-                    continue;
-                }
-
-                foreach (var (dv, dw) in dGroup)
-                {
-                    foreach (var (pv, pw) in pGroup)
-                    {
-                        builder.Add(combine(key, dv, pv), TWeight.Multiply(dw, pw));
-                    }
-                }
-            }
-
-            return;
-        }
-
-        var sortedKeys = SortedKeysOf(delta);
-        foreach (var (key, pRun) in trace.GroupForManySorted(sortedKeys))
-        {
-            var dGroup = delta.GroupFor(key);
-            foreach (var (dv, dw) in dGroup)
-            {
-                foreach (var (pv, pw) in pRun)
-                {
-                    builder.Add(combine(key, dv, pv), TWeight.Multiply(dw, pw));
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// The delta's distinct outer keys, sorted by this op's key comparer (the
-    /// same order the spine batches are sorted by) — the contract
-    /// <see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}.GroupForManySorted"/>
-    /// requires.
-    /// </summary>
-    private TKey[] SortedKeysOf<TDelta>(IndexedZSet<TKey, TDelta, TWeight> delta)
-        where TDelta : notnull
-    {
-        var keys = new TKey[delta.GroupCount];
-        var i = 0;
-        foreach (var key in delta.Keys)
-        {
-            keys[i++] = key;
-        }
-
-        Array.Sort(keys, _keyComparer);
-        return keys;
     }
 
     // Frontier-driven GC: when the join key is monotone on BOTH sides, drop

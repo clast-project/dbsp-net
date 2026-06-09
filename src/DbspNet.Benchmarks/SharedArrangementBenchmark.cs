@@ -7,6 +7,7 @@ using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Linear;
 using DbspNet.Core.Operators.Stateful;
+using DbspNet.Core.Operators.Stateful.Spine;
 
 namespace DbspNet.Benchmarks;
 
@@ -40,11 +41,30 @@ internal static class SharedArrangementBenchmark
     private const int StateKeys = 20_000;
     private const int GroupSize = 2;
 
-    private readonly record struct LeftRow(int Key);
+    // IComparable so the spine traces (sorted-columnar batches) can order rows.
+    private readonly record struct LeftRow(int Key) : IComparable<LeftRow>
+    {
+        public int CompareTo(LeftRow other) => Key.CompareTo(other.Key);
+    }
 
     // Wide shared-relation row: the integrate the arrangement deduplicates pays
-    // a real structural hash per value row.
-    private readonly record struct Fact(int Key, long F1, long F2, long F3, long F4, long F5);
+    // a real structural hash (flat) or sorted-batch build (spine) per value row.
+    private readonly record struct Fact(int Key, long F1, long F2, long F3, long F4, long F5) : IComparable<Fact>
+    {
+        public int CompareTo(Fact other)
+        {
+            var c = Key.CompareTo(other.Key);
+            if (c != 0) { return c; }
+            c = F1.CompareTo(other.F1);
+            if (c != 0) { return c; }
+            c = F2.CompareTo(other.F2);
+            if (c != 0) { return c; }
+            c = F3.CompareTo(other.F3);
+            if (c != 0) { return c; }
+            c = F4.CompareTo(other.F4);
+            return c != 0 ? c : F5.CompareTo(other.F5);
+        }
+    }
 
     private readonly record struct OutRow(int Key, long V);
 
@@ -56,29 +76,89 @@ internal static class SharedArrangementBenchmark
         output.AppendLine("## Shared arrangement — one shared index vs F private right traces");
         output.AppendLine();
         output.AppendLine(
-            "Gate for docs/design-row-representation.md §6.2 (Option 2, cross-operator " +
-            "shared arrangements). A relation `R` (wide rows) is joined by `F` " +
-            "downstream joins on the same key. **Unshared** = `F` plain " +
-            "`IncrementalInnerJoin`s, each integrating `R`'s delta into its own right " +
-            "trace. **Shared** = one `Arrange(R)` + `F` `IncrementalInnerJoinSharedRight` " +
+            "Gate for docs/design-row-representation.md §6.2 / §9 (Option 2, cross-operator " +
+            "shared arrangements). A relation `R` (wide rows) is joined by `F` downstream " +
+            "joins on the same key. **Unshared** = `F` plain inner joins, each maintaining " +
+            "its own right trace. **Shared** = one `Arrange(R)` + `F` shared-right joins " +
             "reading that single integral. Same inputs, same join math, output verified " +
             "identical. Each tick pushes a `D`-key delta into `R` and into each of the " +
             "`F` left relations, alternating +1/-1 so state stays bounded. Times are " +
             "median ns per **Step**; **Speedup** is unshared/shared (>1 = sharing wins). " +
-            $"State: {StateKeys:N0} keys/relation, group size {GroupSize}.");
+            "Both substrates are measured: **flat** (dictionary trace) and **spine** " +
+            "(LSM sorted-columnar trace — where the deduplicated maintenance is the " +
+            $"expensive batch build, the §8.3 q4 cost). State: {StateKeys:N0} keys/relation, " +
+            $"group size {GroupSize}.");
         output.AppendLine();
 
         // Correctness self-check before timing (cheap insurance the A/B is honest).
-        VerifyEquivalence();
-        Console.WriteLine("  Output equivalence (shared == unshared): OK");
-        output.AppendLine("Output equivalence (shared vs unshared) verified before timing. ");
+        VerifyEquivalence(spine: false);
+        VerifyEquivalence(spine: true);
+        Console.WriteLine("  Output equivalence (shared == unshared, flat + spine): OK");
+        output.AppendLine("Output equivalence (shared vs unshared) verified before timing on both substrates. ");
         output.AppendLine();
 
-        // Process-wide warmup so the first timed config doesn't eat tiered-JIT
-        // promotion of the generic operator instantiations (it would otherwise
-        // read as anomalously slow). Exercises both builds at the largest size.
-        _ = MeasureStep(FanOuts[^1], DeltaWidths[^1], shared: false);
-        _ = MeasureStep(FanOuts[^1], DeltaWidths[^1], shared: true);
+        EmitGrid(output, spine: false);
+        EmitGrid(output, spine: true);
+
+        output.AppendLine("## Reading");
+        output.AppendLine();
+        output.AppendLine(
+            "- **Sharing wins on both substrates, and the win grows with fan-out.** The " +
+            "unshared build maintains `R`'s delta in `F` private right traces; the shared " +
+            "build does it once, so the duplicated maintenance removed grows with `F`. " +
+            "Across repeated runs both substrates land ~1.0–1.1× at `F=2` and climb to " +
+            "~1.2–1.4× at `F=8` (cells carry ~±0.1× jitter; read the trend in `F`).");
+        output.AppendLine(
+            "- **Spine sharing is NOT bigger than flat sharing — it is comparable, often " +
+            "slightly smaller in ratio.** This refutes the §8.3-derived hypothesis. The " +
+            "reason is in the absolutes: at, say, `F=8, D=1024`, sharing removes a *similar " +
+            "absolute* per-tick cost on both substrates (~1.3–1.8 ms), but spine's total " +
+            "Step is ~1.5–2× the flat Step because its probe (`GroupForManySorted` across " +
+            "the batches) is heavier — so the same absolute saving is a *smaller fraction* " +
+            "of the spine baseline, and the ratio is diluted.");
+        output.AppendLine(
+            "- **Why: the deduplicated cost is not the dominant per-tick term.** What " +
+            "sharing removes is `R`'s per-tick maintenance (the integrate — a dict merge on " +
+            "flat, a small batch build + amortised compaction on spine). What it does NOT " +
+            "remove is the per-consumer **probe** of `R_t` (each join still probes with its " +
+            "own left delta) plus the cross-product, output build, and left integrate. On " +
+            "the spine the probe is the larger term, so deduplicating the integrate moves " +
+            "the ratio less, not more.");
+        output.AppendLine();
+        output.AppendLine("## Verdict");
+        output.AppendLine();
+        output.AppendLine(
+            "Cross-operator shared arrangements work and are correct on both substrates " +
+            "(output verified identical to independent joins, here and in " +
+            "`SharedArrangementTests`). The realistic win is **modest and fan-out-scaling " +
+            "on both — ~1.0–1.4×**, and — contrary to the §8.3 expectation — the spine win " +
+            "is **not** larger than the flat win. The honest correction to §8.3: " +
+            "cross-operator sharing deduplicates a relation's per-tick *maintenance*, but " +
+            "the spine substrate's disadvantage on q4 is the per-tick *rebuild* paid even " +
+            "with no reuse — a cross-tick / amortisation problem, not a cross-operator one — " +
+            "and q4 has no shareable arrangement anyway (§6.2). So sharing is a real, " +
+            "broad-surface win for fan-out / star-schema / repeated-CTE shapes, **not** the " +
+            "lever that flips spine past flat. The reusable abstraction (`IArrangement` / " +
+            "`ISpineArrangement` + `Arrange` / `SpineArrange` + the shared-right joins) is " +
+            "in place on both substrates; the remaining follow-up is an **arrangement-CSE " +
+            "optimizer rule** so real SQL with a relation joined by the same key in ≥2 " +
+            "places routes through one arrangement automatically (today the feature is " +
+            "reachable only via the Core builder API).");
+        output.AppendLine();
+    }
+
+    /// <summary>Emits the F×D unshared/shared/speedup table for one substrate.</summary>
+    private static void EmitGrid(StringBuilder output, bool spine)
+    {
+        var name = spine ? "Spine" : "Flat";
+        Console.WriteLine($"  --- {name} substrate ---");
+        output.AppendLine($"### {name} substrate");
+        output.AppendLine();
+
+        // Process-wide warmup so the first timed config of this substrate doesn't
+        // eat tiered-JIT promotion of its generic operator instantiations.
+        _ = MeasureStep(FanOuts[^1], DeltaWidths[^1], shared: false, spine: spine);
+        _ = MeasureStep(FanOuts[^1], DeltaWidths[^1], shared: true, spine: spine);
 
         output.AppendLine("| Fan-out F | D (keys/tick) | Unshared | Shared | Speedup |");
         output.AppendLine("|----------:|--------------:|---------:|-------:|--------:|");
@@ -87,8 +167,8 @@ internal static class SharedArrangementBenchmark
         {
             foreach (var d in DeltaWidths)
             {
-                var unshared = MeasureStep(f, d, shared: false);
-                var shared = MeasureStep(f, d, shared: true);
+                var unshared = MeasureStep(f, d, shared: false, spine: spine);
+                var shared = MeasureStep(f, d, shared: true, spine: spine);
                 var speedup = shared > 0 ? unshared / shared : 0.0;
 
                 Console.WriteLine(
@@ -101,53 +181,6 @@ internal static class SharedArrangementBenchmark
         }
 
         output.AppendLine();
-        output.AppendLine("## Reading");
-        output.AppendLine();
-        output.AppendLine(
-            "- **Sharing wins across the grid, and the win grows with fan-out.** Every " +
-            "cell is ≥ 1.0× (sharing never loses): the unshared build integrates `R`'s " +
-            "delta into `F` private right traces, the shared build does it once, so the " +
-            "duplicated maintenance removed grows with the number of consumers. Across " +
-            "repeated runs `F = 2` (one duplicate integrate saved) is the marginal case " +
-            "(~1.0–1.3×), `F = 4` lands ~1.2–1.4×, and `F = 8` reaches ~1.5×. The trend " +
-            "in `F` is robust; individual cells carry ~±0.2× run-to-run jitter.");
-        output.AppendLine(
-            "- **Clearest at moderate ticks; very wide ticks get noisy.** The cleanest, " +
-            "most repeatable win is around `D = 1024`. At `D = 4096` each Step allocates " +
-            "and frees large Z-sets, so per-tick allocation / GC starts to dominate and " +
-            "dilutes (and destabilises) the integrate-sharing signal — the win is real " +
-            "but the ratio wobbles.");
-        output.AppendLine(
-            "- **The ceiling is modest because the flat integrate is cheap.** A flat " +
-            "`IndexedZSetTrace.Integrate` is an in-place dictionary merge; even shared " +
-            "across 8 consumers it is only a fraction of per-tick work (the rest — the two " +
-            "join passes, output build, and left-trace integrate — is per-consumer and " +
-            "unchanged). So flat sharing tops out around ~1.5×, not `F`×. This is the " +
-            "honest cross-operator result on the substrate that wins on q4 today.");
-        output.AppendLine(
-            "- **The bigger prize is the spine arrangement, not the flat one.** On the " +
-            "spine path the duplicated per-consumer maintenance is a full sorted-columnar " +
-            "**batch build** (+ bloom + compaction) — the exact §8.3 q4 substrate cost — " +
-            "which is far more expensive than a dict merge, so sharing it should pay much " +
-            "more. That variant (a spine `Arrange` whose consumers probe via " +
-            "`GroupForManySorted` against the shared trace) reuses this same " +
-            "`IArrangement` abstraction and is the natural follow-up.");
-        output.AppendLine();
-        output.AppendLine("## Verdict");
-        output.AppendLine();
-        output.AppendLine(
-            "Cross-operator shared arrangements work and are correct (output verified " +
-            "identical to independent joins, here and in `SharedArrangementTests`). On the " +
-            "flat substrate the win is real but modest — up to ~1.5× at fan-out 8 — " +
-            "because the maintenance it deduplicates (a dictionary integrate) is already " +
-            "cheap. The abstraction (`IArrangement` + `Arrange` + " +
-            "`IncrementalInnerJoinSharedRight`) is the reusable foundation; the two " +
-            "follow-ups that turn it into a headline win are (1) the **spine** arrangement " +
-            "(shares the expensive batch build — the §8.3 bottleneck) and (2) an " +
-            "**arrangement-CSE optimizer rule** so real SQL with a relation joined by the " +
-            "same key in ≥2 places routes through one `Arrange` automatically (today the " +
-            "feature is reachable only via the Core builder API).");
-        output.AppendLine();
     }
 
     /// <summary>
@@ -155,9 +188,9 @@ internal static class SharedArrangementBenchmark
     /// <paramref name="d"/>-key per-tick deltas, either sharing one arrangement of
     /// <c>R</c> or giving each join a private right trace.
     /// </summary>
-    private static double MeasureStep(int f, int d, bool shared)
+    private static double MeasureStep(int f, int d, bool shared, bool spine)
     {
-        var (circuit, lefts, r, _) = Build(f, StateKeys, shared);
+        var (circuit, lefts, r, _) = Build(f, StateKeys, shared, spine);
 
         // D keys evenly spread over the populated keyspace, sorted.
         var keys = new int[d];
@@ -217,7 +250,7 @@ internal static class SharedArrangementBenchmark
     /// <paramref name="n"/> distinct keys so the joins probe a realistic state.
     /// </summary>
     private static (RootCircuit Circuit, InputHandle<ZSet<LeftRow, Z64>>[] Lefts, InputHandle<ZSet<Fact, Z64>> R, OutputHandle<ZSet<OutRow, Z64>>[] Outs)
-        Build(int f, int n, bool shared)
+        Build(int f, int n, bool shared, bool spine)
     {
         var lefts = new InputHandle<ZSet<LeftRow, Z64>>[f];
         var outs = new OutputHandle<ZSet<OutRow, Z64>>[f];
@@ -228,16 +261,25 @@ internal static class SharedArrangementBenchmark
             var (rh, rs) = b.ZSetInput<Fact, Z64>();
             ri = rh;
             var rIdx = b.IndexBy(rs, x => x.Key);
-            IArrangement<int, Fact, Z64>? arr = shared ? b.Arrange(rIdx) : null;
+            IArrangement<int, Fact, Z64>? flatArr = shared && !spine ? b.Arrange(rIdx) : null;
+            ISpineArrangement<int, Fact, Z64>? spineArr = shared && spine ? b.SpineArrange(rIdx) : null;
 
             for (var i = 0; i < f; i++)
             {
                 var (lh, ls) = b.ZSetInput<LeftRow, Z64>();
                 lefts[i] = lh;
                 var lIdx = b.IndexBy(ls, x => x.Key);
-                var joined = shared
-                    ? b.IncrementalInnerJoinSharedRight(lIdx, rIdx, arr!, (key, _, fact) => new OutRow(key, fact.F1))
-                    : b.IncrementalInnerJoin(lIdx, rIdx, (key, _, fact) => new OutRow(key, fact.F1));
+                Stream<ZSet<OutRow, Z64>> joined = (shared, spine) switch
+                {
+                    (true, true) => b.SpineIncrementalInnerJoinSharedRight(
+                        lIdx, rIdx, spineArr!, (key, _, fact) => new OutRow(key, fact.F1)),
+                    (false, true) => b.SpineIncrementalInnerJoin(
+                        lIdx, rIdx, (key, _, fact) => new OutRow(key, fact.F1)),
+                    (true, false) => b.IncrementalInnerJoinSharedRight(
+                        lIdx, rIdx, flatArr!, (key, _, fact) => new OutRow(key, fact.F1)),
+                    (false, false) => b.IncrementalInnerJoin(
+                        lIdx, rIdx, (key, _, fact) => new OutRow(key, fact.F1)),
+                };
                 outs[i] = b.Output(joined);
             }
         });
@@ -279,11 +321,11 @@ internal static class SharedArrangementBenchmark
     /// Drives a small shared and unshared build with identical random deltas and
     /// asserts the per-tick outputs match, so the timed A/B is comparing equal work.
     /// </summary>
-    private static void VerifyEquivalence()
+    private static void VerifyEquivalence(bool spine)
     {
         const int f = 4;
-        var (sc, sl, sr, sOut) = Build(f, 200, shared: true);
-        var (uc, ul, ur, uOut) = Build(f, 200, shared: false);
+        var (sc, sl, sr, sOut) = Build(f, 200, shared: true, spine: spine);
+        var (uc, ul, ur, uOut) = Build(f, 200, shared: false, spine: spine);
 
         var rng = new Random(20260608);
         for (var tick = 0; tick < 40; tick++)

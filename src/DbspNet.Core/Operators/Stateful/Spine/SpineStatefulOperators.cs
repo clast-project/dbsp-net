@@ -132,6 +132,79 @@ public static class SpineStatefulOperators
     }
 
     /// <summary>
+    /// Build a <b>shared</b> spine arrangement over an already-indexed delta
+    /// stream: one <see cref="SpineArrangeOp{TKey,TValue,TWeight}"/> integrates
+    /// the stream into a single spine trace that many downstream joins probe via
+    /// <see cref="SpineIncrementalInnerJoinSharedRight{TKey,TLeft,TRight,TOut,TWeight}"/>,
+    /// instead of each join building and re-maintaining a private right trace
+    /// (docs/design-row-representation.md §6.2 / §9 — cross-operator sharing on
+    /// the spine, where the deduplicated cost is the expensive sorted-batch
+    /// build). Register before its consumers (the normal bottom-up build order
+    /// does this).
+    /// </summary>
+    internal static ISpineArrangement<TKey, TValue, TWeight> SpineArrange<TKey, TValue, TWeight>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TValue, TWeight>> input,
+        ICompactionStrategy? compactionStrategy = null,
+        IComparer<TKey>? keyComparer = null,
+        IComparer<TValue>? valueComparer = null,
+        SpineIndexedSpillConfig<TKey, TValue, TWeight>? spillConfig = null)
+        where TKey : notnull
+        where TValue : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+
+        var op = new SpineArrangeOp<TKey, TValue, TWeight>(
+            input, compactionStrategy, keyComparer, valueComparer, spillConfig);
+        builder.AddRawOperator(op);
+        return op;
+    }
+
+    /// <summary>
+    /// Spine-backed incremental inner equi-join whose RIGHT side is a
+    /// <b>shared</b> <see cref="ISpineArrangement{TKey,TValue,TWeight}"/> (built
+    /// by <see cref="SpineArrange{TKey,TValue,TWeight}"/>) rather than a private
+    /// trace. <paramref name="rightDelta"/> is the same indexed delta stream the
+    /// arrangement consumes (used for the <c>L_{t-1} ⋈ dr</c> pass); the
+    /// arrangement supplies the integrated <c>R_t</c>. Output is identical to
+    /// <see cref="SpineIncrementalInnerJoin{TKey,TLeft,TRight,TOut,TWeight}"/>
+    /// over the same inputs. The join still owns its own left trace, so pass a
+    /// matching <paramref name="keyComparer"/> (the same one used to build the
+    /// arrangement) and an optional <paramref name="leftValueComparer"/>.
+    /// </summary>
+    internal static Stream<ZSet<TOut, TWeight>> SpineIncrementalInnerJoinSharedRight<TKey, TLeft, TRight, TOut, TWeight>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
+        Stream<IndexedZSet<TKey, TRight, TWeight>> rightDelta,
+        ISpineArrangement<TKey, TRight, TWeight> rightArrangement,
+        Func<TKey, TLeft, TRight, TOut> combine,
+        ICompactionStrategy? compactionStrategy = null,
+        IComparer<TKey>? keyComparer = null,
+        IComparer<TLeft>? leftValueComparer = null,
+        SpineIndexedSpillConfig<TKey, TLeft, TWeight>? leftSpillConfig = null)
+        where TKey : notnull
+        where TLeft : notnull
+        where TRight : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(rightDelta);
+        ArgumentNullException.ThrowIfNull(rightArrangement);
+        ArgumentNullException.ThrowIfNull(combine);
+
+        var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
+        builder.AddRawOperator(
+            new SpineIncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOut, TWeight>(
+                left, rightDelta, rightArrangement, output, combine,
+                compactionStrategy, keyComparer, leftValueComparer, leftSpillConfig));
+        return output;
+    }
+
+    /// <summary>
     /// Incremental LEFT OUTER equi-join with both traces backed by the spine.
     /// Observable behaviour matches <see cref="StatefulOperators.IncrementalLeftJoin"/>.
     /// </summary>
