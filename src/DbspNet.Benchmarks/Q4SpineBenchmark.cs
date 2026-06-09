@@ -57,7 +57,14 @@ internal static class Q4SpineBenchmark
         Flat,
         SpinePoint,
         SpineMerge,
+        SpinePointStaged,
+        SpineMergeStaged,
     }
+
+    // Memtable flush threshold (distinct keys) for the staged configs — a few
+    // q4 replica-ticks' worth, so the spine integrate amortises its batch build
+    // across many ticks instead of building one per tick (docs §9.7).
+    private const int StagingCapacity = 8192;
 
     public static void Run(StringBuilder output, int totalEvents, int? workersOverride, int runs)
     {
@@ -100,6 +107,14 @@ internal static class Q4SpineBenchmark
         output.AppendLine(
             "- **spine·merge** — `TraceFamily.Spine` with the merge probe live. Isolates " +
             "the merge probe's contribution on top of spine·point.");
+        output.AppendLine(
+            $"- **spine·point·staged / spine·merge·staged** — the same two, with the " +
+            $"per-tick **memtable** enabled (flush threshold {StagingCapacity:N0} keys, docs " +
+            "§9.7): each tick's delta is an in-place dictionary merge that flushes to a " +
+            "sorted batch only every few ticks, instead of a fresh batch build per tick. " +
+            "This targets the §8.3 finding that the substrate's loss to flat was the " +
+            "per-tick build, not the probe — so *staged vs un-staged* is staging's " +
+            "contribution, and *spine·merge·staged vs flat* is the real question.");
         output.AppendLine();
         output.AppendLine(
             $"Stream: {totalEvents:N0} events, W={workers}, median step throughput of {runs} " +
@@ -147,7 +162,11 @@ internal static class Q4SpineBenchmark
         output.AppendLine("|:-------|-----------:|----------:|--------------:|--------------:|------------:|------------:|");
 
         double flatStepMs = 0;
-        foreach (var config in new[] { Config.Flat, Config.SpinePoint, Config.SpineMerge })
+        foreach (var config in new[]
+        {
+            Config.Flat, Config.SpinePoint, Config.SpineMerge,
+            Config.SpinePointStaged, Config.SpineMergeStaged,
+        })
         {
             var (splitMs, stepMs, gatherMs, outputRows, result) =
                 MeasureMedian(plan, workers, config, events, consumed, batchSize, runs);
@@ -225,8 +244,12 @@ internal static class Q4SpineBenchmark
             ? CompileOptions.Default
             : new CompileOptions { TraceFamily = TraceFamily.Spine };
 
-        SpineJoinProbeMode.ForcePointProbe = config == Config.SpinePoint;
-        SpineAggregateProbeMode.ForcePointProbe = config == Config.SpinePoint;
+        var isPoint = config is Config.SpinePoint or Config.SpinePointStaged;
+        var isStaged = config is Config.SpinePointStaged or Config.SpineMergeStaged;
+        SpineJoinProbeMode.ForcePointProbe = isPoint;
+        SpineAggregateProbeMode.ForcePointProbe = isPoint;
+        // Read at trace construction during the compile below; cleared in finally.
+        SpineStagingConfig.Capacity = isStaged ? StagingCapacity : 0;
         try
         {
             if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, options))
@@ -284,6 +307,7 @@ internal static class Q4SpineBenchmark
         {
             SpineJoinProbeMode.ForcePointProbe = false;
             SpineAggregateProbeMode.ForcePointProbe = false;
+            SpineStagingConfig.Capacity = 0;
         }
     }
 
@@ -352,7 +376,9 @@ internal static class Q4SpineBenchmark
     {
         Config.Flat => "flat",
         Config.SpinePoint => "spine·point",
-        _ => "spine·merge",
+        Config.SpineMerge => "spine·merge",
+        Config.SpinePointStaged => "spine·point·staged",
+        _ => "spine·merge·staged",
     };
 
     private static string TableName(NexmarkTable t) => t switch

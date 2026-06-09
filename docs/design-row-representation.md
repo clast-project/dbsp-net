@@ -790,6 +790,66 @@ guards currently exclude.
 
 ---
 
+## 10. Cross-tick amortisation — the spine memtable (the actual q4 lever, LANDED)
+
+§9.5/§9.6 established that cross-operator *sharing* is not what closes the spine
+substrate's q4 gap: that gap (§8.3) is the **per-tick rebuild paid even with no
+reuse**. At W=24 each replica's tick delta is `batch/24` rows, so the spine
+builds many *tiny* sorted-columnar batches per tick (sort + bloom + compaction)
+where the flat dictionary does in-place updates. This is a *cross-tick* problem,
+and the classic LSM fix is a **memtable**.
+
+**What landed.** `SpineIndexedZSetTrace` gains an in-memory mutable memtable
+(an `IndexedZSet`). When enabled, `Integrate(delta)` folds the delta into the
+memtable **in place** (flat-dictionary cost) and flushes it into ONE sorted
+batch only when it holds ≥ N distinct keys — amortising the batch build + bloom +
+compaction across ~N keys' worth of ticks instead of paying it every tick. Every
+read path (`GroupFor`, `GroupForManySorted`, `Materialize`/`Entries`/`GroupCount`,
+`IsEmpty`), GC (`DropKeysBelow`), and snapshot (`GetBatches` flushes first) merges
+the memtable with the immutable batches, so results are unchanged. Weights sum
+across memtable + batches exactly as across batches (Z-set addition is
+commutative), so the memtable is just one more additive layer.
+
+**Opt-in, default-off, zero behaviour change.** The threshold is a static seam
+`SpineStagingConfig.Capacity` (default 0 = disabled), mirroring
+`SpineJoinProbeMode.ForcePointProbe`. At 0 the memtable is never populated and
+every read's `!_memtable.IsEmpty` guard short-circuits, so the trace is
+byte-identical to before — all ~13 batch/level-structure assertions and the four
+flat-vs-spine PBTs pass untouched. A trace reads the seam once at construction,
+so it needs no operator/builder signature change (dodging the typed-compiler
+reflection gotcha) and no wide plumbing.
+
+**Verification.** New `SpineMemtableTests`: with staging on (capacities 1/4/16/64)
+the trace matches a flat oracle on `GroupFor` + `GroupForManySorted` + `Materialize`
+read *every tick* (mid-stream, before any flush), plus targeted memtable-only-key,
+flush-on-snapshot, GC-from-memtable, and intra-memtable-cancellation cases. Full
+suite 1668 green. The q4 gate's end-to-end output cross-check (every config must
+reproduce flat) also passed with staging on the real parallel pipeline.
+
+**Gate result (`q4spine`, staged configs added; [q4-spine-bench.md](q4-spine-bench.md)).**
+Staging **closes the §8.3 gap**: at the realistic small batch (10k), spine goes
+from clearly losing to flat — spine·point 0.47–0.66×, spine·merge 0.53–0.92× —
+to **competitive parity, ~0.8–1.2×** (staging roughly *doubles* spine step
+throughput); at batch 100k it reaches **parity, ~1.0–1.03×**. Run-to-run noise on
+this heavy parallel benchmark straddles 1.0× at 10k (one run 1.10–1.23×, another
+0.79–0.84×), so the honest claim is *gap closed / parity*, not a guaranteed win.
+Two further findings: (1) **staged·point ≈ staged·merge** — once the memtable
+absorbs recent deltas at tiny per-tick D, the merge probe adds little over a dict
+point-probe (the §5 `D==1` caveat); the memtable, not the probe, is what matters
+here. (2) Staging helps **most at small batches** (tiny ticks, where the per-tick
+build dominated) and least at large batches (where the build was already
+amortised over a wide tick) — the inverse of the merge probe's batch-size curve.
+
+**Net.** This is the increment that makes the spine substrate *competitive* with
+the flat dictionary on q4 — the blocker §8.3/§9.5 identified. It is opt-in and
+default-off; flipping `TraceFamily.Spine` + a memtable capacity toward a default
+is a follow-up gated on a fuller eval (1M events, more runs, more queries, and
+tuning the capacity). The memtable applies to `SpineIndexedZSetTrace` (join +
+aggregate + shared arrangements); the `SpineZSetTrace` used by DISTINCT / import
+traces is the same idea, deferred.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,

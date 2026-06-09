@@ -31,6 +31,16 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     private readonly Func<TKey, long>? _monotoneKey;
     private long _spillCounter;
 
+    // Cross-tick amortisation (docs §9.7). When _stagingCapacity > 0, per-tick
+    // deltas accumulate in this mutable memtable (in-place dict merge — flat
+    // cost) and flush into ONE sorted batch only when it holds ≥ that many keys,
+    // instead of building a fresh batch every Integrate. When 0 the memtable is
+    // never populated and every read's `!_memtable.IsEmpty` guard short-circuits,
+    // so behaviour is byte-identical to the pre-memtable trace.
+    private readonly int _stagingCapacity;
+    private IndexedZSet<TKey, TValue, TWeight> _memtable =
+        new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
+
     public SpineIndexedZSetTrace() : this(TieredCompactionStrategy.Default, keyComparer: null, valueComparer: null)
     {
     }
@@ -40,7 +50,8 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         IComparer<TKey>? keyComparer = null,
         IComparer<TValue>? valueComparer = null,
         SpineIndexedSpillConfig<TKey, TValue, TWeight>? spillConfig = null,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null,
+        int? stagingCapacity = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
@@ -48,6 +59,7 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         _valueComparer = valueComparer ?? Comparer<TValue>.Default;
         _spillConfig = spillConfig;
         _monotoneKey = monotoneKey;
+        _stagingCapacity = stagingCapacity ?? SpineStagingConfig.Capacity;
     }
 
     /// <summary>
@@ -63,9 +75,41 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
             return;
         }
 
+        if (_stagingCapacity <= 0)
+        {
+            // Memtable disabled: one sorted batch per delta (original behaviour).
+            EnsureLevel(0);
+            _levels[0].Add(ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
+                delta, _keyComparer, _valueComparer, _monotoneKey));
+            RunCompaction();
+            return;
+        }
+
+        // Memtable enabled: fold the delta in place (flat-dictionary cost) and
+        // only materialise a sorted batch once enough keys have accumulated.
+        _memtable.MergeInPlace(delta);
+        if (_memtable.GroupCount >= _stagingCapacity)
+        {
+            FlushMemtable();
+        }
+    }
+
+    /// <summary>
+    /// Materialises the memtable into a single sorted batch at level 0 and
+    /// compacts, then resets the memtable. No-op when the memtable is empty (so
+    /// it is also safe to call before snapshot / on a disabled trace).
+    /// </summary>
+    private void FlushMemtable()
+    {
+        if (_memtable.IsEmpty)
+        {
+            return;
+        }
+
         EnsureLevel(0);
         _levels[0].Add(ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
-            delta, _keyComparer, _valueComparer, _monotoneKey));
+            _memtable, _keyComparer, _valueComparer, _monotoneKey));
+        _memtable = new IndexedZSet<TKey, TValue, TWeight>(new Dictionary<TKey, ZSet<TValue, TWeight>>());
         RunCompaction();
     }
 
@@ -89,6 +133,18 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         ArgumentNullException.ThrowIfNull(monotoneKey);
 
         List<TKey>? removed = null;
+
+        // Drop sub-frontier keys from the memtable too (it holds the most recent,
+        // un-flushed deltas).
+        if (!_memtable.IsEmpty)
+        {
+            var memRemoved = _memtable.RemoveKeysBelow(threshold, monotoneKey);
+            if (memRemoved.Count > 0)
+            {
+                (removed ??= new List<TKey>()).AddRange(memRemoved);
+            }
+        }
+
         for (var li = 0; li < _levels.Count; li++)
         {
             var level = _levels[li];
@@ -276,6 +332,21 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
             }
         }
 
+        // The memtable holds un-flushed deltas; fold its group in too (weights
+        // sum across all sources, zeros drop in Build).
+        if (!_memtable.IsEmpty)
+        {
+            var mg = _memtable.GroupFor(key);
+            if (!mg.IsEmpty)
+            {
+                any = true;
+                foreach (var (v, w) in mg)
+                {
+                    b.Add(v, w);
+                }
+            }
+        }
+
         return any ? b.Build() : ZSet<TValue, TWeight>.Empty;
     }
 
@@ -360,9 +431,23 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
             }
         }
 
+        var memtableActive = !_memtable.IsEmpty;
         for (var di = 0; di < sortedKeys.Length; di++)
         {
             var keyRuns = runs[di];
+
+            // Fold the memtable's group for this key in as one more sorted run,
+            // so un-flushed deltas participate in the merge. A key present ONLY
+            // in the memtable (no batch run) is emitted too.
+            if (memtableActive)
+            {
+                var mg = _memtable.GroupFor(sortedKeys[di]);
+                if (!mg.IsEmpty)
+                {
+                    (keyRuns ??= new()).Add(SortedRunFromGroup(mg));
+                }
+            }
+
             if (keyRuns is null)
             {
                 continue;
@@ -376,6 +461,30 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Copies a memtable group's <c>(value, weight)</c> pairs into arrays sorted
+    /// by <see cref="_valueComparer"/>, shaped as a run for <see cref="MergeRuns"/>
+    /// (which requires each run sorted, distinct, and zero-free — a ZSet group is
+    /// distinct and zero-free; this adds the sort).
+    /// </summary>
+    private (TValue[] Values, TWeight[] Weights, int Start, int End) SortedRunFromGroup(
+        ZSet<TValue, TWeight> group)
+    {
+        var n = group.Count;
+        var values = new TValue[n];
+        var weights = new TWeight[n];
+        var i = 0;
+        foreach (var (v, w) in group)
+        {
+            values[i] = v;
+            weights[i] = w;
+            i++;
+        }
+
+        Array.Sort(values, weights, _valueComparer);
+        return (values, weights, 0, n);
     }
 
     private static (TValue Value, TWeight Weight)[] MergeRuns(
@@ -470,6 +579,11 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     {
         get
         {
+            if (!_memtable.IsEmpty)
+            {
+                return false;
+            }
+
             foreach (var level in _levels)
             {
                 foreach (var batch in level)
@@ -544,6 +658,9 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     /// </summary>
     public IReadOnlyList<IndexedZSet<TKey, TValue, TWeight>> GetBatches()
     {
+        // Snapshot must capture un-flushed deltas, so settle the memtable into a
+        // batch first (no-op when the memtable is empty / disabled).
+        FlushMemtable();
         var result = new List<IndexedZSet<TKey, TValue, TWeight>>(BatchCount);
         foreach (var level in _levels)
         {
@@ -695,38 +812,53 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
     private List<KeyValuePair<TKey, ZSet<TValue, TWeight>>> MaterialiseGroups()
     {
         var perKey = new Dictionary<TKey, Dictionary<TValue, TWeight>>();
+
+        void Fold(TKey k, ZSet<TValue, TWeight> group)
+        {
+            if (!perKey.TryGetValue(k, out var inner))
+            {
+                inner = new Dictionary<TValue, TWeight>();
+                perKey[k] = inner;
+            }
+
+            foreach (var (v, w) in group)
+            {
+                if (inner.TryGetValue(v, out var existing))
+                {
+                    var sum = TWeight.Add(existing, w);
+                    if (TWeight.IsZero(sum))
+                    {
+                        inner.Remove(v);
+                    }
+                    else
+                    {
+                        inner[v] = sum;
+                    }
+                }
+                else
+                {
+                    inner[v] = w;
+                }
+            }
+        }
+
         foreach (var level in _levels)
         {
             foreach (var batch in level)
             {
                 foreach (var (k, group) in batch.Entries())
                 {
-                    if (!perKey.TryGetValue(k, out var inner))
-                    {
-                        inner = new Dictionary<TValue, TWeight>();
-                        perKey[k] = inner;
-                    }
-
-                    foreach (var (v, w) in group)
-                    {
-                        if (inner.TryGetValue(v, out var existing))
-                        {
-                            var sum = TWeight.Add(existing, w);
-                            if (TWeight.IsZero(sum))
-                            {
-                                inner.Remove(v);
-                            }
-                            else
-                            {
-                                inner[v] = sum;
-                            }
-                        }
-                        else
-                        {
-                            inner[v] = w;
-                        }
-                    }
+                    Fold(k, group);
                 }
+            }
+        }
+
+        // The memtable's un-flushed deltas sum in alongside the batches.
+        if (!_memtable.IsEmpty)
+        {
+            foreach (var (k, group) in _memtable)
+            {
+                Fold(k, group);
             }
         }
 
