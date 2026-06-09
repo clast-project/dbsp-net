@@ -110,6 +110,15 @@ public static class TypedPlanCompiler
         var meta = new Dictionary<string, ParallelInputMeta>(StringComparer.Ordinal);
         TypedNode? topNode = null;
 
+        // Realise the spine memtable capacity (CompileOptions.SpineStagingCapacity)
+        // through the SpineStagingConfig ambient seam each trace reads at
+        // construction. Replicas are built sequentially on this thread inside
+        // ParallelCircuit.Build, so a scoped seam captures every trace; restore it
+        // after. Flat forces 0 (no spine traces read it). See docs §11.
+        var prevStagingCapacity = SpineStagingConfig.Capacity;
+        SpineStagingConfig.Capacity =
+            compileOptions.TraceFamily == TraceFamily.Spine ? compileOptions.SpineStagingCapacity : 0;
+
         ParallelCircuit? circuit = null;
         try
         {
@@ -160,6 +169,10 @@ public static class TypedPlanCompiler
         {
             circuit?.Dispose();
             return false;
+        }
+        finally
+        {
+            SpineStagingConfig.Capacity = prevStagingCapacity;
         }
     }
 

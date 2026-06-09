@@ -57,6 +57,19 @@ public sealed record CompileOptions
     public ICompactionStrategy? Compaction { get; init; }
 
     /// <summary>
+    /// Spine indexed-trace memtable flush threshold, in distinct keys
+    /// (cross-tick amortisation; docs/design-row-representation.md §10–§11).
+    /// Ignored when <see cref="TraceFamily"/> is <see cref="TraceFamily.Flat"/>.
+    /// The default — <b>8,192</b>, the §11 capacity-sweep knee — buffers each
+    /// tick's delta as an in-place dictionary merge and flushes a sorted batch
+    /// only every few ticks, so the spine substrate is competitive with the flat
+    /// dictionary on small per-tick deltas (the W&gt;1 replica case) instead of
+    /// paying a fresh batch build every tick. Set to 0 to disable the memtable
+    /// (one batch per delta, the pre-§10 behaviour).
+    /// </summary>
+    public int SpineStagingCapacity { get; init; } = 8192;
+
+    /// <summary>
     /// Opt-in arrangement common-subexpression elimination (Option 2 /
     /// cross-operator shared arrangements; see docs/design-row-representation.md
     /// §9.6). When a relation is the right input of ≥2 INNER joins on the same

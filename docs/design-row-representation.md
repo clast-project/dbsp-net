@@ -896,13 +896,28 @@ q4 capacity sweep (sequential, the cleanest signal): memtable **off 0.39× →
   query, configs back-to-back) is far more trustworthy than individual per-query
   cells.
 
-**Decision & next step.** Keep `TraceFamily.Flat` the default. The one change the
-data justifies is to **make the memtable on-by-default whenever `TraceFamily.Spine`
-is selected, at capacity 8,192** — a strict improvement on every stateful query.
-That needs the capacity threaded through `CompileOptions` → the spine operators →
-the trace ctor (the plumbing the `SpineStagingConfig` static seam currently
-sidesteps), so it is a scoped follow-up. Closing q4's residual ~8% is the spine
-**aggregate** read path, a separate item.
+**Decision.** Keep `TraceFamily.Flat` the default.
+
+**Memtable-on-by-default with spine — DONE.** The one change the data justified
+landed: `CompileOptions.SpineStagingCapacity` (default **8,192**, the sweep knee)
+is now the public knob, and the compiler realises it whenever
+`TraceFamily.Spine` is selected — both compile entry points
+(`PlanToCircuit.CompileCore` for the structural / single-typed path and
+`TypedPlanCompiler.TryCompileParallel` for the parallel path) set the
+`SpineStagingConfig` ambient seam from the option for the duration of the build
+and restore it after; each trace reads it once at construction. Threading the
+capacity through every spine builder method was avoided (it would have meant
+editing the typed compiler's reflective arg-arrays — the
+[[typed-compiler-reflection-gotcha]]); the seam is the channel instead. The seam
+is **`[ThreadStatic]`** so concurrent compiles (and direct trace construction in
+the parallel test suite) cannot observe each other's value — sound because the
+whole graph, including a parallel circuit's sequentially-built replicas, is
+constructed synchronously on the compiling thread. `SpineStagingDefaultTests`
+pins the default and confirms spine-with-memtable equals flat on a join and an
+aggregate; the full spine SQL suite now compiles *with* staging and stays green
+(1,672 tests).
+
+Closing q4's residual ~8% is the spine **aggregate** read path — a separate item.
 
 ---
 

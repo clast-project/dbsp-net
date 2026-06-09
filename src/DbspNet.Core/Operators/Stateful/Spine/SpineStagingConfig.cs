@@ -18,18 +18,26 @@ namespace DbspNet.Core.Operators.Stateful.Spine;
 /// fresh batch build + bloom + compaction. The §8.3 q4 gate showed that per-tick
 /// build was the spine substrate's loss to the flat dictionary; this amortises
 /// it across N keys' worth of ticks.</para>
-/// <para>A static seam (mirroring <c>SpineJoinProbeMode.ForcePointProbe</c>):
-/// it sidesteps both the typed-compiler reflection over builder signatures and a
-/// wide plumbing change, while the optimisation is gated and benchmarked. A
-/// trace reads it once at construction. Set it before building the circuit; reset
-/// it after. Promote to a proper compile option once the gate justifies a
-/// default.</para>
+/// <para>The compiler (<c>PlanToCircuit</c> / <c>TypedPlanCompiler</c>) realises
+/// <c>CompileOptions.SpineStagingCapacity</c> through this ambient seam: it sets
+/// the value for the duration of the build and restores it after, and each trace
+/// reads it once at construction. The seam (rather than threading the capacity
+/// through every spine builder method) sidesteps the typed-compiler reflection
+/// over builder signatures. <b>The field is <see cref="ThreadStaticAttribute"/></b>
+/// so concurrent compiles — or a direct <c>new SpineIndexedZSetTrace(...)</c> on
+/// another thread — cannot observe each other's value. This is sound because the
+/// whole graph (every trace, including a parallel circuit's sequentially-built
+/// replicas) is constructed synchronously on the compiling thread, so a
+/// thread-scoped value captures exactly the traces that compile meant to
+/// configure.</para>
 /// </remarks>
 internal static class SpineStagingConfig
 {
     /// <summary>
     /// Memtable flush threshold in distinct keys; 0 disables the memtable (the
-    /// default, byte-identical to the pre-memtable behaviour).
+    /// default, byte-identical to the pre-memtable behaviour). Thread-static:
+    /// each thread's traces read that thread's compile-scoped value.
     /// </summary>
+    [ThreadStatic]
     internal static int Capacity;
 }

@@ -24,16 +24,19 @@ namespace DbspNet.Benchmarks;
 /// </summary>
 internal static class SpineParallelHarness
 {
-    /// <summary>The three orthogonal knobs that define a measured configuration.</summary>
-    /// <param name="Options">Compile options (trace family etc.).</param>
+    /// <summary>The knobs that define a measured configuration.</summary>
+    /// <param name="Options">
+    /// Compile options — trace family AND the memtable capacity
+    /// (<see cref="CompileOptions.SpineStagingCapacity"/>), which the compiler
+    /// realises at trace construction (docs §11). 0 disables the memtable.
+    /// </param>
     /// <param name="ForcePointProbe">Force the per-key point probe (vs the batched merge).</param>
-    /// <param name="StagingCapacity">Spine memtable flush threshold in keys; 0 disables it.</param>
-    internal readonly record struct RunConfig(CompileOptions Options, bool ForcePointProbe, int StagingCapacity);
+    internal readonly record struct RunConfig(CompileOptions Options, bool ForcePointProbe);
 
-    internal static RunConfig Flat => new(CompileOptions.Default, false, 0);
+    internal static RunConfig Flat => new(CompileOptions.Default, false);
 
     internal static RunConfig Spine(bool forcePointProbe, int stagingCapacity) =>
-        new(new CompileOptions { TraceFamily = TraceFamily.Spine }, forcePointProbe, stagingCapacity);
+        new(new CompileOptions { TraceFamily = TraceFamily.Spine, SpineStagingCapacity = stagingCapacity }, forcePointProbe);
 
     internal static LogicalPlan BuildPlan(string[] ddl, string sql)
     {
@@ -100,9 +103,12 @@ internal static class SpineParallelHarness
         HashSet<NexmarkTable> consumed, int batchSize, out (double SplitMs, double StepMs, double GatherMs) phases,
         out long outputRows)
     {
+        // ForcePointProbe is read on the worker threads every Step, so it must be
+        // set for the whole run. The memtable capacity is carried in config.Options
+        // and applied by the compiler at trace construction (docs §11), so the
+        // harness no longer sets the staging seam directly.
         SpineJoinProbeMode.ForcePointProbe = config.ForcePointProbe;
         SpineAggregateProbeMode.ForcePointProbe = config.ForcePointProbe;
-        SpineStagingConfig.Capacity = config.StagingCapacity;
         try
         {
             if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, config.Options))
@@ -159,7 +165,6 @@ internal static class SpineParallelHarness
         {
             SpineJoinProbeMode.ForcePointProbe = false;
             SpineAggregateProbeMode.ForcePointProbe = false;
-            SpineStagingConfig.Capacity = 0;
         }
     }
 

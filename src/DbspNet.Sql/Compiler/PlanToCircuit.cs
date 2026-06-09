@@ -90,6 +90,17 @@ public static class PlanToCircuit
         Dictionary<string, TableInput>? inputs = null;
         OutputHandle<ZSet<StructuralRow, Z64>>? output = null;
 
+        // The spine memtable capacity (CompileOptions.SpineStagingCapacity) is
+        // realised through the SpineStagingConfig ambient seam, which each trace
+        // reads once at construction. Set it for the duration of the build (the
+        // graph — and so every trace — is constructed synchronously inside
+        // RootCircuit.Build) and restore it after. Flat builds force 0 (no spine
+        // traces read it). See docs §11.
+        var prevStagingCapacity = SpineStagingConfig.Capacity;
+        SpineStagingConfig.Capacity = options.TraceFamily == TraceFamily.Spine ? options.SpineStagingCapacity : 0;
+        try
+        {
+
         circuit = RootCircuit.Build(builder =>
         {
             var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
@@ -182,6 +193,11 @@ public static class PlanToCircuit
 
             output = builder.Output(queryStream);
         });
+        }
+        finally
+        {
+            SpineStagingConfig.Capacity = prevStagingCapacity;
+        }
 
         return new CompiledQuery(circuit!, inputs!, output!, plan.Schema);
     }
