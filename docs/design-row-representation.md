@@ -850,6 +850,62 @@ traces is the same idea, deferred.
 
 ---
 
+## 11. Fuller evaluation — should the spine + memtable default flip? (DECIDED: no, with a caveat)
+
+§10 showed the memtable closes the q4 gap; this section ran the broader
+evaluation that decision needs: the candidate config (**spine·merge·staged** —
+`TraceFamily.Spine` + merge probe + memtable) vs the flat default across the
+stateful Nexmark queries, plus a memtable-capacity sweep, at **1M events, W=24,
+batch 10k, median of 3 runs** (`dotnet run -- spineeval`,
+[spine-eval-bench.md](spine-eval-bench.md)). The harness
+(`SpineParallelHarness`) was extracted from the q4 gate so both share one
+knob-driven parallel runner.
+
+**Result.**
+
+| query | shape | spine·merge·staged vs flat |
+|---|---|---|
+| q3 | join (filtered) | ~1.48× |
+| q9 | join + window top-1 | ~1.03× |
+| q4 | join + nested MAX + outer AVG | ~0.8–0.92× |
+| q0/q1/q2 | stateless (controls) | ~1.0× ± noise |
+
+q4 capacity sweep (sequential, the cleanest signal): memtable **off 0.39× →
+1,024: 0.68× → 4,096: 0.81× → 8,192: 0.92× → 16,384: 0.86× → 65,536: 0.82×**.
+
+**Findings.**
+- **The memtable is an unconditional win for spine** and **8,192 keys is the
+  knee.** It takes q4's step from 0.39× to 0.92× (a 2.4× speedup) with a clean
+  peak; smaller thresholds re-introduce per-tick builds, larger ones grow the
+  per-read memtable merge. It also lifts q3 to ~1.48× and q9 to ~1.03×. Whenever
+  spine is used, the memtable should be on.
+- **The global flat→spine flip is NOT justified.** Even staged, q4 — the
+  aggregate-heavy canonical query — is still ~0.9× flat (a small regression), and
+  the stateless / join-light queries gain nothing from the spine trace. Flat
+  remains the safe universal default. The residual q4 gap is the **aggregate**
+  read path (q3/q9, join-only, already win); the spine aggregate's per-group
+  multiset reads are heavier than the flat dictionary's — a separate, later
+  optimisation.
+- **Spine + memtable is now a validated, competitive option** (~0.9–1.5× on the
+  stateful queries, up from the pre-memtable 0.39–0.99×). It is worth selecting
+  for its spill / snapshot / bounded-memory properties at near-flat throughput,
+  rather than the 1.4–2.5× penalty §8.3 measured.
+- **Noise caveat.** The stateless controls calibrate the bench: q1/q2 hold no
+  trace, so `merge` and `staged` are identical work, yet q1 read 1.61× vs 1.13× —
+  a ~±0.5× parallel-pipeline noise floor. The sequential capacity sweep (one
+  query, configs back-to-back) is far more trustworthy than individual per-query
+  cells.
+
+**Decision & next step.** Keep `TraceFamily.Flat` the default. The one change the
+data justifies is to **make the memtable on-by-default whenever `TraceFamily.Spine`
+is selected, at capacity 8,192** — a strict improvement on every stateful query.
+That needs the capacity threaded through `CompileOptions` → the spine operators →
+the trace ctor (the plumbing the `SpineStagingConfig` static seam currently
+sidesteps), so it is a scoped follow-up. Closing q4's residual ~8% is the spine
+**aggregate** read path, a separate item.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,

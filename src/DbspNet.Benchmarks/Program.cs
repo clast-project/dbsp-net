@@ -67,6 +67,24 @@ if (args.Length > 0 && args[0] == "sharedarr")
     return 0;
 }
 
+// Spine + memtable fuller evaluation: `dotnet run -- spineeval [events] [W] [runs]`
+// flat vs spine·merge·staged across stateful Nexmark queries + a q4 capacity sweep
+// (docs/design-row-representation.md §10 — the "flip the default?" decision).
+if (args.Length > 0 && args[0] == "spineeval")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.SpineEvalBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, Environment.ProcessorCount), Arg(3, 3));
+    var sePath = Path.Combine(FindDocsDir(), "spine-eval-bench.md");
+    File.WriteAllText(sePath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(sePath)}");
+    return 0;
+}
+
 // Arrangement-CSE optimizer-rule gate: `dotnet run -- sharedarrsql`
 // Star-schema SQL (F facts joined to one wide dim) compiled with vs without
 // CompileOptions.ShareArrangements (docs/design-row-representation.md §9.6).

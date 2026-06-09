@@ -77,7 +77,7 @@ internal static class Q4SpineBenchmark
         Console.WriteLine($"=== q4 spine gate (events={totalEvents:N0}, W={workers}, runs={runs}) ===");
         Console.WriteLine("Generating event stream…");
         var events = Generate(totalEvents);
-        var plan = BuildPlan(NexmarkQueries.Ddl, query.Sql);
+        var plan = SpineParallelHarness.BuildPlan(NexmarkQueries.Ddl, query.Sql);
 
         // Verify the plan even has a parallel form before measuring.
         if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var probe))
@@ -153,8 +153,8 @@ internal static class Q4SpineBenchmark
         Console.WriteLine();
         Console.WriteLine($"  batch={batchSize:N0}");
 
-        // Reference output (flat) — every config must reproduce it.
-        var reference = Materialize(RunStream(plan, workers, Config.Flat, events, consumed, batchSize, out _, out _));
+        // Flat is measured first; its output is the reference every config must reproduce.
+        Dictionary<string, long>? reference = null;
 
         output.AppendLine($"## Batch = {batchSize:N0} events");
         output.AppendLine();
@@ -169,17 +169,18 @@ internal static class Q4SpineBenchmark
         })
         {
             var (splitMs, stepMs, gatherMs, outputRows, result) =
-                MeasureMedian(plan, workers, config, events, consumed, batchSize, runs);
+                SpineParallelHarness.MeasureMedian(plan, workers, ToRun(config), events, consumed, batchSize, runs);
 
-            if (!SameMultiset(reference, Materialize(result)))
+            var mat = SpineParallelHarness.Materialize(result);
+            if (config == Config.Flat)
+            {
+                reference = mat;
+                flatStepMs = stepMs;
+            }
+            else if (!SpineParallelHarness.SameMultiset(reference!, mat))
             {
                 throw new InvalidOperationException(
                     $"{config} output diverged from flat at batch={batchSize} — aborting gate");
-            }
-
-            if (config == Config.Flat)
-            {
-                flatStepMs = stepMs;
             }
 
             var stepEventsPerSec = stepMs > 0 ? totalEvents / (stepMs / 1000.0) : 0.0;
@@ -196,181 +197,15 @@ internal static class Q4SpineBenchmark
         output.AppendLine();
     }
 
-    /// <summary>
-    /// Median of <paramref name="runs"/> full-stream passes (after one warmup) for one
-    /// config, returning the median split / step / gather wall-clock and the final
-    /// materialized output of the last pass (for the cross-check).
-    /// </summary>
-    private static (double SplitMs, double StepMs, double GatherMs, long OutputRows, IReadOnlyList<(object?[] Values, long Weight)> Result)
-        MeasureMedian(
-            LogicalPlan plan, int workers, Config config, List<Event> events,
-            HashSet<NexmarkTable> consumed, int batchSize, int runs)
+    // Map this benchmark's named configs to the harness's orthogonal knobs.
+    private static SpineParallelHarness.RunConfig ToRun(Config config) => config switch
     {
-        var splits = new List<double>(runs);
-        var steps = new List<double>(runs);
-        var gathers = new List<double>(runs);
-        IReadOnlyList<(object?[], long)> last = Array.Empty<(object?[], long)>();
-        long outputRows = 0;
-
-        for (var run = 0; run < runs + 1; run++)
-        {
-            last = RunStream(plan, workers, config, events, consumed, batchSize, out var phases, out outputRows);
-            if (run > 0)
-            {
-                splits.Add(phases.SplitMs);
-                steps.Add(phases.StepMs);
-                gathers.Add(phases.GatherMs);
-            }
-        }
-
-        splits.Sort();
-        steps.Sort();
-        gathers.Sort();
-        return (splits[splits.Count / 2], steps[steps.Count / 2], gathers[gathers.Count / 2], outputRows, last);
-    }
-
-    /// <summary>
-    /// One full-stream pass through a fresh q4 parallel circuit in the given config.
-    /// Accumulates the split (push) and step time over every micro-batch and times the
-    /// final gather (materialize) once. The probe-mode flags are global statics read on
-    /// the worker threads each <c>Step</c>; set before the run and cleared after.
-    /// </summary>
-    private static List<(object?[] Values, long Weight)> RunStream(
-        LogicalPlan plan, int workers, Config config, List<Event> events,
-        HashSet<NexmarkTable> consumed, int batchSize, out (double SplitMs, double StepMs, double GatherMs) phases,
-        out long outputRows)
-    {
-        var options = config == Config.Flat
-            ? CompileOptions.Default
-            : new CompileOptions { TraceFamily = TraceFamily.Spine };
-
-        var isPoint = config is Config.SpinePoint or Config.SpinePointStaged;
-        var isStaged = config is Config.SpinePointStaged or Config.SpineMergeStaged;
-        SpineJoinProbeMode.ForcePointProbe = isPoint;
-        SpineAggregateProbeMode.ForcePointProbe = isPoint;
-        // Read at trace construction during the compile below; cleared in finally.
-        SpineStagingConfig.Capacity = isStaged ? StagingCapacity : 0;
-        try
-        {
-            if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, options))
-            {
-                throw new InvalidOperationException($"q4 parallel compile failed for {config}");
-            }
-
-            using (q)
-            {
-                var buffers = consumed.ToDictionary(t => t, _ => new List<(object?[], long)>());
-                double splitMs = 0, stepMs = 0;
-                var sw = new Stopwatch();
-                var sinceStep = 0;
-                foreach (var e in events)
-                {
-                    if (consumed.Contains(e.Table))
-                    {
-                        buffers[e.Table].Add((e.Row, 1L));
-                    }
-
-                    if (++sinceStep >= batchSize)
-                    {
-                        splitMs += Flush(q!, buffers, sw);
-                        stepMs += Time(sw, q!.Step);
-                        sinceStep = 0;
-                    }
-                }
-
-                if (sinceStep > 0)
-                {
-                    splitMs += Flush(q!, buffers, sw);
-                    stepMs += Time(sw, q!.Step);
-                }
-
-                // Gather: force the boundary decode by enumerating the output.
-                sw.Restart();
-                var rows = new List<(object?[] Values, long Weight)>();
-                long nonZero = 0;
-                foreach (var (values, weight) in q!.Current)
-                {
-                    rows.Add((values, weight));
-                    if (weight != 0)
-                    {
-                        nonZero++;
-                    }
-                }
-
-                sw.Stop();
-                phases = (splitMs, stepMs, sw.Elapsed.TotalMilliseconds);
-                outputRows = nonZero;
-                return rows;
-            }
-        }
-        finally
-        {
-            SpineJoinProbeMode.ForcePointProbe = false;
-            SpineAggregateProbeMode.ForcePointProbe = false;
-            SpineStagingConfig.Capacity = 0;
-        }
-    }
-
-    private static double Flush(
-        ParallelTypedCompiledQuery q, Dictionary<NexmarkTable, List<(object?[], long)>> buffers, Stopwatch sw)
-    {
-        sw.Restart();
-        foreach (var (table, rows) in buffers)
-        {
-            if (rows.Count == 0)
-            {
-                continue;
-            }
-
-            q.Table(TableName(table)).Push(rows);
-            rows.Clear();
-        }
-
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds;
-    }
-
-    private static double Time(Stopwatch sw, Action action)
-    {
-        sw.Restart();
-        action();
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds;
-    }
-
-    private static Dictionary<string, long> Materialize(IReadOnlyList<(object?[] Values, long Weight)> rows)
-    {
-        var map = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var (values, weight) in rows)
-        {
-            var key = string.Join("|", values.Select(v => v?.ToString() ?? "<null>"));
-            map[key] = map.GetValueOrDefault(key) + weight;
-            if (map[key] == 0)
-            {
-                map.Remove(key);
-            }
-        }
-
-        return map;
-    }
-
-    private static bool SameMultiset(Dictionary<string, long> a, Dictionary<string, long> b)
-    {
-        if (a.Count != b.Count)
-        {
-            return false;
-        }
-
-        foreach (var (k, v) in a)
-        {
-            if (!b.TryGetValue(k, out var bv) || bv != v)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
+        Config.Flat => SpineParallelHarness.Flat,
+        Config.SpinePoint => SpineParallelHarness.Spine(forcePointProbe: true, stagingCapacity: 0),
+        Config.SpineMerge => SpineParallelHarness.Spine(forcePointProbe: false, stagingCapacity: 0),
+        Config.SpinePointStaged => SpineParallelHarness.Spine(forcePointProbe: true, stagingCapacity: StagingCapacity),
+        _ => SpineParallelHarness.Spine(forcePointProbe: false, stagingCapacity: StagingCapacity),
+    };
 
     private static string Label(Config config) => config switch
     {
@@ -381,23 +216,4 @@ internal static class Q4SpineBenchmark
         _ => "spine·merge·staged",
     };
 
-    private static string TableName(NexmarkTable t) => t switch
-    {
-        NexmarkTable.Person => "person",
-        NexmarkTable.Auction => "auction",
-        _ => "bid",
-    };
-
-    private static LogicalPlan BuildPlan(string[] ddl, string sql)
-    {
-        var catalog = new Catalog();
-        var resolver = new Resolver(catalog);
-        foreach (var s in ddl)
-        {
-            resolver.Resolve(Parser.ParseStatement(s));
-        }
-
-        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
-        return PlanOptimizer.Optimize(plan);
-    }
 }
