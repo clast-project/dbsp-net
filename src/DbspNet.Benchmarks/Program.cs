@@ -67,6 +67,24 @@ if (args.Length > 0 && args[0] == "sharedarr")
     return 0;
 }
 
+// Arrangement-CSE optimizer-rule gate: `dotnet run -- sharedarrsql`
+// Star-schema SQL (F facts joined to one wide dim) compiled with vs without
+// CompileOptions.ShareArrangements (docs/design-row-representation.md §9.6).
+if (args.Length > 0 && args[0] == "sharedarrsql")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — shared arrangement (SQL optimizer rule)");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.SharedArrangementSqlBenchmark.Run(sb);
+    var sqPath = Path.Combine(FindDocsDir(), "shared-arrangement-sql-bench.md");
+    File.WriteAllText(sqPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(sqPath)}");
+    return 0;
+}
+
 // Join merge-probe sub-command: `dotnet run -- joinprobe`
 // Point probe vs galloping merge driving the whole SpineIncrementalJoinOp.Step
 // (docs/design-row-representation.md §8).

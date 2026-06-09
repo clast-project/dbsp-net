@@ -55,4 +55,23 @@ public sealed record CompileOptions
     /// selects <see cref="TieredCompactionStrategy.Default"/> at the operator.
     /// </summary>
     public ICompactionStrategy? Compaction { get; init; }
+
+    /// <summary>
+    /// Opt-in arrangement common-subexpression elimination (Option 2 /
+    /// cross-operator shared arrangements; see docs/design-row-representation.md
+    /// §9.6). When a relation is the right input of ≥2 INNER joins on the same
+    /// key, the compiler builds ONE shared arrangement (an <c>Arrange</c> /
+    /// <c>SpineArrange</c>) and routes those joins through the shared-right join
+    /// instead of each maintaining a private right trace.
+    /// </summary>
+    /// <remarks>
+    /// CSE is implemented on the <b>structural</b> compile path only, so this
+    /// flag also forces that path (the typed fast path is skipped). It engages a
+    /// join only when there is no join-key GC frontier and no snapshot codec —
+    /// the shared arrangement carries neither coordinated frontier GC nor
+    /// snapshot in this first increment (a relation joined by the same key in two
+    /// places is the "single clearest case" of §6.2). A modest, fan-out-scaling
+    /// win (§9.5); off by default.
+    /// </remarks>
+    public bool ShareArrangements { get; init; }
 }

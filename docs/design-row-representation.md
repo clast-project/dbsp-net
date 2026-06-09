@@ -739,6 +739,55 @@ is the **arrangement-CSE optimizer rule** (§9.4 item 2). Closing the spine
 substrate's q4 gap is a *different* problem (cross-tick rebuild amortisation /
 larger ticks per replica), not addressed by sharing — see §5 and §8.3.
 
+### 9.6 — Arrangement-CSE optimizer rule (LANDED)
+
+Follow-up (2) — the rule that makes cross-operator sharing reachable from SQL —
+is in. Opt-in via `CompileOptions.ShareArrangements`.
+
+**Why compile-time CSE, not a plan rewrite.** The logical plan is a *tree*;
+sharing is a *DAG* (one arrangement, ≥2 consumers). So the rule lives in the
+structural compiler as common-subexpression elimination, not as a
+`PlanOptimizer` tree rewrite. The "same relation" identity is free: the compiler
+already compiles a base-table scan or a repeated CTE reference to a **single
+shared `Stream`** (`CompileContext.Scans` / `CteCache`). So a relation that is
+the right input of two joins on the same key already shares its delta stream;
+the rule adds one shared `Arrange`/`SpineArrange` over it and routes the joins
+through the shared-right join from §9.1/§9.5.
+
+**Mechanism.**
+- A pre-pass (`CollectShareableArrangements`, mirroring `CollectScans`) counts
+  inner-join right inputs by `ArrangementKey(source, rightKeySig)` — `source` is
+  the `CteRef` (reference identity) or base-table name (value identity) — and
+  marks those used ≥2×. Only bare `ScanPlan` / `CteScanPlan` right inputs (which
+  compile to a shared stream) and non-NULL-accepting joins qualify.
+- `CompileInnerJoin` consults a per-compile `ArrangementCache`: the first
+  qualifying join builds the right index + arrangement; the rest reuse it. The
+  shared relation is the `R_t` ("after") side, so the join math is unchanged and
+  output is byte-identical.
+- **Guards (per join):** sharing engages only with no join-key GC frontier
+  (a shared trace carries no coordinated frontier GC yet — §9.4) and no snapshot
+  codec (the shared-right ops aren't snapshotable yet). Because CSE is
+  structural-only, the flag also **forces the structural path** (skips the typed
+  fast path).
+
+**Verification & gate.** `ArrangementSharingTests`: the rule fires (exactly one
+`Arrange`/`SpineArrange`, two shared-right joins for a 2-fact star schema), does
+not fire without reuse, and produces identical results to the unshared compile
+over random insert/delete sequences on both substrates. Full suite 1660 green.
+End-to-end gate (`dotnet run -- sharedarrsql`,
+[shared-arrangement-sql-bench.md](shared-arrangement-sql-bench.md)): a wide `dim`
+joined by `F` facts, structural-shared vs structural-unshared (same codec). The
+SQL-level win is **~1–6%, growing with fan-out** — smaller than the operator-
+level ~1.5× (§9.5) because at the query level the deduplicated `dim` maintenance
+is a small fraction of per-step work (input encoding, per-fact re-index, UNION,
+projection, output build are all unchanged and per-branch).
+
+**Deferred.** Typed-path CSE (the flag forces structural today); left-side
+sharing (commute inner joins so a shared relation lands on the after side);
+general subplan fingerprinting beyond bare scans/CTE refs (e.g. a shared
+`Filter(Scan)`); and the coordinated frontier-GC / snapshot support that the
+guards currently exclude.
+
 ---
 
 ## Appendix — sources

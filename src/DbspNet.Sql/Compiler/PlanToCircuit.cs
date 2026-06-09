@@ -51,6 +51,23 @@ public static class PlanToCircuit
         return CompileCore(plan, codec, snapshotCodecs: null, CompileOptions.Default);
     }
 
+    /// <summary>
+    /// Opt-in compile path with both explicit <see cref="CompileOptions"/> and a
+    /// non-default <see cref="IRowCodec{TRow}"/>. A non-default codec already pins
+    /// the structural pipeline, so this is the apples-to-apples way to A/B a
+    /// compile option (e.g. <see cref="CompileOptions.ShareArrangements"/>) on the
+    /// structural path with the codec held fixed across arms. Options precede the
+    /// codec to disambiguate from
+    /// <see cref="Compile(LogicalPlan, ISqlSnapshotCodecs, CompileOptions)"/>.
+    /// </summary>
+    public static CompiledQuery Compile(LogicalPlan plan, CompileOptions options, IRowCodec<StructuralRow> codec)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(codec);
+        return CompileCore(plan, codec, snapshotCodecs: null, options);
+    }
+
     public static CompiledQuery Compile(CreateViewPlan view)
     {
         ArgumentNullException.ThrowIfNull(view);
@@ -139,10 +156,14 @@ public static class PlanToCircuit
             // the structural path — long-running bounded pipelines use
             // LATENESS structurally; the typed fast path is for short
             // queries).
+            // Arrangement CSE (options.ShareArrangements) is implemented only on
+            // the structural path below, so the flag also forces it: skip the
+            // typed fast path when sharing is requested.
             Stream<ZSet<StructuralRow, Z64>>? queryStream = null;
             if (ReferenceEquals(codec, StructuralRowCodec.Instance)
                 && !hasLateness
-                && !hasTemporalFilter)
+                && !hasTemporalFilter
+                && !options.ShareArrangements)
             {
                 queryStream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
                     builder, plan, streams, codec, snapshotCodecs, options);
@@ -151,8 +172,11 @@ public static class PlanToCircuit
             if (queryStream is null)
             {
                 var tableSchemas = tables.ToDictionary(kv => kv.Key, kv => kv.Value.Schema, StringComparer.Ordinal);
+                var shareable = options.ShareArrangements
+                    ? CollectShareableArrangements(plan)
+                    : (IReadOnlySet<ArrangementKey>)System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
                 var ctx = new CompileContext(
-                    streams, tableSchemas, codec, snapshotCodecs, options, monotonicity, frontiers);
+                    streams, tableSchemas, codec, snapshotCodecs, options, monotonicity, frontiers, shareable);
                 queryStream = CompilePlan(builder, plan, ctx);
             }
 
@@ -171,7 +195,8 @@ public static class PlanToCircuit
             ISqlSnapshotCodecs? snapshotCodecs,
             CompileOptions options,
             MonotonicityInfo monotonicity,
-            IReadOnlyDictionary<LatenessSource, IFrontier> frontiers)
+            IReadOnlyDictionary<LatenessSource, IFrontier> frontiers,
+            IReadOnlySet<ArrangementKey> shareableArrangements)
         {
             Scans = scans;
             TableSchemas = tableSchemas;
@@ -180,6 +205,7 @@ public static class PlanToCircuit
             Options = options;
             Monotonicity = monotonicity;
             Frontiers = frontiers;
+            ShareableArrangements = shareableArrangements;
         }
 
         /// <summary>Stream per declared table — the circuit's inputs.</summary>
@@ -198,6 +224,20 @@ public static class PlanToCircuit
         /// underlying subplan; every subsequent scan returns the cached stream.
         /// </summary>
         public Dictionary<CteRef, Stream<ZSet<StructuralRow, Z64>>> CteCache { get; } = new();
+
+        /// <summary>
+        /// Arrangement keys (relation + right key columns) that ≥2 INNER joins
+        /// share, found by <see cref="CollectShareableArrangements"/>. Empty
+        /// unless <see cref="CompileOptions.ShareArrangements"/> is set.
+        /// </summary>
+        public IReadOnlySet<ArrangementKey> ShareableArrangements { get; }
+
+        /// <summary>
+        /// Per-shared-arrangement cache: the first INNER join that references a
+        /// shareable (relation, key) builds the indexed delta stream and the
+        /// shared <c>Arrange</c>/<c>SpineArrange</c>; subsequent joins reuse them.
+        /// </summary>
+        public Dictionary<ArrangementKey, SharedArrangement> ArrangementCache { get; } = new();
 
         /// <summary>
         /// Row codec used everywhere internally to build the output row of a
@@ -688,6 +728,165 @@ public static class PlanToCircuit
             }
         }
     }
+
+    /// <summary>
+    /// Identifies a shareable right-side arrangement: the source relation — a
+    /// <see cref="CteRef"/> instance (reference identity) or a base-table name
+    /// (value identity) — plus the right equi-key column indices. Two INNER
+    /// joins with the same source and key compile to one shared arrangement.
+    /// Default record equality does the right thing: <see cref="CteRef"/> has no
+    /// value equality so it compares by reference; a table-name string compares
+    /// by value; <see cref="KeySig"/> is a string.
+    /// </summary>
+    private readonly record struct ArrangementKey(object Source, string KeySig);
+
+    /// <summary>
+    /// A built shared right arrangement: the indexed delta stream (shared as the
+    /// <c>dr</c> side) and the flat <see cref="IArrangement{TKey,TValue,TWeight}"/>
+    /// or spine <see cref="ISpineArrangement{TKey,TValue,TWeight}"/> handle (the
+    /// <c>R_t</c> side) the shared-right joins read.
+    /// </summary>
+    private sealed record SharedArrangement(
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> RightIndexed,
+        object Arrangement);
+
+    /// <summary>
+    /// Finds (relation, right-key) pairs used as the right input of ≥2 INNER
+    /// joins, so the compiler builds one shared arrangement for them instead of
+    /// a private right trace per join (docs/design-row-representation.md §9.6).
+    /// Only bare <see cref="ScanPlan"/> / <see cref="CteScanPlan"/> right inputs
+    /// qualify: those compile to a single shared stream
+    /// (<see cref="CompileContext.Scans"/> / <see cref="CompileContext.CteCache"/>),
+    /// so the arrangement built over the first reference is exactly what the
+    /// others need. NULL-accepting (set-op-synthesised) joins are excluded; the
+    /// per-join GC-frontier and snapshot guards are applied later at the compile
+    /// site. Mirrors the <see cref="CollectScans"/> traversal.
+    /// </summary>
+    private static IReadOnlySet<ArrangementKey> CollectShareableArrangements(LogicalPlan plan)
+    {
+        var counts = new Dictionary<ArrangementKey, int>();
+        var visitedCtes = new HashSet<CteRef>();
+        Walk(plan);
+
+        var shareable = new HashSet<ArrangementKey>();
+        foreach (var (key, n) in counts)
+        {
+            if (n >= 2)
+            {
+                shareable.Add(key);
+            }
+        }
+
+        return shareable;
+
+        void Tally(JoinPlan j)
+        {
+            if (j.JoinType != DbspNet.Sql.Parser.Ast.JoinType.Inner || j.AllowNullKeys)
+            {
+                return;
+            }
+
+            if (RightShareSource(j.Right) is not { } source)
+            {
+                return;
+            }
+
+            var (_, rightIndices) = ExtractEquiKeyIndices(j);
+            var key = new ArrangementKey(source, string.Join(",", rightIndices));
+            counts[key] = counts.TryGetValue(key, out var c) ? c + 1 : 1;
+        }
+
+        void Walk(LogicalPlan p)
+        {
+            switch (p)
+            {
+                case ScanPlan:
+                    break;
+                case CteScanPlan c:
+                    if (visitedCtes.Add(c.Cte))
+                    {
+                        Walk(c.Cte.Plan);
+                    }
+
+                    break;
+                case FilterPlan f:
+                    Walk(f.Input);
+                    break;
+                case TemporalFilterPlan tf:
+                    Walk(tf.Input);
+                    break;
+                case ProjectPlan pr:
+                    Walk(pr.Input);
+                    break;
+                case JoinPlan j:
+                    Tally(j);
+                    Walk(j.Left);
+                    Walk(j.Right);
+                    break;
+                case AggregatePlan a:
+                    Walk(a.Input);
+                    break;
+                case ScalarSubqueryJoinPlan s:
+                    Walk(s.Input);
+                    foreach (var sub in s.Subqueries)
+                    {
+                        Walk(sub);
+                    }
+
+                    break;
+                case SemiJoinPlan sj:
+                    Walk(sj.Input);
+                    Walk(sj.Subquery);
+                    break;
+                case CorrelatedScalarSubqueryJoinPlan csp:
+                    Walk(csp.Input);
+                    Walk(csp.Subquery);
+                    break;
+                case UnionAllPlan u:
+                    foreach (var branch in u.Branches)
+                    {
+                        Walk(branch);
+                    }
+
+                    break;
+                case DistinctPlan d:
+                    Walk(d.Input);
+                    break;
+                case TopKPlan t:
+                    Walk(t.Input);
+                    break;
+                case PartitionedTopKPlan pt:
+                    Walk(pt.Input);
+                    break;
+                case WindowAggregatePlan wa:
+                    Walk(wa.Input);
+                    break;
+                case WindowOffsetPlan wo:
+                    Walk(wo.Input);
+                    break;
+                case DifferencePlan diff:
+                    Walk(diff.Left);
+                    Walk(diff.Right);
+                    break;
+                case RecursiveCtePlan r:
+                    visitedCtes.Add(r.SelfRef);
+                    Walk(r.BasePlan);
+                    Walk(r.RecursivePlan);
+                    break;
+                default:
+                    // Unknown node: don't recurse. Missing a nested join only
+                    // forgoes an optimization; it is never a correctness issue.
+                    break;
+            }
+        }
+    }
+
+    private static object? RightShareSource(LogicalPlan right) => right switch
+    {
+        CteScanPlan c => c.Cte,
+        ScanPlan s => s.TableName,
+        _ => null,
+    };
 
     // ---- Plan → stream ----
 
@@ -1284,7 +1483,6 @@ public static class PlanToCircuit
         CompileContext ctx)
     {
         var left = CompilePlan(builder, plan.Left, ctx);
-        var right = CompilePlan(builder, plan.Right, ctx);
 
         var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
 
@@ -1295,34 +1493,59 @@ public static class PlanToCircuit
         var leftFiltered = plan.AllowNullKeys
             ? left
             : builder.Filter(left, row => HasNoNullKey(row, leftIndices));
-        var rightFiltered = plan.AllowNullKeys
-            ? right
-            : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
 
         var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
         var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
         var joinedSchema = plan.Schema;
         var codec = ctx.Codec;
+        var leftCount = plan.Left.Schema.Count;
+        var rightCount = plan.Right.Schema.Count;
         var leftIndexed = builder.GroupProject(
             leftFiltered,
             row => ExtractKey(codec, leftKeySchema, row, leftIndices),
             row => row);
-        var rightIndexed = builder.GroupProject(
-            rightFiltered,
-            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
-            row => row);
+        StructuralRow Combine(StructuralRow _, StructuralRow lrow, StructuralRow rrow) =>
+            MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount);
 
-        var leftCount = plan.Left.Schema.Count;
-        var rightCount = plan.Right.Schema.Count;
-        var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
-        var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
         var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
-        var joined = EmitInnerJoin(
-            builder, ctx,
-            leftIndexed,
-            rightIndexed,
-            (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
-            leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
+
+        Stream<ZSet<StructuralRow, Z64>> joined;
+
+        // Arrangement CSE: when this relation+key is the right input of ≥2 INNER
+        // joins and this join needs neither join-key GC nor snapshot, route the
+        // right side through ONE shared arrangement instead of a private right
+        // trace (docs/design-row-representation.md §9.6). The shared arrangement
+        // is the R_t ("after") side, so the join math is unchanged.
+        if (ctx.Options.ShareArrangements
+            && !plan.AllowNullKeys
+            && gcFrontier is null
+            && ctx.SnapshotCodecs is null
+            && RightShareSource(plan.Right) is { } shareSource
+            && ctx.ShareableArrangements.Contains(
+                new ArrangementKey(shareSource, string.Join(",", rightIndices))))
+        {
+            var shared = GetOrBuildSharedArrangement(
+                builder, ctx, plan, rightIndices, rightKeySchema,
+                new ArrangementKey(shareSource, string.Join(",", rightIndices)));
+            joined = EmitSharedRightInnerJoin(
+                builder, ctx, leftIndexed, shared.RightIndexed, shared.Arrangement, Combine);
+        }
+        else
+        {
+            var right = CompilePlan(builder, plan.Right, ctx);
+            var rightFiltered = plan.AllowNullKeys
+                ? right
+                : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
+            var rightIndexed = builder.GroupProject(
+                rightFiltered,
+                row => ExtractKey(codec, rightKeySchema, row, rightIndices),
+                row => row);
+            var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
+            var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
+            joined = EmitInnerJoin(
+                builder, ctx, leftIndexed, rightIndexed, Combine,
+                leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
+        }
 
         if (plan.Residual is { } residual)
         {
@@ -1331,6 +1554,76 @@ public static class PlanToCircuit
         }
 
         return joined;
+    }
+
+    /// <summary>
+    /// Returns the shared right arrangement for <paramref name="key"/>, building
+    /// it on first reference: compile the (shared) right stream once, drop
+    /// NULL-keyed rows, index by the right key, and wrap in a flat
+    /// <c>Arrange</c> or spine <c>SpineArrange</c> (per trace family). Subsequent
+    /// joins with the same key reuse the cached stream + arrangement.
+    /// </summary>
+    private static SharedArrangement GetOrBuildSharedArrangement(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        JoinPlan plan,
+        int[] rightIndices,
+        Schema rightKeySchema,
+        ArrangementKey key)
+    {
+        if (ctx.ArrangementCache.TryGetValue(key, out var entry))
+        {
+            return entry;
+        }
+
+        var codec = ctx.Codec;
+        var right = CompilePlan(builder, plan.Right, ctx);
+        // The pre-pass only marks non-NULL-accepting joins shareable, so the
+        // right side always drops NULL keys here.
+        var rightFiltered = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
+        var rightIndexed = builder.GroupProject(
+            rightFiltered,
+            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
+            row => row);
+
+        object arrangement = ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineArrange(
+                rightIndexed, ctx.Options.Compaction,
+                keyComparer: StructuralRowComparer.Instance,
+                valueComparer: StructuralRowComparer.Instance)
+            : builder.Arrange(rightIndexed);
+
+        entry = new SharedArrangement(rightIndexed, arrangement);
+        ctx.ArrangementCache[key] = entry;
+        return entry;
+    }
+
+    /// <summary>
+    /// Emits an INNER join whose right side is a shared arrangement (flat or
+    /// spine, per trace family). <paramref name="rightDelta"/> is the shared
+    /// indexed delta stream; <paramref name="arrangement"/> is the matching
+    /// <see cref="IArrangement{TKey,TValue,TWeight}"/> /
+    /// <see cref="ISpineArrangement{TKey,TValue,TWeight}"/> handle.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> EmitSharedRightInnerJoin(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> rightDelta,
+        object arrangement,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> combine)
+    {
+        return ctx.Options.TraceFamily == TraceFamily.Spine
+            ? builder.SpineIncrementalInnerJoinSharedRight(
+                leftIndexed, rightDelta,
+                (ISpineArrangement<StructuralRow, StructuralRow, Z64>)arrangement,
+                combine, ctx.Options.Compaction,
+                keyComparer: StructuralRowComparer.Instance,
+                leftValueComparer: StructuralRowComparer.Instance)
+            : builder.IncrementalInnerJoinSharedRight(
+                leftIndexed, rightDelta,
+                (IArrangement<StructuralRow, StructuralRow, Z64>)arrangement,
+                combine);
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompileLeftOuterJoin(
