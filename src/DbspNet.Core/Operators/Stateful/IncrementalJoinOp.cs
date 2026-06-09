@@ -38,6 +38,7 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     private readonly Stream<IndexedZSet<TKey, TRight, TWeight>> _rightIn;
     private readonly Stream<ZSet<TOut, TWeight>> _output;
     private readonly Func<TKey, TLeft, TRight, TOut> _combine;
+    private readonly Func<TOut, bool>? _residual;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
     private readonly IndexedZSetTrace<TKey, TRight, TWeight> _rightTrace = new();
     private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
@@ -55,12 +56,14 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
         IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
         IFrontier? frontier = null,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null,
+        Func<TOut, bool>? residual = null)
     {
         _leftIn = leftIn;
         _rightIn = rightIn;
         _output = output;
         _combine = combine;
+        _residual = residual;
         _leftSnapshotCodec = leftSnapshotCodec;
         _rightSnapshotCodec = rightSnapshotCodec;
         _frontier = frontier;
@@ -177,7 +180,16 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
                 {
                     foreach (var (bv, bw) in bGroup)
                     {
-                        output.Add(_combine(key, av, bv), TWeight.Multiply(aw, bw));
+                        // Residual (e.g. a non-equi WHERE conjunct spanning both
+                        // sides, folded in by the optimizer) is applied here,
+                        // during the cross-product enumeration, so the failing
+                        // rows never enter the output Z-set — instead of building
+                        // the full join output and filtering it in a separate op.
+                        var outRow = _combine(key, av, bv);
+                        if (_residual is null || _residual(outRow))
+                        {
+                            output.Add(outRow, TWeight.Multiply(aw, bw));
+                        }
                     }
                 }
             }
@@ -196,7 +208,16 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
                 {
                     foreach (var (bv, bw) in bGroup)
                     {
-                        output.Add(_combine(key, av, bv), TWeight.Multiply(aw, bw));
+                        // Residual (e.g. a non-equi WHERE conjunct spanning both
+                        // sides, folded in by the optimizer) is applied here,
+                        // during the cross-product enumeration, so the failing
+                        // rows never enter the output Z-set — instead of building
+                        // the full join output and filtering it in a separate op.
+                        var outRow = _combine(key, av, bv);
+                        if (_residual is null || _residual(outRow))
+                        {
+                            output.Add(outRow, TWeight.Multiply(aw, bw));
+                        }
                     }
                 }
             }

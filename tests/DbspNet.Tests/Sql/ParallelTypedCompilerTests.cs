@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using DbspNet.Sql.Compiler;
+using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
 
@@ -49,10 +50,12 @@ public class ParallelTypedCompilerTests
     /// matches after every step.
     /// </summary>
     private static void AssertParallelMatchesSingle(
-        string[] ddl, string query, int workers, params Action<Func<string, TypedTableInput>>[] ticks)
-    {
-        var plan = CompilePlan(ddl, query);
+        string[] ddl, string query, int workers, params Action<Func<string, TypedTableInput>>[] ticks) =>
+        AssertPlanParallelMatchesSingle(CompilePlan(ddl, query), workers, ticks);
 
+    private static void AssertPlanParallelMatchesSingle(
+        LogicalPlan plan, int workers, params Action<Func<string, TypedTableInput>>[] ticks)
+    {
         Assert.True(TypedPlanCompiler.TryCompile(plan, out var single), "single compile failed");
         Assert.True(TypedPlanCompiler.TryCompileParallel(plan, workers, out var parallel), "parallel compile failed");
 
@@ -188,6 +191,42 @@ public class ParallelTypedCompilerTests
                 tbl("a").Insert(2, 9);
                 tbl("b").Insert(3, 3);
                 tbl("a").Insert(3, 3);
+            });
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public void InnerJoinCrossFilter_FoldedToResidual_MatchesSingle(int workers)
+    {
+        // Run the optimizer so the cross-cutting WHERE folds into the join's
+        // Residual, which the in-memory join op applies during enumeration. The
+        // parallel (exchanged) result must still equal the single-circuit one,
+        // including under a delete that flips a row across the residual boundary.
+        var plan = PlanOptimizer.Optimize(CompilePlan(
+            [
+                "CREATE TABLE a (k INT NOT NULL, lo INT NOT NULL, hi INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, v INT NOT NULL)",
+            ],
+            "SELECT a.k, b.v FROM a JOIN b ON a.k = b.k WHERE b.v BETWEEN a.lo AND a.hi"));
+
+        AssertPlanParallelMatchesSingle(
+            plan,
+            workers,
+            tbl =>
+            {
+                tbl("a").Insert(1, 0, 50);
+                tbl("a").Insert(2, 10, 20);
+                tbl("b").Insert(1, 25);   // passes (0..50)
+                tbl("b").Insert(1, 99);   // fails  (> 50)
+                tbl("b").Insert(2, 15);   // passes (10..20)
+                tbl("b").Insert(2, 5);    // fails  (< 10)
+            },
+            tbl =>
+            {
+                tbl("b").Delete(1, 25);   // retract a passing row
+                tbl("a").Insert(3, 0, 100);
+                tbl("b").Insert(3, 100);  // passes (0..100)
             });
     }
 

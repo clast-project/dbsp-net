@@ -287,6 +287,22 @@ public static class PlanOptimizer
             return newJoin;
         }
 
+        // For an INNER join a cross-cutting predicate above it is exactly a join
+        // residual, so fold it into the join: the in-memory join op applies it
+        // during the cross-product enumeration, never materializing the rows it
+        // rejects (the typed/structural compilers fall back to a post-join filter
+        // when their join variant can't take a residual — same result). Outer
+        // joins must keep the filter above: a post-join predicate there is not a
+        // residual — it would drop NULL-padded rows the outer join must emit.
+        if (join.JoinType == JoinType.Inner)
+        {
+            var folded = ExpressionRewriter.AndAll(keepAbove);
+            var combined = newJoin.Residual is null
+                ? folded
+                : ExpressionRewriter.AndAll(new List<ResolvedExpression> { newJoin.Residual, folded });
+            return newJoin with { Residual = combined };
+        }
+
         return new FilterPlan(newJoin, ExpressionRewriter.AndAll(keepAbove));
     }
 

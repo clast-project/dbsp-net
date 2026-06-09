@@ -744,13 +744,28 @@ public static class TypedPlanCompiler
         var rightSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, right.Schema, keyRowType, right.RowType);
 
+        // An INNER residual is applied during the join enumeration (so rejected
+        // rows never enter the output Z-set) on the in-memory join op. The spine
+        // join variant has no residual hook, so there it falls back to the
+        // post-join filter below. Build the predicate up front; a null means it's
+        // outside the typed pipeline — bail so the structural path takes it.
+        var fuseResidual = plan.JoinType is AstJoinType.Inner
+            && plan.Residual is not null
+            && ctx.Options.TraceFamily != TraceFamily.Spine;
+        Delegate? joinResidual = null;
+        if (fuseResidual)
+        {
+            joinResidual = BuildTypedPredicateDelegate(plan.Residual!, outputRowType);
+            if (joinResidual is null) return null;
+        }
+
         object joined;
         if (plan.JoinType is AstJoinType.Inner)
         {
             joined = EmitInnerJoin(
                 ctx, keyRowType, left.RowType, right.RowType, outputRowType,
                 leftIndexed, rightIndexed, combineDelegate,
-                leftSnapshotCodec, rightSnapshotCodec);
+                leftSnapshotCodec, rightSnapshotCodec, joinResidual);
         }
         else if (plan.JoinType is AstJoinType.LeftOuter)
         {
@@ -817,9 +832,11 @@ public static class TypedPlanCompiler
         var joinPartition = ctx.Workers > 1 ? leftIndices : null;
         var node = new TypedNode(outputRowType, outputSchema, joined, PartitionKey: joinPartition);
 
-        if (plan.Residual is not null)
+        if (plan.Residual is not null && !fuseResidual)
         {
-            // Only INNER reaches here (LEFT/RIGHT bail above).
+            // Only INNER reaches here (LEFT/RIGHT bail above). This is the spine
+            // path, where the join op has no residual hook — apply it as a
+            // post-join filter (the non-spine path fused it into the join above).
             var residual = BuildTypedPredicateDelegate(plan.Residual, outputRowType);
             if (residual is null) return null;
             var filtered = InvokeFilter(ctx.Builder, outputRowType, joined, residual);
@@ -2406,8 +2423,10 @@ public static class TypedPlanCompiler
     private static object EmitInnerJoin(
         CompileContext ctx, Type keyRowType, Type leftRowType, Type rightRowType, Type outputRowType,
         object leftIndexed, object rightIndexed, Delegate combine,
-        object? leftSnapshotCodec, object? rightSnapshotCodec)
+        object? leftSnapshotCodec, object? rightSnapshotCodec, Delegate? residual = null)
     {
+        // residual is non-null only on the in-memory path (the caller leaves it
+        // null for spine and post-filters instead).
         return ctx.Options.TraceFamily == TraceFamily.Spine
             ? InvokeSpineIncrementalInnerJoin(
                 ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
@@ -2415,7 +2434,7 @@ public static class TypedPlanCompiler
                 leftSnapshotCodec, rightSnapshotCodec, ctx.Options.Compaction)
             : InvokeIncrementalInnerJoin(
                 ctx.Builder, keyRowType, leftRowType, rightRowType, outputRowType,
-                leftIndexed, rightIndexed, combine, leftSnapshotCodec, rightSnapshotCodec);
+                leftIndexed, rightIndexed, combine, leftSnapshotCodec, rightSnapshotCodec, residual);
     }
 
     private static object EmitLeftJoin(
@@ -2870,7 +2889,7 @@ public static class TypedPlanCompiler
     private static object InvokeIncrementalInnerJoin(
         CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
         Type outputRowType, object leftIndexed, object rightIndexed, Delegate combine,
-        object? leftSnapshotCodec = null, object? rightSnapshotCodec = null)
+        object? leftSnapshotCodec = null, object? rightSnapshotCodec = null, Delegate? residual = null)
     {
         var openMethod = typeof(StatefulOperators)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
@@ -2879,13 +2898,14 @@ public static class TypedPlanCompiler
         var closed = openMethod.MakeGenericMethod(
             keyRowType, leftRowType, rightRowType, outputRowType, typeof(Z64));
         // Reflection ignores optional-parameter defaults — every parameter must
-        // be supplied. The trailing nulls are the LATENESS GC hooks
+        // be supplied. The two nulls after the codecs are the LATENESS GC hooks
         // (frontier, monotoneKey); the typed path does not GC (LATENESS forces
-        // the structural compile).
+        // the structural compile). The trailing slot is the residual predicate
+        // (Func<TOut,bool>), applied during the join enumeration.
         return closed.Invoke(null, new object?[]
         {
             builder, leftIndexed, rightIndexed, combine,
-            leftSnapshotCodec, rightSnapshotCodec, null, null,
+            leftSnapshotCodec, rightSnapshotCodec, null, null, residual,
         })!;
     }
 

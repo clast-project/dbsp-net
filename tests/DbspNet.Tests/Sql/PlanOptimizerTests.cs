@@ -110,10 +110,12 @@ public class PlanOptimizerTests
     }
 
     [Fact]
-    public void FilterOnInnerJoin_CrossConjunct_StaysAbove()
+    public void FilterOnInnerJoin_CrossConjunct_FoldsIntoResidual()
     {
-        // `WHERE a.v > b.v` references both sides — cannot be pushed to
-        // either. The optimizer must leave it as a Filter above the Join.
+        // `WHERE a.v > b.v` references both sides — cannot be pushed to either
+        // input. On an INNER join a cross-cutting predicate above the join IS a
+        // join residual, so the optimizer folds it into the join (applied during
+        // the join enumeration) rather than leaving a separate Filter above.
         var plan = Plan(
             [
                 "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
@@ -124,8 +126,8 @@ public class PlanOptimizerTests
         var optimized = PlanOptimizer.Optimize(plan);
 
         var proj = (ProjectPlan)optimized;
-        var filter = Assert.IsType<FilterPlan>(proj.Input);
-        Assert.IsType<JoinPlan>(filter.Input);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.NotNull(join.Residual);
     }
 
     // ---- Filter(LeftJoin) → right-only pred stays above, left-only pushes ----
