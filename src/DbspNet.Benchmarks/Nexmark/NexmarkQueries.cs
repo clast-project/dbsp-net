@@ -119,5 +119,58 @@ internal static class NexmarkQueries
                   WHERE rn <= 1
               ) w ON a.id = w.auction",
             AuctionBid),
+        new(
+            "q17",
+            "auction statistics by day",
+            // Feldera uses COUNT(*) FILTER (WHERE …) + DATE_FORMAT; the DbspNet
+            // dialect equivalent is SUM(CASE …) for the conditional counts and
+            // CAST(date_time AS DATE) for the day bucket (group-by-expression key).
+            @"SELECT b.auction, CAST(b.date_time AS DATE) AS day,
+                     COUNT(*) AS total_bids,
+                     SUM(CASE WHEN b.price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
+                     SUM(CASE WHEN b.price >= 10000 AND b.price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
+                     SUM(CASE WHEN b.price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                     MIN(b.price) AS min_price, MAX(b.price) AS max_price,
+                     AVG(b.price) AS avg_price, SUM(b.price) AS sum_price
+              FROM bid b
+              GROUP BY b.auction, CAST(b.date_time AS DATE)",
+            BidOnly),
+        new(
+            "q18",
+            "find last bid — dedup latest bid per (bidder, auction)",
+            @"SELECT auction, bidder, price, channel, url, date_time, extra
+              FROM (
+                  SELECT auction, bidder, price, channel, url, date_time, extra,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY bidder, auction
+                             ORDER BY date_time DESC) AS rank_number
+                  FROM bid
+              ) ranked
+              WHERE rank_number <= 1",
+            BidOnly),
+        new(
+            "q19",
+            "auction TOP-10 — ten highest bids per auction",
+            @"SELECT auction, bidder, price, channel, url, date_time, extra
+              FROM (
+                  SELECT auction, bidder, price, channel, url, date_time, extra,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY auction
+                             ORDER BY price DESC) AS rank_number
+                  FROM bid
+              ) ranked
+              WHERE rank_number <= 10",
+            BidOnly),
+        new(
+            "q20",
+            "expand bid with auction — filtered bid ⋈ auction",
+            @"SELECT b.auction, b.bidder, b.price, b.channel, b.url,
+                     b.date_time AS bid_date_time, b.extra AS bid_extra,
+                     a.item_name, a.description, a.initial_bid, a.reserve,
+                     a.date_time AS auction_date_time, a.expires, a.seller,
+                     a.category, a.extra AS auction_extra
+              FROM bid b JOIN auction a ON b.auction = a.id
+              WHERE a.category = 10",
+            AuctionBid),
     };
 }

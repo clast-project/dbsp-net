@@ -89,11 +89,15 @@ internal static class NexmarkBenchmark
             "the full materialized view size.");
         output.AppendLine(">");
         output.AppendLine(
-            "> Queries q5 / q7 / q8 (tumbling / sliding event-time windows) are " +
-            "omitted: they require TUMBLE / HOP windowing table functions that " +
-            "DbspNet does not yet expose. q9 uses `ROW_NUMBER() OVER (PARTITION … " +
-            "ORDER …)` which compiles to a partitioned incremental TOP-K (and, " +
-            "in parallel, an exchange on the partition key).");
+            "> Queries q5 / q7 / q8 / q11 / q12 (tumbling / sliding / session " +
+            "event-time windows) are omitted: they require TUMBLE / HOP / SESSION " +
+            "windowing table functions that DbspNet does not yet expose. q9 / q18 / " +
+            "q19 use `ROW_NUMBER() OVER (PARTITION … ORDER …)` → a partitioned " +
+            "incremental TOP-K (and, in parallel, an exchange on the partition key); " +
+            "q20 is a filtered bid ⋈ auction join; q17 (per-auction/day statistics " +
+            "with conditional `SUM(CASE …)` counts over a `CAST(date_time AS DATE)` " +
+            "group key) compiles but has no parallel form today, so it runs " +
+            "single-only.");
         output.AppendLine();
     }
 
