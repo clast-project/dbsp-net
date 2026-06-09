@@ -369,6 +369,96 @@ interning, which the evidence says are the wrong targets.
 
 ---
 
+## 8. Next-increment scoping — wiring the merge probe into the aggregate
+
+> Status: scoping only (no code). Prototype landed in commit `0f31ddf`
+> (`GallopIndexOf` + `GroupForManySorted` + `MergeProbeBenchmark`, results in
+> [merge-probe-bench.md](merge-probe-bench.md)). This section captures what a
+> follow-up session needs so it can start at the real decision, not discovery.
+
+### What the code actually does today (verified)
+
+- **Aggregators recompute over the full group every tick.** `SumAggregator` and
+  `MinMaxAggregator` (`src/DbspNet.Core/Operators/Stateful/Aggregators/`)
+  implement **only** `Compute(ZSet<TValue,Z64>)` and inherit `IAggregator`'s
+  default `Update(...) => Compute(afterMultiset)`. So `afterMultiset` is
+  genuinely consumed — fully scanned — and the expensive
+  `afterGroup = beforeGroup + groupDelta` (with `beforeGroup = _trace.GroupFor(key)`)
+  in `SpineIncrementalAggregateOp.Step` is real, necessary work, not waste.
+  (The "MIN/MAX keep a sorted set in state" note in `benchmarks.md` does **not**
+  match this `MinMaxAggregator` — it scans.)
+- **The merge win is therefore: produce `afterMultiset` as a sorted
+  `(value,weight)[]` instead of a rebuilt-and-rehashed `ZSet`, and let the
+  aggregator scan that.** SUM is order-independent (sums either way); MIN/MAX get
+  *faster* on a sorted run (first/last positive-weight element, no full scan).
+- **Both compile paths reach the spine aggregate.** Structural via
+  `PlanToCircuit.SpineIncrementalAggregate` with
+  `IAggregator<StructuralRow,StructuralRow>` (`CompositeAggregator`); typed via
+  the **reflective** `TypedPlanCompiler.InvokeSpineIncrementalAggregate`
+  (line ~3112) with `TypedCompositeAggregator<TIn,TAgg>`. Both Composite
+  aggregators wrap the component aggregators (Sum/MinMax/Count/Avg/…).
+
+### The one real decision: how the aggregator consumes the sorted run
+
+The aggregators take `ZSet<TValue,Z64>`. Feeding them a sorted run without
+rebuilding a `ZSet` is the crux. Options:
+
+- **D (recommended) — additive optional capability, mirroring the existing
+  `Update` default.** Add to `IAggregator` an optional
+  `Optional<TOut> ComputeSorted(ReadOnlySpan<(TValue Value, Z64 Weight)> sortedRun)`
+  with a default that builds a `ZSet` and calls `Compute` (i.e. today's
+  behaviour). Override it in `SumAggregator`/`MinMaxAggregator`/`Count`/`Avg`
+  and have the two Composite aggregators fan out to component `ComputeSorted`.
+  `SpineIncrementalAggregateOp.Step` then: sort the delta keys once →
+  `GroupForManySorted` for the before-groups → merge each with its delta run →
+  call `ComputeSorted`; fall back to today's `GroupFor` + `Compute` path for any
+  aggregator that doesn't override (and for `D==1`, per the §5 soft spot).
+  **Effort S–M. Risk LOW — and this is the key safety property: it adds an
+  interface method with a default, so no existing signature changes, so the
+  reflective builder call `SpineIncrementalAggregate(input, aggregator, codec,
+  compaction, keyComparer, valueComparer, …)` is untouched** (see
+  [[typed-compiler-reflection-gotcha]] — the gotcha is about *builder* signature
+  changes; this is not one).
+- **B — replace `ZSet` with an `IMultiset<TValue>` abstraction** that both `ZSet`
+  and a sorted-run type implement. Cleanest conceptually, but changes the
+  `IAggregator` generic surface and every impl + every caller. Effort L, risk M.
+  Not worth it over D for a first increment.
+- **C — keep the `ZSet` signature, build the `ZSet` cheaper.** Defeats the
+  purpose (still hashes value rows). Rejected.
+
+### Open sub-questions for the follow-up (cheap to answer first)
+
+1. **Delta side.** The per-tick `groupDelta` is a flat `IndexedZSet` group
+   (`delta.GroupFor(key)`) — small and unsorted. Either sort it once per key
+   (tiny) to merge against the sorted before-run, or extend `GroupForManySorted`
+   to also fold in the delta. Decide which; the former keeps the trace method
+   pure.
+2. **Empty-group detection.** `Step` prunes caches on `afterGroup.IsEmpty`. The
+   merged sorted run gives this directly (empty result ⇒ empty group) — keep the
+   check, just off the new representation.
+3. **`Z64` weight sign for MIN/MAX.** `MinMaxAggregator` skips non-positive
+   weights; the merged run already sums weights and drops zeros, so a value
+   present with net-positive weight is the gate — preserve that.
+
+### Parallel follow-up (separate change, not this increment)
+
+The **spine join probe** (`SpineIncrementalJoinOp`) also point-probes via
+`GroupFor` per delta key, and `merge-probe-bench.md` shows the absent-key
+(probe-side miss) case is where the merge wins biggest (up to 135×). But the
+join *consumes* the matched group differently (cross-product into output rows,
+not an aggregate scan), so it's a distinct wiring job — `GroupForManySorted`
+gives the batched probe, then the existing combine/cross-product loop runs over
+the sliced runs. Scope it after the aggregate proves out end-to-end.
+
+### End-to-end gate
+
+Wire D, then measure the q4 Nexmark **step** (not the microbench) via the
+`comparison`/`nexmark` benchmark and the `nexprofile` split/step/gather timing
+at W=14. Ship only if the q4 step improves without regressing the existing
+flat-vs-spine benchmark or the `D==1`/small-group cases.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
