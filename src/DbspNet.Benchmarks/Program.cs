@@ -31,6 +31,24 @@ if (args.Length > 0 && args[0] == "parallel")
     return DbspNet.Benchmarks.ParallelScalingBenchmark.RunConsole(args);
 }
 
+// Merge-probe prototype sub-command: `dotnet run -- mergeprobe`
+// Point probe vs galloping merge over the spine indexed trace
+// (docs/design-row-representation.md §6.1).
+if (args.Length > 0 && args[0] == "mergeprobe")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — merge-probe prototype");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.MergeProbeBenchmark.Run(sb);
+    var mpPath = Path.Combine(FindDocsDir(), "merge-probe-bench.md");
+    File.WriteAllText(mpPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(mpPath)}");
+    return 0;
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();
@@ -114,6 +132,25 @@ static CompiledQuery CompileSpine(string[] ddl, string sql)
         PlanOptimizer.Optimize(plan),
         snapshotCodecs: null,
         new CompileOptions { TraceFamily = TraceFamily.Spine });
+}
+
+// Walk up from the current directory to the repo's docs/ folder, so the
+// report lands in the right place regardless of the run's working directory.
+static string FindDocsDir()
+{
+    var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
+    while (dir is not null)
+    {
+        var candidate = Path.Combine(dir.FullName, "docs");
+        if (Directory.Exists(candidate) && File.Exists(Path.Combine(dir.FullName, "README.md")))
+        {
+            return candidate;
+        }
+
+        dir = dir.Parent;
+    }
+
+    return Directory.GetCurrentDirectory();
 }
 
 static void PrintHeader(string name)

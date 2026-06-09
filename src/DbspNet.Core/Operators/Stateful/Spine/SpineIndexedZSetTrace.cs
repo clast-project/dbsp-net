@@ -279,6 +279,192 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         return any ? b.Build() : ZSet<TValue, TWeight>.Empty;
     }
 
+    /// <summary>
+    /// Batched group probe: given <paramref name="sortedKeys"/> in ascending
+    /// key order, returns the integrated group for each key that has one,
+    /// merged across batches. Unlike a loop of <see cref="GroupFor"/> calls,
+    /// this walks each batch's sorted outer-key column exactly once with a
+    /// galloping cursor (O(D·log(N/D)) instead of D independent bloom + binary
+    /// searches) and returns each group as a sorted <c>(value, weight)</c>
+    /// array sliced straight from the batch columns — no per-probe
+    /// <c>ZSetBuilder</c>, so value rows are never hashed. This is the
+    /// merge-execution prototype from docs/design-row-representation.md §6.1.
+    /// </summary>
+    /// <remarks>
+    /// Semantics match calling <see cref="GroupFor"/> per key and discarding
+    /// the empty results: weights are summed per value across all batches and
+    /// zero-weight values are dropped. Only keys with a non-empty integrated
+    /// group appear in the result, in <paramref name="sortedKeys"/> order.
+    /// <paramref name="sortedKeys"/> must be sorted by this trace's key comparer
+    /// and hold no duplicates.
+    /// </remarks>
+    public List<(TKey Key, (TValue Value, TWeight Weight)[] Group)> GroupForManySorted(TKey[] sortedKeys)
+    {
+        ArgumentNullException.ThrowIfNull(sortedKeys);
+        var result = new List<(TKey, (TValue, TWeight)[])>();
+        if (sortedKeys.Length == 0)
+        {
+            return result;
+        }
+
+        // Per delta key, the sorted (value, weight) runs gathered from each
+        // batch. Most keys live in a single batch, so the inner list stays
+        // tiny and is only allocated on first match.
+        var runs = new List<(TValue[] Values, TWeight[] Weights, int Start, int End)>?[sortedKeys.Length];
+        var first = sortedKeys[0];
+        var last = sortedKeys[sortedKeys.Length - 1];
+
+        foreach (var level in _levels)
+        {
+            foreach (var batch in level)
+            {
+                if (batch.IsEmpty)
+                {
+                    continue;
+                }
+
+                var rb = batch as ResidentSpineIndexedBatch<TKey, TValue, TWeight>
+                    ?? batch.MaterialiseIndexed(_keyComparer, _valueComparer);
+                var keys = rb.Keys;
+                if (keys.Length == 0)
+                {
+                    continue;
+                }
+
+                // Whole-batch range gate: skip batches whose key span can't
+                // overlap the probe span (cheaper than galloping every key
+                // against a disjoint batch).
+                if (_keyComparer.Compare(keys[keys.Length - 1], first) < 0 ||
+                    _keyComparer.Compare(keys[0], last) > 0)
+                {
+                    continue;
+                }
+
+                var offsets = rb.Offsets;
+                var values = rb.Values;
+                var weights = rb.Weights;
+                var cursor = 0;
+                for (var di = 0; di < sortedKeys.Length && cursor < keys.Length; di++)
+                {
+                    var idx = SortedKeySearch.GallopIndexOf(keys, cursor, sortedKeys[di], _keyComparer);
+                    if (idx >= 0)
+                    {
+                        (runs[di] ??= new()).Add((values, weights, offsets[idx], offsets[idx + 1]));
+                        cursor = idx + 1;
+                    }
+                    else
+                    {
+                        cursor = ~idx;
+                    }
+                }
+            }
+        }
+
+        for (var di = 0; di < sortedKeys.Length; di++)
+        {
+            var keyRuns = runs[di];
+            if (keyRuns is null)
+            {
+                continue;
+            }
+
+            var group = MergeRuns(keyRuns, _valueComparer);
+            if (group.Length > 0)
+            {
+                result.Add((sortedKeys[di], group));
+            }
+        }
+
+        return result;
+    }
+
+    private static (TValue Value, TWeight Weight)[] MergeRuns(
+        List<(TValue[] Values, TWeight[] Weights, int Start, int End)> runs,
+        IComparer<TValue> valueComparer)
+    {
+        // Fast path: a key present in a single batch — its run is already
+        // sorted, distinct, and zero-free, so slice it straight out.
+        if (runs.Count == 1)
+        {
+            var (v, w, s, e) = runs[0];
+            var single = new (TValue, TWeight)[e - s];
+            for (var i = 0; i < single.Length; i++)
+            {
+                single[i] = (v[s + i], w[s + i]);
+            }
+
+            return single;
+        }
+
+        var acc = SliceToList(runs[0]);
+        for (var r = 1; r < runs.Count; r++)
+        {
+            acc = MergeTwo(acc, runs[r], valueComparer);
+        }
+
+        return acc.ToArray();
+    }
+
+    private static List<(TValue Value, TWeight Weight)> SliceToList(
+        (TValue[] Values, TWeight[] Weights, int Start, int End) run)
+    {
+        var list = new List<(TValue, TWeight)>(run.End - run.Start);
+        for (var i = run.Start; i < run.End; i++)
+        {
+            list.Add((run.Values[i], run.Weights[i]));
+        }
+
+        return list;
+    }
+
+    private static List<(TValue Value, TWeight Weight)> MergeTwo(
+        List<(TValue Value, TWeight Weight)> a,
+        (TValue[] Values, TWeight[] Weights, int Start, int End) b,
+        IComparer<TValue> valueComparer)
+    {
+        var merged = new List<(TValue, TWeight)>(a.Count + (b.End - b.Start));
+        int i = 0, j = b.Start;
+        while (i < a.Count && j < b.End)
+        {
+            var c = valueComparer.Compare(a[i].Value, b.Values[j]);
+            if (c < 0)
+            {
+                merged.Add(a[i]);
+                i++;
+            }
+            else if (c > 0)
+            {
+                merged.Add((b.Values[j], b.Weights[j]));
+                j++;
+            }
+            else
+            {
+                var sum = TWeight.Add(a[i].Weight, b.Weights[j]);
+                if (!TWeight.IsZero(sum))
+                {
+                    merged.Add((a[i].Value, sum));
+                }
+
+                i++;
+                j++;
+            }
+        }
+
+        while (i < a.Count)
+        {
+            merged.Add(a[i]);
+            i++;
+        }
+
+        while (j < b.End)
+        {
+            merged.Add((b.Values[j], b.Weights[j]));
+            j++;
+        }
+
+        return merged;
+    }
+
     /// <summary>True iff every batch is empty (or the spine holds no batches).</summary>
     public bool IsEmpty
     {

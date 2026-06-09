@@ -172,6 +172,99 @@ public class SpineIndexedZSetTraceTests
         Assert.Equal(spine.Materialize().GroupCount, fromEntries.Count);
     }
 
+    [Fact]
+    public void GroupForManySorted_MatchesPerKeyGroupFor()
+    {
+        var spine = new SpineIndexedZSetTrace<int, string, Z64>();
+        spine.Integrate(IndexedSingleton(1, "x", new Z64(3)));
+        spine.Integrate(IndexedSingleton(1, "x", new Z64(-1)));  // sums to 2 across batches
+        spine.Integrate(IndexedSingleton(1, "y", new Z64(2)));
+        spine.Integrate(IndexedSingleton(3, "z", new Z64(1)));
+        spine.Integrate(IndexedSingleton(5, "q", new Z64(4)));
+        spine.Integrate(IndexedSingleton(5, "q", new Z64(-4))); // cancels to empty group
+
+        // Sorted keys including an absent (2), an empty-after-cancel (5), and a
+        // miss past the end (9).
+        var groups = spine.GroupForManySorted(new[] { 1, 2, 3, 5, 9 });
+        var byKey = groups.ToDictionary(g => g.Key, g => g.Group);
+
+        // Only keys with a non-empty integrated group appear.
+        Assert.Equal(new[] { 1, 3 }, byKey.Keys.OrderBy(k => k).ToArray());
+
+        AssertGroupEquals(spine.GroupFor(1), byKey[1]);
+        AssertGroupEquals(spine.GroupFor(3), byKey[3]);
+    }
+
+    [Fact]
+    public void GroupForManySorted_EmptyKeys_ReturnsEmpty()
+    {
+        var spine = new SpineIndexedZSetTrace<int, string, Z64>();
+        spine.Integrate(IndexedSingleton(1, "x", new Z64(1)));
+        Assert.Empty(spine.GroupForManySorted(Array.Empty<int>()));
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void Pbt_GroupForManySorted_MatchesFlatOracle(int batchesPerLevel)
+    {
+        var rng = new Random(Seed: 91 + batchesPerLevel);
+        var spine = new SpineIndexedZSetTrace<int, int, Z64>(new TieredCompactionStrategy(batchesPerLevel));
+        var oracle = new IndexedZSetBuilder<int, int, Z64>();
+
+        for (var step = 0; step < 200; step++)
+        {
+            var delta = RandomDelta(rng, keySpace: 12, valueSpace: 6, maxEntries: 8);
+            spine.Integrate(delta);
+            foreach (var (k, group) in delta)
+            {
+                foreach (var (v, w) in group)
+                {
+                    oracle.Add(k, v, w);
+                }
+            }
+        }
+
+        var expected = oracle.Build();
+
+        // Probe the whole key space (present + absent), sorted as the contract
+        // requires, in one batched call.
+        var probeKeys = Enumerable.Range(-3, 18).ToArray();
+        var byKey = spine.GroupForManySorted(probeKeys).ToDictionary(g => g.Key, g => g.Group);
+
+        foreach (var k in probeKeys)
+        {
+            var pointGroup = spine.GroupFor(k);
+            if (pointGroup.IsEmpty)
+            {
+                Assert.DoesNotContain(k, byKey.Keys);
+            }
+            else
+            {
+                Assert.True(byKey.TryGetValue(k, out var mergeGroup), $"key {k} missing from merge result");
+                AssertGroupEquals(pointGroup, mergeGroup!);
+            }
+        }
+    }
+
+    private static void AssertGroupEquals<TValue>(ZSet<TValue, Z64> expected, (TValue Value, Z64 Weight)[] actual)
+        where TValue : notnull
+    {
+        var expectedPairs = new Dictionary<TValue, Z64>();
+        foreach (var (v, w) in expected)
+        {
+            expectedPairs[v] = w;
+        }
+
+        Assert.Equal(expectedPairs.Count, actual.Length);
+        foreach (var (v, w) in actual)
+        {
+            Assert.True(expectedPairs.TryGetValue(v, out var ew), $"value {v} not expected in group");
+            Assert.Equal(ew, w);
+        }
+    }
+
     private static IndexedZSet<TKey, TValue, Z64> IndexedSingleton<TKey, TValue>(TKey key, TValue value, Z64 weight)
         where TKey : notnull
         where TValue : notnull
