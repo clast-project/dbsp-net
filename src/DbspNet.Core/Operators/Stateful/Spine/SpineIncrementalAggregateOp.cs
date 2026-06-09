@@ -42,7 +42,6 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
     private readonly IAggregator<TValue, TOut> _aggregator;
     private readonly IComparer<TKey> _keyComparer;
     private readonly IComparer<TValue> _valueComparer;
-    private readonly Comparison<(TValue Value, Z64 Weight)> _runComparison;
     private readonly SpineIndexedZSetTrace<TKey, TValue, Z64> _trace;
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
@@ -69,7 +68,6 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
         _aggregator = aggregator;
         _keyComparer = keyComparer ?? Comparer<TKey>.Default;
         _valueComparer = valueComparer ?? Comparer<TValue>.Default;
-        _runComparison = (a, b) => _valueComparer.Compare(a.Value, b.Value);
         _trace = new SpineIndexedZSetTrace<TKey, TValue, Z64>(
             compactionStrategy ?? TieredCompactionStrategy.Default,
             keyComparer,
@@ -187,8 +185,11 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
                 }
 
                 var groupDelta = delta.GroupFor(key);
-                var afterRun = MergeDeltaIntoRun(beforeRun, groupDelta);
-                EmitForKey(key, groupDelta, new SortedRunMultiset<TValue>(afterRun, _valueComparer), builder);
+                // Lazy after-group view over (beforeRun, groupDelta): the
+                // incremental MIN/MAX aggregators only probe WeightOf for the few
+                // delta rows, so this never pays the O(N) after-run merge + array
+                // the eager build cost (docs §12). SUM/AVG enumerate it lazily.
+                EmitForKey(key, groupDelta, new MergeViewMultiset<TValue>(beforeRun, groupDelta, _valueComparer), builder);
             }
         }
 
@@ -203,8 +204,9 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
     /// retract/insert pair for any changed aggregate value. Shared by the
     /// point-probe and merge paths — they differ only in how
     /// <paramref name="afterGroup"/> is represented (a rebuilt <see cref="ZSet{TKey,TWeight}"/>
-    /// vs a <see cref="SortedRunMultiset{T}"/>), which is exactly what the
-    /// <see cref="IMultiset{TKey,TWeight}"/> abstraction hides.
+    /// vs a lazy <see cref="MergeViewMultiset{T}"/> over the before-run and the
+    /// delta), which is exactly what the <see cref="IMultiset{TKey,TWeight}"/>
+    /// abstraction hides.
     /// </summary>
     private void EmitForKey(
         TKey key,
@@ -221,8 +223,8 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
 
         // Cache-pruning keyed on dict-shape IsEmpty (no trace entries) — see the
         // matching comment in IncrementalAggregateOp.Step for why the linear
-        // gate can't be used here. A fully cancelled group merges to a length-0
-        // run, so SortedRunMultiset.IsEmpty agrees with the rebuilt Z-set's.
+        // gate can't be used here. A fully cancelled group's MergeViewMultiset
+        // reports IsEmpty just like the rebuilt Z-set's.
         if (afterGroup.IsEmpty)
         {
             _aggCache.Remove(key);
@@ -267,75 +269,6 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
 
         Array.Sort(keys, _keyComparer);
         return keys;
-    }
-
-    /// <summary>
-    /// Merges a sorted, distinct, zero-free before-run (from
-    /// <c>GroupForManySorted</c>) with this tick's flat <paramref name="groupDelta"/>
-    /// into the sorted, distinct, zero-free after-run — summing weights on equal
-    /// values and dropping any that cancel to zero. Values are only compared,
-    /// never hashed.
-    /// </summary>
-    private (TValue Value, Z64 Weight)[] MergeDeltaIntoRun(
-        (TValue Value, Z64 Weight)[] beforeRun,
-        ZSet<TValue, Z64> groupDelta)
-    {
-        // Sort the (small, flat) delta group into the trace's value order once.
-        var deltaArr = new (TValue Value, Z64 Weight)[groupDelta.Count];
-        var di = 0;
-        foreach (var (v, w) in groupDelta)
-        {
-            deltaArr[di++] = (v, w);
-        }
-
-        Array.Sort(deltaArr, _runComparison);
-
-        if (beforeRun.Length == 0)
-        {
-            // New group: the after-run is just the (already distinct, zero-free)
-            // sorted delta.
-            return deltaArr;
-        }
-
-        var merged = new List<(TValue Value, Z64 Weight)>(beforeRun.Length + deltaArr.Length);
-        int bi = 0, dj = 0;
-        while (bi < beforeRun.Length && dj < deltaArr.Length)
-        {
-            var c = _valueComparer.Compare(beforeRun[bi].Value, deltaArr[dj].Value);
-            if (c < 0)
-            {
-                merged.Add(beforeRun[bi]);
-                bi++;
-            }
-            else if (c > 0)
-            {
-                merged.Add(deltaArr[dj]);
-                dj++;
-            }
-            else
-            {
-                var sum = Z64.Add(beforeRun[bi].Weight, deltaArr[dj].Weight);
-                if (!Z64.IsZero(sum))
-                {
-                    merged.Add((beforeRun[bi].Value, sum));
-                }
-
-                bi++;
-                dj++;
-            }
-        }
-
-        while (bi < beforeRun.Length)
-        {
-            merged.Add(beforeRun[bi++]);
-        }
-
-        while (dj < deltaArr.Length)
-        {
-            merged.Add(deltaArr[dj++]);
-        }
-
-        return merged.ToArray();
     }
 
     /// <summary>

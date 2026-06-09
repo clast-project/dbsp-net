@@ -921,6 +921,60 @@ Closing q4's residual ~8% is the spine **aggregate** read path — a separate it
 
 ---
 
+## 12. Spine aggregate read path — the lazy merge-view (q4's residual gap, CLOSED)
+
+§11 left q4 the one stateful query still behind flat (~0.92× at the capacity
+knee), and attributed it to the spine **aggregate** read path. This closes it.
+
+**Where the cost was.** q4's inner `MAX(price)` compiles to
+`TypedSqlMinMaxAggregator`, which is *incremental*: per tick it probes only the
+few **delta** rows — `after.WeightOf(row)` — and maintains its own `SortedSet`.
+But the spine aggregate op materialised the **whole** after-group every tick to
+serve those few probes: `GroupForManySorted` gathers the before-run (O(N)) and
+then `MergeDeltaIntoRun` merged it with the delta into a fresh sorted array
+(another O(N) + an allocation), all so a handful of `WeightOf` calls could binary-
+search it. Flat answers the same probes O(1) from its dictionary. For q4's
+growing per-auction groups with small per-tick deltas, that redundant O(N) merge
+was the spine's drag.
+
+**The fix — `MergeViewMultiset`.** A lazy `IMultiset` view over
+`(beforeRun, groupDelta)` that never builds the merged array:
+- `WeightOf(v)` = binary-search the before-run + an O(1) delta lookup — so a
+  probe-only tick (incremental MIN/MAX) pays no merge at all;
+- `IsEmpty` short-circuits in O(1) for a non-empty (growing) group — the first
+  before-run value the delta does not touch has net = its before weight ≠ 0;
+- `SumWeights` = `sum(beforeRun) + delta.SumWeights()` (no merge);
+- enumeration (SUM/COUNT/AVG and the non-incremental MIN/MAX `Compute`) folds the
+  two lazily — same work as the old eager merge, minus the throwaway array.
+
+Enumeration order is no longer sorted, which is sound because every `IMultiset`
+consumer folds commutatively (MIN/MAX/SUM/COUNT/AVG and the sketches). The op's
+merge path now hands the aggregator a `MergeViewMultiset` instead of
+`SortedRunMultiset(MergeDeltaIntoRun(...))`; the eager merge is gone. Drop-in,
+contained to the spine aggregate op + one new type.
+
+**Verified.** Full suite 1,672 green (the existing flat-vs-spine SUM/MIN PBTs and
+the SQL random-query PBTs exercise it). The operator gate (`aggprobe`) keeps the
+merge path ahead of point-probe (1.5–4.3×).
+
+**Result (`q4spine`, batch 10k, three median-of-2/3 runs).** q4
+spine·merge·staged vs flat now reads **0.99×, 1.11×, 1.20×** — **parity-to-ahead**,
+up from §11's 0.92×, and spine·merge·staged now beats spine·point·staged (the
+merge-view made merge the winning probe). The exact figure sits inside the
+parallel bench's ~±0.1× noise, but the gap is closed: **all three stateful
+Nexmark queries (q3, q4, q9) are now at parity-or-better with spine + memtable**.
+This removes §11's q4-specific objection; the global default stays `Flat` for the
+unchanged reasons (stateless / join-light queries gain nothing, conservative
+default).
+
+The remaining spine read-path idea — for probe-only aggregators, skip even the
+O(N) `GroupForManySorted` gather and probe individual delta values across batches
+(`WeightOfValueInGroup`) — was scoped but not needed to reach parity; it is
+blocked on a cheap per-group emptiness signal (today `IsEmpty` needs the
+before-run) and left as future work.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,

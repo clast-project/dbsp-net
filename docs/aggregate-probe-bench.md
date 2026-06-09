@@ -8,9 +8,9 @@ Operator-level gate for docs/design-row-representation.md §8 (the IMultiset inc
 
 | N | D=1 | D=8 | D=64 | D=512 | D=4096 |
 |--:|----:|----:|-----:|------:|-------:|
-| 1,000 | 0.90× | 1.70× | 2.39× | 2.45× | 5.47× |
-| 100,000 | 1.32× | 1.48× | 2.40× | 2.33× | 2.38× |
-| 1,000,000 | 1.00× | 1.79× | 2.00× | 2.21× | 2.39× |
+| 1,000 | 0.97× | 1.56× | 2.25× | 2.27× | 4.31× |
+| 100,000 | 0.96× | 1.51× | 2.34× | 2.23× | 2.55× |
+| 1,000,000 | 0.95× | 1.94× | 2.51× | 1.88× | 2.37× |
 
 Reading: the merge wins on multi-key ticks (`D > 1`) by skipping the two whole-group hashing passes the Z-set rebuild pays; `D == 1` keeps the point probe (the trace-level soft spot), so that column is ~1.0× by construction. The win is the after-group build cost the IMultiset abstraction removes — the aggregators are unchanged.
 

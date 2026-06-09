@@ -15,21 +15,21 @@ The merge probe ships as the typed default only if **spine·merge beats flat**. 
 
 | Config | Split (ms) | Step (ms) | Step events/s | Step↑ vs flat | Gather (ms) | Output rows |
 |:-------|-----------:|----------:|--------------:|--------------:|------------:|------------:|
-| flat | 111.4 | 395.4 | 1,517,604 | 1.00× | 0.6 | 10 |
-| spine·point | 99.6 | 833.7 | 719,647 | 0.47× | 0.7 | 10 |
-| spine·merge | 86.4 | 740.3 | 810,469 | 0.53× | 0.5 | 10 |
-| spine·point·staged | 101.0 | 472.1 | 1,270,784 | 0.84× | 0.8 | 10 |
-| spine·merge·staged | 84.8 | 500.1 | 1,199,721 | 0.79× | 0.7 | 10 |
+| flat | 77.3 | 525.9 | 1,140,808 | 1.00× | 0.5 | 10 |
+| spine·point | 75.0 | 847.3 | 708,159 | 0.62× | 0.7 | 10 |
+| spine·merge | 129.0 | 623.4 | 962,470 | 0.84× | 0.5 | 10 |
+| spine·point·staged | 79.0 | 429.5 | 1,396,948 | 1.22× | 0.6 | 10 |
+| spine·merge·staged | 99.8 | 439.1 | 1,366,385 | 1.20× | 0.5 | 10 |
 
 ## Batch = 100,000 events
 
 | Config | Split (ms) | Step (ms) | Step events/s | Step↑ vs flat | Gather (ms) | Output rows |
 |:-------|-----------:|----------:|--------------:|--------------:|------------:|------------:|
-| flat | 64.1 | 437.0 | 1,372,866 | 1.00× | 0.5 | 10 |
-| spine·point | 135.0 | 585.1 | 1,025,484 | 0.75× | 0.6 | 10 |
-| spine·merge | 171.4 | 525.7 | 1,141,296 | 0.83× | 0.8 | 10 |
-| spine·point·staged | 132.1 | 433.1 | 1,385,225 | 1.01× | 0.6 | 10 |
-| spine·merge·staged | 132.6 | 424.9 | 1,411,971 | 1.03× | 0.7 | 10 |
+| flat | 85.5 | 402.0 | 1,492,359 | 1.00× | 0.6 | 10 |
+| spine·point | 64.3 | 633.9 | 946,553 | 0.63× | 0.7 | 10 |
+| spine·merge | 56.8 | 556.3 | 1,078,532 | 0.72× | 0.6 | 10 |
+| spine·point·staged | 129.5 | 441.2 | 1,359,857 | 0.91× | 0.8 | 10 |
+| spine·merge·staged | 67.5 | 493.4 | 1,216,151 | 0.81× | 0.6 | 10 |
 
 **Reading it.** *Step↑ vs flat* is the headline gate: > 1.0× means the spine config out-steps the flat default. *spine·merge vs spine·point* attributes the merge probe's share. Expect the gap to widen with batch size (wider D → the merge skips more whole-row hashing); at the small batch, ticks approach the `D == 1` point-probe guard, so spine·merge and spine·point converge.
 
