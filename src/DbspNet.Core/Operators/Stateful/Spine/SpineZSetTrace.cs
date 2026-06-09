@@ -35,6 +35,16 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     private readonly Func<TKey, long>? _monotoneKey;
     private long _spillCounter;
 
+    // Cross-tick amortisation (docs §10/§13). When _stagingCapacity > 0, per-tick
+    // deltas accumulate in this mutable memtable (in-place dict merge — flat cost)
+    // and flush into ONE sorted batch only when it holds ≥ that many keys, instead
+    // of building a fresh batch every Integrate. When 0 the memtable is never
+    // populated and every read's `!_memtable.IsEmpty` guard short-circuits, so the
+    // trace is byte-identical to the pre-memtable behaviour. Counterpart to the
+    // memtable in <see cref="SpineIndexedZSetTrace{TKey,TValue,TWeight}"/>.
+    private readonly int _stagingCapacity;
+    private ZSet<TKey, TWeight> _memtable = new(new Dictionary<TKey, TWeight>());
+
     /// <summary>
     /// Creates an empty spine that uses
     /// <see cref="TieredCompactionStrategy.Default"/> (4 batches per
@@ -48,13 +58,15 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         ICompactionStrategy strategy,
         IComparer<TKey>? comparer = null,
         SpineSpillConfig<TKey, TWeight>? spillConfig = null,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null,
+        int? stagingCapacity = null)
     {
         ArgumentNullException.ThrowIfNull(strategy);
         _strategy = strategy;
         _comparer = comparer ?? Comparer<TKey>.Default;
         _spillConfig = spillConfig;
         _monotoneKey = monotoneKey;
+        _stagingCapacity = stagingCapacity ?? SpineStagingConfig.Capacity;
     }
 
     /// <summary>
@@ -70,8 +82,39 @@ public sealed class SpineZSetTrace<TKey, TWeight>
             return;
         }
 
+        if (_stagingCapacity <= 0)
+        {
+            // Memtable disabled: one sorted batch per delta (original behaviour).
+            EnsureLevel(0);
+            _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(delta, _comparer, _monotoneKey));
+            RunCompaction();
+            return;
+        }
+
+        // Memtable enabled: fold the delta in place (flat-dictionary cost) and
+        // only materialise a sorted batch once enough keys have accumulated.
+        _memtable.MergeInPlace(delta);
+        if (_memtable.Count >= _stagingCapacity)
+        {
+            FlushMemtable();
+        }
+    }
+
+    /// <summary>
+    /// Materialises the memtable into a single sorted batch at level 0 and
+    /// compacts, then resets the memtable. No-op when the memtable is empty (so
+    /// it is also safe to call before snapshot / on a disabled trace).
+    /// </summary>
+    private void FlushMemtable()
+    {
+        if (_memtable.IsEmpty)
+        {
+            return;
+        }
+
         EnsureLevel(0);
-        _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(delta, _comparer, _monotoneKey));
+        _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(_memtable, _comparer, _monotoneKey));
+        _memtable = new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>());
         RunCompaction();
     }
 
@@ -106,6 +149,14 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         ArgumentNullException.ThrowIfNull(monotoneKey);
 
         var removed = 0;
+
+        // Drop sub-frontier keys from the memtable too (the most recent,
+        // un-flushed deltas).
+        if (!_memtable.IsEmpty)
+        {
+            removed += _memtable.RemoveKeysBelow(threshold, monotoneKey);
+        }
+
         for (var li = 0; li < _levels.Count; li++)
         {
             var level = _levels[li];
@@ -245,6 +296,12 @@ public sealed class SpineZSetTrace<TKey, TWeight>
             }
         }
 
+        // The memtable holds un-flushed deltas; its weight sums in too.
+        if (!_memtable.IsEmpty)
+        {
+            total = TWeight.Add(total, _memtable.WeightOf(key));
+        }
+
         return total;
     }
 
@@ -253,6 +310,11 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     {
         get
         {
+            if (!_memtable.IsEmpty)
+            {
+                return false;
+            }
+
             foreach (var level in _levels)
             {
                 foreach (var batch in level)
@@ -329,6 +391,9 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     /// </summary>
     public IReadOnlyList<ZSet<TKey, TWeight>> GetBatches()
     {
+        // Snapshot must capture un-flushed deltas, so settle the memtable into a
+        // batch first (no-op when the memtable is empty / disabled).
+        FlushMemtable();
         var result = new List<ZSet<TKey, TWeight>>(BatchCount);
         foreach (var level in _levels)
         {
@@ -485,29 +550,44 @@ public sealed class SpineZSetTrace<TKey, TWeight>
     private Dictionary<TKey, TWeight> MergeEntries()
     {
         var merged = new Dictionary<TKey, TWeight>();
+
+        void Fold(TKey k, TWeight w)
+        {
+            if (merged.TryGetValue(k, out var existing))
+            {
+                var sum = TWeight.Add(existing, w);
+                if (TWeight.IsZero(sum))
+                {
+                    merged.Remove(k);
+                }
+                else
+                {
+                    merged[k] = sum;
+                }
+            }
+            else
+            {
+                merged[k] = w;
+            }
+        }
+
         foreach (var level in _levels)
         {
             foreach (var batch in level)
             {
                 foreach (var (k, w) in batch.Entries())
                 {
-                    if (merged.TryGetValue(k, out var existing))
-                    {
-                        var sum = TWeight.Add(existing, w);
-                        if (TWeight.IsZero(sum))
-                        {
-                            merged.Remove(k);
-                        }
-                        else
-                        {
-                            merged[k] = sum;
-                        }
-                    }
-                    else
-                    {
-                        merged[k] = w;
-                    }
+                    Fold(k, w);
                 }
+            }
+        }
+
+        // The memtable's un-flushed deltas sum in alongside the batches.
+        if (!_memtable.IsEmpty)
+        {
+            foreach (var (k, w) in _memtable)
+            {
+                Fold(k, w);
             }
         }
 

@@ -51,22 +51,26 @@ internal static class DistinctBenchmark
             "(probe hit + no-op integrate), and a **bulk-10** delta of mixed new + " +
             "existing keys (probe + integrate work scaled 10×, swamping the per-step " +
             "overhead that obscures the trace cost in singleton-delta measurements). " +
-            "Spine variants are tiered with 4 batches per level (default) and 2 " +
-            "batches per level (leveled-like).");
+            "Spine is tiered with 4 batches per level (default). **Spine·staged** adds " +
+            "the per-tick memtable (capacity " + StagingCapacity.ToString("N0", System.Globalization.CultureInfo.InvariantCulture) +
+            ", docs §13): integrate becomes an in-place dict merge, flushed to a sorted " +
+            "batch only every few thousand keys, so a churning `SELECT DISTINCT` stops " +
+            "rebuilding a batch per tick. `staged/spine` < 1 = the memtable speeds spine " +
+            "up; `staged/flat` near 1 = it reaches the flat dictionary.");
         output.AppendLine();
-        output.AppendLine("| N          | Op           | Flat        | Spine(N=4)  | Spine(N=2)  | Spine(4) vs Flat |");
-        output.AppendLine("|-----------:|:-------------|------------:|------------:|------------:|-----------------:|");
+        output.AppendLine("| N          | Op           | Flat        | Spine       | Spine·staged | staged/spine | staged/flat |");
+        output.AppendLine("|-----------:|:-------------|------------:|------------:|-------------:|-------------:|------------:|");
 
         foreach (var n in Sizes)
         {
             Console.WriteLine($"  N={n}");
-            var (flatNew, spine4New, spine2New) = MeasureStep(n, deltaShape: DeltaShape.NewKey);
-            var (flatExisting, spine4Existing, spine2Existing) = MeasureStep(n, deltaShape: DeltaShape.ExistingKey);
-            var (flatBulk, spine4Bulk, spine2Bulk) = MeasureStep(n, deltaShape: DeltaShape.Bulk10);
+            var (flatNew, spineNew, stagedNew) = MeasureStep(n, deltaShape: DeltaShape.NewKey);
+            var (flatExisting, spineExisting, stagedExisting) = MeasureStep(n, deltaShape: DeltaShape.ExistingKey);
+            var (flatBulk, spineBulk, stagedBulk) = MeasureStep(n, deltaShape: DeltaShape.Bulk10);
 
-            AppendRow(output, n, "new key",       flatNew,       spine4New,       spine2New);
-            AppendRow(output, n, "existing key",  flatExisting,  spine4Existing,  spine2Existing);
-            AppendRow(output, n, "bulk-10 mixed", flatBulk,      spine4Bulk,      spine2Bulk);
+            AppendRow(output, n, "new key",       flatNew,       spineNew,       stagedNew);
+            AppendRow(output, n, "existing key",  flatExisting,  spineExisting,  stagedExisting);
+            AppendRow(output, n, "bulk-10 mixed", flatBulk,      spineBulk,      stagedBulk);
         }
     }
 
@@ -87,21 +91,24 @@ internal static class DistinctBenchmark
         Bulk10,
     }
 
-    private static (double Flat, double Spine4, double Spine2) MeasureStep(int n, DeltaShape deltaShape)
+    // The §13 memtable capacity (the §11 sweep knee) for the staged spine column.
+    private const int StagingCapacity = 8192;
+
+    private static (double Flat, double Spine, double SpineStaged) MeasureStep(int n, DeltaShape deltaShape)
     {
         var flatUs = BenchmarkHarness.MedianPerStepMicros(
             setup: () => SetupFlat(n),
             oneStep: state => OneStep(state, deltaShape));
 
-        var spine4Us = BenchmarkHarness.MedianPerStepMicros(
-            setup: () => SetupSpine(n, batchesPerLevel: 4),
+        var spineUs = BenchmarkHarness.MedianPerStepMicros(
+            setup: () => SetupSpine(n, batchesPerLevel: 4, stagingCapacity: 0),
             oneStep: state => OneStep(state, deltaShape));
 
-        var spine2Us = BenchmarkHarness.MedianPerStepMicros(
-            setup: () => SetupSpine(n, batchesPerLevel: 2),
+        var spineStagedUs = BenchmarkHarness.MedianPerStepMicros(
+            setup: () => SetupSpine(n, batchesPerLevel: 4, stagingCapacity: StagingCapacity),
             oneStep: state => OneStep(state, deltaShape));
 
-        return (flatUs, spine4Us, spine2Us);
+        return (flatUs, spineUs, spineStagedUs);
     }
 
     private sealed class DistinctState
@@ -126,17 +133,28 @@ internal static class DistinctBenchmark
         return PreloadAndPrepare(circuit, ih!, n);
     }
 
-    private static DistinctState SetupSpine(int n, int batchesPerLevel)
+    private static DistinctState SetupSpine(int n, int batchesPerLevel, int stagingCapacity)
     {
+        // The SpineZSetTrace reads the memtable capacity from the SpineStagingConfig
+        // seam at construction (docs §13), so set it around the build and restore.
+        var prev = SpineStagingConfig.Capacity;
+        SpineStagingConfig.Capacity = stagingCapacity;
         InputHandle<ZSet<int, Z64>>? ih = null;
-        var circuit = RootCircuit.Build(b =>
+        try
         {
-            var (h, s) = b.ZSetInput<int, Z64>();
-            ih = h;
-            _ = b.Output(b.SpineDistinct(s, new TieredCompactionStrategy(batchesPerLevel)));
-        });
+            var circuit = RootCircuit.Build(b =>
+            {
+                var (h, s) = b.ZSetInput<int, Z64>();
+                ih = h;
+                _ = b.Output(b.SpineDistinct(s, new TieredCompactionStrategy(batchesPerLevel)));
+            });
 
-        return PreloadAndPrepare(circuit, ih!, n);
+            return PreloadAndPrepare(circuit, ih!, n);
+        }
+        finally
+        {
+            SpineStagingConfig.Capacity = prev;
+        }
     }
 
     private static DistinctState PreloadAndPrepare(
@@ -199,13 +217,15 @@ internal static class DistinctBenchmark
 
     private static void AppendRow(
         StringBuilder output, int n, string op,
-        double flatUs, double spine4Us, double spine2Us)
+        double flatUs, double spineUs, double spineStagedUs)
     {
-        var ratio = flatUs > 0 ? spine4Us / flatUs : 0.0;
+        var stagedVsSpine = spineUs > 0 ? spineStagedUs / spineUs : 0.0;
+        var stagedVsFlat = flatUs > 0 ? spineStagedUs / flatUs : 0.0;
         output.AppendLine(
             $"| {n,10} | {op,-12} | {BenchmarkHarness.FormatMicros(flatUs).Trim()} | " +
-            $"{BenchmarkHarness.FormatMicros(spine4Us).Trim()} | " +
-            $"{BenchmarkHarness.FormatMicros(spine2Us).Trim()} | " +
-            $"{BenchmarkHarness.FormatRatio(ratio).Trim()} |");
+            $"{BenchmarkHarness.FormatMicros(spineUs).Trim()} | " +
+            $"{BenchmarkHarness.FormatMicros(spineStagedUs).Trim()} | " +
+            $"{BenchmarkHarness.FormatRatio(stagedVsSpine).Trim()} | " +
+            $"{BenchmarkHarness.FormatRatio(stagedVsFlat).Trim()} |");
     }
 }

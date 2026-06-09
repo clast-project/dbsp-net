@@ -85,6 +85,23 @@ if (args.Length > 0 && args[0] == "spineeval")
     return 0;
 }
 
+// DISTINCT flat-vs-spine-vs-staged gate: `dotnet run -- distinct`
+// Shows the SpineZSetTrace memtable (docs §13) closing the spine DISTINCT gap.
+if (args.Length > 0 && args[0] == "distinct")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — distinct (flat vs spine vs staged)");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.DistinctBenchmark.Run(sb);
+    var dPath = Path.Combine(FindDocsDir(), "distinct-bench.md");
+    File.WriteAllText(dPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(dPath)}");
+    return 0;
+}
+
 // Arrangement-CSE optimizer-rule gate: `dotnet run -- sharedarrsql`
 // Star-schema SQL (F facts joined to one wide dim) compiled with vs without
 // CompileOptions.ShareArrangements (docs/design-row-representation.md §9.6).

@@ -975,6 +975,49 @@ before-run) and left as future work.
 
 ---
 
+## 13. The memtable for the non-indexed trace — DISTINCT & import (LANDED)
+
+§10 added the memtable to `SpineIndexedZSetTrace` (join + aggregate state). Its
+non-indexed sibling `SpineZSetTrace` backs **DISTINCT** (`SpineDistinctOp`) and
+the **recursive-CTE import** state (`SpineImportTrace`), and paid the same
+per-tick batch-build cost. This applies the identical memtable there.
+
+**What landed.** `SpineZSetTrace` gains a mutable `ZSet` memtable, mirroring the
+indexed trace: `Integrate` folds the delta in place (flat-dictionary cost) and
+flushes into one sorted batch only at ≥ capacity keys; every read (`WeightOf`,
+`Materialize`/`Entries`/`KeyCount`, `IsEmpty`), GC (`DropKeysBelow`), and snapshot
+(`GetBatches` flushes first) merges the memtable with the batches. Same opt-in
+`SpineStagingConfig.Capacity` `[ThreadStatic]` seam (default 0 = disabled,
+byte-identical), realised from `CompileOptions.SpineStagingCapacity` by the
+compiler — so DISTINCT and import traces pick it up **automatically** (their ops
+construct the trace without an explicit capacity → read the seam), no operator or
+builder change. New `SpineZSetMemtableTests` (caps 1/4/16/64 match a flat oracle
+on WeightOf/Materialize/Entries/IsEmpty read every tick, + memtable-only-key /
+flush-on-snapshot / GC-from-memtable / cancellation). Full suite 1,680 green.
+
+**Gate (`dotnet run -- distinct`, [distinct-bench.md](distinct-bench.md)).** A
+`SELECT DISTINCT` over a churning table, flat vs spine vs spine·staged at
+pre-loaded sizes:
+- **`staged/spine` = 0.17–0.50×** — the memtable makes spine DISTINCT **2–6×
+  faster than un-staged spine** (the §10 lever: integrate becomes a dict merge,
+  and the trace holds far fewer batches so probes are cheaper too).
+- **`staged/flat` = 1.0–2.2×** — staged reaches **parity with flat at small N**
+  but stays ~2× behind at larger N.
+
+**Honest read.** Unlike the join/aggregate, DISTINCT is **probe-bound** — every
+step probes the trace, and a sorted-batch probe is O(log) + a bloom check versus
+the flat dictionary's O(1) hash. The memtable amortises the *integrate*, not that
+*probe*, so it closes most of the gap (and all of it at small N) but does not make
+spine DISTINCT beat flat on throughput. Spine's value for DISTINCT/import remains
+spill / snapshot / bounded memory, now at a much smaller throughput cost. The
+import (recursive-CTE) path is `Materialize`-bound per outer tick (it reads the
+whole consolidated set), so it benefits on the integrate exactly as DISTINCT does.
+
+This was the last deferred row-representation item: every spine trace family now
+has the cross-tick memtable, on by default when `TraceFamily.Spine` is selected.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
