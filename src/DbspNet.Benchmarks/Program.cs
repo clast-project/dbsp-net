@@ -49,6 +49,24 @@ if (args.Length > 0 && args[0] == "mergeprobe")
     return 0;
 }
 
+// Shared-arrangement gate sub-command: `dotnet run -- sharedarr`
+// One shared index vs F private right traces across a join fan-out
+// (docs/design-row-representation.md §6.2, Option 2 — cross-operator sharing).
+if (args.Length > 0 && args[0] == "sharedarr")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — shared arrangement");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.SharedArrangementBenchmark.Run(sb);
+    var saPath = Path.Combine(FindDocsDir(), "shared-arrangement-bench.md");
+    File.WriteAllText(saPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(saPath)}");
+    return 0;
+}
+
 // Join merge-probe sub-command: `dotnet run -- joinprobe`
 // Point probe vs galloping merge driving the whole SpineIncrementalJoinOp.Step
 // (docs/design-row-representation.md §8).

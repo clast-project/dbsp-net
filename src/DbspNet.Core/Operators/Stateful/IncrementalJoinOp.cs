@@ -115,9 +115,9 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
 
         var builder = new ZSetBuilder<TOut, TWeight>();
         // dl ⋈ R_t
-        JoinInto(dl, _rightTrace.Current, builder);
+        IncrementalJoinCore.JoinInto(dl, _rightTrace.Current, _combine, _residual, builder);
         // L_{t-1} ⋈ dr
-        JoinInto(_leftTrace.Current, dr, builder);
+        IncrementalJoinCore.JoinInto(_leftTrace.Current, dr, _combine, _residual, builder);
         _output.SetCurrent(builder.Build());
 
         _leftTrace.Integrate(dl);
@@ -154,73 +154,4 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     public long? GcFrontier => Metric.Frontier(_frontier);
 
     public long GcDroppedTotal => _gcDropped;
-
-    private void JoinInto(
-        IndexedZSet<TKey, TLeft, TWeight> a,
-        IndexedZSet<TKey, TRight, TWeight> b,
-        ZSetBuilder<TOut, TWeight> output)
-    {
-        if (a.IsEmpty || b.IsEmpty)
-        {
-            return;
-        }
-
-        // Iterate the smaller side (by group count) to amortize probing cost.
-        if (a.GroupCount <= b.GroupCount)
-        {
-            foreach (var (key, aGroup) in a)
-            {
-                var bGroup = b.GroupFor(key);
-                if (bGroup.IsEmpty)
-                {
-                    continue;
-                }
-
-                foreach (var (av, aw) in aGroup)
-                {
-                    foreach (var (bv, bw) in bGroup)
-                    {
-                        // Residual (e.g. a non-equi WHERE conjunct spanning both
-                        // sides, folded in by the optimizer) is applied here,
-                        // during the cross-product enumeration, so the failing
-                        // rows never enter the output Z-set — instead of building
-                        // the full join output and filtering it in a separate op.
-                        var outRow = _combine(key, av, bv);
-                        if (_residual is null || _residual(outRow))
-                        {
-                            output.Add(outRow, TWeight.Multiply(aw, bw));
-                        }
-                    }
-                }
-            }
-        }
-        else
-        {
-            foreach (var (key, bGroup) in b)
-            {
-                var aGroup = a.GroupFor(key);
-                if (aGroup.IsEmpty)
-                {
-                    continue;
-                }
-
-                foreach (var (av, aw) in aGroup)
-                {
-                    foreach (var (bv, bw) in bGroup)
-                    {
-                        // Residual (e.g. a non-equi WHERE conjunct spanning both
-                        // sides, folded in by the optimizer) is applied here,
-                        // during the cross-product enumeration, so the failing
-                        // rows never enter the output Z-set — instead of building
-                        // the full join output and filtering it in a separate op.
-                        var outRow = _combine(key, av, bv);
-                        if (_residual is null || _residual(outRow))
-                        {
-                            output.Add(outRow, TWeight.Multiply(aw, bw));
-                        }
-                    }
-                }
-            }
-        }
-    }
 }

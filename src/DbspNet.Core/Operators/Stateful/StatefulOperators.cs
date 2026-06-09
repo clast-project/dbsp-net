@@ -298,6 +298,67 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Build a <b>shared</b> indexed arrangement over an already-indexed Z-set
+    /// delta stream: one <see cref="ArrangeOp{TKey,TValue,TWeight}"/> integrates
+    /// the stream into a single trace whose post-tick integral many downstream
+    /// joins read via <see cref="IncrementalInnerJoinSharedRight{TKey,TLeft,TRight,TOut,TWeight}"/>,
+    /// instead of each join owning and re-integrating a private right trace
+    /// (docs/design-row-representation.md §6.2). Register the arrangement before
+    /// its consumers (the normal bottom-up build order does this) so each
+    /// consumer reads the "after" integral in the same tick.
+    /// </summary>
+    internal static IArrangement<TKey, TValue, TWeight> Arrange<TKey, TValue, TWeight>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TValue, TWeight>> input)
+        where TKey : notnull
+        where TValue : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+
+        var op = new ArrangeOp<TKey, TValue, TWeight>(input);
+        builder.AddRawOperator(op);
+        return op;
+    }
+
+    /// <summary>
+    /// Incremental inner equi-join whose RIGHT side is a <b>shared</b>
+    /// <see cref="IArrangement{TKey,TValue,TWeight}"/> (built by
+    /// <see cref="Arrange{TKey,TValue,TWeight}"/>) rather than a private trace.
+    /// <paramref name="rightDelta"/> is the same indexed delta stream the
+    /// arrangement consumes (used for the <c>L_{t-1} ⋈ dr</c> pass); the
+    /// arrangement supplies the integrated <c>R_t</c>. Output is identical to
+    /// <see cref="IncrementalInnerJoin{TKey,TLeft,TRight,TOut,TWeight}"/> over
+    /// the same inputs.
+    /// </summary>
+    internal static Stream<ZSet<TOut, TWeight>> IncrementalInnerJoinSharedRight<TKey, TLeft, TRight, TOut, TWeight>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
+        Stream<IndexedZSet<TKey, TRight, TWeight>> rightDelta,
+        IArrangement<TKey, TRight, TWeight> rightArrangement,
+        Func<TKey, TLeft, TRight, TOut> combine,
+        Func<TOut, bool>? residual = null)
+        where TKey : notnull
+        where TLeft : notnull
+        where TRight : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(rightDelta);
+        ArgumentNullException.ThrowIfNull(rightArrangement);
+        ArgumentNullException.ThrowIfNull(combine);
+
+        var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
+        builder.AddRawOperator(
+            new IncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOut, TWeight>(
+                left, rightDelta, rightArrangement, output, combine, residual));
+        return output;
+    }
+
+    /// <summary>
     /// Incremental LEFT OUTER equi-join. Behaves like
     /// <see cref="IncrementalInnerJoin{TKey,TLeft,TRight,TOut,TWeight}"/> on
     /// keys with a right-side match, and emits a NULL-padded row (produced by

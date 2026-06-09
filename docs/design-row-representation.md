@@ -592,6 +592,101 @@ as the execution model that shared arrangements will read through.
 
 ---
 
+## 9. Option 2 increment — cross-operator shared arrangements (flat, LANDED)
+
+> Status: first increment of Option 2 (§6.2). Built and benchmark-gated this
+> session. Report: [shared-arrangement-bench.md](shared-arrangement-bench.md).
+> Scope deliberately matches §6.2's "first increment": a read-only shared
+> arrangement handle + a join that reads it, **before** touching compaction
+> coordination, on the **flat** substrate first.
+
+After §8.3 closed Option 1 (the merge probe is done and validated, but the spine
+*substrate* loses to flat on q4 because of per-operator, per-tick index rebuild),
+the next gap is **arrangement sharing** — build an index once and read it from
+many operators, instead of each operator owning and re-maintaining its own.
+
+### 9.1 — What landed
+
+A relation arranged by a key for several consumers is now maintained **once**:
+
+- **`IArrangement<TKey,TValue,TWeight>`** (`Operators/Stateful/Arrangement.cs`):
+  a read-only handle exposing `Current` — the running integral **after** this
+  tick's delta. Consumers read it within their `Step`, exactly as a join reads
+  its own (after-)right trace.
+- **`ArrangeOp`** (same file): a stateful op that reads an already-indexed
+  delta stream and integrates it into ONE `IndexedZSetTrace`, exposing itself as
+  the handle. Registered before its consumers, so they see the post-delta
+  integral in the same tick (operators fire in registration / topological
+  order — `RootCircuit`).
+- **`IncrementalJoinSharedRightOp`** (`IncrementalJoinSharedRightOp.cs`): an
+  inner join whose RIGHT side is a shared `IArrangement` instead of a private
+  right trace. It owns only the left (delayed `L_{t-1}`) trace. The incremental
+  rule is **unchanged** — `out_t = dl ⋈ R_t + L_{t-1} ⋈ dr` — because the shared
+  relation is always the `R_t` ("after", integrate-first) side, which is exactly
+  what a private right trace would hold; output is therefore byte-identical to a
+  plain join. The join kernel was factored into a shared `IncrementalJoinCore.JoinInto`
+  so the private-trace and shared-arrangement joins run identical cross-product
+  logic.
+- **Builder API** (`StatefulOperators.cs`): `Arrange(indexedStream)` →
+  `IArrangement`, and `IncrementalInnerJoinSharedRight(left, rightDelta, arrangement, combine)`.
+  Internal (experimental), reachable from the Core builder.
+
+**Key feasibility insight:** sharing needs no change to the join math. Two joins
+`A ⋈ R` and `B ⋈ R` both want `R_t` (after) and `dR`; the arrangement folds `dR`
+into the shared trace once, both read it, and each keeps its own left trace. The
+asymmetric two-pass factoring (one side after, one before) is satisfied by always
+placing the shared relation on the after side — and inner join is commutative, so
+the optimizer can always orient it there.
+
+### 9.2 — Why flat first
+
+The §8.3 motivation is the *spine* per-tick build cost, but the cleanest, lowest-
+risk **first** demonstration of cross-operator sharing is family-agnostic and
+simplest on the flat trace: no LSM batch/bloom/compaction subtleties, apples-to-
+apples with the substrate that wins on q4 today, and a much smaller diff. The
+flat `IndexedZSetTrace` is also built per-operator, so sharing it is a legitimate
+(if smaller) win. The spine arrangement is the follow-up that captures the bigger
+prize.
+
+### 9.3 — Verification & gate
+
+- **Correctness.** `SharedArrangementTests` builds both pipelines (independent
+  joins vs. one shared arrangement) over the SAME inputs and asserts byte-
+  identical per-tick output across same-tick arrival, late right arrival,
+  retraction of the shared row, and 4 seeded random delta sequences (incl.
+  retractions). Green; full suite 1648 passing. The `sharedarr` benchmark also
+  self-checks equivalence before timing.
+- **Gate (`dotnet run -- sharedarr`).** A/B of unshared (`F` private right
+  traces) vs. shared (one `Arrange` + `F` shared-right joins) across fan-out
+  `F ∈ {2,4,8}` and tick width `D`, with wide `R` rows. **Result: sharing wins
+  across the grid (every cell ≥ 1.0×) and the win grows with fan-out — ~1.0–1.3×
+  at F=2, ~1.2–1.4× at F=4, ~1.5× at F=8** (clearest at moderate `D≈1024`;
+  cells carry ~±0.2× jitter, and `D=4096` is noisiest as per-step allocation
+  starts to dominate). The ceiling is modest because the flat integrate it
+  deduplicates is an in-place dict merge — already cheap.
+
+### 9.4 — Limitations & the two follow-ups
+
+1. **Spine arrangement (the bigger prize).** On the spine path the duplicated
+   per-consumer maintenance is a full sorted-columnar **batch build** (+ bloom +
+   compaction) — the exact §8.3 q4 substrate cost — far more expensive than a
+   dict merge, so sharing it should pay much more. The variant: a spine `Arrange`
+   whose consumers probe via `GroupForManySorted` against the shared trace
+   (a different consumption pattern than reading a materialised `Current`), reusing
+   this same `IArrangement` abstraction.
+2. **Arrangement-CSE optimizer rule.** Today the feature is reachable only via
+   the Core builder API; no SQL routes through it because nothing detects the
+   reuse. The rule: spot a relation arranged by the same key for ≥2 operators
+   (star-schema / self-join / repeated-CTE shapes, and reduce-by-K→join-on-K
+   adjacency) and emit a single `Arrange` both consume. q4 itself has no such
+   reuse (§6.2), so the gate for the rule is a synthetic star-schema query, not q4.
+3. **No GC on the shared trace.** A shared trace can only drop keys when *all*
+   consumers permit — DD's compaction-coordination sharp edge — which §6.2 says
+   to leave out of the first increment. The arrangement retains full history;
+   adding coordinated frontier GC is a later step.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
