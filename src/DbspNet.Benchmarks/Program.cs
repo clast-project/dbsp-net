@@ -49,6 +49,24 @@ if (args.Length > 0 && args[0] == "mergeprobe")
     return 0;
 }
 
+// Join merge-probe sub-command: `dotnet run -- joinprobe`
+// Point probe vs galloping merge driving the whole SpineIncrementalJoinOp.Step
+// (docs/design-row-representation.md §8).
+if (args.Length > 0 && args[0] == "joinprobe")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — join merge-probe");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.JoinProbeBenchmark.Run(sb);
+    var jpPath = Path.Combine(FindDocsDir(), "join-probe-bench.md");
+    File.WriteAllText(jpPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(jpPath)}");
+    return 0;
+}
+
 var output = new StringBuilder();
 output.AppendLine("# DbspNet — benchmarks");
 output.AppendLine();

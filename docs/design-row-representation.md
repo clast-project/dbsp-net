@@ -375,6 +375,46 @@ interning, which the evidence says are the wrong targets.
 > (`GallopIndexOf` + `GroupForManySorted` + `MergeProbeBenchmark`, results in
 > [merge-probe-bench.md](merge-probe-bench.md)). This section captures what a
 > follow-up session needs so it can start at the real decision, not discovery.
+>
+> **Update (2026-06): the join went first, not the aggregate — see §8.1.** On
+> reading the actual operators, the aggregate is the *harder* wire-up and the
+> join is the *cleaner* one, inverting the order this section assumed. The
+> aggregate's premise below is partly wrong: the **typed** SQL aggregators
+> (`TypedSqlAggregators.cs`, the path q4 uses) are already incremental and
+> consume `afterMultiset` by **point-probe** (`after.WeightOf(deltaRow)` per
+> delta row) and a `SumWeights()` gate — *not* a full scan. So Option D
+> (feed a sorted span to scan) doesn't fit them; capturing the aggregate win
+> really needs the larger Option B (`IMultiset` abstraction so `after` answers
+> `WeightOf`/`SumWeights`/enumerate off a sorted run without hashing). The
+> structural `SumAggregator`/`MinMaxAggregator` below *do* scan, so Option D
+> still fits the structural path. Treat §8 as the **aggregate** plan; the join
+> (a pure cross-product consumer of the probed group) needed none of this.
+
+### 8.1 — Join increment LANDED (this session)
+
+The spine **inner join** (`SpineIncrementalJoinOp`) was the first operator
+wired, because it consumes the probed group purely by **iteration** into a
+cross-product — no `WeightOf`, no aggregator interface, no semantic subtlety —
+so `GroupForManySorted` drops straight in. The bench also showed the
+join probe-side (absent-key) win is the biggest.
+
+- **Change.** `Step` now sorts each delta side's keys once and calls
+  `_rightTrace.GroupForManySorted` / `_leftTrace.GroupForManySorted` instead of
+  a per-key `GroupFor` loop; matched sorted runs feed the existing
+  cross-product unchanged. Single-key ticks (`D == 1`, the trace-level soft
+  spot) keep the point probe. Output is identical — verified by the full spine
+  join suite + spine-compile + random-query PBTs (all green).
+- **Gate (operator-level A/B, [join-probe-bench.md](join-probe-bench.md)).** A
+  benchmark seam (`SpineJoinProbeMode.ForcePointProbe`) drives the whole
+  `Step` both ways in one process. Result: **1.2–2.8× faster steps on
+  multi-key ticks, no regression at `D == 1`.** Smaller than the trace-level
+  2–135× because a whole `Step` also pays the unchanged cross-product / output
+  build / left-trace integrate.
+- **Deferred.** End-to-end q4 on the spine path at W=14 — the parallel Nexmark
+  harness compiles flat-only today, so that measurement belongs with the
+  rollout step that flips `TraceFamily.Spine` toward the typed default. The
+  spine LEFT/FULL joins were left on the point probe (same drop-in applies when
+  needed).
 
 ### What the code actually does today (verified)
 
