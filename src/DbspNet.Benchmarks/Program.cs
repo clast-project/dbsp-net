@@ -69,6 +69,27 @@ if (args.Length > 0 && args[0] == "w1profile")
     return 0;
 }
 
+// Representation/execution decomposition: `dotnet run -- reprbench [ticks] [delta] [runs]`
+// Apportions the Layer-A per-tuple floor between the representation axis (heap
+// allocation + wide-key hash) and the execution axis (delegate dispatch + generic
+// ZSet abstraction), across key widths (docs/design-row-representation.md §17).
+if (args.Length > 0 && args[0] == "reprbench")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — representation/execution decomposition");
+    sb.AppendLine();
+    DbspNet.Benchmarks.ReprDecompBenchmark.Run(sb, Arg(1, 20_000), Arg(2, 256), Arg(3, 5));
+    var rbPath = Path.Combine(FindDocsDir(), "repr-decomp-bench.md");
+    File.WriteAllText(rbPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(rbPath)}");
+    return 0;
+}
+
 // Pool reclaimability microbench: `dotnet run -- poolbench`
 // Fresh vs pre-sized vs pooled delta Z-set dictionary — bounds the lever-1 prize
 // before any operator wiring (docs/design-row-representation.md §16.5/§16.7).

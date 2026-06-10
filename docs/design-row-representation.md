@@ -2124,6 +2124,266 @@ Worth studying our own q3 win (2.83×) to learn what to *preserve* in that desig
 
 ---
 
+## 17. Data representation & per-tuple execution — apportioning the single-core gap (MEASURED, design-only)
+
+> Status: **design note, no engine code.** This is the deliverable of a
+> measure-first design session opening the next arc the §16.11 single-core proof
+> pointed at. §16 established (by *correlation* — ns/event tracks B/event across
+> the query ladder) that the per-tuple gap is allocation-bound. The §16.11
+> single-core run then established *that the per-tuple gap is the whole competitive
+> gap* (we trail Feldera 1-thread on 11/13, 2–5×; our multi-core wins are scaling,
+> not speed). This section does the next thing the prompt demands: **apportion that
+> per-tuple cost between the representation axis and the execution axis** with a
+> direct decomposition, confront the spine lesson, rank the representation ×
+> execution design space, and scope the smallest benchmark-gated first increment —
+> *without* assuming the answer is "all heap" or "go columnar."
+
+### 17.1 — Method: a third probe that apportions, not just correlates
+
+The two existing probes bracket the cost but neither *apportions within the floor*:
+
+- **`w1profile`** (refreshed this session, 1M events / batch 10k / median-3, this
+  i9-12900K, post-§16.9 HEAD) reconfirms the current per-event state: q0 **520 ns /
+  719 B**, q4 **2,142 ns / 2,376 B**, q18 **1,966 ns / 2,175 B**, q19 **2,754 ns /
+  3,831 B**, and the cheap end q3 **81 ns / 89 B**. ns and bytes still move together.
+- **`profile {handwired,typed,structural}`** (refreshed) reconfirms the boundary
+  split: handwired **0.86 µs / 2,782 B** (Layer-A floor, no SQL boundary), typed
+  **2.98 µs / 4,688 B** (+2.12 µs / +1,906 B of Layer-B boundary), structural
+  **3.93 µs / 5,420 B**. So the *boundary* (Layer B) is ~71 % of typed time — but it
+  is `object?[]`-in / `StructuralRow`-out, already partly addressed by levers (a)+2.
+
+Neither tells us, **inside the Layer-A floor that q4 lives in**, how per-tuple time
+splits between *representation* (allocating a fresh dictionary + hashing a whole wide
+row) and *execution* (delegate dispatch + the generic `ZSet`/`IZRing` abstraction).
+That is the open question §1 of this arc poses, and codegen vs representation hinges
+on it. So this session built a third probe.
+
+**`reprbench`** (`Benchmarks/ReprDecompBenchmark.cs`, `dotnet run -- reprbench
+[ticks] [delta] [runs]`, report [repr-decomp-bench.md](repr-decomp-bench.md)) times
+the **universal per-tick Layer-A hot loop** — build a delta dictionary of `D` rows
+keyed by a wide value-type row, fold it into retained state, enumerate the result —
+**four ways**, at three key widths (2 longs / 8 longs / Nexmark-bid-like 3 longs + a
+string, the rows pre-generated outside the timed loop so the floor is a clean
+hash+probe, not a row-materialisation artefact):
+
+1. `gen·fresh` — today's model: a fresh `ZSetBuilder` (`new Dictionary`) per tick,
+   generic `ZSet`/`Z64` ops, a `Func<>` transform per row.
+2. `gen·pooled` — same generic zero-suppressing `Z64` add, dictionary **pooled**
+   (`Clear()`+reuse). `fresh − pooled` = **the allocation tax**.
+3. `mono·deleg` — raw `Dictionary<Row,long>`, pooled, no `Z64`/`ZSet` wrapper, but
+   the transform still a `Func<>`. `pooled − mono·deleg` = **the abstraction tax**.
+4. `mono·inline` — raw pooled dict, transform inlined, no delegate. `mono·deleg −
+   mono·inline` = **the dispatch tax**; `mono·inline` itself = **the irreducible
+   compute floor** (wide value-type key hash + probe) a monomorphised engine still pays.
+
+### 17.2 — What the measurement found: the apportionment
+
+**`reprbench` (D=256, the q4/q18/q19 mid operating point, median-of-11, ns/row):**
+
+| Width | gen·fresh | gen·pooled | mono·inline (floor) | alloc tax | exec tax (pooled−floor) |
+|:--|--:|--:|--:|--:|--:|
+| W2 (2 long) | 50.5 | 19.7 | 16.9 | **30.8 (61 %)** | ~2.8 (6 %) |
+| W8 (8 long, bid-like) | 116.0 | 57.5 | 47.0 | **58.5 (50 %)** | ~10.5 (9 %) |
+| WStr (3 long + string) | 168.3 | 84.5 | 80.1 | **83.7 (50 %)** | ~4.4 (3 %) |
+
+(Swept also at D=16 and D=1024; the D=1024/W8 `fresh` blows up to 345 ns — almost all
+allocation, 268 ns — because growing a per-tick dict from empty reallocates its
+backing ~11× over the delta, the §16.7 resize-churn term. The qualitative ordering is
+identical at every D.)
+
+Three findings, all decisive and all *new* (apportionment, not correlation):
+
+1. **Allocation is the single largest controllable term — ~50–61 % of per-tuple
+   floor time, and the part that explodes with width and large deltas.** This is the
+   fresh-`Dictionary`-per-tick cost (§16.3 Layer A). Pooling (`Clear()`+reuse) removes
+   **100 %** of it (0 B/row, confirming `poolbench` §16.7). The allocation tax is the
+   prize lever-1 targets.
+2. **The irreducible whole-row-hash floor is the second structural term — ~33 % (W2)
+   → 41 % (W8) → 48 % (WStr) — and it scales with row width.** This is `mono·inline`:
+   a raw value-type-keyed dict with the wide row stored **inline** in the `Entry[]`
+   (exactly what the typed path's emitted-struct dict does), pooled, no dispatch. It
+   is what remains after you remove allocation *and* dispatch. **Nothing but a
+   representation change touches it** — you cannot make hashing 8 longs + a string
+   cheaper without either hashing *fewer* bytes (a narrow/extracted key) or hashing
+   *per column* (columnar/SoA). For an aggregate inner multiset keyed by the whole row
+   (q4's MIN/MAX, which needs the full row retained), the key *is* the wide row, so
+   this floor is **largely irreducible short of columnar** — the sobering core fact.
+3. **The execution axis is a distant third, and half of it is free.** The combined
+   dispatch + generic-abstraction tax is only **~3–10 %** of the floor. Within it, the
+   **abstraction tax is consistently ~0** (−3 to −14 ns, i.e. noise around zero):
+   **.NET monomorphises value-type generics, so the `ZSet`/`Z64`/`IZRing` wrapper is
+   already free** — "monomorphising the Z-set abstraction" buys *nothing*. Only the
+   per-row `Func<>` **delegate dispatch** is real (~10–18 ns on numeric rows), and it
+   shrinks relative to the floor as rows widen.
+
+**The apportionment answer to §1 is therefore: it is NOT all the heap, but the two
+real levers are both on the representation axis.** Of the addressable per-tuple floor,
+roughly **half is fresh-dict allocation** (fixable by pooling/arena, Layer-A,
+dead-after-tick edges only) and **~40–48 % is whole-row hashing** (fixable only by
+changing the representation — narrower keys or columnar per-column work), while
+**execution/dispatch is ~3–10 % and codegen of the abstraction is worthless because
+the abstraction is already monomorphic.** This **re-confirms and sharpens the §6.3 /
+§16.5 codegen demotion with a direct measurement**, not just the "time tracks
+allocation" correlation: whole-query codegen / monomorphization attacks the one axis
+that is already cheap. Re-litigated honestly as §1 asked — and it loses again, now on
+apportioned evidence.
+
+### 17.3 — Confronting the spine lesson head-on (the central question)
+
+§2 of the prompt is the pivotal one: we *built* a sorted-columnar LSM substrate
+(`Spine*`, §5–§13) and it **lost** to the flat dictionary on fine ticks (§8.3:
+1.4–2.5×), yet Feldera uses sorted-columnar `OrdZSet` and wins single-core. The
+apportionment resolves the apparent paradox cleanly:
+
+- **Sorted-merge attacked term 2 (the whole-row hash) by replacing it with key
+  *compare*** — galloping/merge over `Ord` keys, never hashing the whole row. That is
+  a real attack on the ~40 % floor.
+- **But it *worsened* term 1 (allocation):** on our fine-grained ticks it rebuilds
+  many tiny **sorted-columnar batches per tick** (sort + bloom + compaction), *more*
+  per-tick allocation/work than the flat dict's in-place update. The §10 memtable only
+  clawed it back to parity by **re-introducing an in-memory mutable dictionary** in
+  front of the batches. So sorted-merge **traded a smaller term-2 for a larger term-1**
+  — and term-1 is the *bigger* half (50–61 %). That is exactly why it lost, and the
+  decomposition now *predicts* it would.
+
+**The lesson for any columnar direction: the win must attack term 1 AND term 2
+together, never trade one for the other.** Feldera does this because its columnar
+buffers are **reused/arena-backed** (term 1 ≈ 0 steady-state) *and* **per-column /
+sorted** (term 2 cheap) — both at once. Sorted *storage* on its own (what `Spine*`
+is) only gets term 2 and pays more term 1 at our granularity. So:
+
+> **The lever is not columnar *storage* (tried, lost) and not sorted-merge
+> *execution* (tried, lost on fine ticks). It is (i) getting the flat-hash model off
+> the per-tick managed heap — pooled/arena, value-type, inline — to kill term 1
+> without touching the execution model that *won*, and, where the key genuinely is a
+> wide row that must be retained (the aggregate inner multiset), (ii) a *columnar
+> per-column* representation of that inner state to attack term 2 — with reused
+> buffers so it does not re-incur term 1 the way the spine did.**
+
+This makes the prompt's "unboxed pooled flat-hash" a first-class candidate (it is the
+clean term-1 win on the model that already beat sorted-merge), and scopes columnar
+narrowly to the *one* place term 2 is both large and irreducible: the
+`IndexedZSet` **inner value multiset** of the aggregate/join, where q4 (0.21×) and
+q15–q19 bleed — not as a whole-engine storage rewrite.
+
+### 17.4 — The representation × execution design space, ranked
+
+ROI against the apportioned bottleneck (term 1 allocation ≈ 50–60 %, term 2 whole-row
+hash ≈ 40–48 %, execution ≈ 3–10 %), discounted by effort/risk. Effort S/M/L/XL.
+
+| # | Candidate | Axis / term | ROI | Effort | Risk | Verdict |
+|---|---|---|---|---|---|---|
+| 1 | **Cross-tick delta/builder pooling** (reuse the `Dictionary` backing on dead-after-tick edges) | repr / term 1 | **High** (the 50–60 % term) | M | **H** (`Build()` ownership + `z⁻¹`/trace retention) | **Lead bounded lever.** §16.7 proved the prize real & the per-edge "no-`z⁻¹`" retention constraint satisfiable; (a) presizing already shipped the *churn* half. This is the *steady-backing* half. |
+| 2 | **Unboxed pooled flat-hash trace** (open-addressing over pooled `T[]`, value-type keys/weights inline, reused across ticks) | repr / terms 1+2 | **High** | L | M | The prompt's leading candidate. Generalises pooling into the *retained* state, keeps the flat-hash execution that beat sorted-merge, kills per-entry object indirection. The end-state for the *non-aggregate* stateful ops. |
+| 3 | **Columnar per-column inner multiset** for the aggregate/join `IndexedZSet` (SoA `Span<T>`-per-column, reused buffers, per-column hash/scan) | repr / term 2 | **High but narrow** (q4/q15–q19 only) | XL | H | The *only* attack on the irreducible term-2 floor, scoped to where it is large. Must reuse buffers (or it repeats the spine's term-1 mistake). The real Feldera-parity move for aggregates. |
+| 4 | **Typed ingest + deferred output materialisation** | repr / Layer B | Medium (q18/q19, every structural query) | S–M | L | §16.9 lever 2 did the output half; typed *ingest* (source emits typed rows, no `object?[]` at the scan) is the remaining half. Cheap, low-risk, q4-irrelevant. Do opportunistically. |
+| 5 | **Per-column dictionary / narrow extracted keys** (hash a compact code, not the wide row, where the key is *not* the whole row) | repr / term 2 | Medium | M | M | Attacks term 2 for *join/group* keys (already narrow at the exchange, §14.2) and any operator whose key ⊊ row. **Does not help the aggregate inner multiset** (key = whole row). The salvageable narrow form of the closed surrogate idea (§14.9). |
+| 6 | **Whole-query codegen / delegate fusion / monomorphization** | execution | **Low (measured wrong target)** | XL | H | **Demoted a third time, now on apportioned evidence (§17.2):** execution is 3–10 % of the floor and the generic abstraction is *already free*. Codegen cannot move a needle that lives in allocation + whole-row hashing. |
+| 7 | **Off-heap / `NativeMemory` / ref-struct buffers** | repr / term 1 | Low–Medium | XL | **H** (safety/lifetime, GC interop, `Span` plumbing) | Literally off the GC heap, but pooling (#1/#2) gets ~all of term 1 *inside* safe managed code. Off-heap buys spill/bounded-memory (the spine's job already), not throughput. **Not worth the unsafety for the per-tuple goal.** |
+| 8 | **Global integer surrogate row keys** | repr / term 2 | Low | L–XL | H | **Stays closed (§14.9):** loses at every `R≈1` site, dominated by the lazy view at the one `R≫1` site; the broad form is global interning with its W>1 contention/routing hazards. |
+
+The shape of the table: **everything with real ROI is on the representation axis**;
+the execution axis (6) is measured-dead; off-heap/unsafe (7) and global surrogates (8)
+are dominated by safe managed pooling. The design collapses to a **two-front
+representation program**: kill term-1 allocation with pooling/unboxed-pooled-flat-hash
+(#1→#2, broad, all stateful ops), and attack the irreducible term-2 floor with a
+columnar per-column inner multiset (#3, narrow, aggregate/join only).
+
+### 17.5 — Fundamental vs fixable (honest ceiling)
+
+- **Term 1 (allocation, ~50–60 %) is fixable in safe managed code** — pooling reclaims
+  100 % of the dict backing (`poolbench`), and the retention constraint is satisfiable
+  per-edge (§16.7). The cap is the residual GC/bump-allocate of the genuinely-live
+  retained state, which Feldera also pays. **Reachable: most of term 1.**
+- **Term 2 (whole-row hash, ~40–48 %) is partly fundamental.** Where the key ⊊ row
+  (join/group keys) it is fixable by narrowing (#5). Where the key *is* the wide
+  retained row (the aggregate inner multiset, MIN/MAX), the only escape is columnar
+  per-column work (#3) — and even then a managed engine pays bounds checks, no
+  SIMD-by-default, object-header/`Span` overhead that monomorphised Rust does not.
+  **Realistic: shrink it, do not erase it.** A .NET unboxed/columnar engine should
+  expect to *narrow* the 2–5× single-core gap on q4/q18/q19 toward ~1.3–2×, not reach
+  parity. The §16.11 q3 **2.83× win** proves the ceiling is well above parity when the
+  query avoids both terms (filter sheds 94 % of the stream, no retained aggregate
+  state, tiny output) — so the engine is not categorically slow; it is slow *exactly
+  where it allocates and whole-row-hashes retained state*.
+- **Execution (~3–10 %) is fixable but not worth fixing** (§17.2): the abstraction is
+  free, dispatch is small.
+
+The honest bottom line: **the reachable prize is term 1 in full and term 2 partially;
+parity with monomorphised columnar Rust is not reachable, but closing most of the
+2–5× on the three laggards is.**
+
+### 17.6 — Recommendation & smallest benchmark-gated first increment
+
+Sequenced, measure-first, each gated before the next — mirroring how `surrogatebench`
+/ `poolbench` retired options before any operator wiring:
+
+1. **First increment (next): cross-tick delta pooling on the q4 hot operator** (lever
+   #1's steady-backing half, behind a per-edge "no-`z⁻¹`" guard). It is the smallest
+   change that validates the term-1 thesis on the floor-bound query: pool the delta
+   `Dictionary` backing in `IncrementalAggregateOp` (and the join), reused across ticks
+   on edges the compiler proves dead-after-tick (§16.7 item 3). **Gate:** q4 W=1
+   `w1profile` ns/event + B/event must drop with the per-tick output cross-check green,
+   *and* in-`Step` W=8 must improve (the §16.11 in-`Step` amplification — (a) went
+   +4 % W=1 → +14 % W=8, so an in-`Step` term-1 win should translate to W>1, unlike the
+   out-of-`Step` lever 2). If pooling the retained state proves to fight `Build()`
+   ownership too hard, fall back to #2 (a purpose-built unboxed pooled flat-hash trace
+   that owns its buffers and never hands them off).
+2. **If it lands: generalise to the unboxed pooled flat-hash trace (#2)** across the
+   stateful ops, and **start the columnar inner-multiset prototype (#3)** as its own
+   arc — convert *one* operator (the q4 aggregate inner multiset) to SoA per-column
+   reused buffers behind a seam, gated on q4 W=1 beating both the struct-keyed dict and
+   the pooled-dict control. This is the term-2 attack and the real structural step; it
+   deserves the same staged, benchmark-gated discipline the spine arc had (and the same
+   willingness to retire it if the fine-tick floor defeats it, as sorted-merge was).
+3. **In parallel (low-risk, independent): typed ingest (#4)** for q18/q19's input
+   boundary, gated on `w1profile` B/event.
+4. **Do not** build whole-query codegen (#6), off-heap buffers (#7), or surrogate keys
+   (#8) — all measured-dominated.
+
+**Microbench precursor already delivered this session:** `reprbench` is the
+apportionment gate, and it *predicts the per-operator outcome before wiring* — it says
+pooling captures the ~50–60 % term-1 prize and a columnar inner multiset is required
+for the residual ~40–48 % term-2 floor on the aggregate. That is the §1 deliverable:
+the gap is apportioned, the execution axis is retired with evidence, and the two
+representation fronts are scoped with the smallest validating increment named.
+
+### 17.7 — Landmines & what the representation must preserve
+
+- **Preserve q3 (2.83× win).** `w1profile`: q3 is **81 ns / 89 B per event** — it wins
+  because the `category = 10` filter sheds ~94 % of the stream *before* the join, the
+  join output is tiny (22 rows) and flat, and there is **no retained aggregate state
+  rebuilt per tick** — i.e. it pays *neither* term. The representation change must stay
+  **opt-in / seam-gated to the stateful-heavy operators** (aggregate/join/TOP-K
+  inner state), never a universal per-tuple tax on the filter/project/small-join path
+  that is already at-or-above parity (q3 2.83×, q9 ~1.07×, q16/q17 win at W>1 by
+  scaling). A representation that taxes the cheap path to help the expensive one is a
+  net regression.
+- **Honor the typed-compiler reflection gotcha** ([[typed-compiler-reflection-gotcha]]):
+  q4 runs the **typed** parallel path; the new representation must be reachable without
+  changing a builder signature — use an ambient seam (`[ThreadStatic]`, as the memtable
+  / `SpineStagingConfig` did), not a new generic parameter or reflective arg-array edit.
+- **Surrogate keys are CLOSED** (§14.9, dominated), **sorted storage lost on our ticks**
+  (§5–§13 — don't re-propose it without confronting term 1), **coordination is a
+  strength not a target** (§16.11).
+- **Accommodate the not-yet-built operators.** The representation should not be designed
+  blind to functionality the engine still owes: **windowing TVFs (TUMBLE/HOP/SESSION)**
+  will add per-window grouped state (another `IndexedZSet`-shaped inner multiset — the
+  columnar #3 target should generalise to them), and **UDFs** (`IScalarFunction` phase 5,
+  [[scalar-function-registry-temporal]]) will reintroduce per-row delegate dispatch on
+  the *scalar* path — the one place the execution axis (#6) could matter later, so the
+  inner-loop representation should keep a clean delegate-or-codegen seam for scalars even
+  though codegen is demoted for the *operator* loops today.
+
+**Durable deliverables this session:** the `reprbench` decomposition harness +
+[repr-decomp-bench.md](repr-decomp-bench.md), refreshed `w1profile` / `profile`
+baselines, and an **apportioned** map of the per-tuple gap (term-1 allocation ~50–60 %
+→ pooling; term-2 whole-row hash ~40–48 % → columnar inner multiset; execution ~3–10 %
+→ retired) that scopes the next two representation fronts and the smallest gated first
+increment — *not* a speculative columnar rewrite.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
@@ -2134,6 +2394,8 @@ DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 `Spine/SpineIndexedZSetTrace.cs`, `CompileOptions.cs`,
 `Benchmarks/PureTraceBenchmark.cs`/`StepProfileBenchmark.cs`/`ExchangeFuseBenchmark.cs`
 (`stepprofile`/`exchangefuse`, docs/step-profile.md + exchange-fuse-bench.md);
+`Benchmarks/W1ProfileBenchmark.cs`/`ProfileHotPath.cs`/`ReprDecompBenchmark.cs`
+(`w1profile`/`profile`/`reprbench`, docs/w1-profile.md + repr-decomp-bench.md — §16/§17);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,
