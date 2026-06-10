@@ -2029,6 +2029,61 @@ only by lever (b)'s cross-tick pooling or lever 3 (columnar). Remaining sequenci
 (b) is thin-prize/high-risk (§16.7 re-attribution); the larger structural step for
 q4 is the columnar end-state (lever 3), which deserves its own arc.
 
+### 16.10 — Same-box A/B regression check + the W=1-vs-W>1 architecture correction
+
+The M4 Pro comparison run (W=1/10/14, both engines) after (a)+lever 2 showed the
+**W=1** per-row wins land on the real box (10c W=1: q0 +47%, q18 +46%, q19 +14%,
+q4 +3% vs the pre-arc snapshot) but the **competitive W>1 ratios** barely moved
+(q4 0.49→0.55, q19 0.55→0.62, q18 0.46→0.39 at 10c — the q18 dip looked like a
+regression). A clean same-box A/B (HEAD `140dff9` vs pre-arc `215fac0`, this
+i9-12900K, W=8, 1M events, 3 runs) settles both questions:
+
+| | W=1 pre→HEAD | W=8 pre→HEAD | speedup pre→HEAD |
+|--|--|--|--|
+| q0 | 1.45M→2.05M (+42%) | 4.02M→5.13M (+28%) | 2.78→2.50 |
+| q4 | 446k→463k (+4%) | 1.10M→1.25M (**+14%**) | 2.47→2.70 |
+| q18 | 391k→549k (+40%) | 1.01M→1.07M (**+6%**) | 2.58→1.96 |
+| q19 | 303k→375k (+24%) | 1.08M→1.05M (−2%) | 3.56→2.80 |
+| q20 | 883k→1.01M (+15%) | 2.13M→2.16M (+1%) | 2.41→2.13 |
+
+**(1) No parallel regression.** Every query is ≥ pre-arc at W=8 (q18 *+6%*,
+q19 −2% within noise). The M4 Pro 10c q18 dip was single-run/cross-session noise,
+not our changes.
+
+**(2) Lever 2 helps only the single-circuit path, not W>1 throughput — a
+load-bearing architecture fact.** The typed→`StructuralRow` output conversion is
+an **in-circuit operator** on the single circuit (`AdaptTypedToStructural`'s
+`MapRows`), so it runs **every `Step()`** and is in the W=1 timed loop — lever 2
+cut it (q18 W=1 +40%). But the **parallel** path decodes output **lazily on
+`q.Current` read**, which the throughput benchmark does **after** `sw.Stop()`
+(`MaterializeParallel`), so the parallel hot loop never eagerly materialises output
+— there is **nothing for lever 2 to remove at W>1**, and the comparison's W>1
+numbers don't even time output decode. *Conclusion: do not "extend lever 2 to the
+parallel output path" — it is moot.* Lever 2 is a real single-thread/latency win
+(and the "DbspNet W=1" column), not a W>1 throughput lever.
+
+**(3) The W>1 competitive lever is in-`Step` work only.** W>1 `Step` = exchange
+coordination + per-replica operator compute. The only per-row levers that move it
+are inside `Step`: (a)'s builder pre-sizing did (q4 W=8 +14%, an in-`Step` join/agg
+win), whereas q18's headline gain was the output boundary, out-of-`Step` at W>1
+(hence only +6% W=8 despite +40% W=1).
+
+**(4) Amdahl dilution, measured.** Per-row wins shrink the parallel speedup
+(q18 2.58→1.96×, q19 3.56→2.80×): cheaper per-tuple work makes the fixed
+coordination a bigger fraction (the §15.8 effect, directly observed). So per-row
+efficiency improves absolute single-thread throughput cleanly but is **partially
+eaten at W>1** by coordination — and q18/q19 are partly coordination-bound (§15),
+so their competitive ceiling is not purely a per-row-cost problem.
+
+**Net for the roadmap.** (a)+lever 2 are the bounded per-row wins; they lift W=1
+strongly and W>1 modestly (q4 +14% at W=8 is the best W>1 gain, an in-`Step`
+result). Closing the *competitive* W>1 gaps further means in-`Step` per-row cost —
+lever (b) pooling the operator internals (thin ~5% prize, high risk, §16.7) — or
+the **columnar end-state (lever 3)**, the real structural step, plus the
+substantially-fundamental coordination ceiling (§15). There is no remaining cheap,
+safe, high-W>1-ROI lever; the honest next move is either the columnar arc or to
+consolidate the bounded wins here.
+
 ---
 
 ## Appendix — sources
