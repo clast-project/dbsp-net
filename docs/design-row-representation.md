@@ -1018,6 +1018,273 @@ has the cross-tick memtable, on by default when `TraceFamily.Spine` is selected.
 
 ---
 
+## 14. Integer surrogate keys / dictionary-encoded rows — revisiting §6.5
+
+> Status: **design proposal, no code yet.** This is the deliverable of a
+> design-first session that deliberately re-opens Option 6 (§6.5), which the
+> original doc *demoted*. The demotion was correct **relative to the world the
+> doc assumed we were heading into** (DD/Feldera sorted-merge). The spine arc
+> (§5–§13) since established a different world — **flat-dictionary execution
+> beats sorted-merge on our fine-grained ticks** — and in *that* world the
+> surrogate lever comes back live. This section re-litigates §6.5 against the
+> current code and scopes a benchmark-gated first increment.
+
+### 14.1 — Why the demotion no longer binds: the flat-dict-wins reframe
+
+§6.5 demoted global row interning because the doc's whole thesis (§7) was to
+adopt the reference systems' answer: **stop hashing whole rows, compare sorted
+keys instead** (merge/gallop on the spine). Against that plan, interning is
+redundant — sorted-merge already avoids the whole-row hash.
+
+But the spine arc settled the §5 caveat the other way:
+
+- §8.3: the spine **substrate loses to the flat dictionary on q4** (1.4–2.5×),
+  because our fine-grained per-tick deltas make per-tick sorted-batch rebuild
+  dominate.
+- §10–§13: the memtable claws spine back only to **parity** with flat, never
+  past it on the aggregate-heavy query, and only by *re-introducing an in-memory
+  mutable dictionary* (the memtable **is** a flat dict) in front of the sorted
+  batches.
+
+So the empirical verdict of §5–§13 is: **for DbspNet's tick granularity, the
+flat dictionary is the winning execution model.** Sorted-merge — the mechanism
+that made interning redundant — is *not* the path. That removes the reason
+§6.5 had to demote surrogates. The live question becomes: given the flat dict
+wins, what is its *one remaining cost*, and can we remove it?
+
+Its one remaining cost is exactly §1: **the keys it hashes are whole rows.**
+The natural synthesis the original doc never considered (because it was
+committed to sorted-merge) is:
+
+> **Keep the flat-dictionary execution model that won, but make its keys cheap
+> to hash — replace whole-row keys with interned integer surrogates.**
+
+DD/Feldera don't need this because their key-comparison model already sidesteps
+whole-row hashing; we measured that model losing, so we need the other half.
+
+### 14.2 — Where whole-row hashing actually remains on the flat path (verified)
+
+The routing hash is already narrow — `ExchangeIndexOp._partition` hashes
+`keyOf(row)` (the bigint key), not the row (the §1 "exchange hashes the full
+row" row is **stale**; the ExchangeIndex fusion fixed it). What remains, all in
+**inner value multisets keyed by the full row**:
+
+| Site | Code | Cost shape |
+|---|---|---|
+| Aggregate group rebuild | `IncrementalAggregateOp.cs:126` — `afterGroup = beforeGroup + groupDelta` | **Re-hashes the *entire* inner Z-set every tick a group is touched**, unconditionally (needed for `Update` and the `IsEmpty` gate). For a group that grows over K ticks → **O(K²) whole-row hashes.** *Verified:* `ZSet.Plus` → `ZSetBuilder.From` (`ZSetBuilder.cs:91-94`) does `new Dictionary(cap)` then `d[k]=w` per entry — a genuine per-entry re-hash, **not** the bucket-copy fast path, so the existing group is rehashed in full, not copied. |
+| Exchange gather | `ExchangeIndexOp.cs:94` — `indexed.Add(keyOf(row), row, w)` | one whole-row hash per gathered row per tick (builds the inner Z-set). |
+| Join trace probe/build | `IncrementalJoinOp` cross-product over `GroupFor(key)` inner Z-sets | stored side's rows hashed on integrate; cross-product re-touches them across ticks. |
+| Output build | `ZSetBuilder.Add` of result rows | one whole-row hash per output row. |
+
+The **critical correction to §6.5(b).** §6.5 dismissed interning wide fact rows
+because "Nexmark bid rows are near-unique → interning costs a hash and saves
+almost nothing." That reasoning silently assumed each row is hashed **once**.
+The aggregate code disproves it: a value row in a *growing* group (q4: bids
+accumulate per auction until it closes) is re-hashed **every tick the group
+changes** by the line-126 rebuild. A row interned **once** then re-touched as a
+cheap int across those K ticks turns O(K²) struct-hashes into K struct-hashes +
+O(K²) int-hashes. **The recurrence §6.5 said didn't exist is created by
+incremental maintenance itself**, independent of row uniqueness.
+
+### 14.3 — Honest re-litigation of §6.5's five objections
+
+| §6.5 objection | Verdict under the current design |
+|---|---|
+| (a) Interning re-introduces the hash you remove | **Partly stands, but amortizes.** You pay one struct-hash to intern, then every *repeated* touch is an int-hash. Net win iff a row is touched > ~1× inside the operator — true for all **stateful** operators (agg rebuilds, join cross-products, retained traces), false for stateless map/filter. ⇒ **apply surrogates to stateful operators only.** |
+| (b) Only low-card keys win; wide fact rows hashed once | **Refuted for the hot path** (§14.2): incremental maintenance re-hashes the same wide rows across ticks. |
+| (c) W>1 contention on a shared intern table | **Defused by locality.** Surrogates need not be global. Post-exchange, a stateful operator's value rows are already co-located on one worker. Make the intern table **operator-local (per replica)** — no cross-worker sharing, no contention. The price is de-referencing at the operator's output boundary (int→row), a cheap dict lookup. |
+| (d) Breaks hash-partition routing | **Refuted.** Routing already uses the narrow extracted key (§14.2) and happens *before* the operator-local surrogate space exists. Surrogates live inside a worker, after routing. |
+| (e) Neither DD nor Feldera does it | **True but no longer dispositive.** They use sorted key-compare, which we measured losing (§8.3). "Flat dict + int surrogates" is the synthesis their model doesn't need and ours does. |
+
+The demotion survives **only** as "don't build a *global row-interning* scheme."
+The salvageable, now-recommended form is **operator-local, reversible surrogate
+encoding of inner value multisets in stateful operators** — which is also what
+§6.5's own closing line gestured at ("salvageable narrow form").
+
+### 14.4 — The design
+
+**Core idea.** A stateful operator owns a reversible bijection
+`RowDict : TValue ↔ int` (a `Dictionary<TValue,int>` forward + `List<TValue>`
+reverse). Its inner value multisets become `ZSet<int, Z64>` instead of
+`ZSet<TValue, Z64>`. Per tick:
+
+1. **Intern** each *delta* value row → int (one struct-hash per distinct delta
+   row, paid once ever for that row).
+2. All trace/group state, the line-126 rebuild, and join cross-products operate
+   on `int` keys (int-hash, no struct-hash, no per-field compare).
+3. **De-reference** only at the operator's output (`reverse[id]`), and only for
+   rows that actually appear in the output delta.
+
+**Reversibility is mandatory** because aggregators need the real value:
+`MIN/MAX` compare values (surrogate order ≠ value order, so they deref to
+compare), `AVG/SUM` read the numeric column. The deref is an indexed
+`List<TValue>` read (`O(1)`, no hash) — strictly cheaper than re-hashing the
+struct. Incremental `MIN/MAX`/`SUM` only touch *delta* rows + their own state,
+so they barely deref; the win there is the **op's** line-126 rebuild going int.
+
+**Surrogate lifetime / GC.** The reverse list must drop a row when its net
+weight across the operator hits zero **and** no retained state references it.
+Frontier GC already drops whole groups (`DropKeysBelow`); per-row reclamation
+inside a surviving group needs a refcount (sum of `|weight|` occurrences). Open
+sub-question — first prototype can **leak** (never reclaim) to isolate the hash
+win, then add reclamation once the win is proven (mirrors how the spine
+prototypes deferred GC).
+
+**What stays struct-keyed.** Stateless operators (map/filter/the exchange
+itself), the **outer** group key (already narrow), and the snapshot codec
+boundary (serialize de-referenced rows; surrogates are an in-memory runtime
+encoding, never persisted — sidesteps the codec/versioning problem entirely).
+
+### 14.5 — The cheaper alternative the design must be honest about
+
+For the **aggregate specifically**, there is a non-surrogate fix that captures
+much of the same win: **port the §12 lazy `MergeViewMultiset` to the flat
+path.** Line 126 materializes `afterGroup` unconditionally; §12 showed the spine
+op avoid it with a lazy view that answers `WeightOf`/`SumWeights`/`IsEmpty`/
+enumerate over `(beforeGroup, groupDelta)` without building the merged dict.
+A flat lazy view would kill the O(K²) rebuild **without** any surrogate
+machinery — smaller, lower-risk, aggregate-only.
+
+The honest trade:
+
+- **Flat lazy merge-view** — small, low-risk, fixes *only* the aggregate
+  rebuild. Doesn't touch join cross-products, exchange gather, or output build,
+  and doesn't make the dict's keys cheap (still struct-hashes on probe/intern).
+- **Surrogates** — larger, generalizes across join + aggregate + output, makes
+  *every* inner-multiset hash an int-hash, but adds the intern/deref/GC
+  machinery and the locality argument.
+
+Recommended sequencing: **prototype the flat lazy merge-view first as the
+control** (it's the cheap baseline the surrogate must beat), then the surrogate
+aggregate, A/B both against the struct-keyed flat aggregate on the q4 step. If
+the lazy view alone closes q4, surrogates must justify themselves on the
+**join**-heavy queries (q3/q9) where there is no single group rebuild to elide.
+
+### 14.6 — Benchmark-gated first increment
+
+Smallest decisive experiment, mirroring the spine prototypes' discipline:
+
+1. **Control:** flat lazy merge-view in `IncrementalAggregateOp` (no surrogates).
+2. **Treatment:** surrogate-encoded inner value multiset in a variant aggregate
+   op (operator-local `RowDict`, leaking GC), behind a flag/seam like
+   `SpineJoinProbeMode.ForcePointProbe`.
+3. **Harness:** reuse `SpineParallelHarness` (the §11 knob-driven parallel
+   runner) — add a `RowEncoding ∈ {Struct, LazyView, Surrogate}` knob; A/B on
+   **q4** (growing groups, the strongest surrogate case) and **q3/q9**
+   (join-heavy, the generalization case) at W=host, 1M events, batch 10k, with
+   the existing per-tick output cross-check against the struct path.
+4. **Gate:** ship surrogates only if they beat **both** the struct path *and the
+   lazy-view control* on q4 step at W=14, **and** win on q3/q9 (where the lazy
+   view can't), **without** regressing low-fan-out / tiny-group cases (the
+   intern overhead with no re-touch to amortize — the §14.3(a) loss regime).
+
+Microbench precursor (cheaper, run first): extend `PureTraceBenchmark` /
+add a `surrogatebench` that A/Bs a `Dictionary<WideStruct,Z64>` vs
+`Dictionary<int,Z64>` + intern, sweeping row width and re-touch count R — this
+directly measures the §14.3(a) crossover (R where intern+int-hash beats
+R struct-hashes) and predicts which queries can win before any operator wiring.
+
+### 14.7 — Risks & open questions
+
+- **The R-crossover is the whole ballgame.** If realistic per-operator re-touch
+  counts are low, surrogates lose to their own intern cost. The microbench
+  (§14.6) must establish the crossover *before* operator work.
+- **Typed-path reach.** q4 runs the **typed** parallel path
+  (`TypedPlanCompiler` + emitted structs). The surrogate op must be reachable
+  there without changing a builder signature (the
+  [[typed-compiler-reflection-gotcha]]); favor a seam/wrapper over a new generic
+  parameter, as the memtable did.
+- **De-ref locality at output.** Output rows must deref before leaving the
+  worker; confirm the downstream consumer (another exchange / the egest) doesn't
+  re-intern, which would thrash. Cross-operator surrogate *sharing* (one space
+  across an operator chain) is a later optimization, not the first increment.
+- **MIN/MAX deref in non-incremental rescan.** The structural (non-incremental)
+  MIN/MAX scans the whole group and would deref every element every tick —
+  measure whether deref-per-scan still beats struct-hash-per-rebuild, or gate
+  surrogates to the incremental aggregators only.
+- **GC reclamation** (deferred to a second increment; leak in the prototype).
+
+### 14.8 — Recommendation
+
+Re-opening §6.5 is justified: its demotion was sound for a sorted-merge future,
+and the spine arc chose a flat-dict present. The recommended path is **design as
+above, then the §14.6 microbench first** — it is cheap and decides whether the
+operator wiring is worth it. Treat the **flat lazy merge-view as the mandatory
+control**, because for the canonical query (q4) it may capture most of the win
+at a fraction of the risk, and surrogates must earn their keep on the
+**join-heavy** queries the lazy view cannot help. This keeps the bet
+benchmark-gated and avoids re-committing the original doc's error of ranking an
+option before measuring it.
+
+### 14.9 — Microbench RAN: the crossover is real, but the lazy view dominates the only high-R site (DECISION: build the lazy view, not surrogates)
+
+The §14.6 microbench is built (`dotnet run -- surrogatebench`,
+`SurrogateKeyBenchmark`, report [surrogate-key-bench.md](surrogate-key-bench.md))
+and run. It A/Bs a whole-row-keyed `Dictionary` (the emitted typed row's
+multi-field hash) against an interned-`int`-keyed one — surrogate totals
+**include** the one-time intern — across row width (`W2`/`W4`/`W8` longs, `WStr`
+= a Nexmark-bid-like 3 longs + string) and re-touch `R`, faithfully modelling the
+verified `ZSetBuilder.From` per-entry re-hash. Two findings:
+
+**(1) The crossover and the width-independence thesis are confirmed.** R\* ≈ 2–4
+for any row wider than ~2 longs; the surrogate win then scales with both `R` and
+width. The faithful **growing-group** table (one group → K, rebuilt each tick,
+the q4 per-auction shape) shows surrogate vs struct **WStr 1.4× at K=16 → 5.3× at
+K=1024**, W8 up to 3.7×, even narrow W2 1.05–1.4×. The headline signal: at
+K=1024 the **surrogate rebuild is ~2.3–2.5 ms regardless of width** (W2 2.96, W4
+2.31, W8 2.49, WStr 2.47 ms) while the struct rebuild scales 3.0→13.1 ms with
+width — surrogates convert a width-dependent whole-row hash into a
+width-independent int hash, exactly as §14.1 argued.
+
+**(2) The `R=1` column is the decisive caveat — and it reframes everything.** At
+`R=1` (a row touched once) surrogates **lose** (W2 0.70×, W4 0.99×, WStr 1.05×):
+pure intern overhead with nothing to amortise — the §14.3(a) loss regime,
+measured. So the whole question collapses to: **where in the engine is
+`R ≫ 1`?** Inventorying the §14.2 hash sites by re-touch count:
+
+| Site | Re-touch R of a given row | Surrogate verdict |
+|---|---|---|
+| **Aggregate group rebuild** | **O(K)** — re-hashed every tick the group is touched | the *only* `R ≫ 1` site |
+| Exchange gather | 1 (gathered once per tick it appears) | loses (R=1) |
+| Join trace integrate | ~1 (hashed once on `MergeInPlace`; churn aside) | loses |
+| Join cross-product | 0 re-hash (matched rows are *enumerated*, not hashed) | n/a |
+| Output build | 1 (each result row built once) | loses |
+
+**The only `R ≫ 1` whole-row hashing in the engine is the aggregate rebuild** —
+and the **flat lazy merge-view** (§14.5's mandatory control) *removes* it rather
+than cheapening it: probe only the delta rows against the before-`ZSet`, never
+materialise `afterGroup`, turning the op's **O(K²)** rebuild into **O(K)**.
+Removing the rebuild asymptotically beats making its hashes cheaper (O(K)
+struct-probes < O(K²) int-hashes), so for the aggregate the lazy view dominates
+the surrogate. And it is **cheap to build**: the §8.2 `IMultiset` widening
+already lets `Update` consume a non-`ZSet` after-multiset, and §12's
+`MergeViewMultiset` is the spine precedent — a flat analogue over
+`(beforeZSet, groupDelta)` needs no surrogate machinery (no intern table, no
+reversibility, no per-row GC reclamation, no W>1 locality argument, no typed-path
+reach).
+
+**Decision.**
+1. **Build + benchmark the flat lazy merge-view** as the real aggregate lever.
+   Asymptotic argument predicts it dominates the surrogate on the one site that
+   matters; confirm with an `aggprobe`/`q4spine`-style gate.
+2. **Do not build operator-local surrogate encoding.** It loses at every `R≈1`
+   site (most of them) and is dominated by the lazy view at the one `R≫1` site.
+3. **Global / cross-operator interning stays demoted (§6.5), now with measured
+   support.** The *only* surrogate form that could win broadly is sharing one
+   surrogate space *across* an operator chain (so each per-operator `R=1`
+   compounds into pipeline-wide `R = #operators`) — but that is precisely
+   §6.5's global-interning form, with its W>1 contention, boundary-hash, and
+   routing hazards. The `R=1` per-operator loss reinforces the demotion.
+
+This is the §14.6 gate working as intended: **measuring first retired an XL
+option (surrogate encoding + its intern/reversibility/GC/locality machinery)
+before any operator was wired**, and redirected the effort to a small, lower-risk
+change (the flat lazy view) that the same inventory shows is the actual lever.
+The next increment is therefore the **flat lazy merge-view**, benchmarked against
+the struct rebuild on q4 — not surrogates.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
