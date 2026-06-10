@@ -1331,14 +1331,13 @@ internal static class SqlBuiltinRuntime
             return null;
         }
 
-        var parts = SplitParts(s.ToStringDecoded(), delim.ToStringDecoded());
-        return n < parts.Length ? (object)Utf8String.Of(parts[n]) : null;
+        return TryNthPart(s.Span, delim.Span, n, out var start, out var end)
+            ? (object)Utf8String.FromBytes(s.Span[start..end].ToArray())
+            : null;
     }
 
     internal static Utf8String SplitPartCore(Utf8String s, Utf8String delim, int n)
     {
-        var parts = SplitParts(s.ToStringDecoded(), delim.ToStringDecoded());
-
         // 1-based from the start; a negative n counts back from the end.
         // n == 0 (and any out-of-range field) yields the empty string.
         int idx;
@@ -1348,20 +1347,96 @@ internal static class SqlBuiltinRuntime
         }
         else if (n < 0)
         {
-            idx = parts.Length + n;
+            idx = CountParts(s.Span, delim.Span) + n;
         }
         else
         {
             return Utf8String.Empty;
         }
 
-        return idx >= 0 && idx < parts.Length ? Utf8String.Of(parts[idx]) : Utf8String.Empty;
+        return idx >= 0 && TryNthPart(s.Span, delim.Span, idx, out var start, out var end)
+            ? Utf8String.FromBytes(s.Span[start..end].ToArray())
+            : Utf8String.Empty;
     }
 
-    // An empty delimiter is not a valid split separator (.NET throws); treat the
-    // whole string as a single part, matching PostgreSQL's split_part.
-    private static string[] SplitParts(string s, string delim) =>
-        delim.Length == 0 ? new[] { s } : s.Split(delim);
+    // Byte-wise split (correct for valid UTF-8, like ReplaceCore/PositionCore —
+    // UTF-8 is self-synchronizing, so a valid delimiter only matches at code-point
+    // boundaries). Sets the [start, end) byte range of the n-th (0-based) part and
+    // returns true, or returns false when n is past the last part. An empty
+    // delimiter yields the whole string as the single part 0 (matching
+    // PostgreSQL's split_part). Only the chosen part is materialized.
+    private static bool TryNthPart(
+        ReadOnlySpan<byte> s, ReadOnlySpan<byte> delim, int n, out int start, out int end)
+    {
+        start = 0;
+        if (delim.Length == 0)
+        {
+            end = s.Length;
+            return n == 0;
+        }
+
+        var partStart = 0;
+        var index = 0;
+        var i = 0;
+        while (i <= s.Length - delim.Length)
+        {
+            if (s.Slice(i, delim.Length).SequenceEqual(delim))
+            {
+                if (index == n)
+                {
+                    start = partStart;
+                    end = i;
+                    return true;
+                }
+
+                index++;
+                i += delim.Length;
+                partStart = i;
+            }
+            else
+            {
+                i++;
+            }
+        }
+
+        // The final part runs from the last delimiter to the end (or is the whole
+        // string when no delimiter occurs).
+        if (index == n)
+        {
+            start = partStart;
+            end = s.Length;
+            return true;
+        }
+
+        end = 0;
+        return false;
+    }
+
+    // Number of parts a byte-wise split on delim produces (≥ 1).
+    private static int CountParts(ReadOnlySpan<byte> s, ReadOnlySpan<byte> delim)
+    {
+        if (delim.Length == 0)
+        {
+            return 1;
+        }
+
+        var count = 1;
+        var i = 0;
+        while (i <= s.Length - delim.Length)
+        {
+            if (s.Slice(i, delim.Length).SequenceEqual(delim))
+            {
+                count++;
+                i += delim.Length;
+            }
+            else
+            {
+                i++;
+            }
+        }
+
+        return count;
+    }
 
     internal static int PositionCore(Utf8String haystack, Utf8String needle)
     {

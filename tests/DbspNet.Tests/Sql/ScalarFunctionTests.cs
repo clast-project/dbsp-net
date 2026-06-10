@@ -470,6 +470,17 @@ public class ScalarFunctionTests
     }
 
     [Fact]
+    public void SplitIndex_MultibyteContentAndDelimiter()
+    {
+        // Byte-wise split must still be code-point-correct for valid UTF-8:
+        // multi-byte parts and a multi-byte ('—', U+2014, 3 bytes) delimiter.
+        Assert.Equal("café", EvalStr("SPLIT_INDEX(s, '—', 0)", "café—latté—τ"));
+        Assert.Equal("latté", EvalStr("SPLIT_INDEX(s, '—', 1)", "café—latté—τ"));
+        Assert.Equal("τ", EvalStr("SPLIT_INDEX(s, '—', 2)", "café—latté—τ"));
+        Assert.Equal("latté", EvalStr("SPLIT_PART(s, '—', 2)", "café—latté—τ"));
+    }
+
+    [Fact]
     public void SplitIndex_PropagatesNull()
     {
         Assert.Null(EvalOne(
