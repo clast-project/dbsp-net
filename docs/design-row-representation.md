@@ -2084,6 +2084,44 @@ substantially-fundamental coordination ceiling (§15). There is no remaining che
 safe, high-W>1-ROI lever; the honest next move is either the columnar arc or to
 consolidate the bounded wins here.
 
+### 16.11 — Single-core comparison resolves the confound: per-row is the whole gap, coordination is a strength
+
+A 1-thread-vs-1-thread run of both engines (M4 Pro) settles the §16.10 confound
+decisively. **DbspNet trails Feldera single-threaded on 11 of 13 queries, often
+2–5×:** q4 **0.21×**, q15 0.32×, q18 0.33×, q19 0.35×, q22 0.41×, q0 0.49×,
+q2 0.59×, q20 0.67×, q1 0.75×, q17 0.84×, q16 0.86×. The only single-core wins are
+**q3 (2.83×)** — a real, persistent algorithmic/data-structure edge — and q9
+(~parity, 1.07×).
+
+So the multi-core competitiveness is **not per-core speed — it is scaling.**
+DbspNet scales positively on 12/13 queries; **Feldera goes *negative* on q4/q15/
+q16/q17** (slower at 14c than 1c — on q15 it loses 4.5×), because its exchange/merge
+overhead swamps the tiny per-row work on low-cardinality aggregations. That, not raw
+speed, is why DbspNet "wins" q15/q16/q17 at 14c (it loses all three single-threaded).
+Even the ingest/egest-bound passthrough q0 — which §16.10 floated as a possible
+serial-boundary weakness — scales **better** for us (1c→14c 2.35×) than for Feldera
+(**1.19×**). So the §16.10 serial-boundary worry is also dispelled: that boundary is
+shared and we handle it at least as well.
+
+**Conclusion — the coordination question is answered, and inverted:** our
+coordination/scaling is a **strength**, not a leak. We out-scale Feldera and never
+de-parallelize. The entire competitive gap on the laggards (q4/q18/q19/q22/q0/q2) is
+**per-row** — the managed-runtime + `object?[]` boundary + per-tick allocation tax,
+worst on aggregate/join/string-heavy queries. This retires coordination (§15) as a
+*competitive* target (it is the shared BSP ceiling and we sit below Feldera on it)
+and vindicates the §16 per-row direction unambiguously.
+
+**Refinement of the §16.10 dilution caveat (it strengthens the columnar case).** The
+q18 W=1→W=8 collapse (+40%→+6%) was specifically **lever 2 being out-of-`Step` at
+W>1**, not a general law that per-row wins vanish in parallel. **In-`Step` per-row
+wins translate to W>1 and can *amplify*:** (a)'s in-`Step` join/agg pre-size went
++4% at W=1 → **+14% at W=8** on q4 (its parallel speedup *rose*, 2.47→2.70×). The
+columnar rewrite attacks in-`Step` operator internals, so it would lift **both**
+single-core (huge, 2–5× headroom) **and** multi-core (well, amplified on the
+join/agg-heavy laggards). **Highest-value columnar target: the aggregate/join inner
+representation** (the `IndexedZSet` trace), where q4 (0.21×) and q15–q19 bleed.
+Worth studying our own q3 win (2.83×) to learn what to *preserve* in that design.
+
 ---
 
 ## Appendix — sources
