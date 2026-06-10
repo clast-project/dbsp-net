@@ -49,7 +49,24 @@ if (args.Length > 0 && args[0] == "mergeprobe")
     return 0;
 }
 
-// q4 end-to-end flat lazy-view gate: `dotnet run -- q4flat [events] [workers] [runs]`
+// q18 profile: `dotnet run -- q18profile [events] [runs]`
+// Sweep W; split/step/gather to locate q18's cost (TOP-K op vs wide-row movement).
+if (args.Length > 0 && args[0] == "q18profile")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Q18ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 3));
+    var q18Path = Path.Combine(FindDocsDir(), "q18-profile.md");
+    File.WriteAllText(q18Path, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(q18Path)}");
+    return 0;
+}
+
+// q4 end-to-end flat lazy-view gate: `dotnet run -- q4flat [workers] [runs]`
 // Whole q4 parallel pipeline, flat·eager vs flat·lazy aggregate
 // (docs/design-row-representation.md §14.10).
 if (args.Length > 0 && args[0] == "q4flat")
