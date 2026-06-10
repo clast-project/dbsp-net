@@ -214,4 +214,57 @@ public sealed class CircuitBuilder
             input, output, partition, keyOf, coordinator, _parallel.WorkerId, _parallel.Abort));
         return output;
     }
+
+    /// <summary>
+    /// A join's <em>dual</em> <see cref="ExchangeIndex{TKey,TRow,TWeight}"/>: shuffle
+    /// and re-index both inputs by the same join key across <b>one</b> shared
+    /// rendezvous instead of two independent ones. Returns the left and right
+    /// indexed streams, identical to calling <see cref="ExchangeIndex{TKey,TRow,TWeight}"/>
+    /// on each side, but with half the barrier/straggler cost
+    /// (docs/design-row-representation.md §15). Outside a
+    /// <see cref="ParallelCircuit"/>, or with a single worker, there is nothing to
+    /// shuffle, so each side degrades to a plain
+    /// <see cref="StatefulOperators.GroupProject{TKey,TRow,TValue,TWeight}"/> —
+    /// byte-for-byte the W=1 shape of the unfused form.
+    /// </summary>
+    public (Stream<IndexedZSet<TKey, TLeftRow, TWeight>> Left, Stream<IndexedZSet<TKey, TRightRow, TWeight>> Right)
+        ExchangeIndexJoin<TKey, TLeftRow, TRightRow, TWeight>(
+            Stream<ZSet<TLeftRow, TWeight>> leftInput,
+            Func<TLeftRow, int> leftPartition,
+            Func<TLeftRow, TKey> leftKeyOf,
+            Stream<ZSet<TRightRow, TWeight>> rightInput,
+            Func<TRightRow, int> rightPartition,
+            Func<TRightRow, TKey> rightKeyOf)
+        where TKey : notnull
+        where TLeftRow : notnull
+        where TRightRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(leftInput);
+        ArgumentNullException.ThrowIfNull(leftPartition);
+        ArgumentNullException.ThrowIfNull(leftKeyOf);
+        ArgumentNullException.ThrowIfNull(rightInput);
+        ArgumentNullException.ThrowIfNull(rightPartition);
+        ArgumentNullException.ThrowIfNull(rightKeyOf);
+
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return (
+                this.GroupProject(leftInput, leftKeyOf, static row => row),
+                this.GroupProject(rightInput, rightKeyOf, static row => row));
+        }
+
+        var workers = _parallel.Workers;
+        var coordinator = _parallel.NextCoordinator(
+            () => new ExchangeCoordinator<ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight>.DualBucket>(workers));
+        var leftOutput = new Stream<IndexedZSet<TKey, TLeftRow, TWeight>>(
+            IndexedZSet<TKey, TLeftRow, TWeight>.Empty);
+        var rightOutput = new Stream<IndexedZSet<TKey, TRightRow, TWeight>>(
+            IndexedZSet<TKey, TRightRow, TWeight>.Empty);
+        _root.AddOperator(new ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight>(
+            leftInput, rightInput, leftOutput, rightOutput,
+            leftPartition, rightPartition, leftKeyOf, rightKeyOf,
+            coordinator, _parallel.WorkerId, _parallel.Abort));
+        return (leftOutput, rightOutput);
+    }
 }

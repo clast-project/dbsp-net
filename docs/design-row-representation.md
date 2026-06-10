@@ -1557,17 +1557,67 @@ count, ≈10 on the M4 Pro) the first concrete experiment to run, since the
 comparison currently puts 4 of DbspNet's 14 workers on permanent-straggler
 E-cores.
 
+### 15.7 — Prototype RAN: join exchange-barrier fusion — gated and HELD (negative result)
+
+Built the lever-3 prototype: `ExchangeIndexJoinOp` (`Circuit/Operators/`) fuses a
+join's two key exchanges into **one** shared barrier — split both inputs, publish
+the pair of buckets per destination, rendezvous *once*, gather both indexed sides.
+Reached from SQL via `CompileOptions.CoalesceJoinExchange` (off by default; typed
+parallel path only; W=1 unchanged) through a new `CircuitBuilder.ExchangeIndexJoin`
++ reflective `InvokeExchangeIndexJoin`. Correctness proven byte-identical to the
+unfused (two-barrier) form and to the single circuit across inserts / group-growth
+/ both-side retractions at W=1/2/4/8 (`JoinExchangeFusion_MatchesUnfusedAndSingle`).
+
+Gate (`dotnet run -- exchangefuse`, docs/exchange-fuse-bench.md — median step A/B
++ the exchange Wait% it targets + output cross-check; q4, 1M events):
+
+| W | unfused step | fused step | Step↑ | Wait% (unfused→fused) |
+|--:|---:|---:|---:|---:|
+| 24 | 679 ms | 576 ms | **1.18×** | 61→44% |
+| 16 | 550 ms | 600 ms | **0.92×** | 33→24% |
+| 12 | 521 ms | 603 ms | **0.86×** | 25→30% |
+
+**The mechanism works but the lever does not.** Fusing reliably *cuts the exchange
+Wait%* (across the full q4/q9/q20/q3 set: q20 66→24%, q4 52→37%, etc.) — yet the
+throughput-bounding step only improves in the **W=24 oversubscribed regime** (the
+one §15.5 lever 1 says *not* to run, where 8 E-cores are active and wait is
+highest) and **regresses 0.86–0.92× at the sensible operating point** (W≈12–16, the
+P-core count, where q4 is actually fastest: 521 ms unfused at W=12 beats every
+fused cell at every W). So unfused-at-the-right-W dominates fused-at-any-W.
+
+**Why — it confirms §15.4.** A 15–40 pp Wait% drop producing ~0 % (or negative)
+step change is direct evidence that the ceiling is the straggler *bound* — the
+slowest worker's *actual work* each tick — not the barrier *count*. Fusing removes
+a barrier's fixed latency but not a row of work, so the bound is unmoved; the
+Wait% "drop" is largely re-accounting (one rendezvous's idle counted instead of
+two). And fusing can *hurt*: it concentrates both sides' split into one pre-barrier
+phase, so the single barrier waits on each worker's *combined* left+right skew,
+whereas the two separate barriers let independent per-side skews partially cancel
+and **resync** between them — two barriers are sometimes better than one.
+
+**Decision: HOLD — do not adopt.** `CoalesceJoinExchange` stays off by default,
+kept behind the flag as a documented, reproducible negative result + regression
+guard (matching the repo's `ForceEagerRebuild`/`ForcePointProbe`/`ShareArrangements`
+gated-seam discipline). The measure-first gate did its job: it stopped a
+plausible-but-counterproductive "optimization" and tightened §15's conclusion —
+**lever 1 (right-size W to the fast cores) is the real win; reducing barrier count
+is not.** The remaining levers (coarser ticks; async non-BSP exchange) are
+untouched, but the bar they must clear is now sharper: beat *unfused at W≈P-cores*,
+not unfused at W=host.
+
 ---
 
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
-`IncrementalAggregateOp.cs`, `ExchangeOp.cs`/`ExchangeIndexOp.cs`,
+`IncrementalAggregateOp.cs`,
+`ExchangeOp.cs`/`ExchangeIndexOp.cs`/`ExchangeIndexJoinOp.cs`,
 `Circuit/ParallelCircuit.cs`/`ExchangeCoordinator.cs`/`StepProfiler.cs`,
 `Spine/SpineBatch.cs`, `Spine/SpineZSetTrace.cs`,
 `Spine/SpineIndexedZSetTrace.cs`, `CompileOptions.cs`,
-`Benchmarks/PureTraceBenchmark.cs`/`StepProfileBenchmark.cs`
-(`stepprofile`, docs/step-profile.md); parallel-pipeline-perf profiling notes.
+`Benchmarks/PureTraceBenchmark.cs`/`StepProfileBenchmark.cs`/`ExchangeFuseBenchmark.cs`
+(`stepprofile`/`exchangefuse`, docs/step-profile.md + exchange-fuse-bench.md);
+parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,
 `spine_fueled.rs`, McSherry "Specialize differential dataflow" (2017) &

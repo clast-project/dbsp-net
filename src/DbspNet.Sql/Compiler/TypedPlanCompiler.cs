@@ -745,12 +745,27 @@ public static class TypedPlanCompiler
         // the shuffle and the re-index). Both sides hash the same key type, so
         // equal keys land on the same worker. At W=1 ExchangeIndex is a plain
         // GroupProject, so the single-thread shape is unchanged.
-        var leftIndexed = InvokeExchangeIndex(
-            ctx.Builder, left.RowType, keyRowType, left.Stream,
-            BuildKeyHashPartition(left.RowType, keyRowType, leftKeyExtractor), leftKeyExtractor);
-        var rightIndexed = InvokeExchangeIndex(
-            ctx.Builder, right.RowType, keyRowType, right.Stream,
-            BuildKeyHashPartition(right.RowType, keyRowType, rightKeyExtractor), rightKeyExtractor);
+        var leftPartition = BuildKeyHashPartition(left.RowType, keyRowType, leftKeyExtractor);
+        var rightPartition = BuildKeyHashPartition(right.RowType, keyRowType, rightKeyExtractor);
+
+        object leftIndexed, rightIndexed;
+        if (ctx.Options.CoalesceJoinExchange)
+        {
+            // Fuse the two key exchanges into one shared barrier (§15): both sides
+            // are independent and adjacent (no dependency between them), so a single
+            // rendezvous serves both, halving the join's barrier straggler tax.
+            (leftIndexed, rightIndexed) = InvokeExchangeIndexJoin(
+                ctx.Builder, keyRowType, left.RowType, right.RowType,
+                left.Stream, leftPartition, leftKeyExtractor,
+                right.Stream, rightPartition, rightKeyExtractor);
+        }
+        else
+        {
+            leftIndexed = InvokeExchangeIndex(
+                ctx.Builder, left.RowType, keyRowType, left.Stream, leftPartition, leftKeyExtractor);
+            rightIndexed = InvokeExchangeIndex(
+                ctx.Builder, right.RowType, keyRowType, right.Stream, rightPartition, rightKeyExtractor);
+        }
 
         var leftSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, left.Schema, keyRowType, left.RowType);
@@ -3012,6 +3027,34 @@ public static class TypedPlanCompiler
             .Single(m => m.Name == nameof(CircuitBuilder.ExchangeIndex) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(keyRowType, rowType, typeof(Z64));
         return closed.Invoke(builder, new[] { stream, partition, keyExtractor })!;
+    }
+
+    /// <summary>
+    /// <c>builder.ExchangeIndexJoin&lt;TKey, TLeft, TRight, Z64&gt;(...)</c> — the
+    /// fused dual shuffle + re-index of a join's two inputs across one shared
+    /// barrier (§15). Returns the boxed (left, right) indexed streams, each
+    /// identical to a separate <see cref="InvokeExchangeIndex"/> but sharing one
+    /// rendezvous. The builder method returns a value tuple; its <c>Item1</c>/
+    /// <c>Item2</c> fields are the two streams.
+    /// </summary>
+    private static (object Left, object Right) InvokeExchangeIndexJoin(
+        CircuitBuilder builder, Type keyRowType, Type leftRowType, Type rightRowType,
+        object leftStream, Delegate leftPartition, Delegate leftKeyExtractor,
+        object rightStream, Delegate rightPartition, Delegate rightKeyExtractor)
+    {
+        var openMethod = typeof(CircuitBuilder)
+            .GetMethods()
+            .Single(m => m.Name == nameof(CircuitBuilder.ExchangeIndexJoin) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, leftRowType, rightRowType, typeof(Z64));
+        var result = closed.Invoke(builder, new[]
+        {
+            leftStream, leftPartition, leftKeyExtractor,
+            rightStream, rightPartition, rightKeyExtractor,
+        })!;
+        var type = result.GetType();
+        var leftOut = type.GetField("Item1")!.GetValue(result)!;
+        var rightOut = type.GetField("Item2")!.GetValue(result)!;
+        return (leftOut, rightOut);
     }
 
     /// <summary>

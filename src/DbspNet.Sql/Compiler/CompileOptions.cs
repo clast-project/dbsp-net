@@ -87,4 +87,18 @@ public sealed record CompileOptions
     /// win (§9.5); off by default.
     /// </remarks>
     public bool ShareArrangements { get; init; }
+
+    /// <summary>
+    /// Opt-in fusion of a join's two input exchanges into one shared barrier
+    /// (docs/design-row-representation.md §15). A parallel INNER/OUTER join shuffles
+    /// both inputs by the join key through two independent
+    /// <c>ExchangeIndex</c> rendezvous back to back; each pays the barrier
+    /// straggler tax separately (the dominant scaling cost — q4's exchange wait
+    /// reaches ~40% of the step at W=24). When set, the typed parallel compiler
+    /// emits a single <c>ExchangeIndexJoin</c> that publishes both sides and
+    /// rendezvouses once, halving the join's straggler exposure with identical
+    /// output. Affects only the typed parallel path (W&gt;1); W=1 is unchanged.
+    /// Off by default while it is gated.
+    /// </summary>
+    public bool CoalesceJoinExchange { get; init; }
 }

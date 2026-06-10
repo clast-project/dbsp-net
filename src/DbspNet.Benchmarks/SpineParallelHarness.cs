@@ -46,6 +46,9 @@ internal static class SpineParallelHarness
     /// <summary>Flat with the aggregate forced back to the eager per-tick rebuild (the §14.10 A/B baseline).</summary>
     internal static RunConfig FlatEager => new(CompileOptions.Default, false, ForceEagerRebuild: true);
 
+    /// <summary>Flat with a join's two key exchanges fused into one shared barrier (§15 gate).</summary>
+    internal static RunConfig FlatCoalesced => new(new CompileOptions { CoalesceJoinExchange = true }, false);
+
     internal static RunConfig Spine(bool forcePointProbe, int stagingCapacity) =>
         new(new CompileOptions { TraceFamily = TraceFamily.Spine, SpineStagingCapacity = stagingCapacity }, forcePointProbe);
 

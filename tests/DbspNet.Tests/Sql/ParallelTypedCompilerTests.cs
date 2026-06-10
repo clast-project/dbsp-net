@@ -104,6 +104,78 @@ public class ParallelTypedCompilerTests
             });
     }
 
+    /// <summary>
+    /// The §15 join exchange-barrier fusion (<c>CompileOptions.CoalesceJoinExchange</c>
+    /// → <c>ExchangeIndexJoinOp</c>) is a pure coordination change: shuffling a
+    /// join's two inputs across one shared barrier instead of two must yield
+    /// byte-identical output. Drives a join (+ GROUP BY, the q4 shape) three ways —
+    /// single, parallel-unfused, parallel-fused — through inserts, a group-growing
+    /// insert, and retractions on both sides, asserting all three agree every tick.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void JoinExchangeFusion_MatchesUnfusedAndSingle(int workers)
+    {
+        var plan = CompilePlan(
+            [
+                "CREATE TABLE l (k INT NOT NULL, a BIGINT NOT NULL)",
+                "CREATE TABLE r (k INT NOT NULL, b BIGINT NOT NULL)",
+            ],
+            "SELECT l.k, SUM(l.a * r.b) FROM l JOIN r ON l.k = r.k GROUP BY l.k");
+
+        Assert.True(TypedPlanCompiler.TryCompile(plan, out var single), "single compile failed");
+        Assert.True(
+            TypedPlanCompiler.TryCompileParallel(plan, workers, out var unfused, null, CompileOptions.Default),
+            "unfused parallel compile failed");
+        Assert.True(
+            TypedPlanCompiler.TryCompileParallel(
+                plan, workers, out var fused, null, new CompileOptions { CoalesceJoinExchange = true }),
+            "fused parallel compile failed");
+
+        var ticks = new Action<Func<string, TypedTableInput>>[]
+        {
+            tbl =>
+            {
+                tbl("l").Insert(1, 2L);
+                tbl("l").Insert(2, 3L);
+                tbl("r").Insert(1, 10L);
+                tbl("r").Insert(2, 20L);
+                tbl("r").Insert(3, 30L);   // no left match yet
+            },
+            tbl =>
+            {
+                tbl("l").Insert(3, 4L);    // now matches r.k=3
+                tbl("r").Insert(1, 100L);  // grows the k=1 join fan-out
+            },
+            tbl =>
+            {
+                tbl("l").Delete(1, 2L);    // retract a left row
+                tbl("r").Delete(2, 20L);   // retract a right row
+            },
+        };
+
+        using (unfused)
+        using (fused)
+        {
+            foreach (var tick in ticks)
+            {
+                tick(single!.Table);
+                tick(unfused!.Table);
+                tick(fused!.Table);
+                single.Step();
+                unfused.Step();
+                fused.Step();
+
+                var expected = Materialize(single.Current);
+                Assert.Equal(expected, Materialize(unfused.Current));
+                Assert.Equal(expected, Materialize(fused.Current));
+            }
+        }
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(2)]

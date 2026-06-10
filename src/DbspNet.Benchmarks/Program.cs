@@ -93,6 +93,30 @@ if (args.Length > 0 && args[0] == "stepprofile")
     return 0;
 }
 
+// Join exchange-barrier fusion gate: `dotnet run -- exchangefuse [events] [W] [runs] [q4,q9,...]`
+// Unfused vs fused (CoalesceJoinExchange) step A/B + Wait% (docs §15).
+if (args.Length > 0 && args[0] == "exchangefuse")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var events = Arg(1, 1_000_000);
+    var workers = Arg(2, Environment.ProcessorCount);
+    var runs = Arg(3, 5);
+    var queryIds = args.Length > 4
+        ? args[4].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        : new[] { "q4", "q9", "q20", "q3" };
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.ExchangeFuseBenchmark.Run(sb, queryIds, events, workers, runs);
+    var efPath = Path.Combine(FindDocsDir(), "exchange-fuse-bench.md");
+    File.WriteAllText(efPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(efPath)}");
+    return 0;
+}
+
 // q4 end-to-end flat lazy-view gate: `dotnet run -- q4flat [workers] [runs]`
 // Whole q4 parallel pipeline, flat·eager vs flat·lazy aggregate
 // (docs/design-row-representation.md §14.10).
