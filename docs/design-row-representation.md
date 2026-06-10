@@ -1437,19 +1437,37 @@ exchange):
    at W>16, core heterogeneity (below). So rebalancing the hash would not help —
    the partition is already even on average.
 
-### 15.3 — Host caveat (an honest confound)
+### 15.3 — Hybrid-core note (both boxes are hybrid — not a confound)
 
-The bench host is an i9-12900K: a **hybrid** 8 P-core (16 threads) + 8 E-core
-(8 threads) part, 24 logical. Past W≈16 some workers land on the slower E-cores
-and become *permanent* stragglers the barrier waits on every tick — so the W>16
-rows conflate that heterogeneity with the structural barrier tax, and explain
-why q4 is no faster (sometimes slower) at W=24 than W=16. The Feldera
-comparison numbers were taken on a different, homogeneous 14-core box, where this
-specific E-core tax does **not** appear. The **portable** finding is the
-*structural trend* — operators scale ~7–9× while the step scales ~3.5–5×, the
-gap being barrier wait that grows with W — not the absolute W=24 cell values. It
-also means this profile alone cannot fully attribute the cross-box Feldera gap;
-it explains the *shape* of our scaling loss, which is what the levers target.
+The step-decomposition host is an i9-12900K: a **hybrid** 8 P-core (16 threads) +
+8 E-core (8 threads) part, 24 logical. Past W≈16 some workers land on the slower
+E-cores and become *permanent* stragglers the barrier waits on every tick — so
+the W>16 rows mix that heterogeneity with the structural barrier tax, and explain
+why q4 is no faster (sometimes slower) at W=24 than W=16. **The Feldera
+comparison box ([[nexmark-feldera-w14-snapshot]]) is an Apple M4 Pro — also
+hybrid (the 14-core part is ~10 P + 4 E), confirmed by the user 2026-06-10.** So
+the E-core straggler tax is present in the *actual comparison numbers too*, not
+just this local profile — which makes the decomposition *more* representative of
+the comparison environment, not less. Two consequences:
+
+- **It sharpens lever 1 (§15.5).** The comparison runs DbspNet at W=14 on a 10P+4E
+  box, i.e. 4 workers pinned to permanent-straggler E-cores. The decomposition
+  predicts DbspNet step throughput should **peak around W≈10 (P-cores only) and go
+  flat-or-worse at W=14** — so *capping W at the P-core count is a concrete,
+  testable throughput claw-back on the very box the comparison uses*, not a
+  homogeneous-box non-event as first written.
+- **It does not explain the gap away.** Feldera runs on the *same* hybrid box and
+  still wins q4/q18/q22, so the gap is not a measurement artifact: either its
+  per-row work is cheaper (same straggler tax = smaller fraction of the step) or
+  its scheduling tolerates core heterogeneity better than our static equal-shard
+  BSP. This profile (our side only) cannot separate those — but on a hybrid box,
+  static equal sharding is *especially* penalised, which is itself an argument for
+  the adaptive-scheduling direction (levers 3–4).
+
+The **portable** finding is unchanged and machine-independent: operators scale
+~7–9× while the step scales ~3.5–5×, the gap being barrier wait that grows with W.
+(If anything the M4 Pro's high unified-memory bandwidth makes the *movement* term
+even smaller relative to coordination — reinforcing the conclusion.)
 
 ### 15.4 — Why this is substantially fundamental
 
@@ -1476,12 +1494,14 @@ incremental result is partly intrinsic.
 
 ### 15.5 — Ranked levers
 
-1. **Right-size W to the fast-core count; do not oversubscribe.** *Cheap config.*
-   The data shows the efficiency knee at ~W=12–16 and W>16 flat-to-negative on
-   this box; defaulting W to physical fast cores (not logical) avoids the E-core
-   straggler tax. Honest limit: the Feldera box is homogeneous and likely already
-   runs W≈cores, so this barely moves *that* comparison — but it is the correct
-   default and the immediate measured win locally.
+1. **Right-size W to the fast-core count; do not oversubscribe.** *Cheap config —
+   and, given §15.3, a directly testable win on the comparison box.* The data
+   shows the efficiency knee at ~W=12–16 and W>16 flat-to-negative on the i9;
+   defaulting W to the P-core count (not logical cores) avoids the E-core
+   straggler tax. Because the comparison M4 Pro is *also* hybrid (10P+4E) and the
+   comparison runs DbspNet at W=14 (4 workers on E-cores), the prediction is that
+   **DbspNet at W≈10 may beat its own W=14** on q4/q18/q22 — a concrete experiment
+   for the next comparison run, not a homogeneous-box non-event.
 2. **Coarser ticks (larger batch) where the latency budget allows.** *Config /
    tradeoff.* A bigger per-worker slice lowers relative per-tick variance and
    amortises barrier latency over more work (consistent with the prior finding
@@ -1508,9 +1528,13 @@ incremental result is partly intrinsic.
    5–22%-and-shrinking gather term, so minor; column-*pruning* the shuffle stays
    blocked by non-linear MIN/MAX (q4, [parallel-pipeline-perf]) and the data says
    it would not help much anyway (movement is not the ceiling). Do opportunistically.
-6. **Heterogeneity-aware weighted shards / thread affinity.** *Demote.*
-   Machine-specific (helps only hybrid CPUs), needs affinity pinning the OS
-   scheduler fights, and does nothing for the homogeneous comparison box.
+6. **Heterogeneity-aware weighted shards / thread affinity.** *Keep demoted, but
+   note it is now relevant to the comparison box.* Both the i9 and the comparison
+   M4 Pro are hybrid, so weighting E-core workers' shards smaller (or pinning
+   workers to P-cores) would, in principle, help on the actual benchmark hardware
+   — but it needs affinity pinning the OS scheduler fights and is brittle across
+   machines. Lever 1 (just cap W at the P-core count) captures most of the same
+   benefit far more cheaply, so this stays below it.
 
 ### 15.6 — Recommendation
 
@@ -1526,9 +1550,12 @@ exchange, 4) is a research-grade rewrite whose payoff is bounded by the
 slowest-worker-per-tick floor that is partly intrinsic to synchronous fine-grained
 incrementality. Net: ship the profiler (durable measurement infrastructure),
 adopt the W-sizing default, and treat much of the residual q4/q18/q22 Feldera gap
-as a property of the execution model rather than a bug awaiting one fix — with the
-explicit caveat that the local profile carries an E-core confound the homogeneous
-comparison box does not.
+as a property of the execution model rather than a bug awaiting one fix. Both
+boxes are hybrid (§15.3), so the E-core straggler tax is part of the *real*
+comparison, not a local artifact — which makes lever 1 (cap W at the P-core
+count, ≈10 on the M4 Pro) the first concrete experiment to run, since the
+comparison currently puts 4 of DbspNet's 14 workers on permanent-straggler
+E-cores.
 
 ---
 
