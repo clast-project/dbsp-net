@@ -208,6 +208,7 @@ grows and the GC frontier climbs.
 - Scalar functions: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `UPPER`,
   `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING`/`SUBSTR`, `TRIM`/`LTRIM`/`RTRIM`
   (whitespace or a custom char set), `REPLACE`, `POSITION(x IN y)`/`STRPOS`,
+  `SPLIT_INDEX`/`SPLIT_PART`,
   `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`,
   `LOG` (base-10, or `LOG(b, x)`), `EXP`. String functions are native UTF-8
   with code-point semantics. NULL semantics follow PostgreSQL (most propagate;

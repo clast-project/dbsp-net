@@ -219,6 +219,30 @@ internal static class BuiltinScalarFunctions
         return new ResolvedFunctionCall("replace", args, new SqlVarcharType(null, AnyNullable(args)));
     }
 
+    internal static ResolvedFunctionCall ResolveSplitIndex(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("split_index", args, 3);
+        RequireString("split_index", args[0]);
+        RequireString("split_index", args[1]);
+        RequireInteger("split_index", args[2]);
+
+        // An out-of-range (or negative) index yields NULL even for non-NULL
+        // inputs, so the result is always nullable (Flink/Feldera semantics).
+        return new ResolvedFunctionCall("split_index", args, new SqlVarcharType(null, Nullable: true));
+    }
+
+    internal static ResolvedFunctionCall ResolveSplitPart(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("split_part", args, 3);
+        RequireString("split_part", args[0]);
+        RequireString("split_part", args[1]);
+        RequireInteger("split_part", args[2]);
+
+        // An out-of-range field yields the empty string (PostgreSQL), so the
+        // result is NULL only when an argument is NULL.
+        return new ResolvedFunctionCall("split_part", args, new SqlVarcharType(null, AnyNullable(args)));
+    }
+
     internal static ResolvedFunctionCall ResolvePosition(string name, IReadOnlyList<ResolvedExpression> args)
     {
         RequireArity(name, args, 2);
@@ -231,6 +255,12 @@ internal static class BuiltinScalarFunctions
 
     internal static Expression BuildReplace(Expression[] c) =>
         Expression.Call(ReplaceRuntime, c[0], c[1], c[2]);
+
+    internal static Expression BuildSplitIndex(Expression[] c) =>
+        Expression.Call(SplitIndexRuntime, c[0], c[1], c[2]);
+
+    internal static Expression BuildSplitPart(Expression[] c) =>
+        Expression.Call(SplitPartRuntime, c[0], c[1], c[2]);
 
     // POSITION(sub IN str) → (needle=sub, haystack=str); STRPOS(str, sub) is the
     // same with the arguments swapped.
@@ -840,6 +870,10 @@ internal static class BuiltinScalarFunctions
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.TrimString), new[] { typeof(object), typeof(object), typeof(int) })!;
     internal static readonly MethodInfo ReplaceRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Replace))!;
+    internal static readonly MethodInfo SplitIndexRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.SplitIndex))!;
+    internal static readonly MethodInfo SplitPartRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.SplitPart))!;
     internal static readonly MethodInfo PositionRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Position))!;
     internal static readonly MethodInfo MathSignDouble =
@@ -1020,6 +1054,29 @@ internal static class SqlBuiltinRuntime
         s is null || from is null || to is null
             ? null
             : ReplaceCore((Utf8String)s, (Utf8String)from, (Utf8String)to);
+
+    /// <summary>
+    /// <c>SPLIT_INDEX(s, delim, n)</c> — split <paramref name="s"/> on
+    /// <paramref name="delim"/> and return the <c>n</c>-th (0-based) part, or
+    /// NULL if <c>n</c> is negative or past the last part (Flink/Feldera).
+    /// NULL in any argument → NULL.
+    /// </summary>
+    public static object? SplitIndex(object? s, object? delim, object? n) =>
+        s is null || delim is null || n is null
+            ? null
+            : SplitIndexCore((Utf8String)s, (Utf8String)delim, AsInt(n));
+
+    /// <summary>
+    /// <c>SPLIT_PART(s, delim, n)</c> — split <paramref name="s"/> on
+    /// <paramref name="delim"/> and return the <c>n</c>-th (1-based) part; a
+    /// negative <c>n</c> counts from the end (PostgreSQL 14+). An out-of-range
+    /// field (including <c>n = 0</c>) yields the empty string. NULL in any
+    /// argument → NULL.
+    /// </summary>
+    public static object? SplitPart(object? s, object? delim, object? n) =>
+        s is null || delim is null || n is null
+            ? null
+            : (object)SplitPartCore((Utf8String)s, (Utf8String)delim, AsInt(n));
 
     /// <summary>
     /// <c>POSITION(needle IN haystack)</c> — 1-based code-point index of the
@@ -1266,6 +1323,45 @@ internal static class SqlBuiltinRuntime
 
         return Utf8String.FromBytes(result.ToArray());
     }
+
+    internal static object? SplitIndexCore(Utf8String s, Utf8String delim, int n)
+    {
+        if (n < 0)
+        {
+            return null;
+        }
+
+        var parts = SplitParts(s.ToStringDecoded(), delim.ToStringDecoded());
+        return n < parts.Length ? (object)Utf8String.Of(parts[n]) : null;
+    }
+
+    internal static Utf8String SplitPartCore(Utf8String s, Utf8String delim, int n)
+    {
+        var parts = SplitParts(s.ToStringDecoded(), delim.ToStringDecoded());
+
+        // 1-based from the start; a negative n counts back from the end.
+        // n == 0 (and any out-of-range field) yields the empty string.
+        int idx;
+        if (n > 0)
+        {
+            idx = n - 1;
+        }
+        else if (n < 0)
+        {
+            idx = parts.Length + n;
+        }
+        else
+        {
+            return Utf8String.Empty;
+        }
+
+        return idx >= 0 && idx < parts.Length ? Utf8String.Of(parts[idx]) : Utf8String.Empty;
+    }
+
+    // An empty delimiter is not a valid split separator (.NET throws); treat the
+    // whole string as a single part, matching PostgreSQL's split_part.
+    private static string[] SplitParts(string s, string delim) =>
+        delim.Length == 0 ? new[] { s } : s.Split(delim);
 
     internal static int PositionCore(Utf8String haystack, Utf8String needle)
     {

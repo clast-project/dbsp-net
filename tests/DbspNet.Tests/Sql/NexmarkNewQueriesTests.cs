@@ -102,6 +102,13 @@ public class NexmarkNewQueriesTests
           FROM bid b JOIN auction a ON b.auction = a.id
           WHERE a.category = 10";
 
+    private const string Q22 =
+        @"SELECT auction, bidder, price, channel,
+                 SPLIT_INDEX(url, '/', 3) AS dir1,
+                 SPLIT_INDEX(url, '/', 4) AS dir2,
+                 SPLIT_INDEX(url, '/', 5) AS dir3
+          FROM bid";
+
     private static CompiledQuery Compile(string query)
     {
         var catalog = new Catalog();
@@ -214,6 +221,38 @@ public class NexmarkNewQueriesTests
         Assert.Equal(1L, b[8]);              // rank2_bidders {1}
         Assert.Equal(1L, b[10]);             // total_auctions {2}
         Assert.Equal(1L, b[12]);             // rank2_auctions {2}
+    }
+
+    [Fact]
+    public void Q22_GetUrlDirectories_SplitsPathSegments()
+    {
+        var q = Compile(Q22);
+        // A URL with three path segments after the host.
+        q.Table("bid").Insert(
+            1L, 2L, 100L, "ch", "https://www.nexmark.com/aaa/bbb/item.html", new Timestamp(0), "x");
+        q.Step();
+
+        var rows = PositiveRows(q, 7);
+        var r = Assert.Single(rows);
+        Assert.Equal("aaa", r[4]!.ToString());        // dir1 = segment 3
+        Assert.Equal("bbb", r[5]!.ToString());        // dir2 = segment 4
+        Assert.Equal("item.html", r[6]!.ToString());  // dir3 = segment 5
+    }
+
+    [Fact]
+    public void Q22_OutOfRangeSegment_IsNull()
+    {
+        var q = Compile(Q22);
+        // Only segments 0..4 exist (the generator's shallow URL), so dir3
+        // (index 5) is NULL.
+        q.Table("bid").Insert(
+            1L, 2L, 100L, "ch", "https://www.nexmark.com/ch/item.html", new Timestamp(0), "x");
+        q.Step();
+
+        var r = Assert.Single(PositiveRows(q, 7));
+        Assert.Equal("ch", r[4]!.ToString());          // dir1 = segment 3 (channel)
+        Assert.Equal("item.html", r[5]!.ToString());   // dir2 = segment 4
+        Assert.Null(r[6]);                             // dir3 = segment 5 (out of range)
     }
 
     [Fact]

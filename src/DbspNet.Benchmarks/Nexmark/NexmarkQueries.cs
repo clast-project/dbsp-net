@@ -220,5 +220,17 @@ internal static class NexmarkQueries
               FROM bid b JOIN auction a ON b.auction = a.id
               WHERE a.category = 10",
             AuctionBid),
+        new(
+            "q22",
+            "get URL directories — split the bid URL into path segments",
+            // Verbatim Feldera q22: SPLIT_INDEX picks the n-th (0-based) '/'-
+            // delimited segment of the URL. Indices 3/4/5 are the path segments
+            // after the scheme/host (segments 0='https:', 1='', 2=host).
+            @"SELECT auction, bidder, price, channel,
+                     SPLIT_INDEX(url, '/', 3) AS dir1,
+                     SPLIT_INDEX(url, '/', 4) AS dir2,
+                     SPLIT_INDEX(url, '/', 5) AS dir3
+              FROM bid",
+            BidOnly),
     };
 }

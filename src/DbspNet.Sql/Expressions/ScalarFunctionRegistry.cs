@@ -136,6 +136,8 @@ internal static class ScalarFunctionRegistry
             new TrimFunction("rtrim", BuiltinScalarFunctions.TrimSide.Right),
             new TrimFunction("trim", BuiltinScalarFunctions.TrimSide.Both),
             new ReplaceFunction(),
+            new SplitIndexFunction(),
+            new SplitPartFunction(),
             new PositionFunction("position", swapped: false),
             new PositionFunction("strpos", swapped: true),
             new LikeFunction("like", caseInsensitive: false),

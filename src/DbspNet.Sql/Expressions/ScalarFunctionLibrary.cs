@@ -185,6 +185,30 @@ internal sealed class ReplaceFunction : IScalarFunction
     public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
 }
 
+/// <summary><c>SPLIT_INDEX(s, delim, n)</c> — n-th (0-based) split part, NULL if
+/// out of range.</summary>
+internal sealed class SplitIndexFunction : IScalarFunction
+{
+    public string Name => "split_index";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveSplitIndex(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildSplitIndex(BuiltinScalarFunctions.CompileArgs(fn, buildArg));
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
+/// <summary><c>SPLIT_PART(s, delim, n)</c> — n-th (1-based) split part, empty
+/// string if out of range.</summary>
+internal sealed class SplitPartFunction : IScalarFunction
+{
+    public string Name => "split_part";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveSplitPart(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildSplitPart(BuiltinScalarFunctions.CompileArgs(fn, buildArg));
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+}
+
 /// <summary>POSITION(needle IN haystack); STRPOS(haystack, needle) swaps the args.</summary>
 internal sealed class PositionFunction(string name, bool swapped) : IScalarFunction
 {

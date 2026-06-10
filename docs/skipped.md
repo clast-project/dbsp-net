@@ -500,10 +500,12 @@ reflect that shape, not a backlog.
   `ReadOnlyMemory<byte>`) with native UTF-8 equality, ordering, hashing
   (XxHash3), `LENGTH` (code points), byte-wise `CONCAT`, and `Rune`-based
   invariant `UPPER` / `LOWER`. `SUBSTRING`, `TRIM`/`LTRIM`/`RTRIM`,
-  `REPLACE`, and `POSITION`/`STRPOS` are implemented with native UTF-8 /
+  `REPLACE`, `POSITION`/`STRPOS`, and `SPLIT_INDEX` (0-based, NULL out of
+  range) / `SPLIT_PART` (1-based, negative-from-end, empty-string out of
+  range) are implemented with native UTF-8 /
   code-point semantics (substring offsets and POSITION results are in code
   points; REPLACE / POSITION search is byte-wise, which is correct for
-  valid UTF-8). `LIKE` / `ILIKE` / `SIMILAR TO` pattern matching is
+  valid UTF-8; SPLIT decodes to a .NET string to split). `LIKE` / `ILIKE` / `SIMILAR TO` pattern matching is
   implemented by decoding to a .NET string and matching a translated `Regex`
   (see the SQL-features section above).
 - Apache Arrow boundary: `DbspNet.Arrow` exposes `CompiledQuery.ToArrowDelta()`

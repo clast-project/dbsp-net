@@ -449,6 +449,55 @@ public class ScalarFunctionTests
         Assert.Equal("abc", EvalStr("REPLACE(s, 'z', 'Q')", "abc"));
     }
 
+    // ---- SPLIT_INDEX ----
+
+    [Fact]
+    public void SplitIndex_ReturnsZeroBasedPart()
+    {
+        Assert.Equal("a", EvalStr("SPLIT_INDEX(s, '/', 0)", "a/b/c"));
+        Assert.Equal("b", EvalStr("SPLIT_INDEX(s, '/', 1)", "a/b/c"));
+        Assert.Equal("c", EvalStr("SPLIT_INDEX(s, '/', 2)", "a/b/c"));
+        // Empty part between consecutive delimiters (the "//" in a URL).
+        Assert.Equal("", EvalStr("SPLIT_INDEX(s, '/', 1)", "http:////host"));
+        Assert.Equal("host", EvalStr("SPLIT_INDEX(s, '/', 4)", "http:////host"));
+    }
+
+    [Fact]
+    public void SplitIndex_OutOfRangeOrNegative_IsNull()
+    {
+        Assert.Null(EvalStr("SPLIT_INDEX(s, '/', 3)", "a/b/c"));
+        Assert.Null(EvalStr("SPLIT_INDEX(s, '/', -1)", "a/b/c"));
+    }
+
+    [Fact]
+    public void SplitIndex_PropagatesNull()
+    {
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (s VARCHAR)"],
+            "SELECT SPLIT_INDEX(s, '/', 0) FROM t",
+            q => q.Table("t").Insert((object?)null)));
+    }
+
+    // ---- SPLIT_PART ----
+
+    [Fact]
+    public void SplitPart_ReturnsOneBasedPart()
+    {
+        Assert.Equal("a", EvalStr("SPLIT_PART(s, '/', 1)", "a/b/c"));
+        Assert.Equal("c", EvalStr("SPLIT_PART(s, '/', 3)", "a/b/c"));
+        // Negative counts from the end (PostgreSQL 14+).
+        Assert.Equal("c", EvalStr("SPLIT_PART(s, '/', -1)", "a/b/c"));
+        Assert.Equal("a", EvalStr("SPLIT_PART(s, '/', -3)", "a/b/c"));
+    }
+
+    [Fact]
+    public void SplitPart_OutOfRangeOrZero_IsEmptyString()
+    {
+        Assert.Equal("", EvalStr("SPLIT_PART(s, '/', 4)", "a/b/c"));
+        Assert.Equal("", EvalStr("SPLIT_PART(s, '/', 0)", "a/b/c"));
+        Assert.Equal("", EvalStr("SPLIT_PART(s, '/', -4)", "a/b/c"));
+    }
+
     // ---- POSITION / STRPOS ----
 
     [Fact]
