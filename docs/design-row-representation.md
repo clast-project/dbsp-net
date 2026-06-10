@@ -1488,8 +1488,13 @@ incompatible with the replica model for exactly the stateful operators that
 matter. This is why Differential/Timely and Feldera/DBSP use **asynchronous
 frontier-based progress** (data flows through channels; workers synchronise on
 logical-time frontiers, not a hard per-operator thread barrier) rather than
-lockstep BSP. Matching that would be an execution-model rewrite, not a tweak —
-and even then the *slowest-worker-per-tick* lower bound on a synchronous
+lockstep BSP. **Correction (see §15.8): this applies to Differential/Timely, NOT
+to Feldera/DBSP.** DBSP is a *synchronous, clocked* circuit engine — per-tick
+exchange + barrier, like ours — confirmed by the §15.8 experiment showing Feldera
+is *uniformly* straggler-sensitive (the fingerprint of BSP, not async frontier).
+So "matching Feldera" is **not** an async-rewrite goal — both engines are BSP; the
+async-frontier model is the Timely/DD escape, a bigger rewrite than parity with
+Feldera. Even then the *slowest-worker-per-tick* lower bound on a synchronous
 incremental result is partly intrinsic.
 
 ### 15.5 — Ranked levers
@@ -1537,6 +1542,15 @@ incremental result is partly intrinsic.
    benefit far more cheaply, so this stays below it.
 
 ### 15.6 — Recommendation
+
+> **Superseded by §15.7–§15.8.** This recommendation predates the two
+> measure-first follow-ups: the barrier-coalescing prototype was built and **held**
+> (negative, §15.7), and the W-sizing lever was run on the comparison box and
+> **falsified as a competitive move** (§15.8) — DbspNet is W-insensitive while
+> Feldera gains uniformly from shedding E-cores, so capping W does not close the
+> gap. The current bottom line is §15.8's reframe: the residual q4/q18/q19 gaps are
+> **per-row execution efficiency**, looping back to the row-rep/columnar arc, not
+> the exchange layer. The paragraph below is kept as the pre-experiment reasoning.
 
 Measure-first overturned the going-in hypothesis: the exchange/scaling ceiling is
 **coordination — the per-step/per-exchange barrier straggler tax at fine-grained
@@ -1599,11 +1613,65 @@ and **resync** between them — two barriers are sometimes better than one.
 kept behind the flag as a documented, reproducible negative result + regression
 guard (matching the repo's `ForceEagerRebuild`/`ForcePointProbe`/`ShareArrangements`
 gated-seam discipline). The measure-first gate did its job: it stopped a
-plausible-but-counterproductive "optimization" and tightened §15's conclusion —
-**lever 1 (right-size W to the fast cores) is the real win; reducing barrier count
-is not.** The remaining levers (coarser ticks; async non-BSP exchange) are
-untouched, but the bar they must clear is now sharper: beat *unfused at W≈P-cores*,
-not unfused at W=host.
+plausible-but-counterproductive "optimization" and tightened §15's conclusion:
+reducing barrier *count* is not the lever (the straggler *bound* is). At the time
+this left lever 1 (right-size W) as the apparent best lever — but §15.8 below then
+falsified *that* too as a competitive move. The remaining levers (coarser ticks;
+async non-BSP exchange) are untouched, but the bar they must clear is now sharper:
+beat *unfused at W≈P-cores*, not unfused at W=host.
+
+### 15.8 — Experiment RAN: W=10 vs W=14 on the comparison box — lever 1 FALSIFIED, and a reframe
+
+The user ran lever 1 on the comparison M4 Pro (10 P + 4 E): DbspNet and Feldera
+each at W=10 (P-cores only) vs W=14 (all cores), full Nexmark set (single run;
+the cross-engine pattern below is too uniform to be noise). Head-to-head at 10
+cores: q3 1.87×, q16 3.25×, q17 2.47×, q9 1.48×, q15 1.17×, q2 1.05× (wins/ties);
+q20 0.89×, q1 0.87×, q0 0.86×, q22 0.68×, q19 0.55×, q18 0.46×, **q4 0.49×**
+(gaps). Same-engine 14→10:
+
+| | DbspNet 14→10 | Feldera 14→10 |
+|---|---|---|
+| pattern | **mixed ±7–22%** (q0/q3/q17/q22 gain, q1/q2/q9/q16 lose) | **uniform +2–38%, every query** |
+
+Three findings, the first two unexpected:
+
+1. **Feldera is uniformly faster at 10 than 14** — every query, +2–38%. Textbook
+   BSP straggler: its per-tick barrier waits on the slowest worker, so pinning 4
+   workers to E-cores taxes every step; shedding them is pure win.
+2. **DbspNet is W-insensitive (10 ≈ 14, mixed ±)** — it neither suffers much from
+   nor benefits much from the E-cores.
+3. **So the head-to-head ratio moves TOWARD Feldera at W=10** (q4 0.66×→**0.49×**,
+   q0 0.91→0.86, q22 0.70→0.68) — *not* because DbspNet got slower but because
+   Feldera gained more from shedding E-cores. **Lever 1's competitive prediction is
+   falsified:** capping W at the P-core count is a per-machine *absolute*-throughput
+   nicety for DbspNet, NOT a way to close the Feldera gap; the 10-core comparison
+   is if anything a slightly *tougher* test.
+
+This forces two corrections on §15.4:
+
+- **Feldera/DBSP is synchronous/clocked BSP, not async-frontier** (fixed in §15.4).
+  Its *uniform* straggler-sensitivity is the BSP fingerprint; it is *more* tightly
+  barrier-coupled than DbspNet, not less. The async-frontier escape is Timely/DD,
+  not what we are chasing for Feldera parity.
+- **DbspNet's lower straggler-sensitivity cuts both ways.** It is genuine
+  resilience on heterogeneous hardware (a real point in our favour) — but partly a
+  *symptom of slower per-row work*: the more efficient your per-tuple work, the
+  less work sits between barriers, so the larger the straggler/coordination
+  fraction. Feldera is faster per-row → more straggler-bound → hurt more by
+  E-cores; we are slower per-row → less straggler-bound → tolerate them.
+
+**The reframe (where the gap actually is).** Putting §15.1–15.8 together: our
+*scaling* is coordination-bound (§15.2, confirmed) and W-sizing does not close the
+competitive gap (§15.8, shown). So the residual q4/q18/q19 gaps (0.46–0.55× at
+10c) are substantially **per-row execution efficiency** — Feldera processes the
+same tuples cheaper (columnar/vectorised batch operators), winning *even while
+paying a heavier straggler tax*. That points the lever back at **per-row/columnar
+execution** (the row-representation arc, §1–§14) for those specific queries, NOT
+the exchange/scaling layer. **The exchange/scaling investigation concludes here:**
+movement is not the ceiling (§15.2), barrier count is not the lever (§15.7), and
+W-sizing is not competitive (§15.8); the durable deliverables are the measurement
+infrastructure (`stepprofile`/`exchangefuse`) and a correct, evidence-backed map
+of where the gap is *not*.
 
 ---
 
