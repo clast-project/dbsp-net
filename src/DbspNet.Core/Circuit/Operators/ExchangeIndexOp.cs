@@ -58,17 +58,21 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
     public void Step()
     {
         var workers = _workers;
+        var profile = StepProfiler.Enabled;
+        var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // Split this shard's rows into one append-only bucket per destination —
         // the input is a Z-set so its keys are distinct, so a bucket never
         // merges (see ExchangeOp). Buckets are allocated lazily; empty cells
         // publish null.
         var buckets = new List<KeyValuePair<TRow, TWeight>>?[workers];
+        long splitRows = 0;
         foreach (var kv in _input.Current)
         {
             // Non-negative modulo: partition() may return a negative hash.
             var j = ((_partition(kv.Key) % workers) + workers) % workers;
             (buckets[j] ??= new List<KeyValuePair<TRow, TWeight>>()).Add(kv);
+            splitRows++;
         }
 
         for (var j = 0; j < workers; j++)
@@ -76,7 +80,21 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
             _coordinator.Publish(_worker, j, buckets[j]!);
         }
 
+        if (profile)
+        {
+            var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+            StepProfiler.RecordSplit(_worker, t1 - t0, splitRows);
+            t0 = t1;
+        }
+
         _coordinator.Wait(_abort);
+
+        if (profile)
+        {
+            var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+            StepProfiler.RecordWait(_worker, t2 - t0);
+            t0 = t2;
+        }
 
         // Gather our column straight into the indexed form. Building the index
         // here (rather than a flat Z-set re-indexed downstream) is the whole
@@ -84,6 +102,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         // per (key, row) and drops zeros, so the same row arriving from two
         // source workers (a column-dropping map upstream) merges correctly.
         var indexed = new IndexedZSetBuilder<TKey, TRow, TWeight>();
+        long gatherRows = 0;
         for (var src = 0; src < workers; src++)
         {
             var bucket = _coordinator.Read(src, _worker);
@@ -92,10 +111,17 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
                 foreach (var (row, weight) in bucket)
                 {
                     indexed.Add(_keyOf(row), row, weight);
+                    gatherRows++;
                 }
             }
         }
 
         _output.SetCurrent(indexed.Build());
+
+        if (profile)
+        {
+            var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+            StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
+        }
     }
 }

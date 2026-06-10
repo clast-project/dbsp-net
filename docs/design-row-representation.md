@@ -1365,13 +1365,182 @@ full-suite correctness and no regression regime.
 
 ---
 
+## 15. Exchange / parallel-scaling — opening up the step (the coordination ceiling)
+
+With the row-rep flat-path arc shipped (§14), the remaining Feldera gaps —
+q4 (0.66×), q18 (0.41×), q19 (0.67×), q22 (0.70×) — are all the
+*parallel-scaling efficiency* ceiling: every query realises only ~2.4–4.9× on
+14 cores. The q18 profile (docs/q18-profile.md) localised the cost to the
+**step** (not ingest/egest) and showed it saturates by ~W=12, but the step
+itself was a black box. The going-in hypothesis from
+[parallel-pipeline-perf] was that the step is **CPU/bandwidth-bound whole-row
+movement** through the all-to-all shuffle. This section opens the step up and
+**the measurement overturns that hypothesis.**
+
+### 15.1 — Method: the step decomposition profiler
+
+`StepProfiler` (`Core/Circuit/StepProfiler.cs`, a default-off internal seam in
+the established `SpineStagingConfig`/`FlatAggregateMode` mould — benchmark-only,
+each worker accumulates its own `[worker]` array slot during a Step, the
+controller reads after the end-of-tick barrier publishes the writes, zero
+production cost when disabled) splits each worker's `Step` into four phases:
+**split** (bucket this shard's rows by `hash(key)%W` — instrumented in
+`ExchangeOp`/`ExchangeIndexOp`), **wait** (`_coordinator.Wait` — pure idle at the
+per-exchange `Barrier`), **gather** (rebuild the post-shuffle indexed Z-set,
+re-hashing full rows), and **op** (`step − split − wait − gather`, the residual
+join/aggregate/TOP-K compute). It also records each replica's whole-`Step` raw
+ticks, so the report can compare the **mean** per-worker step against **Ctrl**
+(the controller's real per-step wall clock = `Σ_tick max_worker step` — what
+actually bounds throughput). `dotnet run -- stepprofile [events] [q…] [W-sweep]`
+writes docs/step-profile.md. A query with several exchanges sums their phases
+into the same slot (so the figures are step-total movement/idle, not one
+exchange's).
+
+Two derived ratios separate the failure modes:
+- **Strag = Ctrl / mean-Step** — the barrier's straggler tax (1.00 = none; the
+  per-tick slowest worker dragging the rest shows here).
+- **Imbal = max-busy / mean-busy** (busy = step−wait) — *persistent* per-worker
+  work skew (one worker always heavier), distinct from per-tick straggling.
+
+### 15.2 — What the measurement found (1M events, batch 10k, i9-12900K)
+
+The W-sweep (docs/step-profile.md) is decisive and consistent across q18 (TOP-1,
+1 exchange), q4 (join + 2 aggregates, multi-exchange) and q19 (TOP-10, 1
+exchange):
+
+1. **The operators scale ~7–9×; the realised step scales only ~3.5–5×.** At
+   W=24: q18 Op↓ 8.2× vs **Ctrl↓ 3.5×**; q4 Op↓ 6.9× vs **Ctrl↓ 3.5×**; q19 Op↓
+   9.2× vs **Ctrl↓ 5.1×**. Ctrl flattens by ~W=12–16 and then wobbles or
+   regresses (q4 is no better at W=24 than W=16). **The operators are not the
+   bottleneck — coordination is.**
+2. **Wide-row movement is a *small and shrinking* term, not the ceiling.**
+   split+gather is 5–22% of the step and *falls* with W (q4 Move% 31→5% over
+   W=4→24; the gather — the one residual whole-row-rehash site, §14.2 — is
+   0.2–1.1 ms and shrinks as rows split W ways). **This refutes the
+   bandwidth-bound-movement hypothesis:** the all-to-all of wide rows is cheap
+   relative to the step, and gets cheaper per worker as W grows.
+3. **The dominant non-scaling term is the barrier WAIT, and it rises with W.**
+   q4's exchange Wait% climbs 6→14→19→36→36→**40%** over W=4→24 — at W=24 two
+   fifths of the step is idle at the exchange barrier. q4 carries the most
+   exchanges (its join's two inputs), so it has the most barrier-straggler
+   exposure and is the worst-scaling join query — exactly the 0.66× Feldera gap.
+4. **Single- vs multi-exchange queries wear the same tax in different places.**
+   q4 (multi-exchange) shows it as high exchange **Wait%** (fast workers idle at
+   the exchange barrier) with low Strag; q18/q19 (one exchange) push more of the
+   imbalance *past* the exchange into the TOP-K, so it surfaces as **Strag**
+   rising to ~1.4 (the controller's done-barrier waiting on the slowest worker's
+   post-exchange work). Same root cause — a global rendezvous paying for the
+   slowest worker each tick — located at whichever barrier the imbalance lands
+   before.
+5. **Persistent skew is modest (Imbal ≤ 1.4).** It is *not* one hot worker; it is
+   *per-tick rotating* straggling (the unlucky worker varies tick to tick) plus,
+   at W>16, core heterogeneity (below). So rebalancing the hash would not help —
+   the partition is already even on average.
+
+### 15.3 — Host caveat (an honest confound)
+
+The bench host is an i9-12900K: a **hybrid** 8 P-core (16 threads) + 8 E-core
+(8 threads) part, 24 logical. Past W≈16 some workers land on the slower E-cores
+and become *permanent* stragglers the barrier waits on every tick — so the W>16
+rows conflate that heterogeneity with the structural barrier tax, and explain
+why q4 is no faster (sometimes slower) at W=24 than W=16. The Feldera
+comparison numbers were taken on a different, homogeneous 14-core box, where this
+specific E-core tax does **not** appear. The **portable** finding is the
+*structural trend* — operators scale ~7–9× while the step scales ~3.5–5×, the
+gap being barrier wait that grows with W — not the absolute W=24 cell values. It
+also means this profile alone cannot fully attribute the cross-box Feldera gap;
+it explains the *shape* of our scaling loss, which is what the levers target.
+
+### 15.4 — Why this is substantially fundamental
+
+The engine is lockstep **BSP / SPMD-replica** (§ParallelCircuit): W replicas
+advance in lockstep, every `exchange` is a hard `Barrier` over the W worker
+threads, and the controller barriers the whole tick. The barrier always pays for
+the slowest worker. As W grows, each worker's per-tick slice (≈ batch/W = 10k/W
+rows) shrinks, so (a) the *relative* variance in per-tick row counts grows, (b)
+the fixed per-barrier latency amortises over less work, and (c) on a hybrid CPU
+the slow-core workers stop hiding. All three make the idle fraction *grow* with
+W — precisely what the data shows.
+
+The obvious escape — let a fast worker steal a slow worker's rows — is **blocked
+by the co-location invariant**: a stateful operator (aggregate, TOP-K, join)
+keeps a key's running state on one fixed worker, so its rows cannot move to
+another worker mid-stream without moving the state. Dynamic rebalancing is
+incompatible with the replica model for exactly the stateful operators that
+matter. This is why Differential/Timely and Feldera/DBSP use **asynchronous
+frontier-based progress** (data flows through channels; workers synchronise on
+logical-time frontiers, not a hard per-operator thread barrier) rather than
+lockstep BSP. Matching that would be an execution-model rewrite, not a tweak —
+and even then the *slowest-worker-per-tick* lower bound on a synchronous
+incremental result is partly intrinsic.
+
+### 15.5 — Ranked levers
+
+1. **Right-size W to the fast-core count; do not oversubscribe.** *Cheap config.*
+   The data shows the efficiency knee at ~W=12–16 and W>16 flat-to-negative on
+   this box; defaulting W to physical fast cores (not logical) avoids the E-core
+   straggler tax. Honest limit: the Feldera box is homogeneous and likely already
+   runs W≈cores, so this barely moves *that* comparison — but it is the correct
+   default and the immediate measured win locally.
+2. **Coarser ticks (larger batch) where the latency budget allows.** *Config /
+   tradeoff.* A bigger per-worker slice lowers relative per-tick variance and
+   amortises barrier latency over more work (consistent with the prior finding
+   that large batches scale better). Pure latency↔throughput knob, not free, but
+   the cheapest real throughput lever for batch-shaped workloads.
+3. **Coalesce co-partitioned exchange barriers (multi-exchange queries).**
+   *Bounded engine change — the one gated prototype candidate.* q4's two
+   join-input exchanges are two separate `Barrier` rendezvous per step and own
+   its 40%-wait term; publishing both grids and rendezvousing **once** (one
+   barrier, then gather both indexed inputs) halves q4's straggler exposure
+   without touching the join math. Gate: the `stepprofile` q4 Wait% / Ctrl before
+   vs after. This is the highest-value *clean* lever the measurement points to.
+4. **Asynchronous / overlapped exchange** (replace the hard `Barrier` with
+   per-cell ready-flags so a worker's gather consumes each source bucket as it is
+   published, overlapping the slow source's publish with fast sources' gather).
+   *The Timely model — a real execution-model change.* The slowest-source bound
+   remains, so the upside is barrier-latency removal + compute/movement overlap,
+   not unbounded. High complexity/risk; **investigate, do not commit** without a
+   prototype showing it beats the coalesced-barrier (#3) lever.
+5. **Narrow the gather** (append to per-key lists instead of hashing full rows
+   into an `IndexedZSetBuilder` when the exchange input is distinct and no
+   column-dropping map sits upstream — the gather analogue of the split
+   bucket-list opt). *Mechanical, low-risk, small.* Measured upside is the
+   5–22%-and-shrinking gather term, so minor; column-*pruning* the shuffle stays
+   blocked by non-linear MIN/MAX (q4, [parallel-pipeline-perf]) and the data says
+   it would not help much anyway (movement is not the ceiling). Do opportunistically.
+6. **Heterogeneity-aware weighted shards / thread affinity.** *Demote.*
+   Machine-specific (helps only hybrid CPUs), needs affinity pinning the OS
+   scheduler fights, and does nothing for the homogeneous comparison box.
+
+### 15.6 — Recommendation
+
+Measure-first overturned the going-in hypothesis: the exchange/scaling ceiling is
+**coordination — the per-step/per-exchange barrier straggler tax at fine-grained
+ticks — not wide-row movement bandwidth.** Operators already scale ~7–9×; the
+realised ~3.5–5× is barrier-bound, and the one residual whole-row-hashing site
+(the gather) is a small, shrinking term. There is **no clean single big lever**:
+the realistic improvements are right-sizing W (1), coarser ticks (2), and — the
+one worth a gated prototype — coalescing co-partitioned exchange barriers for
+multi-exchange queries like q4 (3). The big structural option (async non-BSP
+exchange, 4) is a research-grade rewrite whose payoff is bounded by the
+slowest-worker-per-tick floor that is partly intrinsic to synchronous fine-grained
+incrementality. Net: ship the profiler (durable measurement infrastructure),
+adopt the W-sizing default, and treat much of the residual q4/q18/q22 Feldera gap
+as a property of the execution model rather than a bug awaiting one fix — with the
+explicit caveat that the local profile carries an E-core confound the homogeneous
+comparison box does not.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 `IncrementalAggregateOp.cs`, `ExchangeOp.cs`/`ExchangeIndexOp.cs`,
+`Circuit/ParallelCircuit.cs`/`ExchangeCoordinator.cs`/`StepProfiler.cs`,
 `Spine/SpineBatch.cs`, `Spine/SpineZSetTrace.cs`,
 `Spine/SpineIndexedZSetTrace.cs`, `CompileOptions.cs`,
-`Benchmarks/PureTraceBenchmark.cs`; parallel-pipeline-perf profiling notes.
+`Benchmarks/PureTraceBenchmark.cs`/`StepProfileBenchmark.cs`
+(`stepprofile`, docs/step-profile.md); parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,
 `spine_fueled.rs`, McSherry "Specialize differential dataflow" (2017) &

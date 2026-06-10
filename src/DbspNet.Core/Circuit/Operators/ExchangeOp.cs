@@ -50,6 +50,8 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
     public void Step()
     {
         var workers = _workers;
+        var profile = StepProfiler.Enabled;
+        var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // Split this shard's rows into one bucket per destination worker. The
         // input is a Z-set, so its keys are already distinct — a bucket never
@@ -59,11 +61,13 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         // gather (vs. the previous build-then-rebuild which hashed every row
         // twice — once per bucket, once at the gather).
         var buckets = new List<KeyValuePair<TKey, TWeight>>?[workers];
+        long splitRows = 0;
         foreach (var kv in _input.Current)
         {
             // Non-negative modulo: partition() may return a negative hash.
             var j = ((_partition(kv.Key) % workers) + workers) % workers;
             (buckets[j] ??= new List<KeyValuePair<TKey, TWeight>>()).Add(kv);
+            splitRows++;
         }
 
         // Publish our row of the grid, then rendezvous: after the barrier every
@@ -74,22 +78,44 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
             _coordinator.Publish(_worker, j, buckets[j]!);
         }
 
+        if (profile)
+        {
+            var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+            StepProfiler.RecordSplit(_worker, t1 - t0, splitRows);
+            t0 = t1;
+        }
+
         _coordinator.Wait(_abort);
+
+        if (profile)
+        {
+            var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+            StepProfiler.RecordWait(_worker, t2 - t0);
+            t0 = t2;
+        }
 
         // Gather our column: the buckets every worker addressed to us, summed.
         // The sum still goes through a builder because a column-dropping map
         // upstream can place the same row on two source workers, so distinct
         // sources may carry the same key.
         var gathered = new ZSetBuilder<TKey, TWeight>();
+        long gatherRows = 0;
         for (var src = 0; src < workers; src++)
         {
             var bucket = _coordinator.Read(src, _worker);
             if (bucket is not null)
             {
                 gathered.AddRange(bucket);
+                gatherRows += bucket.Count;
             }
         }
 
         _output.SetCurrent(gathered.Build());
+
+        if (profile)
+        {
+            var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+            StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
+        }
     }
 }

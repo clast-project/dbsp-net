@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Diagnostics;
 using DbspNet.Benchmarks.Nexmark;
+using DbspNet.Core.Circuit;
 using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Compiler;
@@ -177,6 +178,34 @@ internal static class SpineParallelHarness
             SpineJoinProbeMode.ForcePointProbe = false;
             SpineAggregateProbeMode.ForcePointProbe = false;
             FlatAggregateMode.ForceEagerRebuild = false;
+        }
+    }
+
+    /// <summary>
+    /// Run one warmup pass (profiler off) then one measured pass with the
+    /// <see cref="StepProfiler"/> enabled and sized for <paramref name="workers"/>,
+    /// leaving the profiler's per-worker phase totals populated for the caller to
+    /// read. Returns the controller-observed step wall-clock of the measured pass
+    /// (the throughput-bounding number) for cross-referencing against the
+    /// per-worker decomposition. Disables the profiler before returning.
+    /// </summary>
+    internal static double MeasureProfiled(
+        LogicalPlan plan, int workers, RunConfig config, List<Event> events,
+        HashSet<NexmarkTable> consumed, int batchSize)
+    {
+        StepProfiler.Enabled = false;
+        RunStream(plan, workers, config, events, consumed, batchSize, out _, out _);
+
+        StepProfiler.Configure(workers);
+        StepProfiler.Enabled = true;
+        try
+        {
+            RunStream(plan, workers, config, events, consumed, batchSize, out var phases, out _);
+            return phases.StepMs;
+        }
+        finally
+        {
+            StepProfiler.Enabled = false;
         }
     }
 

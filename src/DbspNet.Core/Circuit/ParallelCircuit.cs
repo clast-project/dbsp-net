@@ -204,6 +204,12 @@ public sealed class ParallelCircuit : IDisposable
             // single replica's state is no more inconsistent than a plain
             // RootCircuit's would be, so there is nothing extra to poison.
             _replicas[0].Step();
+            if (StepProfiler.Enabled)
+            {
+                StepProfiler.RecordStep(0, _replicas[0].LastStepRawTicks);
+                StepProfiler.CountStep();
+            }
+
             return;
         }
 
@@ -212,6 +218,10 @@ public sealed class ParallelCircuit : IDisposable
         // A mid-tick fault means the replicas have diverged (some operators ran,
         // some did not); the run is unrecoverable.
         ThrowOnFailures("One or more workers threw while stepping the parallel circuit.");
+        if (StepProfiler.Enabled)
+        {
+            StepProfiler.CountStep();
+        }
     }
 
     /// <summary>
@@ -266,7 +276,16 @@ public sealed class ParallelCircuit : IDisposable
         _job = null;
     }
 
-    private void StepJob(int worker) => _replicas[worker].Step();
+    private void StepJob(int worker)
+    {
+        _replicas[worker].Step();
+        if (StepProfiler.Enabled)
+        {
+            // Runs on the worker thread, writing this worker's own slot — disjoint
+            // from every peer, published to the controller by the "done" barrier.
+            StepProfiler.RecordStep(worker, _replicas[worker].LastStepRawTicks);
+        }
+    }
 
     /// <summary>Poison the run and rethrow if the last dispatch recorded any fault.</summary>
     private void ThrowOnFailures(string message)

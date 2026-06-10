@@ -66,6 +66,33 @@ if (args.Length > 0 && args[0] == "q18profile")
     return 0;
 }
 
+// Step decomposition: `dotnet run -- stepprofile [events] [q18,q4,q19,...]`
+// Split the parallel step into movement / coordination / op / imbalance to
+// locate the W-scaling ceiling (docs/design-row-representation.md §15).
+if (args.Length > 0 && args[0] == "stepprofile")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var events = Arg(1, 1_000_000);
+    var queryIds = args.Length > 2
+        ? args[2].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        : new[] { "q18", "q4", "q19", "q22" };
+    int[]? sweep = args.Length > 3
+        ? args[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToArray()
+        : null;
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.StepProfileBenchmark.Run(sb, queryIds, events, sweep);
+    var spPath = Path.Combine(FindDocsDir(), "step-profile.md");
+    File.WriteAllText(spPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(spPath)}");
+    return 0;
+}
+
 // q4 end-to-end flat lazy-view gate: `dotnet run -- q4flat [workers] [runs]`
 // Whole q4 parallel pipeline, flat·eager vs flat·lazy aggregate
 // (docs/design-row-representation.md §14.10).

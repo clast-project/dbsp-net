@@ -169,6 +169,14 @@ public sealed class RootCircuit
         new(Interlocked.Read(ref _lastStepTicks) * TimeSpan.TicksPerSecond / System.Diagnostics.Stopwatch.Frequency);
 
     /// <summary>
+    /// Raw <see cref="System.Diagnostics.Stopwatch"/> ticks of the most recent
+    /// <see cref="Step"/>, before the lossy conversion to <see cref="TimeSpan"/>.
+    /// Used by the per-worker <see cref="StepProfiler"/> so its phase totals and
+    /// the step total share one tick scale.
+    /// </summary>
+    internal long LastStepRawTicks => Interlocked.Read(ref _lastStepTicks);
+
+    /// <summary>
     /// Snapshot per-operator runtime metrics (state size, last-tick output size,
     /// GC frontier and cumulative GC drops) for every stateful operator, in
     /// registration order. Opt-in observability: call it whenever you want a
