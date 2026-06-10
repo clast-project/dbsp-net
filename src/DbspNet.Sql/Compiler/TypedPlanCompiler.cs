@@ -2514,6 +2514,21 @@ public static class TypedPlanCompiler
     private static Delegate BuildTypedToStructuralDelegate(
         Type rowType, Schema schema, IRowCodec<StructuralRow> codec)
     {
+        // Lazy-boxing output boundary (docs/design-row-representation.md §16,
+        // lever 2): on the default structural codec — the only codec the typed
+        // path runs under, since a non-default codec gates the typed path off —
+        // emit a TypedStructuralRow<TRow> that holds the struct inline and boxes
+        // columns on demand, instead of eagerly allocating an object?[] and boxing
+        // every field per output row (the dominant per-output-row allocation on
+        // output-heavy queries). The wrapped row is indistinguishable from the
+        // backing-array form (same Count / indexer / hash / equals), so this is
+        // correctness-equivalent.
+        if (ReferenceEquals(codec, StructuralRowCodec.Instance))
+        {
+            return BuildLazyTypedToStructuralDelegate(rowType, schema);
+        }
+
+        // Fallback for any non-default codec: eager object?[] + codec.BuildRow.
         var rowParam = Expression.Parameter(rowType, "r");
 
         var arrInit = new Expression[schema.Count];
@@ -2537,6 +2552,100 @@ public static class TypedPlanCompiler
 
         var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(StructuralRow));
         return Expression.Lambda(delegateType, body, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds <c>(TRow r) =&gt; new TypedStructuralRow&lt;TRow&gt;(r, shape)</c> — the
+    /// lever-2 lazy-boxing boundary. The shared <see cref="StructuralRowShape{TRow}"/>
+    /// carries the typed hash (reproducing <see cref="StructuralRow.ComputeHash"/>
+    /// field-by-field without boxing) and the per-column boxing accessor, both built
+    /// once here. Per output row this allocates one wrapper object (the struct sits
+    /// inline) and no <c>object?[]</c> or per-field boxes; columns box lazily only
+    /// when the indexer is read.
+    /// </summary>
+    private static Delegate BuildLazyTypedToStructuralDelegate(Type rowType, Schema schema)
+    {
+        var fields = new FieldInfo[schema.Count];
+        for (var i = 0; i < schema.Count; i++)
+        {
+            fields[i] = rowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted row missing field F" + i);
+        }
+
+        var hash = BuildTypedHashDelegate(rowType, fields);
+        var box = BuildColumnBoxDelegate(rowType, fields);
+
+        var shapeType = typeof(StructuralRowShape<>).MakeGenericType(rowType);
+        var shape = Activator.CreateInstance(shapeType, schema.Count, hash, box)!;
+
+        var wrapperType = typeof(TypedStructuralRow<>).MakeGenericType(rowType);
+        var ctor = wrapperType.GetConstructor(new[] { rowType, shapeType })!;
+
+        var rowParam = Expression.Parameter(rowType, "r");
+        var body = Expression.New(ctor, rowParam, Expression.Constant(shape, shapeType));
+        var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(StructuralRow));
+        return Expression.Lambda(delegateType, body, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds <c>(TRow r) =&gt; { var hc = default(HashCode); hc.Add(arity);
+    /// hc.Add(r.F0); …; return hc.ToHashCode(); }</c>. This reproduces
+    /// <see cref="StructuralRow.ComputeHash"/> exactly: that method does
+    /// <c>hc.Add(count)</c> then <c>hc.Add((object)values[i])</c>, and
+    /// <c>HashCode.Add(typedField)</c> feeds the identical per-element hash as
+    /// <c>HashCode.Add((object)boxedField)</c> (both route to the field's
+    /// <c>GetHashCode</c>; null → 0), so a wrapped row hashes equal to the
+    /// backing-array form — required for output Z-set dedup and cross-type lookups.
+    /// </summary>
+    private static Delegate BuildTypedHashDelegate(Type rowType, FieldInfo[] fields)
+    {
+        var addOpen = typeof(HashCode).GetMethods()
+            .Single(m => m.Name == nameof(HashCode.Add)
+                && m.IsGenericMethodDefinition
+                && m.GetParameters().Length == 1);
+        var toHash = typeof(HashCode).GetMethod(nameof(HashCode.ToHashCode))!;
+
+        var rowParam = Expression.Parameter(rowType, "r");
+        var hc = Expression.Variable(typeof(HashCode), "hc");
+        var body = new List<Expression>
+        {
+            Expression.Assign(hc, Expression.Default(typeof(HashCode))),
+            Expression.Call(hc, addOpen.MakeGenericMethod(typeof(int)), Expression.Constant(fields.Length)),
+        };
+        foreach (var f in fields)
+        {
+            body.Add(Expression.Call(hc, addOpen.MakeGenericMethod(f.FieldType), Expression.Field(rowParam, f)));
+        }
+
+        body.Add(Expression.Call(hc, toHash));
+        var block = Expression.Block(typeof(int), new[] { hc }, body);
+        var delegateType = typeof(Func<,>).MakeGenericType(rowType, typeof(int));
+        return Expression.Lambda(delegateType, block, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds <c>(TRow r, int i) =&gt; i switch { 0 =&gt; (object?)r.F0, … }</c> — the
+    /// per-column boxing accessor the lazy wrapper's indexer calls on demand.
+    /// </summary>
+    private static Delegate BuildColumnBoxDelegate(Type rowType, FieldInfo[] fields)
+    {
+        var rowParam = Expression.Parameter(rowType, "r");
+        var idxParam = Expression.Parameter(typeof(int), "i");
+
+        var cases = new SwitchCase[fields.Length];
+        for (var i = 0; i < fields.Length; i++)
+        {
+            cases[i] = Expression.SwitchCase(
+                Expression.Convert(Expression.Field(rowParam, fields[i]), typeof(object)),
+                Expression.Constant(i));
+        }
+
+        var defaultBody = Expression.Throw(
+            Expression.New(typeof(IndexOutOfRangeException).GetConstructor(Type.EmptyTypes)!),
+            typeof(object));
+        var sw = Expression.Switch(typeof(object), idxParam, defaultBody, null, cases);
+        var delegateType = typeof(Func<,,>).MakeGenericType(rowType, typeof(int), typeof(object));
+        return Expression.Lambda(delegateType, sw, rowParam, idxParam).Compile();
     }
 
     /// <summary>

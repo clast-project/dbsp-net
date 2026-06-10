@@ -8,14 +8,14 @@ Stream: 1,000,000 events (20,000 person, 60,000 auction, 920,000 bid), batch 10,
 
 | Query | Shape | ns/event | B/event | GC 0/1/2 | out rows |
 |:------|:------|---------:|--------:|:---------|---------:|
-| q0 | passthrough (ingest+egest boundary) | 664.4 | 962 | 3/2/1 | 9,200 |
-| q1 | + 1 projection delegate (price map) | 836.2 | 1078 | 5/3/2 | 9,200 |
-| q2 | + filter (auction % 123 = 0) | 416.3 | 582 | 3/3/1 | 74 |
-| q22 | + 3 string SPLIT_INDEX projections | 1156.7 | 1139 | 5/4/2 | 9,200 |
-| q3 | join (auction ⋈ person, filtered) | 97.5 | 89 | 0/0/0 | 22 |
-| q20 | join (bid ⋈ auction, wide output) | 1106.6 | 1391 | 5/3/1 | 1,890 |
-| q4 | join + nested MAX + outer AVG | 2197.4 | 2376 | 3/2/0 | 10 |
-| q9 | join + partitioned TOP-1 | 1397.8 | 2382 | 5/2/1 | 1,430 |
-| q18 | partitioned TOP-1 dedup | 2248.8 | 2417 | 4/2/1 | 9,200 |
-| q19 | partitioned TOP-10 | 2945.2 | 4059 | 8/3/1 | 8,706 |
+| q0 | passthrough (ingest+egest boundary) | 505.3 | 719 | 3/2/1 | 9,200 |
+| q1 | + 1 projection delegate (price map) | 581.0 | 835 | 4/4/2 | 9,200 |
+| q2 | + filter (auction % 123 = 0) | 500.1 | 581 | 2/2/1 | 74 |
+| q22 | + 3 string SPLIT_INDEX projections | 874.6 | 948 | 4/4/2 | 9,200 |
+| q3 | join (auction ⋈ person, filtered) | 82.8 | 89 | 0/0/0 | 22 |
+| q20 | join (bid ⋈ auction, wide output) | 1087.2 | 1291 | 4/2/1 | 1,890 |
+| q4 | join + nested MAX + outer AVG | 2134.4 | 2376 | 4/2/0 | 10 |
+| q9 | join + partitioned TOP-1 | 1329.5 | 2345 | 6/3/1 | 1,430 |
+| q18 | partitioned TOP-1 dedup | 1874.5 | 2176 | 5/2/2 | 9,200 |
+| q19 | partitioned TOP-10 | 2734.2 | 3831 | 10/5/2 | 8,706 |
 

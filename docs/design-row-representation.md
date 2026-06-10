@@ -1970,6 +1970,65 @@ per-edge "no-`z⁻¹`" guard to reclaim the *steady* backing the fresh-alloc pat
 still pays; (c) lever 2 (deferred `StructuralRow` output) for the boundary objects
 that dominate q18/q19; (d) columnar (lever 3) deferred end-state.
 
+### 16.9 — Lazy-boxing output boundary LANDED (lever 2, gated)
+
+After (a) shipped, the post-(a) re-attribution (from the `w1profile` differential)
+showed the largest *universal* remaining term is the **typed→`StructuralRow`
+output boundary**: `AdaptTypedToStructural` mapped each output row to
+`new object?[] { (object)r.F0, … }` → `StructuralRow` **every tick** — an array +
+N field-boxes + a wrapper per output row. This wires the lazy-boxing fix.
+
+**What landed.** `TypedStructuralRow<TRow>` + `StructuralRowShape<TRow>`
+(`Core/Collections/TypedStructuralRow.cs`): a `StructuralRow` subclass that holds
+the emitted typed row struct **inline** and boxes columns **lazily** (only when the
+indexer is read). The typed output boundary
+(`TypedPlanCompiler.BuildTypedToStructuralDelegate`) now, on the default codec,
+constructs one of these per output row instead of the eager `object?[]`. The shared
+`StructuralRowShape` carries a **typed hash** delegate that reproduces
+`StructuralRow.ComputeHash` field-by-field with **no boxing** (valid because
+`HashCode.Add(typedField)` and `HashCode.Add((object)boxed)` feed the identical
+per-element hash, null → 0), plus a per-column boxing accessor. Per output row this
+allocates one wrapper (struct inline) instead of array + N boxes + wrapper, and
+defers all boxing to actual column reads.
+
+**Correctness-equivalent by construction** — the wrapped row is indistinguishable
+from a backing-array `StructuralRow` (same `Count`, indexer values, hash, and
+inherited `Equals`), so output Z-set dedup and cross-type lookups are unchanged.
+The eager `object?[]` path is kept as the fallback for any non-default codec (which
+gates the typed path off anyway). **Full suite 1,747 passed** — the gate, since the
+SQL output-correctness tests compare materialised `ZSet<StructuralRow>` (a hash
+mismatch would fail them).
+
+**Gate (`w1profile`, 1M events, batch 10k, before = commit `ed21c68` = post-(a)):**
+
+| Query | B/event (a)→(2) | ns/event (a)→(2) |
+|:--|--:|--:|
+| q0 | 962 → **719** (−25%) | 803 → **~490** (−39%) |
+| q1 | 1,078 → 835 (−23%) | 810 → 563 (−30%) |
+| q22 | 1,139 → 948 (−17%) | 1,144 → 789 (−31%) |
+| q18 | 2,417 → **2,173** (−10%) | 2,249 → **~1,810** (−20%) |
+| q19 | 4,059 → 3,831 (−6%) | 2,945 → ~2,700 (−8%) |
+| q4 | 2,376 → 2,376 (**0%**) | 2,197 → 2,133 (~noise) |
+
+Exactly the predicted shape: large wins on output-heavy queries (q0/q1/q22 and the
+gap query **q18 −10% alloc / −20% time**), modest on q19 (its cost is more TOP-10
+retained state than output boundary), and **nothing for q4** — confirming q4 is
+boundary-light (10 output rows) and floor-bound, needing lever (b)/columnar, not the
+boundary. **Honest caveat:** `w1profile`'s consumer (`CountOutput`) does not read
+output columns, so the *time* win is partly deferred boxing work that a
+column-reading consumer would still pay lazily on read; the **allocation** reduction
+(the eliminated array + eager-box construction) is real for every consumer, and a
+consumer that reads only some columns saves the boxing of the rest outright.
+
+**Status.** Lever 2 shipped: a correctness-equivalent output-boundary allocation
+cut (6–25%) and time cut (8–39%), concentrated on output-heavy queries including
+the gap query q18. Combined with (a), the per-tuple allocation on q18 is down ~38%
+from the start of this arc (3,530 → 2,173 B/event). q4 remains the holdout — its
+remainder is join/aggregate internals (the IndexedZSet trace structures), addressed
+only by lever (b)'s cross-tick pooling or lever 3 (columnar). Remaining sequencing:
+(b) is thin-prize/high-risk (§16.7 re-attribution); the larger structural step for
+q4 is the columnar end-state (lever 3), which deserves its own arc.
+
 ---
 
 ## Appendix — sources
