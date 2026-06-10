@@ -1287,13 +1287,23 @@ public static class TypedPlanCompiler
     /// </summary>
     private static TypedNode? CompileAggregate(AggregatePlan plan, CompileContext ctx)
     {
-        // Group-by keys must be ResolvedColumn (matches resolver
-        // restriction in v1) so we can index by typed field reads.
+        // Bare-column group keys take the fast path: typed field reads, and the
+        // exchange-elision check below needs their column indices. Any other
+        // scalar key expression (CAST(ts AS DATE), a + b, …) takes the general
+        // path — each key is lowered over the input row into a synthetic key row,
+        // mirroring the structural compiler. `allColumns` gates the two.
+        var allColumns = true;
         var groupIndices = new int[plan.GroupKeys.Count];
         for (var i = 0; i < plan.GroupKeys.Count; i++)
         {
-            if (plan.GroupKeys[i] is not ResolvedColumn rc) return null;
-            groupIndices[i] = rc.Index;
+            if (plan.GroupKeys[i] is ResolvedColumn rc)
+            {
+                groupIndices[i] = rc.Index;
+            }
+            else
+            {
+                allColumns = false;
+            }
         }
 
         var inner = TryCompileNode(plan.Input, ctx);
@@ -1308,13 +1318,31 @@ public static class TypedPlanCompiler
         // for NULL, distinct from any non-null value). No special
         // handling needed at this layer.
 
-        // TKey from the group-key columns. Same schema-fingerprint
-        // sharing as anywhere else.
-        var keySchema = inner.Schema.SubsetByIndex(groupIndices);
+        // TKey from the group keys. For bare columns it is the matching
+        // input-column subset; for expression keys a synthetic schema of the key
+        // expressions' resolved types ($gk{i}). Same schema-fingerprint sharing.
+        Schema keySchema;
+        if (allColumns)
+        {
+            keySchema = inner.Schema.SubsetByIndex(groupIndices);
+        }
+        else
+        {
+            var keyColumns = new SchemaColumn[plan.GroupKeys.Count];
+            for (var i = 0; i < plan.GroupKeys.Count; i++)
+            {
+                keyColumns[i] = new SchemaColumn("$gk" + i, plan.GroupKeys[i].Type);
+            }
+
+            keySchema = new Schema(keyColumns);
+        }
+
         var keyRowType = TypedRowEmitter.EmitRowType(keySchema);
         if (keyRowType is null) return null;
 
-        var keyExtractor = BuildKeyExtractorDelegate(inner.RowType, keyRowType, keySchema, groupIndices);
+        var keyExtractor = allColumns
+            ? BuildKeyExtractorDelegate(inner.RowType, keyRowType, keySchema, groupIndices)
+            : BuildExprKeyExtractorDelegate(inner.RowType, keyRowType, keySchema, plan.GroupKeys);
         if (keyExtractor is null) return null;
 
         // Per-aggregate-call schema for TAgg, parallel to plan.Aggregates.
@@ -1371,14 +1399,36 @@ public static class TypedPlanCompiler
         // so the gather builds the indexed Z-set directly. When the input is
         // already co-partitioned (elided) there is no gather, so a plain
         // GroupProject over the inherited stream is all that's needed.
+        // Elision is sound only for bare-column keys, where IsKeySubset can prove
+        // the input is already partitioned by a subset of the group key. An
+        // expression key always re-shards.
         var needsExchange = ctx.Workers > 1
-            && !(inner.PartitionKey is { } p && IsKeySubset(p, groupIndices));
-        var indexed = needsExchange
-            ? InvokeExchangeIndex(
-                ctx.Builder, inner.RowType, keyRowType, inner.Stream,
-                BuildKeyHashPartition(inner.RowType, keyRowType, keyExtractor), keyExtractor)
-            : InvokeGroupProject(
+            && !(allColumns && inner.PartitionKey is { } p && IsKeySubset(p, groupIndices));
+
+        object indexed;
+        if (needsExchange)
+        {
+            Delegate partition;
+            try
+            {
+                partition = BuildKeyHashPartition(inner.RowType, keyRowType, keyExtractor);
+            }
+            catch (NotSupportedException)
+            {
+                // A key type outside the stable-hash surface (e.g. INTERVAL) can't
+                // be sharded deterministically — refuse the parallel compile; the
+                // structural path handles it.
+                return null;
+            }
+
+            indexed = InvokeExchangeIndex(
+                ctx.Builder, inner.RowType, keyRowType, inner.Stream, partition, keyExtractor);
+        }
+        else
+        {
+            indexed = InvokeGroupProject(
                 ctx.Builder, inner.RowType, keyRowType, inner.Stream, keyExtractor);
+        }
 
         // IncrementalAggregate<TKey, TIn, TAgg>(indexed, composite)
         // Output: Stream<ZSet<(TKey, TAgg), Z64>>
@@ -2057,6 +2107,49 @@ public static class TypedPlanCompiler
             var field = inputRowType.GetField("F" + indices[i]);
             if (field is null) return null;
             args[i] = Expression.Field(inParam, field);
+        }
+
+        var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, keyRowType);
+        return Expression.Lambda(delegateType, Expression.New(ctor, args), inParam).Compile();
+    }
+
+    /// <summary>
+    /// Like <see cref="BuildKeyExtractorDelegate"/> but for arbitrary scalar
+    /// group-key expressions (e.g. <c>CAST(ts AS DATE)</c>): each key is lowered
+    /// over the input row via the typed expression compiler and packed into the
+    /// synthetic key row. Returns <c>null</c> if any key falls outside the typed
+    /// expression surface (the caller then refuses the typed/parallel compile and
+    /// the structural path runs it).
+    /// </summary>
+    private static Delegate? BuildExprKeyExtractorDelegate(
+        Type inputRowType, Type keyRowType, Schema keySchema, IReadOnlyList<ResolvedExpression> keys)
+    {
+        var ctorParamTypes = new Type[keySchema.Count];
+        for (var i = 0; i < keySchema.Count; i++)
+        {
+            var field = keyRowType.GetField("F" + i);
+            if (field is null) return null;
+            ctorParamTypes[i] = field.FieldType;
+        }
+
+        var ctor = keyRowType.GetConstructor(ctorParamTypes);
+        if (ctor is null) return null;
+
+        var inParam = Expression.Parameter(inputRowType, "in");
+        var args = new Expression[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+        {
+            var body = TypedExpressionCompiler.TryBuildInto(keys[i], inParam);
+            if (body is null) return null;
+
+            // Align the lowered value to the emitted key field type (e.g. lift a
+            // non-null value into Nullable<T> when the field is nullable).
+            if (body.Type != ctorParamTypes[i])
+            {
+                body = Expression.Convert(body, ctorParamTypes[i]);
+            }
+
+            args[i] = body;
         }
 
         var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, keyRowType);

@@ -4764,8 +4764,47 @@ public sealed class Resolver
         return false;
     }
 
-    private readonly record struct AggregateKey(
-        AggregateKind Kind, ResolvedExpression? Argument, double? Fraction = null, bool Discrete = false);
+    /// <summary>
+    /// Dedup key for <see cref="AggregateCall"/>s. The argument is compared
+    /// <b>structurally</b> (<see cref="ResolvedExprEqual"/>), not by record
+    /// equality: a collection-bearing arg (e.g. <c>SUM(CASE …)</c>,
+    /// <c>COUNT(DISTINCT CASE …)</c>) re-resolved at a second collection site
+    /// would otherwise compare unequal (its <c>Whens</c>/<c>Arguments</c> list
+    /// is reference-compared) and the aggregate would be collected twice — a
+    /// duplicate the typed compiler can't lay out, forcing a structural/
+    /// single-only fallback. The hash is coarse (kind + arg type + fraction +
+    /// discrete) so structurally-equal args share a bucket; <see cref="Equals"/>
+    /// settles collisions.
+    /// </summary>
+    private readonly struct AggregateKey : IEquatable<AggregateKey>
+    {
+        public AggregateKey(
+            AggregateKind kind, ResolvedExpression? argument, double? fraction = null, bool discrete = false)
+        {
+            Kind = kind;
+            Argument = argument;
+            Fraction = fraction;
+            Discrete = discrete;
+        }
+
+        public AggregateKind Kind { get; }
+
+        public ResolvedExpression? Argument { get; }
+
+        public double? Fraction { get; }
+
+        public bool Discrete { get; }
+
+        public bool Equals(AggregateKey other) =>
+            Kind == other.Kind
+            && Nullable.Equals(Fraction, other.Fraction)
+            && Discrete == other.Discrete
+            && ResolvedExprEqual(Argument, other.Argument);
+
+        public override bool Equals(object? obj) => obj is AggregateKey k && Equals(k);
+
+        public override int GetHashCode() => HashCode.Combine(Kind, Argument?.Type, Fraction, Discrete);
+    }
 
     /// <summary>
     /// Resolve an aggregate call's value argument and — for the quantile family
@@ -5181,6 +5220,85 @@ public sealed class Resolver
             SqlDoubleType => new SqlDoubleType(true),
             _ => throw new ResolveException($"SUM not supported on {t.Display}"),
         };
+    }
+
+    // Structural equality on *resolved* scalar expressions — used to dedup
+    // AggregateCalls (see AggregateKey). Like AstEqual below, record auto-equality
+    // is unusable for the collection-bearing resolved nodes
+    // (ResolvedCaseWhen.Whens, ResolvedFunctionCall.Arguments,
+    // ResolvedInList.Values), which compare their lists by reference. Hence an
+    // explicit recursive walk; leaf nodes (Column/Literal/CorrelationRef) and any
+    // unlisted node fall back to record equality, which is correct for them and a
+    // safe — merely non-deduping — default for anything else.
+    private static bool ResolvedExprEqual(ResolvedExpression? a, ResolvedExpression? b)
+    {
+        if (ReferenceEquals(a, b))
+        {
+            return true;
+        }
+
+        if (a is null || b is null || !a.Type.Equals(b.Type))
+        {
+            return false;
+        }
+
+        switch (a, b)
+        {
+            case (ResolvedBinary x, ResolvedBinary y):
+                return x.Operator == y.Operator
+                    && ResolvedExprEqual(x.Left, y.Left)
+                    && ResolvedExprEqual(x.Right, y.Right);
+            case (ResolvedUnary x, ResolvedUnary y):
+                return x.Operator == y.Operator && ResolvedExprEqual(x.Operand, y.Operand);
+            case (ResolvedIsNull x, ResolvedIsNull y):
+                return x.Negated == y.Negated && ResolvedExprEqual(x.Operand, y.Operand);
+            case (ResolvedCast x, ResolvedCast y):
+                return ResolvedExprEqual(x.Operand, y.Operand);
+            case (ResolvedFunctionCall x, ResolvedFunctionCall y):
+                return string.Equals(x.FunctionName, y.FunctionName, StringComparison.Ordinal)
+                    && ResolvedListEqual(x.Arguments, y.Arguments);
+            case (ResolvedInList x, ResolvedInList y):
+                return x.IsNegated == y.IsNegated
+                    && ResolvedExprEqual(x.Probe, y.Probe)
+                    && ResolvedListEqual(x.Values, y.Values);
+            case (ResolvedCaseWhen x, ResolvedCaseWhen y):
+                if (x.Whens.Count != y.Whens.Count)
+                {
+                    return false;
+                }
+
+                for (var i = 0; i < x.Whens.Count; i++)
+                {
+                    if (!ResolvedExprEqual(x.Whens[i].Condition, y.Whens[i].Condition)
+                        || !ResolvedExprEqual(x.Whens[i].Result, y.Whens[i].Result))
+                    {
+                        return false;
+                    }
+                }
+
+                return ResolvedExprEqual(x.ElseResult, y.ElseResult);
+            default:
+                return a.Equals(b);
+        }
+    }
+
+    private static bool ResolvedListEqual(
+        IReadOnlyList<ResolvedExpression> a, IReadOnlyList<ResolvedExpression> b)
+    {
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!ResolvedExprEqual(a[i], b[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // Syntactic equality on AST expressions — used to match SELECT/HAVING/ORDER BY

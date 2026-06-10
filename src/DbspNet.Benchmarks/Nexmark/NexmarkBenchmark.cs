@@ -107,8 +107,10 @@ internal static class NexmarkBenchmark
             "filtered bid ⋈ auction join; q22 splits the bid URL with `SPLIT_INDEX`; " +
             "q15 / q16 / q17 (per-day / per-channel / per-auction statistics with " +
             "`COUNT(DISTINCT …)` and conditional `SUM(CASE …)` counts over a " +
-            "`CAST(date_time AS DATE)` group key) compile but have no parallel form " +
-            "today, so they run single-only.");
+            "`CAST(date_time AS DATE)` group key) now parallelize too — the typed " +
+            "aggregate path handles expression group keys and the exchange shards on " +
+            "the computed key. q15 groups by day alone, so its speedup is bounded by " +
+            "the (small) number of distinct days, not the worker count.");
         output.AppendLine();
     }
 

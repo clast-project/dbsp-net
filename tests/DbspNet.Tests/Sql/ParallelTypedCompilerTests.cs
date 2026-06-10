@@ -163,6 +163,74 @@ public class ParallelTypedCompilerTests
     }
 
     [Theory]
+    [InlineData(2)]
+    public void GroupByComputedKey_CountStar_MatchesSingle(int workers)
+    {
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL, p BIGINT NOT NULL)"],
+            "SELECT CAST(ts AS DATE) AS day, COUNT(*) AS n FROM t GROUP BY CAST(ts AS DATE)",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(1_000_000L), 5L);
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(2_000_000L), 7L);
+            });
+    }
+
+    [Theory]
+    [InlineData(2)]
+    public void GroupByComputedKey_SumCase_MatchesSingle(int workers)
+    {
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL, p BIGINT NOT NULL)"],
+            "SELECT CAST(ts AS DATE) AS day, " +
+            "SUM(CASE WHEN p < 10 THEN 1 ELSE 0 END) AS lo FROM t GROUP BY CAST(ts AS DATE)",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(1_000_000L), 5L);
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(2_000_000L), 50L);
+            });
+    }
+
+    [Theory]
+    [InlineData(2)]
+    public void GroupByColumn_SumCase_MatchesSingle(int workers)
+    {
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (k INT NOT NULL, p BIGINT NOT NULL)"],
+            "SELECT k, SUM(CASE WHEN p < 10 THEN 1 ELSE 0 END) AS lo FROM t GROUP BY k",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 5L);
+                tbl("t").Insert(1, 50L);
+            });
+    }
+
+    [Theory]
+    [InlineData(2)]
+    public void GroupByComputedKey_CountDistinct_MatchesSingle(int workers)
+    {
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL, b BIGINT NOT NULL)"],
+            "SELECT CAST(ts AS DATE) AS day, COUNT(DISTINCT b) AS nb FROM t GROUP BY CAST(ts AS DATE)",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(1_000_000L), 5L);
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(1_500_000L), 5L);
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(2_000_000L), 7L);
+            },
+            tbl =>
+            {
+                // Drop one of the two b=5 rows (5 still present) and add a new value.
+                tbl("t").Delete(new DbspNet.Sql.TypeSystem.Timestamp(1_500_000L), 5L);
+                tbl("t").Insert(new DbspNet.Sql.TypeSystem.Timestamp(2_500_000L), 9L);
+            });
+    }
+
+    [Theory]
     [InlineData(1)]
     [InlineData(2)]
     [InlineData(4)]
