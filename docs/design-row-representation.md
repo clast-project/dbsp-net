@@ -1331,13 +1331,37 @@ MIN/MAX that **q4 actually runs**), the rebuild was the *only* O(K) per-tick
 term, so the lazy view additionally collapses the asymptotics **O(K²)→O(K)** —
 the typed q4 path gets that on top of the constant win shown here.
 
-**Honest scope.** This is an *operator-level* gate on the aggregate step in
-isolation. End-to-end q4 is join + exchange + outer AVG + the inner MAX, so the
-query-level gain is Amdahl-bounded by the aggregate's share of the pipeline (the
-spine §12 work found q4's aggregate read-path was its residual ~8%). Quantifying
-the query-level effect — a flat **parallel** q4 A/B (eager-vs-lazy seam) through
-the `SpineParallelHarness` — is the natural follow-up; this increment establishes
-that the operator-level lever is real, large, correct, and default-safe.
+**Operator-level vs query-level.** The table above is an *operator-level* gate on
+the aggregate step in isolation. End-to-end q4 is join + exchange + outer AVG +
+the inner MAX, so the query-level gain is Amdahl-diluted by the work the lazy
+view does not touch.
+
+**End-to-end q4 gate (`dotnet run -- q4flat`,
+[q4-flat-bench.md](q4-flat-bench.md)).** The whole q4 `W`-replica parallel
+pipeline (`TraceFamily.Flat`, W=24, 1M events) run flat·eager vs flat·lazy
+through the `SpineParallelHarness` (a `ForceEagerRebuild` knob added to
+`RunConfig`), step phase timed apart from split/gather, lazy output
+cross-checked identical to eager:
+
+| Batch | flat·eager step | flat·lazy step | Step↑ |
+|---:|---:|---:|---:|
+| 10k  | ~620 ms | ~488 ms | **~1.3–1.6×** |
+| 100k | ~610 ms | ~413 ms | **~1.5×** |
+
+So the operator-level 4.6–19× dilutes to a **~1.3–1.5× query-level step win** on
+q4 — real and worthwhile, since q4 is the worst non-inherent gap vs Feldera
+(0.53×) and is step-bound on exactly this aggregate. **Noise caveat:** this is
+the noisy parallel bench (the 100k batch is only ~10 Step calls per pass); across
+runs the 10k win held 1.28–1.55× while a single 100k pass once read 0.83× before
+settling to ~1.5× at runs=5 — trust the small-batch (realistic Nexmark operating
+point) number and the multi-run medians. The lazy view is the default and only
+ever removes the rebuild, so there is no regression regime; the bench variance is
+measurement, not the operator.
+
+**Status: the row-rep flat-path lever is shipped.** The surrogate question is
+closed (dominated, §14.9); the flat lazy merge-view is the realized win on the
+flat default path — operator-level 4.6–19×, query-level ~1.3–1.5× on q4 — with
+full-suite correctness and no regression regime.
 
 ---
 

@@ -49,6 +49,29 @@ if (args.Length > 0 && args[0] == "mergeprobe")
     return 0;
 }
 
+// q4 end-to-end flat lazy-view gate: `dotnet run -- q4flat [events] [workers] [runs]`
+// Whole q4 parallel pipeline, flat·eager vs flat·lazy aggregate
+// (docs/design-row-representation.md §14.10).
+if (args.Length > 0 && args[0] == "q4flat")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var totalEvents = Arg(1, 1_000_000);
+    int? workers = args.Length > 2 && int.TryParse(args[2], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var w) ? w : null;
+    var runs = Arg(3, 3);
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Q4FlatBenchmark.Run(sb, totalEvents, workers, runs);
+    var q4fPath = Path.Combine(FindDocsDir(), "q4-flat-bench.md");
+    File.WriteAllText(q4fPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(q4fPath)}");
+    return 0;
+}
+
 // Flat aggregate lazy merge-view A/B gate: `dotnet run -- flatagg`
 // Eager rebuild vs lazy LazyMergeMultiset on the q4 growing-group shape
 // (docs/design-row-representation.md §14.9).

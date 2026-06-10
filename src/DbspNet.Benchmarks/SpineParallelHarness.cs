@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Diagnostics;
 using DbspNet.Benchmarks.Nexmark;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Optimizer;
@@ -31,9 +32,18 @@ internal static class SpineParallelHarness
     /// realises at trace construction (docs §11). 0 disables the memtable.
     /// </param>
     /// <param name="ForcePointProbe">Force the per-key point probe (vs the batched merge).</param>
-    internal readonly record struct RunConfig(CompileOptions Options, bool ForcePointProbe);
+    /// <param name="ForceEagerRebuild">
+    /// Force the flat aggregate's eager <c>beforeGroup + groupDelta</c> rebuild
+    /// instead of the default lazy <c>LazyMergeMultiset</c> view (docs §14.10).
+    /// Only affects the flat aggregate operator; ignored on the spine path.
+    /// </param>
+    internal readonly record struct RunConfig(CompileOptions Options, bool ForcePointProbe, bool ForceEagerRebuild = false);
 
+    /// <summary>Flat default — dictionary traces, the lazy merge-view aggregate (§14.10).</summary>
     internal static RunConfig Flat => new(CompileOptions.Default, false);
+
+    /// <summary>Flat with the aggregate forced back to the eager per-tick rebuild (the §14.10 A/B baseline).</summary>
+    internal static RunConfig FlatEager => new(CompileOptions.Default, false, ForceEagerRebuild: true);
 
     internal static RunConfig Spine(bool forcePointProbe, int stagingCapacity) =>
         new(new CompileOptions { TraceFamily = TraceFamily.Spine, SpineStagingCapacity = stagingCapacity }, forcePointProbe);
@@ -109,6 +119,7 @@ internal static class SpineParallelHarness
         // harness no longer sets the staging seam directly.
         SpineJoinProbeMode.ForcePointProbe = config.ForcePointProbe;
         SpineAggregateProbeMode.ForcePointProbe = config.ForcePointProbe;
+        FlatAggregateMode.ForceEagerRebuild = config.ForceEagerRebuild;
         try
         {
             if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, config.Options))
@@ -165,6 +176,7 @@ internal static class SpineParallelHarness
         {
             SpineJoinProbeMode.ForcePointProbe = false;
             SpineAggregateProbeMode.ForcePointProbe = false;
+            FlatAggregateMode.ForceEagerRebuild = false;
         }
     }
 
