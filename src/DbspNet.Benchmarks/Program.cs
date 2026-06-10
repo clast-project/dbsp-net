@@ -49,6 +49,24 @@ if (args.Length > 0 && args[0] == "mergeprobe")
     return 0;
 }
 
+// Flat aggregate lazy merge-view A/B gate: `dotnet run -- flatagg`
+// Eager rebuild vs lazy LazyMergeMultiset on the q4 growing-group shape
+// (docs/design-row-representation.md §14.9).
+if (args.Length > 0 && args[0] == "flatagg")
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — flat aggregate lazy merge-view");
+    sb.AppendLine();
+    sb.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+    sb.AppendLine();
+    DbspNet.Benchmarks.FlatAggBenchmark.Run(sb);
+    var faPath = Path.Combine(FindDocsDir(), "flat-agg-bench.md");
+    File.WriteAllText(faPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(faPath)}");
+    return 0;
+}
+
 // Surrogate-key microbench: `dotnet run -- surrogatebench`
 // Whole-row dictionary keys vs interned int surrogates — locates the §14.3(a)
 // re-touch crossover (docs/design-row-representation.md §14.6).

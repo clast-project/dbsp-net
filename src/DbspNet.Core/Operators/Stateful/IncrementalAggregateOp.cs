@@ -123,54 +123,92 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         {
             var groupDelta = delta.GroupFor(key);
             var beforeGroup = before.GroupFor(key);
-            var afterGroup = beforeGroup + groupDelta;
 
-            var oldAgg = _aggCache.TryGetValue(key, out var cached)
-                ? cached
-                : Optional<TOut>.None;
-            _stateCache.TryGetValue(key, out var state);
-
-            var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
-
-            // Cache-pruning is keyed on "is there literally no trace
-            // entry?" (dict-shape IsEmpty), not on the aggregator's
-            // linear "group is present" gate. The aggregator's
-            // per-key state (e.g. SqlSumAggregator.DistinctNonNullRows)
-            // tracks weight transitions across ticks and must persist
-            // for cancelling-weight groups where the trace still has
-            // entries but the sum is zero. The emission decision
-            // (retract vs emit) is handled separately by the
-            // oldAgg/newAgg comparison below.
-            if (afterGroup.IsEmpty)
+            // The post-delta group. By default a lazy view over (beforeGroup,
+            // groupDelta) that the incremental aggregators probe per delta row —
+            // avoiding the eager `beforeGroup + groupDelta` rebuild, which
+            // re-hashes the whole group every tick (ZSetBuilder.From; O(K²) over a
+            // growing group; docs/design-row-representation.md §14). The eager
+            // path is kept behind a seam for the A/B benchmark; both are
+            // correctness-equivalent (LazyMergeMultiset.IsEmpty matches the
+            // post-cancellation (before+delta).IsEmpty). Passed as the IMultiset
+            // parameter of EmitForKey so the concrete type stays at the call site
+            // (the interface is unavoidable in IAggregator.Update regardless).
+            if (FlatAggregateMode.ForceEagerRebuild)
             {
-                _aggCache.Remove(key);
-                _stateCache.Remove(key);
+                EmitForKey(key, groupDelta, beforeGroup + groupDelta, builder);
             }
             else
             {
-                _aggCache[key] = newAgg;
-                _stateCache[key] = state;
-            }
-
-            if (oldAgg == newAgg)
-            {
-                continue;
-            }
-
-            if (oldAgg.HasValue)
-            {
-                builder.Add((key, oldAgg.Value), new Z64(-1));
-            }
-
-            if (newAgg.HasValue)
-            {
-                builder.Add((key, newAgg.Value), new Z64(1));
+                EmitForKey(key, groupDelta, new LazyMergeMultiset<TValue>(beforeGroup, groupDelta), builder);
             }
         }
 
         _output.SetCurrent(builder.Build());
         _trace.Integrate(delta);
         CollectGarbage();
+    }
+
+    /// <summary>
+    /// Runs the aggregator for one changed group: hand it the cached value, the
+    /// per-key delta, and the post-delta multiset, update the caches, and emit a
+    /// retract/insert pair if the aggregate changed. Shared by the lazy-view and
+    /// eager-rebuild paths (which differ only in the <paramref name="afterGroup"/>
+    /// implementation they pass).
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage(
+        "Performance",
+        "CA1859:Use concrete types when possible for improved performance",
+        Justification = "afterGroup is genuinely polymorphic: the two call sites pass a ZSet (eager) " +
+                        "and a LazyMergeMultiset (lazy), so the IMultiset interface is required. " +
+                        "IAggregator.Update takes IMultiset regardless, so no dispatch is saved.")]
+    private void EmitForKey(
+        TKey key,
+        ZSet<TValue, Z64> groupDelta,
+        IMultiset<TValue, Z64> afterGroup,
+        ZSetBuilder<(TKey, TOut), Z64> builder)
+    {
+        var oldAgg = _aggCache.TryGetValue(key, out var cached)
+            ? cached
+            : Optional<TOut>.None;
+        _stateCache.TryGetValue(key, out var state);
+
+        var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
+
+        // Cache-pruning is keyed on "is there literally no trace
+        // entry?" (dict-shape IsEmpty), not on the aggregator's
+        // linear "group is present" gate. The aggregator's
+        // per-key state (e.g. SqlSumAggregator.DistinctNonNullRows)
+        // tracks weight transitions across ticks and must persist
+        // for cancelling-weight groups where the trace still has
+        // entries but the sum is zero. The emission decision
+        // (retract vs emit) is handled separately by the
+        // oldAgg/newAgg comparison below.
+        if (afterGroup.IsEmpty)
+        {
+            _aggCache.Remove(key);
+            _stateCache.Remove(key);
+        }
+        else
+        {
+            _aggCache[key] = newAgg;
+            _stateCache[key] = state;
+        }
+
+        if (oldAgg == newAgg)
+        {
+            return;
+        }
+
+        if (oldAgg.HasValue)
+        {
+            builder.Add((key, oldAgg.Value), new Z64(-1));
+        }
+
+        if (newAgg.HasValue)
+        {
+            builder.Add((key, newAgg.Value), new Z64(1));
+        }
     }
 
     /// <summary>

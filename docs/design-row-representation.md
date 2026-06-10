@@ -1283,6 +1283,62 @@ change (the flat lazy view) that the same inventory shows is the actual lever.
 The next increment is therefore the **flat lazy merge-view**, benchmarked against
 the struct rebuild on q4 — not surrogates.
 
+### 14.10 — Flat lazy merge-view LANDED + gated (the §14.9 lever, built)
+
+The §14.9 lever is implemented and benchmark-gated.
+
+**What landed.** `LazyMergeMultiset<T>`
+(`Operators/Stateful/LazyMergeMultiset.cs`) — the flat analogue of §12's spine
+`MergeViewMultiset`, and simpler: the flat before-group is a hashed `ZSet` with
+O(1) `WeightOf`/`Contains`, so no binary search is needed. `IncrementalAggregateOp`
+now hands the aggregator this lazy view over `(beforeGroup, groupDelta)` instead
+of materialising `afterGroup = beforeGroup + groupDelta` (the verified
+per-entry-re-hash rebuild). The eager rebuild is kept behind a process seam
+(`FlatAggregateMode.ForceEagerRebuild`) for the A/B, and the per-key body was
+factored into a shared `EmitForKey(…, IMultiset afterGroup, …)`. The lazy view is
+the **default**; it only ever *removes* the rebuild + its allocation, so there is
+no regression regime (a single-element group builds a view object instead of a
+1-entry dict — comparable).
+
+**Correctness.** `LazyMergeMultiset.IsEmpty` matches the eager
+`(before + delta).IsEmpty` exactly: `ZSetBuilder` drops zero-net entries, so the
+eager after-group's dict-shape emptiness *is* "every value cancels", which the
+view reproduces (zero-free before run; scan stops at the first surviving value —
+O(1) for a growing group). Full suite green (**1743 passed, 0 failed**),
+including the existing flat-vs-spine SUM/MIN PBTs and the SQL random-query PBTs.
+
+**Gate (`dotnet run -- flatagg`, [flat-agg-bench.md](flat-agg-bench.md)).** The
+q4 shape — `MAX(price)` over growing per-auction groups (`MAX` blocks
+`NarrowAggregateInput`, keeping the inner value rows *wide*) — driven through
+compiled SQL, eager rebuild vs lazy view, output cross-checked identical:
+
+| K (final group size) | eager | lazy | Speedup |
+|---:|---:|---:|---:|
+| 128  | ~204 ms | ~24 ms  | **8.6×** |
+| 512  | ~556 ms | ~120 ms | **4.6×** |
+| 2048 | ~13.8 s | ~715 ms | **19.3×** |
+
+**Reading it — the win's two regimes (verified).** The structural
+`MinMaxAggregator` implements only `Compute(IMultiset)` and inherits
+`Update => Compute(after)`, so it **scans the whole group every tick** (confirmed
+by reading it; the `benchmarks.md` "MIN/MAX keep a sorted set" note describes the
+*typed* `TypedSqlMinMaxAggregator`, not this one). So this gate measures the
+**constant-factor** win: the lazy view removes the per-tick dict allocation +
+wide-row re-hash, leaving only the aggregator's scan — already 4.6–19×, growing
+with K because the eager path allocates and re-hashes a K-entry dict *every*
+tick. For the **incremental** aggregators (SUM/COUNT/AVG, and the **typed**
+MIN/MAX that **q4 actually runs**), the rebuild was the *only* O(K) per-tick
+term, so the lazy view additionally collapses the asymptotics **O(K²)→O(K)** —
+the typed q4 path gets that on top of the constant win shown here.
+
+**Honest scope.** This is an *operator-level* gate on the aggregate step in
+isolation. End-to-end q4 is join + exchange + outer AVG + the inner MAX, so the
+query-level gain is Amdahl-bounded by the aggregate's share of the pipeline (the
+spine §12 work found q4's aggregate read-path was its residual ~8%). Quantifying
+the query-level effect — a flat **parallel** q4 A/B (eager-vs-lazy seam) through
+the `SpineParallelHarness` — is the natural follow-up; this increment establishes
+that the operator-level lever is real, large, correct, and default-safe.
+
 ---
 
 ## Appendix — sources
