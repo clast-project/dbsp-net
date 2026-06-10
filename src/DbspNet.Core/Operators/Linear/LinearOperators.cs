@@ -133,9 +133,17 @@ public static class LinearOperators
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(step);
 
+        // Pre-size each tick's output to the previous tick's output size, killing
+        // dictionary-resize churn on stable workloads with no over-allocation:
+        // last-output sizing self-tunes to the true output (a 1:1 project sizes to
+        // the input, a selective filter to its small result), unlike input-count
+        // sizing which would over-allocate the selective case
+        // (docs/design-row-representation.md §16.7). Fresh allocation each tick —
+        // no cross-tick reuse — so there is no z⁻¹/retention hazard.
+        var lastSize = 0;
         return builder.Apply(input, z =>
         {
-            var b = new ZSetBuilder<TOut, TWeight>();
+            var b = new ZSetBuilder<TOut, TWeight>(lastSize);
             foreach (var (row, w) in z)
             {
                 var (keep, value) = step(row);
@@ -145,7 +153,9 @@ public static class LinearOperators
                 }
             }
 
-            return b.Build();
+            var result = b.Build();
+            lastSize = result.Count;
+            return result;
         });
     }
 
@@ -164,9 +174,11 @@ public static class LinearOperators
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(expand);
 
+        // Last-output sizing (see MapFilterRows) — fresh alloc, no reuse.
+        var lastSize = 0;
         return builder.Apply(input, z =>
         {
-            var b = new ZSetBuilder<TOut, TWeight>();
+            var b = new ZSetBuilder<TOut, TWeight>(lastSize);
             foreach (var (row, w) in z)
             {
                 foreach (var expanded in expand(row))
@@ -175,7 +187,9 @@ public static class LinearOperators
                 }
             }
 
-            return b.Build();
+            var result = b.Build();
+            lastSize = result.Count;
+            return result;
         });
     }
 }

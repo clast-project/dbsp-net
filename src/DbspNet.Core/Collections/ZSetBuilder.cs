@@ -20,6 +20,20 @@ public sealed class ZSetBuilder<TKey, TWeight>
         _entries = new Dictionary<TKey, TWeight>();
     }
 
+    /// <summary>
+    /// Creates a builder whose backing dictionary is pre-sized to
+    /// <paramref name="capacity"/> entries. Capacity is a pure allocation hint —
+    /// the built Z-set is identical to one from the parameterless ctor — but it
+    /// lets an operator that knows its delta's size avoid the dictionary-resize
+    /// churn that growing from empty pays (~3× the steady backing at large deltas;
+    /// docs/design-row-representation.md §16.7). A negative capacity is treated as
+    /// zero (grow from empty).
+    /// </summary>
+    public ZSetBuilder(int capacity)
+    {
+        _entries = new Dictionary<TKey, TWeight>(capacity > 0 ? capacity : 0);
+    }
+
     internal ZSetBuilder(Dictionary<TKey, TWeight> entries)
     {
         _entries = entries;

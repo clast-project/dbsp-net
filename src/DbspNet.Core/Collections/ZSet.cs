@@ -136,7 +136,10 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         where TKey2 : notnull
     {
         ArgumentNullException.ThrowIfNull(f);
-        var b = new ZSetBuilder<TKey2, TWeight>();
+        // Output has at most one entry per input row (fewer only if rows collide
+        // under f), so the input count is a tight upper bound — pre-size to it to
+        // avoid resize churn on the common 1:1 projection (§16.7).
+        var b = new ZSetBuilder<TKey2, TWeight>(_entries.Count);
         foreach (var (k, w) in _entries)
         {
             b.Add(f(k), w);

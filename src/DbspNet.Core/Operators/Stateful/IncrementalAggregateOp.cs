@@ -29,6 +29,10 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 {
     private readonly Stream<IndexedZSet<TKey, TValue, Z64>> _input;
     private readonly Stream<ZSet<(TKey Key, TOut Value), Z64>> _output;
+
+    // Previous tick's output size — pre-sizes this tick's delta builder to avoid
+    // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
+    private int _lastOutputSize;
     private readonly IAggregator<TValue, TOut> _aggregator;
     private readonly IndexedZSetTrace<TKey, TValue, Z64> _trace = new();
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
@@ -118,7 +122,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         var before = _trace.Current;
 
-        var builder = new ZSetBuilder<(TKey, TOut), Z64>();
+        var builder = new ZSetBuilder<(TKey, TOut), Z64>(_lastOutputSize);
         foreach (var key in delta.Keys)
         {
             var groupDelta = delta.GroupFor(key);
@@ -144,7 +148,9 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             }
         }
 
-        _output.SetCurrent(builder.Build());
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
         _trace.Integrate(delta);
         CollectGarbage();
     }

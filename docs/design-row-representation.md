@@ -1916,6 +1916,60 @@ edges, gate on q4 W=1 ns/event + B/event with the per-tick output cross-check;
 (c) lever 2 (deferred output) in parallel for q18/q19. Columnar (lever 3) stays
 the deferred end-state.
 
+### 16.8 — Adaptive delta-builder pre-sizing LANDED (lever-1 step (a), gated)
+
+The §16.7 (a) sub-lever — pre-size the delta builder, zero retention risk — is
+wired and gated. The refinement over §16.7's wording: size to the **previous
+tick's output count**, not the input count. Last-output sizing self-tunes to the
+true output (a 1:1 projection sizes to its input; a selective filter or
+few-groups aggregate to its small result), so it kills the resize churn **without**
+the over-allocation that input-count sizing would pay on selective operators.
+
+**What landed.** A `ZSetBuilder(int capacity)` ctor (`ZSetBuilder.cs`) and
+last-output sizing at the hot delta-builder sites: the fused linear
+`MapFilterRows`/`FlatMapRows` (closure-captured `lastSize`,
+`LinearOperators.cs`), `ZSet.MapKeys` (sized to the input count — a tight upper
+bound for a projection), and the three stateful operators that dominate the gap
+queries — `IncrementalJoinOp`, `IncrementalAggregateOp`, `PartitionedTopKOp`
+(instance `_lastOutputSize` field). **Correctness-neutral by construction**: a
+`Dictionary`'s initial capacity is a pure allocation hint, so the built Z-set is
+byte-identical. Fresh allocation each tick (no cross-tick reuse), so there is no
+`z⁻¹`/retention hazard — this is the strictly-safe half of lever 1; true pooling
+(reclaiming the *steady* backing, not just the churn) remains the gated follow-up.
+
+**Verification.** Full suite **1,747 passed**, 0 failed (the capacity hint changes
+no behaviour).
+
+**Gate (`w1profile`, 1M events, batch 10k, before = commit `d7c38af`).** Managed
+allocation falls 16–35% across every query, and per-event time falls on the gap
+queries:
+
+| Query | B/event before→after | ns/event before→after |
+|:--|--:|--:|
+| q4 | 2,812 → **2,376** (−16%) | 2,430 → **2,197** (−10%) |
+| q9 | 2,883 → **2,382** (−17%) | 1,704 → **1,398** (−18%) |
+| q18 | 3,530 → **2,417** (−32%) | 2,620 → **2,249** (−14%) |
+| q19 | 5,130 → **4,059** (−21%) | 3,592 → **2,945** (−18%) |
+| q0 | 1,263 → 962 (−24%) | 829 → 803 |
+| q1 | 1,633 → 1,078 (−34%) | 916 → 810 |
+
+The win is **larger than §16.7 predicted** (it framed pre-sizing as a ~70%-of-
+backing churn reclaim, expecting a single-digit query-level effect). At the batch-
+10k operating point the resize churn is a bigger share than expected — especially
+q18/q19, whose wide bid rows are value-type structs stored *inline* in the
+dictionary `Entry[]`, so the churned backing is large. The allocation drop tracks
+into a real per-event time drop (−10% to −18%) on all four competitive-gap
+queries, confirming §16.2's allocation-bound finding *and* that q4's earlier
+single noisy `ns` reading (an apparent regression) was measurement noise — the
+clean median-of-4 shows q4 improved.
+
+**Status.** Lever-1 step (a) shipped: a safe, correctness-neutral, 16–32%
+per-event allocation reduction on the gap queries with a 10–18% time win. Next
+increments (unchanged from §16.7): (b) true cross-tick delta pooling behind a
+per-edge "no-`z⁻¹`" guard to reclaim the *steady* backing the fresh-alloc path
+still pays; (c) lever 2 (deferred `StructuralRow` output) for the boundary objects
+that dominate q18/q19; (d) columnar (lever 3) deferred end-state.
+
 ---
 
 ## Appendix — sources

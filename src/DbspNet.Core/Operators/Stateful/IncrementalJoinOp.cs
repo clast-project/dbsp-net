@@ -37,6 +37,10 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     private readonly Stream<IndexedZSet<TKey, TLeft, TWeight>> _leftIn;
     private readonly Stream<IndexedZSet<TKey, TRight, TWeight>> _rightIn;
     private readonly Stream<ZSet<TOut, TWeight>> _output;
+
+    // Previous tick's output size — pre-sizes this tick's delta builder to avoid
+    // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
+    private int _lastOutputSize;
     private readonly Func<TKey, TLeft, TRight, TOut> _combine;
     private readonly Func<TOut, bool>? _residual;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
@@ -113,12 +117,14 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         // calls together.
         _rightTrace.Integrate(dr);
 
-        var builder = new ZSetBuilder<TOut, TWeight>();
+        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
         // dl ⋈ R_t
         IncrementalJoinCore.JoinInto(dl, _rightTrace.Current, _combine, _residual, builder);
         // L_{t-1} ⋈ dr
         IncrementalJoinCore.JoinInto(_leftTrace.Current, dr, _combine, _residual, builder);
-        _output.SetCurrent(builder.Build());
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
 
         _leftTrace.Integrate(dl);
         CollectGarbage();

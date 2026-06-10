@@ -74,6 +74,10 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
     // The window emitted last tick, per partition: row -> in-window weight (> 0).
     private readonly Dictionary<TKey, Dictionary<TRow, long>> _window;
 
+    // Previous tick's output size — pre-sizes this tick's delta builder to avoid
+    // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
+    private int _lastOutputSize;
+
     public PartitionedTopKOp(
         Stream<ZSet<TRow, Z64>> input,
         Stream<ZSet<TRow, Z64>> output,
@@ -162,7 +166,7 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
             }
         }
 
-        var builder = new ZSetBuilder<TRow, Z64>();
+        var builder = new ZSetBuilder<TRow, Z64>(_lastOutputSize);
         if (touched is not null)
         {
             foreach (var key in touched)
@@ -184,7 +188,9 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
             }
         }
 
-        _output.SetCurrent(builder.Build());
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
     }
 
     /// <summary>Emit the +/- weights moving the previously-emitted window for a
