@@ -152,62 +152,64 @@ internal static class NexmarkQueries
         new(
             "q15",
             "bidding statistics report — per-day bid/bidder/auction counts",
-            // Feldera uses COUNT(*) FILTER / COUNT(DISTINCT …) FILTER over
-            // to_char(date_time,'YYYY-MM-DD'). DbspNet-dialect equivalents:
-            // CAST(date_time AS DATE) for the day bucket, SUM(CASE …) for the
-            // conditional plain counts, and COUNT(DISTINCT CASE WHEN p THEN x END)
-            // for the conditional distinct counts (the CASE yields NULL when the
-            // predicate is false and COUNT(DISTINCT) ignores NULL — exactly the
-            // FILTER semantics).
+            // Verbatim Feldera form: COUNT(*) FILTER (WHERE …) for the conditional
+            // plain counts and COUNT(DISTINCT x) FILTER (WHERE …) for the
+            // conditional distinct counts. DbspNet's FILTER is parser sugar that
+            // lowers agg(x) FILTER (WHERE p) → agg(CASE WHEN p THEN x END) (and
+            // COUNT(*) FILTER → COUNT(CASE WHEN p THEN 1 END)), so results are
+            // identical to the prior SUM(CASE 1/0) form. Day bucket uses
+            // CAST(date_time AS DATE) (Feldera's to_char(date_time,'YYYY-MM-DD')).
             @"SELECT CAST(date_time AS DATE) AS day,
                      COUNT(*) AS total_bids,
-                     SUM(CASE WHEN price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
-                     SUM(CASE WHEN price >= 10000 AND price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
-                     SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                     COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids,
+                     COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids,
+                     COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids,
                      COUNT(DISTINCT bidder) AS total_bidders,
-                     COUNT(DISTINCT CASE WHEN price < 10000 THEN bidder END) AS rank1_bidders,
-                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN bidder END) AS rank2_bidders,
-                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN bidder END) AS rank3_bidders,
+                     COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders,
+                     COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders,
+                     COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders,
                      COUNT(DISTINCT auction) AS total_auctions,
-                     COUNT(DISTINCT CASE WHEN price < 10000 THEN auction END) AS rank1_auctions,
-                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN auction END) AS rank2_auctions,
-                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN auction END) AS rank3_auctions
+                     COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions,
+                     COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions,
+                     COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions
               FROM bid
               GROUP BY CAST(date_time AS DATE)",
             BidOnly),
         new(
             "q16",
             "channel statistics report — per-channel/day bid/bidder/auction counts",
-            // As q15 but keyed by channel and day. Feldera's cosmetic `minute`
-            // column (max of to_char(date_time,'HH:mm')) is omitted — DbspNet has
-            // no minute-format scalar and it does not exercise COUNT(DISTINCT).
+            // As q15 (verbatim Feldera FILTER form) but keyed by channel and day.
+            // Feldera's cosmetic `minute` column (max of to_char(date_time,'HH:mm'))
+            // is omitted — DbspNet has no minute-format scalar and it does not
+            // exercise COUNT(DISTINCT).
             @"SELECT channel, CAST(date_time AS DATE) AS day,
                      COUNT(*) AS total_bids,
-                     SUM(CASE WHEN price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
-                     SUM(CASE WHEN price >= 10000 AND price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
-                     SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                     COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids,
+                     COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids,
+                     COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids,
                      COUNT(DISTINCT bidder) AS total_bidders,
-                     COUNT(DISTINCT CASE WHEN price < 10000 THEN bidder END) AS rank1_bidders,
-                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN bidder END) AS rank2_bidders,
-                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN bidder END) AS rank3_bidders,
+                     COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders,
+                     COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders,
+                     COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders,
                      COUNT(DISTINCT auction) AS total_auctions,
-                     COUNT(DISTINCT CASE WHEN price < 10000 THEN auction END) AS rank1_auctions,
-                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN auction END) AS rank2_auctions,
-                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN auction END) AS rank3_auctions
+                     COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions,
+                     COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions,
+                     COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions
               FROM bid
               GROUP BY channel, CAST(date_time AS DATE)",
             BidOnly),
         new(
             "q17",
             "auction statistics by day",
-            // Feldera uses COUNT(*) FILTER (WHERE …) + DATE_FORMAT; the DbspNet
-            // dialect equivalent is SUM(CASE …) for the conditional counts and
-            // CAST(date_time AS DATE) for the day bucket (group-by-expression key).
+            // Verbatim Feldera form: COUNT(*) FILTER (WHERE …) for the conditional
+            // counts (DbspNet lowers FILTER → COUNT(CASE …), identical to the prior
+            // SUM(CASE 1/0) results) and CAST(date_time AS DATE) for the day bucket
+            // (group-by-expression key, Feldera's DATE_FORMAT).
             @"SELECT b.auction, CAST(b.date_time AS DATE) AS day,
                      COUNT(*) AS total_bids,
-                     SUM(CASE WHEN b.price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
-                     SUM(CASE WHEN b.price >= 10000 AND b.price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
-                     SUM(CASE WHEN b.price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                     COUNT(*) FILTER (WHERE b.price < 10000) AS rank1_bids,
+                     COUNT(*) FILTER (WHERE b.price >= 10000 AND b.price < 1000000) AS rank2_bids,
+                     COUNT(*) FILTER (WHERE b.price >= 1000000) AS rank3_bids,
                      MIN(b.price) AS min_price, MAX(b.price) AS max_price,
                      AVG(b.price) AS avg_price, SUM(b.price) AS sum_price
               FROM bid b
