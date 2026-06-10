@@ -1675,6 +1675,249 @@ of where the gap is *not*.
 
 ---
 
+## 16. Per-row / columnar execution efficiency — the §15.8 lever (MEASURED)
+
+§15.8 concluded the exchange/scaling arc with a reframe: the residual competitive
+gaps — **q4 (0.49×), q18 (0.46×), q19 (0.55×) at 10 cores** — are not scaling
+gaps (movement isn't the ceiling §15.2, barrier count isn't the lever §15.7,
+W-sizing isn't competitive §15.8). They are **per-tuple execution cost**: Feldera
+processes the same tuples cheaper, winning *while paying a heavier straggler tax*.
+This section measures that per-tuple cost directly — at **W=1**, because per-row
+efficiency is a single-thread property that must be isolated from parallelism —
+and ranks the levers. Same discipline as the prior arcs: measure first, gate, and
+be honest about fundamental-vs-fixable.
+
+### 16.1 — Method
+
+Two W=1 measurements, both durable and benchmark-only:
+
+- **`w1profile`** (`Benchmarks/W1ProfileBenchmark.cs`, `dotnet run -- w1profile
+  [events] [batch] [runs]`, report `docs/w1-profile.md`). Runs each Nexmark query
+  through a **single (non-parallel) circuit** and reports, per stream event:
+  wall-clock **ns/event** (median of N runs after one warmup), managed
+  **bytes/event** (`GC.GetAllocatedBytesForCurrentThread` — accurate at W=1
+  because a single circuit's `Step()` runs synchronously on the calling thread, no
+  worker thread allocates), and **GC collections**. The queries form a
+  differential ladder (q0 = ingest/egest boundary only; q1 = +1 map; q2 = +filter;
+  q20/q4/q9 = +join/+aggregate; q18/q19 = +partitioned TOP-K) so per-event deltas
+  attribute to operator classes without a sampling profiler.
+- **`profile {handwired,typed,structural}`** (`Benchmarks/ProfileHotPath.cs`, now
+  also reporting **alloc/step**) on a steady-state single-row-insert join+GROUP BY.
+  `handwired` builds the circuit directly in Core with typed `ZSet`s — **no SQL,
+  no `object?[]`, no `StructuralRow` boundary** — establishing the ceiling. The
+  `typed`/`structural` deltas over it isolate the SQL-engine + boundary tax.
+
+### 16.2 — What the measurement found
+
+**`w1profile` (1M events, batch 10k, median-of-2, Server GC, i9-12900K):**
+
+| Query | Shape | ns/event | **B/event** | out rows |
+|:--|:--|--:|--:|--:|
+| q0 | passthrough (ingest+egest) | 829 | **1,263** | 9,200 |
+| q1 | + 1 projection (price map) | 916 | 1,633 | 9,200 |
+| q2 | + filter (selective, 74 out) | 472 | 818 | 74 |
+| q22 | + 3 string SPLIT_INDEX | 1,206 | 1,751 | 9,200 |
+| q3 | join a⋈p (reads ~6% of stream) | 121 | 111 | 22 |
+| q20 | join b⋈a (wide output) | 1,349 | 1,725 | 1,890 |
+| **q4** | join + nested MAX + outer AVG | **2,430** | **2,812** | 10 |
+| q9 | join + partitioned TOP-1 | 1,704 | 2,883 | 1,430 |
+| **q18** | partitioned TOP-1 dedup | **2,620** | **3,530** | 9,200 |
+| **q19** | partitioned TOP-10 | **3,592** | **5,130** | 8,706 |
+
+**`profile` steady-state (1 row/step, join+GROUP BY):**
+
+| Mode | µs/step | **B/step** | vs handwired |
+|:--|--:|--:|--:|
+| handwired (pure Core typed ZSet) | 0.92 | **2,843** | 1.0× |
+| typed (SQL typed path) | 3.14 | 4,949 | 3.4× time, +2,106 B |
+| structural (SQL `object?[]` path) | 4.12 | 5,467 | 4.5× time, +2,624 B |
+
+Three facts, all decisive:
+
+1. **Per-tuple time tracks allocation almost exactly.** Across the ladder, ns/event
+   and B/event move together (q19 worst on both, q3 cheapest on both). The engine
+   is **allocation-bound** per tuple, not dispatch-bound or compute-bound — which
+   is why §6.3's codegen demotion still holds (codegen attacks dispatch, not the
+   binding cost).
+2. **The three competitive-gap queries are exactly the three heaviest allocators.**
+   q4/q18/q19 — the 0.46–0.55× Feldera gaps — allocate **2.8 / 3.5 / 5.1 KB per
+   event** and are the slowest. The correlation between the §15.8 gap list and the
+   allocation ranking is not a coincidence: **allocation is the per-tuple gap.**
+3. **There is a large generic-engine floor present in *everything*.** Even
+   passthrough (q0) allocates **1,263 B/event**, and even the hand-wired Core
+   ceiling allocates **2,843 B/step**. This floor is structural, not query-specific.
+
+### 16.3 — Attribution: where the per-tuple allocation goes (code-grounded)
+
+The two measurements bracket the cost into two layers:
+
+- **Layer A — the Core dictionary-Z-set churn (~2,843 B/step, the floor).** Every
+  stateful operator's `Step()` allocates a **fresh `ZSetBuilder` (a new
+  `Dictionary`)**, fills it, and `Build()`s it into the output Z-set — verified
+  universal: the `new ZSetBuilder … _output.SetCurrent(builder.Build())` pattern
+  appears across **all 25** stateful-operator files
+  (`IncrementalAggregateOp.cs:121,147`, `TopKOp.cs:101,119`, join ops, etc.), plus
+  per-key `GroupFor` materialisations inside the loop. This is the analogue of
+  Feldera's per-operator batch — except Feldera builds **one reused sorted columnar
+  buffer** and we build **a fresh hash `Dictionary` every tick**. Present even in
+  the hand-wired path, so it is **architectural**, not a SQL-compiler artifact.
+  Critically, **`Build()` transfers the dictionary's ownership into the output
+  `ZSet`** (`ZSetBuilder.cs:72-82` nulls `_entries`), which the output stream holds
+  until the next tick and which `z⁻¹`/trace consumers may retain — so the dict
+  cannot be trivially pooled (see §16.5 lever 1).
+- **Layer B — the SQL boundary tax (+2,106 B/step typed, +2,624 structural).** The
+  `object?[]`→typed-struct **input lift** at the scan and the typed→`StructuralRow`
+  **output materialisation** at the sink, plus per-projection delegate result rows.
+  q4/q18/q19 run the **typed** path at W=1, so they pay the +2,106 (not the
+  structural +2,624). The `w1profile` ladder localises this: q2 (74 output rows)
+  allocates 818 B/event while q0 (9,200 output rows) allocates 1,263 — the ~445 B
+  delta on near-identical input work is **output materialisation** (building a
+  `StructuralRow` per result row). q18/q19, with ~9,200 wide output rows per batch
+  *plus* retained wide rows in the TOP-K `SortedDictionary`, are the worst hit.
+
+So roughly **~55–60% of per-tuple allocation is the architectural Layer A floor**
+(dictionary-Z-set churn, hits *every* operator including q4's internal pipeline),
+and **~40–45% is the Layer B boundary** (`object?[]` in / `StructuralRow` out,
+concentrated in output-heavy q18/q19, near-zero for tiny-output q4).
+
+### 16.4 — Fundamental vs fixable (honest)
+
+- **Layer B is bounded and partly fixable.** Typed ingest (source emits typed rows,
+  no `object?[]` at the scan) and deferring `StructuralRow` materialisation to the
+  true sink would remove much of the +2,106. **But** it helps **q18/q19**
+  (output-heavy) far more than **q4** (10 output rows, ~entirely Layer-A-bound), and
+  it cannot touch the floor. A real but partial, query-skewed win.
+- **Layer A is substantially architectural.** Matching Feldera's near-zero
+  steady-state per-tuple allocation means not building a fresh `Dictionary` per
+  operator per tick. Two ways: **(1) reuse the delta buffers** (bounded, but fights
+  the `Build()` ownership transfer and `z⁻¹`/trace retention — correctness-risky),
+  or **(2) columnar/vectorised batch operators** (an `OrdZSet`-style reused sorted
+  columnar buffer + cursor-merge operators — the Feldera model, a near-rewrite).
+  This is the honest core of the §15.8 framing: **the gap is in large part the cost
+  of a generic `object?[]`/hash-`Dictionary` managed engine versus Feldera's
+  monomorphised columnar Rust.** The spine arc (§5–§13) already tried sorted-merge
+  on our tick granularity and it lost to the flat dict — so "columnar" here means
+  *buffer reuse + vectorised per-column work*, not *sorted-merge execution*, which
+  we already measured is the wrong model for fine-grained ticks.
+
+### 16.5 — Ranked levers
+
+ROI against the measured bottleneck (per-tuple allocation), discounted by
+effort/risk.
+
+| # | Lever | Hits | Effort | Risk | Notes |
+|--|--|--|--|--|--|
+| 1 | **Delta Z-set buffer/builder pooling** | Layer A (all ops incl. q4) | M | **H** | The only bounded lever that touches q4's internal-bound cost. Fights `Build()` ownership + `z⁻¹`/trace retention — needs a microbench to bound the reclaimable fraction *and* prove the retention constraint before any wiring. |
+| 2 | **Typed ingest + deferred output materialisation** | Layer B | S–M | L | Removes much of +2,106 B; helps q18/q19 (output-heavy) and every structural-fallback query; ~no help for q4. Low-risk partial win. |
+| 3 | **Columnar/vectorised batch operators** (`OrdZSet` analogue, reused buffers) | Layer A floor | XL | H | The real Feldera-parity move and the end-state if 1/2 fall short. Near-rewrite; defer until the bounded levers are measured. |
+| 4 | **Whole-query codegen / delegate fusion** | dispatch | XL | H | **Demoted again** (§6.3): time tracks *allocation*, not dispatch, so codegen without allocation reduction won't move the needle. |
+
+### 16.6 — Recommendation & first increment
+
+The measurement confirms the going-in framing and sharpens it: the per-tuple gap
+is **allocation**, split between a fixable boundary (Layer B) and an architectural
+floor (Layer A), and **q4 lives almost entirely in the floor** while q18/q19 are
+split. There is no single bounded lever that closes all three.
+
+Sequenced, measure-first:
+
+1. **Microbench-precursor for lever 1 (next).** Before wiring any operator, build a
+   focused Core microbench that (a) quantifies how much of the ~2,843 B/step floor
+   is the *reclaimable* delta-`Dictionary` backing vs genuinely-live retained state,
+   and (b) tests whether the `Build()`-ownership + `z⁻¹`/trace-retention constraint
+   actually permits reuse. This mirrors how `surrogatebench` (§14.9) retired an XL
+   option *before* operator work. If the reclaimable fraction is small or retention
+   blocks reuse, lever 1 is dead and the answer is lever 3.
+2. **Lever 2 in parallel (low-risk).** Typed ingest + deferred output for the
+   output-heavy queries (q18/q19), gated on `w1profile` ns/event + B/event with the
+   existing per-tick output cross-check. Independent of lever 1.
+3. **Lever 3 (columnar) stays the explicit end-state**, deferred until 1/2 are
+   measured — not assumed, because the spine arc already showed one "obvious"
+   representation change (sorted-merge) lose on our tick granularity.
+
+Durable deliverables this session: the `w1profile` harness, the `profile`
+allocation ceiling, and an evidence-backed map showing the per-tuple gap **is**
+allocation (Layer A floor + Layer B boundary), with q4 floor-bound and q18/q19
+split — so the next experiment is the lever-1 reclaimability microbench, not a
+speculative columnar rewrite.
+
+### 16.7 — Lever-1 reclaimability microbench RAN (prize real, but it's Layer-A-only)
+
+The §16.6 gate — bound the pooling prize and test the retention constraint before
+wiring — is built (`Benchmarks/PoolBenchmark.cs`, `dotnet run -- poolbench`,
+report [pool-bench.md](pool-bench.md)) and run. It A/Bs the delta dictionary's
+lifecycle — **fresh** (`new Dictionary()`, today's bare `ZSetBuilder()`),
+**presized** (`new Dictionary(D)`, what `ZSetBuilder.From`'s capacity hint buys),
+**pooled** (reuse via `Clear()`) — across delta sizes `D` spanning q4/q18/q19's
+operating points, measuring managed bytes per built dictionary.
+
+**Result (bytes/dict/tick, median):**
+
+| D | fresh (long→long) | presized | pooled | fresh (pair→long) |
+|--:|--:|--:|--:|--:|
+| 1 | 216 | 216 | **0** | 240 |
+| 256 | 22,312 | 8,336 | **0** | 28,560 |
+| 1,024 | 102,216 | 31,016 | **0** | 131,264 |
+| 4,096 | 451,344 | 136,240 | **0** | 580,136 |
+| 9,216 | 941,928 | 283,016 | **0** | 1,210,872 |
+
+Three findings:
+
+1. **Pooling reclaims 100% of the dict backing.** `Clear()` keeps the bucket/entry
+   arrays, so a stable-size delta re-fills with **zero** allocation at every `D`.
+   The prize is real and scales with the delta: ~283 B/entry-cleared… no — ~31 B
+   per entry of *steady* backing (presized), but the **fresh** path pays **~3.3×
+   that** because growing a dictionary from capacity 0 reallocates and copies its
+   backing ~11 times over 9,216 inserts (resize churn).
+2. **A strictly-safe sub-lever falls out: pre-sizing.** `fresh − presized` is ~70%
+   of `fresh` at large `D` — pure resize churn — and pre-sizing the builder
+   reclaims it with **zero retention risk** (no cross-tick reuse; the dict is still
+   handed off and dropped). The bare `ZSetBuilder()` ctor (used by the stateful
+   ops, `IncrementalAggregateOp.cs:121`, `TopKOp.cs:101`) takes no capacity hint;
+   `ZSetBuilder.From` already does. Sizing the builder to the input-delta count
+   (an exact upper bound for linear ops, a good estimate for stateful ops) is a
+   safe, mechanical partial win for the large-batch operators.
+3. **The retention constraint is satisfiable per-edge** (verified from the Core
+   lifecycle, recorded in the report): `ZSet` takes dict ownership; trace
+   `Integrate` folds the delta into its *own* dict (`MergeInPlace`) and does not
+   retain it; a `Stream.Current` holds an output only until the next `SetCurrent`;
+   the **only** cross-tick aliasing of a delta `ZSet` is `DelayOp`
+   (`_nextOutput = _input.Current`, `DelayOp.cs:34`). q4/q18/q19's flat pipelines
+   put no `z⁻¹` on a delta edge (their delays are trace-internal — the join's
+   `L_{t-1}` is `_leftTrace.Current`, a trace-owned dict), so their delta edges are
+   dead-after-tick and poolable. Recursive/nested circuits have explicit `z⁻¹` on
+   deltas and must be excluded — a per-edge analysis the compiler can do.
+
+**The honest limit — pooling is Layer-A-only.** poolbench measures the dict
+**backing arrays**. The per-row **objects** the dict references — the
+`StructuralRow` + `object?[]` + boxed scalars at the output boundary (Layer B) —
+are *separate* heap allocations that pooling the dictionary does **not** reclaim.
+Cross-referencing §16.2: the `handwired` ceiling (typed value-type rows stored
+*inline* in the dict's `Entry[]`, no boundary) is ~all reclaimable backing, but the
+SQL path's +2,106 B (typed) / +2,624 B (structural) is boundary objects pooling
+cannot touch. So:
+
+- **q4** (10 output rows, Layer-A-dominated, value-type internal rows): the **best
+  case for lever 1** — most of its per-tuple allocation is poolable dict backing.
+- **q18/q19** (≈9,200 wide output rows/tick): **pooling helps the internal/TOP-K
+  state dicts but not the output boundary objects**, which dominate their per-event
+  number — they need **lever 2** (deferred `StructuralRow` materialisation).
+
+**Decision.** Lever 1 is **alive** (prize real, constraint satisfiable) but
+**Layer-A-scoped** — it is the right lever for q4 and a partial one for q18/q19,
+and it pairs with lever 2 (boundary objects) rather than replacing it. The
+microbench did its gating job: it confirmed the prize without speculative wiring
+and surfaced the **pre-sizing sub-lever** as the zero-risk first step. Recommended
+sequencing for the wiring increment (next): (a) pre-size the bare `ZSetBuilder()`
+to the input-delta count where estimable — safe, mechanical, captures the ~70%
+resize-churn term immediately, gate on `w1profile` B/event; then (b) full
+cross-tick delta pooling behind a per-edge "no-z⁻¹" guard for the dead-after-tick
+edges, gate on q4 W=1 ns/event + B/event with the per-tick output cross-check;
+(c) lever 2 (deferred output) in parallel for q18/q19. Columnar (lever 3) stays
+the deferred end-state.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,

@@ -111,6 +111,7 @@ internal static class ProfileHotPath
 
         // Sampled loop.
         Console.WriteLine("Sampling start...");
+        var bytes0 = GC.GetAllocatedBytesForCurrentThread();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long steps = 0;
         var deadline = TimeSpan.FromSeconds(seconds);
@@ -122,7 +123,7 @@ internal static class ProfileHotPath
         }
 
         sw.Stop();
-        Console.WriteLine($"Steps: {steps}, per-step: {sw.Elapsed.TotalMicroseconds / steps:F2} µs");
+        ReportSampled("typed", sw.Elapsed, steps, bytes0);
     }
 
     private static void RunStructural(
@@ -154,6 +155,7 @@ internal static class ProfileHotPath
         }
 
         Console.WriteLine("Sampling start...");
+        var bytes0 = GC.GetAllocatedBytesForCurrentThread();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long steps = 0;
         var deadline = TimeSpan.FromSeconds(seconds);
@@ -165,7 +167,7 @@ internal static class ProfileHotPath
         }
 
         sw.Stop();
-        Console.WriteLine($"Steps: {steps}, per-step: {sw.Elapsed.TotalMicroseconds / steps:F2} µs");
+        ReportSampled("structural", sw.Elapsed, steps, bytes0);
     }
 
     private static void RunHandwired(
@@ -189,6 +191,7 @@ internal static class ProfileHotPath
         }
 
         Console.WriteLine("Sampling start...");
+        var bytes0 = GC.GetAllocatedBytesForCurrentThread();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long steps = 0;
         var deadline = TimeSpan.FromSeconds(seconds);
@@ -202,7 +205,15 @@ internal static class ProfileHotPath
         }
 
         sw.Stop();
-        Console.WriteLine($"Steps: {steps}, per-step: {sw.Elapsed.TotalMicroseconds / steps:F2} µs");
+        ReportSampled("handwired", sw.Elapsed, steps, bytes0);
+    }
+
+    private static void ReportSampled(string mode, TimeSpan elapsed, long steps, long bytes0)
+    {
+        var bytes1 = GC.GetAllocatedBytesForCurrentThread();
+        Console.WriteLine(
+            $"[{mode}] steps={steps:N0}  per-step={elapsed.TotalMicroseconds / steps:F3} µs  " +
+            $"alloc/step={(bytes1 - bytes0) / (double)steps:F1} B");
     }
 
     private static CompiledQuery Compile(string[] ddl, string sql)
