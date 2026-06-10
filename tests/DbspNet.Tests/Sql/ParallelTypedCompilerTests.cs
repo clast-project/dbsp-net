@@ -195,6 +195,31 @@ public class ParallelTypedCompilerTests
 
     [Theory]
     [InlineData(2)]
+    public void GroupBy_FilterClause_MatchesSingle(int workers)
+    {
+        // FILTER desugars to CASE, so it must ride the same parallel aggregate
+        // path (the Nexmark q15/q16 authoring shape).
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (k INT NOT NULL, v BIGINT NOT NULL)"],
+            "SELECT k, COUNT(*) FILTER (WHERE v < 10) AS lo, " +
+            "COUNT(DISTINCT v) FILTER (WHERE v >= 10) AS hi FROM t GROUP BY k",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 5L);
+                tbl("t").Insert(1, 50L);
+                tbl("t").Insert(1, 50L);
+                tbl("t").Insert(2, 7L);
+            },
+            tbl =>
+            {
+                tbl("t").Insert(2, 100L);
+                tbl("t").Delete(1, 5L);
+            });
+    }
+
+    [Theory]
+    [InlineData(2)]
     public void GroupByColumn_SumCase_MatchesSingle(int workers)
     {
         AssertParallelMatchesSingle(

@@ -375,10 +375,15 @@ reflect that shape, not a backlog.
   (the typed fast path falls back, as INTERVAL arithmetic already does). The
   array-returning `APPROX_QUANTILES(x, n)` is still deferred.
   Heavy-hitters (Count-Min) remain **[P2]**.
-- **[P1]** `FILTER (WHERE …)` clause on aggregates. (Rewritable to `CASE`: a
-  conditional plain count is `SUM(CASE WHEN p THEN 1 ELSE 0 END)`, and a
-  conditional distinct count is `COUNT(DISTINCT CASE WHEN p THEN x END)` — the
-  CASE yields NULL when `p` is false and the count ignores NULL.)
+- **[DONE]** `FILTER (WHERE …)` clause on aggregates — parse-time sugar:
+  `agg(x) FILTER (WHERE p)` lowers to `agg(CASE WHEN p THEN x END)` and
+  `COUNT(*) FILTER (WHERE p)` to `COUNT(CASE WHEN p THEN 1 END)` (unmatched rows
+  become NULL, which every aggregate ignores). A `DISTINCT` modifier is preserved
+  (`COUNT(DISTINCT x) FILTER (WHERE p)` → `COUNT(DISTINCT CASE WHEN p THEN x
+  END)`). Since it desugars to CASE it flows through every compile path / trace
+  family and parallelizes like any aggregate. `filter` stays a usable identifier
+  (contextual keyword); the window form (`… FILTER (…) OVER (…)`) is rejected.
+  Still open: `WITHIN DISTINCT`, and `DISTINCT` on non-COUNT aggregates.
 - **[DONE]** Exact `COUNT(DISTINCT x)` — the number of distinct non-NULL argument
   values per group, on both compile paths and both trace families. The `DISTINCT`
   argument modifier is parsed onto `FunctionCallExpression` and accepted by the

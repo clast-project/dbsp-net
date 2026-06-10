@@ -220,7 +220,8 @@ grows and the GC frontier climbs.
   `APPROX_PERCENTILE(x, f)`, `MEDIAN(x)`, and the ANSI ordered-set spellings
   `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)` / `PERCENTILE_DISC` (DDSketch;
   bounded state, ~1% relative error, fully invertible). NULL skipping per SQL
-  semantics; `COUNT(*)` counts all.
+  semantics; `COUNT(*)` counts all. Any aggregate accepts a
+  `FILTER (WHERE …)` clause (e.g. `COUNT(*) FILTER (WHERE price < 10000)`).
 - `LATENESS` bounded-history GC: a column declared `LATENESS d` in
   `CREATE TABLE` (e.g. `ts TIMESTAMP NOT NULL LATENESS 10000000`) promises no
   future row's value falls more than `d` below the running maximum. The engine

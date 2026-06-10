@@ -1618,6 +1618,27 @@ public sealed class Parser
         return new FunctionCallExpression("coalesce", args, IsStar: false);
     }
 
+    /// <summary>
+    /// Parse an optional <c>FILTER (WHERE predicate)</c> clause following an
+    /// aggregate call. Returns the predicate, or <c>null</c> when no FILTER
+    /// follows. <c>filter</c> is recognised contextually so it stays usable as an
+    /// ordinary identifier elsewhere.
+    /// </summary>
+    private Expression? TryParseAggregateFilter()
+    {
+        if (!IsContextualKeyword("filter"))
+        {
+            return null;
+        }
+
+        Advance(); // filter
+        Expect(TokenKind.LParen);
+        Expect(TokenKind.Where);
+        var predicate = ParseExpression();
+        Expect(TokenKind.RParen);
+        return predicate;
+    }
+
     private Expression ParseIdentifierExpression()
     {
         var first = Advance();
@@ -1667,6 +1688,23 @@ public sealed class Parser
             {
                 Advance();
                 Expect(TokenKind.RParen);
+
+                // COUNT(*) FILTER (WHERE p) ≡ COUNT(CASE WHEN p THEN 1 END):
+                // count only the rows where p holds (the CASE is non-NULL there).
+                var starFilter = TryParseAggregateFilter();
+                if (starFilter is not null)
+                {
+                    if (IsContextualKeyword("over"))
+                    {
+                        throw Error(first, "FILTER is not supported with a window function");
+                    }
+
+                    var oneArm = new CaseExpression(
+                        new[] { new CaseWhenClause(starFilter, new LiteralExpression(LiteralKind.Integer, 1L)) },
+                        ElseResult: null);
+                    return new FunctionCallExpression(first.Text, new Expression[] { oneArm }, IsStar: false);
+                }
+
                 if (IsContextualKeyword("over"))
                 {
                     Advance();
@@ -1737,6 +1775,29 @@ public sealed class Parser
             if (first.Text == "decode")
             {
                 return BuildDecodeExpression(args, first);
+            }
+
+            // agg(x) FILTER (WHERE p) ≡ agg(CASE WHEN p THEN x END): unmatched
+            // rows become NULL, which every aggregate ignores. Pure sugar — it
+            // flows through the CASE + aggregate machinery unchanged (a DISTINCT
+            // modifier is preserved). The window form is out of scope.
+            var filter = TryParseAggregateFilter();
+            if (filter is not null)
+            {
+                if (IsContextualKeyword("over"))
+                {
+                    throw Error(first, "FILTER is not supported with a window function");
+                }
+
+                if (args.Count != 1)
+                {
+                    throw Error(first, "FILTER requires a single-argument aggregate");
+                }
+
+                var arm = new CaseExpression(
+                    new[] { new CaseWhenClause(filter, args[0]) }, ElseResult: null);
+                return new FunctionCallExpression(
+                    first.Text, new Expression[] { arm }, IsStar: false, Distinct: distinct);
             }
 
             // A trailing OVER (...) turns the call into a window function. The
