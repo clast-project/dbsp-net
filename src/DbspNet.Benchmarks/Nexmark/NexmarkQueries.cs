@@ -120,6 +120,54 @@ internal static class NexmarkQueries
               ) w ON a.id = w.auction",
             AuctionBid),
         new(
+            "q15",
+            "bidding statistics report — per-day bid/bidder/auction counts",
+            // Feldera uses COUNT(*) FILTER / COUNT(DISTINCT …) FILTER over
+            // to_char(date_time,'YYYY-MM-DD'). DbspNet-dialect equivalents:
+            // CAST(date_time AS DATE) for the day bucket, SUM(CASE …) for the
+            // conditional plain counts, and COUNT(DISTINCT CASE WHEN p THEN x END)
+            // for the conditional distinct counts (the CASE yields NULL when the
+            // predicate is false and COUNT(DISTINCT) ignores NULL — exactly the
+            // FILTER semantics).
+            @"SELECT CAST(date_time AS DATE) AS day,
+                     COUNT(*) AS total_bids,
+                     SUM(CASE WHEN price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
+                     SUM(CASE WHEN price >= 10000 AND price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
+                     SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                     COUNT(DISTINCT bidder) AS total_bidders,
+                     COUNT(DISTINCT CASE WHEN price < 10000 THEN bidder END) AS rank1_bidders,
+                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN bidder END) AS rank2_bidders,
+                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN bidder END) AS rank3_bidders,
+                     COUNT(DISTINCT auction) AS total_auctions,
+                     COUNT(DISTINCT CASE WHEN price < 10000 THEN auction END) AS rank1_auctions,
+                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN auction END) AS rank2_auctions,
+                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN auction END) AS rank3_auctions
+              FROM bid
+              GROUP BY CAST(date_time AS DATE)",
+            BidOnly),
+        new(
+            "q16",
+            "channel statistics report — per-channel/day bid/bidder/auction counts",
+            // As q15 but keyed by channel and day. Feldera's cosmetic `minute`
+            // column (max of to_char(date_time,'HH:mm')) is omitted — DbspNet has
+            // no minute-format scalar and it does not exercise COUNT(DISTINCT).
+            @"SELECT channel, CAST(date_time AS DATE) AS day,
+                     COUNT(*) AS total_bids,
+                     SUM(CASE WHEN price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
+                     SUM(CASE WHEN price >= 10000 AND price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
+                     SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                     COUNT(DISTINCT bidder) AS total_bidders,
+                     COUNT(DISTINCT CASE WHEN price < 10000 THEN bidder END) AS rank1_bidders,
+                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN bidder END) AS rank2_bidders,
+                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN bidder END) AS rank3_bidders,
+                     COUNT(DISTINCT auction) AS total_auctions,
+                     COUNT(DISTINCT CASE WHEN price < 10000 THEN auction END) AS rank1_auctions,
+                     COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN auction END) AS rank2_auctions,
+                     COUNT(DISTINCT CASE WHEN price >= 1000000 THEN auction END) AS rank3_auctions
+              FROM bid
+              GROUP BY channel, CAST(date_time AS DATE)",
+            BidOnly),
+        new(
             "q17",
             "auction statistics by day",
             // Feldera uses COUNT(*) FILTER (WHERE …) + DATE_FORMAT; the DbspNet

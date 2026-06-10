@@ -212,7 +212,8 @@ grows and the GC frontier climbs.
   `LOG` (base-10, or `LOG(b, x)`), `EXP`. String functions are native UTF-8
   with code-point semantics. NULL semantics follow PostgreSQL (most propagate;
   `CONCAT`/`GREATEST`/`LEAST` skip NULLs).
-- Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`,
+- Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT x)` (exact),
+  `MIN`, `MAX`, `AVG`,
   `APPROX_COUNT_DISTINCT` (HyperLogLog; bounded state, exact in the
   small-cardinality regime), and approximate quantiles —
   `APPROX_PERCENTILE(x, f)`, `MEDIAN(x)`, and the ANSI ordered-set spellings

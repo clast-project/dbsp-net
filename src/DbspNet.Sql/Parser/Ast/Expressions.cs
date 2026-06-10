@@ -110,12 +110,15 @@ public sealed record CastExpression(Expression Operand, SqlTypeSpec TargetType) 
 /// <summary>
 /// A function or aggregate call. <see cref="IsStar"/> is set for
 /// <c>COUNT(*)</c> (and only there in v1) and forces <see cref="Arguments"/>
-/// to be empty.
+/// to be empty. <see cref="Distinct"/> is set for the <c>DISTINCT</c> argument
+/// modifier (<c>COUNT(DISTINCT x)</c>); the resolver accepts it only on
+/// <c>COUNT</c>.
 /// </summary>
 public sealed record FunctionCallExpression(
     string FunctionName,
     IReadOnlyList<Expression> Arguments,
-    bool IsStar) : Expression;
+    bool IsStar,
+    bool Distinct = false) : Expression;
 
 /// <summary>The framing mode of a window <see cref="WindowFrame"/>. Only
 /// <see cref="Range"/> is supported by the resolver in v1; <see cref="Rows"/> /

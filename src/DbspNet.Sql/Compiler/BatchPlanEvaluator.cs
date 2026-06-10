@@ -711,6 +711,7 @@ internal static class BatchPlanEvaluator
     {
         AggregateKind.CountStar => new SqlCountStarAggregator(),
         AggregateKind.Count => new SqlCountAggregator(ExpressionCompiler.CompileScalar(call.Argument!)),
+        AggregateKind.CountDistinct => new SqlCountDistinctAggregator(ExpressionCompiler.CompileScalar(call.Argument!)),
         AggregateKind.ApproxCountDistinct => new SqlApproxCountDistinctAggregator(ExpressionCompiler.CompileScalar(call.Argument!)),
         AggregateKind.ApproxPercentile => DdSketchSupport.BuildStructuralPercentile(call),
         AggregateKind.Sum => new SqlSumAggregator(ExpressionCompiler.CompileScalar(call.Argument!), call.ResultType),

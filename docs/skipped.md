@@ -245,8 +245,8 @@ reflect that shape, not a backlog.
   bag-semantics no-op default); the resolver wraps the projection's
   `ProjectPlan` in a `DistinctPlan`, so the existing `DistinctOp` (and its
   spine sibling) handles the dedup incrementally on both compiler paths.
-  Distinct-inside-aggregates (`COUNT(DISTINCT x)`) is still listed
-  separately under Aggregate functions.
+  Distinct-inside-aggregates (`COUNT(DISTINCT x)`) is **implemented** —
+  see the Aggregate functions section.
 - `CASE WHEN ... THEN ... [ELSE ...] END` (searched form) and
   `CASE x WHEN v THEN ... END` (simple form) — **implemented**. Modeled
   as a flat `CaseExpression(whens, elseResult)` AST node so the recursive
@@ -375,8 +375,20 @@ reflect that shape, not a backlog.
   (the typed fast path falls back, as INTERVAL arithmetic already does). The
   array-returning `APPROX_QUANTILES(x, n)` is still deferred.
   Heavy-hitters (Count-Min) remain **[P2]**.
-- **[P1]** `FILTER (WHERE …)` clause on aggregates.
-- **[P1]** `DISTINCT` in aggregates; `WITHIN DISTINCT`.
+- **[P1]** `FILTER (WHERE …)` clause on aggregates. (Rewritable to `CASE`: a
+  conditional plain count is `SUM(CASE WHEN p THEN 1 ELSE 0 END)`, and a
+  conditional distinct count is `COUNT(DISTINCT CASE WHEN p THEN x END)` — the
+  CASE yields NULL when `p` is false and the count ignores NULL.)
+- **[DONE]** Exact `COUNT(DISTINCT x)` — the number of distinct non-NULL argument
+  values per group, on both compile paths and both trace families. The `DISTINCT`
+  argument modifier is parsed onto `FunctionCallExpression` and accepted by the
+  resolver only on `COUNT` (mapped to `AggregateKind.CountDistinct`); other
+  aggregates reject it. State is an invertible per-value positive-weight count
+  (the `MIN`/`MAX` membership model), so a retraction that empties a value's count
+  drops it without a rebuild and the incremental result equals a batch recompute
+  exactly. Non-linear, so it bails out of aggregate-input column pruning like
+  `MIN`/`MAX`/`APPROX_COUNT_DISTINCT`. Unlocks Nexmark q15/q16. `DISTINCT` on
+  other aggregates and `WITHIN DISTINCT` remain **[P1]**.
 - **[P2]** `ARG_MIN`, `ARG_MAX`, `ARRAY_AGG` (with `ORDER BY`,
   `RESPECT|IGNORE NULLS`), `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`.
 - **[P2]** Bitwise aggregates: `BIT_AND`, `BIT_OR`, `BIT_XOR`.

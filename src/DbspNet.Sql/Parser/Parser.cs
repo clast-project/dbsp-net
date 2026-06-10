@@ -1693,6 +1693,15 @@ public sealed class Parser
                 return new FunctionCallExpression("position", new[] { needle, haystack }, IsStar: false);
             }
 
+            // DISTINCT argument modifier — COUNT(DISTINCT x). Captured here for
+            // any function spelling; the resolver accepts it only on COUNT.
+            var distinct = false;
+            if (Peek().Kind == TokenKind.Distinct)
+            {
+                Advance();
+                distinct = true;
+            }
+
             var args = new List<Expression>();
             if (Peek().Kind != TokenKind.RParen)
             {
@@ -1738,11 +1747,16 @@ public sealed class Parser
             // window-aggregate resolver can read the aggregate argument.
             if (IsContextualKeyword("over"))
             {
+                if (distinct)
+                {
+                    throw Error(first, "DISTINCT is not supported in a window function");
+                }
+
                 Advance();
                 return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseWindowSpec());
             }
 
-            return new FunctionCallExpression(first.Text, args, IsStar: false);
+            return new FunctionCallExpression(first.Text, args, IsStar: false, Distinct: distinct);
         }
 
         return new ColumnReference(Qualifier: null, first.Text);

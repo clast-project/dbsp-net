@@ -891,6 +891,75 @@ internal sealed class TypedApproxCountDistinctAggregator<TIn> : TypedSqlAggregat
 }
 
 /// <summary>
+/// Typed <c>COUNT(DISTINCT x)</c>: the exact number of distinct non-NULL
+/// argument values in the group. Uses the same boxing argument extractor as
+/// <see cref="TypedApproxCountDistinctAggregator{TIn}"/> (<c>null</c> for SQL
+/// NULL), so one implementation covers every argument type, and the same
+/// invertible per-value count state as <see cref="SqlCountDistinctAggregator"/>,
+/// so the incremental result equals a batch recompute exactly.
+/// </summary>
+internal sealed class TypedCountDistinctAggregator<TIn> : TypedSqlAggregator<TIn>
+    where TIn : notnull
+{
+    private readonly Func<TIn, object?> _argExtract;
+
+    public TypedCountDistinctAggregator(Func<TIn, object?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class State
+    {
+        public Dictionary<object, long> Counts = new();
+    }
+
+    public override Type ResultClrType => typeof(long);
+
+    public override object? Compute(IMultiset<TIn, Z64> rows)
+    {
+        var seen = new HashSet<object>();
+        foreach (var (row, w) in rows)
+        {
+            if (!Z64.IsPositive(w)) continue;
+            var v = _argExtract(row);
+            if (v is null) continue;
+            seen.Add(v);
+        }
+
+        return (long)seen.Count;
+    }
+
+    public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
+    {
+        var s = state as State ?? new State();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (v is null) continue;
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            var wasPositive = beforeW > 0;
+            var isPositive = afterW > 0;
+            if (wasPositive == isPositive) continue;
+
+            if (isPositive)
+            {
+                s.Counts[v] = s.Counts.GetValueOrDefault(v, 0L) + 1;
+            }
+            else
+            {
+                var c = s.Counts[v] - 1;
+                if (c == 0) s.Counts.Remove(v);
+                else s.Counts[v] = c;
+            }
+        }
+
+        state = s;
+        return (long)s.Counts.Count;
+    }
+}
+
+/// <summary>
 /// Typed <c>APPROX_PERCENTILE</c> / <c>MEDIAN</c> / <c>PERCENTILE_CONT</c> over a
 /// <b>numeric or INTERVAL</b> argument: DDSketch estimate of the requested
 /// quantile of the non-NULL argument values. The boxing argument extractor

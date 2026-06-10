@@ -5072,6 +5072,16 @@ public sealed class Resolver
             return AggregateKind.CountStar;
         }
 
+        if (call.Distinct)
+        {
+            // DISTINCT is only wired for COUNT; every other aggregate would
+            // silently ignore it, so reject rather than mislead.
+            return call.FunctionName == "count"
+                ? AggregateKind.CountDistinct
+                : throw new ResolveException(
+                    $"DISTINCT is not supported for {call.FunctionName.ToUpperInvariant()}");
+        }
+
         return call.FunctionName switch
         {
             "count" => AggregateKind.Count,
@@ -5093,6 +5103,13 @@ public sealed class Resolver
             case AggregateKind.CountStar:
                 return new SqlBigintType(false);
             case AggregateKind.Count:
+                return new SqlBigintType(false);
+            case AggregateKind.CountDistinct:
+                if (argType is null)
+                {
+                    throw new ResolveException("COUNT(DISTINCT) requires an argument");
+                }
+
                 return new SqlBigintType(false);
             case AggregateKind.ApproxCountDistinct:
                 if (argType is null)

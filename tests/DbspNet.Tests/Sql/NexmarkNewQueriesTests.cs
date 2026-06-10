@@ -31,6 +31,40 @@ public class NexmarkNewQueriesTests
             channel VARCHAR NOT NULL, url VARCHAR NOT NULL, date_time TIMESTAMP NOT NULL, extra VARCHAR NOT NULL)",
     };
 
+    private const string Q15 =
+        @"SELECT CAST(date_time AS DATE) AS day,
+                 COUNT(*) AS total_bids,
+                 SUM(CASE WHEN price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
+                 SUM(CASE WHEN price >= 10000 AND price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
+                 SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                 COUNT(DISTINCT bidder) AS total_bidders,
+                 COUNT(DISTINCT CASE WHEN price < 10000 THEN bidder END) AS rank1_bidders,
+                 COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN bidder END) AS rank2_bidders,
+                 COUNT(DISTINCT CASE WHEN price >= 1000000 THEN bidder END) AS rank3_bidders,
+                 COUNT(DISTINCT auction) AS total_auctions,
+                 COUNT(DISTINCT CASE WHEN price < 10000 THEN auction END) AS rank1_auctions,
+                 COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN auction END) AS rank2_auctions,
+                 COUNT(DISTINCT CASE WHEN price >= 1000000 THEN auction END) AS rank3_auctions
+          FROM bid
+          GROUP BY CAST(date_time AS DATE)";
+
+    private const string Q16 =
+        @"SELECT channel, CAST(date_time AS DATE) AS day,
+                 COUNT(*) AS total_bids,
+                 SUM(CASE WHEN price < 10000 THEN 1 ELSE 0 END) AS rank1_bids,
+                 SUM(CASE WHEN price >= 10000 AND price < 1000000 THEN 1 ELSE 0 END) AS rank2_bids,
+                 SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS rank3_bids,
+                 COUNT(DISTINCT bidder) AS total_bidders,
+                 COUNT(DISTINCT CASE WHEN price < 10000 THEN bidder END) AS rank1_bidders,
+                 COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN bidder END) AS rank2_bidders,
+                 COUNT(DISTINCT CASE WHEN price >= 1000000 THEN bidder END) AS rank3_bidders,
+                 COUNT(DISTINCT auction) AS total_auctions,
+                 COUNT(DISTINCT CASE WHEN price < 10000 THEN auction END) AS rank1_auctions,
+                 COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 1000000 THEN auction END) AS rank2_auctions,
+                 COUNT(DISTINCT CASE WHEN price >= 1000000 THEN auction END) AS rank3_auctions
+          FROM bid
+          GROUP BY channel, CAST(date_time AS DATE)";
+
     private const string Q17 =
         @"SELECT b.auction, CAST(b.date_time AS DATE) AS day,
                  COUNT(*) AS total_bids,
@@ -84,6 +118,9 @@ public class NexmarkNewQueriesTests
     private static void InsertBid(CompiledQuery q, long auction, long bidder, long price, long timeMicros) =>
         q.Table("bid").Insert(auction, bidder, price, "ch", "url", new Timestamp(timeMicros), "x");
 
+    private static void InsertBidCh(CompiledQuery q, long auction, long bidder, long price, string channel, long timeMicros) =>
+        q.Table("bid").Insert(auction, bidder, price, channel, "url", new Timestamp(timeMicros), "x");
+
     private static void InsertAuction(CompiledQuery q, long id, long category) =>
         q.Table("auction").Insert(id, "item", "desc", 1L, 1L, new Timestamp(0), new Timestamp(0), 99L, category, "x");
 
@@ -107,6 +144,76 @@ public class NexmarkNewQueriesTests
         }
 
         return rows;
+    }
+
+    [Fact]
+    public void Q15_BiddingStatistics_DistinctBiddersAndAuctionsPerDay()
+    {
+        var q = Compile(Q15);
+        // All bids within epoch day 0 (micros < one day), so a single group.
+        // Rank bands: <10k (rank1), [10k,1M) (rank2), >=1M (rank3).
+        InsertBid(q, auction: 1, bidder: 1, price: 5000, timeMicros: 1_000_000);     // rank1
+        InsertBid(q, auction: 1, bidder: 2, price: 8000, timeMicros: 2_000_000);     // rank1
+        InsertBid(q, auction: 2, bidder: 1, price: 9000, timeMicros: 3_000_000);     // rank1 (bidder 1 again)
+        InsertBid(q, auction: 2, bidder: 3, price: 50000, timeMicros: 4_000_000);    // rank2
+        InsertBid(q, auction: 3, bidder: 4, price: 2000000, timeMicros: 5_000_000);  // rank3
+        InsertBid(q, auction: 3, bidder: 4, price: 3000000, timeMicros: 6_000_000);  // rank3 (bidder 4 again)
+        q.Step();
+
+        var rows = PositiveRows(q, 13);
+        Assert.Single(rows);
+        var r = rows[0];
+        Assert.Equal(new Date32(0), r[0]);   // day bucket
+        Assert.Equal(6L, r[1]);              // total_bids
+        Assert.Equal(3L, r[2]);              // rank1_bids
+        Assert.Equal(1L, r[3]);              // rank2_bids
+        Assert.Equal(2L, r[4]);              // rank3_bids
+        Assert.Equal(4L, r[5]);              // total_bidders {1,2,3,4}
+        Assert.Equal(2L, r[6]);              // rank1_bidders {1,2}
+        Assert.Equal(1L, r[7]);              // rank2_bidders {3}
+        Assert.Equal(1L, r[8]);              // rank3_bidders {4}
+        Assert.Equal(3L, r[9]);              // total_auctions {1,2,3}
+        Assert.Equal(2L, r[10]);             // rank1_auctions {1,2}
+        Assert.Equal(1L, r[11]);             // rank2_auctions {2}
+        Assert.Equal(1L, r[12]);             // rank3_auctions {3}
+    }
+
+    [Fact]
+    public void Q16_ChannelStatistics_DistinctCountsPerChannelDay()
+    {
+        var q = Compile(Q16);
+        // Channel "a": one rank1 bid (bidder 1) and one rank3 bid (bidder 2) on auction 1.
+        // Channel "b": one rank2 bid (bidder 1) on auction 2. All within day 0.
+        InsertBidCh(q, auction: 1, bidder: 1, price: 5000, channel: "a", timeMicros: 1_000_000);
+        InsertBidCh(q, auction: 1, bidder: 2, price: 2000000, channel: "a", timeMicros: 2_000_000);
+        InsertBidCh(q, auction: 2, bidder: 1, price: 50000, channel: "b", timeMicros: 3_000_000);
+        q.Step();
+
+        var rows = PositiveRows(q, 14);
+        Assert.Equal(2, rows.Count);
+
+        var a = rows.Single(row => row[0]!.ToString() == "a");
+        Assert.Equal(new Date32(0), a[1]);   // day
+        Assert.Equal(2L, a[2]);              // total_bids
+        Assert.Equal(1L, a[3]);              // rank1_bids
+        Assert.Equal(0L, a[4]);              // rank2_bids
+        Assert.Equal(1L, a[5]);              // rank3_bids
+        Assert.Equal(2L, a[6]);              // total_bidders {1,2}
+        Assert.Equal(1L, a[7]);              // rank1_bidders {1}
+        Assert.Equal(0L, a[8]);              // rank2_bidders {}
+        Assert.Equal(1L, a[9]);              // rank3_bidders {2}
+        Assert.Equal(1L, a[10]);             // total_auctions {1}
+        Assert.Equal(1L, a[11]);             // rank1_auctions {1}
+        Assert.Equal(0L, a[12]);             // rank2_auctions {}
+        Assert.Equal(1L, a[13]);             // rank3_auctions {1}
+
+        var b = rows.Single(row => row[0]!.ToString() == "b");
+        Assert.Equal(1L, b[2]);              // total_bids
+        Assert.Equal(1L, b[4]);              // rank2_bids
+        Assert.Equal(1L, b[6]);              // total_bidders {1}
+        Assert.Equal(1L, b[8]);              // rank2_bidders {1}
+        Assert.Equal(1L, b[10]);             // total_auctions {2}
+        Assert.Equal(1L, b[12]);             // rank2_auctions {2}
     }
 
     [Fact]

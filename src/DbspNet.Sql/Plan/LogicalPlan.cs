@@ -398,6 +398,13 @@ public enum AggregateKind
     Avg,
     ApproxCountDistinct,
     ApproxPercentile,
+
+    /// <summary>
+    /// Exact <c>COUNT(DISTINCT x)</c> — the number of distinct non-NULL values
+    /// of the argument in the group. Appended after the approximate kinds so the
+    /// existing ordinals (and thus persisted plan fingerprints) are unchanged.
+    /// </summary>
+    CountDistinct,
 }
 
 /// <summary>

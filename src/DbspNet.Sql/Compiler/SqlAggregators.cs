@@ -653,6 +653,109 @@ internal sealed class SqlApproxCountDistinctAggregator : SqlAggregator
 }
 
 /// <summary>
+/// SQL <c>COUNT(DISTINCT expr)</c> — the <b>exact</b> number of distinct
+/// non-NULL argument values present in the group. Returns a non-nullable
+/// <c>BIGINT</c> (0 for an all-NULL or empty group, like <c>COUNT(col)</c>).
+/// </summary>
+/// <remarks>
+/// State mirrors <see cref="SqlMinMaxAggregator"/>: <see cref="State.Counts"/>
+/// maps each distinct non-NULL value to the number of rows in the post-delta
+/// multiset that carry it with strictly-positive net weight. A value is
+/// "present" (and contributes 1 to the count) iff that per-value count is
+/// positive, so the aggregate is fully invertible — a retraction that empties a
+/// value's count drops it without a rebuild. Because the present-value set is a
+/// deterministic function of the multiset, the incremental result equals a
+/// from-scratch batch recompute exactly.
+/// </remarks>
+internal sealed class SqlCountDistinctAggregator : SqlAggregator
+{
+    private readonly Func<StructuralRow, object?> _argExtract;
+
+    public SqlCountDistinctAggregator(Func<StructuralRow, object?> argExtract)
+    {
+        _argExtract = argExtract;
+    }
+
+    private sealed class State
+    {
+        public Dictionary<object, long> Counts = new();
+    }
+
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
+    {
+        // Distinct non-NULL values appearing in any positive-weight row — the
+        // same membership model SqlMinMaxAggregator.Compute uses.
+        var seen = new HashSet<object>();
+        foreach (var (row, w) in rows)
+        {
+            if (!Z64.IsPositive(w))
+            {
+                continue;
+            }
+
+            var v = _argExtract(row);
+            if (v is null)
+            {
+                continue;
+            }
+
+            seen.Add(v);
+        }
+
+        return (long)seen.Count;
+    }
+
+    public override object? Update(
+        ref object? state,
+        object? oldValue,
+        ZSet<StructuralRow, Z64> delta,
+        IMultiset<StructuralRow, Z64> after)
+    {
+        var s = state as State ?? new State();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (v is null)
+            {
+                continue;
+            }
+
+            // Flip this value's per-value membership only when this row's net
+            // weight crosses the positive/non-positive boundary (the same
+            // transition logic as SqlMinMaxAggregator).
+            var afterW = after.WeightOf(row).Value;
+            var beforeW = afterW - w.Value;
+            var wasPositive = beforeW > 0;
+            var isPositive = afterW > 0;
+            if (wasPositive == isPositive)
+            {
+                continue;
+            }
+
+            if (isPositive)
+            {
+                s.Counts[v] = s.Counts.GetValueOrDefault(v, 0L) + 1;
+            }
+            else
+            {
+                var c = s.Counts[v] - 1;
+                if (c == 0)
+                {
+                    s.Counts.Remove(v);
+                }
+                else
+                {
+                    s.Counts[v] = c;
+                }
+            }
+        }
+
+        state = s;
+        return (long)s.Counts.Count;
+    }
+}
+
+/// <summary>
 /// SQL <c>APPROX_PERCENTILE(expr, fraction)</c> / <c>MEDIAN</c> /
 /// <c>PERCENTILE_CONT</c> over a <b>numeric or INTERVAL</b> argument — a DDSketch
 /// estimate of the value at the requested <see cref="_fraction"/> quantile of

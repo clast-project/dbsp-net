@@ -2549,6 +2549,9 @@ public static class PlanToCircuit
                 return new SqlCountStarAggregator();
             case AggregateKind.Count:
                 return new SqlCountAggregator(ExpressionCompiler.CompileScalar(call.Argument!));
+            case AggregateKind.CountDistinct:
+                return new SqlCountDistinctAggregator(
+                    ExpressionCompiler.CompileScalar(call.Argument!));
             case AggregateKind.ApproxCountDistinct:
                 return new SqlApproxCountDistinctAggregator(
                     ExpressionCompiler.CompileScalar(call.Argument!));
