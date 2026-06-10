@@ -49,6 +49,36 @@ internal static class NexmarkQueries
         string Sql,
         NexmarkGenerator.NexmarkTable[] Tables);
 
+    /// <summary>
+    /// A standard Nexmark query DbspNet cannot yet compile, with the reason.
+    /// These are emitted as explicit rows in the throughput report so a
+    /// side-by-side comparison shows a declared capability gap rather than a
+    /// silent omission that reads as "the runner didn't run it".
+    /// </summary>
+    public sealed record Unsupported(string Id, string Description, string Reason);
+
+    /// <summary>
+    /// The standard Nexmark queries DbspNet does not run. All five need an
+    /// event-time / processing-time windowing table function (TUMBLE / HOP /
+    /// SESSION) that DbspNet does not yet expose — see
+    /// <c>docs/skipped.md</c> (window functions). Feldera additionally omits
+    /// q6/q10/q11/q13/q14/q21 from its own published set, so they are not listed
+    /// here as DbspNet-specific gaps.
+    /// </summary>
+    public static readonly Unsupported[] NotSupported =
+    {
+        new("q5", "hot items — sliding-window auction popularity",
+            "needs a HOP (sliding) windowing table function"),
+        new("q7", "highest bid by window — tumbling-window max price + join",
+            "needs a TUMBLE (tumbling) windowing table function"),
+        new("q8", "monitor new users — windowed person ⋈ auction",
+            "needs a TUMBLE windowing table function"),
+        new("q11", "user sessions — session-window bid counts",
+            "needs a SESSION windowing table function"),
+        new("q12", "processing-time windows — per-bidder bid counts",
+            "needs processing-time TUMBLE windows"),
+    };
+
     private static readonly NexmarkGenerator.NexmarkTable[] BidOnly =
         { NexmarkGenerator.NexmarkTable.Bid };
 

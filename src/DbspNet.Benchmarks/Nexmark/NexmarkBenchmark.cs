@@ -82,6 +82,14 @@ internal static class NexmarkBenchmark
             RunOne(output, query, events, batchSize, runs, workers);
         }
 
+        // Emit the declared capability gaps as explicit rows, so a side-by-side
+        // comparison shows *why* DbspNet has no number here rather than a bare
+        // "n/a" that reads as "the runner skipped it".
+        foreach (var u in NexmarkQueries.NotSupported)
+        {
+            ReportUnsupported(output, u, workers);
+        }
+
         output.AppendLine();
         output.AppendLine(
             "> *Last Δ rows* is the size of the output change-set emitted by the " +
@@ -89,16 +97,26 @@ internal static class NexmarkBenchmark
             "the full materialized view size.");
         output.AppendLine(">");
         output.AppendLine(
-            "> Queries q5 / q7 / q8 / q11 / q12 (tumbling / sliding / session " +
-            "event-time windows) are omitted: they require TUMBLE / HOP / SESSION " +
-            "windowing table functions that DbspNet does not yet expose. q9 / q18 / " +
-            "q19 use `ROW_NUMBER() OVER (PARTITION … ORDER …)` → a partitioned " +
-            "incremental TOP-K (and, in parallel, an exchange on the partition key); " +
-            "q20 is a filtered bid ⋈ auction join; q17 (per-auction/day statistics " +
-            "with conditional `SUM(CASE …)` counts over a `CAST(date_time AS DATE)` " +
-            "group key) compiles but has no parallel form today, so it runs " +
-            "single-only.");
+            "> The `unsupported` rows (q5 / q7 / q8 / q11 / q12 — tumbling / sliding " +
+            "/ session event-time and processing-time windows) require TUMBLE / HOP " +
+            "/ SESSION windowing table functions that DbspNet does not yet expose; " +
+            "they are listed explicitly so a Feldera comparison shows a declared gap, " +
+            "not a silent omission. Among the queries that do run: q9 / q18 / q19 use " +
+            "`ROW_NUMBER() OVER (PARTITION … ORDER …)` → a partitioned incremental " +
+            "TOP-K (and, in parallel, an exchange on the partition key); q20 is a " +
+            "filtered bid ⋈ auction join; q22 splits the bid URL with `SPLIT_INDEX`; " +
+            "q15 / q16 / q17 (per-day / per-channel / per-auction statistics with " +
+            "`COUNT(DISTINCT …)` and conditional `SUM(CASE …)` counts over a " +
+            "`CAST(date_time AS DATE)` group key) compile but have no parallel form " +
+            "today, so they run single-only.");
         output.AppendLine();
+    }
+
+    private static void ReportUnsupported(StringBuilder output, NexmarkQueries.Unsupported u, int workers)
+    {
+        Console.WriteLine($"  {u.Id}: unsupported — {u.Reason}");
+        var blanks = workers > 1 ? "— | — | — | —" : "— | —";
+        output.AppendLine($"| {u.Id} | {u.Description} | {blanks} | unsupported ({u.Reason}) |");
     }
 
     private static void RunOne(
