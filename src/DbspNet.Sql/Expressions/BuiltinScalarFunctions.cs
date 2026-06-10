@@ -1061,10 +1061,16 @@ internal static class SqlBuiltinRuntime
     /// NULL if <c>n</c> is negative or past the last part (Flink/Feldera).
     /// NULL in any argument → NULL.
     /// </summary>
-    public static object? SplitIndex(object? s, object? delim, object? n) =>
-        s is null || delim is null || n is null
-            ? null
-            : SplitIndexCore((Utf8String)s, (Utf8String)delim, AsInt(n));
+    public static object? SplitIndex(object? s, object? delim, object? n)
+    {
+        if (s is null || delim is null || n is null)
+        {
+            return null;
+        }
+
+        var result = SplitIndexCore((Utf8String)s, (Utf8String)delim, AsInt(n));
+        return result.HasValue ? result.Value : null;
+    }
 
     /// <summary>
     /// <c>SPLIT_PART(s, delim, n)</c> — split <paramref name="s"/> on
@@ -1324,7 +1330,7 @@ internal static class SqlBuiltinRuntime
         return Utf8String.FromBytes(result.ToArray());
     }
 
-    internal static object? SplitIndexCore(Utf8String s, Utf8String delim, int n)
+    internal static Utf8String? SplitIndexCore(Utf8String s, Utf8String delim, int n)
     {
         if (n < 0)
         {
@@ -1332,7 +1338,7 @@ internal static class SqlBuiltinRuntime
         }
 
         return TryNthPart(s.Span, delim.Span, n, out var start, out var end)
-            ? (object)Utf8String.FromBytes(s.Span[start..end].ToArray())
+            ? Utf8String.FromBytes(s.Span[start..end].ToArray())
             : null;
     }
 

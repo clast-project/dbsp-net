@@ -108,6 +108,34 @@ public class ParallelTypedCompilerTests
     [InlineData(1)]
     [InlineData(2)]
     [InlineData(4)]
+    public void SplitProjection_MatchesSingle(int workers)
+    {
+        // A stateless projection using SPLIT_INDEX / SPLIT_PART. The point is that
+        // it compiles on the TYPED path (so a parallel plan exists at all — the
+        // structural fallback has none); the byte-wise split result is then
+        // sharded trivially and must match the single-circuit output. Regression
+        // guard for the q22 "single-only" fix.
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (url VARCHAR NOT NULL)"],
+            "SELECT SPLIT_INDEX(url, '/', 3) AS d1, SPLIT_INDEX(url, '/', 9) AS oob, " +
+            "SPLIT_PART(url, '/', 1) AS p1 FROM t",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert("https://h/aaa/bbb");
+                tbl("t").Insert("https://h/ccc/ddd");
+            },
+            tbl =>
+            {
+                tbl("t").Insert("no-delimiters-here");
+                tbl("t").Delete("https://h/aaa/bbb");
+            });
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
     [InlineData(8)]
     public void EquiJoin_MatchesSingle(int workers)
     {

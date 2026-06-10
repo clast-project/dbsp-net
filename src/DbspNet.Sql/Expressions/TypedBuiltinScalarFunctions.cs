@@ -269,6 +269,78 @@ internal static class TypedBuiltinScalarFunctions
         return Expression.Call(ConcatStrictTypedNullable, nullableArray);
     }
 
+    // ---- SPLIT_INDEX / SPLIT_PART ----
+
+    internal static readonly MethodInfo SplitIndexTyped =
+        typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.SplitIndexTyped))!;
+    internal static readonly MethodInfo SplitPartTyped =
+        typeof(TypedBuiltinRuntime).GetMethod(nameof(TypedBuiltinRuntime.SplitPartTyped))!;
+
+    internal static Expression BuildSplitIndex(Expression[] args) => BuildSplit(args, SplitIndexTyped);
+
+    internal static Expression BuildSplitPart(Expression[] args) => BuildSplit(args, SplitPartTyped);
+
+    /// <summary>
+    /// Lower SPLIT_INDEX / SPLIT_PART on the typed path. The runtime helper takes
+    /// the three unwrapped values (string, delimiter, <c>int</c> index) and
+    /// returns <c>Utf8String?</c> (SPLIT_INDEX, NULL out of range) or
+    /// <c>Utf8String</c> (SPLIT_PART). NULL in any argument propagates: when any
+    /// arg is nullable the call is guarded by an all-have-value check and the
+    /// result is lifted to <c>Utf8String?</c>.
+    /// </summary>
+    private static Expression BuildSplit(Expression[] args, MethodInfo runtime)
+    {
+        var anyNullable = TypedExpressionCompiler.IsNullable(args[0].Type)
+            || TypedExpressionCompiler.IsNullable(args[1].Type)
+            || TypedExpressionCompiler.IsNullable(args[2].Type);
+
+        if (!anyNullable)
+        {
+            // Every arg is definite — call directly. SPLIT_INDEX still returns
+            // Utf8String? (out-of-range → NULL); SPLIT_PART returns Utf8String.
+            return Expression.Call(runtime, args[0], args[1], ToInt(args[2]));
+        }
+
+        var sLocal = Expression.Variable(args[0].Type, "s");
+        var dLocal = Expression.Variable(args[1].Type, "d");
+        var nLocal = Expression.Variable(args[2].Type, "n");
+
+        var rawCall = Expression.Call(runtime, Unwrap(sLocal), Unwrap(dLocal), ToInt(Unwrap(nLocal)));
+
+        // Lift the runtime result (Utf8String? or Utf8String) to the nullable
+        // result type so the null branch shares it.
+        var resultType = rawCall.Type.IsValueType && !TypedExpressionCompiler.IsNullable(rawCall.Type)
+            ? typeof(Nullable<>).MakeGenericType(rawCall.Type)
+            : rawCall.Type;
+        Expression lifted = rawCall.Type == resultType ? rawCall : Expression.Convert(rawCall, resultType);
+        var nullConst = Expression.Constant(null, resultType);
+
+        var allHaveValue = Expression.AndAlso(
+            Expression.AndAlso(HasValue(sLocal), HasValue(dLocal)), HasValue(nLocal));
+
+        return Expression.Block(
+            new[] { sLocal, dLocal, nLocal },
+            Expression.Assign(sLocal, args[0]),
+            Expression.Assign(dLocal, args[1]),
+            Expression.Assign(nLocal, args[2]),
+            Expression.Condition(allHaveValue, lifted, nullConst));
+    }
+
+    private static Expression Unwrap(Expression local) =>
+        TypedExpressionCompiler.IsNullable(local.Type)
+            ? Expression.Property(local, nameof(Nullable<int>.Value))
+            : local;
+
+    private static Expression HasValue(Expression local) =>
+        TypedExpressionCompiler.IsNullable(local.Type)
+            ? Expression.Property(local, nameof(Nullable<int>.HasValue))
+            : Expression.Constant(true);
+
+    // The split index resolves as INT or BIGINT; narrow BIGINT to int (checked,
+    // matching the structural AsInt) so it reaches the runtime helper's int arg.
+    private static Expression ToInt(Expression e) =>
+        e.Type == typeof(int) ? e : Expression.ConvertChecked(e, typeof(int));
+
     // ---- Numeric ----
 
     internal static Expression BuildAbs(Expression arg, SqlType argType)
@@ -507,6 +579,20 @@ internal static class TypedBuiltinRuntime
 
         return Utf8String.FromBytes(buf);
     }
+
+    /// <summary>
+    /// SPLIT_INDEX on the typed path: the n-th (0-based) part, or <c>null</c> when
+    /// out of range. Shares the byte-wise core with the structural path.
+    /// </summary>
+    public static Utf8String? SplitIndexTyped(Utf8String s, Utf8String delim, int n) =>
+        SqlBuiltinRuntime.SplitIndexCore(s, delim, n);
+
+    /// <summary>
+    /// SPLIT_PART on the typed path: the n-th (1-based, negative-from-end) part,
+    /// or the empty string when out of range. Shares the byte-wise core.
+    /// </summary>
+    public static Utf8String SplitPartTyped(Utf8String s, Utf8String delim, int n) =>
+        SqlBuiltinRuntime.SplitPartCore(s, delim, n);
 
     /// <summary>
     /// Typed GREATEST over <typeparamref name="T"/> values, where T

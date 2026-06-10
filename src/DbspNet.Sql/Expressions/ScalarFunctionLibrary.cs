@@ -194,7 +194,8 @@ internal sealed class SplitIndexFunction : IScalarFunction
         BuiltinScalarFunctions.ResolveSplitIndex(args);
     public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
         BuiltinScalarFunctions.BuildSplitIndex(BuiltinScalarFunctions.CompileArgs(fn, buildArg));
-    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) =>
+        TypedBuiltinScalarFunctions.BuildSplitIndex(t);
 }
 
 /// <summary><c>SPLIT_PART(s, delim, n)</c> — n-th (1-based) split part, empty
@@ -206,7 +207,8 @@ internal sealed class SplitPartFunction : IScalarFunction
         BuiltinScalarFunctions.ResolveSplitPart(args);
     public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
         BuiltinScalarFunctions.BuildSplitPart(BuiltinScalarFunctions.CompileArgs(fn, buildArg));
-    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) =>
+        TypedBuiltinScalarFunctions.BuildSplitPart(t);
 }
 
 /// <summary>POSITION(needle IN haystack); STRPOS(haystack, needle) swaps the args.</summary>
