@@ -242,6 +242,105 @@ public class WindowAggregateParallelTests
                 tbl("t").Delete(1, 1, 9L);    // retract the max — frames must recompute their extreme
             });
 
+    // ---- Offset functions: LAG / LEAD / FIRST_VALUE / LAST_VALUE -------------
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void LagLead_MatchesSingle(int workers) =>
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)"],
+            "SELECT g, ts, v, " +
+            "LAG(v) OVER (PARTITION BY g ORDER BY ts) AS prev, " +
+            "LEAD(v) OVER (PARTITION BY g ORDER BY ts) AS nxt FROM t",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 1, 10);
+                tbl("t").Insert(1, 3, 30);
+                tbl("t").Insert(1, 2, 20);   // lands between — shifts neighbours' LAG/LEAD
+                tbl("t").Insert(2, 1, 5);
+            },
+            tbl =>
+            {
+                tbl("t").Insert(1, 4, 40);
+                tbl("t").Delete(1, 2, 20);   // retract a middle row — neighbours' offsets move
+            });
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void LagWithOffsetAndDefault_MatchesSingle(int workers) =>
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)"],
+            "SELECT g, ts, v, LAG(v, 2, -1) OVER (PARTITION BY g ORDER BY ts) AS p2 FROM t",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 1, 10);
+                tbl("t").Insert(1, 2, 20);   // p2 = -1 (no row two back)
+                tbl("t").Insert(1, 3, 30);   // p2 = 10
+                tbl("t").Insert(2, 1, 99);
+            },
+            tbl =>
+            {
+                tbl("t").Insert(1, 4, 40);
+                tbl("t").Delete(1, 1, 10);   // shifts every later row's "two back"
+            });
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void FirstLastValue_MatchesSingle(int workers) =>
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)"],
+            "SELECT g, ts, v, " +
+            "FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS fv, " +
+            "LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts) AS lv FROM t",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 2, 20);
+                tbl("t").Insert(1, 3, 30);
+                tbl("t").Insert(2, 5, 50);
+            },
+            tbl =>
+            {
+                tbl("t").Insert(1, 1, 10);   // new partition-1 first value
+                tbl("t").Insert(1, 4, 40);   // new partition-1 last value
+                tbl("t").Delete(2, 5, 50);   // empties partition 2
+            });
+
+    // ---- Mixed aggregate + offset in one query (chained typed ops) -----------
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void MixedAggregateAndOffset_MatchesSingle(int workers) =>
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)"],
+            "SELECT g, ts, v, " +
+            "SUM(v) OVER (PARTITION BY g ORDER BY ts) AS run, " +
+            "LAG(v) OVER (PARTITION BY g ORDER BY ts) AS prev FROM t",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 1, 10);
+                tbl("t").Insert(1, 2, 20);
+                tbl("t").Insert(2, 1, 5);
+            },
+            tbl =>
+            {
+                tbl("t").Insert(1, 3, 30);
+                tbl("t").Delete(1, 1, 10);
+            });
+
     // ---- Negative gate: sound structural fallback ----------------------------
 
     private static bool CompilesParallel(string[] ddl, string query)
@@ -259,5 +358,14 @@ public class WindowAggregateParallelTests
         Assert.False(CompilesParallel(
             ["CREATE TABLE t (ts INT NOT NULL, v BIGINT NOT NULL)"],
             "SELECT ts, SUM(v) OVER (ORDER BY ts) AS run FROM t"));
+    }
+
+    [Fact]
+    public void NoPartitionByOffset_FallsBackToStructural_NoParallelPath()
+    {
+        // Likewise for LAG/LEAD with no PARTITION BY — a single global ordering.
+        Assert.False(CompilesParallel(
+            ["CREATE TABLE t (ts INT NOT NULL, v INT NOT NULL)"],
+            "SELECT ts, v, LAG(v) OVER (ORDER BY ts) AS p FROM t"));
     }
 }

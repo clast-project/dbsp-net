@@ -400,8 +400,9 @@ public static class TypedPlanCompiler
         // columns). No-partition windows and unsupported aggregators (MIN/MAX,
         // see BuildTypedAggregator) fall back to structural inside the method.
         WindowAggregatePlan w => CompileWindowAggregate(w, ctx),
-        // Offset functions (LAG/LEAD) still widen via the structural path.
-        WindowOffsetPlan => null,
+        // PARTITION BY offset functions (LAG/LEAD/FIRST_VALUE/LAST_VALUE) take the
+        // typed/parallel path too (row-opaque op + a struct-fusing widener).
+        WindowOffsetPlan wo => CompileWindowOffset(wo, ctx),
         _ => null,
     };
 
@@ -1390,6 +1391,101 @@ public static class TypedPlanCompiler
         return new TypedNode(outRowType, plan.Schema, output, PartitionKey: outPartition);
     }
 
+    /// <summary>
+    /// Compiles a <see cref="WindowOffsetPlan"/> — <c>LAG/LEAD/FIRST_VALUE/
+    /// LAST_VALUE(expr) OVER (PARTITION BY p ORDER BY o)</c> — to the row-opaque
+    /// <see cref="PartitionedOffsetOp{TInRow,TOutRow,TKey}"/>. Mirrors
+    /// <see cref="CompileWindowAggregate"/>: boxed partition extractors + a parallel
+    /// exchange on the PARTITION BY key, a boxed order extractor + full-row tiebreak
+    /// comparer, and a hybrid widener that reads the base columns from the typed row
+    /// and casts each boxed offset value onto the appended columns. Output schema is
+    /// <c>[input cols…, offset cols…]</c> (= <c>plan.Schema</c>). Falls back to
+    /// structural (returns <c>null</c>) for a window with no PARTITION BY or an
+    /// offset value the typed expression compiler can't lower.
+    /// </summary>
+    private static TypedNode? CompileWindowOffset(WindowOffsetPlan plan, CompileContext ctx)
+    {
+        // The no-PARTITION-BY case is a single global ordering; leave it structural.
+        if (plan.PartitionKeys.Count == 0) return null;
+
+        var inner = TryCompileNode(plan.Input, ctx);
+        if (inner is null) return null;
+        var rowType = inner.RowType;
+
+        var partitionExtractors = new Delegate[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            if (BuildBoxedExtractor(plan.PartitionKeys[i], rowType) is not { } ex) return null;
+            partitionExtractors[i] = ex;
+        }
+
+        // The ORDER BY key (required) — a total order with a full-row tiebreak makes
+        // the positional offsets deterministic. Any comparable key type is allowed.
+        if (BuildBoxedExtractor(plan.OrderKey.Expression, rowType) is not { } orderExtractor) return null;
+
+        // Per-function value extractors (read from the positionally-selected row).
+        var n = plan.Functions.Count;
+        var valueExtractors = new Delegate[n];
+        var kinds = new OffsetKind[n];
+        var offsets = new long[n];
+        var defaults = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            var fn = plan.Functions[i];
+            if (BuildBoxedExtractor(fn.Value, rowType) is not { } ex) return null;
+            valueExtractors[i] = ex;
+            kinds[i] = fn.Kind;
+            offsets[i] = fn.Offset;
+            defaults[i] = fn.Default;
+        }
+
+        // Widened output row = [input cols…, offset cols…] = plan.Schema.
+        var outRowType = TypedRowEmitter.EmitRowType(plan.Schema);
+        if (outRowType is null) return null;
+        var widen = BuildOffsetWidenDelegate(rowType, outRowType, plan.Schema, plan.Input.Schema.Count);
+
+        // Parallel: co-locate each partition on one worker.
+        var opInput = inner.Stream;
+        if (ctx.Workers > 1)
+        {
+            if (BuildExprListHashPartition(rowType, plan.PartitionKeys) is not { } partition) return null;
+            opInput = InvokeExchange(ctx.Builder, rowType, inner.Stream, partition);
+        }
+
+        var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Input.Schema, rowType);
+
+        var output = InvokePartitionedOffset(
+            ctx.Builder, rowType, outRowType, opInput, partitionExtractors, orderExtractor,
+            plan.OrderKey.Descending, plan.OrderKey.NullsFirst,
+            valueExtractors, kinds, offsets, defaults, widen, snapshotCodec);
+
+        // Output partitioned by the PARTITION BY columns, carried through at their
+        // original indices (they precede the offset cols). Bare-column keys keep
+        // their indices; an expression key yields no inherited partition.
+        int[]? outPartition = null;
+        if (ctx.Workers > 1)
+        {
+            var indices = new int[plan.PartitionKeys.Count];
+            var allColumns = true;
+            for (var i = 0; i < plan.PartitionKeys.Count; i++)
+            {
+                if (plan.PartitionKeys[i] is ResolvedColumn rc)
+                {
+                    indices[i] = rc.Index;
+                }
+                else
+                {
+                    allColumns = false;
+                    break;
+                }
+            }
+
+            if (allColumns) outPartition = indices;
+        }
+
+        return new TypedNode(outRowType, plan.Schema, output, PartitionKey: outPartition);
+    }
+
     /// <summary>Lower a resolved expression to a compiled <c>Func&lt;TRow,
     /// object?&gt;</c> over the emitted row struct (boxed so a null
     /// <c>Nullable&lt;T&gt;</c> becomes a null reference, matching
@@ -2087,6 +2183,57 @@ public static class TypedPlanCompiler
 
         var delegateType = typeof(Func<,>).MakeGenericType(pairType, finalRowType);
         return Expression.Lambda(delegateType, Expression.New(ctor, args), pairParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds the offset-op widener <c>(TInRow row, object?[] vals) =&gt; new
+    /// TOutRow(row.F0, …, row.F{inputCount-1}, (T)vals[0], …)</c>: the first
+    /// <paramref name="inputCount"/> output columns are read from the typed base
+    /// row, and each appended offset column unboxes/casts the corresponding boxed
+    /// value from <c>vals</c> (a null boxes to an absent <c>Nullable&lt;T&gt;</c> /
+    /// null reference, matching the resolver's nullable offset-result columns).
+    /// </summary>
+    private static Delegate BuildOffsetWidenDelegate(
+        Type inRowType, Type outRowType, Schema outSchema, int inputCount)
+    {
+        var ctorParamTypes = new Type[outSchema.Count];
+        for (var i = 0; i < outSchema.Count; i++)
+        {
+            var field = outRowType.GetField("F" + i)
+                ?? throw new InvalidOperationException("emitted offset output row missing field F" + i);
+            ctorParamTypes[i] = field.FieldType;
+        }
+
+        var ctor = outRowType.GetConstructor(ctorParamTypes)
+            ?? throw new InvalidOperationException("emitted offset output row missing typed-fields ctor");
+
+        var rowParam = Expression.Parameter(inRowType, "row");
+        var valsParam = Expression.Parameter(typeof(object?[]), "vals");
+
+        var args = new Expression[outSchema.Count];
+        for (var i = 0; i < outSchema.Count; i++)
+        {
+            Expression source;
+            if (i < inputCount)
+            {
+                var field = inRowType.GetField("F" + i)!;
+                source = Expression.Field(rowParam, field);
+            }
+            else
+            {
+                // (FieldType) vals[i - inputCount] — unbox/cast the boxed offset value.
+                source = Expression.Convert(
+                    Expression.ArrayIndex(valsParam, Expression.Constant(i - inputCount)),
+                    ctorParamTypes[i]);
+            }
+
+            args[i] = source.Type == ctorParamTypes[i]
+                ? source
+                : Expression.Convert(source, ctorParamTypes[i]);
+        }
+
+        var delegateType = typeof(Func<,,>).MakeGenericType(inRowType, typeof(object?[]), outRowType);
+        return Expression.Lambda(delegateType, Expression.New(ctor, args), rowParam, valsParam).Compile();
     }
 
     // ---- Helpers: identity / projection / predicate ----
@@ -3297,6 +3444,71 @@ public static class TypedPlanCompiler
         var codec = (IZSetTraceCodec<TInRow, Z64>?)snapshotCodec;
         return builder.PartitionedWindowAggregate<TInRow, TAgg, TOutRow, StructuralRow>(
             stream, PartitionOf, order, orderValueOf, preceding, descending, agg, Widen, null, codec, null);
+    }
+
+    private static object InvokePartitionedOffset(
+        CircuitBuilder builder, Type inRowType, Type outRowType, object input,
+        Delegate[] partitionExtractors, Delegate orderExtractor, bool descending, bool nullsFirst,
+        Delegate[] valueExtractors, OffsetKind[] kinds, long[] offsets, object?[] defaults,
+        Delegate widen, object? snapshotCodec)
+    {
+        var openMethod = typeof(TypedPlanCompiler)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Single(m => m.Name == nameof(BuildPartitionedOffset) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(inRowType, outRowType);
+        return closed.Invoke(null, new object?[]
+        {
+            builder, input, partitionExtractors, orderExtractor, descending, nullsFirst,
+            valueExtractors, kinds, offsets, defaults, widen, snapshotCodec,
+        })!;
+    }
+
+    /// <summary>Generic worker for <see cref="InvokePartitionedOffset"/> — builds
+    /// the strongly-typed partition/order delegates and the
+    /// <see cref="OffsetSpec{TInRow}"/> array, then drives the row-opaque offset
+    /// builder (TKey = StructuralRow over the boxed partition columns).</summary>
+    private static object BuildPartitionedOffset<TInRow, TOutRow>(
+        CircuitBuilder builder, object input, Delegate[] partitionExtractors,
+        Delegate orderExtractor, bool descending, bool nullsFirst,
+        Delegate[] valueExtractors, OffsetKind[] kinds, long[] offsets, object?[] defaults,
+        Delegate widen, object? snapshotCodec)
+        where TInRow : notnull
+        where TOutRow : notnull
+    {
+        var partKeys = new Func<TInRow, object?>[partitionExtractors.Length];
+        for (var i = 0; i < partitionExtractors.Length; i++)
+        {
+            partKeys[i] = (Func<TInRow, object?>)partitionExtractors[i];
+        }
+
+        StructuralRow PartitionOf(TInRow row)
+        {
+            var values = new object?[partKeys.Length];
+            for (var i = 0; i < partKeys.Length; i++)
+            {
+                values[i] = partKeys[i](row);
+            }
+
+            return new StructuralRow(values);
+        }
+
+        var orderBoxed = (Func<TInRow, object?>)orderExtractor;
+        var order = new SortKeyComparer<TInRow>(
+            new[] { orderBoxed }, new[] { descending }, new[] { nullsFirst }, Comparer<TInRow>.Default);
+
+        var specs = new OffsetSpec<TInRow>[valueExtractors.Length];
+        for (var s = 0; s < valueExtractors.Length; s++)
+        {
+            specs[s] = new OffsetSpec<TInRow>(
+                (Func<TInRow, object?>)valueExtractors[s], kinds[s], offsets[s], defaults[s]);
+        }
+
+        var fuse = (Func<TInRow, object?[], TOutRow>)widen;
+
+        var stream = (Stream<ZSet<TInRow, Z64>>)input;
+        var codec = (IZSetTraceCodec<TInRow, Z64>?)snapshotCodec;
+        return builder.PartitionedOffset<TInRow, TOutRow, StructuralRow>(
+            stream, PartitionOf, order, specs, fuse, null, codec);
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>
