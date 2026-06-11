@@ -54,7 +54,7 @@ internal static class W1ProfileBenchmark
 
     public static void Run(
         StringBuilder output, int totalEvents, int batchSize, int runs,
-        bool narrowNonLinear, bool pool, bool prune = false)
+        bool narrowNonLinear, bool pool, bool prune = false, bool narrowTopK = false)
     {
         // Optional term-2 lever (§18): narrow non-linear (MIN/MAX) aggregate
         // inputs to {keys, args}. Thread-static seam; w1profile runs single-
@@ -68,6 +68,10 @@ internal static class W1ProfileBenchmark
         // narrow each stored join input to the columns a consumer reads. Read at
         // Optimize time; same thread-static seam discipline as narrow.
         DbspNet.Sql.Optimizer.JoinColumnPruningMode.Enabled = prune;
+        // Optional §22 lever: narrow-key partitioned TOP-K (q18/q19). Read at operator
+        // construction; the W=1 harness compiles single-threaded on this thread, so
+        // setting it once covers every Compile.
+        DbspNet.Core.Operators.Stateful.PartitionedTopKNarrowingMode.Enabled = narrowTopK;
         Console.WriteLine();
         Console.WriteLine(
             $"=== W=1 per-row cost profile (events={totalEvents:N0}, batch={batchSize:N0}, " +

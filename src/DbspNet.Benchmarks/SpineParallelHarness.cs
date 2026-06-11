@@ -39,13 +39,17 @@ internal static class SpineParallelHarness
     /// Only affects the flat aggregate operator; ignored on the spine path.
     /// </param>
     internal readonly record struct RunConfig(
-        CompileOptions Options, bool ForcePointProbe, bool ForceEagerRebuild = false, bool DeltaPool = false);
+        CompileOptions Options, bool ForcePointProbe, bool ForceEagerRebuild = false,
+        bool DeltaPool = false, bool NarrowTopK = false);
 
     /// <summary>Flat default — dictionary traces, the lazy merge-view aggregate (§14.10).</summary>
     internal static RunConfig Flat => new(CompileOptions.Default, false);
 
     /// <summary>Flat with cross-tick delta-builder pooling on (§20 gate).</summary>
     internal static RunConfig FlatPool => new(CompileOptions.Default, false, DeltaPool: true);
+
+    /// <summary>Flat with the §22 narrow-key partitioned TOP-K on (q18/q19 gate).</summary>
+    internal static RunConfig FlatNarrowTopK => new(CompileOptions.Default, false, NarrowTopK: true);
 
     /// <summary>Flat with the aggregate forced back to the eager per-tick rebuild (the §14.10 A/B baseline).</summary>
     internal static RunConfig FlatEager => new(CompileOptions.Default, false, ForceEagerRebuild: true);
@@ -132,6 +136,10 @@ internal static class SpineParallelHarness
         // TryCompileParallel on this (compiling) thread — so set it for the build
         // and restore after; the per-replica pooled builders capture it then.
         DeltaPoolMode.Enabled = config.DeltaPool;
+        // PartitionedTopKNarrowingMode is likewise read at operator construction inside
+        // TryCompileParallel on this (compiling) thread (§22) — set for the build and
+        // restore after; the per-replica narrow operators capture it then.
+        PartitionedTopKNarrowingMode.Enabled = config.NarrowTopK;
         try
         {
             if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, config.Options))
@@ -190,6 +198,7 @@ internal static class SpineParallelHarness
             SpineAggregateProbeMode.ForcePointProbe = false;
             FlatAggregateMode.ForceEagerRebuild = false;
             DeltaPoolMode.Enabled = false;
+            PartitionedTopKNarrowingMode.Enabled = false;
         }
     }
 

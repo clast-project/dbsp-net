@@ -1122,9 +1122,24 @@ public static class PlanToCircuit
             return new StructuralRow(values);
         }
 
+        // §22 narrow-key path: pass the single ORDER BY extractor so the operator can
+        // key its trace by {order value, wide row} when the narrowing seam is on. Only
+        // the single-column shape (q18/q19) is plumbed; multi-column ORDER BY falls back
+        // to the whole-row operator. Harmless when the seam is off.
+        Func<StructuralRow, object?>? orderKey = null;
+        var orderDescending = false;
+        var orderNullsFirst = false;
+        if (plan.SortKeys.Count == 1)
+        {
+            orderKey = keys[0];
+            orderDescending = descending[0];
+            orderNullsFirst = nullsFirst[0];
+        }
+
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
         return builder.PartitionedTopK<StructuralRow, StructuralRow>(
-            input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec);
+            input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec,
+            orderKey, orderDescending, orderNullsFirst);
     }
 
     // ---- Window aggregates (agg(x) OVER (PARTITION BY p [ORDER BY o RANGE …])) ----

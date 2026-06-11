@@ -3066,10 +3066,28 @@ public static class TypedPlanCompiler
             return new StructuralRow(values);
         }
 
+        // §22 narrow-key path: pass the single ORDER BY extractor (the same boxed
+        // delegate `order`/`sortKeyOnly` already use) so the operator can key its trace
+        // by {order value, wide row} when the narrowing seam is on. Single-column shape
+        // only (q18/q19); multi-column falls back to the whole-row operator. Harmless
+        // when the seam is off. No reflected-signature change — `keys`/`descending`/
+        // `nullsFirst` are already this method's arguments (the typed reflection gotcha
+        // is dodged: only this in-method call site changes).
+        Func<TRow, object?>? orderKey = null;
+        var orderDescending = false;
+        var orderNullsFirst = false;
+        if (keys.Length == 1)
+        {
+            orderKey = keys[0];
+            orderDescending = descending[0];
+            orderNullsFirst = nullsFirst[0];
+        }
+
         var stream = (Stream<ZSet<TRow, Z64>>)input;
         var codec = (IZSetTraceCodec<TRow, Z64>?)snapshotCodec;
         return builder.PartitionedTopK<TRow, StructuralRow>(
-            stream, PartitionOf, order, sortKeyOnly, function, limit, null, codec);
+            stream, PartitionOf, order, sortKeyOnly, function, limit, null, codec,
+            orderKey, orderDescending, orderNullsFirst);
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>

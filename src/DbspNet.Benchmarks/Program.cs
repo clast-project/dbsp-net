@@ -61,10 +61,11 @@ if (args.Length > 0 && args[0] == "w1profile")
     var narrow = args.Any(a => a is "narrow" or "narrowNonLinear");
     var pool = args.Any(a => a is "pool" or "deltapool");
     var prune = args.Any(a => a is "prune" or "joinprune");
+    var narrowTopK = args.Any(a => a is "narrowtopk" or "topk");
     var sb = new StringBuilder();
     sb.AppendLine("# DbspNet — W=1 per-row execution cost");
     sb.AppendLine();
-    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool, prune);
+    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool, prune, narrowTopK);
     var w1Path = Path.Combine(FindDocsDir(), "w1-profile.md");
     File.WriteAllText(w1Path, sb.ToString());
     Console.WriteLine();
@@ -264,6 +265,31 @@ if (args.Length > 0 && args[0] == "q4prune")
     File.WriteAllText(q4prPath, sb.ToString());
     Console.WriteLine();
     Console.WriteLine($"Report written to {Path.GetFullPath(q4prPath)}");
+    return 0;
+}
+
+// q18/q19 narrow-key TOP-K gate (W>1 in-Step): `dotnet run -- q18narrow [q18|q19] [workers] [runs] [events]`
+// Whole pipeline, flat·wholerow vs flat·narrow partitioned TOP-K state
+// (docs/design-row-representation.md §22).
+if (args.Length > 0 && args[0] == "q18narrow")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var queryId = args.Length > 1 && args[1] is "q18" or "q19" ? args[1] : "q18";
+    var argShift = args.Length > 1 && args[1] is "q18" or "q19" ? 1 : 0;
+    int? workers = args.Length > 1 + argShift && int.TryParse(args[1 + argShift],
+        System.Globalization.NumberStyles.Integer, CultureInfo.InvariantCulture, out var w) ? w : null;
+    var runs = Arg(2 + argShift, 3);
+    var totalEvents = Arg(3 + argShift, 1_000_000);
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Q18NarrowBenchmark.Run(sb, queryId, totalEvents, workers, runs);
+    var q18nPath = Path.Combine(FindDocsDir(), $"{queryId}-narrow-bench.md");
+    File.WriteAllText(q18nPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(q18nPath)}");
     return 0;
 }
 

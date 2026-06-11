@@ -3057,6 +3057,85 @@ shrink-key; and the **decision** — a positive, non-forbidden, **justified** le
 the next focused gated operator increment (q18 first), correcting §19's pessimism with
 evidence rather than re-trying its dead-end.
 
+### 22.6 — Built and gated: q19 lands, q18 doesn't — the prize tracks partition state, not partition count (SHIPPED, default-off seam)
+
+The §22.5 increment was built: a narrow-key partitioned-TOP-K operator
+(`PartitionedTopKNarrowOp`) keying its per-partition `_accum`/`_window` by a
+`readonly struct OrderRowKey {order value, wide row}` — hashing on the order value
+alone (the kill-hash half) and comparing the wide row only within an equal-order tie
+group, with the wide row **carried in the key** (the recovery store, no separate
+buffer/index). It sits behind the default-off `PartitionedTopKNarrowingMode` seam
+(mirroring `DeltaPoolMode`), selected by `CircuitBuilder.PartitionedTopK` only when a
+**single-column** ORDER BY extractor was plumbed through — which both compile sites
+(`PlanToCircuit.CompilePartitionedTopK`, `TypedPlanCompiler.BuildPartitionedTopK`) now
+pass as `keys[0]/descending[0]/nullsFirst[0]` when `SortKeys.Count == 1`. The typed
+reflection gotcha is dodged exactly as §22.4 predicted: `BuildPartitionedTopK` already
+*had* `keys` as a local, so only its own in-method call site changed — no
+reflected-signature change. Snapshot format is byte-compatible (same flattened
+`(wideRow, weight)` Z-set).
+
+**Correctness held.** A 5000-iteration equivalence PBT
+(`PartitionedTopKNarrowingPbtTests`) over the whole TOP-K surface
+(ROW_NUMBER/RANK/DENSE_RANK, k ∈ {1,2,3}, ASC/DESC, ±1 ticks **incl. retractions** over
+tie-forcing domains) proved seam-on accumulated output ≡ an independent batch TOP-K
+oracle **and** ≡ the seam-off whole-row operator. The full suite is green with the seam
+off (1754 tests, byte-identical), and every W=8 gate cross-checks the narrow output
+identical to whole-row (re-proving correctness on the typed parallel path).
+
+**The throughput result inverts the prompt's expected ordering, and it is the
+load-bearing finding.** The lever was scoped "q18 first (simplest), then q19" — but q18
+is exactly where it **doesn't** pay, and q19 (the harder TOP-10) is where it lands large:
+
+| Query | shape | W=1 time (off→on) | W=1 alloc (off→on, deterministic) | W=8 step ↑ |
+|:--|:--|--:|--:|--:|
+| **q9** (shared op, TOP-1) | join + dedup | 1300 → 1335 ns (noise) | 2345 → 2349 B (**+0.2 %, flat**) | — (control) |
+| **q18** (TOP-1, ~1 row/partition) | dedup | 1826 → 1840 ns (flat) | 2173 → 2224 B (**+2.3 %**) | 0.89–1.08× (**parity/noise**) |
+| **q19** (TOP-10, accumulating) | top-10 | 2542 → **1862 ns (−27 %)** | 3831 → **1734 B (−55 %)** | **1.30× / 1.29×** |
+
+Three reads settle it:
+
+1. **q19 is a clean, robust win** — deterministic −55 % W=1 allocation, −27 % W=1 time,
+   and a **1.30× W=8 step** that holds across both batch sizes (cross-checked identical
+   output). This is precisely the §22.2-identified **83 %-op-bound** query meeting the
+   §22.3 **82 %** in-state prize, and the §16.11 in-`Step` amplification carrying it
+   through Amdahl to W=8. The lever works.
+2. **q18 does not pay — and *why* is the correction to §22.3.** q18 keeps TOP-1 over
+   **size-1 partitions**, so its window/accum dicts hold ~1 entry. There the whole-row
+   hash is both **cached** (`StructuralRow` precomputes it upstream) **and** trivially
+   cheap (a 1-entry probe), so the kill-hash prize ≈ 0, while the narrow machinery (the
+   16-byte struct key vs an 8-byte ref, slightly larger dict backing) adds a
+   **deterministic +2.3 % allocation**. The `reprbench topk` 50 % q18 figure was modelled
+   on a **value-type** wide row (faithful to the typed W>1 path, where the hash is *not*
+   cached and the node copy is real) — landmine 1(a)/1(b) materialised exactly:
+   on the single-circuit `StructuralRow` path the prize erodes to nothing for q18, and
+   even the typed W=8 path can't recover it because the **win tracks per-partition state
+   size, not partition count** — q18 has no state to narrow.
+3. **q9 is unharmed** (alloc +0.2 %, the §19 failure mode — a deterministic q9 allocation
+   regression — does **not** recur), so enabling the seam is safe for the shared operator.
+
+**Disposition — ship the seam, default-off (like §18/§20).** Correctness holds, the gate
+is a clean robust positive **on q19**, and q9 is unharmed — so the operator and seam land
+on `main`. But the honest scope is narrower than §22.5 hoped: the lever is a **TOP-K-state
+narrowing**, and it pays **only when a partition holds enough state to amortise the
+narrow-key overhead** (q19's accumulating TOP-10), not on dedup-shaped TOP-1 with size-1
+partitions (q18/q9). The seam is process-wide opt-in; a productionising follow-on would
+gate it per-operator (e.g. `limit > 1`, or a partition-fanout heuristic) so q18/q9 keep
+the whole-row op while q19-shaped windows take the narrow path. **The §22 arc thus
+delivers a real, gated competitive lever for q19 (~0.32× → narrowed) and a measured
+"no" for q18** — correcting not §19's pessimism this time but §22.3's own q18 optimism,
+with the same measure-first honesty: the microbench's value-type model over-priced the
+single-circuit/cached-hash reality for the size-1-partition case.
+
+**Durable deliverables (22.6):** `PartitionedTopKNarrowOp` + `OrderRowKey`/
+`OrderRowComparer`/`OrderRowEquality` + the `PartitionedTopKNarrowingMode` seam; the
+single-column extractor plumbed through both compile sites + `CircuitBuilder.PartitionedTopK`;
+`PartitionedTopKNarrowingPbtTests` (batch-oracle + whole-row equivalence, retractions);
+the `w1profile … narrowtopk` and `q18narrow [q18|q19]` gates
+(`Q18NarrowBenchmark` + `SpineParallelHarness.FlatNarrowTopK`); and the **decision** — a
+gated, correct, default-off lever that **lands on q19 (1.30× W=8) and is measured flat on
+q18**, with the prize attributed to per-partition state size rather than the partition
+count the q18-first framing assumed.
+
 ---
 
 ## Appendix — sources
@@ -3082,6 +3161,11 @@ DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 `Q18ProfileBenchmark` (q18+q19 egest) + `StepProfileBenchmark`
 (`reprbench`/`q18profile`/`stepprofile`, docs/repr-decomp-bench.md + q18-profile.md +
 step-profile.md — §22);
+`Operators/Stateful/PartitionedTopKNarrowOp.cs` (+ `OrderRowKey`/`OrderRowComparer`/
+`OrderRowEquality`) + `PartitionedTopKNarrowingMode.cs` +
+`PartitionedTopKNarrowingPbtTests` + `Benchmarks/Q18NarrowBenchmark.cs` +
+`SpineParallelHarness.FlatNarrowTopK` (`q18narrow [q18|q19]`,
+`w1profile … narrowtopk`, docs/q19-narrow-bench.md — §22.6, shipped default-off);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

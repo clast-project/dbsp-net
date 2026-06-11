@@ -133,7 +133,10 @@ public static class StatefulOperators
         RankFunction function,
         long limit,
         IEqualityComparer<TKey>? partitionComparer = null,
-        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null,
+        Func<TRow, object?>? orderKey = null,
+        bool orderDescending = false,
+        bool orderNullsFirst = false)
         where TRow : notnull
         where TKey : notnull
     {
@@ -144,8 +147,22 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(sortKeyOnly);
 
         var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
-        builder.AddRawOperator(new PartitionedTopKOp<TRow, TKey>(
-            input, output, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec));
+
+        // §22 narrow-key path: opt-in (default-off seam) and only when a single-column
+        // ORDER BY extractor was plumbed through. Otherwise the whole-row operator is
+        // the byte-identical default.
+        if (PartitionedTopKNarrowingMode.Enabled && orderKey is not null)
+        {
+            builder.AddRawOperator(new PartitionedTopKNarrowOp<TRow, TKey>(
+                input, output, partitionOf, order, orderKey, orderDescending, orderNullsFirst,
+                function, limit, partitionComparer, snapshotCodec));
+        }
+        else
+        {
+            builder.AddRawOperator(new PartitionedTopKOp<TRow, TKey>(
+                input, output, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec));
+        }
+
         return output;
     }
 
