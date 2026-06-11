@@ -196,10 +196,35 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(order);
         ArgumentNullException.ThrowIfNull(aggregator);
 
+        // The structural widener: append the aggregate columns onto the base row.
+        // (The typed compile path will supply a struct-fusing widener instead.)
+        StructuralRow Widen(StructuralRow row, Optional<StructuralRow> agg)
+        {
+            var n = row.Count;
+            var vs = new object?[n + aggCount];
+            for (var i = 0; i < n; i++)
+            {
+                vs[i] = row[i];
+            }
+
+            if (agg.HasValue)
+            {
+                var a = agg.Value;
+                for (var j = 0; j < aggCount; j++)
+                {
+                    vs[n + j] = a[j];
+                }
+            }
+
+            // agg.HasValue is false only for an empty frame (no positive weight) —
+            // impossible while the current row is in its own frame; leave NULLs.
+            return new StructuralRow(vs);
+        }
+
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
-        builder.AddRawOperator(new PartitionedWindowAggregateOp<TKey>(
+        builder.AddRawOperator(new PartitionedWindowAggregateOp<StructuralRow, StructuralRow, StructuralRow, TKey>(
             input, output, partitionOf, order, orderValueOf, preceding, descending,
-            aggregator, aggCount, partitionComparer, snapshotCodec, frontier));
+            aggregator, Widen, partitionComparer, snapshotCodec, frontier));
         return output;
     }
 

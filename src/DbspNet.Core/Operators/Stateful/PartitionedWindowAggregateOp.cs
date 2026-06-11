@@ -29,51 +29,61 @@ namespace DbspNet.Core.Operators.Stateful;
 /// changed (a bounded value range for bounded frames; the suffix from the
 /// earliest changed value for running; the whole partition for whole-partition
 /// frames), diffing each against the last emitted output. The frame multiset is
-/// handed to the supplied <see cref="IAggregator{StructuralRow,StructuralRow}"/>
-/// (a SQL <c>CompositeAggregator</c>).</para>
+/// handed to the supplied <see cref="IAggregator{TInRow,TAgg}"/> (a SQL
+/// <c>CompositeAggregator</c>), and the per-row aggregate is fused onto the base
+/// row by the supplied <c>widen</c> delegate — the only row-shape-specific seam,
+/// which lets the same operator run over structural or typed rows.</para>
 /// <para>Because finalized rows (value below the frontier) are never recomputed,
 /// a bounded ascending frame over a monotone key supports frontier-driven GC:
 /// rows whose value is below <c>frontier − preceding</c> can neither enter a
 /// future row's backward frame nor be recomputed, so they are dropped from state
 /// silently.</para>
 /// </remarks>
-internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshotable, IIntrospectable
+/// <typeparam name="TInRow">The input (base) row type.</typeparam>
+/// <typeparam name="TAgg">The aggregator's per-frame output (the new columns).</typeparam>
+/// <typeparam name="TOutRow">The widened output row type (base ⧺ aggregate columns).</typeparam>
+/// <typeparam name="TKey">The PARTITION BY key type.</typeparam>
+internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
+    : IOperator, ISnapshotable, IIntrospectable
+    where TInRow : notnull
+    where TAgg : notnull
+    where TOutRow : notnull
     where TKey : notnull
 {
-    private readonly Stream<ZSet<StructuralRow, Z64>> _input;
-    private readonly Stream<ZSet<StructuralRow, Z64>> _output;
-    private readonly Func<StructuralRow, TKey> _partitionOf;
-    private readonly IComparer<StructuralRow> _order;
-    private readonly Func<StructuralRow, long>? _orderValueOf;
+    private readonly Stream<ZSet<TInRow, Z64>> _input;
+    private readonly Stream<ZSet<TOutRow, Z64>> _output;
+    private readonly Func<TInRow, TKey> _partitionOf;
+    private readonly IComparer<TInRow> _order;
+    private readonly Func<TInRow, long>? _orderValueOf;
     private readonly long? _preceding;
     private readonly bool _descending;
-    private readonly IAggregator<StructuralRow, StructuralRow> _aggregator;
-    private readonly int _aggCount;
-    private readonly IZSetTraceCodec<StructuralRow, Z64>? _snapshotCodec;
+    private readonly IAggregator<TInRow, TAgg> _aggregator;
+    private readonly Func<TInRow, Optional<TAgg>, TOutRow> _widen;
+    private readonly IZSetTraceCodec<TInRow, Z64>? _snapshotCodec;
     private readonly IFrontier? _frontier;
     private long _lastGcFrontier = long.MinValue;
     private long _gcDropped;
 
     // Per-partition integrated input, sorted by the total-order comparer.
-    private readonly Dictionary<TKey, SortedDictionary<StructuralRow, long>> _accum;
+    private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
 
     // Last-emitted output per partition, keyed by the input (base) row →
     // (widened row, weight). Keying by base row lets GC drop a finalized row
     // from both _accum and here without emitting a retraction.
-    private readonly Dictionary<TKey, Dictionary<StructuralRow, (StructuralRow Widened, long Weight)>> _window;
+    private readonly Dictionary<TKey, Dictionary<TInRow, (TOutRow Widened, long Weight)>> _window;
 
     public PartitionedWindowAggregateOp(
-        Stream<ZSet<StructuralRow, Z64>> input,
-        Stream<ZSet<StructuralRow, Z64>> output,
-        Func<StructuralRow, TKey> partitionOf,
-        IComparer<StructuralRow> order,
-        Func<StructuralRow, long>? orderValueOf,
+        Stream<ZSet<TInRow, Z64>> input,
+        Stream<ZSet<TOutRow, Z64>> output,
+        Func<TInRow, TKey> partitionOf,
+        IComparer<TInRow> order,
+        Func<TInRow, long>? orderValueOf,
         long? preceding,
         bool descending,
-        IAggregator<StructuralRow, StructuralRow> aggregator,
-        int aggCount,
+        IAggregator<TInRow, TAgg> aggregator,
+        Func<TInRow, Optional<TAgg>, TOutRow> widen,
         IEqualityComparer<TKey>? partitionComparer = null,
-        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null,
+        IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null,
         IFrontier? frontier = null)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -81,6 +91,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
         ArgumentNullException.ThrowIfNull(partitionOf);
         ArgumentNullException.ThrowIfNull(order);
         ArgumentNullException.ThrowIfNull(aggregator);
+        ArgumentNullException.ThrowIfNull(widen);
 
         _input = input;
         _output = output;
@@ -90,11 +101,11 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
         _preceding = preceding;
         _descending = descending;
         _aggregator = aggregator;
-        _aggCount = aggCount;
+        _widen = widen;
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
-        _accum = new Dictionary<TKey, SortedDictionary<StructuralRow, long>>(partitionComparer);
-        _window = new Dictionary<TKey, Dictionary<StructuralRow, (StructuralRow, long)>>(partitionComparer);
+        _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
+        _window = new Dictionary<TKey, Dictionary<TInRow, (TOutRow, long)>>(partitionComparer);
     }
 
     /// <summary>Total input rows currently retained across all partitions —
@@ -126,7 +137,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
     public void Step()
     {
         var delta = _input.Current;
-        var builder = new ZSetBuilder<StructuralRow, Z64>();
+        var builder = new ZSetBuilder<TOutRow, Z64>();
 
         if (!delta.IsEmpty)
         {
@@ -148,7 +159,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
 
                 if (!_accum.TryGetValue(key, out var bucket))
                 {
-                    bucket = new SortedDictionary<StructuralRow, long>(_order);
+                    bucket = new SortedDictionary<TInRow, long>(_order);
                     _accum[key] = bucket;
                 }
 
@@ -181,16 +192,16 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
     /// <summary>Recompute the output rows of one partition whose frame the delta
     /// (spanning value range <paramref name="deltaRange"/>) could have changed, and
     /// emit the +/- diffs against the previously emitted output.</summary>
-    private void RecomputePartition(ZSetBuilder<StructuralRow, Z64> builder, TKey key, (long Min, long Max) deltaRange)
+    private void RecomputePartition(ZSetBuilder<TOutRow, Z64> builder, TKey key, (long Min, long Max) deltaRange)
     {
         _accum.TryGetValue(key, out var bucket);
         _window.TryGetValue(key, out var win);
-        win ??= new Dictionary<StructuralRow, (StructuralRow, long)>();
+        win ??= new Dictionary<TInRow, (TOutRow, long)>();
 
         // Materialise the current partition ascending by order value; the frame
         // for any row is then a contiguous slice.
         var rows = bucket is null
-            ? new List<(StructuralRow Row, long Weight, long Value)>()
+            ? new List<(TInRow Row, long Weight, long Value)>()
             : bucket.Select(kv => (Row: kv.Key, Weight: kv.Value, Value: _orderValueOf?.Invoke(kv.Key) ?? 0L))
                     .OrderBy(r => r.Value).ToList();
 
@@ -231,7 +242,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
 
         // Candidate base rows = current rows in range ∪ previously-emitted rows in
         // range (the latter catches rows the delta retracted).
-        var candidates = new HashSet<StructuralRow>();
+        var candidates = new HashSet<TInRow>();
         foreach (var r in rows)
         {
             if (r.Value >= lo && r.Value <= hi)
@@ -254,7 +265,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
             if (bucket is not null && bucket.TryGetValue(baseRow, out var weight))
             {
                 var agg = whole ? wholeAgg : _aggregator.Compute(FrameFor(rows, _orderValueOf!(baseRow)));
-                var widened = Widen(baseRow, agg);
+                var widened = _widen(baseRow, agg);
                 EmitRowDiff(builder, win, baseRow, widened, weight);
             }
             else if (win.TryGetValue(baseRow, out var old))
@@ -276,7 +287,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
 
     /// <summary>The frame multiset for a row at order value <paramref name="v"/>
     /// over the ascending-by-value <paramref name="rows"/>.</summary>
-    private ZSet<StructuralRow, Z64> FrameFor(List<(StructuralRow Row, long Weight, long Value)> rows, long v)
+    private ZSet<TInRow, Z64> FrameFor(List<(TInRow Row, long Weight, long Value)> rows, long v)
     {
         long lo, hi;
         if (_preceding is null)
@@ -292,7 +303,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
             hi = _descending ? v + _preceding.Value : v;
         }
 
-        var entries = new List<(StructuralRow, Z64)>();
+        var entries = new List<(TInRow, Z64)>();
         foreach (var r in rows)
         {
             if (r.Value >= lo && r.Value <= hi)
@@ -308,10 +319,10 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
     /// output (in <paramref name="win"/>) to (<paramref name="widened"/>,
     /// <paramref name="weight"/>), and update <paramref name="win"/>.</summary>
     private static void EmitRowDiff(
-        ZSetBuilder<StructuralRow, Z64> builder,
-        Dictionary<StructuralRow, (StructuralRow Widened, long Weight)> win,
-        StructuralRow baseRow,
-        StructuralRow widened,
+        ZSetBuilder<TOutRow, Z64> builder,
+        Dictionary<TInRow, (TOutRow Widened, long Weight)> win,
+        TInRow baseRow,
+        TOutRow widened,
         long weight)
     {
         if (win.TryGetValue(baseRow, out var old))
@@ -335,29 +346,6 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
         }
 
         win[baseRow] = (widened, weight);
-    }
-
-    private StructuralRow Widen(StructuralRow row, Optional<StructuralRow> agg)
-    {
-        var n = row.Count;
-        var vs = new object?[n + _aggCount];
-        for (var i = 0; i < n; i++)
-        {
-            vs[i] = row[i];
-        }
-
-        if (agg.HasValue)
-        {
-            var a = agg.Value;
-            for (var j = 0; j < _aggCount; j++)
-            {
-                vs[n + j] = a[j];
-            }
-        }
-
-        // agg.HasValue is false only for an empty frame (no positive weight) —
-        // impossible while the current row is in its own frame; leave NULLs.
-        return new StructuralRow(vs);
     }
 
     /// <summary>Frontier-driven GC for bounded ascending frames: drop rows whose
@@ -385,7 +373,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
         var emptyPartitions = new List<TKey>();
         foreach (var (key, bucket) in _accum)
         {
-            List<StructuralRow>? drop = null;
+            List<TInRow>? drop = null;
             foreach (var (row, _) in bucket)
             {
                 // bucket is ascending by order value (ascending frame ⇒ _order
@@ -395,7 +383,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
                     break;
                 }
 
-                (drop ??= new List<StructuralRow>()).Add(row);
+                (drop ??= new List<TInRow>()).Add(row);
             }
 
             if (drop is null)
@@ -469,7 +457,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
             var key = _partitionOf(row);
             if (!_accum.TryGetValue(key, out var bucket))
             {
-                bucket = new SortedDictionary<StructuralRow, long>(_order);
+                bucket = new SortedDictionary<TInRow, long>(_order);
                 _accum[key] = bucket;
             }
 
@@ -479,7 +467,7 @@ internal sealed class PartitionedWindowAggregateOp<TKey> : IOperator, ISnapshota
         // The restored accumulation is current; the windows it implies are already
         // materialised downstream, so record them without emitting (recompute the
         // whole partition by passing a full delta range).
-        var sink = new ZSetBuilder<StructuralRow, Z64>();
+        var sink = new ZSetBuilder<TOutRow, Z64>();
         foreach (var key in _accum.Keys.ToList())
         {
             RecomputePartition(sink, key, (long.MinValue, long.MaxValue));

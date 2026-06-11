@@ -341,7 +341,7 @@ public class WindowAggregateTests
 
     private static int RetainedRows(CompiledQuery q) =>
         q.Circuit.Operators
-            .OfType<PartitionedWindowAggregateOp<StructuralRow>>()
+            .OfType<PartitionedWindowAggregateOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow>>()
             .Single()
             .RetainedRowCount;
 
