@@ -58,25 +58,20 @@ internal static class NexmarkQueries
     public sealed record Unsupported(string Id, string Description, string Reason);
 
     /// <summary>
-    /// The standard Nexmark queries DbspNet does not run. All five need an
-    /// event-time / processing-time windowing table function (TUMBLE / HOP /
-    /// SESSION) that DbspNet does not yet expose — see
+    /// The standard Nexmark queries DbspNet does not run. Event-time tumbling
+    /// windows (<c>GROUP BY TUMBLE</c> / <c>TUMBLE_START</c> / <c>TUMBLE_END</c>)
+    /// are now supported, so q7/q8/q12 have moved to <see cref="All"/>. What
+    /// remains needs a windowing table function DbspNet does not yet expose — see
     /// <c>docs/skipped.md</c> (window functions). Feldera additionally omits
-    /// q6/q10/q11/q13/q14/q21 from its own published set, so they are not listed
-    /// here as DbspNet-specific gaps.
+    /// q6/q10/q13/q14/q21 from its own published set, so they are not listed here
+    /// as DbspNet-specific gaps.
     /// </summary>
     public static readonly Unsupported[] NotSupported =
     {
         new("q5", "hot items — sliding-window auction popularity",
             "needs a HOP (sliding) windowing table function"),
-        new("q7", "highest bid by window — tumbling-window max price + join",
-            "needs a TUMBLE (tumbling) windowing table function"),
-        new("q8", "monitor new users — windowed person ⋈ auction",
-            "needs a TUMBLE windowing table function"),
         new("q11", "user sessions — session-window bid counts",
-            "needs a SESSION windowing table function"),
-        new("q12", "processing-time windows — per-bidder bid counts",
-            "needs processing-time TUMBLE windows"),
+            "needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)"),
     };
 
     private static readonly NexmarkGenerator.NexmarkTable[] BidOnly =
@@ -91,9 +86,9 @@ internal static class NexmarkQueries
     /// <summary>
     /// The candidate queries. Not all are guaranteed to compile on every
     /// build of DbspNet — the harness attempts each and reports which
-    /// succeed. Windowed queries that require TUMBLE / HOP table functions
-    /// (q5, q7, q8) are intentionally omitted: DbspNet does not yet expose
-    /// those windowing primitives.
+    /// succeed. Event-time tumbling-window queries (q7/q8/q12) are included via
+    /// the <c>GROUP BY TUMBLE</c> surface; q5 (HOP / sliding) and q11 (SESSION)
+    /// remain in <see cref="NotSupported"/>.
     /// </summary>
     public static readonly Query[] All =
     {
@@ -149,6 +144,60 @@ internal static class NexmarkQueries
                   WHERE rn <= 1
               ) w ON a.id = w.auction",
             AuctionBid),
+        new(
+            "q7",
+            "highest bid by window — tumbling-window max price + join",
+            // Verbatim Feldera q7: per-10s-window MAX(price) joined back to the
+            // bids matching that max within the window's [start − size, start]
+            // band. GROUP BY TUMBLE(date_time, size) buckets by the window start;
+            // TUMBLE_START projects that bucket.
+            @"SELECT B.auction, B.price, B.bidder, B.date_time, B.extra
+              FROM bid B
+              JOIN (
+                SELECT MAX(B1.price) AS maxprice,
+                       TUMBLE_START(B1.date_time, INTERVAL '10' SECOND) AS date_time
+                FROM bid B1
+                GROUP BY TUMBLE(B1.date_time, INTERVAL '10' SECOND)
+              ) B1
+              ON B.price = B1.maxprice
+              WHERE B.date_time BETWEEN B1.date_time - INTERVAL '10' SECOND AND B1.date_time",
+            BidOnly),
+        new(
+            "q8",
+            "monitor new users — windowed person ⋈ auction",
+            // Verbatim Feldera q8: people who became sellers in the same 10s
+            // tumbling window they were created in. Both sides group by
+            // TUMBLE(date_time, size); the join matches on (id, window start,
+            // window end).
+            @"SELECT P.id, P.name, P.starttime
+              FROM (
+                SELECT P.id, P.name,
+                       TUMBLE_START(P.date_time, INTERVAL '10' SECOND) AS starttime,
+                       TUMBLE_END(P.date_time, INTERVAL '10' SECOND) AS endtime
+                FROM person P
+                GROUP BY P.id, P.name, TUMBLE(P.date_time, INTERVAL '10' SECOND)
+              ) P
+              JOIN (
+                SELECT A.seller,
+                       TUMBLE_START(A.date_time, INTERVAL '10' SECOND) AS starttime,
+                       TUMBLE_END(A.date_time, INTERVAL '10' SECOND) AS endtime
+                FROM auction A
+                GROUP BY A.seller, TUMBLE(A.date_time, INTERVAL '10' SECOND)
+              ) A
+              ON P.id = A.seller AND P.starttime = A.starttime AND P.endtime = A.endtime",
+            AuctionPerson),
+        new(
+            "q12",
+            "windowed bid counts — per-bidder counts per event-time window",
+            // Verbatim Feldera q12 (event-time TUMBLE on date_time, not the
+            // original Nexmark processing-time form): per-bidder bid counts in
+            // each 10s tumbling window.
+            @"SELECT B.bidder, COUNT(*) AS bid_count,
+                     TUMBLE_START(B.date_time, INTERVAL '10' SECOND) AS starttime,
+                     TUMBLE_END(B.date_time, INTERVAL '10' SECOND) AS endtime
+              FROM bid B
+              GROUP BY B.bidder, TUMBLE(B.date_time, INTERVAL '10' SECOND)",
+            BidOnly),
         new(
             "q15",
             "bidding statistics report — per-day bid/bidder/auction counts",

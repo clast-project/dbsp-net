@@ -118,6 +118,7 @@ internal static class ScalarFunctionRegistry
             new DateTruncFunction(),
             new DateAddFunction(),
             new DateDiffFunction(),
+            new WindowStartFunction(),
 
             // General.
             new CoalesceFunction(),

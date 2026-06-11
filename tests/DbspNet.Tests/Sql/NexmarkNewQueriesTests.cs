@@ -29,7 +29,55 @@ public class NexmarkNewQueriesTests
         @"CREATE TABLE bid (
             auction BIGINT NOT NULL, bidder BIGINT NOT NULL, price BIGINT NOT NULL,
             channel VARCHAR NOT NULL, url VARCHAR NOT NULL, date_time TIMESTAMP NOT NULL, extra VARCHAR NOT NULL)",
+        @"CREATE TABLE person (
+            id BIGINT NOT NULL, name VARCHAR NOT NULL, email_address VARCHAR NOT NULL,
+            credit_card VARCHAR NOT NULL, city VARCHAR NOT NULL, state VARCHAR NOT NULL,
+            date_time TIMESTAMP NOT NULL, extra VARCHAR NOT NULL)",
     };
+
+    private const long Sec = 1_000_000L;
+
+    // q7: highest bid per 10s tumbling window, joined back to the bids matching that
+    // max price within the window's [start − size, start] band (Feldera's verbatim form).
+    private const string Q7 =
+        @"SELECT B.auction, B.price, B.bidder, B.date_time, B.extra
+          FROM bid B
+          JOIN (
+            SELECT MAX(B1.price) AS maxprice,
+                   TUMBLE_START(B1.date_time, INTERVAL '10' SECOND) AS date_time
+            FROM bid B1
+            GROUP BY TUMBLE(B1.date_time, INTERVAL '10' SECOND)
+          ) B1
+          ON B.price = B1.maxprice
+          WHERE B.date_time BETWEEN B1.date_time - INTERVAL '10' SECOND AND B1.date_time";
+
+    // q8: people who entered an auction (as seller) within the same 10s window they
+    // were created in — windowed person ⋈ auction on (id, window start, window end).
+    private const string Q8 =
+        @"SELECT P.id, P.name, P.starttime
+          FROM (
+            SELECT P.id, P.name,
+                   TUMBLE_START(P.date_time, INTERVAL '10' SECOND) AS starttime,
+                   TUMBLE_END(P.date_time, INTERVAL '10' SECOND) AS endtime
+            FROM person P
+            GROUP BY P.id, P.name, TUMBLE(P.date_time, INTERVAL '10' SECOND)
+          ) P
+          JOIN (
+            SELECT A.seller,
+                   TUMBLE_START(A.date_time, INTERVAL '10' SECOND) AS starttime,
+                   TUMBLE_END(A.date_time, INTERVAL '10' SECOND) AS endtime
+            FROM auction A
+            GROUP BY A.seller, TUMBLE(A.date_time, INTERVAL '10' SECOND)
+          ) A
+          ON P.id = A.seller AND P.starttime = A.starttime AND P.endtime = A.endtime";
+
+    // q12: per-bidder bid counts within each 10s (event-time) tumbling window.
+    private const string Q12 =
+        @"SELECT B.bidder, COUNT(*) AS bid_count,
+                 TUMBLE_START(B.date_time, INTERVAL '10' SECOND) AS starttime,
+                 TUMBLE_END(B.date_time, INTERVAL '10' SECOND) AS endtime
+          FROM bid B
+          GROUP BY B.bidder, TUMBLE(B.date_time, INTERVAL '10' SECOND)";
 
     private const string Q15 =
         @"SELECT CAST(date_time AS DATE) AS day,
@@ -130,6 +178,12 @@ public class NexmarkNewQueriesTests
 
     private static void InsertAuction(CompiledQuery q, long id, long category) =>
         q.Table("auction").Insert(id, "item", "desc", 1L, 1L, new Timestamp(0), new Timestamp(0), 99L, category, "x");
+
+    private static void InsertSeller(CompiledQuery q, long seller, long timeMicros) =>
+        q.Table("auction").Insert(0L, "item", "desc", 1L, 1L, new Timestamp(timeMicros), new Timestamp(0), seller, 1L, "x");
+
+    private static void InsertPerson(CompiledQuery q, long id, string name, long timeMicros) =>
+        q.Table("person").Insert(id, name, "e", "cc", "city", "st", new Timestamp(timeMicros), "x");
 
     private static List<object?[]> PositiveRows(CompiledQuery q, int ncols)
     {
@@ -318,6 +372,62 @@ public class NexmarkNewQueriesTests
         var prices = rows.Select(r => (long)r[2]!).OrderBy(p => p).ToList();
         Assert.Equal(3L, prices.First());    // the two lowest (1, 2) are dropped
         Assert.Equal(12L, prices.Last());
+    }
+
+    [Fact]
+    public void Q7_HighestBidPerTumblingWindow_Compiles()
+    {
+        var q = Compile(Q7);
+        // Window [0,10): bids 100@3s, 250@7s → max 250, window start 0s.
+        // Window [10,20): bid 250@12s → max 250, window start 10s.
+        InsertBid(q, auction: 1, bidder: 1, price: 100, timeMicros: 3 * Sec);
+        InsertBid(q, auction: 1, bidder: 2, price: 250, timeMicros: 7 * Sec);
+        InsertBid(q, auction: 1, bidder: 3, price: 250, timeMicros: 12 * Sec);
+        q.Step();
+
+        // Every surviving bid carries a window-max price; the literal BETWEEN band
+        // [start − 10s, start] keeps the 250@7s bid via window-1's start (10s).
+        var rows = PositiveRows(q, 5);
+        Assert.NotEmpty(rows);
+        Assert.All(rows, r => Assert.Equal(250L, (long)r[1]!)); // price column = a window max
+        Assert.Contains(rows, r => (long)r[2]! == 2L);          // bidder 2 (250@7s) survives
+    }
+
+    [Fact]
+    public void Q8_WindowedPersonAuctionJoin_MatchesSameWindow()
+    {
+        var q = Compile(Q8);
+        InsertPerson(q, id: 1, name: "alice", timeMicros: 3 * Sec);   // window [0,10)
+        InsertSeller(q, seller: 1, timeMicros: 8 * Sec);              // window [0,10) → match
+        InsertSeller(q, seller: 1, timeMicros: 15 * Sec);             // window [10,20) → no match
+        InsertPerson(q, id: 2, name: "bob", timeMicros: 4 * Sec);     // no matching seller
+        q.Step();
+
+        var rows = PositiveRows(q, 3);
+        var r = Assert.Single(rows);
+        Assert.Equal(1L, r[0]);                       // id
+        Assert.Equal("alice", r[1]!.ToString());      // name
+        Assert.Equal(new Timestamp(0L), r[2]);        // window start (same window as the auction)
+    }
+
+    [Fact]
+    public void Q12_PerBidderWindowCounts()
+    {
+        var q = Compile(Q12);
+        InsertBid(q, auction: 1, bidder: 1, price: 10, timeMicros: 3 * Sec);  // bidder1, window0
+        InsertBid(q, auction: 1, bidder: 1, price: 20, timeMicros: 7 * Sec);  // bidder1, window0
+        InsertBid(q, auction: 1, bidder: 1, price: 30, timeMicros: 12 * Sec); // bidder1, window1
+        InsertBid(q, auction: 1, bidder: 2, price: 40, timeMicros: 4 * Sec);  // bidder2, window0
+        q.Step();
+
+        var rows = PositiveRows(q, 4);
+        Assert.Equal(3, rows.Count);
+        // (bidder, count, wstart, wend)
+        Assert.Equal(2L, rows.Single(r => (long)r[0]! == 1L && (Timestamp)r[2]! == new Timestamp(0L))[1]);
+        Assert.Equal(1L, rows.Single(r => (long)r[0]! == 1L && (Timestamp)r[2]! == new Timestamp(10 * Sec))[1]);
+        Assert.Equal(1L, rows.Single(r => (long)r[0]! == 2L && (Timestamp)r[2]! == new Timestamp(0L))[1]);
+        // window end = start + 10s
+        Assert.Equal(new Timestamp(10 * Sec), rows.First(r => (Timestamp)r[2]! == new Timestamp(0L))[3]);
     }
 
     [Fact]

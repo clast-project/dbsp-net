@@ -1817,6 +1817,31 @@ public sealed class Parser
                 return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseWindowSpec());
             }
 
+            // Event-time tumbling-window functions. TUMBLE(t, size) (a GROUP BY
+            // auxiliary) and TUMBLE_START(t, size) both name the window's start —
+            // the floor of t to its size-bucket; TUMBLE_END(t, size) is start +
+            // size. Desugar all three to the internal `tumble_start` scalar (and
+            // TUMBLE_END to `tumble_start(t, size) + size`) so a query GROUPed BY
+            // TUMBLE matches the TUMBLE_START / TUMBLE_END it SELECTs via the
+            // resolver's AstEqual group-key match, and the whole family rides the
+            // existing GROUP BY-expression-key + monotonicity-GC machinery with no
+            // new plan node or operator. TUMBLE* are contextual (matched by text),
+            // so they stay usable as ordinary identifiers.
+            if (!distinct && first.Text is "tumble" or "tumble_start" or "tumble_end")
+            {
+                if (args.Count != 2)
+                {
+                    throw Error(first,
+                        $"{first.Text.ToUpperInvariant()} takes a time column and a window-size INTERVAL");
+                }
+
+                var start = new FunctionCallExpression(
+                    "tumble_start", new[] { args[0], args[1] }, IsStar: false);
+                return first.Text == "tumble_end"
+                    ? new BinaryExpression(BinaryOperator.Add, start, args[1])
+                    : start;
+            }
+
             return new FunctionCallExpression(first.Text, args, IsStar: false, Distinct: distinct);
         }
 

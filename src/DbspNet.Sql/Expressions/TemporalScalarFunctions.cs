@@ -170,6 +170,105 @@ internal sealed class DateTruncFunction : IScalarFunction
 }
 
 /// <summary>
+/// <c>tumble_start(timecol, INTERVAL size)</c> — the internal window-assignment
+/// function the event-time TUMBLE windowing surface lowers onto: floor a temporal
+/// value to the start of its fixed-size, non-overlapping window. Like
+/// <see cref="DateTruncFunction"/> but bucketing by an arbitrary constant day-time
+/// interval rather than a named calendar unit; returns the source temporal type.
+/// </summary>
+/// <remarks>
+/// The parser desugars <c>TUMBLE(t, s)</c> and <c>TUMBLE_START(t, s)</c> to this
+/// call and <c>TUMBLE_END(t, s)</c> to <c>tumble_start(t, s) + s</c>. A query that
+/// <c>GROUP</c>s <c>BY TUMBLE(t, s)</c> and <c>SELECT</c>s <c>TUMBLE_START(t, s)</c> /
+/// <c>TUMBLE_END(t, s)</c> therefore matches the group key through the resolver's
+/// AstEqual post-aggregate machinery — so tumbling windows (Nexmark q7/q8/q12)
+/// need no new plan node or operator. The bucket-floor monotonicity makes a
+/// <c>GROUP BY</c> on the window start GC-able under LATENESS / clock watermarks:
+/// a window is dropped only once the frontier passes <c>start + size</c>.
+/// </remarks>
+internal sealed class WindowStartFunction : IScalarFunction
+{
+    public string Name => "tumble_start";
+
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args)
+    {
+        if (args.Count != 2)
+        {
+            throw new ResolveException("TUMBLE takes a time column and a window-size INTERVAL");
+        }
+
+        if (args[0].Type is not (SqlTimestampType or SqlDateType))
+        {
+            throw new ResolveException(
+                $"TUMBLE requires a TIMESTAMP or DATE time column, got {args[0].Type.Display}");
+        }
+
+        // Validate the size now so a bad bucket is rejected at resolve time (it is
+        // re-read identically by BuildStructural and Monotonicity).
+        _ = WindowSizeNative(args, args[0].Type);
+        return new ResolvedFunctionCall(Name, args, args[0].Type);
+    }
+
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg)
+    {
+        var size = WindowSizeNative(fn.Arguments, fn.Arguments[0].Type);
+        return Expression.Call(
+            TemporalFunctionSupport.Method(nameof(TemporalFunctions.TumbleStart)),
+            buildArg(fn.Arguments[0]),
+            Expression.Constant(size));
+    }
+
+    public Expression? BuildTyped(
+        ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) => null;
+
+    // Non-decreasing in the time column but floors values to the window start, so
+    // — like date_trunc — the frontier must pass through the same bucket floor to
+    // threshold the derived window-start keys soundly (a window may not be GC'd
+    // until the watermark has passed its end, i.e. maxSeen >= start + size).
+    public ScalarMonotonicity? Monotonicity(ResolvedFunctionCall fn)
+    {
+        var size = WindowSizeNative(fn.Arguments, fn.Arguments[0].Type);
+        return new ScalarMonotonicity(0, v => TemporalFunctions.FloorToBucket(v, size));
+    }
+
+    /// <summary>The window size in the time column's native frontier unit
+    /// (microseconds for TIMESTAMP, whole days for DATE). Rejects a non-constant
+    /// size, a calendar (month/year) interval — whose bucket length is non-uniform,
+    /// so its floor is not a monotone fixed-bucket map — a non-positive size, and a
+    /// sub-day size over a DATE column.</summary>
+    private static long WindowSizeNative(IReadOnlyList<ResolvedExpression> args, SqlType timeType)
+    {
+        if (args.Count < 2 || args[1] is not ResolvedLiteral { Value: Interval iv })
+        {
+            throw new ResolveException("TUMBLE window size must be a constant INTERVAL");
+        }
+
+        if (iv.Months != 0)
+        {
+            throw new ResolveException(
+                "TUMBLE window size must be a day-time INTERVAL (a calendar month/year bucket is non-uniform)");
+        }
+
+        if (iv.Micros <= 0)
+        {
+            throw new ResolveException("TUMBLE window size must be a positive INTERVAL");
+        }
+
+        if (timeType is SqlDateType)
+        {
+            if (iv.Micros % Interval.MicrosPerDay != 0)
+            {
+                throw new ResolveException("a TUMBLE over a DATE column requires a whole-day window size");
+            }
+
+            return iv.Micros / Interval.MicrosPerDay;
+        }
+
+        return iv.Micros;
+    }
+}
+
+/// <summary>
 /// <c>DATEADD('unit', n, source)</c> — add <c>n</c> units to a temporal value.
 /// Equivalent to <c>source + n * INTERVAL unit</c>; returns the source type.
 /// (The unit is a string literal here, not SQL Server's bare keyword, to avoid
@@ -508,6 +607,27 @@ internal static class TemporalFunctions
         SqlTimeType => TruncTime(new Time64(v), unit).Microseconds,
         _ => v,
     };
+
+    // ---- TUMBLE (window assignment) ----
+
+    /// <summary>Floor a temporal value to the start of its fixed-size window — the
+    /// runtime of <c>tumble_start</c>. <paramref name="size"/> is in the source's
+    /// native unit (microseconds for TIMESTAMP, whole days for DATE), matching
+    /// <see cref="FloorToBucket"/> so the structural result and the GC frontier
+    /// transform agree exactly.</summary>
+    public static object? TumbleStart(object? src, long size) => src switch
+    {
+        null => null,
+        Timestamp ts => (object)new Timestamp(FloorToBucket(ts.Microseconds, size)),
+        Date32 d => (object)new Date32((int)FloorToBucket(d.Days, size)),
+        _ => throw new InvalidOperationException($"tumble_start: unsupported source {src.GetType().Name}"),
+    };
+
+    /// <summary>Floor <paramref name="v"/> to the largest multiple of
+    /// <paramref name="size"/> not exceeding it (correct for negative
+    /// <paramref name="v"/> — epoch-relative times can precede 1970). Doubles as the
+    /// monotone frontier transform for a window-start key.</summary>
+    internal static long FloorToBucket(long v, long size) => FloorDiv(v, size) * size;
 
     // ---- DATEADD ----
 

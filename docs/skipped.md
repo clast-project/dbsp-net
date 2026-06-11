@@ -573,6 +573,32 @@ reflect that shape, not a backlog.
 - **[P3]** CHAR(n) with space-padding semantics.
 
 ### Streaming extensions
+- **Event-time windowing — TUMBLE (tumbling)** — **implemented**. The
+  `GROUP BY TUMBLE(timecol, INTERVAL size)` surface plus the `TUMBLE_START` /
+  `TUMBLE_END` projection functions (Feldera's Nexmark q7/q8/q12 form). It is
+  pure lowering — *no new plan node or operator*: the parser desugars
+  `TUMBLE(t, s)` and `TUMBLE_START(t, s)` to an internal monotone scalar
+  `tumble_start(t, s)` (a fixed-bucket floor, `floor(t/s)*s`, the
+  arbitrary-interval generalisation of `DATE_TRUNC`) and `TUMBLE_END(t, s)` to
+  `tumble_start(t, s) + s`, so a query that `GROUP`s `BY TUMBLE` matches the
+  `TUMBLE_START`/`TUMBLE_END` it `SELECT`s through the resolver's `AstEqual`
+  post-aggregate group-key match. The whole family therefore rides the existing
+  GROUP BY-expression-key, aggregate, and join machinery. `tumble_start` declares
+  a bucket-floor `Monotonicity` frontier transform (like `date_trunc`), so a
+  `GROUP BY` on the window start is **GC-able** under `LATENESS` / clock
+  watermarks — a window is dropped only once the frontier passes `start + size`
+  (the soundness crux, PBT-proven). TIMESTAMP and whole-day DATE columns; a
+  calendar (month/year) window size is rejected (non-uniform bucket). Structural
+  compile only (`tumble_start`'s typed lowering returns null, like the other
+  temporal functions), so windowed queries currently run single-circuit — a typed
+  lowering to unlock the parallel W&gt;1 path is the open follow-on. *Deferred:*
+  **HOP** (sliding — fans each row out to `size/slide` windows; lowers to a
+  `UNION ALL` of shifted projections, unlocks q5) and **SESSION** (gap-merged,
+  genuinely stateful merge under retraction, unlocks q11 — Feldera itself omits
+  q11 / has no session-window support, so there is no apples-to-apples baseline).
+  The `TABLE(TUMBLE/HOP(TABLE t, DESCRIPTOR(c), …))` table-valued-function spelling
+  (Feldera's q5 form, emitting `window_start`/`window_end` columns) is the Phase-2
+  surface; the GROUP BY form above is the q7/q8/q12 surface.
 - `LATENESS` bounds — **implemented** (bounded-history trace GC driven by a
   monotonicity analysis, the standard answer across long-running IVM engines:
   Feldera's `MonotoneAnalyzer` + `IntegrateTraceRetainKeysOperator`,
