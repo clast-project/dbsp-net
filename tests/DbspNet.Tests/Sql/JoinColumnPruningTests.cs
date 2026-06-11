@@ -113,8 +113,8 @@ public class JoinColumnPruningTests
         // disabled.
         var plan = ParsePlan(JoinSql);
 
-        var off = FindJoin(PlanOptimizer.Optimize(plan));
-        var on = FindJoin(WithPruning(() => PlanOptimizer.Optimize(plan)));
+        var off = FindJoin(WithPruning(false, () => PlanOptimizer.Optimize(plan)));
+        var on = FindJoin(WithPruning(true, () => PlanOptimizer.Optimize(plan)));
 
         Assert.Equal(3, off.Left.Schema.Count);  // k, a, b (unchanged)
         Assert.Equal(3, off.Right.Schema.Count); // k, c, d (unchanged)
@@ -147,17 +147,15 @@ public class JoinColumnPruningTests
         bool prune, IReadOnlyList<IReadOnlyList<InputEvent>> ticks)
     {
         var plan = ParsePlan(JoinSql);
-        var optimized = prune
-            ? WithPruning(() => PlanOptimizer.Optimize(plan))
-            : PlanOptimizer.Optimize(plan);
+        var optimized = WithPruning(prune, () => PlanOptimizer.Optimize(plan));
         var compiled = PlanToCircuit.Compile(optimized);
         return IncrementalOracle.RunAndAccumulate(compiled, ticks);
     }
 
-    private static T WithPruning<T>(Func<T> body)
+    private static T WithPruning<T>(bool enabled, Func<T> body)
     {
         var prev = JoinColumnPruningMode.Enabled;
-        JoinColumnPruningMode.Enabled = true;
+        JoinColumnPruningMode.Enabled = enabled;
         try
         {
             return body();

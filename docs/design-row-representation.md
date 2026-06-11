@@ -2699,8 +2699,8 @@ gates — plus the **answered architectural question** that unblocks the columna
 
 ## 21. The columnar arc, re-justified — and the cheaper term-2 lever it surfaced: projection pushdown through joins (LANDED, gated, unconditionally sound)
 
-> Status: **measure-first design session that pivoted the increment, then landed it
-> behind a default-off seam, benchmark-gated.** This opened as the columnar / arena
+> Status: **measure-first design session that pivoted the increment, gated it, and
+> shipped it default-ON (unconditionally sound).** This opened as the columnar / arena
 > inner-multiset arc (§17 #3) with the prompt's own honest instruction: *re-justify the
 > target first — §18 narrowing may already have captured most of q4's term-2, so measure
 > where whole-row hashing is still large before any rewrite.* The measurement did exactly
@@ -2819,17 +2819,19 @@ arc** — bigger than §18's 1.22–1.37×, §14.10's 1.3–1.5×, and (a)'s +14
 
 ### 21.6 — Decision
 
-- **Keep the rule behind the seam this session; strongly recommend flipping it default-on
-  next.** Unlike every prior seam in this family, `JoinColumnPruningMode` is
-  **unconditionally sound** (proven by the full-±1 PBT) and delivers a **−50 % W=1 / 2.93–4.19×
-  W=8** win on the worst query with **no regression on the cheap path** (q3 preserved, the
-  §17.7 landmine respected). The only reason it ships default-off is the project's
-  land-seam-then-flip discipline and to let the default change be reviewed deliberately; the
-  evidence to flip it is already in hand. Productization is the same shape as §18's deferred
-  flip but *without* the envelope caveat — it can be a plain default-on optimizer rule
-  (eventually generalised from the local `Project/Aggregate(Join)` patterns to the proper
-  top-down column-liveness pass `PlanOptimizer.cs:38` anticipates, which would also prune
-  Filter/TOP-K/window parents and chained joins).
+- **Flipped default-ON (this session).** Unlike every prior seam in this family,
+  `JoinColumnPruningMode` is **unconditionally sound** (proven by the full-±1 PBT) and delivers
+  a **−50 % W=1 / 2.93–4.19× W=8** win on the worst query with **no regression on the cheap
+  path** (q3 preserved, the §17.7 landmine respected) — so it ships on, not as an opt-in. The
+  rule now runs for every caller that optimizes (`PlanToCircuit.Compile(PlanOptimizer.Optimize(plan))`,
+  the documented idiom); the **full SQL e2e suite is green with it on (1,753 passed)**, every
+  join query pruned by default with output unchanged — the production-scale corroboration of
+  the PBT. Implementation note: the seam stores the **inverse** of an opt-out flag, because a
+  `[ThreadStatic] bool` cannot default to `true` (a field initializer never runs on threads
+  that did not first touch the type) — so "on" is the zero/default state and benchmarks set it
+  `false` to A/B the full-row baseline. The next generalisation (deferred) is the proper
+  top-down column-liveness pass `PlanOptimizer.cs:38` anticipates — pruning Filter/TOP-K/window
+  parents and chained joins, not just the local `Project/Aggregate(Join)` patterns.
 - **The columnar SoA inner multiset (§17 #3) is reframed, not built — and its prize shrank
   again.** For q4 it is now firmly behind two cheaper levers (§18 on the aggregate, §21 on
   the join), both of which leave the inner state a *narrow* flat dict where columnar's

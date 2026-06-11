@@ -29,19 +29,33 @@ namespace DbspNet.Sql.Optimizer;
 /// aggregate's argument columns are kept, being referenced above), so there is no
 /// value-presence hazard. Holds for arbitrary <i>signed</i> Z-sets — this is ordinary
 /// relational projection pushdown, valid by construction.</para>
-/// <para>Kept default-off behind this seam while the rule is benchmark-gated, joining the
-/// <c>NonLinearNarrowingMode</c> / <c>DeltaPoolMode</c> / <c>FlatAggregateMode</c> family.
-/// Read at <see cref="PlanOptimizer.Optimize"/> time; <see cref="ThreadStaticAttribute"/>
-/// so concurrent compiles cannot observe each other's value. No plan/compiler signature
-/// change (dodges the typed-compiler reflection gotcha). Scoped to INNER joins in v1.</para>
+/// <para><b>Default ON</b> (§21 gate: q4 −50% W=1 / 2.93–4.19× W=8, q3 preserved, full-±1
+/// PBT proves soundness). Read at <see cref="PlanOptimizer.Optimize"/> time;
+/// <see cref="ThreadStaticAttribute"/> so concurrent compiles cannot observe each other's
+/// value. No plan/compiler signature change (dodges the typed-compiler reflection gotcha).
+/// Scoped to INNER joins in v1. Benchmarks set it <c>false</c> to A/B the full-row baseline;
+/// the rest of the seam family (<c>NonLinearNarrowingMode</c> / <c>DeltaPoolMode</c>) stays
+/// default-off because those are conditionally sound, this one is not.</para>
 /// </remarks>
 internal static class JoinColumnPruningMode
 {
-    /// <summary>
-    /// When true, <c>PruneJoinInputs</c> inserts narrowing projections on an INNER
-    /// join's inputs, dropping every column no consumer (parent, combine, residual,
-    /// equi-key) reads. Default false — byte-identical to today. Thread-static.
-    /// </summary>
+    // Stored as the INVERSE of an opt-out flag: a [ThreadStatic] field's zero value is
+    // observed per thread and a field initializer never runs on threads other than the one
+    // that first touches the type, so "on" must be the zero/default state to default to true
+    // robustly across threads. Enabled exposes the inverse so all call sites and the
+    // benchmark A/B toggles keep their natural sense.
     [ThreadStatic]
-    internal static bool Enabled;
+    private static bool _disabledOnThisThread;
+
+    /// <summary>
+    /// When true (the default), <c>PruneJoinInputs</c> inserts narrowing projections on an
+    /// INNER join's inputs, dropping every column no consumer (parent, combine, residual,
+    /// equi-key) reads. Unconditionally sound, so on by default; set false to A/B the
+    /// full-row baseline. Thread-static.
+    /// </summary>
+    internal static bool Enabled
+    {
+        get => !_disabledOnThisThread;
+        set => _disabledOnThisThread = !value;
+    }
 }
