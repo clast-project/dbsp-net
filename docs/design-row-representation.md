@@ -2595,6 +2595,108 @@ boundary + coordination, not window representation).
 
 ---
 
+## 20. Term-1 attack — cross-tick delta-builder pooling (LANDED behind a seam; thin throughput, but the architectural question is answered YES)
+
+> Status: **mechanism built, gated, kept default-off behind a seam.** This is §17's
+> *term-1* front (the ~50–60 % per-tick **allocation** half of the per-tuple floor)
+> and the lever §17 ranked #1. Its headline result is **not** a throughput win — that
+> is thin, exactly as §16.10 predicted — but the **load-bearing architectural
+> question it was chosen to answer**: *can a managed operator reuse its delta buffer
+> across ticks despite `Build()`'s ownership transfer?* The answer is **yes, safely**,
+> which is the prerequisite the columnar end-state (§17 #3) needed proven.
+
+### 20.1 — The mechanism
+
+The per-tick allocation §16.3 measured is the fresh `ZSetBuilder` (a new
+`Dictionary`) each stateful op builds, fills, and `Build()`s every `Step`. §16.8
+pre-sizing removed the *resize churn* half; this removes the *steady backing* half by
+**reusing one builder across ticks**:
+
+- **`ZSetBuilder.Reset()`** (clear, keep the grown dictionary) + **`BuildShared()`**
+  (wrap the dictionary in a Z-set **without** nulling it, so the builder keeps it) —
+  `ZSetBuilder.cs`. This deliberately breaks the `ZSet` ctor's "callers must not
+  retain the dict" invariant, which is sound **only on a dead-after-tick edge**.
+- **`DeltaPoolMode`** (`Operators/Stateful/DeltaPoolMode.cs`): a default-off
+  `[ThreadStatic]` seam read at operator construction (mirroring
+  `SpineStagingConfig`/`FlatAggregateMode`; no builder signature change). When on,
+  `IncrementalAggregateOp` and `IncrementalJoinOp` hold one pooled builder and
+  `Reset` + refill + `BuildShared` each `Step` instead of allocating fresh.
+
+### 20.2 — The retention constraint, and that it is satisfiable (the real result)
+
+A pooled `BuildShared` output **shares** the builder's dictionary, which the next
+tick's `Reset` clears — so it is correct only if **nothing retains the output across
+ticks**. §16.7 item 3 established the only cross-tick aliaser of a delta is `DelayOp`
+(`z⁻¹`), and flat (non-recursive) pipelines put no `z⁻¹` on an operator-output delta.
+This section **proves that constraint holds empirically**:
+
+- **`DeltaPoolingPbtTests`** runs the full random-query oracle (joins / aggregates /
+  filters / TOP-K — all flat) with pooling **on**, over **3000 iterations including
+  retractions** (`±1` weights), and the pooled circuit's accumulated output **equals
+  the batch re-computation** every time. Pooling is pure memory reuse, so a mismatch
+  would expose an aliasing bug — none appeared.
+- **Full suite green with the seam off** (1,750 passed, +1 the pooled PBT) — the
+  byte-identical-when-disabled regression guard.
+- **Parallel output cross-check** (`q4pool`) confirms pooled = unpooled output on the
+  W-replica pipeline, re-proving the constraint end-to-end on the parallel path.
+
+So the `Build()`-ownership invariant **can be broken safely** with the
+`Reset`/`BuildShared` pattern under a no-`z⁻¹`/non-terminal edge guard. Recursive-CTE
+circuits (explicit `z⁻¹` on deltas) and a circuit's externally-read terminal output
+(unless the consumer copies each tick) are the excluded cases — the per-edge analysis
+a productionised version would need.
+
+### 20.3 — The throughput prize is thin (as §16.10 predicted)
+
+**W=1 (`w1profile … pool`, 1M events, batch 10k, median-4):**
+
+| Query | B/event off→on | note |
+|:--|--:|:--|
+| q4 | 2,376 → **2,198 (−7.5 %)** | join + 2 aggregates pooled |
+| q20 | 1,291 → 1,237 (−4 %) | wide join |
+| q9 | 2,349 → 2,324 (−1 %) | join + TOP-1 (TOP-K not pooled) |
+| q18 | 2,175 → 2,175 (**0 %**) | control — TOP-K only, nothing pooled |
+
+Time was flat within noise. **W=8 (`q4pool`):** the step ratio ranged **0.86×–1.29×**
+across runs — inside the parallel bench's ±0.5× noise floor (§11), a slight positive
+lean (median ~1.05–1.14× at the realistic batch 10k), **not a reliable win.**
+
+Why thin: (1) §16.8 pre-sizing already removed the larger *churn* term, leaving only
+the steady backing; and (2) the pooled output builders are only **part** of q4's
+per-tick allocation — the `GroupProject` re-index `IndexedZSet` builds, the trace
+`MergeInPlace` growth, and the `object?[]` input boundary are all unpooled. Reclaiming
+~7 % of q4's allocation moves throughput by less than the bench's noise.
+
+### 20.4 — Decision: keep as a seam; the value is the de-risked columnar foundation
+
+- **Do not productionise pooling as a throughput optimisation.** A per-edge
+  "no-`z⁻¹`, non-terminal" compiler analysis to reclaim ~7 % of q4's allocation (and a
+  noise-level step) is not worth the complexity/risk. `DeltaPoolMode` stays
+  **default-off behind the seam**, joining `ForceEagerRebuild` / `ForcePointProbe` /
+  `CoalesceJoinExchange` / `NonLinearNarrowingMode` as a proven, reproducible, gated
+  mechanism + regression guard.
+- **The architectural result is the deliverable.** §17 ranked term-1 #1 *specifically
+  because it answers whether buffer reuse is feasible despite `Build()` ownership* —
+  the question the entire columnar/arena end-state (§17 #3) hinges on. It is now
+  answered **yes, safely**, with a working `Reset`/`BuildShared` primitive and an
+  empirically-validated dead-after-tick edge constraint. A columnar inner-multiset
+  that reuses arena buffers across ticks (the Feldera model, §16.4) can build on this
+  with the retention rule already proven — it does **not** have to re-litigate buffer
+  reuse from scratch, and it must own its buffers exactly the way this seam does.
+- **Term-1 is therefore substantially closed as a *standalone* lever** (pre-sizing
+  shipped §16.8; steady-backing pooling proven-but-thin here). The remaining per-tuple
+  headroom on the gap queries is the **other unpooled allocation sites** (re-index /
+  trace / boundary) and the **columnar restructuring** that would fold the output
+  build, the re-index, and the inner multiset into one reused columnar buffer — the
+  §17 #3 end-state, now standing on a proven buffer-reuse foundation.
+
+**Durable deliverables:** the `ZSetBuilder.Reset`/`BuildShared` pooled-builder
+primitive, the `DeltaPoolMode` seam, `DeltaPoolingPbtTests` (the retention-constraint
+proof), and the `w1profile … pool` / `q4pool` ([q4-pool-bench.md](q4-pool-bench.md))
+gates — plus the **answered architectural question** that unblocks the columnar arc.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
@@ -2609,6 +2711,8 @@ DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 (`w1profile`/`profile`/`reprbench`, docs/w1-profile.md + repr-decomp-bench.md — §16/§17);
 `Sql/Optimizer/NonLinearNarrowingMode.cs` + `Benchmarks/Q4NarrowBenchmark.cs`
 (`q4narrow`, docs/q4-narrow-bench.md — §18);
+`Operators/Stateful/DeltaPoolMode.cs` + `ZSetBuilder.Reset/BuildShared` +
+`Benchmarks/Q4PoolBenchmark.cs` (`q4pool`, docs/q4-pool-bench.md — §20);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

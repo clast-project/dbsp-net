@@ -59,10 +59,11 @@ if (args.Length > 0 && args[0] == "w1profile")
             CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
     var narrow = args.Any(a => a is "narrow" or "narrowNonLinear");
+    var pool = args.Any(a => a is "pool" or "deltapool");
     var sb = new StringBuilder();
     sb.AppendLine("# DbspNet — W=1 per-row execution cost");
     sb.AppendLine();
-    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow);
+    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool);
     var w1Path = Path.Combine(FindDocsDir(), "w1-profile.md");
     File.WriteAllText(w1Path, sb.ToString());
     Console.WriteLine();
@@ -218,6 +219,28 @@ if (args.Length > 0 && args[0] == "q4narrow")
     File.WriteAllText(q4nPath, sb.ToString());
     Console.WriteLine();
     Console.WriteLine($"Report written to {Path.GetFullPath(q4nPath)}");
+    return 0;
+}
+
+// q4 cross-tick delta-pooling gate (W>1 in-Step): `dotnet run -- q4pool [workers] [runs] [events]`
+// (docs/design-row-representation.md §20).
+if (args.Length > 0 && args[0] == "q4pool")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    int? workers = args.Length > 1 && int.TryParse(args[1], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var w) ? w : null;
+    var runs = Arg(2, 3);
+    var totalEvents = Arg(3, 1_000_000);
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Q4PoolBenchmark.Run(sb, totalEvents, workers, runs);
+    var q4pPath = Path.Combine(FindDocsDir(), "q4-pool-bench.md");
+    File.WriteAllText(q4pPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(q4pPath)}");
     return 0;
 }
 

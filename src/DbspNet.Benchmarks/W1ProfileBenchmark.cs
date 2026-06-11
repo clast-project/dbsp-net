@@ -50,14 +50,19 @@ internal static class W1ProfileBenchmark
     };
 
     public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs)
-        => Run(output, totalEvents, batchSize, runs, narrowNonLinear: false);
+        => Run(output, totalEvents, batchSize, runs, narrowNonLinear: false, pool: false);
 
-    public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs, bool narrowNonLinear)
+    public static void Run(
+        StringBuilder output, int totalEvents, int batchSize, int runs, bool narrowNonLinear, bool pool)
     {
         // Optional term-2 lever (§18): narrow non-linear (MIN/MAX) aggregate
         // inputs to {keys, args}. Thread-static seam; w1profile runs single-
         // threaded on this thread, so setting it once covers every Compile.
         DbspNet.Sql.Optimizer.NonLinearNarrowingMode.Enabled = narrowNonLinear;
+        // Optional term-1 lever (§20): cross-tick delta-builder pooling. Read at
+        // operator construction; safe here because the W=1 harness never retains a
+        // tick's output across the next Step.
+        DbspNet.Core.Operators.Stateful.DeltaPoolMode.Enabled = pool;
         Console.WriteLine();
         Console.WriteLine(
             $"=== W=1 per-row cost profile (events={totalEvents:N0}, batch={batchSize:N0}, " +

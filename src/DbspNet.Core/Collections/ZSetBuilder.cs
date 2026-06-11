@@ -94,6 +94,25 @@ public sealed class ZSetBuilder<TKey, TWeight>
 
         return new ZSet<TKey, TWeight>(d);
     }
+
+    /// <summary>
+    /// Clears the backing dictionary, keeping its grown capacity, so this builder
+    /// can be refilled and <see cref="BuildShared"/> again on the next tick without
+    /// reallocating — the cross-tick delta pooling of
+    /// docs/design-row-representation.md §16.7/§20. Use only on a builder whose last
+    /// <see cref="BuildShared"/> output is dead (no <c>z⁻¹</c> or external consumer
+    /// retains it across ticks); for the owning-handoff path use <see cref="Build"/>.
+    /// </summary>
+    public void Reset() => Entries.Clear();
+
+    /// <summary>
+    /// Wraps the backing dictionary in a Z-set <b>without</b> transferring ownership
+    /// — the builder keeps the dictionary so <see cref="Reset"/> can reclaim it next
+    /// tick. The returned Z-set therefore <b>shares</b> the builder's dictionary and
+    /// is invalidated by the next <see cref="Reset"/>; the caller guarantees it is
+    /// dead by then (the §20 dead-after-tick / no-<c>z⁻¹</c> edge constraint).
+    /// </summary>
+    public ZSet<TKey, TWeight> BuildShared() => new(Entries);
 }
 
 internal static class ZSetBuilder

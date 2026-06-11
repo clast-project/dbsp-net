@@ -33,6 +33,15 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     // Previous tick's output size — pre-sizes this tick's delta builder to avoid
     // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
     private int _lastOutputSize;
+
+    // When DeltaPoolMode is enabled at construction, reuse one output builder
+    // across ticks (Reset + refill + BuildShared) instead of allocating a fresh
+    // dictionary every Step — the §20 cross-tick delta pooling. Null = the
+    // default fresh-builder-per-tick path. Sound only on a dead-after-tick edge
+    // (no z⁻¹/terminal retains the output); see DeltaPoolMode.
+    private readonly ZSetBuilder<(TKey, TOut), Z64>? _pooledBuilder =
+        DeltaPoolMode.Enabled ? new ZSetBuilder<(TKey, TOut), Z64>() : null;
+
     private readonly IAggregator<TValue, TOut> _aggregator;
     private readonly IndexedZSetTrace<TKey, TValue, Z64> _trace = new();
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
@@ -122,7 +131,17 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         var before = _trace.Current;
 
-        var builder = new ZSetBuilder<(TKey, TOut), Z64>(_lastOutputSize);
+        ZSetBuilder<(TKey, TOut), Z64> builder;
+        if (_pooledBuilder is not null)
+        {
+            _pooledBuilder.Reset();
+            builder = _pooledBuilder;
+        }
+        else
+        {
+            builder = new ZSetBuilder<(TKey, TOut), Z64>(_lastOutputSize);
+        }
+
         foreach (var key in delta.Keys)
         {
             var groupDelta = delta.GroupFor(key);
@@ -148,7 +167,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             }
         }
 
-        var result = builder.Build();
+        var result = _pooledBuilder is not null ? builder.BuildShared() : builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
         _trace.Integrate(delta);

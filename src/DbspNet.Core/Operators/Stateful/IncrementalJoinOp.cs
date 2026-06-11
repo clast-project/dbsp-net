@@ -41,6 +41,13 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     // Previous tick's output size — pre-sizes this tick's delta builder to avoid
     // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
     private int _lastOutputSize;
+
+    // Cross-tick pooled output builder when DeltaPoolMode is on at construction
+    // (§20); null = the default fresh-builder-per-tick path. Sound only on a
+    // dead-after-tick edge (no z⁻¹/terminal retains the output); see DeltaPoolMode.
+    private readonly ZSetBuilder<TOut, TWeight>? _pooledBuilder =
+        DeltaPoolMode.Enabled ? new ZSetBuilder<TOut, TWeight>() : null;
+
     private readonly Func<TKey, TLeft, TRight, TOut> _combine;
     private readonly Func<TOut, bool>? _residual;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
@@ -117,12 +124,22 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         // calls together.
         _rightTrace.Integrate(dr);
 
-        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        ZSetBuilder<TOut, TWeight> builder;
+        if (_pooledBuilder is not null)
+        {
+            _pooledBuilder.Reset();
+            builder = _pooledBuilder;
+        }
+        else
+        {
+            builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        }
+
         // dl ⋈ R_t
         IncrementalJoinCore.JoinInto(dl, _rightTrace.Current, _combine, _residual, builder);
         // L_{t-1} ⋈ dr
         IncrementalJoinCore.JoinInto(_leftTrace.Current, dr, _combine, _residual, builder);
-        var result = builder.Build();
+        var result = _pooledBuilder is not null ? builder.BuildShared() : builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
 

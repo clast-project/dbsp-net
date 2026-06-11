@@ -38,10 +38,14 @@ internal static class SpineParallelHarness
     /// instead of the default lazy <c>LazyMergeMultiset</c> view (docs §14.10).
     /// Only affects the flat aggregate operator; ignored on the spine path.
     /// </param>
-    internal readonly record struct RunConfig(CompileOptions Options, bool ForcePointProbe, bool ForceEagerRebuild = false);
+    internal readonly record struct RunConfig(
+        CompileOptions Options, bool ForcePointProbe, bool ForceEagerRebuild = false, bool DeltaPool = false);
 
     /// <summary>Flat default — dictionary traces, the lazy merge-view aggregate (§14.10).</summary>
     internal static RunConfig Flat => new(CompileOptions.Default, false);
+
+    /// <summary>Flat with cross-tick delta-builder pooling on (§20 gate).</summary>
+    internal static RunConfig FlatPool => new(CompileOptions.Default, false, DeltaPool: true);
 
     /// <summary>Flat with the aggregate forced back to the eager per-tick rebuild (the §14.10 A/B baseline).</summary>
     internal static RunConfig FlatEager => new(CompileOptions.Default, false, ForceEagerRebuild: true);
@@ -124,6 +128,10 @@ internal static class SpineParallelHarness
         SpineJoinProbeMode.ForcePointProbe = config.ForcePointProbe;
         SpineAggregateProbeMode.ForcePointProbe = config.ForcePointProbe;
         FlatAggregateMode.ForceEagerRebuild = config.ForceEagerRebuild;
+        // DeltaPoolMode is read at operator construction, which happens inside
+        // TryCompileParallel on this (compiling) thread — so set it for the build
+        // and restore after; the per-replica pooled builders capture it then.
+        DeltaPoolMode.Enabled = config.DeltaPool;
         try
         {
             if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, config.Options))
@@ -181,6 +189,7 @@ internal static class SpineParallelHarness
             SpineJoinProbeMode.ForcePointProbe = false;
             SpineAggregateProbeMode.ForcePointProbe = false;
             FlatAggregateMode.ForceEagerRebuild = false;
+            DeltaPoolMode.Enabled = false;
         }
     }
 
