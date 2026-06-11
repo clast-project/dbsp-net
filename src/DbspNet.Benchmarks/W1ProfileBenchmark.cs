@@ -50,10 +50,11 @@ internal static class W1ProfileBenchmark
     };
 
     public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs)
-        => Run(output, totalEvents, batchSize, runs, narrowNonLinear: false, pool: false);
+        => Run(output, totalEvents, batchSize, runs, narrowNonLinear: false, pool: false, prune: false);
 
     public static void Run(
-        StringBuilder output, int totalEvents, int batchSize, int runs, bool narrowNonLinear, bool pool)
+        StringBuilder output, int totalEvents, int batchSize, int runs,
+        bool narrowNonLinear, bool pool, bool prune = false)
     {
         // Optional term-2 lever (§18): narrow non-linear (MIN/MAX) aggregate
         // inputs to {keys, args}. Thread-static seam; w1profile runs single-
@@ -63,6 +64,10 @@ internal static class W1ProfileBenchmark
         // operator construction; safe here because the W=1 harness never retains a
         // tick's output across the next Step.
         DbspNet.Core.Operators.Stateful.DeltaPoolMode.Enabled = pool;
+        // Optional term-2 lever (§21): projection pushdown through INNER joins —
+        // narrow each stored join input to the columns a consumer reads. Read at
+        // Optimize time; same thread-static seam discipline as narrow.
+        DbspNet.Sql.Optimizer.JoinColumnPruningMode.Enabled = prune;
         Console.WriteLine();
         Console.WriteLine(
             $"=== W=1 per-row cost profile (events={totalEvents:N0}, batch={batchSize:N0}, " +

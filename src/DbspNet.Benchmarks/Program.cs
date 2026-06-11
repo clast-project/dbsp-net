@@ -60,10 +60,11 @@ if (args.Length > 0 && args[0] == "w1profile")
 
     var narrow = args.Any(a => a is "narrow" or "narrowNonLinear");
     var pool = args.Any(a => a is "pool" or "deltapool");
+    var prune = args.Any(a => a is "prune" or "joinprune");
     var sb = new StringBuilder();
     sb.AppendLine("# DbspNet — W=1 per-row execution cost");
     sb.AppendLine();
-    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool);
+    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool, prune);
     var w1Path = Path.Combine(FindDocsDir(), "w1-profile.md");
     File.WriteAllText(w1Path, sb.ToString());
     Console.WriteLine();
@@ -219,6 +220,29 @@ if (args.Length > 0 && args[0] == "q4narrow")
     File.WriteAllText(q4nPath, sb.ToString());
     Console.WriteLine();
     Console.WriteLine($"Report written to {Path.GetFullPath(q4nPath)}");
+    return 0;
+}
+
+// q4 join column-pruning gate (W>1 in-Step): `dotnet run -- q4prune [workers] [runs] [events]`
+// Whole q4 parallel pipeline, flat·full vs flat·prune stored join rows
+// (docs/design-row-representation.md §21).
+if (args.Length > 0 && args[0] == "q4prune")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    int? workers = args.Length > 1 && int.TryParse(args[1], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var w) ? w : null;
+    var runs = Arg(2, 3);
+    var totalEvents = Arg(3, 1_000_000);
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Q4PruneBenchmark.Run(sb, totalEvents, workers, runs);
+    var q4prPath = Path.Combine(FindDocsDir(), "q4-prune-bench.md");
+    File.WriteAllText(q4prPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(q4prPath)}");
     return 0;
 }
 

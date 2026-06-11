@@ -128,8 +128,8 @@ public static class PlanOptimizer
         return withOptChildren switch
         {
             FilterPlan f => SimplifyFilter(f),
-            ProjectPlan p => SimplifyProject(p),
-            AggregatePlan a => NarrowAggregateInput(a),
+            ProjectPlan p => PruneJoinInputs(SimplifyProject(p)),
+            AggregatePlan a => PruneJoinInputs(NarrowAggregateInput(a)),
             _ => withOptChildren,
         };
     }
@@ -448,5 +448,249 @@ public static class PlanOptimizer
         // The aggregate's output schema is unchanged — group-key
         // and aggregate-result types are preserved by the remap.
         return new AggregatePlan(narrowingProject, newGroupKeys, newAggregates, agg.Schema);
+    }
+
+    // ---------- Join-input column pruning (projection pushdown through join) ----------
+
+    /// <summary>
+    /// Push column liveness through an INNER join: when <paramref name="parent"/>
+    /// (a Project or Aggregate) plus the join's own equi-key / residual reference a
+    /// strict subset of an input side's columns, insert a narrowing
+    /// <see cref="ProjectPlan"/> on that side so the join stores and whole-row-hashes
+    /// only the live columns (docs/design-row-representation.md §21 — the term-2 lever
+    /// the §18 aggregate-input narrowing cannot reach, sitting above the join).
+    /// </summary>
+    /// <remarks>
+    /// Unconditionally sound (ordinary relational projection pushdown), unlike
+    /// <see cref="NonLinearNarrowingMode"/>: only columns <i>no</i> consumer reads
+    /// (parent, combine via concatenation, residual, equi-key) are dropped, so two
+    /// stored rows identical on the kept columns produce identical join output rows and
+    /// consolidate the same way before or after the join — valid for arbitrary signed
+    /// Z-sets. Gated behind <see cref="JoinColumnPruningMode"/>; INNER joins only in v1.
+    /// </remarks>
+    private static LogicalPlan PruneJoinInputs(LogicalPlan parent)
+    {
+        if (!JoinColumnPruningMode.Enabled)
+        {
+            return parent;
+        }
+
+        // Only Project(Join) and Aggregate(Join) parents in v1 (covers the Nexmark
+        // join queries q3/q4/q9/q20). Other parents bail — safe, just no pruning.
+        var input = parent switch
+        {
+            ProjectPlan p => p.Input,
+            AggregatePlan a => a.Input,
+            _ => parent,
+        };
+
+        if (input is not JoinPlan { JoinType: JoinType.Inner } join)
+        {
+            return parent;
+        }
+
+        var leftCount = join.Left.Schema.Count;
+        var rightCount = join.Right.Schema.Count;
+        var total = leftCount + rightCount;
+
+        // Columns referenced in the join's OUTPUT (concatenated [left | right]) space:
+        // by the parent, plus the join's own equi-keys and residual.
+        var live = ReferencedOutputColumns(parent);
+        foreach (var eq in join.EquiKeys)
+        {
+            live.Add(eq.LeftIndex);
+            live.Add(leftCount + eq.RightIndex);
+        }
+
+        if (join.Residual is not null)
+        {
+            live.UnionWith(ExpressionRewriter.CollectColumnIndices(join.Residual));
+        }
+
+        // Per-side live native indices (ascending — deterministic, easy to inspect).
+        var liveLeft = new List<int>();
+        var liveRight = new List<int>();
+        foreach (var i in live)
+        {
+            if (i < leftCount)
+            {
+                liveLeft.Add(i);
+            }
+            else if (i < total)
+            {
+                liveRight.Add(i - leftCount);
+            }
+        }
+
+        liveLeft.Sort();
+        liveRight.Sort();
+
+        // Never narrow a side to zero columns (a value-less side is a multiplicity-only
+        // cross product; keep its full schema to dodge empty-schema edge cases). Only
+        // narrow a side that has a strict, non-empty live subset.
+        var narrowLeft = liveLeft.Count > 0 && liveLeft.Count < leftCount;
+        var narrowRight = liveRight.Count > 0 && liveRight.Count < rightCount;
+        if (!narrowLeft && !narrowRight)
+        {
+            return parent;
+        }
+
+        var (newLeft, leftRemap) = narrowLeft
+            ? NarrowSide(join.Left, liveLeft)
+            : (join.Left, Identity(leftCount));
+        var (newRight, rightRemap) = narrowRight
+            ? NarrowSide(join.Right, liveRight)
+            : (join.Right, Identity(rightCount));
+
+        var newLeftCount = newLeft.Schema.Count;
+
+        // Concatenated remap: old [left | right] output index → new output index.
+        var concatRemap = new int[total];
+        for (var i = 0; i < leftCount; i++)
+        {
+            concatRemap[i] = leftRemap[i];
+        }
+
+        for (var i = 0; i < rightCount; i++)
+        {
+            concatRemap[leftCount + i] = rightRemap[i] < 0 ? -1 : newLeftCount + rightRemap[i];
+        }
+
+        // Remap the join's equi-keys (native per-side indices) and residual (concat space).
+        var newEqui = new List<JoinEquality>(join.EquiKeys.Count);
+        foreach (var eq in join.EquiKeys)
+        {
+            newEqui.Add(new JoinEquality(leftRemap[eq.LeftIndex], rightRemap[eq.RightIndex], eq.KeyType));
+        }
+
+        var newResidual = join.Residual is null
+            ? null
+            : ExpressionRewriter.RemapColumnIndices(join.Residual, concatRemap);
+
+        var newJoin = join with
+        {
+            Left = newLeft,
+            Right = newRight,
+            EquiKeys = newEqui,
+            Residual = newResidual,
+            Schema = newLeft.Schema.Concat(newRight.Schema),
+        };
+
+        // Rebuild the parent against the narrowed join, remapping its references into
+        // the new output space. Output schema is unchanged (same projected columns).
+        return parent switch
+        {
+            ProjectPlan p => new ProjectPlan(
+                newJoin, RemapProjections(p.Projections, concatRemap), p.Schema),
+            AggregatePlan a => new AggregatePlan(
+                newJoin,
+                RemapExpressions(a.GroupKeys, concatRemap),
+                RemapAggregates(a.Aggregates, concatRemap),
+                a.Schema),
+            _ => parent,
+        };
+    }
+
+    private static HashSet<int> ReferencedOutputColumns(LogicalPlan parent)
+    {
+        var used = new HashSet<int>();
+        switch (parent)
+        {
+            case ProjectPlan p:
+                foreach (var item in p.Projections)
+                {
+                    used.UnionWith(ExpressionRewriter.CollectColumnIndices(item.Expression));
+                }
+
+                break;
+            case AggregatePlan a:
+                foreach (var g in a.GroupKeys)
+                {
+                    used.UnionWith(ExpressionRewriter.CollectColumnIndices(g));
+                }
+
+                foreach (var call in a.Aggregates)
+                {
+                    if (call.Argument is not null)
+                    {
+                        used.UnionWith(ExpressionRewriter.CollectColumnIndices(call.Argument));
+                    }
+                }
+
+                break;
+        }
+
+        return used;
+    }
+
+    private static int[] Identity(int count)
+    {
+        var remap = new int[count];
+        for (var i = 0; i < count; i++)
+        {
+            remap[i] = i;
+        }
+
+        return remap;
+    }
+
+    // Insert a narrowing projection on one join input, keeping only liveNative columns
+    // (ascending). Returns the new side and the old→new native index remap (-1 = dropped).
+    private static (LogicalPlan Side, int[] Remap) NarrowSide(LogicalPlan side, List<int> liveNative)
+    {
+        var remap = new int[side.Schema.Count];
+        for (var i = 0; i < remap.Length; i++)
+        {
+            remap[i] = -1;
+        }
+
+        var keptColumns = new List<SchemaColumn>(liveNative.Count);
+        var projections = new List<ProjectionItem>(liveNative.Count);
+        for (var newIdx = 0; newIdx < liveNative.Count; newIdx++)
+        {
+            var origIdx = liveNative[newIdx];
+            remap[origIdx] = newIdx;
+            var col = side.Schema[origIdx];
+            keptColumns.Add(col);
+            projections.Add(new ProjectionItem(
+                new ResolvedColumn(origIdx, col.Type), col.Name, col.Qualifier));
+        }
+
+        return (new ProjectPlan(side, projections, new Schema(keptColumns)), remap);
+    }
+
+    private static List<ProjectionItem> RemapProjections(IReadOnlyList<ProjectionItem> items, int[] remap)
+    {
+        var result = new List<ProjectionItem>(items.Count);
+        foreach (var item in items)
+        {
+            result.Add(item with { Expression = ExpressionRewriter.RemapColumnIndices(item.Expression, remap) });
+        }
+
+        return result;
+    }
+
+    private static List<ResolvedExpression> RemapExpressions(IReadOnlyList<ResolvedExpression> exprs, int[] remap)
+    {
+        var result = new List<ResolvedExpression>(exprs.Count);
+        foreach (var e in exprs)
+        {
+            result.Add(ExpressionRewriter.RemapColumnIndices(e, remap));
+        }
+
+        return result;
+    }
+
+    private static List<AggregateCall> RemapAggregates(IReadOnlyList<AggregateCall> calls, int[] remap)
+    {
+        var result = new List<AggregateCall>(calls.Count);
+        foreach (var call in calls)
+        {
+            result.Add(call.Argument is null
+                ? call
+                : call with { Argument = ExpressionRewriter.RemapColumnIndices(call.Argument, remap) });
+        }
+
+        return result;
     }
 }

@@ -2697,6 +2697,180 @@ gates — plus the **answered architectural question** that unblocks the columna
 
 ---
 
+## 21. The columnar arc, re-justified — and the cheaper term-2 lever it surfaced: projection pushdown through joins (LANDED, gated, unconditionally sound)
+
+> Status: **measure-first design session that pivoted the increment, then landed it
+> behind a default-off seam, benchmark-gated.** This opened as the columnar / arena
+> inner-multiset arc (§17 #3) with the prompt's own honest instruction: *re-justify the
+> target first — §18 narrowing may already have captured most of q4's term-2, so measure
+> where whole-row hashing is still large before any rewrite.* The measurement did exactly
+> that and **corrected a load-bearing premise of §17/§18** — the same way §18 corrected
+> §17 — surfacing a cheaper, **unconditionally sound** lever the optimizer was missing, and
+> retiring (for now) the expensive columnar rewrite for the query that motivated it.
+
+### 21.1 — The measure-first question
+
+§17 scoped columnar to "the one place term 2 is both large and irreducible: the
+`IndexedZSet` inner value multiset." §18 then proved term 2 is **not** irreducible for
+q4's *aggregate* — narrowing the MAX input to `{keys, args}` (3 cols) gave −35 % W=1 /
+1.22–1.37× W=8. So before writing any columnar code, §1 of this arc demands: **after §18,
+where is whole-row hashing still large, and does it actually need columnar?** The
+candidates §1 named: (a) aggregates referencing many columns; (b) **join inner state** —
+the stored side's wide rows, which §18's *aggregate-input* narrowing sits above and never
+touches; (c) retraction-heavy streams outside §18's append-only envelope.
+
+### 21.2 — The measurement: term-2 at the join is large, and §18-immune
+
+Two verified facts localise it to the **join trace**:
+
+- **The optimizer has no column-liveness rule across joins.** `PlanOptimizer` documents
+  it in so many words (`PlanOptimizer.cs:38`: *"Not yet applied: general top-down column
+  liveness across joins"*). The only narrowing that exists is §18's, *above* the join.
+- **The join stores and hashes the full source row.** `IncrementalJoinOp`'s trace is an
+  `IndexedZSet<joinKey, storedRow>` whose inner `ZSet` is keyed by the **whole stored
+  row**; every `MergeInPlace` integrate re-hashes it and the cross-product probe re-touches
+  it (§14.2). So for q4's `auction ⋈ bid`, the traces store all ~10 auction and ~7 bid
+  columns even though only `{id,category,date_time,expires}` (auction) and
+  `{auction,price,date_time}` (bid) are live — read by the aggregate, the residual
+  (`b.date_time BETWEEN a.date_time AND a.expires`), and the equi-key.
+
+`reprbench` was extended with an **`idx` mode** ([repr-decomp-bench.md](repr-decomp-bench.md))
+that models exactly this — one join trace's per-tick `IndexedZSet` integrate + cross-product
+probe — and A/Bs **wide-stored vs narrow-stored** inner rows (the only difference being the
+stored row width):
+
+| Stored inner row | wide ns/row | narrow (W2) ns/row | **term-2 prize** | alloc saved |
+|:--|--:|--:|--:|--:|
+| W8 (8 long) → W2 | 134.0 | 80.9 | **53.1 ns (40 %)** | 402 B (49 %) |
+| WStr (3 long+str) → W2 | 178.3 | 75.7 | **102.6 ns (58 %)** | 134 B |
+
+**Term 2 at the join is large (40–58 % of the join-trace per-row cost) and §18 cannot reach
+it.** So the arc does *not* retire — there is real term-2 left after §18. But the measurement
+says something more specific about *which lever* captures it.
+
+### 21.3 — The reframe: the prize is a cheap optimizer rule, not columnar SoA
+
+The decisive detail in the table: the prize is captured by the **`narrow` column — which is
+still an ordinary flat `Dictionary`.** Narrowing the stored row from wide → few-columns
+recovers the entire 40–58 %; a columnar SoA inner multiset could only chase the *residual
+below* the narrow-dict line. And narrowing the join's stored rows is exactly **projection
+pushdown through the join** — the column-liveness rule `PlanOptimizer.cs:38` says is "not
+yet applied." That is an **S–M optimizer rule, no new data structure**, the join analogue
+of §18 — and it is the right first increment, not the XL columnar rewrite. The same shape
+as §18: *a cheap narrowing corrects the "needs columnar" premise before the expensive arc.*
+
+**Critically, join column-pruning is *unconditionally* sound — strictly better than §18.**
+§18 narrows the aggregate's *own* multiset, which a *non-linear* aggregate (MIN/MAX) can
+distinguish, so it needs the non-negative/append-only envelope and stays opt-in. Join
+pruning drops only columns **no consumer reads** (not the parent, not the join's
+combine/residual/equi-key). Two stored rows identical on the kept columns but differing on a
+dropped one produce **identical** join output rows — the dropped column is in no output — so
+they consolidate to the same weight whether collapsed before the join (pruned) or after. The
+join is bilinear and no aggregator reads a dropped column *through* the join (the aggregate's
+argument columns are kept, being referenced above). This holds for **arbitrary signed
+Z-sets** — it is ordinary relational projection pushdown, valid by construction, so the
+random-query PBT can run with it **on** (it could not for §18).
+
+### 21.4 — What landed
+
+- **`JoinColumnPruningMode`** (`Sql/Optimizer/JoinColumnPruningMode.cs`): a default-off
+  `[ThreadStatic]` seam, mirroring `NonLinearNarrowingMode`/`DeltaPoolMode`. Read at
+  `Optimize` time; no plan/compiler signature change (dodges [[typed-compiler-reflection-gotcha]]).
+- **`PruneJoinInputs`** (`PlanOptimizer.cs`): when a `Project` or `Aggregate` parent sits
+  over an **INNER** `JoinPlan`, compute the live output columns (parent refs ∪ equi-key ∪
+  residual), split per side, and insert a narrowing `ProjectPlan` on each side that has a
+  strict non-empty live subset — remapping the equi-keys (native indices), residual (concat
+  space), output schema, and the parent's references. INNER-scoped in v1; a side never
+  narrows to zero columns (keeps the multiplicity-only cross-product case safe). Idempotent
+  (re-firing bails), so it converges under the optimizer's fixpoint loop.
+- **Correctness gate.** `JoinColumnPruningTests`: (1) the **random-query oracle with pruning
+  ON over the full ±1 surface, 3000 iters** including deletes of never-inserted rows
+  (outside §18's envelope) — pruned circuit ≡ batch oracle every time; (2) a direct
+  seam-on-vs-off circuit equivalence over arbitrary signed streams; (3) a non-vacuous check
+  that the seam genuinely narrows **both** stored join inputs 3→2. Full suite **1,753
+  passed**, seam off ⇒ byte-identical.
+
+### 21.5 — Gate results (the increment is a large win)
+
+**W=1 (`w1profile … prune`, 1M events, batch 10k, median-3):**
+
+| Query | ns/event base→prune | B/event base→prune | note |
+|:--|--:|--:|:--|
+| **q4** | 1,987 → **988 (−50 %)** | 2,376 → **1,592 (−33 %)** | join `auction ⋈ bid`, traces 10→4 / 7→3 cols |
+| q20 | 1,125 → **1,010 (−10 %)** | 1,291 → 1,291 | wide-output join: trace narrows, output stays wide (correct) |
+| q3 | 68.8 → 68.8 (**unchanged**) | 89 → 75 (−16 %) | the 2.83× win **preserved**; GC 1/1/0 → 0/0/0 |
+| q9 | ~noise | 2,349 → 2,307 | auction side narrows; right side (TOP-1) already narrow |
+| q0/q1/q2/q18/q19 | noise | identical | no join — plan unchanged (clean control) |
+
+**W=8 in-`Step` (`q4prune`, 1M events, median-3, this i9-12900K; output cross-checked
+identical):**
+
+| Batch | flat·full step | flat·prune step | **Step↑** |
+|--:|--:|--:|--:|
+| 10k | 594.8 ms | **203.1 ms** | **2.93×** |
+| 100k | 620.5 ms | **148.0 ms** | **4.19×** |
+
+The W=1 −50 % **amplifies** to a **2.93–4.19× W=8 step** — confirming §16.11's in-`Step`
+thesis emphatically (the join integrate runs inside `Step`), and growing with batch because
+larger batches accumulate more bids per auction, so the wide-row hashing pruning attacks is
+the §14.2 O(K²)-in-group-growth term. This is **the largest single q4 step win in the entire
+arc** — bigger than §18's 1.22–1.37×, §14.10's 1.3–1.5×, and (a)'s +14 % — and it is on the
+**worst single-core gap in the whole comparison** (q4 0.21× vs Feldera, `dbsp-bench-2.txt`).
+
+### 21.6 — Decision
+
+- **Keep the rule behind the seam this session; strongly recommend flipping it default-on
+  next.** Unlike every prior seam in this family, `JoinColumnPruningMode` is
+  **unconditionally sound** (proven by the full-±1 PBT) and delivers a **−50 % W=1 / 2.93–4.19×
+  W=8** win on the worst query with **no regression on the cheap path** (q3 preserved, the
+  §17.7 landmine respected). The only reason it ships default-off is the project's
+  land-seam-then-flip discipline and to let the default change be reviewed deliberately; the
+  evidence to flip it is already in hand. Productization is the same shape as §18's deferred
+  flip but *without* the envelope caveat — it can be a plain default-on optimizer rule
+  (eventually generalised from the local `Project/Aggregate(Join)` patterns to the proper
+  top-down column-liveness pass `PlanOptimizer.cs:38` anticipates, which would also prune
+  Filter/TOP-K/window parents and chained joins).
+- **The columnar SoA inner multiset (§17 #3) is reframed, not built — and its prize shrank
+  again.** For q4 it is now firmly behind two cheaper levers (§18 on the aggregate, §21 on
+  the join), both of which leave the inner state a *narrow* flat dict where columnar's
+  residual win is small (the reprbench `narrow` floor, ~17 ns/row, is mostly alloc +
+  narrow-key hash, not wide-row hash). Columnar is correctly scoped to the genuine residual:
+  **(i) genuinely-wide-and-needed stored rows** — q20-style wide *output* joins, where
+  pruning can't shrink the rows because the output needs them (and where §16.9's lazy-boxing
+  output boundary already attacks the same cost); **(ii) wide aggregates** with many genuine
+  argument columns; **(iii) retraction-heavy / CDC** streams where neither §18 nor the
+  append-only assumptions hold and wide rows are retained. On the Nexmark suite, after §18 +
+  §21, term-2 on the wide-row-hash floor is **largely captured by the two cheap narrowing
+  rules** — so the XL columnar rewrite should **wait for a workload that exhibits the
+  residual**, not be built speculatively against q4 (whose term-2 is now narrow).
+
+### 21.7 — Honest ceiling & landmines preserved
+
+- **Ceiling (§17.5 restated).** Two cheap narrowing rules + pooling close most of term-1 and
+  the *reducible* part of term-2. The *irreducible* part — hashing the genuinely-live narrow
+  key, plus bounds-checks / no-SIMD-by-default / object-header overhead a managed engine
+  pays — remains. The §16.11 q4 0.21× gap had room for a ~2× W=1 narrowing (now measured),
+  pointing q4 from "heavy loss" toward "competitive," **not** to parity with monomorphised
+  Rust. The honest target stands: narrow the 2–5× laggards toward ~1.3–2×.
+- **q3 (2.83×) preserved** — measured unchanged at W=1, with a small alloc/GC improvement;
+  the rule only fires on stateful join inputs and only drops dead columns, never taxing the
+  filter/project/cheap path (§17.7).
+- **Typed reflection gotcha honored** — the rule is a logical-plan rewrite at `Optimize`
+  time; q4's typed parallel path consumes the already-pruned plan with no builder-signature
+  change (the W=8 gate's identical cross-checked output re-proves this on the typed path).
+- **Surrogates closed, sorted-merge lost, coordination not a target, codegen dead** — all
+  unchanged; this increment touched none of them.
+
+**Durable deliverables:** the `reprbench` `idx` join-trace measurement
+([repr-decomp-bench.md](repr-decomp-bench.md)); the `JoinColumnPruningMode` seam +
+`PruneJoinInputs` rule; `JoinColumnPruningTests` (full-±1 PBT — the unconditional-soundness
+proof — + the non-vacuous narrowing check); the `w1profile … prune` and `q4prune`
+([q4-prune-bench.md](q4-prune-bench.md)) gates; and the reframed columnar map — q4's term-2
+is now captured by **two cheap narrowing rules**, and columnar SoA is correctly deferred to
+the genuinely-wide residual, not built speculatively.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
@@ -2713,6 +2887,9 @@ DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 (`q4narrow`, docs/q4-narrow-bench.md — §18);
 `Operators/Stateful/DeltaPoolMode.cs` + `ZSetBuilder.Reset/BuildShared` +
 `Benchmarks/Q4PoolBenchmark.cs` (`q4pool`, docs/q4-pool-bench.md — §20);
+`Sql/Optimizer/JoinColumnPruningMode.cs` + `PlanOptimizer.PruneJoinInputs` +
+`Benchmarks/Q4PruneBenchmark.cs` + `ReprDecompBenchmark` idx mode
+(`q4prune`/`w1profile … prune`, docs/q4-prune-bench.md + repr-decomp-bench.md — §21);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

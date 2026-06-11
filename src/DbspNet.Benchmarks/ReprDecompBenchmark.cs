@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Text;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 
 namespace DbspNet.Benchmarks;
 
@@ -86,7 +87,134 @@ internal static class ReprDecompBenchmark
             r => new WStr(r.A0, r.A1 + 1, r.A2, r.S), r => r.A0);
 
         o.AppendLine();
+
+        MeasureJoinTrace(o, ticks, delta, runs);
+
+        o.AppendLine();
         Console.WriteLine($"Report rows written.");
+    }
+
+    // The join-trace integrate hot loop (§18-immune term-2 site, §21). Models what
+    // IncrementalJoinOp does to ONE trace per tick: integrate a delta of D rows into
+    // an IndexedZSet<joinKey, storedRow> (MergeInPlace → inner ZSet keyed by the WHOLE
+    // stored row), then probe the touched groups (the join cross-product enumerates
+    // GroupFor(key)). §18's aggregate-input narrowing sits ABOVE the join and never
+    // touches these stored rows; the optimizer has NO column-liveness-through-join rule
+    // (PlanOptimizer.cs:38). So the inner multiset whole-row-hashes the full source row.
+    //
+    // The decisive A/B: store the WIDE row (today) vs a NARROW projection of it (what a
+    // projection-pushdown-through-join / column-pruning rule, or a columnar SoA inner
+    // multiset, would buy). `wide − narrow` = the term-2 prize at the join, the number
+    // that decides whether the cheap optimizer rule suffices or columnar is required.
+    private static void MeasureJoinTrace(StringBuilder o, int ticks, int delta, int runs)
+    {
+        // ~delta/8 distinct join keys touched per tick (a few rows per key, like q4's
+        // bids-per-auction), so the inner multiset genuinely accumulates and the
+        // cross-product probe re-touches stored rows — the §14.2 recurrence.
+        var groups = Math.Max(delta / 8, 1);
+
+        o.AppendLine("## Join-trace integrate: wide-stored vs narrow-stored inner multiset (§21)");
+        o.AppendLine();
+        o.AppendLine(
+            "The term-2 site §18 narrowing cannot reach: `IncrementalJoinOp`'s trace is an " +
+            "`IndexedZSet<joinKey, storedRow>` whose inner `ZSet` is keyed by the **whole stored " +
+            "row**, hashed on every `MergeInPlace` integrate and re-touched by the cross-product " +
+            "probe. The optimizer has no column-liveness-through-join rule, so the full source row " +
+            "is stored even when only a few columns are live above the join (q4: bid needs " +
+            "`{auction,price,date_time}` of 7, auction `{id,category,date_time,expires}` of 10). " +
+            "`wide` stores the full row; `narrow` stores a 2-column projection — the prize a " +
+            "projection-pushdown rule (or columnar SoA) would capture.");
+        o.AppendLine();
+        o.AppendLine(
+            $"Stream: {ticks:N0} ticks × {delta} rows/tick over ~{groups} join keys, median of " +
+            $"{runs} runs. Same delta/probe/key distribution; the ONLY difference is the stored " +
+            "inner-row width.");
+        o.AppendLine();
+        o.AppendLine("| Stored row | wide ns | wide B | narrow ns | narrow B | term-2 prize (ns) | prize % |");
+        o.AppendLine("|:--|--:|--:|--:|--:|--:|--:|");
+
+        MeasureTracePair(o, "W8 (8 long) → W2", ticks, delta, runs, groups,
+            i => new W8(i, i ^ 0x5bd1, i * 3, i + 7, i ^ 0x1234, i * 5, i + 11, i ^ 0x9999),
+            w => new W2(w.A0, w.A2));
+        MeasureTracePair(o, "WStr (3 long+str) → W2", ticks, delta, runs, groups,
+            i => new WStr(i, i ^ 0x5bd1, i * 3, "bidder-" + (i & 0x3ff)),
+            w => new W2(w.A0, w.A2));
+    }
+
+    private static void MeasureTracePair<TWide>(
+        StringBuilder o, string label, int ticks, int delta, int runs, int groups,
+        Func<long, TWide> makeWide, Func<TWide, W2> narrow)
+        where TWide : notnull
+    {
+        var poolSize = Math.Max(delta * 16, 65_536);
+        var wide = new TWide[poolSize];
+        var thin = new W2[poolSize];
+        for (var i = 0; i < poolSize; i++)
+        {
+            wide[i] = makeWide(i);
+            thin[i] = narrow(wide[i]);
+        }
+
+        var w = TimeMedian(runs, () => RunJoinTrace(ticks, delta, groups, wide));
+        var nrw = TimeMedian(runs, () => RunJoinTrace(ticks, delta, groups, thin));
+        var prize = w.Ns - nrw.Ns;
+        var prizePct = w.Ns > 0 ? 100.0 * prize / w.Ns : 0;
+
+        o.AppendLine(
+            $"| {label} | {w.Ns:F1} | {w.Bytes:F0} | {nrw.Ns:F1} | {nrw.Bytes:F0} | " +
+            $"{prize:F1} | {prizePct:F0}% |");
+        Console.WriteLine(
+            $"  join-trace {label,-22} wide {w.Ns,6:F1}ns/{w.Bytes,5:F0}B  narrow {nrw.Ns,6:F1}ns/{nrw.Bytes,5:F0}B  " +
+            $"| term-2 prize {prize,5:F1}ns ({prizePct:F0}%)");
+    }
+
+    // One join trace's per-tick integrate + probe, today's model: a fresh
+    // IndexedZSetBuilder per tick, MergeInPlace into the retained trace (inner ZSet
+    // keyed by the whole stored row), probe the touched groups, then retract to bound
+    // state (model a churning window, not unbounded growth).
+    private static (long, long) RunJoinTrace<TRow>(int ticks, int delta, int groups, TRow[] rows)
+        where TRow : notnull
+    {
+        long n = 0, sink = 0;
+        var trace = new IndexedZSetTrace<long, TRow, Z64>();
+        for (var t = 0; t < ticks; t++)
+        {
+            var seed = (long)t * delta;
+            var b = new IndexedZSetBuilder<long, TRow, Z64>();
+            for (var i = 0; i < delta; i++)
+            {
+                var key = (seed + i) % groups;
+                b.Add(key, rows[Idx(seed, i, rows.Length)], new Z64(1));
+                n++;
+            }
+
+            var d = b.Build();
+            trace.Integrate(d);
+
+            // Probe: the join enumerates the stored group for each delta key (the
+            // cross-product touch — re-hashing/re-reading the wide stored rows).
+            foreach (var (key, _) in d)
+            {
+                foreach (var (_, gw) in trace.Current.GroupFor(key))
+                {
+                    sink += gw.Value;
+                }
+            }
+
+            // Retract this tick's delta to keep the trace a bounded churning window.
+            var nb = new IndexedZSetBuilder<long, TRow, Z64>();
+            foreach (var (key, g) in d)
+            {
+                foreach (var (v, gw) in g)
+                {
+                    nb.Add(key, v, Z64.Negate(gw));
+                }
+            }
+
+            trace.Integrate(nb.Build());
+        }
+
+        return (n, sink);
     }
 
     private static void MeasureWidth<TRow>(
