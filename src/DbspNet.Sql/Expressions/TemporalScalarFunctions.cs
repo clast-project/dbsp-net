@@ -219,7 +219,9 @@ internal sealed class WindowStartFunction : IScalarFunction
     }
 
     public Expression? BuildTyped(
-        ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) => null;
+        ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> astArgs, Expression[] typedArgs) =>
+        TypedBuiltinScalarFunctions.BuildTumbleStart(
+            typedArgs[0], fn.Arguments[0].Type, WindowSizeNative(fn.Arguments, fn.Arguments[0].Type));
 
     // Non-decreasing in the time column but floors values to the window start, so
     // — like date_trunc — the frontier must pass through the same bucket floor to
@@ -627,7 +629,7 @@ internal static class TemporalFunctions
     /// <paramref name="size"/> not exceeding it (correct for negative
     /// <paramref name="v"/> — epoch-relative times can precede 1970). Doubles as the
     /// monotone frontier transform for a window-start key.</summary>
-    internal static long FloorToBucket(long v, long size) => FloorDiv(v, size) * size;
+    public static long FloorToBucket(long v, long size) => FloorDiv(v, size) * size;
 
     // ---- DATEADD ----
 

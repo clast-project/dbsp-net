@@ -58,6 +58,32 @@ internal static class TypedBuiltinScalarFunctions
     internal static Expression BuildUnaryDouble(Expression arg, MethodInfo math) =>
         TypedExpressionCompiler.PropagateUnary(arg, v => Expression.Call(math, v));
 
+    /// <summary>
+    /// Typed <c>tumble_start(t, size)</c>: floor the temporal value to its
+    /// fixed-size window start, in the same native unit the structural runtime and
+    /// the GC frontier transform use (<see cref="TemporalFunctions.FloorToBucket"/>
+    /// over <c>Timestamp.Microseconds</c> / <c>Date32.Days</c>). NULL propagates.
+    /// </summary>
+    internal static Expression BuildTumbleStart(Expression arg, SqlType timeType, long size)
+    {
+        var floor = typeof(TemporalFunctions).GetMethod(nameof(TemporalFunctions.FloorToBucket))!;
+        var sizeConst = Expression.Constant(size);
+        return TypedExpressionCompiler.PropagateUnary(arg, v =>
+        {
+            if (timeType is SqlTimestampType)
+            {
+                var bucket = Expression.Call(
+                    floor, Expression.Property(v, nameof(Timestamp.Microseconds)), sizeConst);
+                return Expression.New(typeof(Timestamp).GetConstructor(new[] { typeof(long) })!, bucket);
+            }
+
+            // DATE: days are an int; floor in long, narrow back.
+            var days = Expression.Convert(Expression.Property(v, nameof(Date32.Days)), typeof(long));
+            var dayBucket = Expression.Convert(Expression.Call(floor, days, sizeConst), typeof(int));
+            return Expression.New(typeof(Date32).GetConstructor(new[] { typeof(int) })!, dayBucket);
+        });
+    }
+
     internal static Expression BuildLog(Expression[] args)
     {
         if (args.Length == 1)

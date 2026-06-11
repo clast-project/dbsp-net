@@ -489,13 +489,15 @@ reflect that shape, not a backlog.
   `interval × / ÷ numeric`, and `date − date` / `ts − ts` / `time − time`
   → interval. Month addition is calendar-aware; DATE arithmetic is
   day-granular (a day-time interval shifts a DATE by whole days). Both compile
-  paths supported: full support on the structural compiler (so the batch
-  reference and incremental agree); the typed fast path falls back to
-  structural for temporal/interval ops, matching temporal comparisons.
+  paths supported, **including the typed fast path** — temporal±INTERVAL,
+  interval±interval, interval×/÷numeric, and temporal−temporal lower to the same
+  `TemporalArithmetic` runtime helpers on unboxed typed operands (temporal
+  comparison and `CAST(string ↔ INTERVAL)` are typed too), so a temporal-arithmetic
+  query keeps its typed / data-parallel form instead of falling back to structural.
   Deferred follow-ons: `INTERVAL` *stored columns* through the Arrow codec
   (intervals are intermediate-only today — a persisted/snapshotted interval
-  output column would need an Arrow `MonthDayNano` mapping); `interval ×
-  decimal`; and typed-fast-path temporal arithmetic.
+  output column would need an Arrow `MonthDayNano` mapping); and `interval ×
+  decimal`.
 - **[P2]** TIMESTAMP WITH TIME ZONE and typed temporal literals
   (`DATE 'yyyy-mm-dd'` etc.). DATE / TIME / TIMESTAMP base types exist with
   Arrow-aligned representations (`Date32`, `Time64[microsecond]`,
@@ -588,10 +590,13 @@ reflect that shape, not a backlog.
   `GROUP BY` on the window start is **GC-able** under `LATENESS` / clock
   watermarks — a window is dropped only once the frontier passes `start + size`
   (the soundness crux, PBT-proven). TIMESTAMP and whole-day DATE columns; a
-  calendar (month/year) window size is rejected (non-uniform bucket). Structural
-  compile only (`tumble_start`'s typed lowering returns null, like the other
-  temporal functions), so windowed queries currently run single-circuit — a typed
-  lowering to unlock the parallel W&gt;1 path is the open follow-on. *Deferred:*
+  calendar (month/year) window size is rejected (non-uniform bucket).
+  **Typed / data-parallel:** `tumble_start` has a typed lowering and temporal
+  ±INTERVAL arithmetic now compiles on the typed fast path (see the INTERVAL
+  type-system entry), so q8 and q12 take the data-parallel W&gt;1 path (measured
+  ~1.7×/3.0× at W=24). q7 stays structural/single-circuit — its inner join carries
+  a cross-side `BETWEEN` residual the typed join path doesn't yet parallelize
+  (separate from windowing). *Deferred:*
   **HOP** (sliding — fans each row out to `size/slide` windows; lowers to a
   `UNION ALL` of shifted projections, unlocks q5) and **SESSION** (gap-merged,
   genuinely stateful merge under retraction, unlocks q11 — Feldera itself omits

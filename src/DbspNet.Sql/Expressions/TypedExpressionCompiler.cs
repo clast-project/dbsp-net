@@ -403,6 +403,11 @@ public static class TypedExpressionCompiler
                     return BuildDecimalArith(bin.Operator, l, bin.Left.Type, r, bin.Right.Type, decResult);
                 }
 
+                if (IsTemporalOrInterval(bin.Left.Type) || IsTemporalOrInterval(bin.Right.Type))
+                {
+                    return BuildTemporalArith(bin.Operator, l, bin.Left.Type, r, bin.Right.Type);
+                }
+
                 return BuildNumericArith(bin.Operator, l, r, bin.Type.ClrType);
 
             case BinOp.Equal:
@@ -484,6 +489,79 @@ public static class TypedExpressionCompiler
             _ => throw Unsupported(),
         });
     }
+
+    /// <summary>
+    /// Temporal / interval arithmetic on the typed path — the unboxed counterpart
+    /// of the structural <c>EmitTemporalCompute</c>. Operands are already their CLR
+    /// value types (<see cref="Timestamp"/> / <see cref="Date32"/> /
+    /// <see cref="Time64"/> / <see cref="Interval"/>), so each case calls the same
+    /// <see cref="TemporalArithmetic"/> runtime helper the structural path uses,
+    /// with no box/unbox. NULL propagates when either operand is nullable.
+    /// </summary>
+    private static Expression BuildTemporalArith(BinOp op, Expression l, SqlType lt, Expression r, SqlType rt) =>
+        PropagateBinary(l, r, (lv, rv) => EmitTemporalTyped(op, lv, lt, rv, rt));
+
+    private static Expression EmitTemporalTyped(BinOp op, Expression l, SqlType lt, Expression r, SqlType rt)
+    {
+        var lInterval = lt is SqlIntervalType;
+        var rInterval = rt is SqlIntervalType;
+        var lTemporal = lt is SqlDateType or SqlTimeType or SqlTimestampType;
+        var rTemporal = rt is SqlDateType or SqlTimeType or SqlTimestampType;
+        Expression Dbl(Expression e) => Expression.Convert(e, typeof(double));
+
+        switch (op)
+        {
+            case BinOp.Add:
+                if (lTemporal && rInterval) return TemporalAddTo(lt, l, r, sub: false);
+                if (lInterval && rTemporal) return TemporalAddTo(rt, r, l, sub: false);
+                if (lInterval && rInterval) return CallTemporal(nameof(TemporalArithmetic.AddIntervals), l, r);
+                break;
+            case BinOp.Subtract:
+                if (lTemporal && rInterval) return TemporalAddTo(lt, l, r, sub: true);
+                if (lTemporal && rTemporal) return TemporalDiff(lt, l, r);
+                if (lInterval && rInterval) return CallTemporal(nameof(TemporalArithmetic.SubIntervals), l, r);
+                break;
+            case BinOp.Multiply:
+                if (lInterval) return CallTemporal(nameof(TemporalArithmetic.MulInterval), l, Dbl(r));
+                if (rInterval) return CallTemporal(nameof(TemporalArithmetic.MulInterval), r, Dbl(l));
+                break;
+            case BinOp.Divide:
+                if (lInterval) return CallTemporal(nameof(TemporalArithmetic.DivInterval), l, Dbl(r));
+                break;
+        }
+
+        throw Unsupported();
+    }
+
+    private static Expression TemporalAddTo(SqlType temporal, Expression t, Expression iv, bool sub)
+    {
+        var name = temporal switch
+        {
+            SqlDateType => sub ? nameof(TemporalArithmetic.SubFromDate) : nameof(TemporalArithmetic.AddToDate),
+            SqlTimeType => sub ? nameof(TemporalArithmetic.SubFromTime) : nameof(TemporalArithmetic.AddToTime),
+            SqlTimestampType => sub ? nameof(TemporalArithmetic.SubFromTimestamp) : nameof(TemporalArithmetic.AddToTimestamp),
+            _ => throw Unsupported(),
+        };
+        return CallTemporal(name, t, iv);
+    }
+
+    private static Expression TemporalDiff(SqlType temporal, Expression a, Expression b)
+    {
+        var name = temporal switch
+        {
+            SqlDateType => nameof(TemporalArithmetic.DiffDates),
+            SqlTimeType => nameof(TemporalArithmetic.DiffTimes),
+            SqlTimestampType => nameof(TemporalArithmetic.DiffTimestamps),
+            _ => throw Unsupported(),
+        };
+        return CallTemporal(name, a, b);
+    }
+
+    private static Expression CallTemporal(string method, params Expression[] args) =>
+        Expression.Call(typeof(TemporalArithmetic).GetMethod(method)!, args);
+
+    private static bool IsTemporalOrInterval(SqlType t) =>
+        t is SqlDateType or SqlTimeType or SqlTimestampType or SqlIntervalType;
 
     /// <summary>
     /// Decimal arithmetic dispatches to <see cref="DecimalRuntime"/>
@@ -642,6 +720,24 @@ public static class TypedExpressionCompiler
         if (IsTemporal(srcClr) && dstClr == typeof(Utf8String))
         {
             return PropagateUnary(operand, op => BuildTemporalToUtf8(op, srcClr));
+        }
+
+        // INTERVAL ↔ string. An `INTERVAL '…' <qualifier>` literal lowers to
+        // CAST(string AS INTERVAL <qualifier>); the resolver constant-folds it in
+        // most positions, but a post-aggregate projection (e.g. TUMBLE_END =
+        // tumble_start + INTERVAL) can carry the cast unfolded — so the typed path
+        // must lower it too, matching the structural compiler.
+        if (srcClr == typeof(Utf8String) && dstType is SqlIntervalType targetInterval)
+        {
+            return PropagateUnary(operand, op => Expression.Call(
+                typeof(Interval).GetMethod(nameof(Interval.Parse), [typeof(string), typeof(IntervalQualifier)])!,
+                Expression.Call(op, typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!),
+                Expression.Constant(targetInterval.Qualifier)));
+        }
+
+        if (srcClr == typeof(Interval) && dstClr == typeof(Utf8String))
+        {
+            return PropagateUnary(operand, op => BuildTemporalToUtf8(op, typeof(Interval)));
         }
 
         if (srcClr == typeof(Timestamp) && dstClr == typeof(Date32))
