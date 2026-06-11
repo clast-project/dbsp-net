@@ -2873,6 +2873,192 @@ the genuinely-wide residual, not built speculatively.
 
 ---
 
+## 22. Partitioned TOP-K (q18/q19) — decomposing the last competitive gaps, and pricing the row-narrowing lever (MEASURED, design-only)
+
+> Status: **measure-first design session, no shipped engine code.** q18/q19 are the
+> last clear Nexmark losses (q18 0.46× @10c / 0.34× @1c; q19 0.52× @10c / 0.32× @1c,
+> Run D). This arc opened with the prompt's own honest instruction: *decompose the gap
+> first; §19 already found "no cheap in-`Step` lever" for the TOP-K window, and the
+> queries are `SELECT *` so §21's column-pruning does not transfer — there is a real
+> chance the conclusion is "narrow modestly or accept the BSP floor."* The measurement
+> did three things: (1) **completed** the 4-way decomposition (single-core **and** W=10/14),
+> (2) **priced** the one non-forbidden lever — true row/key narrowing — and found it
+> **large** (50 % q18 / 82 % q19 of the in-state op cost), and (3) **corrected** §19's
+> blanket pessimism: §19's reverted *container* swap (dict→array, wide rows kept) was
+> marginal; a *key-representation* change (store `{order, rowRef}`, recover wide rows for
+> survivors) is 2–4× bigger and sits **outside** the container-change zone §19 closed.
+> The honest catch: capturing it is a real operator rewrite (an order-key extractor +
+> a wide-row recovery store), **not** the ThreadStatic seam §18/§20/§21 were — so it is
+> **justified but not cheap**, and scoped here as the next increment rather than shipped
+> speculatively under the measure-first mandate.
+
+### 22.1 — The measure-first question, and the two honest constraints
+
+q18 dedups the latest bid per `(bidder, auction)` (TOP-1, `ORDER BY date_time DESC`,
+many tiny partitions); q19 keeps the ten highest bids per `auction` (TOP-10,
+`ORDER BY price DESC`, fewer partitions accumulating). Both run on `PartitionedTopKOp`,
+which keeps **per partition** a `SortedDictionary<wideRow,long>` (`_accum`, ordered by
+the ORDER BY key with a full-row tiebreak) plus a `Dictionary<wideRow,long>` window —
+**both keyed by the whole 7-column bid row** (incl. the `url`/`extra` strings), though
+ranking needs only `{partition, order}`. Two constraints bound the search before any code:
+
+- **Not column-prunable.** Both queries `SELECT` all 7 bid columns — effectively `SELECT *`
+  — so §21's projection-pushdown-through-join lever (drop columns no consumer reads) has
+  **nothing to drop**. This is exactly the "genuinely-wide residual" §21.6 named.
+- **§19 closed the container door.** §19 swapped the window `Dictionary` for a compact
+  array (still storing wide rows) and **reverted** it: −7…−15 % at W=1 but a deterministic,
+  unexplained **+14 % q9 allocation regression**. So a TOP-K *container* change is off the
+  table. The only remaining lever is changing **what the state stores**, not its container.
+
+### 22.2 — The 4-way decomposition (single-core AND W=10/14)
+
+Combining `stepprofile` (in-`Step` phase split, docs/step-profile.md) with the egest
+profile (`q18profile q18,q19`, docs/q18-profile.md, which confirms out-of-`Step` output)
+attributes the gap into the prompt's four phases. **(d) out-of-`Step` output is ~0** for
+both (egest `Gather%` = 0–1 % at every W — the parallel path decodes output lazily after
+`sw.Stop()`, §16.10), so the gap is entirely in-`Step`, split three ways:
+
+| | (a) in-`Step` TOP-K op | (b) in-`Step` exchange (split+gather) | (c) coordination wait | (d) egest |
+|:--|--:|--:|--:|--:|
+| **q18 @ W=1** | **100 %** (1.30 µs/ev) | — (no shuffle) | — | ~0 % |
+| **q18 @ W=10** | 35 % | **43 %** | 22 % | ~0 % |
+| **q19 @ W=1** | **100 %** (2.02 µs/ev) | — | — | ~0 % |
+| **q19 @ W=10** | **83 %** | 11 % | 6 % | ~0 % |
+
+Three load-bearing reads:
+
+1. **Single-core, the whole cost is the in-`Step` TOP-K op (a).** This is the §16.11
+   single-core gap (q18 0.34×, q19 0.32×) localised precisely: per-partition `_accum`/
+   `_window` over wide rows. The op **scales well** (8.2× q18 / 5.5× q19 to W=10) — the
+   single-core per-row cost is the problem, exactly the §16.11 thesis.
+2. **q18 and q19 wear the competitive (W=10) gap in *different* phases.** q18 is
+   **exchange-movement-bound** (43 % moving wide rows across the shuffle) + op (35 %) +
+   wait (22 %). q19 is **overwhelmingly op-bound** (83 %); its exchange is cheap (11 %)
+   because few auctions ⇒ few distinct shuffle keys. So a single lever that narrows **both
+   what the op stores and what the exchange moves** hits q18 on both (a)+(b) and q19 on (a).
+3. **(c) coordination is not a target** (§15/§16.11 — it is the shared BSP ceiling and our
+   strength). It is 22 % (q18) / 6 % (q19) and excluded from the lever's reachable surface.
+
+### 22.3 — Pricing the lever: `reprbench topk` (the decide-or-retire number)
+
+`reprbench` was extended with a `topk` mode (docs/repr-decomp-bench.md) modelling the
+operator's per-tick hot path — partition + sorted-insert each delta row, recompute the
+top-k window, diff, emit — over the full 7-column bid row, and A/Bing three stored
+representations (same access pattern; only the stored representation differs):
+
+- **`wide`** — today: `SortedDictionary`/`Dictionary` keyed by the whole row (whole-row
+  hash + the wide value-type node copy).
+- **`narrow+fetch`** — the candidate: store `{order, rowRef}`; **recover the wide row from
+  a pool only for the ≤k survivors** the output needs. Output is wide in **both** (the
+  fetch-back recovers it), so the charge is apples-to-apples and the prize is purely the
+  cheaper in-state compare+hash — nothing the lever cannot reach.
+- **`wide·sorted`** — a comparison-based `SortedDictionary` window (no whole-row hash, wide
+  rows kept) — used only to **attribute** the prize, *not* a shippable option (it is the
+  §19-forbidden container change).
+
+| Shape | wide ns | narrow+fetch ns / B | **total prize** | kill-hash | shrink-key | fetch-back cost |
+|:--|--:|--:|--:|--:|--:|--:|
+| **q18** (TOP-1, tiny partitions) | 702 | 348 / 678 | **50 %** | 25 % | 25 % | cheap (raw 231 ≈ n+f 348) |
+| **q19** (TOP-10, accumulating) | 5080 | 923 / 1458 | **82 %** | 40 % | 42 % | cheap (raw 857 ≈ n+f 923) |
+
+(Numbers from the instrumented run that apportions the prize, docs/repr-decomp-bench.md;
+a plain concrete-`Dictionary` baseline — without the `IDictionary` dispatch the attribution
+adds to *both* wide variants — measured the total prize slightly lower at 36 %/75 %, the
+same order. The control join-trace `idx` rows reproduce §21's 31–58 % reference values,
+validating the harness. The prize apportions ~evenly between **kill-hash** (whole-row hash
+→ cheap key hash) and **shrink-key** (wide node → narrow node), and **`narrow+fetch`
+captures both** — a `{order,ref}` key hashes cheaply *and* stores small — so the
+row-narrowing rewrite earns the **full** 50 %/82 %, whereas the §19-forbidden `wide·sorted`
+container would earn only the kill-hash half.)
+
+**Three findings settle the lever:**
+
+1. **The prize is large and real** — 50 % (q18) / **82 %** (q19) of the in-state op cost
+   (36 %/75 % on the plain-`Dictionary` baseline), well above §21's join-trace `WStr`
+   (58 %) that justified shipping projection pushdown. This **refutes §19's blanket "no
+   cheap in-`Step` lever"**: §19 measured a *container* swap (marginal); row/key narrowing
+   is a different, far larger axis.
+2. **The fetch-back — the prompt's flagged "hard part" — is cheap.** `narrow-raw` (no
+   recovery) ≈ `narrow+fetch` (231 vs 348 ns q18; 857 vs 923 ns q19): recovering wide
+   survivors via an O(1) pool reference costs ~15 % of the narrow path, not the prize.
+   Because q18 keeps 1 survivor/partition and q19 ≤10, the recovery volume is tiny.
+3. **The model is faithful to the competitive path.** The bench uses a **value-type** wide
+   row, matching the **typed parallel** path (the path the W>1 comparison runs), where the
+   node copy *and* the hash both apply. On the StructuralRow (W=1 single-circuit) path the
+   wide row is a reference, so the copy term shrinks and the prize tilts toward the
+   kill-hash half — still real, slightly smaller. Either way the prize survives.
+
+### 22.4 — Why this is a real operator change, not a ThreadStatic seam
+
+The prompt's template was "mirror `JoinColumnPruningMode` — a ThreadStatic seam, no
+builder-signature change." That worked for §21 because pruning only **drops** columns the
+optimizer already knows are dead — no new data crosses into the operator. Row-narrowing is
+different: the operator must **build a narrow key** and **recover the wide row for
+survivors**, and neither is derivable from what `PartitionedTopKOp` holds today (it has
+only `IComparer<TRow>` order/sort-key-only comparers — these enable narrow *comparison* but
+**not** narrow *hashing*, and the measurement says the hash is half the prize). So the
+faithful version needs two things plumbed in:
+
+- **An order-key extractor** (`TRow → narrowKey`). Good news: it already exists at **both**
+  compile sites — `TypedPlanCompiler.BuildPartitionedTopK` builds the per-column sort
+  extractors (`keys[i]`), and `PlanToCircuit.CompilePartitionedTopK` has the ORDER BY
+  column indices. It would be threaded as an **optional** `PartitionedTopK` builder/ctor
+  parameter (defaulting null). This is **reflection-safe**: the typed path reaches the
+  builder through `BuildPartitionedTopK` (found by *name*, then called as ordinary compiled
+  code), so an added optional parameter — updated at that call site and in the `Invoke`
+  args array together — does **not** trip [[typed-compiler-reflection-gotcha]] (which bites
+  only *silently-reflected* signatures). No `Optimize`-time-only constraint is violated.
+- **A wide-row recovery store.** The narrow key carries a reference/index to the wide row;
+  for the typed value-struct path that means a backing buffer + index maintained under
+  retraction (append on insert, release when a row's accumulated weight hits 0). Equal-order
+  **ties** fall into small value-equality buckets (q18 unique `date_time` ⇒ size 1; q19
+  occasional price ties ⇒ ~1), so the only residual whole-row work is within a tie group.
+
+That is the **§17 #3 columnar/arena-class structural change, scoped to one operator** —
+plus snapshot-format compatibility, a random-query equivalence **PBT with the seam on**,
+and a **q9 non-regression** gate (q9 shares this operator and is where §19 regressed). It is
+*buildable and gated*, but it is **not** a same-day seam, and shipping a half-verified
+incremental operator under retraction would be the wrong risk for a measure-first session.
+
+### 22.5 — Decision, scoping, and honest ceiling
+
+- **Justified — build it, as a focused gated increment (next).** Unlike §19 (reverted) and
+  §8.3/§9.5 (dead-ends), the measurement here is **positive and large** and the lever is
+  **non-forbidden** (key-representation, not container). The disposition is *build*, not
+  *retire* — but as the scoped operator rewrite above, **default-off behind a seam**
+  (mirroring `NonLinearNarrowingMode`/`DeltaPoolMode`, since TOP-K narrowing has the
+  retraction/tie correctness surface that join-pruning's unconditional soundness lacked),
+  gated on the q18 single-core `w1profile` + a W=8 step harness with the per-tick output
+  cross-check, and the q9 non-regression check. **Start with q18 (TOP-1)** — one survivor
+  per partition, no tie buckets — then generalise to q19's TOP-10.
+- **Expected reach (from the decomposition × the prize).** q19 is 83 % op at W=10 and the
+  op is mostly in-state, so removing ~82 % of the in-state cost could move q19's competitive
+  step materially (the cleanest case — a pure op-bound query meeting a large op-state
+  prize). q18 gets the op share (35 % × 50 %) **plus** the exchange share **if** the narrow
+  `{order,ref}` also flows through the shuffle (attacking the 43 % Move term) — a
+  pipeline-level extension beyond the operator, and the larger build.
+- **Honest ceiling (§17.5 restated).** This narrows the in-state floor; it does not touch
+  coordination (c, not a target) and cannot make a `SortedDictionary` of order keys free.
+  The target stays "narrow the 2–5× laggards toward ~1.3–2×," not parity — q18/q19 from
+  ~0.32–0.34× single-core toward "competitive," consistent with §21's q4 result on the
+  worst gap.
+- **Landmines preserved.** q3 (3.19×) and the W>1 wins are untouched (seam-gated to the
+  TOP-K path); coordination is not a target (§16.11); the typed reflection gotcha is honored
+  (optional param via the compiled `BuildPartitionedTopK` call site, not a reflected
+  signature). Retired-by-measurement and **not** revived here: §19's container swap, typed
+  ingest (`ingestpath`), surrogate keys (§14.9), whole-query codegen (§17.2), sorted-merge
+  on fine ticks (§8.3).
+
+**Durable deliverables:** the 4-way decomposition (single-core + W=10/14, docs/step-profile.md
++ docs/q18-profile.md, the latter extended to q19 and reframed as the egest/phase-(d)
+probe); the `reprbench topk` measurement (docs/repr-decomp-bench.md) that **prices the
+row-narrowing lever at 50 %/82 %**, proves the fetch-back cheap, and apportions kill-hash vs
+shrink-key; and the **decision** — a positive, non-forbidden, **justified** lever, scoped as
+the next focused gated operator increment (q18 first), correcting §19's pessimism with
+evidence rather than re-trying its dead-end.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
@@ -2892,6 +3078,10 @@ DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 `Sql/Optimizer/JoinColumnPruningMode.cs` + `PlanOptimizer.PruneJoinInputs` +
 `Benchmarks/Q4PruneBenchmark.cs` + `ReprDecompBenchmark` idx mode
 (`q4prune`/`w1profile … prune`, docs/q4-prune-bench.md + repr-decomp-bench.md — §21);
+`Operators/Stateful/PartitionedTopKOp.cs` + `ReprDecompBenchmark` topk mode +
+`Q18ProfileBenchmark` (q18+q19 egest) + `StepProfileBenchmark`
+(`reprbench`/`q18profile`/`stepprofile`, docs/repr-decomp-bench.md + q18-profile.md +
+step-profile.md — §22);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

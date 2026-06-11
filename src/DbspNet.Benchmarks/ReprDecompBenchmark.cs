@@ -50,6 +50,18 @@ internal static class ReprDecompBenchmark
     // surrogatebench) — the string hash is the width term columnar can't vectorise.
     private readonly record struct WStr(long A0, long A1, long A2, string S);
 
+    // The full Nexmark bid row q18/q19 retain in TOP-K state and emit (SELECT * —
+    // all 7 columns, incl. the url/extra strings that dominate the structural hash).
+    private readonly record struct WBid(
+        long Auction, long Bidder, long Price, long DateTime,
+        string Channel, string Url, string Extra);
+
+    // The narrow ranking key TOP-K actually needs: the ORDER BY value plus a back-
+    // reference into the wide-row pool (recovered only for the ≤k survivors). The
+    // partition key is extracted from the wide input row before narrowing (it is the
+    // OUTER dict key), so it need not be carried here.
+    private readonly record struct NarrowKey(long Order, long Ref);
+
     public static void Run(StringBuilder o, int ticks, int delta, int runs)
     {
         Console.WriteLine();
@@ -89,6 +101,10 @@ internal static class ReprDecompBenchmark
         o.AppendLine();
 
         MeasureJoinTrace(o, ticks, delta, runs);
+
+        o.AppendLine();
+
+        MeasureTopK(o, delta, runs);
 
         o.AppendLine();
         Console.WriteLine($"Report rows written.");
@@ -212,6 +228,347 @@ internal static class ReprDecompBenchmark
             }
 
             trace.Integrate(nb.Build());
+        }
+
+        return (n, sink);
+    }
+
+    // The partitioned-TOP-K state site (§22, q18/q19). PartitionedTopKOp keeps, per
+    // partition, a SortedDictionary<wideRow,long> (`_accum`) ordered by the ORDER BY
+    // key with a full-row tiebreak, plus a Dictionary<wideRow,long> window — both keyed
+    // by the WHOLE 7-column bid row (incl. url/extra strings), though ranking needs only
+    // {partition, order}. This A/Bs storing the WIDE row vs a NARROW {order, rowRef} that
+    // recovers the full row from a pool only for the ≤k survivors it must output. Output
+    // is wide in BOTH variants (the fetch-back recovers it), so the measured prize is
+    // exactly the cheaper in-state compare+hash — and nothing it cannot reach (the wide
+    // output build is charged identically to both).
+    private static void MeasureTopK(StringBuilder o, int delta, int runs)
+    {
+        // Size the TOP-K workload to ~1M append-only inserts, independent of the outer
+        // width/join ticks. q18/q19 never retract (bids only insert), so per-partition
+        // state GROWS — that growth, and the whole-row compare/hash it drives, is the cost.
+        const int inserts = 1_000_000;
+        var tkTicks = Math.Max(1, inserts / delta);
+
+        o.AppendLine("## Partitioned TOP-K: wide-stored vs narrow-stored ranking state (§22)");
+        o.AppendLine();
+        o.AppendLine(
+            "The q18/q19 site. `PartitionedTopKOp` keeps, per partition, a " +
+            "`SortedDictionary<wideRow,long>` (`_accum`) ordered by the ORDER BY key with a " +
+            "full-row tiebreak, plus a `Dictionary<wideRow,long>` window — both keyed by the " +
+            "**whole 7-column bid row** (incl. the `url`/`extra` strings), even though ranking " +
+            "needs only `{partition, order}`. `wide` stores the full row in that state; " +
+            "`narrow` stores `{order, rowRef}` and **materialises the full row from a pool only " +
+            "for the ≤k survivors** it outputs. Output is wide in BOTH (the fetch-back recovers " +
+            "it), so the prize is purely the cheaper in-state compare+hash — the in-`Step` op " +
+            "term the W>1 step decomposition attributes to the operator (not the exchange).");
+        o.AppendLine();
+        o.AppendLine(
+            $"Stream: {tkTicks:N0} ticks × {delta} rows/tick (~{inserts:N0} append-only inserts), " +
+            $"median of {runs} runs. `narrow+fetch` is the real net (recovers wide survivors); " +
+            "`narrow-raw` emits the narrow row (no recovery) — the unreachable lower bound.");
+        o.AppendLine();
+        o.AppendLine(
+            "`wide·sorted` keeps the WIDE row but swaps the `Dictionary` window for a " +
+            "comparison-based `SortedDictionary` (no whole-row HASH; the prize §19's " +
+            "container swap left on the table — but a TOP-K container change is off-limits " +
+            "after §19's unexplained q9 regression). `wide → wide·sorted` = the *kill-the-hash* " +
+            "share; `wide·sorted → narrow+fetch` = the *shrink-the-key* residual the real " +
+            "row-narrowing rewrite must earn against its extractor + fetch-back cost.");
+        o.AppendLine();
+        o.AppendLine("| Shape | wide ns | wide·sorted ns | narrow+fetch ns | n+f B | total prize % | kill-hash % | shrink-key % | narrow-raw ns |");
+        o.AppendLine("|:--|--:|--:|--:|--:|--:|--:|--:|--:|");
+
+        // q18: TOP-1, PARTITION BY (bidder,auction), ORDER BY date_time DESC. Many tiny
+        // partitions (most pairs see ~1 bid) — large span ⇒ near-size-1 sorted dicts.
+        MeasureTopKPair(o, "q18 (TOP-1, tiny partitions)", tkTicks, delta, runs, 1, 512_000);
+
+        // q19: TOP-10, PARTITION BY auction, ORDER BY price DESC. Few partitions, each
+        // accumulating many bids ⇒ growing sorted tree + churning top-10.
+        MeasureTopKPair(o, "q19 (TOP-10, accumulating)", tkTicks, delta, runs, 10, 4_096);
+    }
+
+    private static void MeasureTopKPair(
+        StringBuilder o, string label, int ticks, int delta, int runs, long limit, int partitionSpan)
+    {
+        // Pre-generate a pool of wide bid rows ONCE (outside the timed loop). The order
+        // value is pseudo-shuffled so the sorted dict genuinely churns and the top-k
+        // moves; the partition is index % span (the partition cardinality dial). The
+        // url/extra strings come from a small pooled set (real hash cost, no per-row alloc).
+        var poolSize = Math.Max(delta * 64, 1 << 20);
+        var pool = new WBid[poolSize];
+        var channels = new[] { "channel-A", "channel-B", "channel-C", "channel-D" };
+        var urls = new[]
+        {
+            "https://www.nexmark.com/item/12345/details",
+            "https://www.nexmark.com/item/67890/bid",
+            "https://auction.example.org/p/abcdef/view",
+        };
+        for (var i = 0; i < poolSize; i++)
+        {
+            var order = (i * 2654435761L) & 0x7fff_ffff; // pseudo-shuffle the ORDER BY key
+            var part = i % partitionSpan;
+            pool[i] = new WBid(
+                part, part >> 1, order, order,
+                channels[i & 3], urls[i % 3], "extra-payload-" + (i & 0xff));
+        }
+
+        var wide = TimeMedian(runs, () => RunTopKWide(ticks, delta, limit, pool, sortedWindow: false));
+        var wideSorted = TimeMedian(runs, () => RunTopKWide(ticks, delta, limit, pool, sortedWindow: true));
+        var nf = TimeMedian(runs, () => RunTopKNarrow(ticks, delta, limit, pool, fetch: true));
+        var raw = TimeMedian(runs, () => RunTopKNarrow(ticks, delta, limit, pool, fetch: false));
+        var totalPct = wide.Ns > 0 ? 100.0 * (wide.Ns - nf.Ns) / wide.Ns : 0;
+        var killHashPct = wide.Ns > 0 ? 100.0 * (wide.Ns - wideSorted.Ns) / wide.Ns : 0;
+        var shrinkKeyPct = wide.Ns > 0 ? 100.0 * (wideSorted.Ns - nf.Ns) / wide.Ns : 0;
+
+        o.AppendLine(
+            $"| {label} | {wide.Ns:F1} | {wideSorted.Ns:F1} | {nf.Ns:F1} | {nf.Bytes:F0} | " +
+            $"{totalPct:F0}% | {killHashPct:F0}% | {shrinkKeyPct:F0}% | {raw.Ns:F1} |");
+        Console.WriteLine(
+            $"  topk {label,-30} wide {wide.Ns,6:F1}  w·sorted {wideSorted.Ns,6:F1}  n+fetch {nf.Ns,6:F1}  raw {raw.Ns,6:F1} " +
+            $"| total {totalPct:F0}% killhash {killHashPct:F0}% shrinkkey {shrinkKeyPct:F0}%");
+    }
+
+    // Order WBid by the ORDER BY value DESC, with a full-row tiebreak (the operator's
+    // `_order` refines the sort-key-only comparer to a total order over whole rows).
+    private static readonly IComparer<WBid> WideOrder = Comparer<WBid>.Create((a, b) =>
+    {
+        var c = b.Price.CompareTo(a.Price); // DESC on the ORDER BY value (Price≡DateTime here)
+        if (c != 0)
+        {
+            return c;
+        }
+
+        // Total-order tiebreak over the WHOLE row (the operator's `_order` refines the
+        // sort-key-only comparer to a full-row order, so distinct rows are distinct keys).
+        c = a.Auction.CompareTo(b.Auction);
+        if (c != 0)
+        {
+            return c;
+        }
+
+        c = a.Bidder.CompareTo(b.Bidder);
+        if (c != 0)
+        {
+            return c;
+        }
+
+        c = a.DateTime.CompareTo(b.DateTime);
+        if (c != 0)
+        {
+            return c;
+        }
+
+        c = string.CompareOrdinal(a.Url, b.Url);
+        if (c != 0)
+        {
+            return c;
+        }
+
+        c = string.CompareOrdinal(a.Extra, b.Extra);
+        return c != 0 ? c : string.CompareOrdinal(a.Channel, b.Channel);
+    });
+
+    private static readonly IComparer<NarrowKey> NarrowOrder = Comparer<NarrowKey>.Create((a, b) =>
+    {
+        var c = b.Order.CompareTo(a.Order); // DESC, matching WideOrder
+        return c != 0 ? c : a.Ref.CompareTo(b.Ref);
+    });
+
+    // Today's model: store the WHOLE wide row in `_accum` (sorted) and `_window`
+    // (hashed). Per tick: partition + sorted-insert each delta row, then for each touched
+    // partition recompute the top-k window (Dictionary<wideRow,long>), diff it against
+    // last tick's, and emit the diff to a wide output builder.
+    private static (long, long) RunTopKWide(int ticks, int delta, long limit, WBid[] pool, bool sortedWindow)
+    {
+        long n = 0, sink = 0;
+        var accum = new Dictionary<long, SortedDictionary<WBid, long>>();
+        // window keyed by the WHOLE wide row: a Dictionary (whole-row HASH each recompute)
+        // or a comparison-based SortedDictionary (no hash — the §19-forbidden container).
+        var window = new Dictionary<long, IDictionary<WBid, long>>();
+        var touched = new HashSet<long>();
+        for (var t = 0; t < ticks; t++)
+        {
+            touched.Clear();
+            var seed = (long)t * delta;
+            for (var i = 0; i < delta; i++)
+            {
+                var row = pool[Idx(seed, i, pool.Length)];
+                var key = row.Auction; // PARTITION BY (encoded into Auction)
+                touched.Add(key);
+                if (!accum.TryGetValue(key, out var bucket))
+                {
+                    bucket = new SortedDictionary<WBid, long>(WideOrder);
+                    accum[key] = bucket;
+                }
+
+                bucket.TryGetValue(row, out var cur);
+                bucket[row] = cur + 1;
+                n++;
+            }
+
+            var builder = new ZSetBuilder<WBid, Z64>();
+            foreach (var key in touched)
+            {
+                IDictionary<WBid, long> newWindow = sortedWindow
+                    ? new SortedDictionary<WBid, long>(WideOrder)
+                    : new Dictionary<WBid, long>();
+                if (accum.TryGetValue(key, out var bucket))
+                {
+                    long pos = 0;
+                    foreach (var (row, w) in bucket)
+                    {
+                        var take = Math.Min(w, limit - pos);
+                        if (take > 0)
+                        {
+                            newWindow[row] = take;
+                        }
+
+                        pos += w;
+                        if (pos >= limit)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                window.TryGetValue(key, out var oldWindow);
+                foreach (var (row, w) in newWindow)
+                {
+                    var old = 0L;
+                    oldWindow?.TryGetValue(row, out old);
+                    if (w != old)
+                    {
+                        builder.Add(row, new Z64(w - old));
+                    }
+                }
+
+                if (oldWindow is not null)
+                {
+                    foreach (var (row, old) in oldWindow)
+                    {
+                        if (!newWindow.ContainsKey(row))
+                        {
+                            builder.Add(row, new Z64(-old));
+                        }
+                    }
+                }
+
+                window[key] = newWindow;
+            }
+
+            foreach (var (_, w) in builder.Build())
+            {
+                sink += w.Value;
+            }
+        }
+
+        return (n, sink);
+    }
+
+    // The §22 candidate: store NARROW {order, rowRef} in `_accum`/`_window`; recover the
+    // wide row from the pool only for the ≤k survivors the output needs (fetch=true). The
+    // partition key is still taken from the wide input row before narrowing (identical to
+    // `wide`). fetch=false emits the narrow row (the unreachable lower bound — no real
+    // output). Everything else mirrors RunTopKWide exactly.
+    private static (long, long) RunTopKNarrow(int ticks, int delta, long limit, WBid[] pool, bool fetch)
+    {
+        long n = 0, sink = 0;
+        var accum = new Dictionary<long, SortedDictionary<NarrowKey, long>>();
+        var window = new Dictionary<long, Dictionary<NarrowKey, long>>();
+        var touched = new HashSet<long>();
+        for (var t = 0; t < ticks; t++)
+        {
+            touched.Clear();
+            var seed = (long)t * delta;
+            for (var i = 0; i < delta; i++)
+            {
+                var refIdx = Idx(seed, i, pool.Length);
+                var row = pool[refIdx];
+                var key = row.Auction;
+                touched.Add(key);
+                if (!accum.TryGetValue(key, out var bucket))
+                {
+                    bucket = new SortedDictionary<NarrowKey, long>(NarrowOrder);
+                    accum[key] = bucket;
+                }
+
+                var stored = new NarrowKey(row.Price, refIdx);
+                bucket.TryGetValue(stored, out var cur);
+                bucket[stored] = cur + 1;
+                n++;
+            }
+
+            var builder = new ZSetBuilder<WBid, Z64>();
+            foreach (var key in touched)
+            {
+                var newWindow = new Dictionary<NarrowKey, long>();
+                if (accum.TryGetValue(key, out var bucket))
+                {
+                    long pos = 0;
+                    foreach (var (row, w) in bucket)
+                    {
+                        var take = Math.Min(w, limit - pos);
+                        if (take > 0)
+                        {
+                            newWindow[row] = take;
+                        }
+
+                        pos += w;
+                        if (pos >= limit)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                window.TryGetValue(key, out var oldWindow);
+                foreach (var (row, w) in newWindow)
+                {
+                    var old = 0L;
+                    oldWindow?.TryGetValue(row, out old);
+                    if (w != old)
+                    {
+                        // Survivor → recover the wide row from the pool for output.
+                        if (fetch)
+                        {
+                            builder.Add(pool[row.Ref], new Z64(w - old));
+                        }
+                        else
+                        {
+                            sink += w - old;
+                        }
+                    }
+                }
+
+                if (oldWindow is not null)
+                {
+                    foreach (var (row, old) in oldWindow)
+                    {
+                        if (!newWindow.ContainsKey(row))
+                        {
+                            if (fetch)
+                            {
+                                builder.Add(pool[row.Ref], new Z64(-old));
+                            }
+                            else
+                            {
+                                sink -= old;
+                            }
+                        }
+                    }
+                }
+
+                window[key] = newWindow;
+            }
+
+            if (fetch)
+            {
+                foreach (var (_, w) in builder.Build())
+                {
+                    sink += w.Value;
+                }
+            }
         }
 
         return (n, sink);

@@ -109,16 +109,19 @@ if (args.Length > 0 && args[0] == "poolbench")
     return 0;
 }
 
-// q18 profile: `dotnet run -- q18profile [events] [runs]`
-// Sweep W; split/step/gather to locate q18's cost (TOP-K op vs wide-row movement).
+// TOP-K egest profile: `dotnet run -- q18profile [events] [runs] [q18,q19,...]`
+// Sweep W; split/step/gather(egest) to confirm out-of-Step output is ~0 (§22 phase d).
 if (args.Length > 0 && args[0] == "q18profile")
 {
     int Arg(int i, int fallback) =>
         args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
             CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
+    var profileIds = args.Length > 3
+        ? args[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        : null;
     var sb = new StringBuilder();
-    DbspNet.Benchmarks.Q18ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 3));
+    DbspNet.Benchmarks.Q18ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 3), profileIds);
     var q18Path = Path.Combine(FindDocsDir(), "q18-profile.md");
     File.WriteAllText(q18Path, sb.ToString());
     Console.WriteLine();

@@ -30,73 +30,86 @@ namespace DbspNet.Benchmarks;
 /// </remarks>
 internal static class Q18ProfileBenchmark
 {
-    public static void Run(StringBuilder output, int totalEvents, int runs)
+    public static void Run(StringBuilder output, int totalEvents, int runs, string[]? queryIds = null)
     {
         var host = Environment.ProcessorCount;
-        var query = Array.Find(NexmarkQueries.All, q => q.Id == "q18")
-            ?? throw new InvalidOperationException("q18 not found in NexmarkQueries.All");
-        var consumed = query.Tables.ToHashSet();
+        var ids = queryIds is { Length: > 0 } ? queryIds : new[] { "q18", "q19" };
 
         Console.WriteLine();
-        Console.WriteLine($"=== q18 profile (events={totalEvents:N0}, runs={runs}, host={host} cores) ===");
+        Console.WriteLine($"=== TOP-K egest profile ({string.Join(",", ids)}, events={totalEvents:N0}, runs={runs}, host={host} cores) ===");
         Console.WriteLine("Generating event stream…");
         var events = Generate(totalEvents);
-        var plan = SpineParallelHarness.BuildPlan(NexmarkQueries.Ddl, query.Sql);
 
         // W values: 1 (operator cost, no real shuffle), host/2, host.
         var widths = new[] { 1, Math.Max(2, host / 2), host }.Distinct().OrderBy(w => w).ToArray();
 
-        output.AppendLine("# DbspNet — q18 profile (TOP-K op vs wide-row movement)");
+        output.AppendLine("# DbspNet — partitioned TOP-K egest profile (out-of-`Step` output)");
         output.AppendLine();
         output.AppendLine(
-            "Nexmark q18 — *dedup the latest bid per `(bidder, auction)`* (TOP-1 over " +
-            "many tiny partitions, keeping all 7 wide bid columns). Worst non-inherent " +
-            "gap vs Feldera (0.44×). The whole pipeline runs as a `W`-replica parallel " +
-            "circuit; **split** (ingest), **step** (operators incl. the inter-worker " +
-            "exchange), and **gather** (egest the full output) are timed separately, and " +
-            "W is swept to see what scales.");
+            "The q18/q19 partitioned-TOP-K queries (worst remaining gaps vs Feldera). The " +
+            "whole pipeline runs as a `W`-replica parallel circuit; **split** (ingest), " +
+            "**step** (operators incl. the inter-worker exchange), and **gather** (egest the " +
+            "full output) are timed separately, and W is swept to see what scales. *gather* " +
+            "here is the **out-of-`Step` output** materialisation — phase (d) in the §22 " +
+            "4-way decomposition; confirming it is ~0 localises the gap to the in-`Step` work.");
         output.AppendLine();
         output.AppendLine(
             $"Stream: {totalEvents:N0} events, batch 10k, median of {runs} run(s) after one " +
             $"warmup. Host: .NET {Environment.Version}, {host} cores.");
         output.AppendLine();
-        output.AppendLine("| W | Split (ms) | Step (ms) | Gather (ms) | Total (ms) | Step ev/s | Step↑ vs W=1 | Output rows |");
-        output.AppendLine("|--:|-----------:|----------:|------------:|-----------:|----------:|-------------:|------------:|");
 
-        double w1Step = 0;
-        foreach (var w in widths)
+        foreach (var id in ids)
         {
-            Console.WriteLine($"  W={w}…");
-            var (splitMs, stepMs, gatherMs, outputRows, _) =
-                SpineParallelHarness.MeasureMedian(
-                    plan, w, SpineParallelHarness.Flat, events, consumed, batchSize: 10_000, runs);
-
-            if (w == 1)
+            var query = Array.Find(NexmarkQueries.All, q => q.Id == id);
+            if (query is null)
             {
-                w1Step = stepMs;
+                Console.WriteLine($"  (skipping unknown query {id})");
+                continue;
             }
 
-            var total = splitMs + stepMs + gatherMs;
-            var stepEvSec = stepMs > 0 ? totalEvents / (stepMs / 1000.0) : 0.0;
-            var stepUp = stepMs > 0 ? w1Step / stepMs : 1.0;
+            Console.WriteLine($"  {id}…");
+            var consumed = query.Tables.ToHashSet();
+            var plan = SpineParallelHarness.BuildPlan(NexmarkQueries.Ddl, query.Sql);
 
-            Console.WriteLine(
-                $"    split={splitMs,8:F1}  step={stepMs,8:F1}  gather={gatherMs,8:F1}  " +
-                $"({stepEvSec,12:N0} ev/s)  {BenchmarkHarness.FormatRatio(stepUp).Trim()}");
-            output.AppendLine(
-                $"| {w} | {splitMs:F1} | {stepMs:F1} | {gatherMs:F1} | {total:F1} | {stepEvSec:N0} | " +
-                $"{BenchmarkHarness.FormatRatio(stepUp).Trim()} | {outputRows:N0} |");
+            output.AppendLine($"## {id} — {query.Description}");
+            output.AppendLine();
+            output.AppendLine("| W | Split (ms) | Step (ms) | Gather (ms) | Total (ms) | Step ev/s | Step↑ vs W=1 | Gather% | Output rows |");
+            output.AppendLine("|--:|-----------:|----------:|------------:|-----------:|----------:|-------------:|--------:|------------:|");
+
+            double w1Step = 0;
+            foreach (var w in widths)
+            {
+                Console.WriteLine($"    W={w}…");
+                var (splitMs, stepMs, gatherMs, outputRows, _) =
+                    SpineParallelHarness.MeasureMedian(
+                        plan, w, SpineParallelHarness.Flat, events, consumed, batchSize: 10_000, runs);
+
+                if (w == 1)
+                {
+                    w1Step = stepMs;
+                }
+
+                var total = splitMs + stepMs + gatherMs;
+                var stepEvSec = stepMs > 0 ? totalEvents / (stepMs / 1000.0) : 0.0;
+                var stepUp = stepMs > 0 ? w1Step / stepMs : 1.0;
+                var gatherPct = total > 0 ? 100.0 * gatherMs / total : 0.0;
+
+                Console.WriteLine(
+                    $"      split={splitMs,8:F1}  step={stepMs,8:F1}  gather={gatherMs,8:F1}  " +
+                    $"({stepEvSec,12:N0} ev/s)  {BenchmarkHarness.FormatRatio(stepUp).Trim()}");
+                output.AppendLine(
+                    $"| {w} | {splitMs:F1} | {stepMs:F1} | {gatherMs:F1} | {total:F1} | {stepEvSec:N0} | " +
+                    $"{BenchmarkHarness.FormatRatio(stepUp).Trim()} | {gatherPct:F0}% | {outputRows:N0} |");
+            }
+
+            output.AppendLine();
         }
 
-        output.AppendLine();
-        var ideal = widths[^1];
         output.AppendLine(
-            $"**Reading it.** If **step** falls ~linearly with W (W={ideal} step ≈ W=1 step / {ideal}), " +
-            "the cost is the TOP-K operator and parallelism works — the gap is elsewhere " +
-            "(split/gather, i.e. wide-row ingest/egest transcode). If step stays flat " +
-            "(Step↑ ≪ W), the inter-worker exchange / coordination is the bottleneck. " +
-            "Large **split**/**gather** relative to step point at the wide-row boundary " +
-            "transcode (the q0-style egest-bound profile), which no operator change fixes.");
+            "**Reading it.** A small **Gather%** confirms output materialisation (phase d) is " +
+            "**not** the cost — the parallel path decodes output lazily after `sw.Stop()`, so " +
+            "the gap is the in-`Step` work (TOP-K op + exchange) the step decomposition splits. " +
+            "If **step** falls ~`1/W` the operator parallelises and the residual is coordination.");
         output.AppendLine();
         _ = CultureInfo.InvariantCulture;
     }
