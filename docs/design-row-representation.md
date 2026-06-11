@@ -3218,6 +3218,72 @@ narrow win is now **default-on automatically**, with the measured-honest finding
 `limit` is a proxy for accumulation (perfect on the real queries, fuzzy off-diagonal) and
 the runtime-adaptive gate named as the follow-on.
 
+### 22.8 — q18 shuffle-narrowing measured: the two halves never coexist → NO-BUILD (measurement only)
+
+With q19 landed default-on (§22.7), the prompt's gated follow-on — flowing the narrow
+`{order, ref}` through the **shuffle** to attack q18's exchange-movement share (§22.2/§22.5
+"Expected reach") — was opened as a **measure-first** thread. The operator-only narrow
+(§22.6) does not reach q18's exchange; the question is whether a *pipeline-level*
+shuffle-narrowing build would. Two measurements priced it.
+
+**(1) Re-decompose q18's step (`stepprofile q18`, design §15 tooling).** The parallel step
+splits into `split` (bucket each row by `hash(partitionKey)%W`), `wait` (barrier), `gather`
+(rebuild the post-shuffle indexed Z-set, re-hashing rows), and `op = step − the rest` (the
+TOP-K). Across W=4–16 (single-pass, noisy): **op dominates (≈50–66 % of step) and scales**
+(14 ms W=1 → 2.5–4 ms), `split+gather` ("move") is ≈25–37 %, `wait` is small (<10 % off the
+W=12 straggler outlier). This re-confirms §15's conclusion (movement is not the ceiling; the
+op — the per-row floor — is) and §16.11.
+
+**(2) Price the movement narrowing (`gatherbench`, `ExchangeGatherBenchmark`,
+docs/exchange-gather-bench.md).** A faithful A/B of the per-worker `split+gather` round-trip
+(bucket into W=8 destinations + rebuild the index), wide 7-col bid vs a narrow
+`{bidder, auction, order, ref}` payload, on the **value-type uncached-hash** model faithful
+to the typed W>1 path q18 actually runs:
+
+| Shape | gather (hash only) | split+gather (full move) |
+|:--|--:|--:|
+| q18 (tiny partitions) | wide→narrow **−58 %** | wide→narrow **−73 %** |
+| q19 (accumulating) | −51 % | −69 % |
+
+So narrowing recovers ~**70 % of the movement** — and because the typed exchange copies a
+*value struct* by value into the bucket list, `split` is width-attributable too, not just
+`gather` (correcting the first-pass assumption that `split` only moves an 8-byte reference).
+Naively: 70 % × ~30 % move ≈ a ~20 % step reach — within the §17.5 ceiling, q19-ballpark.
+
+**Why it is still NO-BUILD — the two halves never coexist for q18.** The microbench's narrow
+arm recovers the wide row from a shared `pool[idx]` **pre-populated outside the timed loop** —
+i.e. it assumes wide-row recovery is *free*. That is the load-bearing cheat, and unwinding it
+kills the lever for q18 specifically:
+- q18 is `SELECT *` — all seven columns are in the output, which is produced **after** the
+  shuffle on the destination worker. So the wide row must reach that worker regardless.
+- On the **typed parallel path** (the one with the real movement cost — value structs copied)
+  a value struct has **no heap identity**, so a narrow `{order, ref}` cannot carry a free
+  8-byte object reference to recover it; recovery needs **boxing** (a per-row heap allocation —
+  the very cost being removed) or a **shared id-keyed wide-row pool** whose maintenance under
+  an append-heavy, retracting bid stream reintroduces the wide-row storage + hash. The
+  free-reference recovery `OrderRowKey` uses (§22.6) exists only on the **structural W=1
+  path** — and there q18 is already flat (size-1 partitions, cached hash, §22.6).
+- Even granting the full ~20 % movement reach, **`op` (50–66 %, the per-row TOP-K floor) is
+  untouched** — and §22.6 measured that floor flat to narrowing on q18's size-1 partitions.
+  A ~20 % step gain moves q18 from ~0.44× toward ~0.53× vs Feldera — not parity.
+
+So q18's two narrowable halves are disjoint: the path with real movement to save (typed,
+value structs) has no cheap recovery for `SELECT *`, and the path with cheap recovery (free
+reference) has no movement worth saving (cached hash, size-1). The lever priced at ~70 % in
+isolation collapses once the recovery store it hides is charged. **Decision: do not build the
+q18 shuffle-narrowing thread.** q18's residual gap is the per-row `op` floor (§16.11/§17.5)
+plus the `SELECT *` wide-row materialisation (§21.6's "genuinely-wide residual") — neither a
+cheap lever. This closes the §22 arc: q19 shipped default-on (§22.7), q18 measured to a
+documented NO-BUILD, consistent with §15 (movement is not the ceiling) and the honest ceiling
+(narrow the gaps to ~1.3–2×, not parity).
+
+**Durable deliverables (22.8):** the `stepprofile` q18 re-decomposition (op-dominated, move
+~30 %); the `gatherbench` / `ExchangeGatherBenchmark` movement A/B (docs/exchange-gather-bench.md)
+pricing the isolated narrowing at ~70 % of `split+gather`; and the **decision** — the
+isolated prize is real but uncashable for q18 because the wide-row recovery it hides is free
+only on the path that has no movement to save (the two-halves-never-coexist finding), so the
+pipeline-level build is not worth it.
+
 ---
 
 ## Appendix — sources
@@ -3251,7 +3317,9 @@ step-profile.md — §22);
 the `PartitionedTopKNarrowing` override + `ShouldNarrow` per-operator gate +
 `Benchmarks/TopKCrossoverBenchmark.cs` + `PartitionedTopKSelectionTests`
 (`topkcrossover`, `w1profile … wholerowtopk`, docs/topk-crossover-bench.md — §22.7,
-default-on);
+default-on); `Benchmarks/ExchangeGatherBenchmark.cs` + `StepProfileBenchmark` q18
+re-decomposition (`gatherbench`, `stepprofile q18`, docs/exchange-gather-bench.md +
+step-profile.md — §22.8, NO-BUILD);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

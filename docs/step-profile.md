@@ -8,19 +8,9 @@ Stream: 1,000,000 events, batch 10k. Host: .NET 10.0.9, 24 logical cores. One wa
 
 | W | Ctrl | Step | Split | Wait | Gather | Op | Move% | Wait% | Op% | Strag | Imbal | Ctrl↓ vs W1 | Op↓ vs W1 |
 |--:|-----:|-----:|------:|-----:|-------:|---:|------:|------:|----:|------:|------:|------------:|----------:|
-| 1 | 14.13 | 14.13 | 0.00 | 0.00 | 0.00 | 14.13 | 0% | 0% | 100% | 1.00 | 1.00 | 1.00× | 1.00× |
-| 10 | 5.73 | 4.88 | 1.53 | 1.06 | 0.57 | 1.72 | 43% | 22% | 35% | 1.17 | 1.29 | 2.47× | 8.20× |
-| 14 | 3.69 | 3.16 | 0.08 | 0.39 | 0.39 | 2.30 | 15% | 12% | 73% | 1.16 | 1.05 | 3.83× | 6.13× |
-| 24 | 6.30 | 4.19 | 0.16 | 1.54 | 0.25 | 2.23 | 10% | 37% | 53% | 1.50 | 1.47 | 2.24× | 6.32× |
-
-## q19
-
-| W | Ctrl | Step | Split | Wait | Gather | Op | Move% | Wait% | Op% | Strag | Imbal | Ctrl↓ vs W1 | Op↓ vs W1 |
-|--:|-----:|-----:|------:|-----:|-------:|---:|------:|------:|----:|------:|------:|------------:|----------:|
-| 1 | 23.49 | 23.49 | 0.00 | 0.00 | 0.00 | 23.49 | 0% | 0% | 100% | 1.00 | 1.00 | 1.00× | 1.00× |
-| 10 | 6.03 | 5.15 | 0.16 | 0.29 | 0.40 | 4.29 | 11% | 6% | 83% | 1.17 | 1.08 | 3.89× | 5.48× |
-| 14 | 5.71 | 4.96 | 0.52 | 0.15 | 0.17 | 4.12 | 14% | 3% | 83% | 1.15 | 1.02 | 4.11× | 5.70× |
-| 24 | 5.03 | 3.51 | 0.31 | 0.52 | 0.16 | 2.52 | 13% | 15% | 72% | 1.43 | 1.19 | 4.67× | 9.32× |
+| 8 | 7.17 | 6.59 | 0.61 | 0.56 | 1.69 | 3.73 | 35% | 8% | 57% | 1.09 | 1.08 | 0.00× | 0.00× |
+| 12 | 4.93 | 3.36 | 0.33 | 0.50 | 0.24 | 2.30 | 17% | 15% | 68% | 1.47 | 1.34 | 0.00× | 0.00× |
+| 16 | 3.61 | 3.00 | 0.09 | 1.01 | 0.24 | 1.66 | 11% | 34% | 55% | 1.21 | 1.25 | 0.00× | 0.00× |
 
 **Reading it.** Per-step phase ms should fall ~`1/W` if that phase parallelises. A high and *rising* **Wait%** / **Strag** with W means the ceiling is coordination: the per-step/per-exchange barrier pays for the slowest worker each tick, and as W grows each worker's 10k/W-row slice shrinks so the relative variance — and the idle — grows. A flat **Gather**/**Split** that refuses to shrink `1/W` would mean the wide-row movement is bandwidth-bound; an **Op** that scales cleanly while *Ctrl* does not confirms the gap is coordination, not the operator. **Imbal ≫ 1** is *persistent* skew (one worker always heavier — rebalance the hash); **Strag ≫ 1 with Imbal ≈ 1** is *per-tick* straggling (rotating unlucky worker + barrier) — only coarser ticks or fewer barriers help.
 

@@ -95,6 +95,24 @@ if (args.Length > 0 && args[0] == "topkcrossover")
     return 0;
 }
 
+// Exchange-gather whole-row-hash share: `dotnet run -- gatherbench [delta] [runs]`
+// A/B wide vs narrow {order,ref} payload through the exchange gather's IndexedZSet
+// rebuild — prices the only width-attributable phase of q18's step (§22.8).
+if (args.Length > 0 && args[0] == "gatherbench")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.ExchangeGatherBenchmark.Run(sb, Arg(1, 256), Arg(2, 5));
+    var gbPath = Path.Combine(FindDocsDir(), "exchange-gather-bench.md");
+    File.WriteAllText(gbPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(gbPath)}");
+    return 0;
+}
+
 // Representation/execution decomposition: `dotnet run -- reprbench [ticks] [delta] [runs]`
 // Apportions the Layer-A per-tuple floor between the representation axis (heap
 // allocation + wide-key hash) and the execution axis (delegate dispatch + generic
