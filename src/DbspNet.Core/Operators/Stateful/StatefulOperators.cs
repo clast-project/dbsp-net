@@ -221,10 +221,49 @@ public static class StatefulOperators
             return new StructuralRow(vs);
         }
 
-        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
-        builder.AddRawOperator(new PartitionedWindowAggregateOp<StructuralRow, StructuralRow, StructuralRow, TKey>(
+        return builder.PartitionedWindowAggregate<StructuralRow, StructuralRow, StructuralRow, TKey>(
+            input, partitionOf, order, orderValueOf, preceding, descending,
+            aggregator, Widen, partitionComparer, snapshotCodec, frontier);
+    }
+
+    /// <summary>
+    /// Incremental partitioned window aggregate over arbitrary (structural or
+    /// typed) rows. The aggregator computes the new column(s) over each row's
+    /// frame multiset; <paramref name="widen"/> fuses them onto the base row to
+    /// produce the widened output row — the sole row-shape-specific seam, which a
+    /// typed compile path supplies as a struct-fusing delegate. Frame shape is
+    /// chosen exactly as the structural overload (see <paramref name="orderValueOf"/>
+    /// / <paramref name="preceding"/>).
+    /// </summary>
+    public static Stream<ZSet<TOutRow, Z64>> PartitionedWindowAggregate<TInRow, TAgg, TOutRow, TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TInRow, Z64>> input,
+        Func<TInRow, TKey> partitionOf,
+        IComparer<TInRow> order,
+        Func<TInRow, long>? orderValueOf,
+        long? preceding,
+        bool descending,
+        IAggregator<TInRow, TAgg> aggregator,
+        Func<TInRow, Optional<TAgg>, TOutRow> widen,
+        IEqualityComparer<TKey>? partitionComparer = null,
+        IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null,
+        IFrontier? frontier = null)
+        where TInRow : notnull
+        where TAgg : notnull
+        where TOutRow : notnull
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partitionOf);
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(aggregator);
+        ArgumentNullException.ThrowIfNull(widen);
+
+        var output = new Stream<ZSet<TOutRow, Z64>>(ZSet<TOutRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>(
             input, output, partitionOf, order, orderValueOf, preceding, descending,
-            aggregator, Widen, partitionComparer, snapshotCodec, frontier));
+            aggregator, widen, partitionComparer, snapshotCodec, frontier));
         return output;
     }
 
