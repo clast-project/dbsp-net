@@ -223,6 +223,24 @@ if (args.Length > 0 && args[0] == "q4narrow")
     return 0;
 }
 
+// Single-core path A/B (structural vs typed W=1): `dotnet run -- ingestpath [events] [batch] [runs]`
+// Quantifies how much of the single-core gap is the structural-boundary path choice vs a
+// real per-row floor (docs/design-row-representation.md §21 scoping).
+if (args.Length > 0 && args[0] == "ingestpath")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.IngestPathBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3));
+    var ipPath = Path.Combine(FindDocsDir(), "ingest-path-bench.md");
+    File.WriteAllText(ipPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(ipPath)}");
+    return 0;
+}
+
 // q4 join column-pruning gate (W>1 in-Step): `dotnet run -- q4prune [workers] [runs] [events]`
 // Whole q4 parallel pipeline, flat·full vs flat·prune stored join rows
 // (docs/design-row-representation.md §21).
