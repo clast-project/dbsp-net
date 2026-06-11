@@ -1311,12 +1311,12 @@ public static class PlanToCircuit
             new[] { plan.OrderKey.NullsFirst },
             StructuralRowComparer.Instance);
 
-        var specs = new OffsetSpec[plan.Functions.Count];
+        var specs = new OffsetSpec<StructuralRow>[plan.Functions.Count];
         for (var i = 0; i < plan.Functions.Count; i++)
         {
             var fn = plan.Functions[i];
             var valueScalar = ExpressionCompiler.CompileScalar(fn.Value);
-            specs[i] = new OffsetSpec(row => valueScalar(row), fn.Kind, fn.Offset, fn.Default);
+            specs[i] = new OffsetSpec<StructuralRow>(row => valueScalar(row), fn.Kind, fn.Offset, fn.Default);
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);

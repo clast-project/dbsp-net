@@ -278,7 +278,7 @@ public static class StatefulOperators
         Stream<ZSet<StructuralRow, Z64>> input,
         Func<StructuralRow, TKey> partitionOf,
         IComparer<StructuralRow> order,
-        OffsetSpec[] specs,
+        OffsetSpec<StructuralRow>[] specs,
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null)
         where TKey : notnull
@@ -289,9 +289,59 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(order);
         ArgumentNullException.ThrowIfNull(specs);
 
-        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
-        builder.AddRawOperator(new PartitionedOffsetOp<TKey>(
-            input, output, partitionOf, order, specs, partitionComparer, snapshotCodec));
+        // The structural widener: append the offset columns onto the base row.
+        // (The typed compile path supplies a struct-fusing widener instead.)
+        StructuralRow Widen(StructuralRow row, object?[] offsetValues)
+        {
+            var n = row.Count;
+            var vs = new object?[n + offsetValues.Length];
+            for (var i = 0; i < n; i++)
+            {
+                vs[i] = row[i];
+            }
+
+            for (var j = 0; j < offsetValues.Length; j++)
+            {
+                vs[n + j] = offsetValues[j];
+            }
+
+            return new StructuralRow(vs);
+        }
+
+        return builder.PartitionedOffset<StructuralRow, StructuralRow, TKey>(
+            input, partitionOf, order, specs, Widen, partitionComparer, snapshotCodec);
+    }
+
+    /// <summary>
+    /// Incremental partitioned offset functions over arbitrary (structural or
+    /// typed) rows. <paramref name="specs"/> read each offset column's value from
+    /// the positionally-selected row; <paramref name="widen"/> fuses those values
+    /// onto the base row — the sole row-shape-specific seam, which a typed compile
+    /// path supplies as a struct-fusing delegate.
+    /// </summary>
+    public static Stream<ZSet<TOutRow, Z64>> PartitionedOffset<TInRow, TOutRow, TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TInRow, Z64>> input,
+        Func<TInRow, TKey> partitionOf,
+        IComparer<TInRow> order,
+        OffsetSpec<TInRow>[] specs,
+        Func<TInRow, object?[], TOutRow> widen,
+        IEqualityComparer<TKey>? partitionComparer = null,
+        IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null)
+        where TInRow : notnull
+        where TOutRow : notnull
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partitionOf);
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(specs);
+        ArgumentNullException.ThrowIfNull(widen);
+
+        var output = new Stream<ZSet<TOutRow, Z64>>(ZSet<TOutRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedOffsetOp<TInRow, TOutRow, TKey>(
+            input, output, partitionOf, order, specs, widen, partitionComparer, snapshotCodec));
         return output;
     }
 
