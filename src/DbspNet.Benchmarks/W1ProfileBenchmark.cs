@@ -50,10 +50,18 @@ internal static class W1ProfileBenchmark
     };
 
     public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs)
+        => Run(output, totalEvents, batchSize, runs, narrowNonLinear: false);
+
+    public static void Run(StringBuilder output, int totalEvents, int batchSize, int runs, bool narrowNonLinear)
     {
+        // Optional term-2 lever (§18): narrow non-linear (MIN/MAX) aggregate
+        // inputs to {keys, args}. Thread-static seam; w1profile runs single-
+        // threaded on this thread, so setting it once covers every Compile.
+        DbspNet.Sql.Optimizer.NonLinearNarrowingMode.Enabled = narrowNonLinear;
         Console.WriteLine();
         Console.WriteLine(
-            $"=== W=1 per-row cost profile (events={totalEvents:N0}, batch={batchSize:N0}, runs={runs}) ===");
+            $"=== W=1 per-row cost profile (events={totalEvents:N0}, batch={batchSize:N0}, " +
+            $"runs={runs}, narrowNonLinear={narrowNonLinear}) ===");
         Console.WriteLine("Generating event stream…");
         var events = Generate(totalEvents);
         var counts = (

@@ -357,13 +357,23 @@ public static class PlanOptimizer
         // COUNT(DISTINCT)): they depend on which distinct values have positive
         // weight, not on the weight sum, so narrowing can collapse two rows that
         // share the kept columns into a single zero-weight entry and drop a
-        // value the aggregate would otherwise have seen.
-        foreach (var call in agg.Aggregates)
+        // value the aggregate would otherwise have seen — over an arbitrary
+        // *signed* Z-set. This bail is the safe default. When
+        // NonLinearNarrowingMode is enabled the rule narrows these too: keeping
+        // the aggregate's argument columns makes collapsing rows that share them
+        // invariant for the aggregate, and over a *well-formed* (non-negative)
+        // per-group integral the narrowed weight is > 0 iff some positive-weight
+        // row exists — exactly the value-presence MIN/MAX/DISTINCT read
+        // (docs/design-row-representation.md §18).
+        if (!NonLinearNarrowingMode.Enabled)
         {
-            if (call.Kind is AggregateKind.Min or AggregateKind.Max
-                or AggregateKind.ApproxCountDistinct or AggregateKind.CountDistinct)
+            foreach (var call in agg.Aggregates)
             {
-                return agg;
+                if (call.Kind is AggregateKind.Min or AggregateKind.Max
+                    or AggregateKind.ApproxCountDistinct or AggregateKind.CountDistinct)
+                {
+                    return agg;
+                }
             }
         }
 

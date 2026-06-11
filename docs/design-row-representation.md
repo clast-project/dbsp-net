@@ -2384,6 +2384,138 @@ increment — *not* a speculative columnar rewrite.
 
 ---
 
+## 18. Term-2 attack, first increment — non-linear aggregate input narrowing (LANDED, gated, opt-in)
+
+> Status: **prototype landed behind a default-off seam; benchmark-gated.** This is
+> the first increment of §17's *term-2* front (the whole-row-hash floor). It began as
+> "scope the columnar inner-multiset bet" and the investigation **corrected a
+> load-bearing premise of §17** before any columnar code was written — exactly the
+> measure/verify-first discipline paying off.
+
+### 18.1 — The premise §17 got wrong: term-2 is *not* irreducible for q4
+
+§17 asserted q4's term-2 (whole-row hash) is "largely irreducible short of columnar,
+because the aggregate inner multiset is keyed by the whole wide row." Reading the
+actual code disproves the "whole *wide* row" part:
+
+- q4's inner aggregate is `MAX(b.price) GROUP BY a.id, a.category` — it references
+  exactly **3 columns**.
+- But its inner multiset stores the **full ~17-column join row**, because the
+  `NarrowAggregateInput` optimizer rule (`PlanOptimizer.cs:354`) — which projects an
+  aggregate's input down to `{group keys, aggregate-argument columns}` — **bails
+  entirely if any aggregate is MIN/MAX/APPROX_COUNT_DISTINCT/COUNT(DISTINCT)**
+  (`PlanOptimizer.cs:361-368`).
+
+So term-2 for q4 is hashing/storing **17-column rows when 3 suffice** — not an
+irreducible floor, a **conservative guard**. The §17 floor measurement (`reprbench`
+WStr/W8 ≈ 47–80 ns/row) is the cost of the *wide* row; narrowing moves q4 toward the
+W2 regime (~17 ns/row) at S effort, *before* any columnar rewrite.
+
+### 18.2 — Why the guard is conservative, and the exact soundness envelope
+
+The guard (`PlanOptimizer.cs:343-352`) protects against narrowing collapsing two rows
+that share the kept columns but cancel in weight, hiding a value MIN/MAX would have
+seen. Worked against the real `SqlMinMaxAggregator` (`SqlAggregators.cs:340-465`),
+which keys its own incremental state (`Counts: Dictionary<value,count>`,
+`Active: SortedSet<value>`) on the **aggregated value** and probes `after.WeightOf(row)`
+per delta row to detect each row's positive/non-positive transitions, the precise
+verdict is:
+
+> **Narrowing to `{group keys, aggregate-argument columns}` is sound for MIN/MAX/
+> DISTINCT whenever the per-group consolidated multiset is non-negative — i.e. for any
+> *well-formed* insert/delete stream (a row is only deleted if previously inserted).**
+
+The narrowing keeps the aggregate's *argument* columns, so collapsing rows that share
+them is invariant for the aggregate (it reads only those columns); and over a
+non-negative integral, the narrowed entry weight `Σ` over same-kept-columns rows is
+`> 0` iff some positive-weight row exists — exactly the value-presence the aggregate
+reads. The failure case the guard protects requires a genuinely **negative** weight in
+the *consolidated* state (e.g. `(price=100, A):+1` and `(price=100, B):−1` coexisting),
+which only a **malformed** stream (delete-without-insert / net-negative bag) produces.
+The guard is correct for *arbitrary signed Z-sets* — which the engine does support and
+test — and is needlessly conservative for the streams real workloads produce.
+
+**This is a real, documented restriction, not a free win:** narrowing **cannot be a
+default** because the engine's contract includes signed-Z-set correctness (the random-
+query PBT deliberately generates `±1` weights including deletes of never-inserted rows,
+`RandomQuery.cs:312`). It is a sound **opt-in for append-only / non-negative inputs**
+(Nexmark, CDC-free event streams, most analytics ingest) — a large and common class.
+
+### 18.3 — What landed
+
+- **`NonLinearNarrowingMode`** (`Sql/Optimizer/NonLinearNarrowingMode.cs`): a
+  default-off `[ThreadStatic]` seam, mirroring `SpineStagingConfig`/`FlatAggregateMode`.
+  When enabled, `NarrowAggregateInput` narrows non-linear aggregates too. Read at
+  `Optimize` time; no plan/compiler signature change (dodges
+  [[typed-compiler-reflection-gotcha]]). Default-off ⇒ byte-identical to before.
+- **Correctness gate.** `NonLinearNarrowingTests`: (1) the seam genuinely narrows the
+  aggregate input arity 4→2 for MIN/MAX (non-vacuous); (2) over **300 seeded
+  well-formed insert/delete streams** that deliberately create `{k,val}`-colliding rows
+  differing in dropped columns, the narrowed circuit is **byte-identical** to the
+  full-row circuit. The complementary regression guard is the full suite green with the
+  seam off (**1,749 passed**, +2 new). The PBT is deliberately *not* reused (its
+  generator emits out-of-envelope net-negative streams).
+- **Gates.** `w1profile … narrow` (W=1 A/B) and `q4narrow` (W>1 in-`Step` A/B, the
+  parallel typed path, output cross-checked identical — which also re-proves
+  in-envelope correctness end-to-end on the insert-only Nexmark stream).
+
+### 18.4 — Gate results
+
+**W=1 (`w1profile`, 1M events, batch 10k, median-3):**
+
+| Query | B/event full→narrow | ns/event full→narrow |
+|:--|--:|--:|
+| **q4** | 2,376 → **1,841 (−23 %)** | 2,256 → **1,456 (−35 %)** |
+| q3 | 89 → 89 | ~unchanged (no MIN/MAX) |
+| q9 | 2,345 → 2,345 | ~unchanged (TOP-1, not an aggregate) |
+
+**W=8 in-`Step` (`q4narrow`, 1M events, median-3, this i9-12900K):**
+
+| Batch | flat·full step | flat·narrow step | Step↑ |
+|--:|--:|--:|--:|
+| 10k | 579 ms | **424 ms** | **1.37×** |
+| 100k | 565 ms | **462 ms** | **1.22×** |
+
+The W=1 −35 % time translates to a **1.22–1.37× W=8 step** win — confirming §16.11's
+claim that an **in-`Step`** per-row win translates/amplifies at W>1 (narrowing shrinks
+the rows the inner aggregate hashes/stores *inside* `Step`), unlike the out-of-`Step`
+output-boundary lever 2 that was Amdahl-eaten. This is the **largest single W>1 q4 step
+win in the arc** — bigger than (a)'s +14 % (§16.11) and the §14.10 lazy view's
+1.3–1.5×, because it removes ~14 columns of per-row hash/store/copy from the hottest
+operator.
+
+### 18.5 — Decision & what it does to §17's two-front plan
+
+1. **Narrowing is a real, cheap, large chunk of q4's term-2** — captured at S effort
+   without any columnar machinery, vindicating the verify-first detour. Productize it
+   as an **opt-in `CompileOptions`/optimizer flag for non-negative inputs** (the clean
+   public surface is a parameter to `PlanOptimizer.Optimize`, since narrowing runs at
+   optimize time, separate from `Compile`; the seam is the prototype channel). Document
+   the append-only envelope prominently.
+2. **The columnar SoA inner-multiset bet (§17 #3) is reframed, not retired.** After
+   narrowing, q4's inner multiset is a **3-column** row, so columnar now attacks a much
+   smaller term-2 floor (W2 ≈ 17 ns/row, not WStr ≈ 80) — the prize shrank, so columnar
+   drops in priority for q4 specifically. It remains the attack for aggregates whose
+   arguments are genuinely wide or many, and for the TOP-K queries (q18/q19) where wide
+   rows are retained for *output* (narrowing can't help — the columns are needed).
+3. **Term-1 (allocation pooling, §17 #1/#2) is unchanged and still the other front** —
+   narrowing reduces but does not remove the fresh-dict-per-tick allocation (the
+   narrowed dict is smaller). Cross-tick pooling stays the next term-1 increment.
+
+**Net:** the term-2 front's first increment shipped a **1.22–1.37× W=8 / 1.55× W=1 q4
+win** behind a sound, default-off, append-only-gated seam — and the investigation
+**corrected §17's "irreducible" premise** before the expensive columnar arc, so that
+arc is now correctly scoped to the *residual narrow-row* floor and the output-retaining
+TOP-K queries, not q4's (now-cheap) aggregate.
+
+**Durable deliverables:** `NonLinearNarrowingMode` seam + rule change,
+`NonLinearNarrowingTests` (well-formed-stream equivalence), the `w1profile narrow` and
+`q4narrow` gates ([q4-narrow-bench.md](q4-narrow-bench.md)), and the corrected term-2
+map. The honest caveat travels with it: **sound only for non-negative / append-only
+inputs**, so it is opt-in, never a default.
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
@@ -2396,6 +2528,8 @@ DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
 (`stepprofile`/`exchangefuse`, docs/step-profile.md + exchange-fuse-bench.md);
 `Benchmarks/W1ProfileBenchmark.cs`/`ProfileHotPath.cs`/`ReprDecompBenchmark.cs`
 (`w1profile`/`profile`/`reprbench`, docs/w1-profile.md + repr-decomp-bench.md — §16/§17);
+`Sql/Optimizer/NonLinearNarrowingMode.cs` + `Benchmarks/Q4NarrowBenchmark.cs`
+(`q4narrow`, docs/q4-narrow-bench.md — §18);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

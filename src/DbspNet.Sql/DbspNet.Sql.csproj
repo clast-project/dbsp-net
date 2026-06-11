@@ -17,6 +17,9 @@
     <!-- WalRecorder subscribes to TableInput.OnPushed to capture per-tick
          input deltas for the durable log. -->
     <InternalsVisibleTo Include="DbspNet.Persistence" />
+    <!-- Benchmark harnesses drive optimizer/operator seams (e.g.
+         NonLinearNarrowingMode) for measure-first A/B gates. -->
+    <InternalsVisibleTo Include="DbspNet.Benchmarks" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />
