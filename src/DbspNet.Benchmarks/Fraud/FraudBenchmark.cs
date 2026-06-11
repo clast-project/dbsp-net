@@ -152,12 +152,13 @@ internal static class FraudBenchmark
     }
 
     /// <summary>
-    /// Data-parallel throughput for the fraud pipeline. The windowed feature view
-    /// itself has no typed/parallel path (window aggregates fall back to the
-    /// structural compile, which the parallel driver does not run), so we report
-    /// that honestly and instead measure the **parallelizable slice** — the
-    /// <c>transactions ⋈ customers</c> join that feeds the window features — at
-    /// W=1 vs W, cross-checking the W-output against the W=1 replica run.
+    /// Data-parallel throughput for the fraud pipeline. The rolling-window feature
+    /// view now compiles to a parallel circuit (its PARTITION BY window aggregates
+    /// take the typed/parallel path, co-located by <c>cust_id</c>), so we measure
+    /// the **whole feature view** at W=1 vs W, cross-checking the W-output against
+    /// the W=1 replica run. If a build can't parallelize the full view (e.g. a
+    /// MIN/MAX feature that falls back to structural), we drop to the
+    /// <c>transactions ⋈ customers</c> join slice that feeds the windows.
     /// </summary>
     private static void RunParallelSection(
         StringBuilder output, List<(object?[], long)> custRows,
@@ -167,34 +168,40 @@ internal static class FraudBenchmark
         output.AppendLine("### Parallel scaling");
         output.AppendLine();
 
+        // Prefer the full feature view; fall back to the join slice if a build
+        // can't parallelize every window aggregate in it.
         var featureSupported = TypedPlanCompiler.TryCompileParallel(
             BuildPlan(Ddl, FeatureSql), workers, out var featureProbe);
         featureProbe?.Dispose();
 
+        var (sql, label) = featureSupported
+            ? (FeatureSql, "feature view")
+            : (JoinSliceSql, "join slice");
+        var plan = BuildPlan(Ddl, sql);
+
         output.AppendLine(
-            "The full rolling-window feature view " +
             (featureSupported
-                ? "compiles to a parallel circuit."
-                : "**does not** have a data-parallel form yet: its `RANGE … INTERVAL` " +
-                  "window aggregates compile through the structural path, which the " +
-                  "`ParallelCircuit` driver (typed pipeline only) does not run. The " +
-                  "join that feeds them does parallelize, so the table below measures " +
-                  "that slice — `transactions ⋈ customers` — as the throughput a " +
-                  "parallel window-aggregate path would build on.") +
+                ? "The full rolling-window feature view compiles to a parallel circuit — " +
+                  "each `cust_id` partition's window state is co-located on one worker by " +
+                  "an exchange on the PARTITION BY key. The table measures the whole view " +
+                  "(join + the three `RANGE` window frames) at W=1 vs W."
+                : "The full feature view does not parallelize on this build (a window " +
+                  "aggregate fell back to the structural path), so the table measures the " +
+                  "parallelizable `transactions ⋈ customers` join slice that feeds the " +
+                  "windows instead.") +
             " W>1 output is cross-checked against the W=1 replica run.");
         output.AppendLine();
 
-        var plan = BuildPlan(Ddl, JoinSliceSql);
-        if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var sliceProbe))
+        if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var probe))
         {
-            output.AppendLine("> The join slice has no parallel plan on this build — skipped.");
+            output.AppendLine($"> The {label} has no parallel plan on this build — skipped.");
             output.AppendLine();
             return;
         }
 
-        sliceProbe!.Dispose();
+        probe!.Dispose();
 
-        output.AppendLine($"Join slice `{JoinSliceSql.Replace("\n", " ").Trim()}`:");
+        output.AppendLine($"{char.ToUpperInvariant(label[0]) + label[1..]} `{sql.Replace("\n", " ").Trim()}`:");
         output.AppendLine();
         output.AppendLine($"| History txns | W=1 (events/s) | W={workers} (events/s) | Speedup | Status |");
         output.AppendLine("|-------------:|---------------:|---------------:|--------:|:-------|");
@@ -203,8 +210,8 @@ internal static class FraudBenchmark
         {
             var txnRows = BuildTransactions(hist, customers, seed: 7);
 
-            var reference = RunJoinSliceParallel(plan, 1, custRows, txnRows, batchSize, out var single);
-            var output1 = RunJoinSliceParallel(plan, workers, custRows, txnRows, batchSize, out var par);
+            var reference = RunPlanParallel(plan, 1, custRows, txnRows, batchSize, out var single);
+            var output1 = RunPlanParallel(plan, workers, custRows, txnRows, batchSize, out var par);
             var correct = SameMultiset(reference, output1);
 
             var speedup = single > 0 ? par / single : 0.0;
@@ -224,13 +231,13 @@ internal static class FraudBenchmark
     /// parallel circuit (customers loaded once first), returns the final
     /// materialized output and the throughput via <paramref name="eventsPerSec"/>.
     /// </summary>
-    private static Dictionary<string, long> RunJoinSliceParallel(
+    private static Dictionary<string, long> RunPlanParallel(
         LogicalPlan plan, int workers, List<(object?[], long)> custRows,
         List<(object?[], long)> txnRows, int batchSize, out double eventsPerSec)
     {
         if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q))
         {
-            throw new InvalidOperationException("join-slice parallel compile unexpectedly failed");
+            throw new InvalidOperationException("parallel compile unexpectedly failed");
         }
 
         using (q)
