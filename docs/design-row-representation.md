@@ -2514,6 +2514,85 @@ TOP-K queries, not q4's (now-cheap) aggregate.
 map. The honest caveat travels with it: **sound only for non-negative / append-only
 inputs**, so it is opt-in, never a default.
 
+> **DEFERRED — revisit to productize.** The prototype is proven and gated but lives
+> behind a benchmark/test seam. Productization (a clean public opt-in — a parameter on
+> `PlanOptimizer.Optimize`, with the append-only envelope documented, and ideally a
+> planner check that engages it only when the aggregate's input lineage is provably
+> insert-only) is a deliberate follow-up, not done here. The win (q4 W=1 −35 %,
+> W=8 1.22–1.37×) justifies coming back to it once the other representation fronts are
+> explored.
+
+---
+
+## 19. Term-2 attack on q18/q19 (TOP-K) — window-representation prototype RAN, mixed, REVERTED
+
+> Status: **prototype built, measured, and reverted.** A documented dead-end, in the
+> spirit of §8.3 (spine substrate), §9.5 (spine sharing), and §15.7 (barrier fusion):
+> the value is the measured conclusion, not shipped code. q18/q19 are the next-worst
+> single-core gaps after q4 (0.33×/0.35×) and, unlike q4, are **narrowing-immune** —
+> partitioned TOP-K (`PartitionedTopKOp`) retains full rows for *output*, so columns
+> cannot be dropped. This section looked for the analogous in-`Step` representation
+> lever and **did not find a clean one.**
+
+### 19.1 — The hypothesis and the change
+
+The operator stores each partition's emitted window as a `Dictionary<TRow,long>`
+(`PartitionedTopKOp.cs:75`), even though a window holds at most `limit` rows (q18: 1,
+q19: 10). The hypothesis: for ≤10 entries a compact **`(TRow,long)[]`** beats the dict
+on both per-tuple axes — one allocation per recompute instead of three, and
+linear-scan equality over a tiny window instead of **hashing whole wide rows** in
+`ComputeWindow`/`EmitDiff`. The change is **correctness-neutral** (same data, different
+container; no soundness envelope, unlike §18) and needs no snapshot-format change
+(`SaveAsync` serialises only `_accum`; `_window` is derived on load). A second
+increment skipped the array realloc + diff when the recomputed window equals the
+retained one.
+
+### 19.2 — Why it was reverted (the measurement)
+
+Clean same-build A/B (`w1profile`, 1M events, batch 10k, stateless controls q0/q2
+byte-identical so the allocation measurement is exact):
+
+| Query | shape | B/event base→proto | result |
+|:--|:--|--:|:--|
+| q18 | TOP-1, `PARTITION BY (bidder,auction)` | 2,160 → **1,837 (−15 %)** | win |
+| q19 | TOP-10, `PARTITION BY auction` | 3,835 → **3,572 (−7 %)** | win |
+| q9 | TOP-1, `PARTITION BY auction` (+ join) | 2,347 → **2,685 (+14 %)** | **regression** |
+
+Three queries on the *same* operator moved in **two directions**, and the q9
+allocation regression is **deterministic, reproducible, and unexplained by the diff**
+— the skip-unchanged increment did not move it (2,687 → 2,683), so it is not the
+per-recompute array realloc the hypothesis targeted. The structural difference is that
+q9 partitions by `auction` (few partitions, many bids each, top-1 churns) while q18
+partitions by `(bidder,auction)` (many partitions, touched ~once) — but that did not
+yield an account of why the array container *raises* q9's allocation while *lowering*
+q18's. Time at W=1 was a wash on q9 (noisy 1,294–1,512 ns) and a modest win on q18/q19
+(−9 % / −12 %).
+
+### 19.3 — Decision and conclusion
+
+**Reverted.** A correctness-neutral representation change that **regresses a structurally
+identical query by 14 % for reasons I could not explain** is not shippable, and the
+wins it does deliver (q18/q19, −7…−15 % allocation at W=1) are both **modest** and
+**likely diluted at W>1**: §16.10 already showed q18's competitive (W>1) cost is the
+*output boundary* (decoded out-of-`Step` at W>1) plus coordination, not in-`Step`
+window state — so an in-`Step` window-container win is exactly the kind that Amdahl-
+shrinks where it would need to count.
+
+**The portable conclusion:** **q18/q19's TOP-K has no cheap in-`Step` representation
+lever analogous to q4's narrowing.** Its retained window is already tiny (≤`limit`),
+so changing its container is marginal; its competitive gap lives in the wide-row
+**output boundary** (Layer B, out-of-`Step` at W>1 — needs the parallel output path to
+eagerly decode, a different lever than §16.9's single-circuit one) and coordination
+(§15, the shared BSP ceiling), not the window dictionary. This **redirects q18/q19
+effort away from `PartitionedTopKOp`'s state** and back to (i) the term-1 allocation
+front (cross-tick delta pooling, §17 #1, which hits the per-touched-partition builder
+churn broadly) and (ii) the parallel-path output-materialisation boundary. The columnar
+SoA bet (§17 #3) remains scoped to genuinely-wide aggregate inner state, not TOP-K.
+
+**Durable value:** a measured dead-end that saves the next session from re-trying the
+"narrow the TOP-K state" idea, plus the localisation of q18/q19's real gap (output
+boundary + coordination, not window representation).
+
 ---
 
 ## Appendix — sources
