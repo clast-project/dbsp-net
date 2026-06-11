@@ -138,8 +138,11 @@ internal static class SpineParallelHarness
         DeltaPoolMode.Enabled = config.DeltaPool;
         // PartitionedTopKNarrowingMode is likewise read at operator construction inside
         // TryCompileParallel on this (compiling) thread (§22) — set for the build and
-        // restore after; the per-replica narrow operators capture it then.
-        PartitionedTopKNarrowingMode.Enabled = config.NarrowTopK;
+        // restore after; the per-replica narrow operators capture it then. The A/B forces
+        // one arm regardless of the §22.7 limit gate so both configs key the same query.
+        PartitionedTopKNarrowingMode.Override = config.NarrowTopK
+            ? PartitionedTopKNarrowing.ForceNarrow
+            : PartitionedTopKNarrowing.ForceWholeRow;
         try
         {
             if (!TypedPlanCompiler.TryCompileParallel(plan, workers, out var q, snapshotCodecs: null, config.Options))
@@ -198,7 +201,7 @@ internal static class SpineParallelHarness
             SpineAggregateProbeMode.ForcePointProbe = false;
             FlatAggregateMode.ForceEagerRebuild = false;
             DeltaPoolMode.Enabled = false;
-            PartitionedTopKNarrowingMode.Enabled = false;
+            PartitionedTopKNarrowingMode.Override = PartitionedTopKNarrowing.Auto;
         }
     }
 

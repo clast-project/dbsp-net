@@ -3136,6 +3136,88 @@ gated, correct, default-off lever that **lands on q19 (1.30× W=8) and is measur
 q18**, with the prize attributed to per-partition state size rather than the partition
 count the q18-first framing assumed.
 
+### 22.7 — Default-ON via a per-operator limit gate; the crossover sweep proves `limit` is a proxy for accumulation, not the predicate (SHIPPED, default-on)
+
+§22.6 shipped the narrow operator behind a process-wide, default-off seam because it
+does not always *pay* (it is always *correct*). This increment turns the q19 win on
+**automatically**: the seam's *selection* role is replaced by a **per-operator compile
+decision**, and the ThreadStatic seam is demoted to a force-on/off override for the §22
+A/B gates. `PartitionedTopKNarrowingMode.Enabled` (bool) becomes
+`PartitionedTopKNarrowingMode.Override` (`Auto` / `ForceNarrow` / `ForceWholeRow`); the
+selection moves into `ShouldNarrow(limit)`, which under the default `Auto` takes the
+narrow path iff a single-column extractor is present **and** `limit > AutoLimitThreshold`.
+The predicate is a pure plan-read at both compile sites — `plan.Limit` was already a local
+in `CompilePartitionedTopK` / `BuildPartitionedTopK`, so no analysis and no
+reflected-signature change (the typed-compiler reflection gotcha stays honoured, exactly
+as §22.4/§22.6).
+
+**The crossover sweep (`topkcrossover`, docs/topk-crossover-bench.md) measured the
+threshold before trusting it — and the finding is the load-bearing one.** §22.6 had data
+only at the endpoints (limit∈{1,10}); this A/Bs whole-row vs narrow on the **real
+single-circuit W=1 path** (cached `StructuralRow` hash and all — the reality the
+value-typed `reprbench topk` over-priced) across `limit ∈ {1,2,3,5,10}` on **both**
+partition shapes:
+
+| limit | q18 shape (tiny partitions) | q19 shape (accumulating) |
+|------:|:--|:--|
+| 1 | narrow **+2.2 % alloc** (2224 vs 2176 B), time ≈ noise | narrow **1.78× time / 2.91× alloc** |
+| 2 | narrow +2.2 % alloc, time ≈ noise | narrow 1.67× / 2.83× |
+| 3 | narrow +2.2 % alloc, time ≈ noise | narrow 1.59× / 2.77× |
+| 5 | narrow +2.2 % alloc, time ≈ noise | narrow 1.51× / 2.49× |
+| 10 | narrow +2.2 % alloc, time ≈ noise | narrow 1.48× / 2.21× |
+
+**`limit` is orthogonal to the prize.** On the **accumulating** shape narrow wins at
+*every* limit — including limit=1 (1.78×/2.91×), the win actually *largest* at the small
+limit and compressing as the limit grows (more TOP-K window to narrow-key adds overhead).
+On the **tiny-partition** shape narrow costs a flat, deterministic **+2.2 % allocation**
+at *every* limit — including limit=10 — with time within noise (the 16-byte struct key vs
+an 8-byte ref in the dict backing; no accumulated `_accum` to shrink, no kill-hash prize
+on a 1-entry window). The prize tracks **per-partition accumulation**, and `limit` is not
+that — it only *correlated* with the win across the two real Nexmark queries by accident:
+q18 happens to be tiny-partition **and** limit=1, q19 accumulating **and** limit=10.
+
+**Decision — flip default-on with `limit > 1` anyway, because it is the right cut for the
+queries that exist, and the only cheap static one.** Accumulation is not knowable at
+compile time; `limit` is the sole cheap static signal. `limit > 1`:
+- **provably leaves every TOP-1 (limit=1) on the whole-row op** — `ShouldNarrow(1) = 1 > 1
+  = false` — so q18 and q9 (the named protected shapes, both limit=1) are byte-identical
+  to the pre-§22.7 default. The +2.3 % q18 regression that §22.6 kept the seam off to
+  avoid **cannot recur** — q18 never reaches the narrow path.
+- **routes q19 (limit=10) to narrow**, capturing the win automatically.
+
+This satisfies the §21 default-ON precedent's bar (a gated lever goes default-on once the
+gate is justified and the suite is green) for the *named* shapes. The honest caveat is the
+off-diagonal: `limit > 1` mis-serves the two shapes the two real queries don't occupy —
+**tiny-partition k≥2** pays the +2.2 % alloc with no win (a small, deterministic
+regression, but no such query exists in the Nexmark suite), and **accumulating k=1** (e.g.
+q9's *own* TOP-K op, which wins ~2.9× *in isolation* but is join-diluted to +0.2 % at the
+query level, §22.6) is left on whole-row — money on the table, not a regression. The true
+predicate is **runtime per-partition state size**; a runtime accumulation-adaptive gate
+(switch keying once a partition's `_accum` crosses a size) is the named follow-on — out of
+scope for a static plan-read, and a bigger operator change.
+
+**Validation.**
+- *Selection* — `PartitionedTopKSelectionTests` asserts the constructed operator type on
+  **both** compile paths (flat `PlanToCircuit` and typed `TryCompile`): narrow for
+  limit∈{2,3,10}, whole-row for limit=1 and for any multi-column ORDER BY, and the force
+  overrides pin either arm regardless of limit.
+- *Non-regression* — `w1profile` under `Auto` (the production default) vs the
+  `wholerowtopk` baseline: **q9 2345 B = 2345 B** and **q18 2173 ≈ 2175 B** (same operator;
+  the 2 B is GC-timing noise in the per-event divisor), **byte-identical**; **q19 1734 B /
+  1742 ns vs 3831 B / 2709 ns** — the −55 % alloc / −36 % time win is now picked up with no
+  flag. W=8 `q18narrow q19` holds **1.49× / 1.69×** step (≥ §22.6's 1.30×; output
+  cross-checked identical). The full suite is **1762 green** with `Auto` default-on (narrow
+  runs on every k≥2 windowed-TOP-K test, re-confirming the equivalence the PBT proves).
+
+**Durable deliverables (22.7):** the `Auto`/`ForceNarrow`/`ForceWholeRow` override +
+`ShouldNarrow(limit)` per-operator gate (`AutoLimitThreshold = 1`); the gate threaded
+through `StatefulOperators.PartitionedTopK` and the §22 A/B harnesses (now force-arms);
+`PartitionedTopKSelectionTests` (both compile paths); the `topkcrossover` sweep
+(`TopKCrossoverBenchmark`, docs/topk-crossover-bench.md); and the **decision** — q19's
+narrow win is now **default-on automatically**, with the measured-honest finding that
+`limit` is a proxy for accumulation (perfect on the real queries, fuzzy off-diagonal) and
+the runtime-adaptive gate named as the follow-on.
+
 ---
 
 ## Appendix — sources
@@ -3166,6 +3248,10 @@ step-profile.md — §22);
 `PartitionedTopKNarrowingPbtTests` + `Benchmarks/Q18NarrowBenchmark.cs` +
 `SpineParallelHarness.FlatNarrowTopK` (`q18narrow [q18|q19]`,
 `w1profile … narrowtopk`, docs/q19-narrow-bench.md — §22.6, shipped default-off);
+the `PartitionedTopKNarrowing` override + `ShouldNarrow` per-operator gate +
+`Benchmarks/TopKCrossoverBenchmark.cs` + `PartitionedTopKSelectionTests`
+(`topkcrossover`, `w1profile … wholerowtopk`, docs/topk-crossover-bench.md — §22.7,
+default-on);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

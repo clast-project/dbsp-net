@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Diagnostics;
 using System.Text;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
@@ -54,7 +55,8 @@ internal static class W1ProfileBenchmark
 
     public static void Run(
         StringBuilder output, int totalEvents, int batchSize, int runs,
-        bool narrowNonLinear, bool pool, bool prune = false, bool narrowTopK = false)
+        bool narrowNonLinear, bool pool, bool prune = false,
+        PartitionedTopKNarrowing topKMode = PartitionedTopKNarrowing.Auto)
     {
         // Optional term-2 lever (§18): narrow non-linear (MIN/MAX) aggregate
         // inputs to {keys, args}. Thread-static seam; w1profile runs single-
@@ -70,8 +72,10 @@ internal static class W1ProfileBenchmark
         DbspNet.Sql.Optimizer.JoinColumnPruningMode.Enabled = prune;
         // Optional §22 lever: narrow-key partitioned TOP-K (q18/q19). Read at operator
         // construction; the W=1 harness compiles single-threaded on this thread, so
-        // setting it once covers every Compile.
-        DbspNet.Core.Operators.Stateful.PartitionedTopKNarrowingMode.Enabled = narrowTopK;
+        // setting it once covers every Compile. Default Auto = the §22.7 per-operator
+        // limit gate (the production path) — `topk` forces narrow, `wholerowtopk` forces
+        // the whole-row baseline.
+        DbspNet.Core.Operators.Stateful.PartitionedTopKNarrowingMode.Override = topKMode;
         Console.WriteLine();
         Console.WriteLine(
             $"=== W=1 per-row cost profile (events={totalEvents:N0}, batch={batchSize:N0}, " +

@@ -148,10 +148,11 @@ public static class StatefulOperators
 
         var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
 
-        // §22 narrow-key path: opt-in (default-off seam) and only when a single-column
-        // ORDER BY extractor was plumbed through. Otherwise the whole-row operator is
-        // the byte-identical default.
-        if (PartitionedTopKNarrowingMode.Enabled && orderKey is not null)
+        // §22.7 narrow-key path: a per-operator decision. Take it only when a
+        // single-column ORDER BY extractor was plumbed through AND the selection gate
+        // (limit threshold by default, or a force override for the §22 A/B gates) says
+        // so. Otherwise the whole-row operator is the byte-identical default.
+        if (orderKey is not null && PartitionedTopKNarrowingMode.ShouldNarrow(limit))
         {
             builder.AddRawOperator(new PartitionedTopKNarrowOp<TRow, TKey>(
                 input, output, partitionOf, order, orderKey, orderDescending, orderNullsFirst,

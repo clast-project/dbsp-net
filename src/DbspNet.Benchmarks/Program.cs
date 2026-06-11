@@ -61,15 +61,37 @@ if (args.Length > 0 && args[0] == "w1profile")
     var narrow = args.Any(a => a is "narrow" or "narrowNonLinear");
     var pool = args.Any(a => a is "pool" or "deltapool");
     var prune = args.Any(a => a is "prune" or "joinprune");
-    var narrowTopK = args.Any(a => a is "narrowtopk" or "topk");
+    var topKMode = args.Any(a => a is "narrowtopk" or "topk")
+        ? DbspNet.Core.Operators.Stateful.PartitionedTopKNarrowing.ForceNarrow
+        : args.Any(a => a is "wholerowtopk")
+            ? DbspNet.Core.Operators.Stateful.PartitionedTopKNarrowing.ForceWholeRow
+            : DbspNet.Core.Operators.Stateful.PartitionedTopKNarrowing.Auto;
     var sb = new StringBuilder();
     sb.AppendLine("# DbspNet — W=1 per-row execution cost");
     sb.AppendLine();
-    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool, prune, narrowTopK);
+    DbspNet.Benchmarks.W1ProfileBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3), narrow, pool, prune, topKMode);
     var w1Path = Path.Combine(FindDocsDir(), "w1-profile.md");
     File.WriteAllText(w1Path, sb.ToString());
     Console.WriteLine();
     Console.WriteLine($"Report written to {Path.GetFullPath(w1Path)}");
+    return 0;
+}
+
+// TOP-K narrow crossover sweep: `dotnet run -- topkcrossover [events] [batch] [runs]`
+// Sweep limit ∈ {1,2,3,5,10} on the q18 (tiny-partition) and q19 (accumulating) shapes,
+// A/Bing whole-row vs narrow on the real W=1 path, to set the §22.7 limit gate.
+if (args.Length > 0 && args[0] == "topkcrossover")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.TopKCrossoverBenchmark.Run(sb, Arg(1, 1_000_000), Arg(2, 10_000), Arg(3, 3));
+    var tkPath = Path.Combine(FindDocsDir(), "topk-crossover-bench.md");
+    File.WriteAllText(tkPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(tkPath)}");
     return 0;
 }
 

@@ -98,8 +98,10 @@ public class PartitionedTopKNarrowingPbtTests
         // The seam is read at operator construction, so enable it across Compile and
         // keep it for the circuit's lifetime, then restore. Thread-static: this test
         // body runs synchronously on one thread.
-        var prev = PartitionedTopKNarrowingMode.Enabled;
-        PartitionedTopKNarrowingMode.Enabled = narrowing;
+        var prev = PartitionedTopKNarrowingMode.Override;
+        PartitionedTopKNarrowingMode.Override = narrowing
+            ? PartitionedTopKNarrowing.ForceNarrow
+            : PartitionedTopKNarrowing.ForceWholeRow;
         try
         {
             var query = IncrementalOracle.CompileQuery(new[] { Ddl }, sql);
@@ -107,7 +109,7 @@ public class PartitionedTopKNarrowingPbtTests
         }
         finally
         {
-            PartitionedTopKNarrowingMode.Enabled = prev;
+            PartitionedTopKNarrowingMode.Override = prev;
         }
     }
 
