@@ -7,6 +7,7 @@ using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Linear;
 using DbspNet.Core.Operators.Stateful;
+using DbspNet.Core.Operators.Stateful.Aggregators;
 using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
@@ -394,9 +395,12 @@ public static class TypedPlanCompiler
         RecursiveCtePlan r => CompileRecursiveCte(r, ctx),
         TopKPlan t => CompileTopK(t, ctx),
         PartitionedTopKPlan pt => CompilePartitionedTopK(pt, ctx),
-        // Window aggregates widen rows to a new schema and use the structural
-        // CompositeAggregator; no typed fast path — fall back to structural.
-        WindowAggregatePlan => null,
+        // PARTITION BY window aggregates take the typed/parallel path (the
+        // operator is row-opaque; a struct-fusing widener appends the agg
+        // columns). No-partition windows and unsupported aggregators (MIN/MAX,
+        // see BuildTypedAggregator) fall back to structural inside the method.
+        WindowAggregatePlan w => CompileWindowAggregate(w, ctx),
+        // Offset functions (LAG/LEAD) still widen via the structural path.
         WindowOffsetPlan => null,
         _ => null,
     };
@@ -1277,6 +1281,115 @@ public static class TypedPlanCompiler
         return new TypedNode(rowType, inner.Schema, output);
     }
 
+    /// <summary>
+    /// Compiles a <see cref="WindowAggregatePlan"/> — <c>agg(x) OVER (PARTITION BY
+    /// p ORDER BY o RANGE …)</c> — to the row-opaque
+    /// <see cref="PartitionedWindowAggregateOp{TInRow,TAgg,TOutRow,TKey}"/>, with a
+    /// struct-fusing widener that appends the aggregate columns onto each base row.
+    /// The output schema is <c>[input cols…, agg cols…]</c> (= <c>plan.Schema</c>).
+    /// </summary>
+    /// <remarks>
+    /// Falls back to structural (returns <c>null</c>) for a window with no
+    /// PARTITION BY (a single global partition, off the parallel target) or an
+    /// aggregate the typed aggregators don't cover (MIN/MAX — see
+    /// <see cref="BuildTypedAggregator"/>).
+    /// <para>No GC frontier is wired here: <see cref="PlanToCircuit"/> gates the
+    /// typed path off whenever LATENESS / a temporal filter is present (the only
+    /// sources a window frontier can derive from), so a typed window's frontier is
+    /// always null anyway — the structural path keeps every GC-eligible query.
+    /// Parallel: the operator partitions by the PARTITION BY key, so an exchange on
+    /// that key co-locates each partition on one worker (same shape + stable-hash
+    /// hazard as <see cref="CompilePartitionedTopK"/>).</para>
+    /// </remarks>
+    private static TypedNode? CompileWindowAggregate(WindowAggregatePlan plan, CompileContext ctx)
+    {
+        // The no-PARTITION-BY case is a single global window; leave it structural.
+        if (plan.PartitionKeys.Count == 0) return null;
+
+        var inner = TryCompileNode(plan.Input, ctx);
+        if (inner is null) return null;
+        var rowType = inner.RowType;
+
+        // Partition-key extractors (boxed), as in CompilePartitionedTopK.
+        var partitionExtractors = new Delegate[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            if (BuildBoxedExtractor(plan.PartitionKeys[i], rowType) is not { } ex) return null;
+            partitionExtractors[i] = ex;
+        }
+
+        // ORDER BY key (boxed), if any — its presence + a bounded frame select the
+        // operator's three frame shapes (see PartitionedWindowAggregateOp).
+        Delegate? orderExtractor = null;
+        var descending = false;
+        var nullsFirst = false;
+        if (plan.OrderKey is { } sk)
+        {
+            if (BuildBoxedExtractor(sk.Expression, rowType) is not { } ex) return null;
+            orderExtractor = ex;
+            descending = sk.Descending;
+            nullsFirst = sk.NullsFirst;
+        }
+
+        // Typed composite aggregator + emitted TAgg ([agg cols…]).
+        if (BuildTypedComposite(plan.Aggregates, rowType) is not { } built) return null;
+        var (composite, aggRowType) = built;
+
+        // Widened output row = [input cols…, agg cols…] = plan.Schema. Reuse the
+        // (TKey, TAgg) → TFinal flatten builder with the *full input row* in the
+        // first slot (input col count = the "key" count).
+        var outRowType = TypedRowEmitter.EmitRowType(plan.Schema);
+        if (outRowType is null) return null;
+        var flatten = BuildAggregateFlattenDelegate(
+            rowType, aggRowType, outRowType, plan.Schema,
+            plan.Input.Schema.Count, plan.Aggregates.Count);
+
+        // Parallel: co-locate each partition on one worker. A partition key
+        // outside the stable-hash surface refuses the parallel compile (falls back).
+        var opInput = inner.Stream;
+        if (ctx.Workers > 1)
+        {
+            if (BuildExprListHashPartition(rowType, plan.PartitionKeys) is not { } partition) return null;
+            opInput = InvokeExchange(ctx.Builder, rowType, inner.Stream, partition);
+        }
+
+        // The per-partition integrated input stores base rows (plan.Input.Schema).
+        var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Input.Schema, rowType);
+
+        var output = InvokePartitionedWindowAggregate(
+            ctx.Builder, rowType, aggRowType, outRowType, opInput,
+            partitionExtractors, orderExtractor, descending, nullsFirst,
+            plan.Frame?.Preceding, composite, flatten, snapshotCodec);
+
+        // Output is partitioned by the PARTITION BY columns. The widen carries the
+        // input columns through at their original indices (they precede the agg
+        // cols), so a bare-column partition key keeps its indices; an expression
+        // key can't be named as columns ⇒ no inherited partition (downstream
+        // re-exchanges if it needs one — sound, just an extra shuffle).
+        int[]? outPartition = null;
+        if (ctx.Workers > 1)
+        {
+            var indices = new int[plan.PartitionKeys.Count];
+            var allColumns = true;
+            for (var i = 0; i < plan.PartitionKeys.Count; i++)
+            {
+                if (plan.PartitionKeys[i] is ResolvedColumn rc)
+                {
+                    indices[i] = rc.Index;
+                }
+                else
+                {
+                    allColumns = false;
+                    break;
+                }
+            }
+
+            if (allColumns) outPartition = indices;
+        }
+
+        return new TypedNode(outRowType, plan.Schema, output, PartitionKey: outPartition);
+    }
+
     /// <summary>Lower a resolved expression to a compiled <c>Func&lt;TRow,
     /// object?&gt;</c> over the emitted row struct (boxed so a null
     /// <c>Nullable&lt;T&gt;</c> becomes a null reference, matching
@@ -1360,47 +1473,14 @@ public static class TypedPlanCompiler
             : BuildExprKeyExtractorDelegate(inner.RowType, keyRowType, keySchema, plan.GroupKeys);
         if (keyExtractor is null) return null;
 
-        // Per-aggregate-call schema for TAgg, parallel to plan.Aggregates.
-        // We use plan.Aggregates (not plan.Schema) because the resolver
-        // may collect more AggregateCalls than it surfaces in Schema
-        // when an aggregate is referenced from both SELECT and HAVING.
-        var aggColumns = new SchemaColumn[plan.Aggregates.Count];
-        for (var i = 0; i < plan.Aggregates.Count; i++)
+        // The typed composite aggregator (TAgg = [agg-result cols...]) — shared
+        // verbatim with the window-aggregate path.
+        if (BuildTypedComposite(plan.Aggregates, inner.RowType) is not { } built)
         {
-            aggColumns[i] = new SchemaColumn(
-                "$agg" + i,
-                TypedAggregateResultType(plan.Aggregates[i]));
+            return null;
         }
 
-        var aggSchema = new Schema(aggColumns);
-        var aggRowType = TypedRowEmitter.EmitRowType(aggSchema);
-        if (aggRowType is null) return null;
-
-        // Build the per-aggregator typed objects.
-        var aggregators = new object[plan.Aggregates.Count];
-        for (var i = 0; i < plan.Aggregates.Count; i++)
-        {
-            var built = BuildTypedAggregator(plan.Aggregates[i], inner.RowType);
-            if (built is null) return null;
-            aggregators[i] = built;
-        }
-
-        var aggArray = CastAggregatorArray(inner.RowType, aggregators);
-
-        var packResults = TypedRowEmitter.BuildBoxedFactory(aggSchema)!;
-        // packResults returns object; wrap into a typed Func<object?[], TAgg>
-        // via Expression compilation.
-        var packParam = Expression.Parameter(typeof(object?[]), "vs");
-        var packCall = Expression.Convert(
-            Expression.Invoke(Expression.Constant(packResults), packParam),
-            aggRowType);
-        var packDelegateType = typeof(Func<,>).MakeGenericType(typeof(object?[]), aggRowType);
-        var typedPack = Expression.Lambda(packDelegateType, packCall, packParam).Compile();
-
-        // new TypedCompositeAggregator<TIn, TAgg>(aggArray, typedPack)
-        var compositeOpen = typeof(TypedCompositeAggregator<,>);
-        var compositeClosed = compositeOpen.MakeGenericType(inner.RowType, aggRowType);
-        var composite = Activator.CreateInstance(compositeClosed, aggArray, typedPack)!;
+        var (composite, aggRowType) = built;
 
         // Parallel: re-shard by the group key so every row of a group co-locates
         // on one worker — that worker then computes the group's complete
@@ -1883,6 +1963,56 @@ public static class TypedPlanCompiler
         var widened = built.Type == targetClr ? built : Expression.Convert(built, targetClr);
         var delegateType = typeof(Func<,>).MakeGenericType(inputRowType, targetClr);
         return Expression.Lambda(delegateType, widened, inParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds the <c>TypedCompositeAggregator&lt;TIn, TAgg&gt;</c> (boxed) for a
+    /// list of aggregate calls over <paramref name="inputRowType"/>, returning it
+    /// alongside the emitted <c>TAgg</c> row type (schema
+    /// <c>[$agg0, $agg1, …]</c>). Returns <c>null</c> if any call is out of the
+    /// typed aggregators' scope (MIN/MAX or an un-lowerable argument) or the agg
+    /// row type can't be emitted — the caller then falls back to structural.
+    /// Shared by the grouped-aggregate and window-aggregate compile paths.
+    /// </summary>
+    private static (object Composite, Type AggRowType)? BuildTypedComposite(
+        IReadOnlyList<AggregateCall> aggregates, Type inputRowType)
+    {
+        // Per-aggregate-call schema for TAgg, parallel to the call list. (The
+        // resolver may collect more AggregateCalls than it surfaces in a plan's
+        // Schema, so we always size TAgg from the calls themselves.)
+        var aggColumns = new SchemaColumn[aggregates.Count];
+        for (var i = 0; i < aggregates.Count; i++)
+        {
+            aggColumns[i] = new SchemaColumn("$agg" + i, TypedAggregateResultType(aggregates[i]));
+        }
+
+        var aggSchema = new Schema(aggColumns);
+        var aggRowType = TypedRowEmitter.EmitRowType(aggSchema);
+        if (aggRowType is null) return null;
+
+        // Build the per-aggregator typed objects.
+        var aggregators = new object[aggregates.Count];
+        for (var i = 0; i < aggregates.Count; i++)
+        {
+            var agg = BuildTypedAggregator(aggregates[i], inputRowType);
+            if (agg is null) return null;
+            aggregators[i] = agg;
+        }
+
+        var aggArray = CastAggregatorArray(inputRowType, aggregators);
+
+        // packResults returns object; wrap into a typed Func<object?[], TAgg>.
+        var packResults = TypedRowEmitter.BuildBoxedFactory(aggSchema)!;
+        var packParam = Expression.Parameter(typeof(object?[]), "vs");
+        var packCall = Expression.Convert(
+            Expression.Invoke(Expression.Constant(packResults), packParam), aggRowType);
+        var packDelegateType = typeof(Func<,>).MakeGenericType(typeof(object?[]), aggRowType);
+        var typedPack = Expression.Lambda(packDelegateType, packCall, packParam).Compile();
+
+        // new TypedCompositeAggregator<TIn, TAgg>(aggArray, typedPack)
+        var compositeClosed = typeof(TypedCompositeAggregator<,>).MakeGenericType(inputRowType, aggRowType);
+        var composite = Activator.CreateInstance(compositeClosed, aggArray, typedPack)!;
+        return (composite, aggRowType);
     }
 
     /// <summary>
@@ -3088,6 +3218,85 @@ public static class TypedPlanCompiler
         return builder.PartitionedTopK<TRow, StructuralRow>(
             stream, PartitionOf, order, sortKeyOnly, function, limit, null, codec,
             orderKey, orderDescending, orderNullsFirst);
+    }
+
+    private static object InvokePartitionedWindowAggregate(
+        CircuitBuilder builder, Type inRowType, Type aggRowType, Type outRowType, object input,
+        Delegate[] partitionExtractors, Delegate? orderExtractor, bool descending, bool nullsFirst,
+        long? preceding, object aggregator, Delegate flatten, object? snapshotCodec)
+    {
+        var openMethod = typeof(TypedPlanCompiler)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Single(m => m.Name == nameof(BuildPartitionedWindowAggregate) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(inRowType, aggRowType, outRowType);
+        return closed.Invoke(null, new object?[]
+        {
+            builder, input, partitionExtractors, orderExtractor, descending, nullsFirst,
+            preceding, aggregator, flatten, snapshotCodec,
+        })!;
+    }
+
+    /// <summary>Generic worker for <see cref="InvokePartitionedWindowAggregate"/> —
+    /// constructs the strongly-typed partition/order delegates, the numeric
+    /// order-value extractor, and the struct-fusing widener, then drives the
+    /// row-opaque window-aggregate builder (TKey = StructuralRow over the boxed
+    /// partition columns, as in <see cref="BuildPartitionedTopK{TRow}"/>).</summary>
+    private static object BuildPartitionedWindowAggregate<TInRow, TAgg, TOutRow>(
+        CircuitBuilder builder, object input, Delegate[] partitionExtractors,
+        Delegate? orderExtractor, bool descending, bool nullsFirst,
+        long? preceding, object aggregator, Delegate flatten, object? snapshotCodec)
+        where TInRow : notnull
+        where TAgg : notnull
+        where TOutRow : notnull
+    {
+        var partKeys = new Func<TInRow, object?>[partitionExtractors.Length];
+        for (var i = 0; i < partitionExtractors.Length; i++)
+        {
+            partKeys[i] = (Func<TInRow, object?>)partitionExtractors[i];
+        }
+
+        StructuralRow PartitionOf(TInRow row)
+        {
+            var values = new object?[partKeys.Length];
+            for (var i = 0; i < partKeys.Length; i++)
+            {
+                values[i] = partKeys[i](row);
+            }
+
+            return new StructuralRow(values);
+        }
+
+        IComparer<TInRow> order;
+        Func<TInRow, long>? orderValueOf = null;
+        if (orderExtractor is Func<TInRow, object?> orderBoxed)
+        {
+            var keys = new[] { orderBoxed };
+            order = new SortKeyComparer<TInRow>(
+                keys, new[] { descending }, new[] { nullsFirst }, Comparer<TInRow>.Default);
+
+            // Ordered frames use the numeric order value for the RANGE arithmetic;
+            // the resolver constrains the key to an integer or temporal type. A
+            // NULL key sorts to the low end of the value space.
+            orderValueOf = row => orderBoxed(row) is { } v ? MonotoneKey.Extract(v) : long.MinValue;
+        }
+        else
+        {
+            // Whole-partition frame: a deterministic total order over distinct rows.
+            order = Comparer<TInRow>.Default;
+        }
+
+        var agg = (IAggregator<TInRow, TAgg>)aggregator;
+        var fuse = (Func<ValueTuple<TInRow, TAgg>, TOutRow>)flatten;
+
+        // The aggregate is non-empty for any emitted row (the current row is always
+        // in its own frame), so HasValue holds in practice; default(TAgg) guards the
+        // impossible empty-frame branch (its agg cols are nullable / zero).
+        TOutRow Widen(TInRow row, Optional<TAgg> a) => fuse((row, a.HasValue ? a.Value : default!));
+
+        var stream = (Stream<ZSet<TInRow, Z64>>)input;
+        var codec = (IZSetTraceCodec<TInRow, Z64>?)snapshotCodec;
+        return builder.PartitionedWindowAggregate<TInRow, TAgg, TOutRow, StructuralRow>(
+            stream, PartitionOf, order, orderValueOf, preceding, descending, agg, Widen, null, codec, null);
     }
 
     /// <summary><c>builder.MapRows&lt;TIn, TOut, Z64&gt;(stream, projection)</c>.</summary>

@@ -432,7 +432,12 @@ public class WindowAggregateTests
                 else
                 {
                     var g = rng.Next(0, 3);
-                    object tsVal = monotonicTs ? nextTs++ : rng.Next(0, 8);
+                    // Box ts at its declared column type: BIGINT (long) when the
+                    // monotonic-LATENESS DDL is used, INT otherwise. A bare ternary
+                    // would unify both arms to long and box an INT column as long —
+                    // harmless on the untyped structural path, but the typed scan
+                    // lift (now reached for PARTITION BY windows) enforces the schema.
+                    object tsVal = monotonicTs ? nextTs++ : (object)rng.Next(0, 8);
                     var v = rng.Next(0, 5);
                     var row = new object?[] { g, tsVal, v };
                     present.Add(row);
