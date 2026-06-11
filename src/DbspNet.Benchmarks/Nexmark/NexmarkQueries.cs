@@ -68,8 +68,6 @@ internal static class NexmarkQueries
     /// </summary>
     public static readonly Unsupported[] NotSupported =
     {
-        new("q5", "hot items — sliding-window auction popularity",
-            "needs a HOP (sliding) windowing table function"),
         new("q11", "user sessions — session-window bid counts",
             "needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)"),
     };
@@ -144,6 +142,32 @@ internal static class NexmarkQueries
                   WHERE rn <= 1
               ) w ON a.id = w.auction",
             AuctionBid),
+        new(
+            "q5",
+            "hot items — sliding-window auction popularity",
+            // Verbatim Feldera q5 (HOP TVF; quoted intervals per the DbspNet
+            // dialect). Per-auction bid counts in 10s windows sliding every 2s,
+            // self-joined to the per-window max count to surface the hot item(s).
+            @"SELECT AuctionBids.auction, AuctionBids.num
+              FROM (
+                SELECT B1.auction, COUNT(*) AS num,
+                       window_start AS starttime, window_end AS endtime
+                FROM TABLE(HOP(TABLE bid, DESCRIPTOR(date_time), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) AS B1
+                GROUP BY B1.auction, window_start, window_end
+              ) AS AuctionBids
+              JOIN (
+                SELECT MAX(CountBids.num) AS maxn, CountBids.starttime, CountBids.endtime
+                FROM (
+                  SELECT COUNT(*) AS num, window_start AS starttime, window_end AS endtime
+                  FROM TABLE(HOP(TABLE bid, DESCRIPTOR(date_time), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) AS B2
+                  GROUP BY B2.auction, window_start, window_end
+                ) AS CountBids
+                GROUP BY CountBids.starttime, CountBids.endtime
+              ) AS MaxBids
+              ON AuctionBids.starttime = MaxBids.starttime
+                AND AuctionBids.endtime = MaxBids.endtime
+                AND AuctionBids.num >= MaxBids.maxn",
+            BidOnly),
         new(
             "q7",
             "highest bid by window — tumbling-window max price + join",

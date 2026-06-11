@@ -39,6 +39,13 @@ public class TumbleWindowPbtTests
         // second key — the q12 shape (per-key per-window counts).
         "SELECT v, TUMBLE_START(ts, INTERVAL '5' SECOND) AS ws, TUMBLE_END(ts, INTERVAL '5' SECOND) AS we, COUNT(*) AS c FROM a GROUP BY v, TUMBLE(ts, INTERVAL '5' SECOND)");
 
+    // Sliding-window (HOP) shapes via the table-valued function. No LATENESS — HOP
+    // doesn't GC yet — so these run under the ±1-retraction no-lateness oracle.
+    private static readonly Gen<string> GenHopShape = Gen.OneOfConst(
+        "SELECT window_start, COUNT(*) AS c FROM TABLE(HOP(TABLE a, DESCRIPTOR(ts), INTERVAL '2' SECOND, INTERVAL '6' SECOND)) GROUP BY window_start, window_end",
+        "SELECT v, window_start, COUNT(*) AS c FROM TABLE(HOP(TABLE a, DESCRIPTOR(ts), INTERVAL '2' SECOND, INTERVAL '6' SECOND)) GROUP BY v, window_start, window_end",
+        "SELECT window_start, window_end, SUM(v) AS s FROM TABLE(HOP(TABLE a, DESCRIPTOR(ts), INTERVAL '3' SECOND, INTERVAL '6' SECOND)) GROUP BY window_start, window_end");
+
     // ts at whole-second granularity in [0, 30]s; v a small INT (some ≤ 0 for WHERE).
     private static readonly Gen<InputEvent> GenEvent =
         Gen.Select(Gen.Int[0, 30], Gen.Int[-2, 5])
@@ -85,6 +92,31 @@ public class TumbleWindowPbtTests
                     var accumulated = IncrementalOracle.RunAndAccumulate(compiled, ticks);
 
                     var plan = ResolvePlan(["CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)"], sql);
+                    var ctx = new BatchEvalContext(
+                        new Dictionary<string, ZSet<StructuralRow, Z64>>(StringComparer.Ordinal)
+                        {
+                            ["a"] = IncrementalOracle.NetTable(ticks.SelectMany(t => t), "a"),
+                        },
+                        new Dictionary<CteRef, ZSet<StructuralRow, Z64>>());
+                    var batch = BatchPlanEvaluator.Evaluate(plan, ctx);
+
+                    return accumulated.Equals(batch);
+                },
+                iter: 2000);
+    }
+
+    [Fact]
+    public void HopIncrementalEqualsBatch_UnderRetractions_NoLateness()
+    {
+        string[] ddl = ["CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)"];
+        Gen.Select(GenHopShape, Ticks(GenSignedEvent))
+            .Sample(
+                (sql, ticks) =>
+                {
+                    var compiled = IncrementalOracle.CompileQuery(ddl, sql);
+                    var accumulated = IncrementalOracle.RunAndAccumulate(compiled, ticks);
+
+                    var plan = ResolvePlan(ddl, sql);
                     var ctx = new BatchEvalContext(
                         new Dictionary<string, ZSet<StructuralRow, Z64>>(StringComparer.Ordinal)
                         {

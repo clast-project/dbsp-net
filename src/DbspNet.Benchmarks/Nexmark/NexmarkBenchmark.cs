@@ -97,11 +97,12 @@ internal static class NexmarkBenchmark
             "the full materialized view size.");
         output.AppendLine(">");
         output.AppendLine(
-            "> The `unsupported` rows (q5 / q7 / q8 / q11 / q12 — tumbling / sliding " +
-            "/ session event-time and processing-time windows) require TUMBLE / HOP " +
-            "/ SESSION windowing table functions that DbspNet does not yet expose; " +
-            "they are listed explicitly so a Feldera comparison shows a declared gap, " +
-            "not a silent omission. Among the queries that do run: q9 / q18 / q19 use " +
+            "> The `unsupported` row (q11 — session windows) requires a SESSION " +
+            "windowing table function that DbspNet does not yet expose (Feldera omits " +
+            "q11 from its own set too); it is listed explicitly so a Feldera comparison " +
+            "shows a declared gap, not a silent omission. The event-time windowing " +
+            "queries now run: q7 / q8 / q12 via `GROUP BY TUMBLE` and q5 via the " +
+            "`TABLE(HOP(…))` sliding-window TVF. Among the others: q9 / q18 / q19 use " +
             "`ROW_NUMBER() OVER (PARTITION … ORDER …)` → a partitioned incremental " +
             "TOP-K (and, in parallel, an exchange on the partition key); q20 is a " +
             "filtered bid ⋈ auction join; q22 splits the bid URL with `SPLIT_INDEX`; " +

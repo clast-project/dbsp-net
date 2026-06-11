@@ -71,6 +71,29 @@ public class NexmarkNewQueriesTests
           ) A
           ON P.id = A.seller AND P.starttime = A.starttime AND P.endtime = A.endtime";
 
+    // q5: hot items — per-auction bid counts in 10s windows sliding every 2s
+    // (HOP TVF), self-joined to the per-window max to surface the hot item(s).
+    private const string Q5 =
+        @"SELECT AuctionBids.auction, AuctionBids.num
+          FROM (
+            SELECT B1.auction, COUNT(*) AS num,
+                   window_start AS starttime, window_end AS endtime
+            FROM TABLE(HOP(TABLE bid, DESCRIPTOR(date_time), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) AS B1
+            GROUP BY B1.auction, window_start, window_end
+          ) AS AuctionBids
+          JOIN (
+            SELECT MAX(CountBids.num) AS maxn, CountBids.starttime, CountBids.endtime
+            FROM (
+              SELECT COUNT(*) AS num, window_start AS starttime, window_end AS endtime
+              FROM TABLE(HOP(TABLE bid, DESCRIPTOR(date_time), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) AS B2
+              GROUP BY B2.auction, window_start, window_end
+            ) AS CountBids
+            GROUP BY CountBids.starttime, CountBids.endtime
+          ) AS MaxBids
+          ON AuctionBids.starttime = MaxBids.starttime
+            AND AuctionBids.endtime = MaxBids.endtime
+            AND AuctionBids.num >= MaxBids.maxn";
+
     // q12: per-bidder bid counts within each 10s (event-time) tumbling window.
     private const string Q12 =
         @"SELECT B.bidder, COUNT(*) AS bid_count,
@@ -372,6 +395,22 @@ public class NexmarkNewQueriesTests
         var prices = rows.Select(r => (long)r[2]!).OrderBy(p => p).ToList();
         Assert.Equal(3L, prices.First());    // the two lowest (1, 2) are dropped
         Assert.Equal(12L, prices.Last());
+    }
+
+    [Fact]
+    public void Q5_HotItems_SlidingWindowPopularity()
+    {
+        var q = Compile(Q5);
+        // Auction 1 gets 2 bids and auction 2 gets 1, all inside one 10s window —
+        // auction 1 is the hot item (per-window max count = 2).
+        InsertBid(q, auction: 1, bidder: 1, price: 100, timeMicros: 3 * Sec);
+        InsertBid(q, auction: 1, bidder: 2, price: 110, timeMicros: 5 * Sec);
+        InsertBid(q, auction: 2, bidder: 3, price: 200, timeMicros: 7 * Sec);
+        q.Step();
+
+        var rows = PositiveRows(q, 2);
+        Assert.Contains(rows, r => (long)r[0]! == 1L && (long)r[1]! == 2L);
+        Assert.DoesNotContain(rows, r => (long)r[0]! == 2L && (long)r[1]! == 2L);
     }
 
     [Fact]

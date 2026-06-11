@@ -596,14 +596,27 @@ reflect that shape, not a backlog.
   type-system entry), so q8 and q12 take the data-parallel W&gt;1 path (measured
   ~1.7×/3.0× at W=24). q7 stays structural/single-circuit — its inner join carries
   a cross-side `BETWEEN` residual the typed join path doesn't yet parallelize
-  (separate from windowing). *Deferred:*
-  **HOP** (sliding — fans each row out to `size/slide` windows; lowers to a
-  `UNION ALL` of shifted projections, unlocks q5) and **SESSION** (gap-merged,
-  genuinely stateful merge under retraction, unlocks q11 — Feldera itself omits
-  q11 / has no session-window support, so there is no apples-to-apples baseline).
-  The `TABLE(TUMBLE/HOP(TABLE t, DESCRIPTOR(c), …))` table-valued-function spelling
-  (Feldera's q5 form, emitting `window_start`/`window_end` columns) is the Phase-2
-  surface; the GROUP BY form above is the q7/q8/q12 surface.
+  (separate from windowing).
+- **Event-time windowing — HOP (sliding) + the windowing TVF surface** —
+  **implemented**. The `TABLE(TUMBLE|HOP(TABLE src, DESCRIPTOR(timecol), [slide,]
+  size))` table-valued-function spelling (Feldera's q5 form), emitting
+  `window_start` / `window_end` columns, parses to a new `WindowTableFunction`
+  `FromClause` node. The resolver lowers it with **no new operator or plan node**:
+  TUMBLE → one `ProjectPlan` appending `window_start = tumble_start(t, size)` /
+  `window_end = window_start + size`; HOP → a `UnionAllPlan` of `size/slide` shifted
+  projections, branch `k` assigning `window_start = tumble_start(t, slide) − k·slide`
+  (each row fans out to every overlapping window). Constant day-time INTERVAL slide
+  and size; size must be a whole multiple of slide; TIMESTAMP / whole-day DATE time
+  column. Unlocks Nexmark q5. PBT-proven incremental≡batch under ±1 retractions.
+  *Deferred:* HOP `GROUP BY window_start` is **not GC'd** (the per-branch `− k·slide`
+  shift isn't followed by the monotonicity analyzer; the structurally-derived
+  `bucket_floor − k·slide` frontier over-drops by up to a slide — a sound transform
+  is `v → v − size`, which needs a custom-transform injection mechanism). So HOP
+  state is unbounded under LATENESS today (correct, just not bounded) — a follow-on.
+  A `(SELECT …)` subquery as the TVF data source is also deferred (base table only).
+  **SESSION** (gap-merged, a genuinely stateful merge under retraction, unlocks
+  q11) remains deferred — Feldera itself omits q11 / has no session-window support,
+  so there is no apples-to-apples baseline.
 - `LATENESS` bounds — **implemented** (bounded-history trace GC driven by a
   monotonicity analysis, the standard answer across long-running IVM engines:
   Feldera's `MonotoneAnalyzer` + `IntegrateTraceRetainKeysOperator`,

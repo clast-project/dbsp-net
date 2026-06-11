@@ -804,6 +804,13 @@ public sealed class Parser
 
     private FromClause ParsePrimaryTableRef()
     {
+        // `TABLE(TUMBLE|HOP(TABLE src, DESCRIPTOR(col), …))` — a streaming
+        // windowing table-valued function (Feldera / Flink syntax).
+        if (Peek().Kind == TokenKind.Table)
+        {
+            return ParseWindowTableFunction();
+        }
+
         // `(SELECT …)` / `(WITH … SELECT …)` / `(…UNION ALL…)` in FROM
         // position is a derived table. SQL requires an alias for these.
         if (Peek().Kind == TokenKind.LParen)
@@ -846,6 +853,83 @@ public sealed class Parser
         }
 
         return new TableReference(name, alias);
+    }
+
+    /// <summary>
+    /// Parse a windowing table-valued function:
+    /// <c>TABLE ( {TUMBLE|HOP} ( TABLE &lt;name&gt;, DESCRIPTOR(&lt;col&gt;), &lt;interval&gt;[, &lt;interval&gt;] ) ) [AS alias]</c>.
+    /// TUMBLE takes one size INTERVAL; HOP takes a slide then a size INTERVAL.
+    /// <c>TUMBLE</c> / <c>HOP</c> / <c>DESCRIPTOR</c> are contextual (matched by
+    /// identifier text), so they stay usable as ordinary names.
+    /// </summary>
+    private FromClause ParseWindowTableFunction()
+    {
+        Expect(TokenKind.Table);
+        Expect(TokenKind.LParen);
+
+        var fnTok = Peek();
+        var kind = ExpectIdentifier("windowing function (TUMBLE or HOP)");
+        if (kind is not ("tumble" or "hop"))
+        {
+            throw Error(fnTok, $"unsupported windowing table function '{kind}' (expected TUMBLE or HOP)");
+        }
+
+        Expect(TokenKind.LParen);
+
+        // Data argument: `TABLE <name>`. (A `(SELECT …)` subquery source is not
+        // yet supported — wrap the windowing TVF over a base table.)
+        if (Peek().Kind != TokenKind.Table)
+        {
+            throw Error(Peek(), $"{kind.ToUpperInvariant()} data argument must be `TABLE <name>`");
+        }
+
+        Advance();
+        var srcName = ExpectIdentifier("table name");
+        FromClause source = new TableReference(srcName, null);
+        Expect(TokenKind.Comma);
+
+        // DESCRIPTOR(timecol).
+        if (!IsContextualKeyword("descriptor"))
+        {
+            throw Error(Peek(), $"{kind.ToUpperInvariant()} requires DESCRIPTOR(<time column>) as its second argument");
+        }
+
+        Advance();
+        Expect(TokenKind.LParen);
+        var timeColumn = ExpectIdentifier("descriptor time column");
+        Expect(TokenKind.RParen);
+        Expect(TokenKind.Comma);
+
+        // Size args: one (TUMBLE) or two (HOP slide, size) INTERVAL expressions.
+        var args = new List<Expression> { ParseExpression() };
+        while (Peek().Kind == TokenKind.Comma)
+        {
+            Advance();
+            args.Add(ParseExpression());
+        }
+
+        var expected = kind == "hop" ? 2 : 1;
+        if (args.Count != expected)
+        {
+            throw Error(fnTok,
+                $"{kind.ToUpperInvariant()} takes {expected} INTERVAL argument(s) (got {args.Count})");
+        }
+
+        Expect(TokenKind.RParen); // close windowing function
+        Expect(TokenKind.RParen); // close TABLE(...)
+
+        string? alias = null;
+        if (Peek().Kind == TokenKind.As)
+        {
+            Advance();
+            alias = ExpectIdentifier("table alias");
+        }
+        else if (Peek().Kind == TokenKind.Identifier)
+        {
+            alias = Advance().Text;
+        }
+
+        return new WindowTableFunction(kind, source, timeColumn, args, alias);
     }
 
     // ---------------- Pratt expression parser ----------------

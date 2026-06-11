@@ -161,6 +161,25 @@ public sealed record TableReference(string TableName, string? Alias) : FromClaus
 public sealed record DerivedTableReference(SqlQuery Query, string Alias) : FromClause;
 
 /// <summary>
+/// A windowing table-valued function in <c>FROM</c> position —
+/// <c>TABLE(TUMBLE(TABLE src, DESCRIPTOR(timecol), size))</c> or
+/// <c>TABLE(HOP(TABLE src, DESCRIPTOR(timecol), slide, size))</c> (Feldera /
+/// Flink streaming-windowing TVF syntax). The resolver lowers it to a window
+/// assignment over <see cref="Source"/> that exposes two extra columns,
+/// <c>window_start</c> and <c>window_end</c>: TUMBLE adds them with a single
+/// projection (each row joins one non-overlapping window); HOP fans each row out
+/// to <c>size / slide</c> overlapping windows via a <c>UNION ALL</c> of shifted
+/// projections. <see cref="SizeArgs"/> is <c>[size]</c> for TUMBLE and
+/// <c>[slide, size]</c> for HOP (each a constant day-time <c>INTERVAL</c>).
+/// </summary>
+public sealed record WindowTableFunction(
+    string Kind,
+    FromClause Source,
+    string TimeColumn,
+    IReadOnlyList<Expression> SizeArgs,
+    string? Alias) : FromClause;
+
+/// <summary>
 /// A join. Exactly one of <see cref="OnCondition"/> (an <c>ON</c> predicate)
 /// or <see cref="UsingColumns"/> (a <c>USING (c1, …)</c> column list) is set;
 /// the parser never produces both. <c>USING</c> is resolved into an equi-join

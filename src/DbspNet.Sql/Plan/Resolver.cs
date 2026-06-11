@@ -1862,9 +1862,136 @@ public sealed class Resolver
         TableReference tr => ResolveTableReference(tr, cteScope),
         JoinClause jc => ResolveJoin(jc, cteScope),
         DerivedTableReference dt => ResolveDerivedTable(dt, cteScope, outerSchema),
+        WindowTableFunction wtf => ResolveWindowTableFunction(wtf, cteScope, outerSchema),
         PreResolvedRelation pr => pr.Plan,
         _ => throw new ResolveException($"unsupported FROM clause: {from.GetType().Name}"),
     };
+
+    /// <summary>
+    /// Resolve a streaming windowing TVF (<c>TABLE(TUMBLE|HOP(…))</c>) to a window
+    /// assignment over its source, exposing <c>window_start</c> / <c>window_end</c>
+    /// columns. It is pure lowering onto existing plan nodes — no new operator:
+    /// <list type="bullet">
+    /// <item>TUMBLE: a single <see cref="ProjectPlan"/> appending
+    /// <c>window_start = tumble_start(t, size)</c> and <c>window_end = window_start
+    /// + size</c> (each row joins exactly one non-overlapping window).</item>
+    /// <item>HOP: a <see cref="UnionAllPlan"/> of <c>size / slide</c> shifted
+    /// projections — branch <c>k</c> assigns <c>window_start = tumble_start(t,
+    /// slide) − k·slide</c> — so each row fans out to every overlapping window it
+    /// belongs to.</item>
+    /// </list>
+    /// </summary>
+    /// <remarks>
+    /// The window-start expression is monotone in the time column, but HOP's
+    /// per-branch <c>− k·slide</c> shift is not currently followed by the
+    /// monotonicity analyzer, so a HOP <c>GROUP BY window_start</c> is not GC'd
+    /// (correct, but unbounded state under LATENESS). A sound HOP frontier transform
+    /// (<c>v → v − size</c>, not the structural <c>bucket_floor − k·slide</c> which
+    /// over-drops by up to a slide) is a deferred follow-on. TUMBLE's window start
+    /// is plain <c>tumble_start</c>, which the analyzer GCs as usual.
+    /// </remarks>
+    private LogicalPlan ResolveWindowTableFunction(
+        WindowTableFunction wtf,
+        IReadOnlyDictionary<string, CteRef> cteScope,
+        Schema? outerSchema)
+    {
+        var source = ResolveFrom(wtf.Source, cteScope, outerSchema);
+
+        var timeIdx = source.Schema.Resolve(null, wtf.TimeColumn);
+        var timeType = source.Schema[timeIdx].Type;
+        if (timeType is not (SqlTimestampType or SqlDateType))
+        {
+            throw new ResolveException(
+                $"{wtf.Kind.ToUpperInvariant()} time column '{wtf.TimeColumn}' must be TIMESTAMP or DATE, " +
+                $"got {timeType.Display}");
+        }
+
+        var sizeLit = ResolveWindowIntervalArg(wtf.SizeArgs[^1], source.Schema, wtf.Kind);
+        var slideLit = wtf.Kind == "hop"
+            ? ResolveWindowIntervalArg(wtf.SizeArgs[0], source.Schema, wtf.Kind)
+            : sizeLit;
+
+        var sizeMicros = ((Interval)sizeLit.Value!).Micros;
+        var slideMicros = ((Interval)slideLit.Value!).Micros;
+        if (sizeMicros % slideMicros != 0)
+        {
+            throw new ResolveException(
+                $"{wtf.Kind.ToUpperInvariant()} window size must be a whole multiple of the slide");
+        }
+
+        var windows = (int)(sizeMicros / slideMicros); // 1 for TUMBLE
+        var branches = new List<LogicalPlan>(windows);
+        for (var k = 0; k < windows; k++)
+        {
+            branches.Add(BuildWindowBranch(
+                source, wtf.Alias, timeIdx, timeType, slideLit, sizeLit, slideMicros, k));
+        }
+
+        return windows == 1 ? branches[0] : new UnionAllPlan(branches, branches[0].Schema);
+    }
+
+    private static ResolvedLiteral ResolveWindowIntervalArg(Expression expr, Schema schema, string kind)
+    {
+        var resolved = ResolveScalarExpression(expr, schema);
+        if (resolved is not ResolvedLiteral { Value: Interval iv } lit || resolved.Type is not SqlIntervalType)
+        {
+            throw new ResolveException(
+                $"{kind.ToUpperInvariant()} window arguments must be constant INTERVAL literals");
+        }
+
+        if (iv.Months != 0)
+        {
+            throw new ResolveException(
+                $"{kind.ToUpperInvariant()} window arguments must be day-time INTERVALs (no month/year)");
+        }
+
+        if (iv.Micros <= 0)
+        {
+            throw new ResolveException(
+                $"{kind.ToUpperInvariant()} window arguments must be positive INTERVALs");
+        }
+
+        return lit;
+    }
+
+    /// <summary>Build one window-assignment branch: the source rows re-qualified by
+    /// the TVF alias, widened with <c>window_start</c> / <c>window_end</c>. Branch
+    /// <paramref name="k"/> shifts the start back by <c>k·slide</c> (0 for TUMBLE /
+    /// HOP's leading window).</summary>
+    private static LogicalPlan BuildWindowBranch(
+        LogicalPlan source, string? alias, int timeIdx, SqlType timeType,
+        ResolvedLiteral slideLit, ResolvedLiteral sizeLit, long slideMicros, int k)
+    {
+        var startBase = ScalarFunctionRegistry.Resolve(
+            "tumble_start",
+            new ResolvedExpression[] { new ResolvedColumn(timeIdx, timeType), slideLit });
+
+        ResolvedExpression windowStart = startBase;
+        if (k > 0)
+        {
+            var kSlide = slideLit with { Value = new Interval(0, (long)k * slideMicros) };
+            windowStart = new ResolvedBinary(BinaryOperator.Subtract, startBase, kSlide, timeType);
+        }
+
+        var windowEnd = new ResolvedBinary(BinaryOperator.Add, windowStart, sizeLit, timeType);
+
+        var cols = new List<SchemaColumn>(source.Schema.Count + 2);
+        var projections = new List<ProjectionItem>(source.Schema.Count + 2);
+        for (var i = 0; i < source.Schema.Count; i++)
+        {
+            var c = source.Schema[i];
+            var qualifier = alias ?? c.Qualifier;
+            cols.Add(new SchemaColumn(c.Name, c.Type, qualifier));
+            projections.Add(new ProjectionItem(new ResolvedColumn(i, c.Type), c.Name, qualifier));
+        }
+
+        cols.Add(new SchemaColumn("window_start", timeType, alias));
+        cols.Add(new SchemaColumn("window_end", timeType, alias));
+        projections.Add(new ProjectionItem(windowStart, "window_start", alias));
+        projections.Add(new ProjectionItem(windowEnd, "window_end", alias));
+
+        return new ProjectPlan(source, projections, new Schema(cols));
+    }
 
     /// <summary>
     /// Resolve a subquery in <c>FROM</c> position: inline the subquery's
