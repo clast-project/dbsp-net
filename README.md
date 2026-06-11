@@ -66,7 +66,8 @@ plan lives in `research/dbsp/performance_test.md`). Both systems run the
 same SQL over in-process generated data:
 
 ```
-# Nexmark throughput (q0–q4, q9): events, batch size, runs, [workers]
+# Nexmark throughput (q0–q9, q12, q15–q22; q11 session-windows still unsupported):
+# events, batch size, runs, [workers]
 dotnet run --project src/DbspNet.Benchmarks -c Release -- nexmark 1000000 10000 3 8
 
 # Fraud detection rolling-window features: history txns, customers, batch, [workers]
@@ -190,6 +191,21 @@ grows and the GC frontier climbs.
   `OVER (PARTITION BY p ORDER BY o)` are also supported (positional, via
   `PartitionedOffsetOp`; FIRST/LAST span the whole partition). `ROWS`/`GROUPS`
   frames and `FOLLOWING` bounds are deferred.
+- Event-time windowing (TUMBLE / HOP). Tumbling windows via the
+  `GROUP BY TUMBLE(t, INTERVAL '…' …)` form with the `TUMBLE_START` / `TUMBLE_END`
+  projection functions, and sliding (and tumbling) windows via the
+  `TABLE(HOP(TABLE t, DESCRIPTOR(timecol), slide, size))` /
+  `TABLE(TUMBLE(…))` table-valued functions, which expose `window_start` /
+  `window_end` columns. Both are **pure lowering — no new operator**: window
+  assignment is an internal monotone bucket-floor scalar (`tumble_start`, the
+  arbitrary-interval generalisation of `DATE_TRUNC`), so a tumbling window is a
+  `GROUP BY` over that expression and a HOP fans each row out to its `size/slide`
+  overlapping windows as a `UNION ALL` of shifted projections. A tumbling
+  `GROUP BY` on the window start is GC-able under `LATENESS` / clock watermarks
+  exactly like `date_trunc` (a window is dropped only once the watermark passes
+  its end); these queries compile on the typed / data-parallel path. Unlocks
+  Nexmark q5 / q7 / q8 / q12. **Deferred**: SESSION (gap-merged) windows; HOP-window
+  GC (correct but unbounded state today); a `(SELECT …)` subquery as a TVF source.
 - Scalar subqueries (uncorrelated, exactly one column) in `WHERE`, `SELECT`,
   and `HAVING` expressions. Empty subquery → `NULL`; changing subquery
   value correctly retracts and re-emits outer rows.
@@ -395,11 +411,12 @@ beyond "Feldera is much bigger":
   the streaming-features list above).
 - `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
   polymorphic "unknown" of PostgreSQL.
-- `INTERVAL` (core) and date/time arithmetic are supported; deferred pieces
-  are `INTERVAL` *stored columns* through the Arrow codec (intervals are
-  intermediate-only today), `interval × decimal`, and typed-fast-path temporal
-  arithmetic (it falls back to the structural compiler, as temporal
-  comparisons do).
+- `INTERVAL` (core) and date/time arithmetic are supported on both the
+  structural and the typed fast path (temporal±interval, interval±interval,
+  interval×/÷numeric, temporal−temporal, and `CAST(string ↔ INTERVAL)` all lower
+  typed, so a temporal-arithmetic query keeps its data-parallel form); deferred
+  pieces are `INTERVAL` *stored columns* through the Arrow codec (intervals are
+  intermediate-only today) and `interval × decimal`.
 
 ## License
 
