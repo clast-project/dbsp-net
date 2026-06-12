@@ -50,8 +50,9 @@ internal static class FraudBenchmark
             SUM(t.amount)   OVER (PARTITION BY t.cust_id ORDER BY t.ts RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW) AS sum_30d
           FROM transactions t JOIN customers c ON t.cust_id = c.id";
 
-    // The join that feeds the window features — the parallelizable slice of the
-    // pipeline (the windowed aggregates themselves have no typed/parallel path).
+    // The join that feeds the window features — kept as a fallback parallel
+    // measurement for builds that can't parallelize the full feature view (the
+    // windowed aggregates now DO take the typed/parallel path; see RunParallelSection).
     private const string JoinSliceSql =
         @"SELECT t.txn_id, t.cust_id, c.zip
           FROM transactions t JOIN customers c ON t.cust_id = c.id";

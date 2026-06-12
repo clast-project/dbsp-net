@@ -5,8 +5,13 @@
 #
 # Both sides run the same query set over in-process-generated Nexmark events
 # (the standard 1:3:46 Person/Auction/Bid stream), cold (every event new), with
-# matched event count, micro-batch size, and core count. Only the queries
-# DbspNet implements are compared: q0 q1 q2 q3 q4 q9.
+# matched event count, micro-batch size, and core count. The default query set is
+# everything DbspNet implements that Feldera's bench also carries:
+#   q0 q1 q2 q3 q4 q5 q7 q8 q9 q12 q15 q16 q17 q18 q19 q20 q22
+# (DbspNet runs its whole suite regardless; QUERIES selects which queries Feldera
+# runs and which rows the merged table shows.) If a particular Feldera build does
+# not implement one of these, the Feldera run is reported as failed and you should
+# narrow the set with --queries — the DbspNet numbers still print either way.
 #
 # Usage:
 #   scripts/compare-nexmark.sh [--events=N] [--cores=C] [--batch=B] [--runs=R]
@@ -53,7 +58,7 @@ CORES="${CORES:-$HOSTCORES}"
 BATCH="${BATCH:-10000}"
 RUNS="${RUNS:-3}"
 GENERATORS="${GENERATORS:-$CORES}"
-QUERIES="${QUERIES:-q0 q1 q2 q3 q4 q9}"
+QUERIES="${QUERIES:-q0 q1 q2 q3 q4 q5 q7 q8 q9 q12 q15 q16 q17 q18 q19 q20 q22}"
 FELDERA_DIR="${FELDERA_DIR:-/Users/curt/Documents/GitHub/feldera}"
 DBSP_ONLY=0
 
@@ -116,14 +121,21 @@ if [ "$DBSP_ONLY" -eq 0 ]; then
   # timer (engine-only), matching DbspNet's pre-generated harness. Requires the
   # local patch to crates/nexmark/benches/nexmark/main.rs; without it the var is
   # ignored and the run is the upstream generation+compute pipeline.
-  ( cd "$FELDERA_DIR" && NEXMARK_PREGEN=1 cargo bench -p dbsp_nexmark --bench nexmark -- \
+  #
+  # Non-fatal: if cargo errors (e.g. this Feldera build doesn't implement one of
+  # the requested queries), we still fall through to the merge so the DbspNet
+  # numbers print. The `if !` keeps `set -e` from aborting the script.
+  if ! ( cd "$FELDERA_DIR" && NEXMARK_PREGEN=1 cargo bench -p dbsp_nexmark --bench nexmark -- \
       --max-events="$EVENTS" \
       --cpu-cores "$CORES" \
       --input-batch-size "$BATCH" \
       --num-event-generators "$GENERATORS" \
       "${qargs[@]}" \
       --csv "$FELDERA_CSV" \
-      --no-progress )
+      --no-progress ); then
+    echo "!! Feldera bench failed — a requested --query may be unsupported by this"
+    echo "   Feldera build. Narrow with --queries=\"...\"; DbspNet numbers print below."
+  fi
   echo
 fi
 
