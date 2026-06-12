@@ -18,6 +18,23 @@ internal static class ComparisonBenchmarks
     public static int Run(string[] args)
     {
         var mode = args[0];
+
+        // `fraud-dump <outDir> [historyTxns] [customers]` writes the SAME generated
+        // customers/transactions the fraud benchmark loads, as headerless CSV, so a
+        // Feldera pipeline (scripts/feldera-fraud.sql) can ingest byte-identical
+        // data — the data-parity basis for the head-to-head. No markdown report.
+        if (mode == "fraud-dump")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("usage: fraud-dump <outDir> [historyTxns] [customers]");
+                return 2;
+            }
+
+            FraudBenchmark.DumpCsv(args[1], ArgInt(args, 2, 500_000), ArgInt(args, 3, 10_000));
+            return 0;
+        }
+
         var output = new StringBuilder();
         output.AppendLine("# DbspNet ↔ Feldera comparison benchmarks");
         output.AppendLine();

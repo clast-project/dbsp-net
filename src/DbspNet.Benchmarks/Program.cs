@@ -19,8 +19,9 @@ if (args.Length > 0 && args[0] == "profile")
 // Cross-system comparison sub-commands (Feldera-compatible workloads).
 //   dotnet run -- nexmark    [totalEvents] [batchSize] [runs]
 //   dotnet run -- fraud      [historyTxns] [customers] [batchSize]
+//   dotnet run -- fraud-dump <outDir> [historyTxns] [customers]   (CSV for Feldera)
 //   dotnet run -- comparison                       (runs both with defaults)
-if (args.Length > 0 && args[0] is "nexmark" or "fraud" or "comparison")
+if (args.Length > 0 && args[0] is "nexmark" or "fraud" or "fraud-dump" or "comparison")
 {
     return DbspNet.Benchmarks.ComparisonBenchmarks.Run(args);
 }

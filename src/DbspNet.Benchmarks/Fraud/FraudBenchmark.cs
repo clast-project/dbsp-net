@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Optimizer;
@@ -390,6 +391,79 @@ internal static class FraudBenchmark
         }
 
         return rows;
+    }
+
+    /// <summary>
+    /// Dump the SAME generated <c>customers</c> / <c>transactions</c> the benchmark
+    /// loads (deterministic, seed 7) as headerless CSV in table-column order, so a
+    /// Feldera pipeline (<c>scripts/feldera-fraud.sql</c>) ingests byte-identical
+    /// data. Timestamps are written as <c>yyyy-MM-dd HH:mm:ss.ffffff</c> (UTC),
+    /// lossless from the underlying microseconds.
+    /// </summary>
+    public static void DumpCsv(string outDir, int historyTxns, int customers)
+    {
+        Directory.CreateDirectory(outDir);
+        var custRows = BuildCustomers(customers);
+        var txnRows = BuildTransactions(historyTxns, customers, seed: 7);
+
+        var custPath = Path.Combine(outDir, "customers.csv");
+        using (var w = new StreamWriter(custPath, append: false))
+        {
+            foreach (var (values, _) in custRows)
+            {
+                w.Write(Csv(values[0]));         // id
+                w.Write(',');
+                w.Write(Csv(values[1]));         // name
+                w.Write(',');
+                w.Write(Csv(values[2]));         // zip
+                w.Write('\n');
+            }
+        }
+
+        var txnPath = Path.Combine(outDir, "transactions.csv");
+        using (var w = new StreamWriter(txnPath, append: false))
+        {
+            foreach (var (values, _) in txnRows)
+            {
+                w.Write(Csv(values[0]));         // txn_id
+                w.Write(',');
+                w.Write(Csv(values[1]));         // cust_id
+                w.Write(',');
+                w.Write(Csv(values[2]));         // amount
+                w.Write(',');
+                w.Write(FormatTs((Timestamp)values[3]!));
+                w.Write('\n');
+            }
+        }
+
+        Console.WriteLine($"Wrote {custRows.Count:N0} customers     -> {custPath}");
+        Console.WriteLine($"Wrote {txnRows.Count:N0} transactions  -> {txnPath}");
+        Console.WriteLine("Headerless CSV, table-column order:");
+        Console.WriteLine("  customers:    id,name,zip");
+        Console.WriteLine("  transactions: txn_id,cust_id,amount,ts   (ts = 'yyyy-MM-dd HH:mm:ss.ffffff' UTC)");
+        Console.WriteLine("Load both into the matching Feldera tables (scripts/feldera-fraud.sql).");
+    }
+
+    /// <summary>Microseconds-since-epoch <see cref="Timestamp"/> as a Feldera-/
+    /// Calcite-parseable TIMESTAMP literal (lossless to microsecond precision).</summary>
+    private static string FormatTs(Timestamp ts) =>
+        DateTime.UnixEpoch.AddTicks(ts.Microseconds * 10)
+            .ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture);
+
+    /// <summary>Render one field invariantly, quote-escaping only if it contains a
+    /// delimiter / quote / newline (the generated values never do, but stay safe).</summary>
+    private static string Csv(object? v)
+    {
+        var s = v switch
+        {
+            null => string.Empty,
+            IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+            _ => v.ToString() ?? string.Empty,
+        };
+
+        return s.IndexOfAny([',', '"', '\n', '\r']) >= 0
+            ? "\"" + s.Replace("\"", "\"\"") + "\""
+            : s;
     }
 
     private sealed class StepState(CompiledQuery query, long nextTxnId, long nextTs)

@@ -27,11 +27,15 @@
 --                    amount = rand(1..100000), ts = 1_700_000_000_000_000us + i*step,
 --                    where step = (90 days) / M  (txns spread evenly across ~90 days,
 --                    so the 1d / 7d / 30d frames genuinely differ).
---    Feed Feldera the *same* rows. There is no exporter yet, so either:
---      (a) add a one-off CSV dump to the DbspNet fraud generator and ingest it via a
---          Feldera file/HTTP connector, or
---      (b) replicate the seeded generation on the Feldera side.
---    (a) is the reliable path — identical bytes beat re-deriving an RNG.
+--    Feed Feldera the *same* rows. The DbspNet harness can dump exactly the rows it
+--    loads, as headerless CSV in table-column order:
+--      dotnet run -c Release --project src/DbspNet.Benchmarks -- \
+--          fraud-dump <outDir> <historyTxns> <customers>
+--    → <outDir>/customers.csv     (id,name,zip)
+--      <outDir>/transactions.csv  (txn_id,cust_id,amount,ts ; ts = 'yyyy-MM-dd HH:mm:ss.ffffff' UTC)
+--    Use the SAME <historyTxns> <customers> you pass to `fraud` so the benchmarked
+--    and ingested data match. Load the two files into the tables below via the CSV
+--    connector appropriate to your Feldera deployment.
 --
 -- 2. Match the metric. DbspNet reports two numbers (docs/benchmarks-fraud.md):
 --      * per-event incremental latency — load the history, then time ONE
