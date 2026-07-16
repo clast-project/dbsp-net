@@ -156,9 +156,45 @@ DbspNet has no ROW/STRUCT type — `skipped.md:569` marks ARRAY/MAP/ROW **[P2]**
 plus an Arrow nested-type mapping, for exactly one source declaration and one consuming
 model. Narrow blast radius, deep implementation.
 
-### 3. Multi-key window `ORDER BY` — BLOCKING, bounded
+### 3. Multi-key window `ORDER BY` — DONE
 
-`skipped.md:479` marks this **[P3]**, but it sits on the workload's critical path.
+Shipped. Scope turned out to be a third of what this entry first implied, for two
+reasons found by reading the code rather than the docs:
+
+- **The rank family was already multi-key.** `PartitionedTopKPlan.SortKeys` is a list,
+  the resolver populates every `OVER` term with no arity check, and `PartitionedTopKOp`
+  takes an opaque `IComparer<TRow>`. `financials`' seven-key `ROW_NUMBER` already
+  resolved. Multi-key only opts out of the §22 narrowing optimization (perf, not
+  correctness).
+- **The benchmark needs no multi-key window *aggregates*.** Its aggregate windows are
+  whole-partition (`MAX(ts) OVER (PARTITION BY k)`) or running on one key. Bounded
+  RANGE is inherently single-scalar-key anyway — `FrameFor` does `v - _preceding.Value`
+  on a `long` — so that restriction stays, now with an accurate error message.
+
+So the work was the **offset family only**: `WindowOffsetPlan.OrderKey` → `OrderKeys`,
+and the three consumers (structural, typed, batch oracle) that fed 1-element arrays to
+an already-N-key `SortKeyComparer`. The single rejection had been sitting in
+`BuildWindowGroup`'s prologue above the `if (isOffset)` branch, catching a family that
+didn't need catching.
+
+Also fixed here: `TryMatchRankFilter` now accepts `rank = 1` (`financials`' spelling).
+Only `= 1` — ranks start at 1 so `= 1` ≡ `<= 1`, but `= k` for k > 1 selects a single
+rank, which TOP-K cannot express, and must not be read as `<= k`.
+
+**Testing note worth keeping.** `PlanToCircuit.Compile` tries typed first, so any
+window test carrying a `PARTITION BY` exercises the *typed* path only; the structural
+path is reached only with no `PARTITION BY`. Mutation testing caught this — a
+first-key-only mutation of the structural path passed the entire suite until a
+no-`PARTITION BY` case was added. Likewise, a multi-key test whose tie-break runs ASC
+can pass even when the extra keys are dropped, because the full-row tiebreak
+(`StructuralRowComparer`) reproduces ASC order by coincidence; the DESC tie-break case
+is what actually pins the behaviour. Both traps are live for anyone extending this.
+
+---
+
+*Original entry, for context:*
+
+`skipped.md` marked this **[P3]**, but it sits on the workload's critical path.
 
 The SCD Type 2 end-dating idiom appears in 6 silver models (`accounts:42`,
 `customers:42`, `companies:22`, `securities:22`, `financials:34`, `trades_history:25`):
@@ -286,13 +322,14 @@ a standalone docs commit before implementation started; recorded here because th
 |---|---|---|---|
 | 1 | Rank projected into output | 5 (all analytics) | Architectural — design decision |
 | 2 | Nested `ROW` structs | 2 | Architectural — type system |
-| 3 | Multi-key window `ORDER BY` | 7 | Bounded — core idiom |
+| 3 | Multi-key window `ORDER BY` | 7 | **DONE** |
 | 4 | OUTER JOIN + non-equi conjunct | 2 | Bounded |
 | 5 | `STDDEV` | 5 | Bounded |
 | 6 | Scalar/type tail | ~10 | Trivial, partly dodgeable |
 
 Items 1–5 are the critical path. Item 1 gates 5 of 50 models and is a design decision
-rather than a coding task; the rest are ordinary implementation work.
+rather than a coding task; the rest are ordinary implementation work. Agreed order:
+3 → 4 → 5 → 2, with 1 to be decided.
 
 Input/output adapter work is **not** on the critical path and should follow, not lead —
 the SQL surface is what determines whether the benchmark can run at all. See the

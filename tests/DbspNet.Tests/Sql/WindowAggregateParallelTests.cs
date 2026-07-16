@@ -273,6 +273,35 @@ public class WindowAggregateParallelTests
     [InlineData(1)]
     [InlineData(2)]
     [InlineData(4)]
+    [InlineData(8)]
+    public void LagLead_MultiKeyOrderBy_MatchesSingle(int workers) =>
+        AssertParallelMatchesSingle(
+            ["CREATE TABLE t (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)"],
+            // Mixed-direction multi-key ORDER BY — the SCD2 end-dating shape. This is
+            // the case that drives the reflected BuildPartitionedOffset arity: a
+            // signature/argument-array mismatch there fails at runtime, not at build.
+            "SELECT g, ts, v, " +
+            "LAG(v) OVER (PARTITION BY g ORDER BY ts DESC, v ASC) AS prev, " +
+            "LEAD(v) OVER (PARTITION BY g ORDER BY ts DESC, v ASC) AS nxt FROM t",
+            workers,
+            tbl =>
+            {
+                tbl("t").Insert(1, 1, 10);
+                tbl("t").Insert(1, 2, 20);
+                tbl("t").Insert(1, 2, 15);   // ties on ts — the second key orders these
+                tbl("t").Insert(1, 3, 30);
+                tbl("t").Insert(2, 1, 5);
+            },
+            tbl =>
+            {
+                tbl("t").Insert(1, 2, 17);   // lands between the tied rows
+                tbl("t").Delete(1, 2, 20);
+            });
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
     public void LagWithOffsetAndDefault_MatchesSingle(int workers) =>
         AssertParallelMatchesSingle(
             ["CREATE TABLE t (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)"],

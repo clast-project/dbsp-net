@@ -1057,11 +1057,17 @@ public sealed class Resolver
     }
 
     /// <summary>
-    /// Match a rank-filter conjunct <c>rank &lt;= k</c> / <c>rank &lt; k</c> (or
-    /// the reversed <c>k &gt;= rank</c> / <c>k &gt; rank</c>) where <c>rank</c> is
-    /// a column reference to <paramref name="rankAlias"/> (optionally qualified by
-    /// the derived alias) and <c>k</c> is an integer literal. Yields the TOP-K
-    /// <paramref name="limit"/> (<c>&lt; k</c> ⇒ <c>k − 1</c>).
+    /// Match a rank-filter conjunct <c>rank &lt;= k</c> / <c>rank &lt; k</c> / <c>rank = 1</c>
+    /// (or the reversed <c>k &gt;= rank</c> / <c>k &gt; rank</c> / <c>1 = rank</c>) where
+    /// <c>rank</c> is a column reference to <paramref name="rankAlias"/> (optionally
+    /// qualified by the derived alias) and <c>k</c> is an integer literal. Yields the
+    /// TOP-K <paramref name="limit"/> (<c>&lt; k</c> ⇒ <c>k − 1</c>).
+    ///
+    /// Equality matches only at <c>k = 1</c>. Ranks start at 1, so <c>rank = 1</c> is
+    /// exactly <c>rank &lt;= 1</c> (true for RANK/DENSE_RANK under ties as well). For
+    /// <c>k &gt; 1</c> the two diverge — <c>rank = 3</c> selects the third rank alone,
+    /// which TOP-K cannot express — so those fall through unmatched and are reported
+    /// as an unsupported rank use.
     /// </summary>
     private static bool TryMatchRankFilter(Expression c, string rankAlias, string dtAlias, out long limit)
     {
@@ -1093,6 +1099,9 @@ public sealed class Resolver
                 return true;
             case BinaryOperator.Less:
                 limit = k - 1;
+                return true;
+            case BinaryOperator.Equal when k == 1:
+                limit = 1;
                 return true;
             default:
                 return false;
@@ -1369,17 +1378,13 @@ public sealed class Resolver
             partitionKeys.Add(ResolveScalarExpression(p, baseSchema));
         }
 
-        // ORDER BY (a single key in v1).
-        SortKey? orderKey = null;
-        if (firstWin.Over.OrderBy.Count > 0)
+        // ORDER BY. The offset family (LAG / LEAD / FIRST_VALUE / LAST_VALUE) takes
+        // any number of keys — it only ever *compares* rows. Window aggregates are
+        // held to one key by the aggregate branch below, because a bounded RANGE
+        // frame does arithmetic (`value - preceding`) on a single scalar.
+        var orderKeys = new List<SortKey>(firstWin.Over.OrderBy.Count);
+        foreach (var item in firstWin.Over.OrderBy)
         {
-            if (firstWin.Over.OrderBy.Count > 1)
-            {
-                throw new ResolveException(
-                    "a window function supports a single ORDER BY key in v1");
-            }
-
-            var item = firstWin.Over.OrderBy[0];
             var resolved = ResolveScalarExpression(item.Expression, baseSchema);
             var descending = item.Direction == SortDirection.Descending;
             var nullsFirst = item.Nulls switch
@@ -1388,7 +1393,7 @@ public sealed class Resolver
                 NullOrdering.NullsLast => false,
                 _ => descending,
             };
-            orderKey = new SortKey(resolved, descending, nullsFirst);
+            orderKeys.Add(new SortKey(resolved, descending, nullsFirst));
         }
 
         var inputSchema = inputPlan.Schema;
@@ -1396,7 +1401,7 @@ public sealed class Resolver
 
         if (isOffset)
         {
-            if (orderKey is null)
+            if (orderKeys.Count == 0)
             {
                 throw new ResolveException("LAG / LEAD / FIRST_VALUE / LAST_VALUE requires an ORDER BY");
             }
@@ -1423,13 +1428,23 @@ public sealed class Resolver
             }
 
             var offsetSchema = new Schema([.. inputSchema.Columns, .. resultCols]);
-            return new WindowOffsetPlan(inputPlan, partitionKeys, orderKey, functions, offsetSchema);
+            return new WindowOffsetPlan(inputPlan, partitionKeys, orderKeys, functions, offsetSchema);
         }
         else
         {
             WindowFrameBounds? frame = null;
-            if (orderKey is not null)
+            SortKey? orderKey = null;
+            if (orderKeys.Count > 0)
             {
+                if (orderKeys.Count > 1)
+                {
+                    throw new ResolveException(
+                        "a window aggregate supports a single ORDER BY key in v1 (a bounded RANGE " +
+                        "frame measures distance along one scalar key); LAG / LEAD / FIRST_VALUE / " +
+                        "LAST_VALUE accept multiple keys");
+                }
+
+                orderKey = orderKeys[0];
                 if (orderKey.Expression.Type is not (SqlIntegerType or SqlBigintType
                     or SqlDateType or SqlTimeType or SqlTimestampType))
                 {

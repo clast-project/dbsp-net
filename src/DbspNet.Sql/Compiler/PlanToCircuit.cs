@@ -1301,15 +1301,22 @@ public static class PlanToCircuit
             return new StructuralRow(values);
         }
 
-        // Total order: the ORDER BY key (any comparable type — LAG/LEAD is
-        // positional) then a full-row tiebreak so positions are deterministic.
-        var sortScalar = ExpressionCompiler.CompileScalar(plan.OrderKey.Expression);
-        var keys = new Func<StructuralRow, object?>[] { row => sortScalar(row) };
+        // Total order: the ORDER BY keys left to right (any comparable type —
+        // LAG/LEAD is positional) then a full-row tiebreak so positions are
+        // deterministic.
+        var keys = new Func<StructuralRow, object?>[plan.OrderKeys.Count];
+        var descending = new bool[plan.OrderKeys.Count];
+        var nullsFirst = new bool[plan.OrderKeys.Count];
+        for (var i = 0; i < plan.OrderKeys.Count; i++)
+        {
+            var sortScalar = ExpressionCompiler.CompileScalar(plan.OrderKeys[i].Expression);
+            keys[i] = row => sortScalar(row);
+            descending[i] = plan.OrderKeys[i].Descending;
+            nullsFirst[i] = plan.OrderKeys[i].NullsFirst;
+        }
+
         var order = new SortKeyComparer<StructuralRow>(
-            keys,
-            new[] { plan.OrderKey.Descending },
-            new[] { plan.OrderKey.NullsFirst },
-            StructuralRowComparer.Instance);
+            keys, descending, nullsFirst, StructuralRowComparer.Instance);
 
         var specs = new OffsetSpec<StructuralRow>[plan.Functions.Count];
         for (var i = 0; i < plan.Functions.Count; i++)

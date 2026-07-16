@@ -118,6 +118,52 @@ public class PartitionedTopKTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
+    public void RowNumber_EqualsOne(bool typed)
+    {
+        // rn = 1 ⇒ limit 1. Ranks start at 1, so `= 1` is exactly `<= 1`. This is the
+        // TPC-DI "latest row per key" spelling (SCD2 current-record selection).
+        var q = Compile(Emp,
+            "SELECT dept, sal FROM (SELECT dept, sal, ROW_NUMBER() OVER " +
+            "(PARTITION BY dept ORDER BY sal DESC) AS rn FROM emp) s WHERE rn = 1", typed);
+        q.Table("emp").Insert(1, 100);
+        q.Table("emp").Insert(1, 90);
+        q.Table("emp").Insert(2, 40);
+        q.Step();
+
+        Assert.Equal(2, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1, 100));
+        Assert.Equal(1, WeightOf(q.Current, 2, 40));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void RowNumber_ReversedEqualsOne(bool typed)
+    {
+        var q = Compile(Emp,
+            "SELECT dept, sal FROM (SELECT dept, sal, ROW_NUMBER() OVER " +
+            "(PARTITION BY dept ORDER BY sal DESC) AS rn FROM emp) s WHERE 1 = rn", typed);
+        q.Table("emp").Insert(1, 100);
+        q.Table("emp").Insert(1, 90);
+        q.Step();
+
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, 1, 100));
+    }
+
+    [Fact]
+    public void RowNumber_EqualsKGreaterThanOne_IsRejected()
+    {
+        // `rn = 3` selects the third rank alone, which TOP-K cannot express — only
+        // `= 1` collapses to a limit. Must not be silently read as `<= 3`.
+        Assert.ThrowsAny<ResolveException>(() => Compile(Emp,
+            "SELECT dept, sal FROM (SELECT dept, sal, ROW_NUMBER() OVER " +
+            "(PARTITION BY dept ORDER BY sal DESC) AS rn FROM emp) s WHERE rn = 3", false));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
     public void RowNumber_SelectStar_ExcludesRankColumn(bool typed)
     {
         // SELECT * over the windowed derived table yields only the data columns —

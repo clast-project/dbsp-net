@@ -23,11 +23,16 @@ public class LagLeadTests
 {
     private const string W = "CREATE TABLE w (g INT NOT NULL, ts INT NOT NULL, v INT NOT NULL)";
 
-    private static LogicalPlan ResolvePlan(string query)
+    /// <summary>A nullable sort key, for the NULLS FIRST/LAST ordering tests.</summary>
+    private const string WN = "CREATE TABLE wn (g INT NOT NULL, ts INT, v INT NOT NULL)";
+
+    private static LogicalPlan ResolvePlan(string query) => ResolvePlan(query, W);
+
+    private static LogicalPlan ResolvePlan(string query, string ddl)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
-        resolver.Resolve(Parser.ParseStatement(W));
+        resolver.Resolve(Parser.ParseStatement(ddl));
         return ((SelectPlan)resolver.Resolve(Parser.ParseStatement(query))).Query;
     }
 
@@ -38,6 +43,9 @@ public class LagLeadTests
     }
 
     private static CompiledQuery Compile(string query) => PlanToCircuit.Compile(ResolvePlan(query));
+
+    private static CompiledQuery CompileNullable(string query) =>
+        PlanToCircuit.Compile(ResolvePlan(query, WN));
 
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
         z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
@@ -61,6 +69,42 @@ public class LagLeadTests
         Assert.Equal(OffsetKind.Lead, wo.Functions[0].Kind);
         Assert.Equal(2, wo.Functions[0].Offset);
         Assert.Equal(0, wo.Functions[0].Default);
+    }
+
+    [Fact]
+    public void Resolve_MultiKeyOrderBy_KeepsEveryKeyAndDirection()
+    {
+        // The SCD2 end-dating shape: order by a timestamp descending, then
+        // tie-break on further keys. Each key keeps its own direction, and the
+        // PostgreSQL NULL default follows the direction (DESC ⇒ NULLS FIRST).
+        var wo = OffsetPlanOf(
+            "SELECT g, LAG(v) OVER (PARTITION BY g ORDER BY ts DESC, v ASC) AS p FROM w");
+        Assert.Equal(2, wo.OrderKeys.Count);
+        Assert.True(wo.OrderKeys[0].Descending);
+        Assert.True(wo.OrderKeys[0].NullsFirst);
+        Assert.False(wo.OrderKeys[1].Descending);
+        Assert.False(wo.OrderKeys[1].NullsFirst);
+    }
+
+    [Fact]
+    public void Resolve_MultiKeyOrderBy_ExplicitNullOrderingWins()
+    {
+        var wo = OffsetPlanOf(
+            "SELECT g, LAG(v) OVER (PARTITION BY g ORDER BY ts DESC NULLS LAST, v NULLS FIRST) AS p FROM w");
+        Assert.True(wo.OrderKeys[0].Descending);
+        Assert.False(wo.OrderKeys[0].NullsFirst);   // explicit NULLS LAST overrides the DESC default
+        Assert.False(wo.OrderKeys[1].Descending);
+        Assert.True(wo.OrderKeys[1].NullsFirst);
+    }
+
+    [Fact]
+    public void Rejects_MultiKeyOrderBy_OnWindowAggregate()
+    {
+        // The offset family takes N keys; a window aggregate does not, because a
+        // bounded RANGE frame measures distance along one scalar key.
+        var ex = Assert.Throws<ResolveException>(() =>
+            ResolvePlan("SELECT g, SUM(v) OVER (PARTITION BY g ORDER BY ts, v) AS s FROM w"));
+        Assert.Contains("single ORDER BY key", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -116,6 +160,110 @@ public class LagLeadTests
         Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 20));
         Assert.Equal(1, WeightOf(q.Current, 1, 2, 20, 30));
         Assert.Equal(1, WeightOf(q.Current, 1, 3, 30, null)); // last row: no successor
+    }
+
+    [Fact]
+    public void Lag_DescendingOrderBy()
+    {
+        var q = Compile("SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts DESC) AS prev FROM w");
+        q.Table("w").Insert(1, 1, 10);
+        q.Table("w").Insert(1, 2, 20);
+        q.Table("w").Insert(1, 3, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 30, null));  // first in DESC order
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 20, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 20));
+    }
+
+    [Fact]
+    public void Lag_MultiKeyOrderBy_MixedDirections()
+    {
+        // ORDER BY ts DESC, v ASC over a partition with a tie on ts. The second key
+        // is load-bearing: it decides the order of the two ts=2 rows, so a run that
+        // ignored it (or applied the wrong direction) lands different LAG values.
+        //
+        //   order: (3,30), (2,15), (2,20), (1,10)
+        var q = Compile("SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts DESC, v ASC) AS prev FROM w");
+        q.Table("w").Insert(1, 1, 10);
+        q.Table("w").Insert(1, 2, 20);
+        q.Table("w").Insert(1, 2, 15);
+        q.Table("w").Insert(1, 3, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 30, null));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 15, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 20, 15));
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 20));
+    }
+
+    [Fact]
+    public void Lag_MultiKeyOrderBy_SecondKeyDescendingFlipsTieOrder()
+    {
+        // Same data as above with the tie-break reversed — pins that direction is
+        // per-key, not global.
+        //
+        //   order: (3,30), (2,20), (2,15), (1,10)
+        var q = Compile("SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts DESC, v DESC) AS prev FROM w");
+        q.Table("w").Insert(1, 1, 10);
+        q.Table("w").Insert(1, 2, 20);
+        q.Table("w").Insert(1, 2, 15);
+        q.Table("w").Insert(1, 3, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 30, null));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 20, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 15, 20));
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 15));
+    }
+
+    [Fact]
+    public void Lag_MultiKeyOrderBy_NoPartitionBy_StructuralPath()
+    {
+        // No PARTITION BY ⇒ the typed compiler bails and this lowers on the
+        // structural path (TypedPlanCompiler.CompileWindowOffset returns null for
+        // PartitionKeys.Count == 0). Every other multi-key test here goes typed, so
+        // this is the only structural multi-key coverage — keep it.
+        //
+        //   order: (3,30), (2,20), (2,15), (1,10)
+        var q = Compile("SELECT g, ts, v, LAG(v) OVER (ORDER BY ts DESC, v DESC) AS prev FROM w");
+        q.Table("w").Insert(1, 1, 10);
+        q.Table("w").Insert(1, 2, 20);
+        q.Table("w").Insert(1, 2, 15);
+        q.Table("w").Insert(1, 3, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 30, null));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 20, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 15, 20));
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 10, 15));
+    }
+
+    [Fact]
+    public void Lag_NullOrderKey_DefaultsToNullsLastAscending()
+    {
+        // Nullable sort key, ASC ⇒ NULLS LAST (PostgreSQL default).
+        //   order: (1,20), (2,30), (null,10)
+        var q = CompileNullable(
+            "SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts) AS prev FROM wn");
+        q.Table("wn").Insert(1, null, 10);
+        q.Table("wn").Insert(1, 1, 20);
+        q.Table("wn").Insert(1, 2, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 20, null));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 30, 20));
+        Assert.Equal(1, WeightOf(q.Current, 1, null, 10, 30));
+    }
+
+    [Fact]
+    public void Lag_NullOrderKey_ExplicitNullsFirst()
+    {
+        //   order: (null,10), (1,20), (2,30)
+        var q = CompileNullable(
+            "SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts NULLS FIRST) AS prev FROM wn");
+        q.Table("wn").Insert(1, null, 10);
+        q.Table("wn").Insert(1, 1, 20);
+        q.Table("wn").Insert(1, 2, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, null, 10, null));
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 20, 10));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 30, 20));
     }
 
     [Fact]
@@ -198,6 +346,12 @@ public class LagLeadTests
     // Mixed families in one query — a window aggregate chained with an offset.
     [InlineData("SELECT g, ts, v, SUM(v) OVER (PARTITION BY g ORDER BY ts) AS s, " +
         "LAG(v) OVER (PARTITION BY g ORDER BY ts) AS p FROM w")]
+    // Multi-key ORDER BY with mixed directions. The generator draws ts from a small
+    // range, so ties on the leading key are common and the second key does real work.
+    [InlineData("SELECT g, ts, v, LAG(v) OVER (PARTITION BY g ORDER BY ts DESC, v ASC) AS p FROM w")]
+    [InlineData("SELECT g, ts, v, LEAD(v) OVER (PARTITION BY g ORDER BY ts, v DESC) AS n FROM w")]
+    [InlineData("SELECT g, ts, v, FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY ts DESC, v) AS fv, " +
+        "LAST_VALUE(v) OVER (PARTITION BY g ORDER BY ts DESC, v) AS lv FROM w")]
     public void IncrementalEqualsBatch_RandomInsertsAndDeletes(string query)
     {
         for (var seed = 0; seed < 16; seed++)

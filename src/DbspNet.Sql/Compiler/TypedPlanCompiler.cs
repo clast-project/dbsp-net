@@ -1419,9 +1419,19 @@ public static class TypedPlanCompiler
             partitionExtractors[i] = ex;
         }
 
-        // The ORDER BY key (required) — a total order with a full-row tiebreak makes
-        // the positional offsets deterministic. Any comparable key type is allowed.
-        if (BuildBoxedExtractor(plan.OrderKey.Expression, rowType) is not { } orderExtractor) return null;
+        // The ORDER BY keys (at least one) — a total order with a full-row tiebreak
+        // makes the positional offsets deterministic. Any comparable key type is
+        // allowed, and keys may mix ASC/DESC.
+        var sortExtractors = new Delegate[plan.OrderKeys.Count];
+        var sortDescending = new bool[plan.OrderKeys.Count];
+        var sortNullsFirst = new bool[plan.OrderKeys.Count];
+        for (var i = 0; i < plan.OrderKeys.Count; i++)
+        {
+            if (BuildBoxedExtractor(plan.OrderKeys[i].Expression, rowType) is not { } ex) return null;
+            sortExtractors[i] = ex;
+            sortDescending[i] = plan.OrderKeys[i].Descending;
+            sortNullsFirst[i] = plan.OrderKeys[i].NullsFirst;
+        }
 
         // Per-function value extractors (read from the positionally-selected row).
         var n = plan.Functions.Count;
@@ -1455,8 +1465,8 @@ public static class TypedPlanCompiler
         var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Input.Schema, rowType);
 
         var output = InvokePartitionedOffset(
-            ctx.Builder, rowType, outRowType, opInput, partitionExtractors, orderExtractor,
-            plan.OrderKey.Descending, plan.OrderKey.NullsFirst,
+            ctx.Builder, rowType, outRowType, opInput, partitionExtractors, sortExtractors,
+            sortDescending, sortNullsFirst,
             valueExtractors, kinds, offsets, defaults, widen, snapshotCodec);
 
         // Output partitioned by the PARTITION BY columns, carried through at their
@@ -3446,9 +3456,15 @@ public static class TypedPlanCompiler
             stream, PartitionOf, order, orderValueOf, preceding, descending, agg, Widen, null, codec, null);
     }
 
+    /// <remarks>
+    /// The argument array below is positional and name-matched only — it is NOT
+    /// checked at compile time. Any change to <see cref="BuildPartitionedOffset{TInRow,TOutRow}"/>'s
+    /// parameter list must be mirrored here in exact positional order, or this fails
+    /// at runtime rather than at build.
+    /// </remarks>
     private static object InvokePartitionedOffset(
         CircuitBuilder builder, Type inRowType, Type outRowType, object input,
-        Delegate[] partitionExtractors, Delegate orderExtractor, bool descending, bool nullsFirst,
+        Delegate[] partitionExtractors, Delegate[] sortExtractors, bool[] descending, bool[] nullsFirst,
         Delegate[] valueExtractors, OffsetKind[] kinds, long[] offsets, object?[] defaults,
         Delegate widen, object? snapshotCodec)
     {
@@ -3458,7 +3474,7 @@ public static class TypedPlanCompiler
         var closed = openMethod.MakeGenericMethod(inRowType, outRowType);
         return closed.Invoke(null, new object?[]
         {
-            builder, input, partitionExtractors, orderExtractor, descending, nullsFirst,
+            builder, input, partitionExtractors, sortExtractors, descending, nullsFirst,
             valueExtractors, kinds, offsets, defaults, widen, snapshotCodec,
         })!;
     }
@@ -3469,7 +3485,7 @@ public static class TypedPlanCompiler
     /// builder (TKey = StructuralRow over the boxed partition columns).</summary>
     private static object BuildPartitionedOffset<TInRow, TOutRow>(
         CircuitBuilder builder, object input, Delegate[] partitionExtractors,
-        Delegate orderExtractor, bool descending, bool nullsFirst,
+        Delegate[] sortExtractors, bool[] descending, bool[] nullsFirst,
         Delegate[] valueExtractors, OffsetKind[] kinds, long[] offsets, object?[] defaults,
         Delegate widen, object? snapshotCodec)
         where TInRow : notnull
@@ -3492,9 +3508,14 @@ public static class TypedPlanCompiler
             return new StructuralRow(values);
         }
 
-        var orderBoxed = (Func<TInRow, object?>)orderExtractor;
+        var sortKeys = new Func<TInRow, object?>[sortExtractors.Length];
+        for (var i = 0; i < sortExtractors.Length; i++)
+        {
+            sortKeys[i] = (Func<TInRow, object?>)sortExtractors[i];
+        }
+
         var order = new SortKeyComparer<TInRow>(
-            new[] { orderBoxed }, new[] { descending }, new[] { nullsFirst }, Comparer<TInRow>.Default);
+            sortKeys, descending, nullsFirst, Comparer<TInRow>.Default);
 
         var specs = new OffsetSpec<TInRow>[valueExtractors.Length];
         for (var s = 0; s < valueExtractors.Length; s++)

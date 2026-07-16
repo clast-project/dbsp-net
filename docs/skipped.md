@@ -487,8 +487,30 @@ reflect that shape, not a backlog.
     - *N/A by design* — a **spine** variant (recompute-and-diff, like `TopKOp`,
       holds no `Trace`). The **typed fast path** is possible but not pursued —
       structural compile is correct and pays only one boundary conversion.
-- **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`; multi-key
-  window `ORDER BY`; named `WINDOW` clauses.
+- **[DONE]** Multi-key window `ORDER BY` for the **offset family** (`LAG` / `LEAD` /
+  `FIRST_VALUE` / `LAST_VALUE`): any number of keys, mixed `ASC`/`DESC`, per-key
+  `NULLS FIRST`/`LAST`. The family only ever *compares* rows, so no single scalar
+  key is needed — `WindowOffsetPlan.OrderKeys` is a list and both compile paths
+  build an N-key `SortKeyComparer` (already N-key capable; it had been fed
+  1-element arrays). The rank family (`PartitionedTopKPlan.SortKeys`) was already
+  multi-key. Drives the TPC-DI SCD2 end-dating idiom
+  (`LAG(ts) OVER (PARTITION BY k ORDER BY ts DESC, …)`) — see
+  `ivm-bench-gap-analysis.md` §3.
+    - **[P2]** Multi-key `ORDER BY` for **window aggregates** stays rejected, and
+      mostly by design: a bounded `RANGE` frame measures distance along the key
+      (`value − preceding`), which is only defined for one scalar. The
+      whole-partition and running shapes need no arithmetic and *could* take N
+      keys, but nothing needs it yet.
+    - Multi-key `ORDER BY` opts a TOP-K out of the §22 narrow-key trace
+      optimization (`PlanToCircuit`/`TypedPlanCompiler` gate on `SortKeys.Count == 1`)
+      and falls back to the whole-row operator. Correct, just not narrowed.
+- **[P2]** The window-aggregate `ORDER BY` key-type check fires on key presence
+  alone, without consulting the frame — so `SUM(x) OVER (PARTITION BY p ORDER BY
+  name)` (a running aggregate over `VARCHAR`, pure peer comparison, no arithmetic)
+  is rejected even though only a bounded frame needs an arithmetic key. The
+  narrower frame-aware error already exists but is unreachable.
+- **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`; named `WINDOW`
+  clauses.
 
 ### Type system
 - **[DONE]** INTERVAL (core) and date/time arithmetic. `INTERVAL '…' <unit>`

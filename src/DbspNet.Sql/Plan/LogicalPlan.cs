@@ -260,15 +260,20 @@ public sealed record OffsetFunctionCall(
 /// <c>FIRST_VALUE/LAST_VALUE(expr)</c> <c>OVER (PARTITION BY p ORDER BY o)</c> —
 /// emitted as new output column(s) appended to every input row. Positional (by
 /// row, not value): the value is read from the row selected by each function's
-/// <see cref="OffsetFunctionCall.Kind"/> in the partition's <see cref="OrderKey"/>
-/// ordering (ties broken by the full row; a weight-<c>w</c> row occupies <c>w</c>
-/// consecutive positions). FIRST_VALUE/LAST_VALUE span the whole partition
-/// (UNLIMITED RANGE). Lowered to a <c>PartitionedOffsetOp</c>.
+/// <see cref="OffsetFunctionCall.Kind"/> in the partition's <see cref="OrderKeys"/>
+/// ordering (keys applied left to right; ties broken by the full row; a weight-<c>w</c>
+/// row occupies <c>w</c> consecutive positions). FIRST_VALUE/LAST_VALUE span the whole
+/// partition (UNLIMITED RANGE). Lowered to a <c>PartitionedOffsetOp</c>.
+///
+/// Unlike <see cref="WindowAggregatePlan"/>, this family accepts any number of ORDER BY
+/// keys with mixed directions: it only ever compares rows, never measures distance
+/// between key values, so no single-scalar arithmetic key is required.
+/// <see cref="OrderKeys"/> is non-empty (an ORDER BY is mandatory).
 /// </summary>
 public sealed record WindowOffsetPlan(
     LogicalPlan Input,
     IReadOnlyList<ResolvedExpression> PartitionKeys,
-    SortKey OrderKey,
+    IReadOnlyList<SortKey> OrderKeys,
     IReadOnlyList<OffsetFunctionCall> Functions,
     Schema Schema) : LogicalPlan(Schema);
 

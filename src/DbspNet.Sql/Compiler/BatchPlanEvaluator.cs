@@ -630,12 +630,19 @@ internal static class BatchPlanEvaluator
             partFns[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
         }
 
-        var sortScalar = ExpressionCompiler.CompileScalar(plan.OrderKey.Expression);
+        var sortKeys = new Func<StructuralRow, object?>[plan.OrderKeys.Count];
+        var sortDescending = new bool[plan.OrderKeys.Count];
+        var sortNullsFirst = new bool[plan.OrderKeys.Count];
+        for (var i = 0; i < plan.OrderKeys.Count; i++)
+        {
+            var sortScalar = ExpressionCompiler.CompileScalar(plan.OrderKeys[i].Expression);
+            sortKeys[i] = row => sortScalar(row);
+            sortDescending[i] = plan.OrderKeys[i].Descending;
+            sortNullsFirst[i] = plan.OrderKeys[i].NullsFirst;
+        }
+
         var order = new SortKeyComparer<StructuralRow>(
-            new Func<StructuralRow, object?>[] { row => sortScalar(row) },
-            new[] { plan.OrderKey.Descending },
-            new[] { plan.OrderKey.NullsFirst },
-            StructuralRowComparer.Instance);
+            sortKeys, sortDescending, sortNullsFirst, StructuralRowComparer.Instance);
 
         var valueFns = new Func<StructuralRow, object?>[plan.Functions.Count];
         for (var i = 0; i < plan.Functions.Count; i++)
