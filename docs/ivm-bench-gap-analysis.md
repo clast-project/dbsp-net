@@ -439,11 +439,23 @@ name, `generate_surrogate_key` → its `md5(coalesce/cast/||)` form; sources wra
 - **Views: 17/50 → 21/50 compile** after the typeless-NULL fix. The other 29 reduce to
   **two remaining root causes**; most are pure cascades (`unknown table X`).
 
-**Update (typeless NULL fixed):** root cause #2 below is done — `finwire_company`,
-`finwire_financial`, `finwire_security`, `crm_customer_mgmt` all compile now, and
-`watches_history`'s own null issue is gone (it now only cascades from `securities`). +4
-compiling. The two remaining roots are #1 (window-in-expression, 5 silver models) and #3
-(named `WINDOW`, 2 models). Original three-cause writeup below.
+**Update (typeless NULL fixed):** root cause #2 done — `finwire_company/financial/security`,
+`crm_customer_mgmt` compile; `watches_history`'s null issue gone. 17 → 21.
+
+**Update (window-in-expression fixed):** root cause #1 done — the resolver now lifts a
+window aggregate/offset nested in an expression to a hidden column (SCD2 `is_current` /
+`end_timestamp`). Cleared `accounts`/`companies`/`customers`/`securities`/`trades_history`
+and their cascade. **21 → 33 compile.** Two more roots surfaced from behind that cascade:
+- **`JOIN USING` merged key not exposed downstream** (NEW): `watches` (`unknown column
+  'symbol'`, from `watches_history`'s `USING (symbol)`) and `fact_holdings` (`unknown
+  column 'trade_id'`, from `USING (trade_id)`). A focused resolver gap — the coalesced
+  USING column isn't in the output schema under its bare name.
+- **`financials`' `ROW_NUMBER() OVER (…) = 1` in a CASE** — rank-in-expression, correctly
+  rejected (gap 1 territory; the aggregate lift excludes rank by design).
+
+Remaining roots: **named `WINDOW`** (`daily_market`, `dim_customer` — now the biggest
+cascade, ~10 models), **`JOIN USING` downstream exposure** (2), **`financials` rank-in-CASE**
+(gap 1, 1 + cascade). Original three-cause writeup below.
 
 The three roots, ranked by cascade impact:
 

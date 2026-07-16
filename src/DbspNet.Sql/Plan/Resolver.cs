@@ -1277,24 +1277,13 @@ public sealed class Resolver
         IReadOnlyDictionary<string, CteRef> scope,
         Schema? outerSchema)
     {
-        var windowItems = stmt.Items
-            .OfType<ExpressionSelectItem>()
-            .Where(it => it.Expression is WindowFunctionExpression)
-            .ToList();
-
-        var mentionedElsewhere =
-            (stmt.Where is not null && MentionsWindowFunction(stmt.Where))
-            || stmt.GroupBy.Any(MentionsWindowFunction)
-            || (stmt.Having is not null && MentionsWindowFunction(stmt.Having))
-            || stmt.Items.Any(it => it is ExpressionSelectItem esi
-                && esi.Expression is not WindowFunctionExpression
-                && MentionsWindowFunction(esi.Expression));
-
-        if (windowItems.Count == 0 && !mentionedElsewhere)
-        {
-            return null; // ordinary query — no window function anywhere.
-        }
-
+        // A window function may appear as a top-level select item OR nested in an
+        // enclosing expression (e.g. `CASE WHEN x = MAX(x) OVER (…) THEN …`, the
+        // TPC-DI SCD2 `is_current` marker, or `COALESCE(LAG(x) OVER (…) − …, …)`).
+        // Collect every window node from every select item; each is lifted to a
+        // hidden computed column and the enclosing expression is rewritten to
+        // reference it (via `preBound`, which substitutes by node identity at any
+        // depth). Window functions in WHERE / GROUP BY / HAVING remain illegal.
         if ((stmt.Where is not null && MentionsWindowFunction(stmt.Where))
             || stmt.GroupBy.Any(MentionsWindowFunction)
             || (stmt.Having is not null && MentionsWindowFunction(stmt.Having)))
@@ -1302,24 +1291,36 @@ public sealed class Resolver
             throw new ResolveException("window functions are not allowed in WHERE / GROUP BY / HAVING");
         }
 
-        if (stmt.Items.Any(it => it is ExpressionSelectItem esi
-            && esi.Expression is not WindowFunctionExpression
-            && MentionsWindowFunction(esi.Expression)))
+        var windowNodes = new List<WindowFunctionExpression>();
+        foreach (var it in stmt.Items)
         {
-            throw new ResolveException(
-                "a window function must be a top-level select item in v1 (it cannot be nested in an expression)");
+            if (it is ExpressionSelectItem esi)
+            {
+                CollectWindowFunctions(esi.Expression, windowNodes);
+            }
         }
 
-        // Every top-level window item must be a supported window function — a
-        // window aggregate (SUM/COUNT/AVG/MIN/MAX) or an offset function
-        // (LAG/LEAD/FIRST_VALUE/LAST_VALUE). Ranking functions ride the TOP-K
-        // pattern. The items are grouped below by family and OVER specification;
-        // each distinct group becomes its own operator, so a single query may
-        // carry several different OVER specs and freely mix aggregates with
-        // LAG / LEAD.
-        foreach (var wi in windowItems)
+        if (windowNodes.Count == 0)
         {
-            var w = (WindowFunctionExpression)wi.Expression;
+            return null; // ordinary query — no window function anywhere.
+        }
+
+        // Each window node must be a supported family — a window aggregate
+        // (SUM/COUNT/AVG/MIN/MAX) or an offset function (LAG/LEAD/FIRST_VALUE/
+        // LAST_VALUE). Ranking functions ride the TOP-K pattern (including when
+        // nested, e.g. `CASE WHEN ROW_NUMBER() OVER (…) = 1 THEN …`). The nodes are
+        // grouped below by family and OVER spec; each distinct group becomes its
+        // own operator, so a single query may carry several OVER specs and freely
+        // mix aggregates with LAG / LEAD.
+        //
+        // Each node is wrapped in a synthetic `ExpressionSelectItem` (alias null —
+        // the intermediate column name is irrelevant, references go through
+        // `preBound`) so the grouping / `BuildWindowGroup` machinery is shared with
+        // the top-level case. The wrapped `Expression` is the SAME node reference,
+        // which `preBound` requires.
+        var windowItems = new List<ExpressionSelectItem>(windowNodes.Count);
+        foreach (var w in windowNodes)
+        {
             if (!IsAggregateName(w.FunctionName, w.IsStar) && !IsOffsetFunctionName(w.FunctionName))
             {
                 throw new ResolveException(
@@ -1328,6 +1329,8 @@ public sealed class Resolver
                     "FIRST_VALUE / LAST_VALUE are (ranking functions ROW_NUMBER / RANK / DENSE_RANK are " +
                     "supported only in the TOP-K filter pattern)");
             }
+
+            windowItems.Add(new ExpressionSelectItem(w, Alias: null));
         }
 
         if (stmt.GroupBy.Count > 0 || stmt.Having is not null
@@ -1758,6 +1761,67 @@ public sealed class Resolver
             || (ce.ElseResult is not null && MentionsWindowFunction(ce.ElseResult)),
         _ => false,
     };
+
+    /// <summary>
+    /// Collect every <see cref="WindowFunctionExpression"/> node in an expression
+    /// tree, in left-to-right order, into <paramref name="into"/>. Mirrors
+    /// <see cref="MentionsWindowFunction"/>'s node coverage. A window function is a
+    /// leaf here — its own subtree is not descended (nested window functions are
+    /// not legal SQL). Preserves node identity, which is what the <c>preBound</c>
+    /// substitution keys on.
+    /// </summary>
+    private static void CollectWindowFunctions(Expression e, List<WindowFunctionExpression> into)
+    {
+        switch (e)
+        {
+            case WindowFunctionExpression w:
+                into.Add(w);
+                break;
+            case BinaryExpression b:
+                CollectWindowFunctions(b.Left, into);
+                CollectWindowFunctions(b.Right, into);
+                break;
+            case UnaryExpression u:
+                CollectWindowFunctions(u.Operand, into);
+                break;
+            case IsNullExpression isn:
+                CollectWindowFunctions(isn.Operand, into);
+                break;
+            case CastExpression c:
+                CollectWindowFunctions(c.Operand, into);
+                break;
+            case FunctionCallExpression f:
+                foreach (var a in f.Arguments)
+                {
+                    CollectWindowFunctions(a, into);
+                }
+
+                break;
+            case InListExpression il:
+                CollectWindowFunctions(il.Probe, into);
+                foreach (var v in il.Values)
+                {
+                    CollectWindowFunctions(v, into);
+                }
+
+                break;
+            case CaseExpression ce:
+                foreach (var w in ce.Whens)
+                {
+                    CollectWindowFunctions(w.Condition, into);
+                    CollectWindowFunctions(w.Result, into);
+                }
+
+                if (ce.ElseResult is not null)
+                {
+                    CollectWindowFunctions(ce.ElseResult, into);
+                }
+
+                break;
+            default:
+                break;
+        }
+    }
 
     /// <summary>Structural equality of two <see cref="WindowSpec"/>s — used to
     /// require that all window aggregates in one query share a single OVER

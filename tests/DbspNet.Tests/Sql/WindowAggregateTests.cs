@@ -219,8 +219,15 @@ public class WindowAggregateTests
     }
 
     [Fact]
-    public void Rejects_NestedWindow() => Rejects(
-        "SELECT cust, 1 + SUM(amount) OVER (PARTITION BY cust) FROM orders");
+    public void Resolve_NestedWindow_LiftsToHiddenColumn()
+    {
+        // A window function nested in an expression (here arithmetic) is lifted
+        // to a hidden column; the outer ProjectPlan wraps the WindowAggregatePlan.
+        var plan = ResolvePlan(Orders,
+            "SELECT cust, 1 + SUM(amount) OVER (PARTITION BY cust) AS s FROM orders");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        Assert.IsType<WindowAggregatePlan>(proj.Input);
+    }
 
     // ---- Behavioural: incremental evaluation ---------------------------------
 
@@ -237,6 +244,87 @@ public class WindowAggregateTests
 
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
         z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
+
+    // ---- Window function nested in an expression (lifted to a hidden column) ----
+
+    [Fact]
+    public void WindowAggregate_NestedInCase_IsCurrentMarker()
+    {
+        // The TPC-DI SCD2 `is_current` shape: MAX(ts) OVER (PARTITION BY g)
+        // nested inside a CASE, compared to the row's own ts.
+        var q = Compile(S,
+            "SELECT g, v, CASE WHEN ts = MAX(ts) OVER (PARTITION BY g) THEN 1 ELSE 0 END AS is_cur FROM s");
+        q.Table("s").Insert(1, 10, 100);   // ts 10
+        q.Table("s").Insert(1, 30, 300);   // ts 30 = max for g=1 → current
+        q.Table("s").Insert(2, 5, 50);     // ts 5 = max for g=2 → current
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 100, 0));   // ts 10 ≠ max 30
+        Assert.Equal(1, WeightOf(q.Current, 1, 300, 1));   // ts 30 = max
+        Assert.Equal(1, WeightOf(q.Current, 2, 50, 1));    // ts 5 = max
+    }
+
+    [Fact]
+    public void OffsetFunction_NestedInCoalesce_EndTimestampShape()
+    {
+        // The SCD2 `end_timestamp` shape: COALESCE(LAG(ts) OVER (...), default).
+        var q = Compile(S,
+            "SELECT g, ts, COALESCE(LAG(ts) OVER (PARTITION BY g ORDER BY ts DESC), -1) AS end_ts FROM s");
+        q.Table("s").Insert(1, 10, 0);
+        q.Table("s").Insert(1, 20, 0);
+        q.Table("s").Insert(1, 30, 0);
+        q.Step();
+        // DESC order: 30, 20, 10. LAG = the previous (later-ts) row, or -1 at the top.
+        Assert.Equal(1, WeightOf(q.Current, 1, 30, -1));
+        Assert.Equal(1, WeightOf(q.Current, 1, 20, 30));
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 20));
+    }
+
+    [Fact]
+    public void OffsetFunction_NestedInIsNull_TradesHistoryShape()
+    {
+        // trades_history is-current: LAG(id) OVER (...) IS NULL marks the newest.
+        var q = Compile(S,
+            "SELECT g, ts, CASE WHEN LAG(v) OVER (PARTITION BY g ORDER BY ts DESC) IS NULL THEN 1 ELSE 0 END AS newest FROM s");
+        q.Table("s").Insert(1, 10, 111);
+        q.Table("s").Insert(1, 30, 333);   // newest (highest ts) → LAG is null
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 30, 1));
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 0));
+    }
+
+    [Fact]
+    public void WindowFunctions_TwoNestedInOneQuery_SharedBase()
+    {
+        // The full SCD2 pair: an offset (end_ts) and an aggregate (is_current),
+        // each nested in its own expression, in one SELECT.
+        var q = Compile(S,
+            "SELECT g, ts, " +
+            "COALESCE(LAG(ts) OVER (PARTITION BY g ORDER BY ts DESC), -1) AS end_ts, " +
+            "CASE WHEN ts = MAX(ts) OVER (PARTITION BY g) THEN 1 ELSE 0 END AS is_cur FROM s");
+        q.Table("s").Insert(1, 10, 0);
+        q.Table("s").Insert(1, 30, 0);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 30, -1, 1));   // newest: end_ts -1, current
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 30, 0));   // older: end_ts 30, not current
+    }
+
+    [Fact]
+    public void RankFunction_NestedInExpression_StillRejected()
+    {
+        // financials shape: ROW_NUMBER() OVER (...) = 1 in a CASE. Rank functions
+        // are TopK-only even when nested — must not be silently lifted.
+        var ex = Assert.Throws<ResolveException>(() => Compile(S,
+            "SELECT g, CASE WHEN ROW_NUMBER() OVER (PARTITION BY g ORDER BY ts) = 1 THEN 1 ELSE 0 END AS c FROM s"));
+        Assert.Contains("TOP-K", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WindowFunction_InWhere_StillRejected()
+    {
+        var ex = Assert.Throws<ResolveException>(() => Compile(S,
+            "SELECT g, v FROM s WHERE MAX(ts) OVER (PARTITION BY g) > 5"));
+        Assert.Contains("WHERE", ex.Message, StringComparison.Ordinal);
+    }
 
     [Fact]
     public void WholePartition_Sum_BroadcastsAndUpdates()

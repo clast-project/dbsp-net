@@ -500,9 +500,17 @@ reflect that shape, not a backlog.
   variants) plus a `BatchPlanEvaluator` arm. **Deferred:**
     - **[P2]** `ROWS` / `GROUPS` frames; `FOLLOWING` bounds; variable-width
       (`YEAR`/`MONTH`) interval offsets; a non-integer/non-temporal `ORDER BY` key.
-    - **[P2]** A window function nested in an expression or over a `GROUP BY` /
-      `DISTINCT` inner query; `SELECT *` alongside a window aggregate (list columns
-      explicitly).
+    - **[DONE]** A window aggregate or offset function **nested in an expression**
+      (`CASE WHEN x = MAX(x) OVER (…) THEN …`, `COALESCE(LAG(x) OVER (…) − …, …)` —
+      the TPC-DI SCD2 `is_current` / `end_timestamp` shapes). The resolver collects
+      every window node from every select item (not just top-level ones), lifts
+      each to a hidden computed column, and the `preBound` identity-substitution
+      rewrites the enclosing expression to reference it — the same machinery the
+      top-level case already used, so no new operator. Rank functions
+      (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) stay TopK-only even when nested. Window
+      functions in `WHERE`/`GROUP BY`/`HAVING` stay rejected.
+    - **[P2]** A window function over a `GROUP BY` / `DISTINCT` inner query;
+      `SELECT *` alongside a window aggregate (list columns explicitly).
     - **[P2]** Neighborhood-only recompute for the running case (currently the
       affected suffix).
     - *N/A by design* — a **spine** variant. Like `TopKOp` / `PartitionedTopKOp`,
