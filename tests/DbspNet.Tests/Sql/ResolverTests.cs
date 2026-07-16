@@ -138,6 +138,106 @@ public class ResolverTests
     }
 
     [Fact]
+    public void InnerJoin_ComputedEquiKey_HoistsToBareColumnKey()
+    {
+        // CAST(a.x) = CAST(b.y) is side-pure on both operands, so it is a real
+        // equi-key — hoisted into synthetic columns rather than left as a
+        // residual over a keyless cross product.
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y BIGINT NOT NULL)");
+        var plan = ResolveQuery(r,
+            "SELECT * FROM a JOIN b ON CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)");
+
+        // Outermost projection strips the synthetic key columns.
+        var strip = Assert.IsType<ProjectPlan>(plan);
+        var proj = Assert.IsType<ProjectPlan>(strip.Input);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+
+        Assert.Single(join.EquiKeys);
+        Assert.Null(join.Residual);
+
+        // Each side is widened by exactly one synthetic column, keyed on it.
+        Assert.Equal(1, join.EquiKeys[0].LeftIndex);   // a.x=0, __jkl0=1
+        Assert.Equal(1, join.EquiKeys[0].RightIndex);  // b.y=0, __jkr0=1
+        Assert.IsType<ProjectPlan>(join.Left);
+        Assert.IsType<ProjectPlan>(join.Right);
+
+        // Caller-visible schema is unchanged: [a.x, b.y].
+        Assert.Equal(2, strip.Schema.Count);
+        Assert.Equal("x", strip.Schema[0].Name);
+        Assert.Equal("y", strip.Schema[1].Name);
+    }
+
+    [Fact]
+    public void InnerJoin_OneSideBareColumn_HoistsOnlyTheExpressionSide()
+    {
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x VARCHAR NOT NULL)",
+            "CREATE TABLE b (y VARCHAR NOT NULL)");
+        var plan = ResolveQuery(r, "SELECT * FROM a JOIN b ON UPPER(a.x) = b.y");
+        var strip = Assert.IsType<ProjectPlan>(plan);
+        var proj = Assert.IsType<ProjectPlan>(strip.Input);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+
+        Assert.Single(join.EquiKeys);
+        Assert.Equal(1, join.EquiKeys[0].LeftIndex);   // hoisted UPPER(a.x)
+        Assert.Equal(0, join.EquiKeys[0].RightIndex);  // b.y reused in place
+        Assert.IsType<ProjectPlan>(join.Left);
+        Assert.IsType<ScanPlan>(join.Right);           // right not widened
+    }
+
+    [Fact]
+    public void LeftJoin_ComputedEquiKey_IsAccepted()
+    {
+        // Previously "LEFT JOIN requires at least one equi-key (v1)" — the cast
+        // equality was classified as a residual, leaving zero equi-keys.
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y BIGINT NOT NULL)");
+        var plan = ResolveQuery(r,
+            "SELECT * FROM a LEFT JOIN b ON CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)");
+        var strip = Assert.IsType<ProjectPlan>(plan);
+        var proj = Assert.IsType<ProjectPlan>(strip.Input);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Single(join.EquiKeys);
+        Assert.Null(join.Residual);
+
+        // The right column is nullable in the output (LEFT JOIN), and the
+        // synthetic columns are gone.
+        Assert.Equal(2, strip.Schema.Count);
+        Assert.True(strip.Schema[1].Type.Nullable);
+    }
+
+    [Fact]
+    public void InnerJoin_ConstantOperand_StaysResidual()
+    {
+        // `a.x = 5` is a filter, not a join key — it must not be hoisted.
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y INT NOT NULL)");
+        var plan = ResolveQuery(r, "SELECT * FROM a JOIN b ON a.x = 5");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Empty(join.EquiKeys);
+        Assert.NotNull(join.Residual);
+    }
+
+    [Fact]
+    public void InnerJoin_MixedSideOperand_StaysResidual()
+    {
+        // `a.x + b.y = 10` reads both inputs on one operand — never a join key.
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (x INT NOT NULL)",
+            "CREATE TABLE b (y INT NOT NULL)");
+        var plan = ResolveQuery(r, "SELECT * FROM a JOIN b ON a.x + b.y = 10");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Empty(join.EquiKeys);
+        Assert.NotNull(join.Residual);
+    }
+
+    [Fact]
     public void CrossJoin_BuildsKeylessJoin()
     {
         var (_, r) = NewResolver(

@@ -174,6 +174,117 @@ public class CompilerTests
         Assert.Equal(1, WeightOf(q.Current, 200, 20));
     }
 
+    // ---- Computed equi-keys (hoisted to synthetic key columns) ----
+
+    /// <summary>
+    /// The differential that matters for the computed-equi-key lowering: a
+    /// hoisted key join must agree with the keyless cross-product-plus-filter
+    /// spelling it replaces. The batch oracle cannot catch a lowering bug here
+    /// (it evaluates the same lowered plan), so compare the two spellings.
+    /// </summary>
+    private static void AssertComputedKeyMatchesCrossFilter(
+        string[] ddl, string onPredicate, Action<Func<string, TableInput>> load)
+    {
+        var keyed = Compile(ddl, $"SELECT a.x, b.y FROM a JOIN b ON {onPredicate}");
+        var cross = Compile(ddl, $"SELECT a.x, b.y FROM a CROSS JOIN b WHERE {onPredicate}");
+        load(keyed.Table);
+        load(cross.Table);
+        keyed.Step();
+        cross.Step();
+        Assert.True(
+            keyed.Current.Equals(cross.Current),
+            $"ON {onPredicate}\n  keyed={keyed.Current}\n  cross={cross.Current}");
+    }
+
+    [Fact]
+    public void ComputedEquiKey_CastBothSides_MatchesCrossFilter() =>
+        AssertComputedKeyMatchesCrossFilter(
+            ["CREATE TABLE a (x INT NOT NULL)", "CREATE TABLE b (y BIGINT NOT NULL)"],
+            "CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)",
+            tbl =>
+            {
+                tbl("a").Insert(1);
+                tbl("a").Insert(2);
+                tbl("a").Insert(2);   // duplicate: bag multiplicity must survive
+                tbl("b").Insert(2L);
+                tbl("b").Insert(3L);
+            });
+
+    [Fact]
+    public void ComputedEquiKey_UpperOnOneSide_MatchesCrossFilter() =>
+        AssertComputedKeyMatchesCrossFilter(
+            ["CREATE TABLE a (x VARCHAR NOT NULL)", "CREATE TABLE b (y VARCHAR NOT NULL)"],
+            "UPPER(a.x) = b.y",
+            tbl =>
+            {
+                tbl("a").Insert("ab");
+                tbl("a").Insert("AB");
+                tbl("b").Insert("AB");
+                tbl("b").Insert("zz");
+            });
+
+    [Fact]
+    public void ComputedEquiKey_NullOperand_MatchesCrossFilter() =>
+        // NULL handling is where the two spellings could diverge: as an equi-key
+        // a NULL key is filtered; as a residual, `NULL = NULL` is NULL, not TRUE.
+        // Both drop the row — this pins that they agree.
+        AssertComputedKeyMatchesCrossFilter(
+            ["CREATE TABLE a (x INT)", "CREATE TABLE b (y BIGINT)"],
+            "CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)",
+            tbl =>
+            {
+                tbl("a").Insert(new object?[] { null });
+                tbl("a").Insert(1);
+                tbl("b").Insert(new object?[] { null });
+                tbl("b").Insert(1L);
+            });
+
+    [Fact]
+    public void ComputedEquiKey_WithRightSideResidual_MatchesCrossFilter() =>
+        // Two conjuncts: one hoisted to a key, one left as a residual. The
+        // residual MUST reference a RIGHT column — hoisting a left key shifts
+        // every right index right by leftSynth.Count, and only a right-side
+        // reference exercises that remap. A left-only residual would pass even
+        // with the remap deleted.
+        AssertComputedKeyMatchesCrossFilter(
+            ["CREATE TABLE a (x INT NOT NULL)", "CREATE TABLE b (y BIGINT NOT NULL)"],
+            "CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR) AND b.y > 1",
+            tbl =>
+            {
+                tbl("a").Insert(1);
+                tbl("a").Insert(2);
+                tbl("b").Insert(1L);
+                tbl("b").Insert(2L);
+            });
+
+    [Fact]
+    public void ComputedEquiKey_WithCrossSideResidual_MatchesCrossFilter() =>
+        AssertComputedKeyMatchesCrossFilter(
+            ["CREATE TABLE a (x INT NOT NULL)", "CREATE TABLE b (y BIGINT NOT NULL)"],
+            "CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR) AND CAST(a.x AS BIGINT) >= b.y",
+            tbl =>
+            {
+                tbl("a").Insert(1);
+                tbl("a").Insert(2);
+                tbl("b").Insert(1L);
+                tbl("b").Insert(2L);
+            });
+
+    [Fact]
+    public void ComputedEquiKey_Retraction_MatchesCrossFilter() =>
+        AssertComputedKeyMatchesCrossFilter(
+            ["CREATE TABLE a (x INT NOT NULL)", "CREATE TABLE b (y BIGINT NOT NULL)"],
+            "CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)",
+            tbl =>
+            {
+                tbl("a").Insert(1);
+                tbl("a").Insert(2);
+                tbl("b").Insert(1L);
+                tbl("b").Insert(2L);
+                tbl("a").Delete(1);
+                tbl("b").Delete(2L);
+            });
+
     // ---- Cross / non-equi inner join (keyless, unit-key nested loop) ----
 
     [Fact]

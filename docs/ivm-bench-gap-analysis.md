@@ -214,16 +214,96 @@ joins across 11 models. This idiom is the structural spine of the workload.
 Note `financials` uses `= 1` rather than `<= 1`; `Resolver.cs:1060` matches `< k` / `<= k`
 (and reversed). Trivially adjacent, but check it.
 
-### 4. OUTER JOIN with a non-equi conjunct — BLOCKING, bounded
+### 4. OUTER JOIN, two separate gaps — 4a DONE, 4b BLOCKING
 
-`skipped.md:173-177` **[P1]**. `Resolver.cs:2127-2131` rejects any non-equi conjunct in
-an outer join's ON.
+The original entry here ("outer join with a non-equi conjunct, bounded") was wrong on
+both diagnosis and size. Reading the actual models rather than the summary:
 
-Hit by `silver/securities.sql` and `silver/financials.sql`, which do
-`LEFT JOIN … ON <equi> AND <BETWEEN>` (the temporal-validity pattern, 2 each).
+```sql
+-- silver/securities.sql and silver/financials.sql, both branches
+left join {{ ref('companies') }} c1
+    on cast(s.cik as varchar) = cast(c1.company_id as varchar)
+    and pts between c1.effective_timestamp and c1.end_timestamp
+left join {{ ref('companies') }} c2
+    on s.company_name = c2.name
+    and pts between c2.effective_timestamp and c2.end_timestamp
+```
+
+The `c1` branch's join key is `cast(…) = cast(…)`. `TryExtractEquiKey` required **bare
+`ResolvedColumn` on both sides**, so that equality was classified as a *residual*,
+leaving `c1` with **zero** equi-keys — meaning it failed a different check first
+("`LEFT JOIN requires at least one equi-key (v1)`"), not the non-equi-conjunct one. The
+`c2` branch has a real equi-key and fails only on the residual. Two gaps, not one.
+
+Also checked and ruled out: the cheap fix. If the residual were right-side-only it would
+be a filter pushdown into the right input and nothing else. It isn't — `pts` comes from
+the left, so `pts BETWEEN c1.effective_timestamp AND c1.end_timestamp` is cross-side and
+the per-left-row match problem is real.
+
+#### 4a. Computed equi-keys — DONE
+
+Lifted the bare-column restriction as a resolver lowering: side-pure key expressions are
+hoisted into synthetic columns projected onto each input, the join keys on those, and a
+projection above strips them. Nothing downstream sees an expression key.
+
+Worth having independently of this benchmark: *any* `JOIN ON UPPER(a.x) = b.y` previously
+compiled to a keyless unit-key cross product plus a filter — correct, quadratic, and
+silent. This is the same generalization `GROUP BY` got when it lifted its own
+bare-column-only rule.
+
+#### 4b. Outer join with a cross-side residual — BLOCKING
+
+`skipped.md` **[P1]**. `Resolver.cs` rejects any non-equi conjunct in an outer join's ON.
+
+Match-presence today is a per-**key** emptiness test — `IncrementalLeftJoinOp.cs:153-154`
+is `var oldMatched = !oldR.IsEmpty; var newMatched = !newR.IsEmpty;`, asking "does *any*
+right row exist under this key". A residual can reference left columns, so two left rows
+under one key can disagree about whether that key is matched: the property becomes
+per-(key, left row), the O(1) check becomes O(|R_key|) per left row, and the
+stayed-matched fast path (which never enumerates `oldL × oldR`) collapses.
+
+**Decided: plan rewrite, not operator surgery.**
+
+```
+matched   = σ_residual( L ⋈_key R )        -- INNER already fuses residuals
+unmatched = L − antisemi( L, π_L(matched) )
+result    = matched ∪ NULLPAD(unmatched)
+```
+
+Rationale: it reuses tested machinery, inherits GC/snapshot/spine for free, and matches
+the codebase's lowering-over-new-ops grain (TUMBLE, operator fusion). Gap 4b unblocks two
+models — thin justification for surgery on the operator that FULL OUTER, LATENESS GC, and
+the spine family all depend on. If it shows up hot, operator surgery becomes a *measured*
+optimization with the rewrite as its correctness oracle.
+
+Three things the rewrite must handle, all found while scoping:
+
+- **It dissolves the keyless-outer restriction too**, since it never uses the keyed
+  operator. `c1` would compile even without 4a — but as a quadratic cross product, which
+  is why 4a is a performance necessity rather than a correctness one.
+- **NULL-safe anti-join is required.** `CompileSemiJoin` filters NULL keys
+  (`PlanToCircuit.cs:2150-2151`). A whole-row anti-semi-join would therefore drop any
+  left row containing a NULL, so it would survive the difference and get a spurious
+  NULL-pad *alongside* its real join output — wrong answers on exactly the NULL-heavy
+  rows these models produce. `JoinPlan` already carries `AllowNullKeys` for this;
+  `SemiJoinPlan` needs the same.
+- **`matched` is consumed twice** (the union and the anti-join) and there is no CSE. But
+  `CompileContext.CteCache` keys on `CteRef` identity, so emitting `matched` as a
+  synthetic CTE gives guaranteed single compilation — the escape hatch `skipped.md`
+  already documents.
+
+Two more, for whoever builds it:
+
+- **`BatchLeftOuterJoin` ignores `plan.Residual` entirely** (`BatchPlanEvaluator.cs:295`
+  decides on `matches.Count > 0`; only `BatchInnerJoin` reads the residual). It is the
+  differential oracle, so it needs fixing first.
+- **The PBT currently proves nothing about this shape.** `RandomQuery.GenQuery` cannot
+  emit outer-joins-with-residual because the resolver rejects them, so the
+  3000-iteration pruning PBT gives zero evidence. Extending the generator is the
+  load-bearing test work.
 
 Most of the 17 `BETWEEN` joins are INNER and are fine — non-equi INNER is supported via
-the unit-key nested-loop path (`skipped.md:145-152`). Only the LEFT-joined ones fail.
+the unit-key nested-loop path. Only the LEFT-joined ones fail.
 
 ### 5. `STDDEV` — BLOCKING, bounded
 
@@ -323,7 +403,8 @@ a standalone docs commit before implementation started; recorded here because th
 | 1 | Rank projected into output | 5 (all analytics) | Architectural — design decision |
 | 2 | Nested `ROW` structs | 2 | Architectural — type system |
 | 3 | Multi-key window `ORDER BY` | 7 | **DONE** |
-| 4 | OUTER JOIN + non-equi conjunct | 2 | Bounded |
+| 4a | Computed equi-keys | 2 (+ latent perf bug) | **DONE** |
+| 4b | OUTER JOIN + cross-side residual | 2 | Architectural — plan rewrite |
 | 5 | `STDDEV` | 5 | Bounded |
 | 6 | Scalar/type tail | ~10 | Trivial, partly dodgeable |
 

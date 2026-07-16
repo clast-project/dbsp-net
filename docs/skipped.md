@@ -170,11 +170,34 @@ reflect that shape, not a backlog.
   unit-key path as the `CROSS JOIN` keyword; `FROM a, b WHERE a.k = b.k` is the
   classic pre-ANSI inner-join spelling (cross product + residual filter, which
   the optimizer's predicate pushdown can later fold into an equi-join).
+- **[DONE]** **Computed equi-keys.** An equality whose operands are each
+  side-pure but not both bare columns (`ON CAST(a.x AS VARCHAR) = CAST(b.y AS
+  VARCHAR)`, `ON UPPER(a.x) = b.y`) is now a real equi-key. Lowered in the
+  resolver: the key expressions are hoisted into synthetic columns projected
+  onto each input, the join keys on those bare columns, and a projection above
+  strips them. Nothing downstream sees an expression key, so the trace, GC,
+  §21 pruning, typed and spine paths are untouched. An operand that is already
+  a bare column is reused in place rather than duplicated.
+    - Previously such an equality fell to the residual, which for INNER meant a
+      keyless unit-key **cross product** — correct but quadratic, and silent —
+      and for an outer join meant zero equi-keys and an outright rejection.
+    - A constant operand (`a.x = 5`) or a mixed-side operand (`a.x + b.y = 10`)
+      is not a key and stays a residual.
 - **[P1]** `LEFT/RIGHT/FULL JOIN` with a non-equi conjunct in the `ON`
   clause (e.g. `LEFT JOIN b ON a.k = b.k AND b.v > 0`). Semantically,
   failing the residual should drop the match but retain the preserved row
   NULL-padded; that requires residual-aware logic in the operator.
-  Resolver rejects with an explicit error.
+  Resolver rejects with an explicit error. Match-presence today is a per-**key**
+  emptiness test (`IncrementalLeftJoinOp`: `var oldMatched = !oldR.IsEmpty`), but
+  a residual can reference left columns, so two left rows under one key can
+  disagree about whether that key is matched — the property becomes per-(key,
+  left row). Planned as a **plan rewrite**, not operator surgery:
+  `σ_residual(L ⋈ R) ∪ NULLPAD(L − antisemi(L, π_L(matched)))`, which also
+  dissolves the keyless-outer restriction since it never uses the keyed
+  operator. See `ivm-bench-gap-analysis.md` §4.
+- **[P1]** `LEFT/RIGHT/FULL JOIN` with **no** equi-key (`equi.Count == 0`).
+  Match-presence tracking is keyed, so there is no operator. The rewrite above
+  would subsume this.
 - **[P2]** `LEFT ASOF JOIN`. Feldera-specific, used for time-series matching.
 - **[P2]** `INTERSECT ALL` / `EXCEPT ALL` (bag semantics for intersect/
   except — min/clamped-subtract of weights). DbspNet supports the

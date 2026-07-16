@@ -2101,16 +2101,38 @@ public sealed class Resolver
         EnsureBooleanCoercible(onResolved, "JOIN ON");
         var equi = new List<JoinEquality>();
         var residuals = new List<ResolvedExpression>();
+        var computed = new List<ComputedEquiKey>();
         foreach (var conjunct in SplitAnd(onResolved))
         {
             if (TryExtractEquiKey(conjunct, leftCount, out var eq))
             {
                 equi.Add(eq);
             }
+            else if (TryExtractComputedEquiKey(conjunct, leftCount, out var ck))
+            {
+                computed.Add(ck);
+            }
             else
             {
                 residuals.Add(conjunct);
             }
+        }
+
+        // Computed equi-keys (`ON CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)`,
+        // `ON UPPER(a.x) = b.y`) are lowered to bare-column keys: the key
+        // expressions are hoisted into synthetic columns projected onto each
+        // input, the join keys on those, and a projection above strips them.
+        // Nothing downstream sees an expression key, so the trace/GC/pruning/
+        // typed paths are untouched. Without this a computed key is a residual,
+        // which for INNER means a keyless unit-key cross product — correct but
+        // quadratic — and for an outer join means no equi-key at all.
+        var leftSynth = new List<ProjectionItem>();
+        var rightSynth = new List<ProjectionItem>();
+        foreach (var ck in computed)
+        {
+            var li = HoistKeySide(ck.LeftExpr, left.Schema, leftSynth, "__jkl");
+            var ri = HoistKeySide(ck.RightExpr, right.Schema, rightSynth, "__jkr");
+            equi.Add(new JoinEquality(li, ri, ck.KeyType));
         }
 
         // A zero-equi-key join is a nested-loop / cross join. INNER supports it
@@ -2143,16 +2165,203 @@ public sealed class Resolver
                 $"{JoinTypeName(join.Type)} with a non-equi ON conjunct is not supported in v1");
         }
 
+        // Widen the inputs with any hoisted key columns. Bare-column equi-keys
+        // are unaffected: JoinEquality holds per-side indices and the synthetic
+        // columns are appended, so existing indices keep pointing at the same
+        // columns.
+        var joinLeft = WidenWithSynthKeys(left, leftSynth);
+        var joinRight = WidenWithSynthKeys(right, rightSynth);
+
+        // The residual is indexed against the ORIGINAL combined schema. Widening
+        // the left input shifts every right-side column right by leftSynth.Count.
+        if (residual is not null && leftSynth.Count > 0)
+        {
+            var remap = new int[leftCount + right.Schema.Count];
+            for (var i = 0; i < remap.Length; i++)
+            {
+                remap[i] = i < leftCount ? i : i + leftSynth.Count;
+            }
+
+            residual = ExpressionRewriter.RemapColumnIndices(residual, remap);
+        }
+
         var outputSchema = join.Type switch
         {
-            JoinType.Inner => combined,
-            JoinType.LeftOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: false),
-            JoinType.RightOuter => MakeSideNullable(left.Schema, right.Schema, makeLeftNullable: true),
-            JoinType.FullOuter => MakeBothNullable(left.Schema, right.Schema),
+            JoinType.Inner => joinLeft.Schema.Concat(joinRight.Schema),
+            JoinType.LeftOuter => MakeSideNullable(joinLeft.Schema, joinRight.Schema, makeLeftNullable: false),
+            JoinType.RightOuter => MakeSideNullable(joinLeft.Schema, joinRight.Schema, makeLeftNullable: true),
+            JoinType.FullOuter => MakeBothNullable(joinLeft.Schema, joinRight.Schema),
             _ => throw new ResolveException($"unsupported join type {join.Type}"),
         };
 
-        return new JoinPlan(left, right, join.Type, equi, residual, outputSchema);
+        var joinPlan = new JoinPlan(joinLeft, joinRight, join.Type, equi, residual, outputSchema);
+        if (leftSynth.Count == 0 && rightSynth.Count == 0)
+        {
+            return joinPlan;
+        }
+
+        // Strip the synthetic key columns, restoring the caller-visible
+        // [left cols…, right cols…] shape (nullability taken from the join's
+        // own output schema, not the inputs').
+        var keep = new List<int>(leftCount + right.Schema.Count);
+        for (var i = 0; i < leftCount; i++)
+        {
+            keep.Add(i);
+        }
+
+        var rightStart = leftCount + leftSynth.Count;
+        for (var i = 0; i < right.Schema.Count; i++)
+        {
+            keep.Add(rightStart + i);
+        }
+
+        return ProjectColumns(joinPlan, keep);
+    }
+
+    /// <summary>Side of a join a resolved expression reads from.</summary>
+    private enum JoinSide
+    {
+        /// <summary>No column references — a constant.</summary>
+        None,
+        Left,
+        Right,
+
+        /// <summary>Reads both inputs; can never be a join key.</summary>
+        Mixed,
+    }
+
+    private sealed record ComputedEquiKey(
+        ResolvedExpression LeftExpr,
+        ResolvedExpression RightExpr,
+        SqlType KeyType);
+
+    private static JoinSide SideOf(ResolvedExpression e, int leftCount)
+    {
+        var indices = ExpressionRewriter.CollectColumnIndices(e);
+        if (indices.Count == 0)
+        {
+            return JoinSide.None;
+        }
+
+        var anyLeft = false;
+        var anyRight = false;
+        foreach (var i in indices)
+        {
+            if (i < leftCount)
+            {
+                anyLeft = true;
+            }
+            else
+            {
+                anyRight = true;
+            }
+        }
+
+        return anyLeft && anyRight ? JoinSide.Mixed
+            : anyLeft ? JoinSide.Left
+            : JoinSide.Right;
+    }
+
+    /// <summary>
+    /// Match an equality whose operands are each side-pure but not both bare
+    /// columns — <c>CAST(a.x AS VARCHAR) = CAST(b.y AS VARCHAR)</c>,
+    /// <c>UPPER(a.x) = b.y</c>. The returned expressions are in per-side index
+    /// space (the right operand shifted down by <paramref name="leftCount"/>),
+    /// ready to project onto their input.
+    ///
+    /// A constant operand (<c>a.x = 5</c>) is <see cref="JoinSide.None"/> and
+    /// stays a residual — it filters, it does not join.
+    /// </summary>
+    private static bool TryExtractComputedEquiKey(
+        ResolvedExpression e, int leftCount, out ComputedEquiKey key)
+    {
+        key = default!;
+        if (e is not ResolvedBinary { Operator: BinaryOperator.Equal } bin)
+        {
+            return false;
+        }
+
+        var ls = SideOf(bin.Left, leftCount);
+        var rs = SideOf(bin.Right, leftCount);
+
+        ResolvedExpression leftExpr, rightExpr;
+        if (ls == JoinSide.Left && rs == JoinSide.Right)
+        {
+            leftExpr = bin.Left;
+            rightExpr = ExpressionRewriter.ShiftColumnIndices(bin.Right, -leftCount);
+        }
+        else if (ls == JoinSide.Right && rs == JoinSide.Left)
+        {
+            leftExpr = bin.Right;
+            rightExpr = ExpressionRewriter.ShiftColumnIndices(bin.Left, -leftCount);
+        }
+        else
+        {
+            return false;
+        }
+
+        key = new ComputedEquiKey(
+            leftExpr, rightExpr, TypeInference.CommonComparableType(leftExpr.Type, rightExpr.Type));
+        return true;
+    }
+
+    /// <summary>
+    /// Resolve one side of a computed equi-key to a column index on its input,
+    /// appending a synthetic projection when the key is not already a bare
+    /// column. Returns the per-side index.
+    /// </summary>
+    private static int HoistKeySide(
+        ResolvedExpression keyExpr, Schema inputSchema, List<ProjectionItem> synth, string prefix)
+    {
+        if (keyExpr is ResolvedColumn c)
+        {
+            return c.Index;
+        }
+
+        var index = inputSchema.Count + synth.Count;
+        synth.Add(new ProjectionItem(keyExpr, prefix + synth.Count));
+        return index;
+    }
+
+    /// <summary>Append synthetic key columns to an input, or pass it through.</summary>
+    private static LogicalPlan WidenWithSynthKeys(LogicalPlan input, List<ProjectionItem> synth)
+    {
+        if (synth.Count == 0)
+        {
+            return input;
+        }
+
+        var items = new List<ProjectionItem>(input.Schema.Count + synth.Count);
+        var cols = new List<SchemaColumn>(input.Schema.Count + synth.Count);
+        for (var i = 0; i < input.Schema.Count; i++)
+        {
+            var sc = input.Schema[i];
+            items.Add(new ProjectionItem(new ResolvedColumn(i, sc.Type), sc.Name, sc.Qualifier));
+            cols.Add(sc);
+        }
+
+        foreach (var s in synth)
+        {
+            items.Add(s);
+            cols.Add(new SchemaColumn(s.Name, s.Expression.Type));
+        }
+
+        return new ProjectPlan(input, items, new Schema(cols));
+    }
+
+    /// <summary>Positional projection of a plan down to a subset of its columns.</summary>
+    private static LogicalPlan ProjectColumns(LogicalPlan input, IReadOnlyList<int> keep)
+    {
+        var items = new List<ProjectionItem>(keep.Count);
+        var cols = new List<SchemaColumn>(keep.Count);
+        foreach (var i in keep)
+        {
+            var sc = input.Schema[i];
+            items.Add(new ProjectionItem(new ResolvedColumn(i, sc.Type), sc.Name, sc.Qualifier));
+            cols.Add(sc);
+        }
+
+        return new ProjectPlan(input, items, new Schema(cols));
     }
 
     /// <summary>
