@@ -51,10 +51,10 @@ reflect that shape, not a backlog.
   `EXISTS (sq)` desugars at parse time to
   `COALESCE((SELECT COUNT(*) FROM (sq)), 0) > 0`, which rides on the
   existing scalar-subquery + COALESCE + comparison machinery; `NOT EXISTS`
-  falls out via the unary-NOT arm. Deferred follow-ons:
-    - **[P1]** `NOT IN (subquery)` — needs anti-semi-join + three-valued
-      NULL handling (`NOT IN` with a NULL in the subquery is NULL, not
-      simply `NOT (x IN ...)`).
+  falls out via the unary-NOT arm. `NOT IN (subquery)` is **implemented**
+  too — anti-semi-join plus full three-valued NULL handling; see the
+  correlated-subquery bullet below, which covers the uncorrelated form via
+  the same machinery.
 - Correlated subqueries — **implemented** for the single-level form
   across all four shapes: `IN (subquery)`, `EXISTS (subquery)`,
   scalar subquery, and the anti-semi-join forms
@@ -412,8 +412,19 @@ reflect that shape, not a backlog.
   column on every row (`SELECT *, ROW_NUMBER() OVER (…) AS rn FROM t`, used
   outside a `<= k` filter). Incrementally expensive: inserting one row shifts the
   rank of every later row in the partition, so a single insert produces
-  O(partition-size) retractions. Feldera restricts the rank functions to TopK
-  patterns for the same reason; DbspNet does too.
+  O(partition-size) retractions.
+
+  Note this is *not* Feldera parity — Feldera supports the general form, and
+  treats the cost as a warning rather than a restriction: "these functions can
+  have a reasonable cost in three circumstances: each modified group (created by
+  `PARTITION BY`) is relatively small in size; new insertions and deletions
+  feature rows that appear towards the end of the order produced by the
+  `ORDER BY` clause; they are used in a TopK pattern with a small limit"
+  (<https://docs.feldera.com/sql/aggregates/>). Earlier Feldera docs did restrict
+  these to TopK, which is where this entry's original parity claim came from; the
+  restriction has since been lifted. The cost analysis above still holds — see
+  `ivm-bench-gap-analysis.md` §1, where unpartitioned ranks (whole relation = one
+  partition) demonstrably wedged Feldera at SF=100. Required to run ivm-bench.
 - Window aggregates `SUM` / `COUNT` / `AVG` / `MIN` / `MAX` `OVER (PARTITION BY p
   [ORDER BY o RANGE …])` emitted as a new output column — **implemented** for the
   three `RANGE` frame shapes (Feldera-faithful, RANGE only):
@@ -888,10 +899,12 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   and via a hybrid lift: aggregates, set ops, CTEs, recursive CTE,
   scalar subqueries).
 - **[P2]** Expression-compiler CAST matrix. v1 supports numeric↔numeric,
-  numeric↔string, bool→string, string↔temporal (date/time/timestamp), and
-  string↔interval. Missing: string→bool (`'t'`/`'f'`),
-  decimal-precision-aware numeric narrowing, and cross-temporal casts
-  (e.g. `date ↔ timestamp`).
+  numeric↔string, bool→string, string↔temporal (date/time/timestamp),
+  string↔interval, and cross-temporal `date ↔ timestamp`
+  (`ExpressionCompiler.cs`: `CAST(timestamp AS date)` floors to the day,
+  `CAST(date AS timestamp)` yields midnight). Missing: string→bool
+  (`'t'`/`'f'`), decimal-precision-aware numeric narrowing, and
+  numeric→temporal (e.g. `CAST(bigint AS timestamp)`).
 
 ## Type system edge cases
 

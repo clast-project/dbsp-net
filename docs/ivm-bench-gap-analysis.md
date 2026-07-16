@@ -1,0 +1,302 @@
+# ivm-bench gap analysis
+
+Audit of what DbspNet would need to run [ivm-bench](https://github.com/mdrakiburrahman/ivm-bench),
+a TPC-DI-based Incremental View Maintenance benchmark that compares engines through a
+shared dbt model DAG. Feldera participates, which makes it the reference implementation
+for our engine class (DBSP, view-definition-only SQL, mutation through connectors).
+
+Audited against commit `main` as of 2026-07-15. Cross-referenced against `skipped.md`
+and the resolver.
+
+## Scope: what the benchmark actually asks for
+
+Each engine gets a dbt project of 50 models (bronze → silver → gold), expressing the
+TPC-DI data model *without* dbt's `incremental` materialization — the README's stated
+reason is that "watermark columns are unreliable". Queries are aligned to the "lowest
+common denominator" across engines so that systems with different incrementalization
+ability stay comparable.
+
+The Feldera project (`src/containers/dbt-server/dbt-projects/feldera`) carries 70 models:
+the same 50 plus 20 in `models/sources/` that declare input tables. Sibling projects
+declare inputs via dbt `source()`; Feldera materializes each as a model so the adapter
+can emit `CREATE TABLE` with an input connector attached. Every downstream
+`{{ source('tpcdi', X) }}` becomes `{{ ref('X') }}`.
+
+**Everything is a view.** No `INSERT`/`UPDATE`/`MERGE` appears anywhere, so DbspNet's
+by-design absence of statement-level DML (`skipped.md:34-37`) does not bite. This is the
+single biggest reason the benchmark is a plausible target despite TPC-DI being nominally
+an ETL workload.
+
+## The output contract: full state, not deltas
+
+**Engines are measured on materializing and writing full current state.** This was not
+obvious and is worth stating plainly, because the natural DBSP instinct — emit deltas —
+would produce a fast but non-comparable number.
+
+Evidence, all from `dbt-projects/feldera/dbt_project.yml` and the harness:
+
+- All 16 gold output connectors are `delta_table_output` with **`mode: truncate`** —
+  full snapshot replace per batch. Zero `append`-mode outputs in the repo.
+- Gold models are `+materialized: view` **plus `+stored: true`**, which in dbt-feldera
+  maps to `CREATE MATERIALIZED VIEW` — full view contents retained, not just the
+  minimal state needed for future changes.
+- No `__feldera_op` / `__feldera_ts` change-tagging columns anywhere. Output schema is
+  the plain model SELECT.
+- Write-out is **inside** the measured window. The timer starts at pipeline `resume`
+  (`benchmark-server/services/engine_runner.py:786-789`) and stops only when
+  `poll_output_completion()` (`dbt-server/services/feldera_client.py:93`) observes every
+  output connector drained *and* the DBSP transaction commit finished — the latter
+  explicitly including state persistence to storage.
+- Rust compile time is measured separately and excluded (`engine_runner.py:813`).
+
+Two gold views have had their output connector **deliberately removed** because
+truncate-mode could not keep up. Quoting `dbt_project.yml` on `fact_market_history`:
+
+> At SF=100, the truncate-mode `delta_table_output` for this 54M+ row materialized view
+> never drains — every input batch rewrites the full snapshot, the connector queue grows
+> unboundedly (1100+ batches with 0 transmitted observed), and `pipeline_complete` never
+> trips. Drop the output connector so Feldera computes the view in-memory but skips the
+> Delta write that wedges the pipeline. The benchmark still measures the compute cost;
+> no Delta is persisted for this table.
+
+Same for `daily_market_pulse` (`dbt_project.yml:426-434`). So Feldera is charged for
+compute + full snapshot rewrite on 16 of 18 gold views, and compute-only on the other
+two.
+
+### Correctness is not enforced on this path
+
+The `EXCEPT ALL` validation is **engine-internal self-consistency**, not a cross-engine
+diff: it builds a temp table from the compiled SQL inside the same DuckDB and diffs it
+against that engine's own IVM-maintained relation
+(`dbt-server/services/openivm_validation.py:116-125`). It exists only for
+`duckdb-openivm` and `spark-openivm`. Grepping the validation services for `feldera`
+returns nothing — Feldera's Delta output is never read back.
+
+**Implication.** Nothing in the harness would catch an engine that emits deltas instead
+of materializing. The contract that forces materialization is the *timer* (sinks must
+drain), not the correctness gate. Emitting deltas would post a fast number while doing
+strictly less work than Feldera is charged for. If we participate, we should match the
+measured work: full state + full rewrite per batch.
+
+### Batch model
+
+The pipeline is long-lived and holds state across all three batches. Batches 2/3 are
+pause → append input → resume → poll (`engine_runner.py:2428-2450`); data loading happens
+while paused, so it sits outside the window. Batch 1 compiles the pipeline paused before
+measurement starts.
+
+Streaming engines have no clean batch-done signal here: `pipeline_complete` never trips
+for `snapshot_and_follow` inputs, so the harness falls back through three signals ending
+in a **120-second quiescence timer** (`FELDERA_QUIESCENCE_S`), which appears to be
+included in the reported duration (`feldera_client.py:273`). Batches 2/3 are 1–2%
+appends and are the most likely to terminate that way. Any comparison against Feldera's
+published batch-2/3 numbers should account for that constant.
+
+## Gaps, ranked
+
+### 1. Ranking window functions projected into the output — BLOCKING, architectural
+
+Affects all 5 analytics models (`models/gold/analytics/*.sql`): 12 call sites.
+
+```sql
+DENSE_RANK() OVER (ORDER BY bw.total_notional DESC) AS rank_by_notional   -- broker_performance.sql:77
+RANK()       OVER (ORDER BY wl.total_volume DESC)   AS rank_by_volume     -- daily_market_pulse.sql:76
+RANK()       OVER (ORDER BY sv.return_volatility DESC, sv.dm_s_symb) AS … -- market_volatility.sql:79
+```
+
+DbspNet rejects this at `Resolver.cs:988` — "the window rank column may only be used in
+the TOP-K filter; selecting or otherwise [using it]" — and `skipped.md:411-416` marks the
+general windowed-column form **[P2]**, on the grounds that one insert shifts the rank of
+every later row in the partition, producing O(partition-size) retractions.
+
+**The cost analysis is correct. The Feldera-parity justification is stale.**
+`skipped.md:415-416` currently reads "Feldera restricts the rank functions to TopK
+patterns for the same reason; DbspNet does too". Feldera's current documentation says
+otherwise — the ranking functions are supported generally, with a cost warning rather
+than a restriction:
+
+> These functions can have a reasonable cost in three circumstances: each modified group
+> (created by `PARTITION BY`) is relatively small in size; new insertions and deletions
+> feature rows that appear towards the end of the order produced by the `ORDER BY`
+> clause; they are used in a TopK pattern with a small limit.
+> — <https://docs.feldera.com/sql/aggregates/>
+
+Older Feldera docs did carry the TopK-only restriction, which is presumably where our
+claim came from. It has since been lifted.
+
+**Worst case, and it is observed.** These ranks are *unpartitioned* — `OVER (ORDER BY x
+DESC)` with no `PARTITION BY` means the whole relation is one partition, which is exactly
+the shape Feldera's cost note warns about. ivm-bench hit that wall in practice
+(`dbt_project.yml:427-433`):
+
+> At SF=100 the global-window aggregations (RANK + LAG over the full daily_market space,
+> plus CROSS JOIN + NOT EXISTS) keep the DBSP circuit producing a long stream of
+> incremental updates that the truncate-mode Delta writer cannot drain.
+
+So: implementing this is required to run the benchmark, Feldera does implement it, and
+it is genuinely expensive in precisely the way `skipped.md` predicted. Both things are
+true. Feldera pays the cost and takes the loss on those views rather than refusing the
+query.
+
+Infrastructure that already exists and should be reusable: `PartitionedTopKOp` (rank
+machinery for the filter pattern) and `PartitionedWindowAggregateOp`'s affected-range
+recompute (which is how bounded churn is kept sound for window aggregates).
+
+### 2. Nested `ROW` structs — BLOCKING, architectural
+
+`models/sources/batch1_customer_mgmt.sql` declares five levels of nested `ROW(...)`,
+consumed by `bronze/crm/crm_customer_mgmt.sql` via three-deep dotted paths:
+
+```sql
+cm.Customer.ContactInfo.C_PHONE_1.C_CTRY_CODE
+```
+
+DbspNet has no ROW/STRUCT type — `skipped.md:569` marks ARRAY/MAP/ROW **[P2]**, and
+`skipped.md:337-338` marks the `ROW(...)` constructor **[P2]**. This is type-system work
+plus an Arrow nested-type mapping, for exactly one source declaration and one consuming
+model. Narrow blast radius, deep implementation.
+
+### 3. Multi-key window `ORDER BY` — BLOCKING, bounded
+
+`skipped.md:479` marks this **[P3]**, but it sits on the workload's critical path.
+
+The SCD Type 2 end-dating idiom appears in 6 silver models (`accounts:42`,
+`customers:42`, `companies:22`, `securities:22`, `financials:34`, `trades_history:25`):
+
+```sql
+LAG(effective_timestamp) OVER (PARTITION BY key ORDER BY effective_timestamp DESC, <tiebreakers>)
+  - INTERVAL '0.001' SECOND
+```
+
+`financials` is the extreme case — `ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY
+effective_timestamp DESC, year DESC, quarter DESC, posting_date DESC, company_name,
+revenue, earnings) = 1`: seven sort keys, mixed ASC/DESC.
+
+These six SCD2 models produce the validity intervals consumed by the 17 `BETWEEN` range
+joins across 11 models. This idiom is the structural spine of the workload.
+
+Note `financials` uses `= 1` rather than `<= 1`; `Resolver.cs:1060` matches `< k` / `<= k`
+(and reversed). Trivially adjacent, but check it.
+
+### 4. OUTER JOIN with a non-equi conjunct — BLOCKING, bounded
+
+`skipped.md:173-177` **[P1]**. `Resolver.cs:2127-2131` rejects any non-equi conjunct in
+an outer join's ON.
+
+Hit by `silver/securities.sql` and `silver/financials.sql`, which do
+`LEFT JOIN … ON <equi> AND <BETWEEN>` (the temporal-validity pattern, 2 each).
+
+Most of the 17 `BETWEEN` joins are INNER and are fine — non-equi INNER is supported via
+the unit-key nested-loop path (`skipped.md:145-152`). Only the LEFT-joined ones fail.
+
+### 5. `STDDEV` — BLOCKING, bounded
+
+`skipped.md:397-398` **[P2]**. 11 call sites across all 5 analytics models, always
+unqualified `STDDEV` — never `STDDEV_POP` / `STDDEV_SAMP`.
+
+Engines disagree on what bare `STDDEV` means (PostgreSQL/Spark → SAMP; others → POP).
+Match whatever the other participants resolve to, or the numbers are silently
+incomparable.
+
+Decomposable into SUM/COUNT/SUM-of-squares, so it should be invertible and fit the
+existing incremental aggregate machinery.
+
+### 6. Small, well-scoped additions
+
+| Gap | Sites | Notes |
+|---|---|---|
+| `MD5` | 6 dim models | Transitively required — `dbt_utils.generate_surrogate_key` expands to `md5(cast(coalesce(...) \|\| '-' \|\| ... as varchar))`. `\|\|`, `COALESCE`, `CAST` are already supported. |
+| `CONCAT_WS` | 6 | `crm_customer_mgmt`. Not in the registry (`concat` is). |
+| `RLIKE` | 2 | `finwire_financial:22`, `finwire_security:17`, both `'^[0-9]+$'`. Spark-flavored; `REGEXP_LIKE` already exists. No POSIX classes involved. |
+| `TINYINT` | 3 columns | Not parsed at all. `staging_account.taxstatus`, `staging_customer.tier`, `staging_trade.t_is_cash`. |
+| `CAST(bigint AS TIMESTAMP)` | 2 | `crm_customer_mgmt`, `cdc_dsn`. Outside the CAST matrix (`skipped.md:890-894`). |
+| Typed temporal literals | 6 | `TIMESTAMP '9999-12-31 23:59:59.999'`. `skipped.md:501-505` **[P2]**; workaround is `CAST('…' AS TIMESTAMP)`. |
+| Named `WINDOW` clause | 2 models | `silver/daily_market.sql`, `gold/dim_customer.sql`. `skipped.md:479-480` **[P3]**; inlining the spec is equivalent. |
+
+### 7. Verified non-issues
+
+Worth recording, because several looked like blockers on first pass.
+
+- **Window frames.** The project contains **zero** explicit frame clauses — no
+  `ROWS`/`RANGE`/`GROUPS`, no `PRECEDING`/`FOLLOWING`/`UNBOUNDED` anywhere. Everything
+  relies on the SQL default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, which is
+  exactly DbspNet's supported shape (`Resolver.cs:1499-1520`: RANGE-only, end bound
+  `CURRENT ROW`, start `UNBOUNDED PRECEDING`). Windows without `ORDER BY` get the
+  whole-partition shape, also supported. Our `ROWS`/`GROUPS` and `FOLLOWING` gaps do not
+  bite.
+- **Cross-temporal CAST** (`CAST(ts AS DATE)`, ~10 sites) is **shipped** —
+  `ExpressionCompiler.cs:610,618` implement both directions. See doc corrections below.
+- **Correlated `NOT EXISTS`** (4 models) is shipped. See doc corrections below.
+- **Typeless NULL** (`skipped.md:744-747`) does not bite: the 3-way `UNION ALL` in
+  `crm_customer_mgmt:119,121` pads branches with typed `CAST(null AS <type>)`.
+- **Identifier quoting**: the project sets `quoting: identifier: true`, so dbt emits
+  `"double quotes"` — the only form DbspNet parses (`skipped.md:681-683`). No `::` casts
+  either; the Feldera project uses `CAST(...)` throughout (the duckdb project uses `::`).
+- **`SUBSTRING(s, pos, len)`** — comma form only, which is what we parse. The
+  `SUBSTRING(s FROM a FOR b)` keyword spelling we don't parse never appears.
+- **No `ORDER BY` / `LIMIT`** anywhere in the project, so the TOP-K path is not exercised
+  at query level.
+- **`COUNT(DISTINCT CAST(ts AS DATE))`** — `COUNT(DISTINCT <expr>)` is supported.
+- Supported and used throughout: `UNION ALL` (2 sites), CTEs (pervasive), `CROSS JOIN`
+  (5, each against a 1-row global-aggregate CTE), `JOIN … USING` (5), `HAVING` (4),
+  self-joins (4 models), `CASE` simple + searched, `COALESCE`, `NULLIF`, `ROUND`,
+  `TRIM`, `POSITION`, `DECIMAL(38,4)`/`(38,6)`, `INTERVAL '0.001' SECOND`.
+
+## Precedent: engine-specific rewrites are legitimate
+
+The Feldera project already carries documented workarounds for its own engine's gaps:
+
+- `LAST_VALUE(x IGNORE NULLS)` → a `COUNT(col) OVER w` cumulative-group-id +
+  `MAX(col) OVER (PARTITION BY key, grp)` forward-fill (`gold/dim_customer.sql`, 22
+  columns each way). The duckdb project uses `IGNORE NULLS` directly.
+- `strptime` / `::DATE` → `SUBSTRING` + `||` + `CAST` (the three finwire models).
+- `regexp_matches` → `RLIKE`.
+- `source()` → `ref()`.
+
+So a `dbspnet` dbt project may legitimately carry its own rewrites for the §6 tail. The
+line worth holding: rewrites that preserve the query's algorithmic shape are fair;
+rewrites that change it are not. Dodging §1 by restructuring the analytics models into
+TopK filters would mean measuring a different query — that one has to be built or
+declared out of scope.
+
+## Corrections to `skipped.md` found during this audit — FIXED
+
+All three were stale in a way that made this benchmark look harder than it is. Fixed as
+a standalone docs commit before implementation started; recorded here because the
+*reason* each was wrong is worth keeping.
+
+1. **CAST matrix** claimed cross-temporal casts (`date ↔ timestamp`) were missing. They
+   are implemented — `ExpressionCompiler.cs:610` (`CAST(timestamp AS date)`, floors to
+   the day) and `:618` (`CAST(date AS timestamp)`, midnight). TPC-DI leans on this
+   heavily (~10 sites). The entry now scopes the remaining gap to numeric→temporal,
+   which is real (§6).
+2. **`NOT IN (subquery)`** was listed **[P1]** deferred under the uncorrelated-subquery
+   bullet, contradicted by the very next bullet describing it as implemented with full
+   3VL. The doc-comment at `Resolver.cs` likewise claimed correlated `NOT EXISTS`
+   "rejects with a deferred message — the anti-semi-join primitive isn't in v1", three
+   lines above its own `IsAnti: isNegated`. Implemented (`Resolver.cs:2977`, `:3055`) and
+   tested (`AntiSemiJoinTests.cs`, `NullableNotInTests.cs`). The benchmark uses
+   correlated `NOT EXISTS` in 4 models.
+3. **Feldera rank parity** — see §1. The entry now records that Feldera supports the
+   general form, keeps the (still-correct) cost analysis, and cites this document.
+
+## Summary
+
+| # | Gap | Models hit | Class |
+|---|---|---|---|
+| 1 | Rank projected into output | 5 (all analytics) | Architectural — design decision |
+| 2 | Nested `ROW` structs | 2 | Architectural — type system |
+| 3 | Multi-key window `ORDER BY` | 7 | Bounded — core idiom |
+| 4 | OUTER JOIN + non-equi conjunct | 2 | Bounded |
+| 5 | `STDDEV` | 5 | Bounded |
+| 6 | Scalar/type tail | ~10 | Trivial, partly dodgeable |
+
+Items 1–5 are the critical path. Item 1 gates 5 of 50 models and is a design decision
+rather than a coding task; the rest are ordinary implementation work.
+
+Input/output adapter work is **not** on the critical path and should follow, not lead —
+the SQL surface is what determines whether the benchmark can run at all. See the
+connector notes in this repo's memory and `08-feldera-internals.md` §6 in the external
+research journal (transport vs. integrated connectors; Delta Lake is *integrated*,
+decoding Parquet to Arrow `RecordBatch`es and pushing structured records straight into
+`InputHandle` with no generic parser).

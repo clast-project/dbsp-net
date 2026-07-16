@@ -2944,9 +2944,9 @@ public sealed class Resolver
     /// to <paramref name="scalarConjunctsForLater"/> for normal scalar
     /// resolution. Correlated cases lift to a <see cref="SemiJoinPlan"/>
     /// with the correlation columns as equi-keys (no IN-probe key, unlike
-    /// <see cref="LiftInSubqueryToSemiJoin"/>). Correlated NOT EXISTS
-    /// rejects with a deferred message — the anti-semi-join primitive
-    /// isn't in v1.
+    /// <see cref="LiftInSubqueryToSemiJoin"/>). Correlated NOT EXISTS lifts to
+    /// the same <see cref="SemiJoinPlan"/> with <c>IsAnti: true</c>, which the
+    /// compiler emits as <c>outer − SemiJoin(outer, sq)</c>.
     /// </summary>
     private LogicalPlan LiftExistsOrDesugar(
         LogicalPlan plan,
