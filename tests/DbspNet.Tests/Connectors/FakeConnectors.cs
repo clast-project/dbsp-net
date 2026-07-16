@@ -140,7 +140,14 @@ internal sealed class FakeInputConnector : IInputConnector
 
         var batch = ArrowTestData.Batch(_schema, rows);
         var completed = idx == _versions.Count - 1;
-        return ValueTask.FromResult<InputBatch?>(new InputBatch(batch, weights, new LongOffset(idx), completed));
+        return ValueTask.FromResult<InputBatch?>(
+            new InputBatch(Single(new VersionBatch(batch, weights)), new LongOffset(idx), completed));
+    }
+
+    private static async IAsyncEnumerable<VersionBatch> Single(VersionBatch vb)
+    {
+        yield return vb;
+        await Task.CompletedTask;
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;

@@ -1,0 +1,3 @@
+[submodule "external/engineered-wood"]
+	path = external/engineered-wood
+	url = https://github.com/CurtHagenlocher/engineered-wood

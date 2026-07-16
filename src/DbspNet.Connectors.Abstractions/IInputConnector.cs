@@ -41,22 +41,31 @@ public interface IInputConnector : IAsyncDisposable
     ValueTask<IConnectorOffset?> LatestOffsetAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// The next unit of change after <paramref name="from"/> (exclusive) — one Delta
-    /// version's rows + signed weights, tagged with the offset it advances to — or
-    /// <c>null</c> if nothing new is available. A bounded source (e.g. a Parquet file)
-    /// returns its whole contents once with <see cref="InputBatch.Completed"/> set.
+    /// The next unit of change after <paramref name="from"/> (exclusive) — one source
+    /// version's changes, tagged with the offset it advances to — or <c>null</c> if
+    /// nothing new is available. A version may span several Arrow batches (several
+    /// Parquet files); all are applied within the one tick the runner Steps for it. A
+    /// bounded source (e.g. a Parquet file) returns its whole contents once with
+    /// <see cref="InputBatch.Completed"/> set.
     /// </summary>
     ValueTask<InputBatch?> NextAsync(IConnectorOffset from, CancellationToken cancellationToken);
 }
 
 /// <summary>
-/// One tick's worth of change from a source: Arrow <paramref name="Rows"/> with matching
-/// signed per-row <paramref name="Weights"/> (length == <c>Rows.Length</c>), tagged with
-/// the <paramref name="Offset"/> this batch advances the source to. <paramref name="Completed"/>
-/// signals a bounded source has been fully read.
+/// One tick's worth of change from a source: the changes of one version as a
+/// <b>lazy stream</b> of Arrow batches (<paramref name="Content"/>), tagged with the
+/// <paramref name="Offset"/> this version advances the source to. The runner pulls the
+/// stream one <see cref="VersionBatch"/> at a time, pushing each before the single
+/// <c>Step</c> for this version — so only one Arrow batch is materialised at a time (a
+/// large version is not double-buffered; <c>PushArrow</c> copies each batch's values
+/// into the engine input, then it is releasable). <paramref name="Completed"/> signals a
+/// bounded source has been fully read.
 /// </summary>
 public sealed record InputBatch(
-    RecordBatch Rows,
-    long[] Weights,
+    IAsyncEnumerable<VersionBatch> Content,
     IConnectorOffset Offset,
     bool Completed = false);
+
+/// <summary>One Arrow batch of a version, with its matching signed per-row weights
+/// (<c>Weights.Length == Batch.Length</c>).</summary>
+public readonly record struct VersionBatch(RecordBatch Batch, long[] Weights);

@@ -1,0 +1,16 @@
+<Project>
+  <!--
+    Build isolation for git submodules under external/ (e.g. engineered-wood).
+    The repo root enables Central Package Management (ManagePackageVersionsCentrally),
+    but submodule projects carry inline PackageReference versions and have no
+    Directory.Packages.props of their own — so without this barrier their MSBuild
+    walk would reach the root's CPM file and fail (NU1008: a versioned
+    PackageReference is not allowed when CPM is on). Disabling CPM here stops the
+    walk at external/ and lets the submodules build exactly as they do standalone.
+    dbsp-net's own projects (under src/, tests/) are unaffected — they still find
+    the repo-root Directory.Packages.props.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

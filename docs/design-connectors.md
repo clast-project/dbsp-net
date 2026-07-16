@@ -329,10 +329,21 @@ the chosen one-tick-per-version default.
 ## Build phases
 
 1. **Abstractions + fakes + runner** (no EW): interfaces, `PipelineRunner`, offset model,
-   in-memory fakes, the differential + recovery tests. Proves the framework.
-2. **Core gaps G1/G2/G3** in `DbspNet.Arrow` / `DbspNet.Persistence`.
+   in-memory fakes, the differential + recovery tests. Proves the framework. **DONE**
+   (G1/G2 pulled forward; `InputBatch` streams `VersionBatch`es so a large version isn't
+   double-buffered — one Arrow batch live at a time).
+2. **Core gaps G1/G2/G3** in `DbspNet.Arrow` / `DbspNet.Persistence`. **DONE** (G1/G2 in
+   phase 1; G3 = offsets in the snapshot manifest, phase 2).
 3. **engineered-wood submodule + `DeltaInputConnector`/`DeltaOutputConnector`/`Parquet`**,
-   round-trip tests against local Delta.
+   round-trip tests against local Delta. **DONE (2026-07-16).** Submodule at
+   `external/engineered-wood` (build-isolated via `external/Directory.Packages.props`
+   disabling CPM + `external/Directory.Build.props`); Apache.Arrow unified to **23.0.0**
+   across dbsp-net + EW (one `RecordBatch` type across the boundary). New project
+   `DbspNet.Connectors.EngineeredWood`: `DeltaInputConnector` (CDF-from-0 follow, one tick
+   per version, `_change_type`→signed weights), `DeltaOutputConnector`
+   (`Overwrite`=truncate / append changelog), `ParquetInputConnector` (bounded). Round-trip
+   tests against real local Delta tables (create+append+overwrite → engine view == source
+   contents; truncate sink == view; incremental resume across drains).
 4. **Mini end-to-end**, then wire the real ivm-bench harness (input/output adapters +
    the drain signal) — the last mile to a measured run.
 

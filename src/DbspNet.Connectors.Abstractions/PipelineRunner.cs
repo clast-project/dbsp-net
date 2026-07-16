@@ -143,7 +143,14 @@ public sealed class PipelineRunner
                     continue;
                 }
 
-                b.TableInput.PushArrow(batch.Rows, batch.Weights);
+                // A version may stream several batches; push each (PushArrow copies the
+                // values out, so only one Arrow batch is live at a time), then Step once
+                // — one engine tick per source version.
+                await foreach (var vb in batch.Content.WithCancellation(cancellationToken).ConfigureAwait(false))
+                {
+                    b.TableInput.PushArrow(vb.Batch, vb.Weights);
+                }
+
                 _query.Step();
                 ticks++;
                 b.Cursor = batch.Offset;
