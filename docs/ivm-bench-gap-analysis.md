@@ -574,3 +574,22 @@ connector notes in this repo's memory and `08-feldera-internals.md` §6 in the e
 research journal (transport vs. integrated connectors; Delta Lake is *integrated*,
 decoding Parquet to Arrow `RecordBatch`es and pushing structured records straight into
 `InputHandle` with no generic parser).
+
+## Output contract — stored / integrated output — DONE (2026-07-16)
+
+Between "the SQL surface compiles" and "the adapters plug in" sits one **engine-side**
+piece: the benchmark measures **full-state materialization**, not delta emission (see
+"The output contract" above), but DbspNet's output boundary emitted only per-tick
+deltas. Closed by `IntegrateOp` (the DBSP `I` operator at the output boundary), opt-in
+via `CompileOptions.StoredOutput`: it integrates the final delta stream so
+`CompiledQuery.CurrentView` / `EnumerateView()` expose the full materialized view for a
+truncate-mode sink, while the delta still flows through (`CompiledQuery.Current`
+unchanged). The view is `ISnapshotable`, so it is retained across restart and inside the
+measured commit — the analogue of Feldera's `+stored` MV. Reuses `ZSetTrace.Integrate`
+(no new algebra). Per-tick cost `O(|delta|)`; the `O(|view|)` full-rewrite is paid by the
+sink enumerating the view — exactly what Feldera is charged for (and what wedged
+truncate-mode on `fact_market_history` / `daily_market_pulse`). Design +
+change-sites in `docs/design-stored-output.md`; differential (view ≡ accumulated deltas
+≡ batch) + snapshot round-trip tests. **Remaining for an end-to-end run: input adapter
+(Delta/Parquet → `InputHandle`), output adapter (`EnumerateView` → Delta truncate write +
+drain signal), and a real-data correctness pass.**

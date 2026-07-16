@@ -101,4 +101,18 @@ public sealed record CompileOptions
     /// Off by default while it is gated.
     /// </summary>
     public bool CoalesceJoinExchange { get; init; }
+
+    /// <summary>
+    /// Opt-in stored / integrated output (docs/design-stored-output.md). When set,
+    /// the compiler integrates the final delta stream at the output boundary (the
+    /// DBSP <c>I</c> operator, an <c>IntegrateOp</c>) so
+    /// <see cref="CompiledQuery.CurrentView"/> exposes the <b>full current view
+    /// contents</b> — a materialized view — for a truncate-mode sink to write a full
+    /// snapshot per batch (the analogue of Feldera's <c>+stored</c> MV; required for
+    /// ivm-bench's full-state contract). The delta output (<see cref="CompiledQuery.Current"/>)
+    /// is unaffected — the delta still flows through. Off by default: a delta-only
+    /// pipeline pays nothing, and the circuit's operator set (hence its snapshot
+    /// fingerprint) is unchanged unless this is requested.
+    /// </summary>
+    public bool StoredOutput { get; init; }
 }

@@ -17,16 +17,20 @@ namespace DbspNet.Sql.Compiler;
 /// </summary>
 public sealed class CompiledQuery
 {
+    private readonly IntegratedViewHandle<StructuralRow>? _view;
+
     internal CompiledQuery(
         RootCircuit circuit,
         IReadOnlyDictionary<string, TableInput> inputs,
         OutputHandle<ZSet<StructuralRow, Z64>> output,
-        Schema outputSchema)
+        Schema outputSchema,
+        IntegratedViewHandle<StructuralRow>? view = null)
     {
         Circuit = circuit;
         Inputs = inputs;
         Output = output;
         OutputSchema = outputSchema;
+        _view = view;
     }
 
     public RootCircuit Circuit { get; }
@@ -36,6 +40,12 @@ public sealed class CompiledQuery
     public OutputHandle<ZSet<StructuralRow, Z64>> Output { get; }
 
     public Schema OutputSchema { get; }
+
+    /// <summary>
+    /// True when the query was compiled with <see cref="CompileOptions.StoredOutput"/>,
+    /// so <see cref="CurrentView"/> / <see cref="EnumerateView"/> are available.
+    /// </summary>
+    public bool HasStoredOutput => _view is not null;
 
     /// <summary>
     /// Convenience: push the queued deltas on every input, then commit one tick.
@@ -58,8 +68,41 @@ public sealed class CompiledQuery
     /// </summary>
     public IReadOnlyList<DbspNet.Core.Circuit.OperatorStat> CollectStats() => Circuit.CollectStats();
 
-    /// <summary>The current output Z-set (only meaningful after <see cref="Step"/>).</summary>
+    /// <summary>The current output <b>delta</b> Z-set (only meaningful after
+    /// <see cref="Step"/>).</summary>
     public ZSet<StructuralRow, Z64> Current => Output.Current;
+
+    /// <summary>
+    /// The full current <b>view</b> contents — every output delta integrated so far
+    /// — for a truncate-mode sink to write as a full snapshot per batch. Requires
+    /// the query to have been compiled with <see cref="CompileOptions.StoredOutput"/>
+    /// (see <see cref="HasStoredOutput"/>); throws otherwise. Valid until the next
+    /// <see cref="Step"/> (the same lifetime as <see cref="Current"/>).
+    /// </summary>
+    public ZSet<StructuralRow, Z64> CurrentView =>
+        (_view ?? throw new InvalidOperationException(
+            "CurrentView requires CompileOptions.StoredOutput; this query emits deltas only.")).Current;
+
+    /// <summary>
+    /// Enumerate the full current view as <c>(row values, weight)</c> pairs in the
+    /// internal storage representation (VARCHAR as <see cref="Utf8String"/>, DECIMAL
+    /// as <c>Decimal128</c>) — a convenience seam for an output adapter, which maps
+    /// these to its wire format (e.g. Arrow for a Delta sink). See
+    /// <see cref="CurrentView"/> for the requirements.
+    /// </summary>
+    public IEnumerable<(object?[] Values, long Weight)> EnumerateView()
+    {
+        foreach (var (row, weight) in CurrentView)
+        {
+            var values = new object?[OutputSchema.Count];
+            for (var i = 0; i < values.Length; i++)
+            {
+                values[i] = row[i];
+            }
+
+            yield return (values, weight.Value);
+        }
+    }
 
     /// <summary>
     /// Look up the weight of a specific row in the current output. Hides

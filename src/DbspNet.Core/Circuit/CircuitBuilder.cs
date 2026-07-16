@@ -84,6 +84,27 @@ public sealed class CircuitBuilder
     }
 
     /// <summary>
+    /// Integrate a Z-set delta stream at the output boundary — the DBSP <c>I</c>
+    /// operator. Returns the (pass-through) delta stream unchanged plus an
+    /// <see cref="IntegratedViewHandle{TRow}"/> exposing the full materialized view
+    /// contents (every delta folded in so far), for a truncate-mode sink to write a
+    /// full snapshot per batch. Opt-in — a delta-only pipeline simply never calls
+    /// this. Pass <paramref name="snapshotCodec"/> to include the view in the
+    /// circuit's snapshot/commit.
+    /// </summary>
+    public (Stream<ZSet<TRow, Z64>> Output, IntegratedViewHandle<TRow> View) Integrate<TRow>(
+        Stream<ZSet<TRow, Z64>> input,
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        where TRow : notnull
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
+        var op = new IntegrateOp<TRow>(input, output, snapshotCodec);
+        AddRawOperator(op);
+        return (output, new IntegratedViewHandle<TRow>(op));
+    }
+
+    /// <summary>
     /// Register a raw operator with the circuit in topological order.
     /// Internal hook used by stateful operators that need direct control
     /// over their inputs and outputs.

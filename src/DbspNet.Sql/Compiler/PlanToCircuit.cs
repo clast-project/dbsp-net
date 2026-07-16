@@ -89,6 +89,7 @@ public static class PlanToCircuit
         RootCircuit? circuit = null;
         Dictionary<string, TableInput>? inputs = null;
         OutputHandle<ZSet<StructuralRow, Z64>>? output = null;
+        IntegratedViewHandle<StructuralRow>? view = null;
 
         // The spine memtable capacity (CompileOptions.SpineStagingCapacity) is
         // realised through the SpineStagingConfig ambient seam, which each trace
@@ -191,6 +192,18 @@ public static class PlanToCircuit
                 queryStream = CompilePlan(builder, plan, ctx);
             }
 
+            // Opt-in stored output: integrate the final delta at the boundary so the
+            // full materialized view is retained (and snapshot-persisted) for a
+            // truncate-mode sink. The delta still flows through the returned stream,
+            // so the plain OutputHandle is unchanged. See docs/design-stored-output.md.
+            if (options.StoredOutput)
+            {
+                var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
+                var integrated = builder.Integrate(queryStream, viewCodec);
+                queryStream = integrated.Output;
+                view = integrated.View;
+            }
+
             output = builder.Output(queryStream);
         });
         }
@@ -199,7 +212,7 @@ public static class PlanToCircuit
             SpineStagingConfig.Capacity = prevStagingCapacity;
         }
 
-        return new CompiledQuery(circuit!, inputs!, output!, plan.Schema);
+        return new CompiledQuery(circuit!, inputs!, output!, plan.Schema, view);
     }
 
     private sealed class CompileContext
