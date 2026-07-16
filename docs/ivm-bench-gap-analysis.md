@@ -429,6 +429,50 @@ a standalone docs commit before implementation started; recorded here because th
 3. **Feldera rank parity** — see §1. The entry now records that Feldera supports the
    general form, keeps the (still-correct) cost analysis, and cites this document.
 
+## Standup results (2026-07-16) — measured, corrects the static gaps
+
+Ran every feldera model through resolve+compile (minimal Jinja expansion: `{{ ref }}` →
+name, `generate_surrogate_key` → its `md5(coalesce/cast/||)` form; sources wrapped as
+`CREATE TABLE`, views registered in dependency order). Outcome:
+
+- **Sources: 20/20 register** — including `batch1_customer_mgmt`'s 5-level nested `ROW`.
+- **Views: 17/50 compile** today. The other 33 reduce to **three root causes**; ~21 of
+  them are pure cascades (`unknown table X` because X failed upstream).
+
+The three roots, ranked by cascade impact:
+
+1. **Window function nested in an expression** — the SCD2 `is_current` marker:
+   `CASE WHEN action_ts = MAX(action_ts) OVER (PARTITION BY key) THEN true ELSE false END`.
+   The resolver requires a window function to be a top-level SELECT item. Roots in 5 silver
+   models (`accounts`, `companies`, `customers`, `securities`, `trades_history`) and
+   cascades to nearly every downstream dim/fact. **The #1 blocker, and it was missed** — the
+   static analysis logged `MAX(ts) OVER (PARTITION BY key)` as a supported whole-partition
+   shape but didn't notice the enclosing `CASE`. Fix shape: lift the window aggregate to a
+   hidden column and rewrite the expression to reference it.
+
+2. **Typeless NULL** — bare `null` resolves to `INTEGER NULL`, which then won't unify. Bites
+   two ways: a `CASE` branch of bare `null` against a typed other branch
+   (`finwire_company` null-vs-DATE, `finwire_financial`/`finwire_security`/`watches_history`
+   null-vs-VARCHAR), and `CAST(null AS DATE)` (`crm_customer_mgmt`, the one **compile**
+   failure — `INTEGER→DATE` isn't in the cast matrix, but the real cause is the bare null).
+   This is `skipped.md`'s **[P1]** typeless-NULL gap. **The static analysis explicitly called
+   it a non-issue** (the 3-way UNION pads with typed `CAST(null AS …)`) — true for the UNION,
+   but it missed the `CASE` branches and `CAST(null AS DATE)`. Fix shape: make a bare-null
+   literal adopt its context type (CASE-branch unification, CAST target, comparison peer).
+
+3. **Named `WINDOW` clause** — `daily_market`, `dim_customer` (+ cascade to
+   `market_volatility`, `fact_market_history`, `daily_market_pulse`). The gap-6 item already
+   deferred.
+
+Gap 1 (rank-in-output) did **not** surface — the analytics models that use it all failed as
+`unknown table 'fact_trade'` (cascade behind root #1). It's still there, masked; it reappears
+once the cascade clears.
+
+**Net: the real remaining critical path is #1 (window-in-expression) + #2 (typeless NULL),
+neither of which was on the ranked list below.** Both are resolver work of similar weight to
+the completed gaps. A throwaway harness (`tests/DbspNet.Tests/Scratch/IvmBenchStandup.cs`,
+uncommitted) reproduces these numbers for measuring progress.
+
 ## Summary
 
 | # | Gap | Models hit | Class |
