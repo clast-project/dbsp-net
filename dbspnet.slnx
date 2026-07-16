@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/DbspNet.Benchmarks/DbspNet.Benchmarks.csproj" />
+    <Project Path="src/DbspNet.Connectors.Abstractions/DbspNet.Connectors.Abstractions.csproj" />
     <Project Path="src/DbspNet.Core/DbspNet.Core.csproj" />
     <Project Path="src/DbspNet.Demo/DbspNet.Demo.csproj" />
     <Project Path="src/DbspNet.Sql/DbspNet.Sql.csproj" />

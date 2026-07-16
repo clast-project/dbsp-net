@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <!-- CA1036 (define <,<=,>,>= alongside IComparable): connector offsets are an
+         ordered progress marker compared only via CompareTo (never operators); every
+         offset implementation would otherwise carry four no-value operators. -->
+    <NoWarn>$(NoWarn);CA1036</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Engine-only dependencies: Sql (Catalog/CompiledQuery/Schema), Persistence
+         (Snapshot/ITableFileSystem), Arrow (RecordBatch bridge). No engineered-wood
+         dependency — that lives in DbspNet.Connectors.EngineeredWood. -->
+    <ProjectReference Include="..\DbspNet.Arrow\DbspNet.Arrow.csproj" />
+    <ProjectReference Include="..\DbspNet.Persistence\DbspNet.Persistence.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" />
+  </ItemGroup>
+</Project>

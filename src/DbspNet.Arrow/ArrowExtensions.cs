@@ -30,8 +30,27 @@ public static class ArrowExtensions
     public static ArrowDelta ToArrowDelta(this CompiledQuery query)
     {
         ArgumentNullException.ThrowIfNull(query);
-        var schema = query.OutputSchema;
-        var zset = query.Current;
+        return BuildArrow(query.OutputSchema, query.Current);
+    }
+
+    /// <summary>
+    /// Materialise the query's full current <b>view</b> (every delta integrated so
+    /// far) as an Arrow batch plus a parallel weights array — the mirror of
+    /// <see cref="ToArrowDelta"/> for a truncate-mode sink. Requires the query to have
+    /// been compiled with <see cref="DbspNet.Sql.Compiler.CompileOptions.StoredOutput"/>
+    /// (throws otherwise, via <see cref="CompiledQuery.CurrentView"/>). <c>weights[i]</c>
+    /// is row <c>i</c>'s multiplicity in the view (≥ 1 for a well-formed query; a set
+    /// after DISTINCT/aggregation, a bag under UNION ALL).
+    /// </summary>
+    public static ArrowDelta ToArrowView(this CompiledQuery query)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        return BuildArrow(query.OutputSchema, query.CurrentView);
+    }
+
+    private static ArrowDelta BuildArrow(
+        SqlSchema schema, DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> zset)
+    {
         var rowCount = zset.Count;
         var columnCount = schema.Count;
 

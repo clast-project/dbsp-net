@@ -58,4 +58,55 @@ public static class ArrowSchemaBridge
                 $"no Arrow mapping for SQL type {type.Display}"),
         };
     }
+
+    /// <summary>
+    /// Reverse of <see cref="ToArrow"/>: infer a DbspNet <see cref="SqlSchema"/> from
+    /// an Arrow schema (a source file/table's schema), preserving column names and
+    /// nullability. Used by connectors to register an inferred table schema and to
+    /// validate a source against a declared one. Nested / unsupported Arrow types are
+    /// rejected in v1 (see <see cref="FromArrowType"/>).
+    /// </summary>
+    public static SqlSchema FromArrow(ArrowSchema schema)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        var cols = new List<DbspNet.Sql.Plan.SchemaColumn>(schema.FieldsList.Count);
+        foreach (var f in schema.FieldsList)
+        {
+            cols.Add(new DbspNet.Sql.Plan.SchemaColumn(f.Name, FromArrowType(f.DataType, f.IsNullable)));
+        }
+
+        return new SqlSchema(cols);
+    }
+
+    /// <summary>
+    /// Map a single Arrow data type to its DbspNet <see cref="SqlType"/> counterpart.
+    /// The inverse of <see cref="ToArrowType"/> over the types DbspNet supports; small
+    /// signed integers widen to INTEGER (as <c>TINYINT</c>/<c>SMALLINT</c> already do),
+    /// any timestamp/time unit and timezone map to the µs-internal TIMESTAMP/TIME (unit
+    /// scaling, if any, is a per-value read concern, not a schema one). Unsigned ints,
+    /// 256-bit decimals, and nested/complex types (Struct/List/Map/Union/Binary) are
+    /// rejected — a connector must flatten or project them away first (the ROW-flatten
+    /// precedent).
+    /// </summary>
+    public static SqlType FromArrowType(IArrowType type, bool nullable = true)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        return type switch
+        {
+            Int8Type or Int16Type or Int32Type => new SqlIntegerType(nullable),
+            Int64Type => new SqlBigintType(nullable),
+            FloatType => new SqlRealType(nullable),
+            DoubleType => new SqlDoubleType(nullable),
+            Decimal128Type d => new SqlDecimalType(d.Precision, d.Scale, nullable),
+            StringType or LargeStringType => new SqlVarcharType(null, nullable),
+            BooleanType => new SqlBooleanType(nullable),
+            Date32Type => new SqlDateType(nullable),
+            Time64Type => new SqlTimeType(nullable),
+            TimestampType => new SqlTimestampType(nullable),
+            _ => throw new NotSupportedException(
+                $"no SQL mapping for Arrow type '{type.Name}' (TypeId {type.TypeId}); " +
+                "nested / unsigned / unsupported types are rejected in v1 — flatten or " +
+                "project them away in the connector first"),
+        };
+    }
 }
