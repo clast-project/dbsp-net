@@ -467,16 +467,20 @@ surfaced `dim_account`'s own root rather than clearing.
 to a midnight TIMESTAMP when compared to a TIMESTAMP (PG/Spark semantics). `fact_market_history`'s
 own DATE/TIMESTAMP error is gone (it now cascades from `financials`/gap-1). Still 35 compile.
 
-**Remaining roots at 35/50, ranked by cascade:**
-- **Numeric ↔ string comparison coercion — `BIGINT = VARCHAR`** (`dim_account`, the biggest
-  cascade: `USING (broker_id)` joins `accounts.broker_id` (BIGINT, from
-  `staging_account.ca_b_id`) against `dim_broker.broker_id` (VARCHAR, from
-  `batch1_hr.employeeid`) → blocks `fact_trade` → all 5 analytics + `fact_cash_transactions`).
-  **A policy decision, not a safe add:** PostgreSQL *rejects* `bigint = varchar`; Spark and
-  Calcite (Feldera) coerce (string → numeric). The values are genuinely numeric IDs stored
-  as strings. Adding it (cast the string operand to the numeric peer type) matches the
-  reference engines and unblocks ~7 models, but diverges from PG, risks a runtime parse
-  failure on a non-numeric string, and can mask real type errors. Needs a decision.
+**Update (numeric ↔ string coercion — opt-in seam):** shipped as
+`NumericStringCoercionMode` (default OFF = PostgreSQL-faithful; the benchmark run turns it
+on). PostgreSQL is the outlier in rejecting `bigint = varchar` for a column pair — SQL
+Server, Oracle, MySQL, DuckDB, Spark, and Calcite (Feldera) all coerce, including all three
+ivm-bench engines. With it on, `dim_account` compiles and cascade-clears `fact_trade` and
+much of the analytics chain. **35 → 39.**
+
+**Remaining roots at 39/50 — down to two, both known:**
+- **Rank-in-output / gap 1** (`market_volatility`, `financials`, `broker_performance`,
+  `daily_market_pulse` — `RANK`/`ROW_NUMBER`/`DENSE_RANK` in output; + cascades). The
+  architectural decision item, now the dominant blocker.
+- **`JOIN USING` merged key not exposed downstream** (`watches`/`symbol`,
+  `fact_holdings`/`trade_id`; + cascade to `fact_watches`, `trade_volume_stats`,
+  `customer_concentration`). A focused resolver gap.
 - **Rank-in-output / gap 1** (`market_volatility`, `financials` + `wrk_company_financials`;
   the analytics models are behind `dim_account`) — the architectural decision item.
 - **`JOIN USING` merged key not exposed downstream** (`watches`, `fact_holdings`).

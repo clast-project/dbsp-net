@@ -582,6 +582,64 @@ public class ScalarFunctionTests
             q => q.Table("t").Insert((object?)null)));
     }
 
+    // ---- Numeric ↔ string comparison coercion (opt-in seam) ----
+
+    [Fact]
+    public void NumericStringComparison_StrictByDefault_Throws()
+    {
+        // Default is PostgreSQL-faithful: BIGINT = VARCHAR is a type error.
+        Assert.False(DbspNet.Sql.TypeSystem.NumericStringCoercionMode.Enabled);
+        var ex = Assert.Throws<ResolveException>(() => Compile(
+            ["CREATE TABLE t (n BIGINT NOT NULL, s VARCHAR NOT NULL)"],
+            "SELECT n FROM t WHERE n = s"));
+        Assert.Contains("not comparable", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NumericStringComparison_Enabled_CoercesStringToNumeric()
+    {
+        try
+        {
+            DbspNet.Sql.TypeSystem.NumericStringCoercionMode.Enabled = true;
+            // dim_account shape: a BIGINT id joined against a VARCHAR id.
+            var q = Compile(
+                ["CREATE TABLE t (n BIGINT NOT NULL, s VARCHAR NOT NULL)"],
+                "SELECT n FROM t WHERE n = s");
+            q.Table("t").Insert(42L, "42");    // "42" parses to 42 → match
+            q.Table("t").Insert(7L, "8");      // 7 ≠ 8 → no match
+            q.Step();
+            Assert.Equal(1, q.Current.Count);
+            Assert.Equal(1, WeightOf(q.Current, 42L));
+        }
+        finally
+        {
+            DbspNet.Sql.TypeSystem.NumericStringCoercionMode.Enabled = false;
+        }
+    }
+
+    [Fact]
+    public void NumericStringComparison_Enabled_JoinOnMixedKeys()
+    {
+        try
+        {
+            DbspNet.Sql.TypeSystem.NumericStringCoercionMode.Enabled = true;
+            var q = Compile(
+                [
+                    "CREATE TABLE a (k BIGINT NOT NULL, v INT NOT NULL)",
+                    "CREATE TABLE b (k VARCHAR NOT NULL, w INT NOT NULL)",
+                ],
+                "SELECT a.v, b.w FROM a JOIN b ON a.k = b.k");
+            q.Table("a").Insert(100L, 1);
+            q.Table("b").Insert("100", 2);   // "100" coerces to 100 → joins
+            q.Step();
+            Assert.Equal(1, WeightOf(q.Current, 1, 2));
+        }
+        finally
+        {
+            DbspNet.Sql.TypeSystem.NumericStringCoercionMode.Enabled = false;
+        }
+    }
+
     // ---- Typeless NULL (bare null adopts context type) ----
 
     [Fact]

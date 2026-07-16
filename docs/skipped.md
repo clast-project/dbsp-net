@@ -1027,10 +1027,13 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
 - **[P1]** Implicit-to-explicit type coercion rules matching PostgreSQL.
   Partially done: **DATE ↔ TIMESTAMP** comparison coerces the DATE to a midnight
   TIMESTAMP (`CommonComparableType`), matching PostgreSQL / Spark — used by the
-  TPC-DI temporal-validity `BETWEEN` joins. Still deferred: **numeric ↔ string**
-  comparison coercion (`BIGINT = VARCHAR`), which PostgreSQL itself *rejects* but
-  Spark / Calcite (Feldera) coerce (string → numeric); a policy decision, not a
-  safe add — see `ivm-bench-gap-analysis.md`.
+  TPC-DI temporal-validity `BETWEEN` joins. **Numeric ↔ string** comparison
+  coercion (`BIGINT = VARCHAR`) is available as an **opt-in seam**
+  (`NumericStringCoercionMode`, default OFF = PostgreSQL-faithful): when enabled,
+  the string operand coerces to the numeric type. Off by default because PG
+  *rejects* the pair for a column comparison, but SQL Server / Oracle / MySQL /
+  DuckDB / Spark / Calcite (Feldera) all coerce — all three ivm-bench engines do,
+  so the benchmark harness turns it on (`dim_account`'s `USING (broker_id)`).
 - **[P2]** `OVERFLOW` semantics on integer arithmetic — v1 uses `checked`.
 - **[P2]** Floating-point edge cases: NaN, ±Inf, subnormals.
 - **[P2]** Decimal precision/scale overflow.

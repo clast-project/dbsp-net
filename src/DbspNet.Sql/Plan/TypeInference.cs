@@ -157,6 +157,24 @@ internal static class TypeInference
                 : new SqlIntervalType(IntervalQualifier.DayToSecond, nullable);
         }
 
+        // Numeric ↔ string. PostgreSQL rejects this for a column pair (default);
+        // SQL Server / Oracle / MySQL / DuckDB / Spark / Calcite (Feldera) coerce
+        // the string to the numeric type. Opt in via NumericStringCoercionMode
+        // (used by ivm-bench's dim_account USING(broker_id)). MaybeCast then casts
+        // the string operand — a non-numeric string fails on the runtime parse.
+        if (NumericStringCoercionMode.Enabled)
+        {
+            if (IsNumeric(a) && IsString(b))
+            {
+                return a.WithNullable(a.Nullable || b.Nullable);
+            }
+
+            if (IsString(a) && IsNumeric(b))
+            {
+                return b.WithNullable(a.Nullable || b.Nullable);
+            }
+        }
+
         throw new ResolveException($"types {a.Display} and {b.Display} are not comparable");
     }
 
