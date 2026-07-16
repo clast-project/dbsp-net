@@ -1341,11 +1341,10 @@ public sealed class Resolver
                 "a window function over a grouped / aggregated query is not supported in v1");
         }
 
-        if (stmt.Items.Any(it => it is StarSelectItem))
-        {
-            throw new ResolveException(
-                "SELECT * is not allowed with a window function; list the output columns explicitly");
-        }
+        // `SELECT *` alongside a window function expands to the BASE columns only
+        // (the pre-window relation), never the hidden window-result columns —
+        // handled by capping the star at baseSchema.Count in ResolveProjections
+        // below (dim_customer: `SELECT *, COUNT(col) OVER w, …`).
 
         // Resolve the pre-window relation (FROM + WHERE) as a star query so the
         // partition / order / argument expressions resolve against the full
@@ -1400,7 +1399,8 @@ public sealed class Resolver
         // Map the user's select list over the widened rows: non-window items
         // resolve against the base columns (the schema prefix); window items
         // resolve to their result column via `preBound`.
-        var projections = ResolveProjections(stmt.Items, windowPlan.Schema, subqueryMap: null, preBound);
+        var projections = ResolveProjections(
+            stmt.Items, windowPlan.Schema, subqueryMap: null, preBound, starColumnLimit: baseSchema.Count);
         LogicalPlan projected = new ProjectPlan(windowPlan, projections, BuildProjectSchema(projections));
         return stmt.Distinct ? new DistinctPlan(projected) : projected;
     }
@@ -2694,15 +2694,20 @@ public sealed class Resolver
         IReadOnlyList<SelectItem> items,
         Schema schema,
         IReadOnlyDictionary<SubqueryExpression, SubqueryBinding>? subqueryMap = null,
-        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
+        IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null,
+        int? starColumnLimit = null)
     {
+        // `SELECT *` expands to columns [0, starLimit). Capped to the base-column
+        // prefix on the window path so the hidden window-result columns (appended
+        // after) are not starred; unbounded (full schema) everywhere else.
+        var starLimit = starColumnLimit ?? schema.Count;
         var result = new List<ProjectionItem>();
         foreach (var item in items)
         {
             switch (item)
             {
                 case StarSelectItem s when s.TableQualifier is null:
-                    for (var i = 0; i < schema.Count; i++)
+                    for (var i = 0; i < starLimit; i++)
                     {
                         var c = schema[i];
                         // Don't expand the hidden subquery-join columns.
@@ -2717,7 +2722,7 @@ public sealed class Resolver
                     break;
                 case StarSelectItem s:
                     var any = false;
-                    for (var i = 0; i < schema.Count; i++)
+                    for (var i = 0; i < starLimit; i++)
                     {
                         var c = schema[i];
                         if (string.Equals(c.Qualifier, s.TableQualifier, StringComparison.Ordinal))

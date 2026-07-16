@@ -174,8 +174,17 @@ public class WindowAggregateTests
         "SELECT ts, SUM(amount) OVER (ORDER BY ts RANGE INTERVAL '1' YEAR PRECEDING) FROM orders");
 
     [Fact]
-    public void Rejects_StarWithWindow() => Rejects(
-        "SELECT *, SUM(amount) OVER (PARTITION BY cust) FROM orders");
+    public void Resolve_StarWithWindow_ExpandsBaseColumns()
+    {
+        // `SELECT *, agg OVER (…)` is now supported — the star covers the base
+        // columns (cust, amount, ts), the window result is appended.
+        var plan = ResolvePlan(Orders,
+            "SELECT *, SUM(amount) OVER (PARTITION BY cust) AS s FROM orders");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        Assert.IsType<WindowAggregatePlan>(proj.Input);
+        // 3 base columns + 1 window result.
+        Assert.Equal(4, plan.Schema.Count);
+    }
 
     [Fact]
     public void Rejects_WindowInWhere() => Rejects(
@@ -244,6 +253,37 @@ public class WindowAggregateTests
 
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
         z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
+
+    // ---- SELECT * alongside a window function ----
+
+    [Fact]
+    public void SelectStar_WithWindow_ExpandsBaseColumnsOnly()
+    {
+        // dim_customer shape: `SELECT *, agg(x) OVER w`. The * expands to the
+        // BASE columns (g, ts, v), NOT the hidden window-result column.
+        var q = Compile(S,
+            "SELECT *, COUNT(v) OVER (PARTITION BY g) AS cnt FROM s");
+        q.Table("s").Insert(1, 10, 100);
+        q.Table("s").Insert(1, 20, 200);
+        q.Step();
+        // Output = base (g, ts, v) + cnt; two rows in g=1 → cnt 2.
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 100, 2L));
+        Assert.Equal(1, WeightOf(q.Current, 1, 20, 200, 2L));
+    }
+
+    [Fact]
+    public void SelectStar_WithNamedWindow_DimCustomerShape()
+    {
+        // The exact dim_customer form: SELECT *, COUNT(col) OVER w … WINDOW w AS (…).
+        var q = Compile(S,
+            "SELECT *, COUNT(v) OVER w AS grp FROM s WINDOW w AS (PARTITION BY g ORDER BY ts)");
+        q.Table("s").Insert(1, 10, 100);
+        q.Table("s").Insert(1, 20, 200);
+        q.Step();
+        // Running COUNT over ts: 1, then 2. Star gives base cols only.
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 100, 1L));
+        Assert.Equal(1, WeightOf(q.Current, 1, 20, 200, 2L));
+    }
 
     // ---- Named WINDOW clause (parser substitutes the definition) ----
 

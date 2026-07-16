@@ -509,8 +509,11 @@ reflect that shape, not a backlog.
       top-level case already used, so no new operator. Rank functions
       (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) stay TopK-only even when nested. Window
       functions in `WHERE`/`GROUP BY`/`HAVING` stay rejected.
-    - **[P2]** A window function over a `GROUP BY` / `DISTINCT` inner query;
-      `SELECT *` alongside a window aggregate (list columns explicitly).
+    - **[DONE]** `SELECT *` alongside a window function — the star expands to the
+      BASE columns (the pre-window relation), never the hidden window-result
+      columns, by capping the star at `baseSchema.Count` in `ResolveProjections`
+      (`dim_customer`: `SELECT *, COUNT(col) OVER w, …`).
+    - **[P2]** A window function over a `GROUP BY` / `DISTINCT` inner query.
     - **[P2]** Neighborhood-only recompute for the running case (currently the
       affected suffix).
     - *N/A by design* — a **spine** variant. Like `TopKOp` / `PartitionedTopKOp`,

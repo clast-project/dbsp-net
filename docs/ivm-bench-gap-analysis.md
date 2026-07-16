@@ -460,15 +460,18 @@ separate P2, and it gates a big cascade: `dim_account` → `fact_cash_transactio
 `fact_trade` → the analytics models), `fact_market_history` (DATE vs TIMESTAMP comparison
 in the temporal-validity join — NEW).
 
-**Remaining roots, ranked by cascade:**
-- **`SELECT *` alongside a window function** (`dim_customer`) — biggest cascade now (~8
-  models via `dim_account`/`fact_trade`). `skipped.md` P2. dim_customer does
-  `select *, COUNT(col) OVER w, …`.
-- **Rank-in-output / gap 1** (`market_volatility`, `financials`, and the 5 analytics
-  models once unmasked) — the architectural decision item.
-- **DATE vs TIMESTAMP comparison** (`fact_market_history`) — `dm_date BETWEEN
-  s.effective_timestamp AND s.end_timestamp` compares a DATE to TIMESTAMP bounds. A small
-  type-coercion gap (NEW).
+**Update (`SELECT *` with a window fixed):** `dim_customer` compiles (35). Its cascade
+surfaced `dim_account`'s own root rather than clearing.
+
+**Remaining roots at 35/50, ranked by cascade:**
+- **Implicit type coercion in comparisons/joins** (the `[P1]` PostgreSQL-coercion gap) —
+  now the biggest cascade. `dim_account` (`BIGINT` vs `VARCHAR`, likely a `USING (broker_id)`
+  type mismatch — blocks `fact_trade` → all 5 analytics + `fact_cash_transactions`);
+  `fact_market_history` (`dm_date BETWEEN s.effective_timestamp AND s.end_timestamp` — DATE
+  vs TIMESTAMP; the DATE→TIMESTAMP cast already exists, just needs `CommonComparableType` to
+  allow it). These are the temporal-validity `BETWEEN` joins across the model.
+- **Rank-in-output / gap 1** (`market_volatility`, `financials` + `wrk_company_financials`;
+  the analytics models are behind `dim_account`) — the architectural decision item.
 - **`JOIN USING` merged key not exposed downstream** (`watches`, `fact_holdings`).
 
 Original three-cause writeup below.
