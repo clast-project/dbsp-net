@@ -24,6 +24,18 @@ public class ScalarFunctionTests
         return PlanToCircuit.Compile(plan);
     }
 
+    private static SelectPlan ResolvePlan(string query, params string[] ddl)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        foreach (var s in ddl)
+        {
+            resolver.Resolve(Parser.ParseStatement(s));
+        }
+
+        return (SelectPlan)resolver.Resolve(Parser.ParseStatement(query));
+    }
+
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
         z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
 
@@ -568,6 +580,87 @@ public class ScalarFunctionTests
             ["CREATE TABLE t (x INT)"],
             "SELECT SIGN(x) FROM t",
             q => q.Table("t").Insert((object?)null)));
+    }
+
+    // ---- Typeless NULL (bare null adopts context type) ----
+
+    [Fact]
+    public void TypelessNull_CaseBranch_UnifiesWithDate()
+    {
+        // finwire_company shape: CASE WHEN ... THEN null ELSE CAST('...' AS DATE).
+        // Bare null in one branch must unify with DATE, not fail as INTEGER.
+        var q = Compile(
+            ["CREATE TABLE t (flag INT NOT NULL, d VARCHAR NOT NULL)"],
+            "SELECT CASE WHEN flag = 0 THEN null ELSE CAST(d AS DATE) END AS x FROM t");
+        q.Table("t").Insert(0, "2020-01-01");   // → null
+        q.Table("t").Insert(1, "2020-06-15");   // → date
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, (object?)null));
+        Assert.Equal(1, WeightOf(q.Current, Date32.Parse("2020-06-15")));
+    }
+
+    [Fact]
+    public void TypelessNull_SimpleCaseBranch_UnifiesWithVarchar()
+    {
+        // watches_history shape: simple CASE with a null ELSE among VARCHAR arms.
+        Assert.Equal("Activate", EvalOne(
+            ["CREATE TABLE t (a VARCHAR NOT NULL)"],
+            "SELECT CASE a WHEN 'ACTV' THEN 'Activate' ELSE null END AS x FROM t",
+            q => q.Table("t").Insert("ACTV")));
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (a VARCHAR NOT NULL)"],
+            "SELECT CASE a WHEN 'ACTV' THEN 'Activate' ELSE null END AS x FROM t",
+            q => q.Table("t").Insert("OTHER")));
+    }
+
+    [Fact]
+    public void TypelessNull_CastToDate()
+    {
+        // crm_customer_mgmt shape: CAST(null AS DATE) — a typed DATE null, no
+        // INTEGER→DATE cast path needed.
+        var q = Compile(
+            ["CREATE TABLE t (x INT NOT NULL)"],
+            "SELECT CAST(null AS DATE) AS d FROM t");
+        q.Table("t").Insert(1);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, (object?)null));
+        // The column is typed DATE (nullable), not INTEGER.
+        Assert.IsType<DbspNet.Sql.TypeSystem.SqlDateType>(
+            ((SelectPlan)ResolvePlan("SELECT CAST(null AS DATE) AS d FROM t",
+                "CREATE TABLE t (x INT NOT NULL)")).Query.Schema[0].Type);
+    }
+
+    [Fact]
+    public void TypelessNull_ComparisonWithString()
+    {
+        // null = 'x' — previously required CAST(NULL AS VARCHAR). NULL comparison
+        // is UNKNOWN (never TRUE), so the row is filtered out.
+        var q = Compile(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT s FROM t WHERE null = s");
+        q.Table("t").Insert("a");
+        q.Step();
+        Assert.Equal(0, q.Current.Count);
+    }
+
+    [Fact]
+    public void TypelessNull_ArithmeticStillWorks()
+    {
+        // Regression guard: null + 1 unified as INTEGER before this change and
+        // must keep working (adopts INTEGER, result null).
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (x INT NOT NULL)"],
+            "SELECT null + 1 AS y FROM t",
+            q => q.Table("t").Insert(1)));
+    }
+
+    [Fact]
+    public void TypelessNull_Coalesce()
+    {
+        Assert.Equal("fallback", EvalOne(
+            ["CREATE TABLE t (x INT NOT NULL)"],
+            "SELECT COALESCE(null, 'fallback') AS y FROM t",
+            q => q.Table("t").Insert(1)));
     }
 
     // ---- CONCAT_WS ----

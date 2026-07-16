@@ -55,6 +55,17 @@ internal static class TypeInference
     /// </summary>
     public static SqlType CommonNumericType(SqlType a, SqlType b)
     {
+        // An untyped NULL adopts the peer type (nullable).
+        if (a is SqlNullType)
+        {
+            return b.WithNullable(true);
+        }
+
+        if (b is SqlNullType)
+        {
+            return a.WithNullable(true);
+        }
+
         if (!IsNumeric(a) || !IsNumeric(b))
         {
             throw new ResolveException($"numeric operand expected; got {a.Display} and {b.Display}");
@@ -75,6 +86,18 @@ internal static class TypeInference
 
     public static SqlType CommonComparableType(SqlType a, SqlType b)
     {
+        // An untyped NULL is comparable to anything and adopts the peer type
+        // (nullable). Two untyped NULLs stay untyped.
+        if (a is SqlNullType)
+        {
+            return b.WithNullable(true);
+        }
+
+        if (b is SqlNullType)
+        {
+            return a.WithNullable(true);
+        }
+
         if (IsNumeric(a) && IsNumeric(b))
         {
             return CommonNumericType(a, b);

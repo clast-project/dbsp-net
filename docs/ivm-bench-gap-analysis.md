@@ -436,8 +436,14 @@ name, `generate_surrogate_key` → its `md5(coalesce/cast/||)` form; sources wra
 `CREATE TABLE`, views registered in dependency order). Outcome:
 
 - **Sources: 20/20 register** — including `batch1_customer_mgmt`'s 5-level nested `ROW`.
-- **Views: 17/50 compile** today. The other 33 reduce to **three root causes**; ~21 of
-  them are pure cascades (`unknown table X` because X failed upstream).
+- **Views: 17/50 → 21/50 compile** after the typeless-NULL fix. The other 29 reduce to
+  **two remaining root causes**; most are pure cascades (`unknown table X`).
+
+**Update (typeless NULL fixed):** root cause #2 below is done — `finwire_company`,
+`finwire_financial`, `finwire_security`, `crm_customer_mgmt` all compile now, and
+`watches_history`'s own null issue is gone (it now only cascades from `securities`). +4
+compiling. The two remaining roots are #1 (window-in-expression, 5 silver models) and #3
+(named `WINDOW`, 2 models). Original three-cause writeup below.
 
 The three roots, ranked by cascade impact:
 

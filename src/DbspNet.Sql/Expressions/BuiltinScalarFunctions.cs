@@ -650,6 +650,13 @@ internal static class BuiltinScalarFunctions
 
     internal static ResolvedExpression MaybeCast(ResolvedExpression e, SqlType target)
     {
+        // A null literal becomes a typed null of the target (a ResolvedCast over
+        // SqlNullType has no compile path). Mirrors Resolver.MaybeCast.
+        if (e is ResolvedLiteral { Kind: Parser.Ast.LiteralKind.Null })
+        {
+            return new ResolvedLiteral(Parser.Ast.LiteralKind.Null, null, target.WithNullable(true));
+        }
+
         if (SameTypeIgnoringNullable(e.Type, target))
         {
             return e;

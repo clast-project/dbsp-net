@@ -840,10 +840,17 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   spellings
   `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING|BOTH … FROM …)`
   are not parsed — use the comma / char-set forms.
-- **[P1]** Typeless `NULL`. A bare `NULL` literal resolves to `INTEGER NULL`
-  rather than an unknown-type marker that context narrows (the PostgreSQL /
-  Calcite behaviour). In practice this means `NULL = 'x'` fails at resolve
-  time; use `CAST(NULL AS VARCHAR)` as a workaround.
+- **[DONE]** Typeless `NULL`. A bare `NULL` literal resolves to `SqlNullType`
+  (the SQL "unknown" type), which unifies with any type — adopting the peer
+  (nullable) — in `CommonComparableType` / `CommonNumericType`, and materialises
+  to a typed null in `ResolveCast` / `MaybeCast`. So `NULL = 'x'`,
+  `CASE WHEN … THEN NULL ELSE <date>`, and `CAST(NULL AS DATE)` all resolve now.
+  `SqlNullType` is always nullable and should not reach the compiler; a
+  context-free `SELECT NULL` leaves a null cell and forces structural compile
+  (its `ClrType` is `object`, outside the typed-codec allowlist). One behaviour
+  shift: aggregating a bare `NULL` (`SUM(NULL)`) now errors "numeric operand
+  expected" rather than silently treating it as `INTEGER` — arguably more
+  correct, and unexercised.
 - **[P2]** Qualified-star beyond a single table alias. `SELECT t.*` works;
   `SELECT t.*, u.*` is not parsed specially (each star is an independent
   `SelectItem`, which is fine — just a reminder that aliasing collisions

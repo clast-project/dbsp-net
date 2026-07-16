@@ -4704,7 +4704,9 @@ public sealed class Resolver
             Utf8String.Of((string)lit.Value!),
             new SqlVarcharType(null, false)),
         LiteralKind.Boolean => new ResolvedLiteral(lit.Kind, lit.Value, new SqlBooleanType(false)),
-        LiteralKind.Null => new ResolvedLiteral(lit.Kind, null, new SqlIntegerType(true)),
+        // Bare NULL is untyped ("unknown") — it adopts a context type at the
+        // first unification / CAST, and only defaults if it never gets one.
+        LiteralKind.Null => new ResolvedLiteral(lit.Kind, null, SqlNullType.Instance),
         _ => throw new ResolveException($"unknown literal kind {lit.Kind}"),
     };
 
@@ -4814,6 +4816,13 @@ public sealed class Resolver
 
     private static ResolvedExpression MaybeCast(ResolvedExpression e, SqlType target)
     {
+        // An untyped/typed null literal becomes a typed null of the target — a
+        // ResolvedCast over SqlNullType would have no valid compile path.
+        if (e is ResolvedLiteral { Kind: LiteralKind.Null })
+        {
+            return new ResolvedLiteral(LiteralKind.Null, null, target.WithNullable(true));
+        }
+
         if (SameTypeIgnoringNullable(e.Type, target))
         {
             return e;
@@ -5062,6 +5071,14 @@ public sealed class Resolver
         {
             var value = Interval.Parse(text.ToStringDecoded(), intervalType.Qualifier);
             return new ResolvedLiteral(LiteralKind.String, value, intervalType.WithNullable(false));
+        }
+
+        // CAST(NULL AS T) is a typed null of T — no cast op (so no numeric→T
+        // cast path is needed, e.g. CAST(NULL AS DATE)). Handles the untyped
+        // bare null and, by the same shape, an already-typed null literal.
+        if (operand is ResolvedLiteral { Kind: LiteralKind.Null })
+        {
+            return new ResolvedLiteral(LiteralKind.Null, null, target.WithNullable(true));
         }
 
         return new ResolvedCast(operand, target);

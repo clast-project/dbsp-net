@@ -20,6 +20,29 @@ public abstract record SqlType(bool Nullable)
     public string Display => Nullable ? Name : Name + " NOT NULL";
 }
 
+/// <summary>
+/// The type of a bare <c>NULL</c> literal before it has been given a context
+/// type — SQL's "unknown" type. It unifies with any type (adopting the peer)
+/// in <see cref="TypeInference.CommonComparableType"/> /
+/// <see cref="TypeInference.CommonNumericType"/>, and materialises to a typed
+/// null in <c>ResolveCast</c> / <c>MaybeCast</c>. It should not normally reach
+/// the compiler; if a truly context-free <c>NULL</c> survives (e.g.
+/// <c>SELECT NULL</c>), it stays a null cell and forces structural compile
+/// (its <see cref="ClrType"/> is not in the typed-codec allowlist). Always
+/// nullable — a NOT-NULL null is meaningless, so <see cref="WithNullable"/>
+/// is a no-op.
+/// </summary>
+public sealed record SqlNullType() : SqlType(true)
+{
+    public static SqlNullType Instance { get; } = new();
+
+    public override Type ClrType => typeof(object);
+
+    public override string Name => "NULL";
+
+    public override SqlType WithNullable(bool nullable) => this;
+}
+
 public sealed record SqlIntegerType(bool Nullable) : SqlType(Nullable)
 {
     public override Type ClrType => typeof(int);
