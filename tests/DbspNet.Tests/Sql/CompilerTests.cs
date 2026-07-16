@@ -556,6 +556,119 @@ public class CompilerTests
         Assert.Equal(1, WeightOf(q.Current, 4, 1L));
     }
 
+    // ---- STDDEV / VARIANCE ----
+
+    private static double AggDouble(CompiledQuery q, params object?[] keyThenValueless)
+    {
+        // Find the single output row matching the leading key columns and return
+        // its last (aggregate) column as a double.
+        foreach (var (values, weight) in q.Current)
+        {
+            if (weight <= 0)
+            {
+                continue;
+            }
+
+            var match = true;
+            for (var i = 0; i < keyThenValueless.Length; i++)
+            {
+                if (!Equals(values[i], keyThenValueless[i]))
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+            {
+                return Convert.ToDouble(values[^1], System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException("no matching output row");
+    }
+
+    [Fact]
+    public void Stddev_PopAndSamp_KnownDataset()
+    {
+        // {2,4,4,4,5,5,7,9}: mean 5, population variance 4 (stddev 2),
+        // sample variance 32/7 ≈ 4.5714 (stddev ≈ 2.1381).
+        foreach (var (fn, expected) in new[]
+        {
+            ("STDDEV_POP(v)", 2.0),
+            ("VAR_POP(v)", 4.0),
+            ("STDDEV_SAMP(v)", Math.Sqrt(32.0 / 7.0)),
+            ("VAR_SAMP(v)", 32.0 / 7.0),
+            ("STDDEV(v)", Math.Sqrt(32.0 / 7.0)),   // bare = sample
+            ("VARIANCE(v)", 32.0 / 7.0),
+        })
+        {
+            var q = Compile(
+                ["CREATE TABLE t (g INT NOT NULL, v INT NOT NULL)"],
+                $"SELECT g, {fn} AS s FROM t GROUP BY g");
+            foreach (var x in new[] { 2, 4, 4, 4, 5, 5, 7, 9 })
+            {
+                q.Table("t").Insert(1, x);
+            }
+
+            q.Step();
+            Assert.Equal(expected, AggDouble(q, 1), 10);
+        }
+    }
+
+    [Fact]
+    public void Stddev_RevisesOnRetraction()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (g INT NOT NULL, v INT NOT NULL)"],
+            "SELECT g, VAR_POP(v) AS s FROM t GROUP BY g");
+        q.Table("t").Insert(1, 2);
+        q.Table("t").Insert(1, 4);
+        q.Table("t").Insert(1, 100);
+        q.Step();
+        // {2,4,100}: mean 106/3, var_pop = ((2-m)²+(4-m)²+(100-m)²)/3.
+        var m = 106.0 / 3.0;
+        var expected3 = (Math.Pow(2 - m, 2) + Math.Pow(4 - m, 2) + Math.Pow(100 - m, 2)) / 3.0;
+        Assert.Equal(expected3, AggDouble(q, 1), 8);
+
+        q.Table("t").Delete(1, 100);   // back to {2,4}: mean 3, var_pop 1
+        q.Step();
+        Assert.Equal(1.0, AggDouble(q, 1), 10);
+    }
+
+    [Fact]
+    public void Stddev_NullCountBoundaries()
+    {
+        // Empty group emits nothing; a single row → VAR_POP 0 but VAR_SAMP NULL.
+        var q = Compile(
+            ["CREATE TABLE t (g INT NOT NULL, v INT)"],
+            "SELECT g, VAR_POP(v) AS p, VAR_SAMP(v) AS s FROM t GROUP BY g");
+
+        q.Table("t").Insert(1, 7);                       // single row
+        q.Table("t").Insert(new object?[] { 2, null });  // all-NULL group (but present)
+        q.Step();
+
+        // Group 1: one non-null value → pop 0, samp NULL (n<2).
+        Assert.Equal(1, WeightOf(q.Current, 1, 0.0, null));
+        // Group 2: no non-null values → both NULL.
+        Assert.Equal(1, WeightOf(q.Current, 2, null, null));
+    }
+
+    [Fact]
+    public void Stddev_ZeroVarianceClampsNonNegative()
+    {
+        // All-equal values: true variance 0. The moment form can round to a tiny
+        // negative before the clamp; result must be exactly 0, never NaN.
+        var q = Compile(
+            ["CREATE TABLE t (g INT NOT NULL, v INT NOT NULL)"],
+            "SELECT g, STDDEV_SAMP(v) AS s FROM t GROUP BY g");
+        q.Table("t").Insert(1, 1000000);
+        q.Table("t").Insert(1, 1000000);
+        q.Table("t").Insert(1, 1000000);
+        q.Step();
+        Assert.Equal(0.0, AggDouble(q, 1), 12);
+    }
+
     [Fact]
     public void GroupBy_AggregateInKey_Rejected()
     {

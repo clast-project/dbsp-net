@@ -772,6 +772,10 @@ internal static class BatchPlanEvaluator
         AggregateKind.Min => new SqlMinMaxAggregator(ExpressionCompiler.CompileScalar(call.Argument!), wantMin: true),
         AggregateKind.Max => new SqlMinMaxAggregator(ExpressionCompiler.CompileScalar(call.Argument!), wantMin: false),
         AggregateKind.Avg => new SqlAvgAggregator(ExpressionCompiler.CompileScalar(call.Argument!), call.ResultType),
+        AggregateKind.VarSamp => new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: true, sqrt: false),
+        AggregateKind.VarPop => new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: false, sqrt: false),
+        AggregateKind.StddevSamp => new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: true, sqrt: true),
+        AggregateKind.StddevPop => new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: false, sqrt: true),
         _ => throw new InvalidOperationException($"unknown aggregate kind {call.Kind}"),
     };
 

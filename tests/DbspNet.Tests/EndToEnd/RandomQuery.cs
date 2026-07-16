@@ -76,6 +76,18 @@ internal static class RandomQuery
         // 9. GROUP BY MIN/MAX
         GenTable.Select(t => $"SELECT k, MIN(v) AS mn, MAX(v) AS mx FROM {t} GROUP BY k"),
 
+        // 9b. GROUP BY AVG / STDDEV / VARIANCE — the moment aggregators. Compared
+        // against BatchPlanEvaluator over signed streams, so this exercises the
+        // invertible sum/sum-of-squares accumulators under retraction. (AVG and
+        // the STDDEV family had no PBT coverage before this.) SUM alongside pins
+        // that the composite advances every sub-aggregator's state together.
+        GenTable.Select(t =>
+            $"SELECT k, SUM(v) AS s, AVG(v) AS a, STDDEV_POP(v) AS sp, VAR_SAMP(v) AS vs FROM {t} GROUP BY k"),
+
+        // 9c. STDDEV over the nullable table — NULL args must be skipped, and an
+        // all-NULL or single-non-NULL group must resolve to NULL correctly.
+        Gen.Const("SELECT k, STDDEV_SAMP(v) AS ss, VAR_POP(v) AS vp FROM n GROUP BY k"),
+
         // 10. UNION ALL
         Gen.Const("SELECT k, v FROM t UNION ALL SELECT k, v FROM u"),
 

@@ -425,8 +425,20 @@ reflect that shape, not a backlog.
   exactly. Non-linear, so it bails out of aggregate-input column pruning like
   `MIN`/`MAX`/`APPROX_COUNT_DISTINCT`. Unlocks Nexmark q15/q16. `DISTINCT` on
   other aggregates and `WITHIN DISTINCT` remain **[P1]**.
+- **[DONE]** `STDDEV` / `STDDEV_SAMP` / `STDDEV_POP` and `VARIANCE` /
+  `VAR_SAMP` / `VAR_POP`. One invertible aggregator (`SqlStddevAggregator`)
+  holding the three moments `n`, `Σ(value·weight)`, `Σ(value²·weight)`; the
+  moment form is the only one that inverts under arbitrary signed retraction
+  (Welford's online update can't remove an arbitrary element), at the cost of
+  floating-point cancellation, guarded by clamping negative variance to zero.
+  Result is nullable DOUBLE; empty/all-NULL → NULL, and the sample forms are
+  also NULL for a single row (`n < 2`). Bare `STDDEV`/`VARIANCE` are the SAMPLE
+  forms, matching PostgreSQL/Spark/DuckDB (the ivm-bench participants).
+  Structural + spine + batch-oracle; the typed fast path falls back to
+  structural (one null aggregator bails the whole composite). Serves
+  ivm-bench's 11 `STDDEV` sites.
 - **[P2]** `ARG_MIN`, `ARG_MAX`, `ARRAY_AGG` (with `ORDER BY`,
-  `RESPECT|IGNORE NULLS`), `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`.
+  `RESPECT|IGNORE NULLS`).
 - **[P2]** Bitwise aggregates: `BIT_AND`, `BIT_OR`, `BIT_XOR`.
 - **[P2]** Boolean aggregates: `BOOL_AND`/`EVERY`, `BOOL_OR`/`SOME`,
   `LOGICAL_AND`, `LOGICAL_OR`, `COUNTIF`.

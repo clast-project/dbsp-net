@@ -5056,7 +5056,9 @@ public sealed class Resolver
         return name switch
         {
             "count" or "sum" or "min" or "max" or "avg" or "approx_count_distinct"
-                or "approx_percentile" or "median" or "percentile_cont" or "percentile_disc" => true,
+                or "approx_percentile" or "median" or "percentile_cont" or "percentile_disc"
+                or "stddev" or "stddev_samp" or "stddev_pop"
+                or "variance" or "var_samp" or "var_pop" => true,
             _ => false,
         };
     }
@@ -5469,6 +5471,12 @@ public sealed class Resolver
             "approx_count_distinct" => AggregateKind.ApproxCountDistinct,
             "approx_percentile" or "median" or "percentile_cont" or "percentile_disc"
                 => AggregateKind.ApproxPercentile,
+            // Bare STDDEV / VARIANCE are the SAMPLE forms (n−1), matching
+            // PostgreSQL, Spark, and DuckDB — the ivm-bench participants.
+            "stddev" or "stddev_samp" => AggregateKind.StddevSamp,
+            "stddev_pop" => AggregateKind.StddevPop,
+            "variance" or "var_samp" => AggregateKind.VarSamp,
+            "var_pop" => AggregateKind.VarPop,
             _ => throw new ResolveException($"unknown aggregate '{call.FunctionName}'"),
         };
     }
@@ -5538,6 +5546,18 @@ public sealed class Resolver
                 }
 
                 return argType is SqlDecimalType ? argType.WithNullable(true) : new SqlDoubleType(true);
+            case AggregateKind.VarSamp:
+            case AggregateKind.VarPop:
+            case AggregateKind.StddevSamp:
+            case AggregateKind.StddevPop:
+                if (argType is null || !TypeInference.IsNumeric(argType))
+                {
+                    throw new ResolveException($"{kind} requires a numeric argument");
+                }
+
+                // Always DOUBLE (even for DECIMAL input) and always nullable —
+                // an empty group is NULL, and the sample forms are NULL for n<2.
+                return new SqlDoubleType(true);
             default:
                 throw new ResolveException($"unsupported aggregate {kind}");
         }

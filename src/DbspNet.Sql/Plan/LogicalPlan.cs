@@ -410,6 +410,18 @@ public enum AggregateKind
     /// existing ordinals (and thus persisted plan fingerprints) are unchanged.
     /// </summary>
     CountDistinct,
+
+    /// <summary>Sample variance, <c>VAR_SAMP</c> / <c>VARIANCE</c> — divides by n−1.</summary>
+    VarSamp,
+
+    /// <summary>Population variance, <c>VAR_POP</c> — divides by n.</summary>
+    VarPop,
+
+    /// <summary>Sample standard deviation, <c>STDDEV_SAMP</c> / <c>STDDEV</c> — sqrt of <see cref="VarSamp"/>.</summary>
+    StddevSamp,
+
+    /// <summary>Population standard deviation, <c>STDDEV_POP</c> — sqrt of <see cref="VarPop"/>.</summary>
+    StddevPop,
 }
 
 /// <summary>

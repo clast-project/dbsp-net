@@ -318,17 +318,28 @@ independent implementations.
 Most of the 17 `BETWEEN` joins are INNER and were always fine — non-equi INNER via the
 unit-key nested-loop path. This closes the LEFT-joined ones.
 
-### 5. `STDDEV` — BLOCKING, bounded
+### 5. `STDDEV` — DONE
 
-`skipped.md:397-398` **[P2]**. 11 call sites across all 5 analytics models, always
-unqualified `STDDEV` — never `STDDEV_POP` / `STDDEV_SAMP`.
+11 call sites across all 5 analytics models, always unqualified `STDDEV`.
 
-Engines disagree on what bare `STDDEV` means (PostgreSQL/Spark → SAMP; others → POP).
-Match whatever the other participants resolve to, or the numbers are silently
-incomparable.
+Confirmed bare `STDDEV`/`VARIANCE` = the **sample** forms (÷ n−1) in PostgreSQL, Spark,
+and DuckDB — all three ivm-bench participants — so `STDDEV` maps to `STDDEV_SAMP`. Getting
+this wrong would make the numbers silently incomparable rather than error.
 
-Decomposable into SUM/COUNT/SUM-of-squares, so it should be invertible and fit the
-existing incremental aggregate machinery.
+Shipped the whole family (`STDDEV`/`STDDEV_SAMP`/`STDDEV_POP`, `VARIANCE`/`VAR_SAMP`/
+`VAR_POP`) as one invertible `SqlStddevAggregator` holding the three moments `n`,
+`Σ(value·weight)`, `Σ(value²·weight)`. The moment form is the only one that inverts under
+arbitrary signed retraction — Welford's online update can't remove an arbitrary element —
+at the cost of floating-point cancellation, guarded by clamping negative variance to zero
+before the square root. One class serves the circuit and the batch oracle.
+
+Two test layers, and mutation testing proved they cover **distinct** failure classes: the
+known-dataset test (hand-computed pop/sample values on {2,4,4,4,5,5,7,9}) catches formula
+errors; the differential PBT catches invertibility errors (`Update` fold ≠ `Compute`
+rescan). A formula mutation passed the PBT — because both circuit and oracle share
+`Finish` — but failed the known-dataset test; an `Update`-only mutation passed the
+known-dataset test but failed the PBT on a retraction-heavy counterexample. Both are
+needed. This also gave AVG its first PBT coverage (the generator had none).
 
 ### 6. Small, well-scoped additions
 
@@ -418,13 +429,13 @@ a standalone docs commit before implementation started; recorded here because th
 | 3 | Multi-key window `ORDER BY` | 7 | **DONE** |
 | 4a | Computed equi-keys | 2 (+ latent perf bug) | **DONE** |
 | 4b | OUTER JOIN + cross-side residual | 2 | **DONE** |
-| 5 | `STDDEV` | 5 | Bounded |
+| 5 | `STDDEV` | 5 | **DONE** |
 | 6 | Scalar/type tail | ~10 | Trivial, partly dodgeable |
 
 Items 1–5 are the critical path. Item 1 gates 5 of 50 models and is a design decision
 rather than a coding task; the rest are ordinary implementation work. Agreed order:
-3 → 4 → 5 → 2, with 1 to be decided. **3, 4a and 4b are done.** Remaining: 5 (`STDDEV`,
-bounded), then 2 (nested `ROW` structs, deepest), then the 1 decision.
+3 → 4 → 5 → 2, with 1 to be decided. **3, 4a, 4b and 5 are done.** Remaining: 2 (nested
+`ROW` structs, deepest), then the gap-1 decision.
 
 Input/output adapter work is **not** on the critical path and should follow, not lead —
 the SQL surface is what determines whether the benchmark can run at all. See the

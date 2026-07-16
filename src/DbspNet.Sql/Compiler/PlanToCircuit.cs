@@ -2797,6 +2797,14 @@ public static class PlanToCircuit
                 return new SqlAvgAggregator(
                     ExpressionCompiler.CompileScalar(call.Argument!),
                     call.ResultType);
+            case AggregateKind.VarSamp:
+                return new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: true, sqrt: false);
+            case AggregateKind.VarPop:
+                return new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: false, sqrt: false);
+            case AggregateKind.StddevSamp:
+                return new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: true, sqrt: true);
+            case AggregateKind.StddevPop:
+                return new SqlStddevAggregator(ExpressionCompiler.CompileScalar(call.Argument!), sample: false, sqrt: true);
             default:
                 throw new InvalidOperationException($"unsupported aggregate kind {call.Kind}");
         }

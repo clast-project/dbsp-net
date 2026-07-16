@@ -583,6 +583,110 @@ internal sealed class SqlAvgAggregator : SqlAggregator
 }
 
 /// <summary>
+/// <c>VAR_SAMP</c> / <c>VAR_POP</c> / <c>STDDEV_SAMP</c> / <c>STDDEV_POP</c>.
+///
+/// <para>Maintains the three moments <c>n = Σweight</c>, <c>Σ(value·weight)</c>,
+/// <c>Σ(value²·weight)</c> over non-NULL rows, and forms
+/// <c>variance = (Σx² − (Σx)²/n) / d</c> where the denominator <c>d</c> is
+/// <c>n</c> (population) or <c>n−1</c> (sample). This sum-of-moments form is the
+/// only one that inverts cleanly under arbitrary signed retractions — Welford's
+/// online update cannot remove an arbitrary element — which is why it is used
+/// despite being more prone to floating-point cancellation than a two-pass
+/// method. The subtraction can yield a tiny negative from rounding when the true
+/// variance is ~0, so it is clamped to zero before the square root.</para>
+///
+/// <para>Result is DOUBLE and always nullable: an empty / all-NULL group is NULL
+/// (<c>n == 0</c>), and the sample forms are additionally NULL for a single row
+/// (<c>n &lt; 2</c>, since <c>n−1 == 0</c>). The population forms are 0 for a
+/// single row.</para>
+/// </summary>
+internal sealed class SqlStddevAggregator : SqlAggregator
+{
+    private readonly Func<StructuralRow, object?> _argExtract;
+    private readonly bool _sample;
+    private readonly bool _sqrt;
+
+    public SqlStddevAggregator(Func<StructuralRow, object?> argExtract, bool sample, bool sqrt)
+    {
+        _argExtract = argExtract;
+        _sample = sample;
+        _sqrt = sqrt;
+    }
+
+    private sealed class MomentState
+    {
+        public double Sum;
+        public double SumSq;
+        public long NonNullCount;
+    }
+
+    private object? Finish(double sum, double sumSq, long n)
+    {
+        // Denominator: n (population) or n−1 (sample). NULL when it would be
+        // non-positive — empty/all-NULL for either form, single row for sample.
+        var denom = _sample ? n - 1 : n;
+        if (n == 0 || denom <= 0)
+        {
+            return null;
+        }
+
+        var variance = (sumSq - (sum * sum / n)) / denom;
+        if (variance < 0)
+        {
+            variance = 0;   // floating-point cancellation guard
+        }
+
+        return (object)(_sqrt ? Math.Sqrt(variance) : variance);
+    }
+
+    public override object? Compute(IMultiset<StructuralRow, Z64> rows)
+    {
+        double sum = 0, sumSq = 0;
+        long n = 0;
+        foreach (var (row, w) in rows)
+        {
+            var v = _argExtract(row);
+            if (v is null)
+            {
+                continue;
+            }
+
+            var x = Convert.ToDouble(v, System.Globalization.CultureInfo.InvariantCulture);
+            sum += x * w.Value;
+            sumSq += x * x * w.Value;
+            n += w.Value;
+        }
+
+        return Finish(sum, sumSq, n);
+    }
+
+    public override object? Update(
+        ref object? state,
+        object? oldValue,
+        ZSet<StructuralRow, Z64> delta,
+        IMultiset<StructuralRow, Z64> after)
+    {
+        var s = state as MomentState ?? new MomentState();
+        foreach (var (row, w) in delta)
+        {
+            var v = _argExtract(row);
+            if (v is null)
+            {
+                continue;
+            }
+
+            var x = Convert.ToDouble(v, System.Globalization.CultureInfo.InvariantCulture);
+            s.Sum += x * w.Value;
+            s.SumSq += x * x * w.Value;
+            s.NonNullCount += w.Value;
+        }
+
+        state = s;
+        return Finish(s.Sum, s.SumSq, s.NonNullCount);
+    }
+}
+
+/// <summary>
 /// SQL <c>APPROX_COUNT_DISTINCT</c> — a HyperLogLog estimate of the number of
 /// distinct non-NULL argument values in the group. Returns a non-nullable
 /// <c>BIGINT</c> (0 for an all-NULL group, like <c>COUNT(col)</c>).
