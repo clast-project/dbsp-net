@@ -356,9 +356,14 @@ reflect that shape, not a backlog.
   `UsingColumns` list on `JoinClause`; the resolver builds the equi-join
   directly (one `JoinEquality` per shared column, resolved against each
   side) and wraps the `JoinPlan` in a `ProjectPlan` that merges each shared
-  column to a single unqualified copy (taken from the preserved side for
-  outer joins). Output order is SQL-standard: merged USING columns, then
-  remaining left, then remaining right. Supported for INNER / LEFT / RIGHT.
+  column to a single copy (taken from the preserved side for outer joins;
+  `COALESCE(left, right)` for FULL). The merged column carries the **source
+  side's qualifier** (not null), so a qualified star `t1.*` includes the USING
+  key — matching PostgreSQL, and required by the TPC-DI SCD2 models that project
+  `select s1.* … using (symbol)` (a null qualifier was silently dropped by
+  `t1.*`). Bare-name access is unaffected (an unqualified reference ignores the
+  qualifier). Output order is SQL-standard: merged USING columns, then remaining
+  left, then remaining right. Supported for INNER / LEFT / RIGHT / FULL.
 - **[P2]** `VALUES (...), (...) AS t(a, b)` as a row source.
   `ParsePrimaryTableRef` accepts only `(SELECT ...)` or a base table;
   would need a literal-table constructor.

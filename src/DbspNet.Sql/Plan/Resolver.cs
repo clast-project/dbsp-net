@@ -2520,6 +2520,13 @@ public sealed class Resolver
         var projections = new List<ProjectionItem>();
         for (var i = 0; i < join.UsingColumns!.Count; i++)
         {
+            // The merged column carries the source side's qualifier (the side it
+            // is taken from; the left side for FULL's COALESCE), NOT null. This
+            // matches PostgreSQL, where `t1.*` includes the USING key — and a
+            // null qualifier would be dropped by qualified-star expansion
+            // (`s1.*` keeps only `Qualifier == "s1"`), which is how the ivm-bench
+            // SCD2 models (`select s1.* … using (symbol)`) lost the key. Bare-name
+            // access still works: an unqualified reference ignores the qualifier.
             if (join.Type == JoinType.FullOuter)
             {
                 var leftCol = joinOutputSchema[usingLeftIdx[i]];
@@ -2533,13 +2540,13 @@ public sealed class Resolver
                         new ResolvedColumn(usingRightCombinedIdx[i], rightCol.Type),
                     },
                     mergedType);
-                projections.Add(new ProjectionItem(coalesce, join.UsingColumns[i], Qualifier: null));
+                projections.Add(new ProjectionItem(coalesce, join.UsingColumns[i], leftCol.Qualifier));
                 continue;
             }
 
             var idx = takeLeftForMerged ? usingLeftIdx[i] : usingRightCombinedIdx[i];
             var c = joinOutputSchema[idx];
-            projections.Add(new ProjectionItem(new ResolvedColumn(idx, c.Type), join.UsingColumns[i], Qualifier: null));
+            projections.Add(new ProjectionItem(new ResolvedColumn(idx, c.Type), join.UsingColumns[i], c.Qualifier));
         }
 
         for (var i = 0; i < leftCount; i++)

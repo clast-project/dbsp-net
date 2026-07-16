@@ -474,13 +474,24 @@ Server, Oracle, MySQL, DuckDB, Spark, and Calcite (Feldera) all coerce, includin
 ivm-bench engines. With it on, `dim_account` compiles and cascade-clears `fact_trade` and
 much of the analytics chain. **35 → 39.**
 
-**Remaining roots at 39/50 — down to two, both known:**
-- **Rank-in-output / gap 1** (`market_volatility`, `financials`, `broker_performance`,
-  `daily_market_pulse` — `RANK`/`ROW_NUMBER`/`DENSE_RANK` in output; + cascades). The
-  architectural decision item, now the dominant blocker.
-- **`JOIN USING` merged key not exposed downstream** (`watches`/`symbol`,
-  `fact_holdings`/`trade_id`; + cascade to `fact_watches`, `trade_volume_stats`,
-  `customer_concentration`). A focused resolver gap.
+**Update (`JOIN USING` fixed):** the merged key now carries its source side's qualifier,
+so `s1.*` includes it (PG-faithful). `watches`, `fact_holdings`, `fact_watches` compile.
+**39 → 42.**
+
+**Remaining at 42/50 — ONE root cause: rank-in-output (gap 1).** All 8 remaining failures
+are `RANK`/`ROW_NUMBER`/`DENSE_RANK` selected into the output, or a cascade from
+`financials` (`ROW_NUMBER`):
+- Direct: `market_volatility` (RANK), `financials` (ROW_NUMBER), `trade_volume_stats`
+  (RANK), `broker_performance` (DENSE_RANK), `customer_concentration` (DENSE_RANK),
+  `daily_market_pulse` (RANK).
+- Cascade: `wrk_company_financials` ← `financials`; `fact_market_history` ←
+  `wrk_company_financials`.
+
+**The board is now clear for the gap-1 decision** — it is the sole remaining blocker.
+Feldera implements general rank-in-output (its docs frame the cost as a warning, not a
+restriction; it wedged Feldera at SF=100 on the unpartitioned analytics ranks — see §1).
+DbspNet restricts rank to the TopK filter pattern for the O(partition-size)-retraction
+cost. Deciding to implement it (or to run a 42/50 partial) is the last call.
 - **Rank-in-output / gap 1** (`market_volatility`, `financials` + `wrk_company_financials`;
   the analytics models are behind `dim_account`) — the architectural decision item.
 - **`JOIN USING` merged key not exposed downstream** (`watches`, `fact_holdings`).

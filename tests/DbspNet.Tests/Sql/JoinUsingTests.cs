@@ -123,6 +123,42 @@ public class JoinUsingTests
     }
 
     [Fact]
+    public void QualifiedStar_IncludesMergedUsingKey()
+    {
+        // `a.*` must include the merged USING key (attributed to the source
+        // side), matching PostgreSQL. Regression for the ivm-bench SCD2 models
+        // (`select s1.* … using (symbol)`), which lost the key when it was
+        // null-qualified.
+        var q = Compile(TwoTables, "SELECT a.* FROM a JOIN b USING (k)");
+        q.Table("a").Insert(3, 30);
+        q.Table("b").Insert(3, 300);
+        q.Step();
+        // a.* = (k, x); the merged k survives.
+        Assert.Equal(1, WeightOf(q.Current, 3, 30));
+    }
+
+    [Fact]
+    public void UsingKey_SurvivesCteStar_AndDownstreamBareReference()
+    {
+        // The exact watches_history → watches shape: a CTE joins USING (k) and
+        // projects `cte.*`; a downstream query then selects the bare key.
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        foreach (var s in TwoTables)
+        {
+            resolver.Resolve(Parser.ParseStatement(s));
+        }
+
+        // A view whose body is `SELECT s1.* FROM a s1 JOIN b USING (k)` must
+        // expose `k` in its output schema.
+        var viewPlan = ((CreateViewPlan)resolver.Resolve(Parser.ParseStatement(
+            "CREATE VIEW v AS SELECT s1.* FROM a s1 JOIN b USING (k)"))).Query;
+        var names = viewPlan.Schema.Columns.Select(c => c.Name).ToArray();
+        Assert.Contains("k", names);   // the merged key reached the view output
+        Assert.Contains("x", names);
+    }
+
+    [Fact]
     public void Using_UnknownColumn_Throws()
     {
         var catalog = new Catalog();
