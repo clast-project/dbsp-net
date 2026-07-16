@@ -642,7 +642,18 @@ reflect that shape, not a backlog.
   columns is a future SQL-frontend extension.
 - **[P2]** Unsigned integer variants (`UINT8`, `UINT16`, etc.). Feldera
   supports them.
-- **[P2]** ARRAY, MAP, ROW/STRUCT. Feldera supports all three.
+- **ROW/STRUCT** — `ROW(field TYPE, …)` column declarations (nested) and
+  multi-level dotted field access (`cm.Customer.ContactInfo.C_PHONE_1.C_CTRY_CODE`)
+  are **[DONE]**, but by FLATTENING at CREATE TABLE — a ROW column expands into
+  dotted-name scalar leaf columns, and there is **no runtime struct value**.
+  Consequently a whole-struct reference / `SELECT *` of nested structs is *not*
+  supported (resolves to no leaf, errors cleanly), and there is no `ROW(...)`
+  value constructor or struct comparison. A **first-class `SqlRowType`** (carrying
+  a runtime value, round-trippable through Arrow `StructArray`) remains **[P2]** —
+  needed only for whole-struct values and as the shared foundation for **ARRAY**
+  (which cannot be flattened — variable arity). See `docs/design-nested-types.md`.
+- **[P2]** ARRAY, MAP. Feldera supports both. ARRAY specifically needs the
+  first-class composite-value machinery (see above and `design-nested-types.md`).
 - **[P2]** BINARY, VARBINARY, UUID.
 - **[P3]** VARIANT (dynamic / JSON). Feldera supports it but restricts it
   in table schemas.

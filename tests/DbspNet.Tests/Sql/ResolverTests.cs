@@ -47,6 +47,113 @@ public class ResolverTests
 
     // --- Projection / column resolution ---
 
+    // ---- Nested ROW columns (flattened to dotted-name leaf columns) ----
+
+    private const string CustomerDdl =
+        "CREATE TABLE cust (" +
+        "  id BIGINT NOT NULL," +
+        "  info ROW(" +
+        "    Name ROW(First VARCHAR NULL, Last VARCHAR NULL) NULL," +
+        "    Phone ROW(Area BIGINT NULL, Local VARCHAR NULL) NULL," +
+        "    _Tier BIGINT NULL" +
+        "  ) NULL" +
+        ")";
+
+    [Fact]
+    public void RowColumn_FlattensToDottedLeafColumns()
+    {
+        var (cat, _) = NewResolver(CustomerDdl);
+        var schema = cat.Get("cust");
+        // The lexer folds identifiers to lowercase — leaf names and dotted
+        // access are folded consistently, so they match.
+        var names = schema.Columns.Select(c => c.Name).ToArray();
+        Assert.Equal(
+            new[] { "id", "info.name.first", "info.name.last", "info.phone.area", "info.phone.local", "info._tier" },
+            names);
+
+        // The scalar id keeps its declared non-nullability; every ROW leaf is
+        // nullable (declared NULL, and under nullable parents).
+        Assert.False(schema[0].Type.Nullable);
+        Assert.True(schema[1].Type.Nullable);
+        Assert.IsType<DbspNet.Sql.TypeSystem.SqlVarcharType>(schema[1].Type);
+        Assert.IsType<DbspNet.Sql.TypeSystem.SqlBigintType>(schema[3].Type);   // info.Phone.Area
+    }
+
+    [Fact]
+    public void RowColumn_DottedAccessResolvesToLeaf()
+    {
+        var (_, r) = NewResolver(CustomerDdl);
+        var plan = ResolveQuery(r,
+            "SELECT c.info.Name.Last AS ln, c.info.Phone.Area AS ac FROM cust c");
+        Assert.Equal(2, plan.Schema.Count);
+        Assert.Equal("ln", plan.Schema[0].Name);
+        Assert.IsType<DbspNet.Sql.TypeSystem.SqlVarcharType>(plan.Schema[0].Type);
+        Assert.IsType<DbspNet.Sql.TypeSystem.SqlBigintType>(plan.Schema[1].Type);
+    }
+
+    [Fact]
+    public void RowColumn_ThreeLevelDeepAccessResolves()
+    {
+        // The deepest ivm-bench path shape: cm.Customer.ContactInfo.C_PHONE_1.C_CTRY_CODE
+        var (_, r) = NewResolver(
+            "CREATE TABLE t (" +
+            "  Customer ROW(Contact ROW(Phone ROW(Ctry BIGINT NULL) NULL) NULL) NULL" +
+            ")");
+        var plan = ResolveQuery(r, "SELECT t.Customer.Contact.Phone.Ctry AS x FROM t");
+        Assert.Single(plan.Schema.Columns);
+        Assert.IsType<DbspNet.Sql.TypeSystem.SqlBigintType>(plan.Schema[0].Type);
+    }
+
+    [Fact]
+    public void RowColumn_WholeStructReference_FailsCleanly()
+    {
+        // Selecting a whole struct (no leaf) resolves to no column — a clean
+        // error, not a silent wrong answer. Documented limitation of flattening.
+        var (_, r) = NewResolver(CustomerDdl);
+        Assert.Throws<ResolveException>(() => ResolveQuery(r, "SELECT c.info FROM cust c"));
+        Assert.Throws<ResolveException>(() => ResolveQuery(r, "SELECT c.info.Name FROM cust c"));
+    }
+
+    [Fact]
+    public void RowColumn_SameLeafNameDifferentPaths_NoFalseDuplicate()
+    {
+        // ivm-bench declares _VALUE inside two different structs. They flatten to
+        // distinct dotted paths, so the dedup must key on the full path, not the
+        // leaf tail.
+        var (cat, r) = NewResolver(
+            "CREATE TABLE t (" +
+            "  Customer ROW(" +
+            "    Account ROW(_VALUE VARCHAR NULL) NULL," +
+            "    _VALUE VARCHAR NULL" +
+            "  ) NULL" +
+            ")");
+        var names = cat.Get("t").Columns.Select(c => c.Name).ToArray();
+        Assert.Equal(new[] { "customer.account._value", "customer._value" }, names);
+
+        // Both are independently addressable.
+        var plan = ResolveQuery(r,
+            "SELECT t.Customer.Account._VALUE AS a, t.Customer._VALUE AS b FROM t");
+        Assert.Equal(2, plan.Schema.Count);
+    }
+
+    [Fact]
+    public void RowColumn_TrueDuplicatePath_Rejected()
+    {
+        var cat = new Catalog();
+        var r = new Resolver(cat);
+        Assert.Throws<ResolveException>(() => r.Resolve(Parser.ParseStatement(
+            "CREATE TABLE t (a ROW(x INT NULL, x VARCHAR NULL) NULL)")));
+    }
+
+    [Fact]
+    public void RowColumn_LatenessRejected()
+    {
+        var cat = new Catalog();
+        var r = new Resolver(cat);
+        Assert.Throws<ResolveException>(() => r.Resolve(Parser.ParseStatement(
+            "CREATE TABLE t (x ROW(a INT NULL) NULL LATENESS 5)")));
+    }
+
     [Fact]
     public void SelectStar_ExpandsToAllColumns()
     {

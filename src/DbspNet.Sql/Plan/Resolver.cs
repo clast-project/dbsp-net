@@ -100,6 +100,19 @@ public sealed class Resolver
                 throw new ResolveException($"duplicate column '{c.Name}' in table '{stmt.TableName}'");
             }
 
+            // A ROW column carries no runtime struct value: it flattens into one
+            // dotted-name scalar leaf per nested field (docs/design-nested-types.md).
+            if (c.Type.Fields is not null)
+            {
+                if (c.Lateness is not null)
+                {
+                    throw new ResolveException($"LATENESS is not supported on ROW column '{c.Name}'");
+                }
+
+                ExpandRowColumn(c.Name, c.Type, parentNullable: !c.NotNull, stmt.TableName, cols, seen);
+                continue;
+            }
+
             var type = TypeInference.FromSpec(c.Type, nullable: !c.NotNull);
             if (c.Lateness is { } bound)
             {
@@ -126,6 +139,45 @@ public sealed class Resolver
         var schema = new Schema(cols);
         _catalog.Register(stmt.TableName, schema);
         return new CreateTablePlan(stmt.TableName, schema);
+    }
+
+    /// <summary>
+    /// Flatten a <c>ROW(...)</c> column into one scalar <see cref="SchemaColumn"/>
+    /// per leaf field, named by its dotted path (<c>Customer.Account.CA_B_ID</c>).
+    /// Recurses through nested ROWs. A leaf is nullable if it is declared nullable
+    /// or lies under any nullable ancestor struct — a NULL parent struct yields a
+    /// NULL leaf, which for a leaf-access-only workload is indistinguishable from
+    /// a per-field NULL. There is no runtime struct value; see
+    /// <c>docs/design-nested-types.md</c> for the rationale and the first-class
+    /// alternative deferred there.
+    /// </summary>
+    private static void ExpandRowColumn(
+        string prefix,
+        SqlTypeSpec rowSpec,
+        bool parentNullable,
+        string tableName,
+        List<SchemaColumn> cols,
+        HashSet<string> seen)
+    {
+        foreach (var field in rowSpec.Fields!)
+        {
+            var leafName = prefix + "." + field.Name;
+            var leafNullable = parentNullable || field.Nullable;
+
+            if (field.Type.Fields is not null)
+            {
+                ExpandRowColumn(leafName, field.Type, leafNullable, tableName, cols, seen);
+                continue;
+            }
+
+            if (!seen.Add(leafName))
+            {
+                throw new ResolveException($"duplicate column '{leafName}' in table '{tableName}'");
+            }
+
+            var type = TypeInference.FromSpec(field.Type, nullable: leafNullable);
+            cols.Add(new SchemaColumn(leafName, type, Qualifier: tableName));
+        }
     }
 
     // LATENESS requires a totally-ordered column whose values map to an Int64

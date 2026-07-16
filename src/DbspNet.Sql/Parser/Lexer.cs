@@ -14,6 +14,14 @@ namespace DbspNet.Sql.Parser;
 /// </summary>
 public sealed class Lexer
 {
+    /// <summary>
+    /// True if <paramref name="kind"/> is a reserved-word token (came from
+    /// <see cref="Keywords"/>), as opposed to punctuation, a literal, an
+    /// identifier, or EOF. Used to accept a keyword as an ordinary name in
+    /// member-name positions (ROW field declarations, dotted field access).
+    /// </summary>
+    public static bool IsKeywordKind(TokenKind kind) => KeywordKinds.Contains(kind);
+
     private static readonly Dictionary<string, TokenKind> Keywords = new(StringComparer.Ordinal)
     {
         ["select"] = TokenKind.Select,
@@ -94,6 +102,8 @@ public sealed class Lexer
         ["interval"] = TokenKind.Interval,
         ["extract"] = TokenKind.Extract,
     };
+
+    private static readonly HashSet<TokenKind> KeywordKinds = new(Keywords.Values);
 
     private readonly string _source;
     private int _pos;

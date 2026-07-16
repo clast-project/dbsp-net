@@ -29,11 +29,21 @@ public sealed record ColumnDefinition(
 /// this into a concrete <see cref="DbspNet.Sql.TypeSystem.SqlType"/>. Keeping
 /// the AST type "string-ish" lets the parser stay dumb about the type system.
 /// </summary>
+/// <param name="Fields">
+/// For a <c>ROW(...)</c> struct spec (<see cref="Name"/> == "ROW"), the ordered
+/// nested fields; null for every scalar type. The resolver flattens a ROW column
+/// into dotted-name scalar leaf columns at CREATE TABLE — there is no runtime
+/// struct value. See <c>docs/design-nested-types.md</c>.
+/// </param>
 public sealed record SqlTypeSpec(
     string Name,
     int? Parameter1 = null,
     int? Parameter2 = null,
-    DbspNet.Sql.TypeSystem.IntervalQualifier? IntervalQualifier = null);
+    DbspNet.Sql.TypeSystem.IntervalQualifier? IntervalQualifier = null,
+    IReadOnlyList<RowFieldSpec>? Fields = null);
+
+/// <summary>One named field of a <c>ROW(...)</c> type spec.</summary>
+public sealed record RowFieldSpec(string Name, SqlTypeSpec Type, bool Nullable);
 
 public sealed record CreateViewStatement(
     string ViewName,

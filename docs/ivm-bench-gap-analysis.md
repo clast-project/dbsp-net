@@ -142,19 +142,28 @@ Infrastructure that already exists and should be reusable: `PartitionedTopKOp` (
 machinery for the filter pattern) and `PartitionedWindowAggregateOp`'s affected-range
 recompute (which is how bounded churn is kept sound for window aggregates).
 
-### 2. Nested `ROW` structs — BLOCKING, architectural
+### 2. Nested `ROW` structs — DONE (by flattening)
 
 `models/sources/batch1_customer_mgmt.sql` declares five levels of nested `ROW(...)`,
-consumed by `bronze/crm/crm_customer_mgmt.sql` via three-deep dotted paths:
+consumed by `bronze/crm/crm_customer_mgmt.sql` via three-deep dotted paths like
+`cm.Customer.ContactInfo.C_PHONE_1.C_CTRY_CODE`.
 
-```sql
-cm.Customer.ContactInfo.C_PHONE_1.C_CTRY_CODE
-```
+The decisive scoping finding: **every** use of the structs bottoms out at a scalar leaf —
+no query selects, constructs, compares, or passes a whole `ROW`. So the runtime never needs
+a struct value. Shipped by **flattening** at CREATE TABLE — a ROW column expands into
+dotted-name scalar leaf columns, dotted access resolves to those leaves, and the runtime
+(`StructuralRow`, expression compiler, typed codec, Arrow) is entirely untouched. Work
+confined to the parser (ROW-spec + multi-dot access + keyword-as-field-name) and the
+resolver (`ExpandRowColumn`).
 
-DbspNet has no ROW/STRUCT type — `skipped.md:569` marks ARRAY/MAP/ROW **[P2]**, and
-`skipped.md:337-338` marks the `ROW(...)` constructor **[P2]**. This is type-system work
-plus an Arrow nested-type mapping, for exactly one source declaration and one consuming
-model. Narrow blast radius, deep implementation.
+Chosen over a first-class `SqlRowType` because it's far smaller and this is the only
+nested-data model in the benchmark. The limitation — no whole-struct selection / `SELECT *`
+of structs — is unexercised here. The first-class alternative (and why **arrays**, unlike
+structs, cannot be flattened and would force it) is captured in
+`docs/design-nested-types.md` for when a workload needs a composite *value*.
+
+Note gap 2 unblocks the *struct* part of `crm_customer_mgmt`; that model also needs two
+gap-6 tail items to run fully — `CONCAT_WS` and `CAST(bigint AS timestamp)`.
 
 ### 3. Multi-key window `ORDER BY` — DONE
 
@@ -425,7 +434,7 @@ a standalone docs commit before implementation started; recorded here because th
 | # | Gap | Models hit | Class |
 |---|---|---|---|
 | 1 | Rank projected into output | 5 (all analytics) | Architectural — design decision |
-| 2 | Nested `ROW` structs | 2 | Architectural — type system |
+| 2 | Nested `ROW` structs | 2 | **DONE** (flattened) |
 | 3 | Multi-key window `ORDER BY` | 7 | **DONE** |
 | 4a | Computed equi-keys | 2 (+ latent perf bug) | **DONE** |
 | 4b | OUTER JOIN + cross-side residual | 2 | **DONE** |
@@ -434,8 +443,10 @@ a standalone docs commit before implementation started; recorded here because th
 
 Items 1–5 are the critical path. Item 1 gates 5 of 50 models and is a design decision
 rather than a coding task; the rest are ordinary implementation work. Agreed order:
-3 → 4 → 5 → 2, with 1 to be decided. **3, 4a, 4b and 5 are done.** Remaining: 2 (nested
-`ROW` structs, deepest), then the gap-1 decision.
+3 → 4 → 5 → 2, with 1 to be decided. **3, 4a, 4b, 5 and 2 are done — the whole "bounded"
+critical path plus the struct gap.** Remaining: the gap-1 decision (rank-in-output), and
+the gap-6 scalar/type tail (`CONCAT_WS`, `MD5`, `RLIKE`, `TINYINT`, `CAST(bigint AS
+timestamp)`, typed temporal literals, named `WINDOW`).
 
 Input/output adapter work is **not** on the critical path and should follow, not lead —
 the SQL surface is what determines whether the benchmark can run at all. See the

@@ -236,9 +236,56 @@ public sealed class Parser
             case TokenKind.Interval:
                 Advance();
                 return new SqlTypeSpec("INTERVAL", IntervalQualifier: ParseIntervalQualifier());
+            case TokenKind.Row:
+                return ParseRowTypeSpec();
             default:
                 throw Error(t, $"expected SQL type, got {Describe(t)}");
         }
+    }
+
+    /// <summary>
+    /// Parse a <c>ROW( field TYPE [NULL | NOT NULL], … )</c> struct type spec,
+    /// recursively (fields may themselves be <c>ROW</c>). The resolver flattens
+    /// these into dotted-name scalar leaf columns — there is no runtime struct
+    /// value. See <c>docs/design-nested-types.md</c>.
+    /// </summary>
+    private SqlTypeSpec ParseRowTypeSpec()
+    {
+        Expect(TokenKind.Row);
+        Expect(TokenKind.LParen);
+        var fields = new List<RowFieldSpec>();
+        while (true)
+        {
+            var fieldName = ExpectFieldName("ROW field name");
+            var fieldType = ParseTypeSpec();
+
+            // Per-field nullability. Fields default to nullable (the ivm-bench /
+            // Parquet convention); an explicit NOT NULL tightens it.
+            var nullable = true;
+            if (Peek().Kind == TokenKind.Not)
+            {
+                Advance();
+                Expect(TokenKind.Null);
+                nullable = false;
+            }
+            else if (Peek().Kind == TokenKind.Null)
+            {
+                Advance();
+            }
+
+            fields.Add(new RowFieldSpec(fieldName, fieldType, nullable));
+
+            if (Peek().Kind == TokenKind.Comma)
+            {
+                Advance();
+                continue;
+            }
+
+            break;
+        }
+
+        Expect(TokenKind.RParen);
+        return new SqlTypeSpec("ROW", Fields: fields);
     }
 
     /// <summary>
@@ -1760,9 +1807,22 @@ public sealed class Parser
 
         if (Peek().Kind == TokenKind.Dot)
         {
+            // Dotted path. The first segment is the qualifier (table alias);
+            // the remaining segments join with '.' into the column name. A plain
+            // `t.k` yields ColumnReference("t", "k") as before; a nested-struct
+            // access `cm.Customer.Name.C_L_NAME` yields
+            // ColumnReference("cm", "Customer.Name.C_L_NAME"), which resolves
+            // against the flattened dotted-name leaf columns produced at CREATE
+            // TABLE. See docs/design-nested-types.md.
             Advance();
-            var colName = ExpectIdentifier("column name");
-            return new ColumnReference(first.Text, colName);
+            var name = ExpectFieldName("column name");
+            while (Peek().Kind == TokenKind.Dot)
+            {
+                Advance();
+                name = name + "." + ExpectFieldName("field name");
+            }
+
+            return new ColumnReference(first.Text, name);
         }
 
         if (Peek().Kind == TokenKind.LParen)
@@ -2164,6 +2224,23 @@ public sealed class Parser
     {
         var t = Peek();
         if (t.Kind != TokenKind.Identifier)
+        {
+            throw Error(t, $"expected {what}, got {Describe(t)}");
+        }
+
+        return Advance().Text;
+    }
+
+    /// <summary>
+    /// Expect a member name — an identifier, or a reserved word used as a name.
+    /// Struct field names and dotted field-access segments (<c>ROW(Name …)</c>,
+    /// <c>x.Value</c>) legitimately collide with keywords; in these positions the
+    /// grammar is unambiguous, so a keyword is accepted by its (folded) text.
+    /// </summary>
+    private string ExpectFieldName(string what)
+    {
+        var t = Peek();
+        if (t.Kind != TokenKind.Identifier && !Lexer.IsKeywordKind(t.Kind))
         {
             throw Error(t, $"expected {what}, got {Describe(t)}");
         }

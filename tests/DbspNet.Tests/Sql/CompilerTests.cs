@@ -556,6 +556,58 @@ public class CompilerTests
         Assert.Equal(1, WeightOf(q.Current, 4, 1L));
     }
 
+    // ---- Nested ROW columns (flattened) ----
+
+    [Fact]
+    public void RowColumn_EndToEnd_ReadsNestedLeavesAsScalars()
+    {
+        // A flattened ROW table is indistinguishable from a flat table at
+        // runtime: push rows positionally over the leaf columns, read nested
+        // leaves back. Mirrors ivm-bench crm_customer_mgmt's leaf extraction.
+        var q = Compile(
+            [
+                "CREATE TABLE cm (" +
+                "  id BIGINT NOT NULL," +
+                "  Customer ROW(" +
+                "    Name ROW(First VARCHAR NULL, Last VARCHAR NULL) NULL," +
+                "    Contact ROW(Phone ROW(Ctry BIGINT NULL, Local VARCHAR NULL) NULL) NULL," +
+                "    _Tier BIGINT NULL" +
+                "  ) NULL" +
+                ")",
+            ],
+            "SELECT cm.id, cm.Customer.Name.Last AS ln, " +
+            "cm.Customer.Contact.Phone.Ctry AS cc, " +
+            "CAST(cm.Customer._Tier AS INTEGER) AS tier " +
+            "FROM cm");
+
+        // Leaves in declaration order: id, first, last, ctry, local, tier.
+        q.Table("cm").Insert(1L, "Ada", "Lovelace", 44L, "1234", 3L);
+        q.Table("cm").Insert(2L, "Alan", "Turing", 1L, "5678", 1L);
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1L, "Lovelace", 44L, 3));
+        Assert.Equal(1, WeightOf(q.Current, 2L, "Turing", 1L, 1));
+    }
+
+    [Fact]
+    public void RowColumn_NullStruct_YieldsNullLeaves()
+    {
+        // A wholly-NULL nested struct presents each leaf as NULL — the
+        // leaf-access-only semantics flattening relies on.
+        var q = Compile(
+            [
+                "CREATE TABLE cm (" +
+                "  id BIGINT NOT NULL," +
+                "  Customer ROW(Name ROW(Last VARCHAR NULL) NULL) NULL" +
+                ")",
+            ],
+            "SELECT cm.id, cm.Customer.Name.Last AS ln FROM cm");
+
+        q.Table("cm").Insert(new object?[] { 1L, null });   // id=1, last=NULL
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1L, null));
+    }
+
     // ---- STDDEV / VARIANCE ----
 
     private static double AggDouble(CompiledQuery q, params object?[] keyThenValueless)
