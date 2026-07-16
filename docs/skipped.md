@@ -322,9 +322,12 @@ reflect that shape, not a backlog.
   follows PostgreSQL: replaces the **first** match by default, all with `g`;
   the replacement string supports `\1`…`\9` and `\&` backreferences (translated
   to .NET `$1`/`$0`). `REGEXP_SUBSTR` returns the first match or NULL. Regular
-  registry entries; ordinary function-call syntax (the `~` / `~*` / `!~` / `!~*`
-  match operators are *deferred* — they need new lexer tokens around `!`/`!=`).
-  Shares the `[[:alpha:]]` POSIX-class gap noted above.
+  registry entries; ordinary function-call syntax. The Spark/Hive infix
+  `[NOT] RLIKE` operator is **implemented** as a contextual-keyword parser arm
+  that desugars to `REGEXP_LIKE` (same substring-POSIX semantics), mirroring
+  `LIKE`/`ILIKE`. The PostgreSQL `~` / `~*` / `!~` / `!~*` match operators are
+  still *deferred* — they need new lexer tokens around `!`/`!=`. Shares the
+  `[[:alpha:]]` POSIX-class gap noted above.
 - `IN (literal_list)` / `NOT IN (literal_list)` — **implemented**.
   Modeled as a flat `InListExpression(probe, values, isNegated)` AST
   node, not a parser-time desugar to a left-leaning OR chain. The flat
@@ -574,11 +577,14 @@ reflect that shape, not a backlog.
   (intervals are intermediate-only today — a persisted/snapshotted interval
   output column would need an Arrow `MonthDayNano` mapping); and `interval ×
   decimal`.
-- **[P2]** TIMESTAMP WITH TIME ZONE and typed temporal literals
-  (`DATE 'yyyy-mm-dd'` etc.). DATE / TIME / TIMESTAMP base types exist with
-  Arrow-aligned representations (`Date32`, `Time64[microsecond]`,
+- **[P2]** TIMESTAMP WITH TIME ZONE. DATE / TIME / TIMESTAMP base types exist
+  with Arrow-aligned representations (`Date32`, `Time64[microsecond]`,
   `Timestamp[microsecond]` naive), with `CAST` from string and ordering /
-  equality. (Temporal literals can be written as `CAST('…' AS DATE)` etc.)
+  equality. **Typed temporal literals `DATE '…'` / `TIME '…'` / `TIMESTAMP '…'`
+  are DONE** — the parser lowers a type keyword immediately followed by a string
+  literal to a constant `CAST(string AS type)` (mirroring the existing
+  `INTERVAL '…'` literal). Guarded on the following-string so the keywords stay
+  usable as type names.
 - VARCHAR is stored as `Utf8String` (Arrow-aligned
   `ReadOnlyMemory<byte>`) with native UTF-8 equality, ordering, hashing
   (XxHash3), `LENGTH` (code points), byte-wise `CONCAT`, and `Rune`-based
@@ -642,6 +648,9 @@ reflect that shape, not a backlog.
   columns is a future SQL-frontend extension.
 - **[P2]** Unsigned integer variants (`UINT8`, `UINT16`, etc.). Feldera
   supports them.
+- `TINYINT` / `SMALLINT` — **parsed**, widened to `INTEGER` (lossy, like
+  `CHAR`→`VARCHAR`): no native 8/16-bit runtime type. Fine where values are
+  small flags/tiers (the ivm-bench use). A true narrow integer type is deferred.
 - **ROW/STRUCT** — `ROW(field TYPE, …)` column declarations (nested) and
   multi-level dotted field access (`cm.Customer.ContactInfo.C_PHONE_1.C_CTRY_CODE`)
   are **[DONE]**, but by FLATTENING at CREATE TABLE — a ROW column expands into
@@ -795,13 +804,16 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
 - **[P1]** `SELECT *` is forbidden with `GROUP BY` / aggregates. Feldera
   (via Calcite) rewrites to an explicit column list during resolution.
 - **[P1]** Scalar function library. Currently supported:
-  `COALESCE`, `CAST`, `UPPER`, `LOWER`, `LENGTH`, `CONCAT`,
+  `COALESCE`, `CAST`, `UPPER`, `LOWER`, `LENGTH`, `MD5`, `CONCAT`, `CONCAT_WS`,
   `SUBSTRING`/`SUBSTR`, `TRIM`/`LTRIM`/`RTRIM` (whitespace default or a
   custom char set), `REPLACE`, `POSITION(x IN y)`/`STRPOS`, `ABS`, `FLOOR`,
   `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG`
   (base-10, or `LOG(b, x)`), `EXP`, `GREATEST`, `LEAST`, `NULLIF`, and the
   temporal functions `EXTRACT(field FROM …)` / `DATE_PART`, `DATE_TRUNC`,
   `DATEADD`, `DATEDIFF`. String functions are native UTF-8 / code-point.
+  `MD5` (32-char lowercase hex over the UTF-8 bytes, PG/Spark-compatible) and
+  `CONCAT_WS(sep, …)` (separator-join skipping NULL values; NULL sep → NULL)
+  are structural-only.
   `SIGN`/`LN`/`LOG`/`EXP` cast the operand to DOUBLE in the resolver, so the
   multi-arg string functions and the temporal functions fall back from the
   typed-row fast path to the structural compile (matching temporal
@@ -976,11 +988,14 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   scalar subqueries).
 - **[P2]** Expression-compiler CAST matrix. v1 supports numeric↔numeric,
   numeric↔string, bool→string, string↔temporal (date/time/timestamp),
-  string↔interval, and cross-temporal `date ↔ timestamp`
+  string↔interval, cross-temporal `date ↔ timestamp`
   (`ExpressionCompiler.cs`: `CAST(timestamp AS date)` floors to the day,
-  `CAST(date AS timestamp)` yields midnight). Missing: string→bool
-  (`'t'`/`'f'`), decimal-precision-aware numeric narrowing, and
-  numeric→temporal (e.g. `CAST(bigint AS timestamp)`).
+  `CAST(date AS timestamp)` yields midnight), and numeric→timestamp
+  (`CAST(bigint AS timestamp)`, value = MICROSECONDS since epoch, matching
+  DuckDB; both compile paths). Missing: string→bool (`'t'`/`'f'`),
+  decimal-precision-aware numeric narrowing, and numeric→date/time.
+  Note the numeric→timestamp UNIT is a semantic choice — Spark/Hive read it as
+  SECONDS; switch by scaling in the two `IsNumeric… && dstClr == Timestamp` arms.
 
 ## Type system edge cases
 

@@ -42,7 +42,7 @@ public enum TokenKind
     Case, When, Then, Else, End,
 
     // Type keywords
-    Int, Integer, BigInt, Real, Double, Precision,
+    Int, Integer, BigInt, TinyInt, SmallInt, Real, Double, Precision,
     Decimal, Numeric, Varchar, Char, Text, Boolean, Bool,
     Date, Time, Timestamp, Interval, Extract,
 

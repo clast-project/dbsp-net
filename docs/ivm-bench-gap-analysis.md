@@ -350,17 +350,17 @@ rescan). A formula mutation passed the PBT — because both circuit and oracle s
 known-dataset test but failed the PBT on a retraction-heavy counterexample. Both are
 needed. This also gave AVG its first PBT coverage (the generator had none).
 
-### 6. Small, well-scoped additions
+### 6. Small, well-scoped additions — DONE except named `WINDOW`
 
-| Gap | Sites | Notes |
+| Gap | Sites | Status |
 |---|---|---|
-| `MD5` | 6 dim models | Transitively required — `dbt_utils.generate_surrogate_key` expands to `md5(cast(coalesce(...) \|\| '-' \|\| ... as varchar))`. `\|\|`, `COALESCE`, `CAST` are already supported. |
-| `CONCAT_WS` | 6 | `crm_customer_mgmt`. Not in the registry (`concat` is). |
-| `RLIKE` | 2 | `finwire_financial:22`, `finwire_security:17`, both `'^[0-9]+$'`. Spark-flavored; `REGEXP_LIKE` already exists. No POSIX classes involved. |
-| `TINYINT` | 3 columns | Not parsed at all. `staging_account.taxstatus`, `staging_customer.tier`, `staging_trade.t_is_cash`. |
-| `CAST(bigint AS TIMESTAMP)` | 2 | `crm_customer_mgmt`, `cdc_dsn`. Outside the CAST matrix (`skipped.md:890-894`). |
-| Typed temporal literals | 6 | `TIMESTAMP '9999-12-31 23:59:59.999'`. `skipped.md:501-505` **[P2]**; workaround is `CAST('…' AS TIMESTAMP)`. |
-| Named `WINDOW` clause | 2 models | `silver/daily_market.sql`, `gold/dim_customer.sql`. `skipped.md:479-480` **[P3]**; inlining the spec is equivalent. |
+| `MD5` | 6 dim models | **DONE**. Transitively required — `dbt_utils.generate_surrogate_key` expands to `md5(cast(coalesce(...) \|\| '-' \|\| ... as varchar))`. 32-char lowercase hex over UTF-8 bytes (PG/Spark-compatible), structural-only. |
+| `CONCAT_WS` | 6 | **DONE**. `crm_customer_mgmt`. Separator-join skipping NULL values; NULL sep → NULL. Structural-only (variadic). |
+| `RLIKE` | 2 | **DONE**. `finwire_financial:22`, `finwire_security:17`. Infix contextual-keyword arm desugaring to `REGEXP_LIKE`. |
+| `TINYINT` / `SMALLINT` | 3 columns | **DONE**. Parsed, widened to `INTEGER` (lossy, like `CHAR`→`VARCHAR`). |
+| `CAST(bigint AS TIMESTAMP)` | 2 | **DONE**. `cdc_dsn`. Value = MICROSECONDS since epoch (DuckDB convention; Spark=seconds is a one-line swap). Both compile paths. |
+| Typed temporal literals | 6 | **DONE**. `TIMESTAMP '…'` / `DATE '…'` / `TIME '…'` parse to a constant `CAST(string AS type)`, mirroring `INTERVAL '…'`. |
+| Named `WINDOW` clause | 2 models | **Deferred** — see below. `silver/daily_market.sql`, `gold/dim_customer.sql`; inlining the spec is equivalent, so a forward-reference resolver substitution, structurally different from the rest of the tail. |
 
 ### 7. Verified non-issues
 

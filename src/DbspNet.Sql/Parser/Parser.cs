@@ -165,6 +165,12 @@ public sealed class Parser
             case TokenKind.BigInt:
                 Advance();
                 return new SqlTypeSpec("BIGINT");
+            case TokenKind.TinyInt:
+            case TokenKind.SmallInt:
+                // No native 8/16-bit type; widen to INTEGER (lossy, like CHAR→VARCHAR).
+                // Benchmark values are small flags/tiers where this is exact.
+                Advance();
+                return new SqlTypeSpec("INTEGER");
             case TokenKind.Real:
                 Advance();
                 return new SqlTypeSpec("REAL");
@@ -1101,6 +1107,15 @@ public sealed class Parser
                 continue;
             }
 
+            // `value [NOT] RLIKE pattern` — the Spark/Hive infix spelling of a
+            // POSIX substring regex match; desugars to REGEXP_LIKE.
+            if (IsContextualKeyword("rlike"))
+            {
+                Advance();
+                left = ParseLikeRhs(left, "regexp_like", isNegated: false);
+                continue;
+            }
+
             if (IsContextualKeyword("similar") && IsContextualKeywordAt(1, "to"))
             {
                 Advance(); // SIMILAR
@@ -1122,6 +1137,14 @@ public sealed class Parser
                 Advance(); // NOT
                 Advance(); // ILIKE
                 left = ParseLikeRhs(left, "ilike", isNegated: true);
+                continue;
+            }
+
+            if (t.Kind == TokenKind.Not && IsContextualKeywordAt(1, "rlike"))
+            {
+                Advance(); // NOT
+                Advance(); // RLIKE
+                left = ParseLikeRhs(left, "regexp_like", isNegated: true);
                 continue;
             }
 
@@ -1497,6 +1520,10 @@ public sealed class Parser
                 return inner;
             case TokenKind.Interval:
                 return ParseIntervalLiteral();
+            case TokenKind.Date when PeekAt(1).Kind == TokenKind.StringLiteral:
+            case TokenKind.Time when PeekAt(1).Kind == TokenKind.StringLiteral:
+            case TokenKind.Timestamp when PeekAt(1).Kind == TokenKind.StringLiteral:
+                return ParseTypedTemporalLiteral();
             case TokenKind.Extract:
                 return ParseExtractExpression();
             case TokenKind.Cast:
@@ -1698,6 +1725,28 @@ public sealed class Parser
     /// folds the cast of the literal string into a typed interval value, so
     /// there is no per-row re-parse.
     /// </summary>
+    /// <summary>
+    /// Parse a typed temporal literal — <c>DATE '…'</c>, <c>TIME '…'</c>,
+    /// <c>TIMESTAMP '…'</c> — as a constant CAST of the string to that type,
+    /// mirroring <see cref="ParseIntervalLiteral"/>. Only reached when the type
+    /// keyword is immediately followed by a string literal (guarded by the
+    /// caller), so the keywords stay usable as type names elsewhere.
+    /// </summary>
+    private Expression ParseTypedTemporalLiteral()
+    {
+        var typeName = Peek().Kind switch
+        {
+            TokenKind.Date => "DATE",
+            TokenKind.Time => "TIME",
+            _ => "TIMESTAMP",
+        };
+        Advance();
+        var strTok = Advance();   // the caller guaranteed a StringLiteral here
+        return new CastExpression(
+            new LiteralExpression(LiteralKind.String, strTok.Text),
+            new SqlTypeSpec(typeName));
+    }
+
     private Expression ParseIntervalLiteral()
     {
         Expect(TokenKind.Interval);
@@ -2197,6 +2246,12 @@ public sealed class Parser
     // ---------------- Token helpers ----------------
 
     private Token Peek() => _tokens[_pos];
+
+    private Token PeekAt(int offset)
+    {
+        var i = _pos + offset;
+        return i < _tokens.Count ? _tokens[i] : _tokens[^1];
+    }
 
     private Token Advance()
     {

@@ -86,6 +86,8 @@ public sealed class Lexer
         ["int"] = TokenKind.Int,
         ["integer"] = TokenKind.Integer,
         ["bigint"] = TokenKind.BigInt,
+        ["tinyint"] = TokenKind.TinyInt,
+        ["smallint"] = TokenKind.SmallInt,
         ["real"] = TokenKind.Real,
         ["double"] = TokenKind.Double,
         ["precision"] = TokenKind.Precision,

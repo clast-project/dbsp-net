@@ -59,6 +59,28 @@ internal sealed class ConcatFunction : IScalarFunction
         TypedBuiltinScalarFunctions.BuildConcat(t);
 }
 
+internal sealed class ConcatWsFunction : IScalarFunction
+{
+    public string Name => "concat_ws";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveConcatWs(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildConcatWs(BuiltinScalarFunctions.CompileArgs(fn, buildArg));
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) =>
+        null;   // structural-only (variadic)
+}
+
+internal sealed class Md5Function : IScalarFunction
+{
+    public string Name => "md5";
+    public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args) =>
+        BuiltinScalarFunctions.ResolveMd5(args);
+    public Expression BuildStructural(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg) =>
+        BuiltinScalarFunctions.BuildMd5(BuiltinScalarFunctions.CompileArgs(fn, buildArg)[0]);
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) =>
+        null;   // structural-only
+}
+
 internal sealed class ConcatStrictFunction : IScalarFunction
 {
     public string Name => "||";

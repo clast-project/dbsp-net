@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using DbspNet.Sql.Plan;
@@ -80,6 +81,31 @@ internal static class BuiltinScalarFunctions
 
         // PG semantics: CONCAT never returns NULL. NULL args are skipped.
         return new ResolvedFunctionCall("concat", args, new SqlVarcharType(null, Nullable: false));
+    }
+
+    internal static ResolvedFunctionCall ResolveConcatWs(IReadOnlyList<ResolvedExpression> args)
+    {
+        if (args.Count < 2)
+        {
+            throw new ResolveException("CONCAT_WS requires a separator and at least one value argument");
+        }
+
+        foreach (var a in args)
+        {
+            RequireString("concat_ws", a);
+        }
+
+        // PG semantics: NULL value args are skipped; a NULL separator yields
+        // NULL, so the result is nullable exactly when the separator is.
+        return new ResolvedFunctionCall("concat_ws", args, new SqlVarcharType(null, args[0].Type.Nullable));
+    }
+
+    internal static ResolvedFunctionCall ResolveMd5(IReadOnlyList<ResolvedExpression> args)
+    {
+        RequireArity("md5", args, 1);
+        RequireString("md5", args[0]);
+        // 32-char lowercase hex; NULL propagates.
+        return new ResolvedFunctionCall("md5", args, new SqlVarcharType(null, args[0].Type.Nullable));
     }
 
     internal static ResolvedFunctionCall ResolveConcatStrict(IReadOnlyList<ResolvedExpression> args)
@@ -685,6 +711,25 @@ internal static class BuiltinScalarFunctions
         return Expression.Convert(Expression.Call(ConcatRuntime, argArray), typeof(object));
     }
 
+    internal static readonly MethodInfo ConcatWsRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.ConcatWs))!;
+
+    internal static Expression BuildConcatWs(Expression[] args)
+    {
+        // CONCAT_WS(sep, a, b, …): join non-NULL value args with the separator;
+        // NULL separator → NULL result. Variadic ⇒ runtime dispatch.
+        var argArray = Expression.NewArrayInit(typeof(object), args);
+        return Expression.Convert(Expression.Call(ConcatWsRuntime, argArray), typeof(object));
+    }
+
+    internal static readonly MethodInfo Md5Runtime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Md5))!;
+
+    internal static Expression BuildMd5(Expression arg)
+    {
+        return NullPropagatingUnary(arg, typeof(Utf8String), s => Expression.Call(Md5Runtime, s));
+    }
+
     internal static readonly MethodInfo ConcatStrictRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.ConcatStrict))!;
 
@@ -1000,6 +1045,86 @@ internal static class SqlBuiltinRuntime
         }
 
         return Utf8String.FromBytes(buf);
+    }
+
+    /// <summary>
+    /// <c>CONCAT_WS(sep, a, b, …)</c>: join the non-NULL value args with the
+    /// separator between adjacent kept values (no leading/trailing separator,
+    /// and skipped NULLs collapse — <c>CONCAT_WS('-', 'a', NULL, 'b') = 'a-b'</c>).
+    /// A NULL separator yields NULL. Byte-wise over UTF-8, single pass.
+    /// </summary>
+    public static object? ConcatWs(object?[] args)
+    {
+        if (args[0] is not Utf8String sep)
+        {
+            return null;   // NULL separator ⇒ NULL result
+        }
+
+        var totalBytes = 0;
+        var kept = 0;
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i] is Utf8String u)
+            {
+                totalBytes += u.ByteLength;
+                kept++;
+            }
+        }
+
+        if (kept == 0)
+        {
+            return Utf8String.Empty;
+        }
+
+        var buf = new byte[totalBytes + sep.ByteLength * (kept - 1)];
+        var offset = 0;
+        var written = 0;
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i] is not Utf8String u)
+            {
+                continue;
+            }
+
+            if (written > 0)
+            {
+                sep.Span.CopyTo(buf.AsSpan(offset));
+                offset += sep.ByteLength;
+            }
+
+            u.Span.CopyTo(buf.AsSpan(offset));
+            offset += u.ByteLength;
+            written++;
+        }
+
+        return Utf8String.FromBytes(buf);
+    }
+
+    private static ReadOnlySpan<byte> HexDigits => "0123456789abcdef"u8;
+
+    /// <summary>
+    /// <c>MD5(x)</c>: the 32-character lowercase hex MD5 digest of the argument's
+    /// UTF-8 bytes (matching PostgreSQL / Spark, which hash the text's byte
+    /// encoding). Not cryptographically meaningful here — this is dbt's
+    /// surrogate-key hashing.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage(
+        "Security", "CA5351:Do Not Use Broken Cryptographic Algorithms",
+        Justification = "SQL MD5() is a deterministic content hash (dbt surrogate keys), " +
+            "not a security primitive. Its digest must match other engines' MD5().")]
+    public static Utf8String Md5(Utf8String s)
+    {
+        Span<byte> digest = stackalloc byte[16];
+        MD5.HashData(s.Span, digest);
+
+        var hex = new byte[32];
+        for (var i = 0; i < 16; i++)
+        {
+            hex[i * 2] = HexDigits[digest[i] >> 4];
+            hex[i * 2 + 1] = HexDigits[digest[i] & 0xF];
+        }
+
+        return Utf8String.FromBytes(hex);
     }
 
     /// <summary>

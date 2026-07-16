@@ -319,6 +319,21 @@ public class TypedExpressionCompilerTests
     }
 
     [Fact]
+    public void Cast_BigintToTimestamp_Microseconds()
+    {
+        // The typed compiler is a separate cast dispatch from the structural
+        // one; verify the numeric→timestamp arm there too.
+        var (rowType, factory) = RowFor(("a", new SqlBigintType(false)));
+        var expr = ResolveSelectExpression(
+            ["CREATE TABLE t (a BIGINT NOT NULL)"], "CAST(a AS TIMESTAMP)");
+
+        var del = TypedExpressionCompiler.TryCompile(expr, rowType);
+        Assert.NotNull(del);
+        var ts = Assert.IsType<Timestamp>(Invoke(del!, factory(new object?[] { 1_600_000_000_000_000L })));
+        Assert.Equal(1_600_000_000_000_000L, ts.Microseconds);
+    }
+
+    [Fact]
     public void IsNull_OnNonNullExpr_CollapsesToFalse()
     {
         var (rowType, factory) = RowFor(("a", new SqlIntegerType(false)));

@@ -754,6 +754,16 @@ public static class TypedExpressionCompiler
                 typeof(Timestamp).GetMethod(nameof(Timestamp.FromDate), [typeof(Date32)])!, op));
         }
 
+        if (IsNumericNonDecimal(srcClr) && dstClr == typeof(Timestamp))
+        {
+            // CAST(numeric AS timestamp): value is MICROSECONDS since the epoch
+            // (matches the structural compiler; see the note there re: Spark
+            // seconds semantics).
+            return PropagateUnary(operand, op => Expression.New(
+                typeof(Timestamp).GetConstructor([typeof(long)])!,
+                Expression.Convert(op, typeof(long))));
+        }
+
         throw Unsupported();
     }
 

@@ -621,6 +621,17 @@ public static class ExpressionCompiler
                 typeof(Timestamp).GetMethod(nameof(Timestamp.FromDate), [typeof(Date32)])!, unboxed);
             converted = Expression.Convert(toTs, typeof(object));
         }
+        else if (IsNumeric(srcClr) && dstClr == typeof(Timestamp))
+        {
+            // CAST(numeric AS timestamp): interpret the value as MICROSECONDS
+            // since the Unix epoch (Timestamp's native unit; matches DuckDB).
+            // NOTE: Spark/Hive interpret it as SECONDS — to switch, multiply by
+            // Interval.MicrosPerSecond here. The ivm-bench use (cdc_dsn) is a
+            // monotonic ordering key, so either unit preserves its semantics.
+            var micros = Expression.Convert(Expression.Convert(operand, srcClr), typeof(long));
+            var toTs = Expression.New(typeof(Timestamp).GetConstructor([typeof(long)])!, micros);
+            converted = Expression.Convert(toTs, typeof(object));
+        }
         else
         {
             throw new InvalidOperationException(

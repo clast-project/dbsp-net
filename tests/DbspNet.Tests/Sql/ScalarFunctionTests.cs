@@ -569,4 +569,150 @@ public class ScalarFunctionTests
             "SELECT SIGN(x) FROM t",
             q => q.Table("t").Insert((object?)null)));
     }
+
+    // ---- CONCAT_WS ----
+
+    [Fact]
+    public void ConcatWs_JoinsWithSeparator()
+    {
+        Assert.Equal("a-b-c", EvalOne(
+            ["CREATE TABLE t (a VARCHAR NOT NULL, b VARCHAR NOT NULL, c VARCHAR NOT NULL)"],
+            "SELECT CONCAT_WS('-', a, b, c) FROM t",
+            q => q.Table("t").Insert("a", "b", "c")));
+    }
+
+    [Fact]
+    public void ConcatWs_SkipsNullValues_NoDoubledSeparator()
+    {
+        // NULL value args collapse: no leading/trailing/doubled separator.
+        Assert.Equal("a-c", EvalOne(
+            ["CREATE TABLE t (a VARCHAR NOT NULL, b VARCHAR, c VARCHAR NOT NULL)"],
+            "SELECT CONCAT_WS('-', a, b, c) FROM t",
+            q => q.Table("t").Insert("a", null, "c")));
+    }
+
+    [Fact]
+    public void ConcatWs_AllNullValues_EmptyString()
+    {
+        Assert.Equal("", EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL, a VARCHAR, b VARCHAR)"],
+            "SELECT CONCAT_WS(s, a, b) FROM t",
+            q => q.Table("t").Insert("-", null, null)));
+    }
+
+    [Fact]
+    public void ConcatWs_NullSeparator_ReturnsNull()
+    {
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (s VARCHAR, a VARCHAR NOT NULL)"],
+            "SELECT CONCAT_WS(s, a) FROM t",
+            q => q.Table("t").Insert(new object?[] { null, "a" })));
+    }
+
+    // ---- MD5 ----
+
+    [Fact]
+    public void Md5_MatchesKnownDigests()
+    {
+        // Reference MD5 hex digests (as PostgreSQL / Spark emit).
+        Assert.Equal("d41d8cd98f00b204e9800998ecf8427e", EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT MD5(s) FROM t",
+            q => q.Table("t").Insert("")));
+        Assert.Equal("0cc175b9c0f1b6a831c399e269772661", EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT MD5(s) FROM t",
+            q => q.Table("t").Insert("a")));
+        Assert.Equal("900150983cd24fb0d6963f7d28e17f72", EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT MD5(s) FROM t",
+            q => q.Table("t").Insert("abc")));
+    }
+
+    [Fact]
+    public void Md5_PropagatesNull()
+    {
+        Assert.Null(EvalOne(
+            ["CREATE TABLE t (s VARCHAR)"],
+            "SELECT MD5(s) FROM t",
+            q => q.Table("t").Insert((object?)null)));
+    }
+
+    // ---- RLIKE (Spark infix, desugars to REGEXP_LIKE) ----
+
+    [Fact]
+    public void Rlike_MatchesPosixRegex()
+    {
+        Assert.Equal(true, EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT s RLIKE '^[0-9]+$' FROM t",
+            q => q.Table("t").Insert("12345")));
+        Assert.Equal(false, EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT s RLIKE '^[0-9]+$' FROM t",
+            q => q.Table("t").Insert("12a45")));
+    }
+
+    [Fact]
+    public void NotRlike_Negates()
+    {
+        Assert.Equal(true, EvalOne(
+            ["CREATE TABLE t (s VARCHAR NOT NULL)"],
+            "SELECT s NOT RLIKE '^[0-9]+$' FROM t",
+            q => q.Table("t").Insert("x")));
+    }
+
+    // ---- Typed temporal literals ----
+
+    [Fact]
+    public void TimestampLiteral_ParsesAndEqualsCast()
+    {
+        // TIMESTAMP '…' ≡ CAST('…' AS TIMESTAMP); both feed a filter here.
+        var q = Compile(
+            ["CREATE TABLE t (ts TIMESTAMP NOT NULL)"],
+            "SELECT ts FROM t WHERE ts < TIMESTAMP '9999-12-31 23:59:59.999'");
+        q.Table("t").Insert(Timestamp.Parse("2020-01-01 00:00:00"));
+        q.Step();
+        Assert.Equal(1, q.Current.Count);
+    }
+
+    [Fact]
+    public void DateLiteral_Parses()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (d DATE NOT NULL)"],
+            "SELECT d FROM t WHERE d >= DATE '1900-01-01'");
+        q.Table("t").Insert(Date32.Parse("2020-06-15"));
+        q.Step();
+        Assert.Equal(1, q.Current.Count);
+    }
+
+    // ---- TINYINT / SMALLINT (parse as INTEGER) ----
+
+    [Fact]
+    public void TinyIntSmallInt_ParseAsInteger()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (flag TINYINT NOT NULL, n SMALLINT NOT NULL)"],
+            "SELECT flag + n AS s FROM t");
+        q.Table("t").Insert(1, 100);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 101));
+    }
+
+    // ---- CAST(bigint AS timestamp) ----
+
+    [Fact]
+    public void CastBigintToTimestamp_InterpretsAsMicroseconds()
+    {
+        // 1_600_000_000_000_000 µs since epoch = 2020-09-13 12:26:40 UTC.
+        var q = Compile(
+            ["CREATE TABLE t (n BIGINT NOT NULL)"],
+            "SELECT CAST(n AS TIMESTAMP) AS ts FROM t");
+        q.Table("t").Insert(1_600_000_000_000_000L);
+        q.Step();
+        var entry = Assert.Single(q.Current);
+        var ts = Assert.IsType<Timestamp>(entry.Key[0]);
+        Assert.Equal(1_600_000_000_000_000L, ts.Microseconds);
+    }
 }
