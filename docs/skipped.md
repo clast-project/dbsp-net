@@ -260,17 +260,13 @@ reflect that shape, not a backlog.
     (`ConstantZeroComparer` tiebreak). Supported on both compiler paths and
     snapshotable. PARTITION BY / ORDER BY may reference non-selected columns
     (carried as hidden columns, reusing the ORDER BY machinery). Deferred:
-      - **[P2]** Selecting the rank value into the output (`SELECT …, rn …`).
-        Today the rank exists only to drive the `<= k` cut, so the output schema
-        is unchanged; emitting the rank as a column is a separate feature.
-        Rejected with an explicit error.
+      - Selecting the rank value into the output (`SELECT …, rn …`) — now
+        **implemented** as the general rank-in-output form; see the windowed-column
+        form under Window functions below.
       - **[P2]** `QUALIFY` (Snowflake/BigQuery/DuckDB sugar for the same pattern
         without a derived table).
       - **[P2]** A window function over a grouped/aggregated/`DISTINCT` inner
         query, or more than one window per query. Rejected with explicit errors.
-      - See the general windowed-column form (a rank column on every row) under
-        Window functions below — deliberately not supported (unbounded
-        incremental churn).
 - `SELECT DISTINCT` (SELECT-list form) — **implemented**. A `Distinct`
   flag on `SelectStatement` (parsed after `SELECT`; `ALL` is the
   bag-semantics no-op default); the resolver wraps the projection's
@@ -456,26 +452,43 @@ reflect that shape, not a backlog.
   (e.g. `SUM(CASE WHEN MAX(x) ...)`). Rejected by `Resolver.HasAggregate`.
 
 ### Window functions
-- `ROW_NUMBER` / `RANK` / `DENSE_RANK` **restricted to the TopK filter pattern**
-  are **implemented** (see "Partitioned TOP-K" under Query constructs above).
-  The rest are deferred:
-- **[P2]** The general windowed-column form — a rank/number emitted as an output
-  column on every row (`SELECT *, ROW_NUMBER() OVER (…) AS rn FROM t`, used
-  outside a `<= k` filter). Incrementally expensive: inserting one row shifts the
-  rank of every later row in the partition, so a single insert produces
-  O(partition-size) retractions.
+- `ROW_NUMBER` / `RANK` / `DENSE_RANK` are **implemented** both as the TopK filter
+  pattern (see "Partitioned TOP-K" under Query constructs above) and as the general
+  rank-in-output column (below). The rest are deferred:
+- The general windowed-column form — a rank/number emitted as an output column on
+  every row (`SELECT *, RANK() OVER (…) AS r FROM t`, or nested, e.g.
+  `CASE WHEN ROW_NUMBER() OVER (…) = 1 THEN …`, used outside a `<= k` filter) — is
+  **implemented**. A new `PartitionedRankPlan` + `PartitionedRankOp<TInRow,TOutRow,
+  TKey>` widens each row with its rank; ranking is *positional* (an insert shifts
+  the rank of every later row with no value-arithmetic bound), so a touched
+  partition is recomputed in full and diffed against its last emitted output. The
+  op forks the per-partition sorted trace and rank-assignment logic from
+  `PartitionedTopKOp` (`ROW_NUMBER` = multiplicity-counted position; `RANK` =
+  `1 + rows before`; `DENSE_RANK` = distinct-group index — tie groups via a
+  keys-only `ConstantZeroComparer` comparer) and the widened-output diffing from
+  `PartitionedWindowAggregateOp`. Empty `PARTITION BY` ⇒ a single global partition
+  (the unpartitioned analytics rank). Ranking accepts any number of `ORDER BY` keys
+  with mixed directions and takes no frame. The resolver adds a rank family to the
+  window-lift path (`TryResolveWindowAggregate`), grouping by `(family, OVER spec,
+  function)` so each rank column is one operator; the `preBound` machinery maps the
+  rank into the select list, including when nested in an expression (`financials`'
+  `is_current`). Structural compile only (typed/spine fall back — the marquee case
+  is unpartitioned, where a data-parallel path would not help). Correctness held by
+  a randomized incremental≡batch test (`BatchPartitionedRank` oracle) plus
+  behavioural tie / retraction / snapshot coverage.
 
-  Note this is *not* Feldera parity — Feldera supports the general form, and
-  treats the cost as a warning rather than a restriction: "these functions can
-  have a reasonable cost in three circumstances: each modified group (created by
+  This achieves Feldera parity — Feldera also supports the general form and treats
+  the cost as a warning rather than a restriction: "these functions can have a
+  reasonable cost in three circumstances: each modified group (created by
   `PARTITION BY`) is relatively small in size; new insertions and deletions
   feature rows that appear towards the end of the order produced by the
   `ORDER BY` clause; they are used in a TopK pattern with a small limit"
-  (<https://docs.feldera.com/sql/aggregates/>). Earlier Feldera docs did restrict
-  these to TopK, which is where this entry's original parity claim came from; the
-  restriction has since been lifted. The cost analysis above still holds — see
-  `ivm-bench-gap-analysis.md` §1, where unpartitioned ranks (whole relation = one
-  partition) demonstrably wedged Feldera at SF=100. Required to run ivm-bench.
+  (<https://docs.feldera.com/sql/aggregates/>). The cost is inherent and shared:
+  the op has no GC (`GcFrontier => null`) and retains the whole integrated input
+  per partition — a future smaller `ORDER BY` value re-ranks everyone. For
+  unpartitioned analytics ranks (whole relation = one partition) this is
+  O(relation) churn per tick — see `ivm-bench-gap-analysis.md` §1, where it
+  demonstrably wedged Feldera at SF=100. This was the last ivm-bench blocker.
 - Window aggregates `SUM` / `COUNT` / `AVG` / `MIN` / `MAX` `OVER (PARTITION BY p
   [ORDER BY o RANGE …])` emitted as a new output column — **implemented** for the
   three `RANGE` frame shapes (Feldera-faithful, RANGE only):
@@ -512,7 +525,8 @@ reflect that shape, not a backlog.
       each to a hidden computed column, and the `preBound` identity-substitution
       rewrites the enclosing expression to reference it — the same machinery the
       top-level case already used, so no new operator. Rank functions
-      (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) stay TopK-only even when nested. Window
+      (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) nested in an expression now lift the same
+      way (via `PartitionedRankPlan` — see the rank-in-output entry above). Window
       functions in `WHERE`/`GROUP BY`/`HAVING` stay rejected.
     - **[DONE]** `SELECT *` alongside a window function — the star expands to the
       BASE columns (the pre-window relation), never the hidden window-result

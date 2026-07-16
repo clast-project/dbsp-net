@@ -96,6 +96,9 @@ internal static class BatchPlanEvaluator
             case WindowOffsetPlan wo:
                 return BatchWindowOffset(wo, ctx);
 
+            case PartitionedRankPlan pr:
+                return BatchPartitionedRank(pr, ctx);
+
             case ScalarSubqueryJoinPlan s:
                 return BatchScalarSubqueryJoin(s, ctx);
 
@@ -753,6 +756,120 @@ internal static class BatchPlanEvaluator
                 }
 
                 result.Add(new StructuralRow(vs), Z64.One);
+            }
+        }
+
+        return result.Build();
+    }
+
+    // Batch rank-in-output — the from-scratch oracle for PartitionedRankOp. Sort
+    // each partition by the total order and assign each row its rank, widened onto
+    // the row. Mirrors PartitionedRankOp.ComputeWindow exactly (multiplicity and
+    // tie semantics included).
+    private static ZSet<StructuralRow, Z64> BatchPartitionedRank(PartitionedRankPlan plan, BatchEvalContext ctx)
+    {
+        var input = Evaluate(plan.Input, ctx);
+
+        var partFns = new Func<IReadOnlyList<object?>, object?>[plan.PartitionKeys.Count];
+        for (var i = 0; i < plan.PartitionKeys.Count; i++)
+        {
+            partFns[i] = ExpressionCompiler.CompileScalar(plan.PartitionKeys[i]);
+        }
+
+        var sortKeys = new Func<StructuralRow, object?>[plan.SortKeys.Count];
+        var sortDescending = new bool[plan.SortKeys.Count];
+        var sortNullsFirst = new bool[plan.SortKeys.Count];
+        for (var i = 0; i < plan.SortKeys.Count; i++)
+        {
+            var sortScalar = ExpressionCompiler.CompileScalar(plan.SortKeys[i].Expression);
+            sortKeys[i] = row => sortScalar(row);
+            sortDescending[i] = plan.SortKeys[i].Descending;
+            sortNullsFirst[i] = plan.SortKeys[i].NullsFirst;
+        }
+
+        var order = new SortKeyComparer<StructuralRow>(
+            sortKeys, sortDescending, sortNullsFirst, StructuralRowComparer.Instance);
+        var sortKeyOnly = new SortKeyComparer<StructuralRow>(
+            sortKeys, sortDescending, sortNullsFirst, ConstantZeroComparer<StructuralRow>.Instance);
+
+        var parts = new Dictionary<StructuralRow, List<(StructuralRow Row, long Weight)>>();
+        foreach (var (row, w) in input)
+        {
+            var kvs = new object?[partFns.Length];
+            for (var i = 0; i < partFns.Length; i++)
+            {
+                kvs[i] = partFns[i](row);
+            }
+
+            var key = new StructuralRow(kvs);
+            if (!parts.TryGetValue(key, out var lst))
+            {
+                lst = new List<(StructuralRow, long)>();
+                parts[key] = lst;
+            }
+
+            lst.Add((row, w.Value));
+        }
+
+        StructuralRow Widen(StructuralRow row, long rank)
+        {
+            var vs = new object?[row.Count + 1];
+            for (var i = 0; i < row.Count; i++)
+            {
+                vs[i] = row[i];
+            }
+
+            vs[row.Count] = rank;
+            return new StructuralRow(vs);
+        }
+
+        var result = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var (_, rows) in parts)
+        {
+            rows.Sort((a, b) => order.Compare(a.Row, b.Row));
+
+            if (plan.Function == RankFunction.RowNumber)
+            {
+                long pos = 0;
+                foreach (var (row, weight) in rows)
+                {
+                    if (weight <= 0)
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0L; i < weight; i++)
+                    {
+                        result.Add(Widen(row, pos + i + 1), Z64.One);
+                    }
+
+                    pos += weight;
+                }
+
+                continue;
+            }
+
+            var dense = plan.Function == RankFunction.DenseRank;
+            long rowsBefore = 0;
+            long denseRank = 0;
+            long groupRank = 0;
+            StructuralRow? groupKey = null;
+            foreach (var (row, weight) in rows)
+            {
+                if (weight <= 0)
+                {
+                    continue;
+                }
+
+                if (groupKey is null || sortKeyOnly.Compare(groupKey, row) != 0)
+                {
+                    denseRank++;
+                    groupRank = dense ? denseRank : rowsBefore + 1;
+                    groupKey = row;
+                }
+
+                result.Add(Widen(row, groupRank), new Z64(weight));
+                rowsBefore += weight;
             }
         }
 

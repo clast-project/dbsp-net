@@ -94,7 +94,24 @@ published batch-2/3 numbers should account for that constant.
 
 ## Gaps, ranked
 
-### 1. Ranking window functions projected into the output — BLOCKING, architectural
+### 1. Ranking window functions projected into the output — DONE (2026-07-16)
+
+**Resolved.** Implemented as `PartitionedRankPlan` + `PartitionedRankOp<TInRow,
+TOutRow,TKey>` (structural compile path). The op forks `PartitionedTopKOp`'s
+per-partition sorted trace + rank-assignment and `PartitionedWindowAggregateOp`'s
+widened-output diffing; a touched partition is recomputed in full (ranking is
+positional — no value-range bound) and diffed against its last emitted output.
+Empty `PARTITION BY` ⇒ one global partition (the unpartitioned analytics ranks);
+rank nested in a CASE (`financials`' `is_current`) lifts via the same `preBound`
+path. No GC (`GcFrontier => null`) — the whole integrated input is retained per
+partition, the inherent cost this section predicted (and which wedged Feldera at
+SF=100). Correctness held by a randomized incremental≡batch PBT
+(`BatchPartitionedRank` oracle) plus behavioural tie / retraction / snapshot tests.
+This was the sole remaining ivm-bench compile blocker; all analytics ranks + the
+`financials`/`wrk_company_financials`/`fact_market_history` cascade now compile.
+The original analysis follows.
+
+---
 
 Affects all 5 analytics models (`models/gold/analytics/*.sql`): 12 call sites.
 

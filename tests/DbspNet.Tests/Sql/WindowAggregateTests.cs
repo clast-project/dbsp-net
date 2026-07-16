@@ -410,13 +410,18 @@ public class WindowAggregateTests
     }
 
     [Fact]
-    public void RankFunction_NestedInExpression_StillRejected()
+    public void RankFunction_NestedInExpression_LiftsToRankColumn()
     {
-        // financials shape: ROW_NUMBER() OVER (...) = 1 in a CASE. Rank functions
-        // are TopK-only even when nested — must not be silently lifted.
-        var ex = Assert.Throws<ResolveException>(() => Compile(S,
-            "SELECT g, CASE WHEN ROW_NUMBER() OVER (PARTITION BY g ORDER BY ts) = 1 THEN 1 ELSE 0 END AS c FROM s"));
-        Assert.Contains("TOP-K", ex.Message, StringComparison.Ordinal);
+        // financials shape: ROW_NUMBER() OVER (...) = 1 in a CASE. Rank-in-output
+        // is now supported generally — the rank is lifted to a hidden column and
+        // the CASE reads it (see PartitionedRankTests for the full coverage).
+        var q = Compile(S,
+            "SELECT g, CASE WHEN ROW_NUMBER() OVER (PARTITION BY g ORDER BY ts) = 1 THEN 1 ELSE 0 END AS c FROM s");
+        q.Table("s").Insert(1, 10, 0);   // earliest ts → row_number 1 → c = 1
+        q.Table("s").Insert(1, 30, 0);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 1));
+        Assert.Equal(1, WeightOf(q.Current, 1, 0));
     }
 
     [Fact]

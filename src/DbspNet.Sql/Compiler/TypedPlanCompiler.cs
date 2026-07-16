@@ -395,6 +395,11 @@ public static class TypedPlanCompiler
         RecursiveCtePlan r => CompileRecursiveCte(r, ctx),
         TopKPlan t => CompileTopK(t, ctx),
         PartitionedTopKPlan pt => CompilePartitionedTopK(pt, ctx),
+        // Rank-in-output (ROW_NUMBER / RANK / DENSE_RANK as a column) has no typed
+        // path — it recomputes whole partitions positionally. Returning null falls
+        // the whole query back to the structural compiler (the marquee case is the
+        // unpartitioned analytics rank, where a typed/parallel path would not help).
+        PartitionedRankPlan => null,
         // PARTITION BY window aggregates take the typed/parallel path (the
         // operator is row-opaque; a struct-fusing widener appends the agg
         // columns). No-partition windows and unsupported aggregators (MIN/MAX,

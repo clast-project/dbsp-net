@@ -1321,13 +1321,14 @@ public sealed class Resolver
         var windowItems = new List<ExpressionSelectItem>(windowNodes.Count);
         foreach (var w in windowNodes)
         {
-            if (!IsAggregateName(w.FunctionName, w.IsStar) && !IsOffsetFunctionName(w.FunctionName))
+            if (!IsAggregateName(w.FunctionName, w.IsStar)
+                && !IsOffsetFunctionName(w.FunctionName)
+                && !IsRankFunctionName(w.FunctionName))
             {
                 throw new ResolveException(
                     $"window function '{w.FunctionName}' is not supported as an output column; only the " +
-                    "window aggregates SUM / COUNT / AVG / MIN / MAX and the offset functions LAG / LEAD / " +
-                    "FIRST_VALUE / LAST_VALUE are (ranking functions ROW_NUMBER / RANK / DENSE_RANK are " +
-                    "supported only in the TOP-K filter pattern)");
+                    "window aggregates SUM / COUNT / AVG / MIN / MAX, the offset functions LAG / LEAD / " +
+                    "FIRST_VALUE / LAST_VALUE, and the ranking functions ROW_NUMBER / RANK / DENSE_RANK are");
             }
 
             windowItems.Add(new ExpressionSelectItem(w, Alias: null));
@@ -1368,12 +1369,19 @@ public sealed class Resolver
         foreach (var wi in windowItems)
         {
             var w = (WindowFunctionExpression)wi.Expression;
-            var off = IsOffsetFunctionName(w.FunctionName);
+            var fam = WindowFamily(w);
             var group = groups.FirstOrDefault(g =>
             {
                 var head = (WindowFunctionExpression)g[0].Expression;
-                return IsOffsetFunctionName(head.FunctionName) == off
-                    && SameWindowSpec(head.Over, w.Over);
+                if (WindowFamily(head) != fam || !SameWindowSpec(head.Over, w.Over))
+                {
+                    return false;
+                }
+
+                // A rank operator emits exactly one function's rank column, so
+                // RANK vs DENSE_RANK vs ROW_NUMBER over the same OVER spec each get
+                // their own group (aggregate / offset groups share by spec alone).
+                return fam != WindowFamilyRank || head.FunctionName == w.FunctionName;
             });
 
             if (group is null)
@@ -1453,6 +1461,48 @@ public sealed class Resolver
 
         var inputSchema = inputPlan.Schema;
         var resultCols = new List<SchemaColumn>(group.Count);
+
+        if (IsRankFunctionName(firstWin.FunctionName))
+        {
+            // Ranking (ROW_NUMBER / RANK / DENSE_RANK) is positional — like the
+            // offset family it only compares rows, so it accepts any number of
+            // ORDER BY keys, but an ORDER BY is mandatory and it takes no frame.
+            if (orderKeys.Count == 0)
+            {
+                throw new ResolveException(
+                    $"{firstWin.FunctionName.ToUpperInvariant()}() OVER (...) requires an ORDER BY");
+            }
+
+            if (firstWin.Over.Frame is not null)
+            {
+                throw new ResolveException(
+                    "ROW_NUMBER / RANK / DENSE_RANK does not take a frame clause");
+            }
+
+            var func = firstWin.FunctionName switch
+            {
+                "row_number" => RankFunction.RowNumber,
+                "rank" => RankFunction.Rank,
+                "dense_rank" => RankFunction.DenseRank,
+                _ => throw new ResolveException($"unsupported ranking function '{firstWin.FunctionName}'"),
+            };
+
+            // The whole group (same function + OVER spec) shares a single BIGINT
+            // rank column appended after the input columns; every item maps to it.
+            var rankType = new SqlBigintType(false);
+            var (rankName, _) = DeriveProjectionName(firstWin, group[0].Alias);
+            var rankCol = new SchemaColumn(
+                group[0].Alias ?? (rankName == "$col" ? $"$wrank{synth}" : rankName), rankType);
+            var rankColumn = new ResolvedColumn(inputSchema.Count, rankType);
+            foreach (var wi in group)
+            {
+                preBound[wi.Expression] = rankColumn;
+            }
+
+            synth++;
+            var rankSchema = new Schema([.. inputSchema.Columns, rankCol]);
+            return new PartitionedRankPlan(inputPlan, partitionKeys, orderKeys, func, rankSchema);
+        }
 
         if (isOffset)
         {
@@ -1656,6 +1706,21 @@ public sealed class Resolver
 
     private static bool IsOffsetFunctionName(string name) =>
         name is "lag" or "lead" or "first_value" or "last_value";
+
+    private static bool IsRankFunctionName(string name) =>
+        name is "row_number" or "rank" or "dense_rank";
+
+    private const int WindowFamilyAggregate = 0;
+    private const int WindowFamilyOffset = 1;
+    private const int WindowFamilyRank = 2;
+
+    /// <summary>Which window family (aggregate / offset / rank) a window node
+    /// belongs to — the coarse grouping key that decides which operator it lowers
+    /// to. Each family has its own <see cref="BuildWindowGroup"/> arm.</summary>
+    private static int WindowFamily(WindowFunctionExpression w) =>
+        IsOffsetFunctionName(w.FunctionName) ? WindowFamilyOffset
+        : IsRankFunctionName(w.FunctionName) ? WindowFamilyRank
+        : WindowFamilyAggregate;
 
     /// <summary>Fold a resolved constant — a literal or a unary negation of a
     /// numeric literal — to its value. Used for LAG/LEAD constant offsets and

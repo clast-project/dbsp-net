@@ -168,6 +168,53 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// Incremental rank-in-output — <c>ROW_NUMBER</c> / <c>RANK</c> /
+    /// <c>DENSE_RANK</c> <c>OVER (PARTITION BY p ORDER BY o …)</c> emitted as a
+    /// single BIGINT column appended to every row (the general form, not the
+    /// <c>… &lt;= k</c> filter of <see cref="PartitionedTopK{TRow,TKey}"/>).
+    /// <paramref name="order"/> is the per-partition total order; the appended rank
+    /// is a <c>long</c>. <paramref name="sortKeyOnly"/> orders by the ORDER BY keys
+    /// alone so <paramref name="function"/> <c>Rank</c> / <c>DenseRank</c> can share
+    /// a rank across a tie group (ignored for <c>RowNumber</c>).
+    /// </summary>
+    public static Stream<ZSet<StructuralRow, Z64>> PartitionedRank<TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, TKey> partitionOf,
+        IComparer<StructuralRow> order,
+        IComparer<StructuralRow> sortKeyOnly,
+        RankFunction function,
+        IEqualityComparer<TKey>? partitionComparer = null,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(partitionOf);
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(sortKeyOnly);
+
+        // The structural widener: append the rank as a trailing BIGINT column.
+        static StructuralRow Widen(StructuralRow row, long rank)
+        {
+            var n = row.Count;
+            var vs = new object?[n + 1];
+            for (var i = 0; i < n; i++)
+            {
+                vs[i] = row[i];
+            }
+
+            vs[n] = rank;
+            return new StructuralRow(vs);
+        }
+
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedRankOp<StructuralRow, StructuralRow, TKey>(
+            input, output, partitionOf, order, sortKeyOnly, function, Widen, partitionComparer, snapshotCodec));
+        return output;
+    }
+
+    /// <summary>
     /// Incremental partitioned window aggregate — <c>agg(x) OVER (PARTITION BY p
     /// [ORDER BY o RANGE …])</c> emitted as new column(s) appended to every row.
     /// <paramref name="orderValueOf"/> null ⇒ a whole-partition frame;

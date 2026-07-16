@@ -198,6 +198,33 @@ public sealed record PartitionedTopKPlan(
     long Limit) : LogicalPlan(Input.Schema);
 
 /// <summary>
+/// A ranking window function — <c>ROW_NUMBER</c> / <c>RANK</c> / <c>DENSE_RANK</c>
+/// <c>OVER (PARTITION BY p ORDER BY o …)</c> — emitted as a new output column
+/// appended to every input row (the general form, not the <c>… &lt;= k</c>
+/// TOP-K filter pattern of <see cref="PartitionedTopKPlan"/>). Within each
+/// partition (the <see cref="PartitionKeys"/> grouping) every row is assigned its
+/// rank under <see cref="SortKeys"/> and re-emitted widened by that rank; an
+/// insert shifts the rank of every later row in the partition, so the operator
+/// recomputes the whole touched partition (positional, no value-range bound).
+/// </summary>
+/// <remarks>
+/// Unlike a window aggregate, ranking is positional — it never measures distance
+/// between key values — so it accepts any number of ORDER BY keys with mixed
+/// directions (mirroring <see cref="WindowOffsetPlan"/>); <c>RANK</c> /
+/// <c>DENSE_RANK</c> detect tie groups from the ORDER BY keys alone.
+/// <see cref="Schema"/> is <see cref="Input"/>'s columns followed by one BIGINT
+/// rank column. The widened rows are mapped to the user's select list (including
+/// when the rank is nested in an expression, e.g. <c>ROW_NUMBER() OVER (…) = 1</c>
+/// inside a CASE) by a <see cref="ProjectPlan"/> the resolver places above.
+/// </remarks>
+public sealed record PartitionedRankPlan(
+    LogicalPlan Input,
+    IReadOnlyList<ResolvedExpression> PartitionKeys,
+    IReadOnlyList<SortKey> SortKeys,
+    RankFunction Function,
+    Schema Schema) : LogicalPlan(Schema);
+
+/// <summary>
 /// Resolved <c>RANGE</c> frame for a <see cref="WindowAggregatePlan"/>. The upper
 /// bound is always <c>CURRENT ROW</c> in v1; <see cref="Preceding"/> is the lower
 /// bound's distance in the <see cref="WindowAggregatePlan.OrderKey"/>'s native

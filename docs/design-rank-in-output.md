@@ -2,8 +2,11 @@
 
 Plan for the last ivm-bench gap (gap 1): a ranking window function emitted as an
 **output column** on every row, not the existing `WHERE rn <= k` TopK-filter pattern.
-Scoped 2026-07-16; not yet built. This is the sole remaining blocker — with it, all 50
-feldera models compile (standup was 42/50, all 8 remaining failures are rank-in-output).
+Scoped 2026-07-16; **BUILT 2026-07-16** — shipped as `PartitionedRankPlan` +
+`PartitionedRankOp`, structural path, with a `BatchPartitionedRank` differential-PBT
+oracle (see `PartitionedRankTests` / `PartitionedRankSnapshotTests`). This was the sole
+remaining blocker — with it, all 50 feldera models compile (standup was 42/50, all 8
+remaining failures were rank-in-output). The plan below is the as-built design.
 
 ## Target shapes (from the analytics models)
 
@@ -53,6 +56,14 @@ Assemble from parts that already exist; do **not** extend either op in place.
 the rank of every row after it in sort order, with no value-arithmetic bound. So the op
 recomputes the **whole touched partition** (TopK `Step`-style, `:132-194`) rather than a
 value range. This sidesteps suffix arithmetic at an O(P) cost that is the accepted cost anyway.
+
+**As-built deviation:** `_window` is keyed by the **widened** row → weight (`Dictionary<TKey,
+Dictionary<TOutRow,long>>`), not by base row as the reuse assessment above suggested. This is
+closer to `PartitionedTopKOp`'s `_window` (whose `EmitDiff` it borrows verbatim) than to the
+window aggregate's, and it is what correctly handles `ROW_NUMBER`'s one-base-row → many-widened-
+rows expansion (a weight-`w` row takes `w` distinct consecutive ranks) — base-row keying can't
+hold that. The base-row keying the aggregate op uses exists only to let GC drop a finalized row
+silently; rank has no GC (`GcFrontier => null`), so that motivation doesn't apply.
 
 ## Resolver path — the nested case is already free
 
