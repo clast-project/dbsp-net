@@ -463,13 +463,20 @@ in the temporal-validity join — NEW).
 **Update (`SELECT *` with a window fixed):** `dim_customer` compiles (35). Its cascade
 surfaced `dim_account`'s own root rather than clearing.
 
+**Update (DATE ↔ TIMESTAMP coercion fixed):** `CommonComparableType` now coerces a DATE
+to a midnight TIMESTAMP when compared to a TIMESTAMP (PG/Spark semantics). `fact_market_history`'s
+own DATE/TIMESTAMP error is gone (it now cascades from `financials`/gap-1). Still 35 compile.
+
 **Remaining roots at 35/50, ranked by cascade:**
-- **Implicit type coercion in comparisons/joins** (the `[P1]` PostgreSQL-coercion gap) —
-  now the biggest cascade. `dim_account` (`BIGINT` vs `VARCHAR`, likely a `USING (broker_id)`
-  type mismatch — blocks `fact_trade` → all 5 analytics + `fact_cash_transactions`);
-  `fact_market_history` (`dm_date BETWEEN s.effective_timestamp AND s.end_timestamp` — DATE
-  vs TIMESTAMP; the DATE→TIMESTAMP cast already exists, just needs `CommonComparableType` to
-  allow it). These are the temporal-validity `BETWEEN` joins across the model.
+- **Numeric ↔ string comparison coercion — `BIGINT = VARCHAR`** (`dim_account`, the biggest
+  cascade: `USING (broker_id)` joins `accounts.broker_id` (BIGINT, from
+  `staging_account.ca_b_id`) against `dim_broker.broker_id` (VARCHAR, from
+  `batch1_hr.employeeid`) → blocks `fact_trade` → all 5 analytics + `fact_cash_transactions`).
+  **A policy decision, not a safe add:** PostgreSQL *rejects* `bigint = varchar`; Spark and
+  Calcite (Feldera) coerce (string → numeric). The values are genuinely numeric IDs stored
+  as strings. Adding it (cast the string operand to the numeric peer type) matches the
+  reference engines and unblocks ~7 models, but diverges from PG, risks a runtime parse
+  failure on a non-numeric string, and can mask real type errors. Needs a decision.
 - **Rank-in-output / gap 1** (`market_volatility`, `financials` + `wrk_company_financials`;
   the analytics models are behind `dim_account`) — the architectural decision item.
 - **`JOIN USING` merged key not exposed downstream** (`watches`, `fact_holdings`).

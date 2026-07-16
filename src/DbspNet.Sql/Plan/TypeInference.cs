@@ -136,6 +136,16 @@ internal static class TypeInference
             return new SqlTimestampType(a.Nullable || b.Nullable);
         }
 
+        // DATE and TIMESTAMP are comparable — the DATE side coerces to TIMESTAMP
+        // (midnight of that day), matching PostgreSQL / Spark. The same-type arms
+        // above already handled DATE=DATE and TIMESTAMP=TIMESTAMP, so this fires
+        // only for the mixed pair. Used by the TPC-DI temporal-validity joins
+        // (`dm_date BETWEEN effective_timestamp AND end_timestamp`).
+        if (a is SqlDateType or SqlTimestampType && b is SqlDateType or SqlTimestampType)
+        {
+            return new SqlTimestampType(a.Nullable || b.Nullable);
+        }
+
         // Two intervals are comparable; the result keeps the left qualifier
         // when both share an interval class, else falls back to a generic
         // day-time qualifier (comparison itself is by (months, micros)).

@@ -106,12 +106,14 @@ public class TemporalCompilerTests
     // ---- Comparison rejects cross-temporal-kind ----
 
     [Fact]
-    public void Compare_DateWithTimestamp_RejectedByResolver()
+    public void Compare_DateWithTimestamp_Coerces()
     {
-        var ex = Assert.Throws<ResolveException>(() => Compile(
+        // DATE = TIMESTAMP now resolves (DATE coerces to midnight TIMESTAMP),
+        // matching PostgreSQL / Spark. Behavioural coverage below.
+        var q = Compile(
             ["CREATE TABLE t (d DATE NOT NULL, ts TIMESTAMP NOT NULL)"],
-            "SELECT 1 FROM t WHERE d = ts"));
-        Assert.Contains("not comparable", ex.Message);
+            "SELECT 1 FROM t WHERE d = ts");
+        Assert.NotNull(q);
     }
 
     [Fact]
@@ -196,6 +198,40 @@ public class TemporalCompilerTests
         q.Step();
 
         Assert.Equal(1, WeightOf(q.Current, Timestamp.Parse("2026-04-27 00:00:00")));
+    }
+
+    // ---- DATE ↔ TIMESTAMP comparison (DATE coerces to midnight TIMESTAMP) ----
+
+    [Fact]
+    public void DateVsTimestamp_Comparison_CoercesDateToMidnight()
+    {
+        // fact_market_history shape: a DATE compared against TIMESTAMP bounds.
+        // DATE coerces to midnight of that day.
+        var q = Compile(
+            ["CREATE TABLE t (d DATE NOT NULL, lo TIMESTAMP NOT NULL, hi TIMESTAMP NOT NULL)"],
+            "SELECT d FROM t WHERE d BETWEEN lo AND hi");
+
+        // 2026-04-27 00:00:00 is within [2026-04-26 12:00, 2026-04-28 00:00].
+        q.Table("t").Insert(Date32.Parse("2026-04-27"),
+            Timestamp.Parse("2026-04-26 12:00:00"), Timestamp.Parse("2026-04-28 00:00:00"));
+        // 2026-04-25 midnight is below lo → excluded.
+        q.Table("t").Insert(Date32.Parse("2026-04-25"),
+            Timestamp.Parse("2026-04-26 12:00:00"), Timestamp.Parse("2026-04-28 00:00:00"));
+        q.Step();
+        Assert.Equal(1, q.Current.Count);
+        Assert.Equal(1, WeightOf(q.Current, Date32.Parse("2026-04-27")));
+    }
+
+    [Fact]
+    public void DateVsTimestamp_Equality_MidnightMatches()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (d DATE NOT NULL, ts TIMESTAMP NOT NULL)"],
+            "SELECT d FROM t WHERE d = ts");
+        q.Table("t").Insert(Date32.Parse("2026-04-27"), Timestamp.Parse("2026-04-27 00:00:00"));  // midnight → equal
+        q.Table("t").Insert(Date32.Parse("2026-04-27"), Timestamp.Parse("2026-04-27 09:00:00"));  // not midnight → unequal
+        q.Step();
+        Assert.Equal(1, q.Current.Count);
     }
 
     // ---- Codec smoke test: rows with temporal columns are equatable ----

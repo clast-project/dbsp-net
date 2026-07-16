@@ -1025,6 +1025,12 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
 ## Type system edge cases
 
 - **[P1]** Implicit-to-explicit type coercion rules matching PostgreSQL.
+  Partially done: **DATE ↔ TIMESTAMP** comparison coerces the DATE to a midnight
+  TIMESTAMP (`CommonComparableType`), matching PostgreSQL / Spark — used by the
+  TPC-DI temporal-validity `BETWEEN` joins. Still deferred: **numeric ↔ string**
+  comparison coercion (`BIGINT = VARCHAR`), which PostgreSQL itself *rejects* but
+  Spark / Calcite (Feldera) coerce (string → numeric); a policy decision, not a
+  safe add — see `ivm-bench-gap-analysis.md`.
 - **[P2]** `OVERFLOW` semantics on integer arithmetic — v1 uses `checked`.
 - **[P2]** Floating-point edge cases: NaN, ±Inf, subnormals.
 - **[P2]** Decimal precision/scale overflow.
