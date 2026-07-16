@@ -453,9 +453,25 @@ and their cascade. **21 → 33 compile.** Two more roots surfaced from behind th
 - **`financials`' `ROW_NUMBER() OVER (…) = 1` in a CASE** — rank-in-expression, correctly
   rejected (gap 1 territory; the aggregate lift excludes rank by design).
 
-Remaining roots: **named `WINDOW`** (`daily_market`, `dim_customer` — now the biggest
-cascade, ~10 models), **`JOIN USING` downstream exposure** (2), **`financials` rank-in-CASE**
-(gap 1, 1 + cascade). Original three-cause writeup below.
+**Update (named `WINDOW` fixed):** `daily_market` compiles (34). Named WINDOW was
+necessary but its dependents surfaced their *own* roots rather than cascade-clearing:
+`market_volatility` (RANK in output → gap 1), `dim_customer` (`SELECT *` with a window →
+separate P2, and it gates a big cascade: `dim_account` → `fact_cash_transactions`,
+`fact_trade` → the analytics models), `fact_market_history` (DATE vs TIMESTAMP comparison
+in the temporal-validity join — NEW).
+
+**Remaining roots, ranked by cascade:**
+- **`SELECT *` alongside a window function** (`dim_customer`) — biggest cascade now (~8
+  models via `dim_account`/`fact_trade`). `skipped.md` P2. dim_customer does
+  `select *, COUNT(col) OVER w, …`.
+- **Rank-in-output / gap 1** (`market_volatility`, `financials`, and the 5 analytics
+  models once unmasked) — the architectural decision item.
+- **DATE vs TIMESTAMP comparison** (`fact_market_history`) — `dm_date BETWEEN
+  s.effective_timestamp AND s.end_timestamp` compares a DATE to TIMESTAMP bounds. A small
+  type-coercion gap (NEW).
+- **`JOIN USING` merged key not exposed downstream** (`watches`, `fact_holdings`).
+
+Original three-cause writeup below.
 
 The three roots, ranked by cascade impact:
 

@@ -245,6 +245,67 @@ public class WindowAggregateTests
     private static long WeightOf(ZSet<StructuralRow, Z64> z, params object?[] row) =>
         z.WeightOf(new StructuralRow(SqlTestHelpers.EncodeStrings(row))).Value;
 
+    // ---- Named WINDOW clause (parser substitutes the definition) ----
+
+    [Fact]
+    public void NamedWindow_SubstitutesDefinition()
+    {
+        // `OVER w` resolves to the WINDOW-clause definition, even though the
+        // clause is lexically after the SELECT list that references it.
+        var stmt = (SelectStatement)Parser.ParseStatement(
+            "SELECT g, MIN(v) OVER w AS lo, MAX(v) OVER w AS hi FROM s " +
+            "WINDOW w AS (PARTITION BY g ORDER BY ts)");
+        var lo = (WindowFunctionExpression)((ExpressionSelectItem)stmt.Items[1]).Expression;
+        Assert.Null(lo.Over.Name);                    // substituted, not a placeholder
+        Assert.Single(lo.Over.PartitionBy);
+        Assert.Single(lo.Over.OrderBy);
+    }
+
+    [Fact]
+    public void NamedWindow_EndToEnd_MatchesInlineSpec()
+    {
+        // daily_market shape: cumulative MIN/MAX over a named window.
+        var q = Compile(S,
+            "SELECT g, ts, MIN(v) OVER w AS lo, MAX(v) OVER w AS hi FROM s " +
+            "WINDOW w AS (PARTITION BY g ORDER BY ts)");
+        q.Table("s").Insert(1, 1, 50);   // g, ts, v
+        q.Table("s").Insert(1, 2, 30);
+        q.Table("s").Insert(1, 3, 70);
+        q.Step();
+        // Output (g, ts, lo, hi); running MIN/MAX over ts order.
+        Assert.Equal(1, WeightOf(q.Current, 1, 1, 50, 50));
+        Assert.Equal(1, WeightOf(q.Current, 1, 2, 30, 50));
+        Assert.Equal(1, WeightOf(q.Current, 1, 3, 30, 70));
+    }
+
+    [Fact]
+    public void NamedWindow_NestedInExpression()
+    {
+        // Named window referenced from inside a CASE (combines with the lift).
+        var q = Compile(S,
+            "SELECT g, v, CASE WHEN v = MAX(v) OVER w THEN 1 ELSE 0 END AS is_max FROM s " +
+            "WINDOW w AS (PARTITION BY g)");
+        q.Table("s").Insert(1, 1, 10);
+        q.Table("s").Insert(1, 2, 30);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 10, 0));
+        Assert.Equal(1, WeightOf(q.Current, 1, 30, 1));
+    }
+
+    [Fact]
+    public void NamedWindow_UndefinedName_Throws()
+    {
+        Assert.Throws<ParseException>(() => Parser.ParseStatement(
+            "SELECT g, MIN(v) OVER w FROM s WINDOW x AS (PARTITION BY g)"));
+    }
+
+    [Fact]
+    public void NamedWindow_DuplicateDefinition_Throws()
+    {
+        Assert.Throws<ParseException>(() => Parser.ParseStatement(
+            "SELECT g, MIN(v) OVER w FROM s WINDOW w AS (PARTITION BY g), w AS (PARTITION BY ts)"));
+    }
+
     // ---- Window function nested in an expression (lifted to a hidden column) ----
 
     [Fact]

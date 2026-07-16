@@ -31,6 +31,7 @@ public sealed class Lexer
         ["by"] = TokenKind.By,
         ["having"] = TokenKind.Having,
         ["as"] = TokenKind.As,
+        ["window"] = TokenKind.Window,
         ["with"] = TokenKind.With,
         ["recursive"] = TokenKind.Recursive,
         ["create"] = TokenKind.Create,

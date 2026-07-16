@@ -25,7 +25,7 @@ public enum TokenKind
     Identifier,
 
     // Statement / clause keywords
-    Select, From, Where, Group, By, Having, As, With, Recursive,
+    Select, From, Where, Group, By, Having, As, With, Recursive, Window,
     Create, Table, View, Inner, Left, Right, Full, Outer, Cross, Join, On, Using,
     Union, All, Intersect, Except,
 

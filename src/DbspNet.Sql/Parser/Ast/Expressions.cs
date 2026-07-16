@@ -163,10 +163,16 @@ public sealed record WindowFrame(WindowFrameMode Mode, FrameBound Start, FrameBo
 /// query-level <c>ORDER BY</c>; <see cref="Frame"/> is the optional frame clause
 /// (only meaningful with an <c>ORDER BY</c>).
 /// </summary>
+/// <param name="Name">
+/// Set only for an <c>OVER w</c> reference to a named window, before the parser
+/// substitutes the named definition from the <c>WINDOW</c> clause. It is always
+/// null by the time the AST leaves the parser — the resolver never sees it.
+/// </param>
 public sealed record WindowSpec(
     IReadOnlyList<Expression> PartitionBy,
     IReadOnlyList<SortItem> OrderBy,
-    WindowFrame? Frame = null);
+    WindowFrame? Frame = null,
+    string? Name = null);
 
 /// <summary>
 /// A window-function call — <c>fn(args) OVER (PARTITION BY … ORDER BY … frame)</c>.

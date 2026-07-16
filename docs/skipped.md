@@ -563,8 +563,15 @@ reflect that shape, not a backlog.
   name)` (a running aggregate over `VARCHAR`, pure peer comparison, no arithmetic)
   is rejected even though only a bounded frame needs an arithmetic key. The
   narrower frame-aware error already exists but is unreachable.
-- **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`; named `WINDOW`
-  clauses.
+- **[P3]** Full SQL frame spec beyond the above: `ROWS`, `GROUPS`.
+- **[DONE]** Named `WINDOW` clauses (`… OVER w … WINDOW w AS (PARTITION BY … )`).
+  Purely syntactic: `OVER w` parses to a placeholder `WindowSpec` carrying only a
+  name; after the `WINDOW` clause is parsed (it is lexically *after* the SELECT
+  list that references it), the parser substitutes each reference — including
+  when nested in an expression — with the definition. The resolver never sees a
+  named window. `WINDOW` is now a reserved word (so `FROM t WINDOW …` isn't
+  misread as a table alias `t AS window`). Window-referencing-window
+  (`w2 AS (w1 ORDER BY …)`) is not supported (unused by ivm-bench).
 
 ### Type system
 - **[DONE]** INTERVAL (core) and date/time arithmetic. `INTERVAL '…' <unit>`

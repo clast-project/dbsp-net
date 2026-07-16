@@ -650,7 +650,100 @@ public sealed class Parser
             having = ParseExpression();
         }
 
+        // Optional named-window clause: WINDOW w AS ( … ), w2 AS ( … ). Parsed
+        // after the SELECT list that references it (`… OVER w`), so references are
+        // substituted here, once the definitions are known. Purely syntactic — the
+        // resolver never sees a named window.
+        if (Peek().Kind == TokenKind.Window)
+        {
+            Advance();
+            var windows = new Dictionary<string, WindowSpec>(StringComparer.Ordinal);
+            while (true)
+            {
+                var name = ExpectIdentifier("window name");
+                Expect(TokenKind.As);
+                if (!windows.TryAdd(name, ParseWindowSpec()))
+                {
+                    throw Error(Peek(), $"window '{name}' is defined more than once");
+                }
+
+                if (Peek().Kind == TokenKind.Comma)
+                {
+                    Advance();
+                    continue;
+                }
+
+                break;
+            }
+
+            items = items.Select(it => it is ExpressionSelectItem esi
+                ? esi with { Expression = SubstituteNamedWindows(esi.Expression, windows) }
+                : it).ToList();
+        }
+
         return new SelectStatement(items, from, where, groupBy, having, Array.Empty<CteDefinition>(), distinct);
+    }
+
+    /// <summary>
+    /// Replace every <c>OVER w</c> named-window reference (a placeholder
+    /// <see cref="WindowSpec"/> with <see cref="WindowSpec.Name"/> set) in an
+    /// expression tree with the definition from <paramref name="windows"/>.
+    /// Recurses through the same node shapes as the window-lifting walkers; a
+    /// window function's own arguments are also visited. An unknown name is a
+    /// parse error.
+    /// </summary>
+    private Expression SubstituteNamedWindows(Expression e, Dictionary<string, WindowSpec> windows)
+    {
+        switch (e)
+        {
+            case WindowFunctionExpression w:
+            {
+                var args = w.Arguments.Select(a => SubstituteNamedWindows(a, windows)).ToList();
+                var over = w.Over;
+                if (over.Name is { } name)
+                {
+                    if (!windows.TryGetValue(name, out var def))
+                    {
+                        throw Error(Peek(), $"window '{name}' is not defined");
+                    }
+
+                    over = def;
+                }
+
+                return w with { Arguments = args, Over = over };
+            }
+
+            case BinaryExpression b:
+                return b with
+                {
+                    Left = SubstituteNamedWindows(b.Left, windows),
+                    Right = SubstituteNamedWindows(b.Right, windows),
+                };
+            case UnaryExpression u:
+                return u with { Operand = SubstituteNamedWindows(u.Operand, windows) };
+            case IsNullExpression isn:
+                return isn with { Operand = SubstituteNamedWindows(isn.Operand, windows) };
+            case CastExpression c:
+                return c with { Operand = SubstituteNamedWindows(c.Operand, windows) };
+            case FunctionCallExpression f:
+                return f with { Arguments = f.Arguments.Select(a => SubstituteNamedWindows(a, windows)).ToList() };
+            case InListExpression il:
+                return il with
+                {
+                    Probe = SubstituteNamedWindows(il.Probe, windows),
+                    Values = il.Values.Select(v => SubstituteNamedWindows(v, windows)).ToList(),
+                };
+            case CaseExpression ce:
+                return ce with
+                {
+                    Whens = ce.Whens.Select(wc => new CaseWhenClause(
+                        SubstituteNamedWindows(wc.Condition, windows),
+                        SubstituteNamedWindows(wc.Result, windows))).ToList(),
+                    ElseResult = ce.ElseResult is null ? null : SubstituteNamedWindows(ce.ElseResult, windows),
+                };
+            default:
+                return e;
+        }
     }
 
     private List<CteDefinition> ParseWithClause()
@@ -1902,7 +1995,7 @@ public sealed class Parser
                 {
                     Advance();
                     return new WindowFunctionExpression(
-                        first.Text, Array.Empty<Expression>(), IsStar: true, ParseWindowSpec());
+                        first.Text, Array.Empty<Expression>(), IsStar: true, ParseOverSpec());
                 }
 
                 return new FunctionCallExpression(first.Text, Array.Empty<Expression>(), IsStar: true);
@@ -2007,7 +2100,7 @@ public sealed class Parser
                 }
 
                 Advance();
-                return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseWindowSpec());
+                return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseOverSpec());
             }
 
             // Event-time tumbling-window functions. TUMBLE(t, size) (a GROUP BY
@@ -2082,6 +2175,24 @@ public sealed class Parser
     /// a contextual keyword (not reserved); <c>ORDER BY</c> reuses
     /// <see cref="ParseSortItem"/>.
     /// </summary>
+    /// <summary>
+    /// Parse what follows <c>OVER</c>: either an inline <c>(PARTITION BY … )</c>
+    /// spec, or a bare identifier naming a window defined in the query's
+    /// <c>WINDOW</c> clause. The named form is a placeholder <see cref="WindowSpec"/>
+    /// carrying only <see cref="WindowSpec.Name"/>; <see cref="SubstituteNamedWindows"/>
+    /// replaces it once the <c>WINDOW</c> clause has been parsed.
+    /// </summary>
+    private WindowSpec ParseOverSpec()
+    {
+        if (Peek().Kind == TokenKind.LParen)
+        {
+            return ParseWindowSpec();
+        }
+
+        var name = ExpectIdentifier("window name or '('");
+        return new WindowSpec(Array.Empty<Expression>(), Array.Empty<SortItem>(), Frame: null, Name: name);
+    }
+
     private WindowSpec ParseWindowSpec()
     {
         Expect(TokenKind.LParen);
