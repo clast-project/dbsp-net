@@ -1669,13 +1669,13 @@ public static class PlanToCircuit
         JoinPlan plan,
         CompileContext ctx)
     {
-        // Residual predicates on LEFT JOIN are rejected by the resolver — a
-        // failing residual would drop the match but retain the left row
-        // NULL-padded, and that's not encoded in the operator's semantics.
+        // A residual on an outer join isn't expressible in IncrementalLeftJoin:
+        // its match-presence is a per-KEY emptiness test, but a residual can
+        // reference left columns, so two left rows under one key can disagree
+        // about whether the key is matched. Lower to the anti-join rewrite.
         if (plan.Residual is not null)
         {
-            throw new InvalidOperationException(
-                "internal: LEFT JOIN with residual reached PlanToCircuit; resolver should have rejected");
+            return CompileOuterJoinWithResidual(builder, plan, ctx);
         }
 
         var left = CompilePlan(builder, plan.Left, ctx);
@@ -1728,6 +1728,209 @@ public static class PlanToCircuit
         return builder.Union(joined, nullKeyPadded);
     }
 
+    /// <summary>
+    /// Lower an outer join carrying a residual (non-equi) ON conjunct:
+    /// <code>
+    ///   matched   = σ_residual( L ⋈_key R )
+    ///   unmatched = S − antisemi( S, π_S(matched) )      for each preserved side S
+    ///   result    = matched ∪ NULLPAD(unmatched…)
+    /// </code>
+    /// Composed from primitives rather than taught to the operator.
+    /// <see cref="IncrementalLeftJoinOp"/> decides padding with a per-key
+    /// emptiness test (<c>!oldR.IsEmpty</c>); a residual makes match-presence a
+    /// property of the (key, preserved row) pair instead, which that test cannot
+    /// express. The rewrite sidesteps the operator entirely — which also means it
+    /// does not need an equi-key at all, so a keyless outer join with a residual
+    /// lowers here too (as a unit-key cross product: correct, quadratic).
+    ///
+    /// <para><b>NULL-safety.</b> The anti-join keys on the WHOLE preserved row and
+    /// deliberately does NOT filter NULL keys — unlike <c>CompileSemiJoin</c>,
+    /// whose keys are SQL probe values where <c>NULL = x</c> is never TRUE. Here
+    /// the key is row identity, so <c>NULL</c> must equal <c>NULL</c>: dropping
+    /// NULL-bearing rows from the anti-join would let a row that DID match survive
+    /// the subtraction and emit a spurious NULL-pad alongside its real join
+    /// output.</para>
+    ///
+    /// <para><b>Sharing.</b> <c>matched</c> is consumed once per preserved side
+    /// plus once for the output. There is no CSE at plan level, but this is the
+    /// circuit — the stream is a value, so reusing the variable shares the
+    /// operator.</para>
+    ///
+    /// <para>NULL <em>equi-key</em> semantics are inherited from the inner join:
+    /// NULL-keyed rows never match, so they fall through to the anti-join and get
+    /// padded (preserved side) or dropped (non-preserved side) — exactly the
+    /// non-residual operator's behaviour.</para>
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> CompileOuterJoinWithResidual(
+        CircuitBuilder builder,
+        JoinPlan plan,
+        CompileContext ctx)
+    {
+        var left = CompilePlan(builder, plan.Left, ctx);
+        var right = CompilePlan(builder, plan.Right, ctx);
+
+        var leftCount = plan.Left.Schema.Count;
+        var rightCount = plan.Right.Schema.Count;
+        var codec = ctx.Codec;
+        var joinedSchema = plan.Schema;
+
+        var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
+
+        // matched = the inner join, with the residual applied. Rows are built in
+        // the OUTER join's schema so the padded and matched branches agree.
+        var validKeyLeft = builder.Filter(left, row => HasNoNullKey(row, leftIndices));
+        var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
+
+        var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
+        var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
+        var leftIndexed = builder.GroupProject(
+            validKeyLeft,
+            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
+            row => row);
+        var rightIndexed = builder.GroupProject(
+            validKeyRight,
+            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
+            row => row);
+
+        var joined = EmitInnerJoin(
+            builder, ctx,
+            leftIndexed,
+            rightIndexed,
+            (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema),
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema));
+
+        var residualFn = ExpressionCompiler.CompileScalar(plan.Residual!);
+        var matched = builder.Filter(joined, row => residualFn(row) is true);
+
+        var parts = new List<Stream<ZSet<StructuralRow, Z64>>> { matched };
+
+        if (plan.JoinType is DbspNet.Sql.Parser.Ast.JoinType.LeftOuter
+            or DbspNet.Sql.Parser.Ast.JoinType.FullOuter)
+        {
+            var unmatchedLeft = UnmatchedPreservedRows(
+                builder, ctx, left, matched, joinedSchema, plan.Left.Schema, offsetInCombined: 0);
+            parts.Add(builder.MapRows(
+                unmatchedLeft,
+                row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount)));
+        }
+
+        if (plan.JoinType is DbspNet.Sql.Parser.Ast.JoinType.RightOuter
+            or DbspNet.Sql.Parser.Ast.JoinType.FullOuter)
+        {
+            var unmatchedRight = UnmatchedPreservedRows(
+                builder, ctx, right, matched, joinedSchema, plan.Right.Schema, offsetInCombined: leftCount);
+            parts.Add(builder.MapRows(
+                unmatchedRight,
+                row => NullPadLeft(codec, joinedSchema, row, leftCount, rightCount)));
+        }
+
+        var result = parts[0];
+        for (var i = 1; i < parts.Count; i++)
+        {
+            result = builder.Union(result, parts[i]);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Set-ify by PRESENCE: every row whose accumulated weight is non-zero gets
+    /// weight +1; rows at zero drop out.
+    ///
+    /// <para><c>Distinct</c> alone will not do. It defines presence as weight
+    /// <c>&gt; 0</c> (<c>DistinctOp</c> tests <c>TWeight.IsPositive</c>), but the
+    /// join operators define match-presence as weight <c>≠ 0</c>
+    /// (<c>!oldR.IsEmpty</c>) — and the PBT feeds arbitrary ±1 streams, so
+    /// accumulated weights genuinely go negative and the two notions diverge.
+    /// <c>Distinct(x) + Distinct(−x)</c> reconciles them: for accumulated weight
+    /// <c>w</c>, the first term fires iff <c>w &gt; 0</c>, the second iff
+    /// <c>w &lt; 0</c>, and they cannot both fire — so the sum is exactly
+    /// <c>w ≠ 0 ⇒ 1</c>. <c>Negate</c> is linear, so negating the delta stream
+    /// negates the accumulation.</para>
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> NonZeroSet(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Schema schema)
+    {
+        var positive = EmitDistinct(
+            builder, ctx, input,
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema));
+        var negative = EmitDistinct(
+            builder, ctx, builder.Negate(input),
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema));
+        return builder.Union(positive, negative);
+    }
+
+    /// <summary>
+    /// Rows of a preserved side that contributed no <paramref name="matched"/>
+    /// row: <c>S − antisemi(S, π_S(matched))</c>. Keys on the whole row, NULLs
+    /// included (see <see cref="CompileOuterJoinWithResidual"/>).
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> UnmatchedPreservedRows(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<ZSet<StructuralRow, Z64>> side,
+        Stream<ZSet<StructuralRow, Z64>> matched,
+        Schema matchedSchema,
+        Schema sideSchema,
+        int offsetInCombined)
+    {
+        var codec = ctx.Codec;
+        var width = sideSchema.Count;
+
+        // Set-ify the matched PAIRS before projecting. Projecting first would
+        // sum weights across a preserved row's matches, and Z-sets admit
+        // negative weights, so those could cancel to zero — a row that matched
+        // would look unmatched and emit a spurious NULL-pad. Set-ifying first
+        // makes every surviving pair weight +1, so the projection below can only
+        // sum upward.
+        var matchedPairs = NonZeroSet(builder, ctx, matched, matchedSchema);
+
+        // π_S(matchedPairs), rebuilt in the SIDE's own schema (not a slice of
+        // the join's, whose nullability differs) so the rows compare equal to
+        // the side's own.
+        var projected = builder.MapRows<StructuralRow, StructuralRow, Z64>(
+            matchedPairs,
+            row =>
+            {
+                var vs = new object?[width];
+                for (var i = 0; i < width; i++)
+                {
+                    vs[i] = row[offsetInCombined + i];
+                }
+
+                return codec.BuildRow(sideSchema, vs);
+            });
+
+        // Collapse the per-match multiplicity: a preserved row that matched k
+        // rows must be subtracted exactly once, not k times. Weights here are
+        // all +1, so plain Distinct is enough.
+        var distinct = EmitDistinct(
+            builder, ctx, projected,
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(sideSchema));
+
+        var sideIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            side, row => row, row => row);
+        var distinctIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            distinct, row => row, row => row);
+
+        // Semi-join on row identity: emits each matched preserved row carrying
+        // its ORIGINAL weight (distinct side contributes weight 1), so the
+        // subtraction below cancels it exactly.
+        var semi = EmitInnerJoin(
+            builder, ctx,
+            sideIndexed,
+            distinctIndexed,
+            (_, sideRow, _) => sideRow,
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema),
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema));
+
+        return builder.Difference(side, semi);
+    }
+
     private static Stream<ZSet<StructuralRow, Z64>> CompileRightOuterJoin(
         CircuitBuilder builder,
         JoinPlan plan,
@@ -1740,8 +1943,7 @@ public static class PlanToCircuit
         // left columns are NULL-padded.
         if (plan.Residual is not null)
         {
-            throw new InvalidOperationException(
-                "internal: RIGHT JOIN with residual reached PlanToCircuit; resolver should have rejected");
+            return CompileOuterJoinWithResidual(builder, plan, ctx);
         }
 
         var left = CompilePlan(builder, plan.Left, ctx);
@@ -1801,13 +2003,13 @@ public static class PlanToCircuit
         JoinPlan plan,
         CompileContext ctx)
     {
-        // Residual predicates on FULL OUTER are rejected by the resolver (same
-        // reason as LEFT / RIGHT — a failing residual must retain the preserved
-        // rows NULL-padded, which the operator doesn't encode).
+        // A residual is not encodable in the operator (same reason as LEFT /
+        // RIGHT — a failing residual must retain the preserved rows NULL-padded,
+        // and match-presence there is per-key). Lower to the anti-join rewrite,
+        // which preserves both sides.
         if (plan.Residual is not null)
         {
-            throw new InvalidOperationException(
-                "internal: FULL OUTER JOIN with residual reached PlanToCircuit; resolver should have rejected");
+            return CompileOuterJoinWithResidual(builder, plan, ctx);
         }
 
         var left = CompilePlan(builder, plan.Left, ctx);

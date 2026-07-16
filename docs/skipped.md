@@ -183,21 +183,29 @@ reflect that shape, not a backlog.
       and for an outer join meant zero equi-keys and an outright rejection.
     - A constant operand (`a.x = 5`) or a mixed-side operand (`a.x + b.y = 10`)
       is not a key and stays a residual.
-- **[P1]** `LEFT/RIGHT/FULL JOIN` with a non-equi conjunct in the `ON`
-  clause (e.g. `LEFT JOIN b ON a.k = b.k AND b.v > 0`). Semantically,
-  failing the residual should drop the match but retain the preserved row
-  NULL-padded; that requires residual-aware logic in the operator.
-  Resolver rejects with an explicit error. Match-presence today is a per-**key**
-  emptiness test (`IncrementalLeftJoinOp`: `var oldMatched = !oldR.IsEmpty`), but
-  a residual can reference left columns, so two left rows under one key can
-  disagree about whether that key is matched — the property becomes per-(key,
-  left row). Planned as a **plan rewrite**, not operator surgery:
-  `σ_residual(L ⋈ R) ∪ NULLPAD(L − antisemi(L, π_L(matched)))`, which also
-  dissolves the keyless-outer restriction since it never uses the keyed
-  operator. See `ivm-bench-gap-analysis.md` §4.
-- **[P1]** `LEFT/RIGHT/FULL JOIN` with **no** equi-key (`equi.Count == 0`).
-  Match-presence tracking is keyed, so there is no operator. The rewrite above
-  would subsume this.
+- **[DONE]** `LEFT/RIGHT/FULL JOIN` with a non-equi conjunct in the `ON`
+  clause (e.g. `LEFT JOIN b ON a.k = b.k AND b.v > 0`), **and** outer joins with
+  **no equi-key at all**. Failing the residual drops the match but retains the
+  preserved row NULL-padded, which `IncrementalLeftJoin/FullJoin` cannot encode:
+  their match-presence is a per-**key** emptiness test (`!oldR.IsEmpty`), but a
+  residual can reference the preserved side, so two preserved rows under one key
+  can disagree — the property is per-(key, preserved row). Lowered in
+  `PlanToCircuit` as a **plan rewrite** rather than operator surgery
+  (`CompileOuterJoinWithResidual`):
+  `matched = σ_residual(L ⋈_key R)`, then for each preserved side `S`,
+  `unmatched = S − antisemi(S, π_S(matched))`, and `result = matched ∪
+  NULLPAD(unmatched…)`. Reuses the inner join + Distinct + Difference, so GC,
+  snapshots and the spine family come along unchanged. The keyless case falls
+  out for free — the rewrite never touches the keyed operator, so a keyless
+  outer join lowers as a unit-key cross product (correct, quadratic). The
+  `JoinPlan(outer, equi, residual)` node is kept intact so `BatchPlanEvaluator`
+  implements the semantics directly and serves as an independent PBT oracle. Two
+  subtleties, both PBT-caught: the anti-join keys on the **whole** preserved row
+  and must NOT drop NULL-bearing rows (unlike `CompileSemiJoin`'s probe-key
+  filter) — row identity requires `NULL = NULL`; and the match set must be
+  collapsed by **presence** (`Distinct(x) + Distinct(−x)`, weight ≠ 0) not by
+  `Distinct` alone (weight > 0), because signed streams cancel. See
+  `ivm-bench-gap-analysis.md` §4.
 - **[P2]** `LEFT ASOF JOIN`. Feldera-specific, used for time-series matching.
 - **[P2]** `INTERSECT ALL` / `EXCEPT ALL` (bag semantics for intersect/
   except — min/clamped-subtract of weights). DbspNet supports the

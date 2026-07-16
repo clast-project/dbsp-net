@@ -2135,17 +2135,6 @@ public sealed class Resolver
             equi.Add(new JoinEquality(li, ri, ck.KeyType));
         }
 
-        // A zero-equi-key join is a nested-loop / cross join. INNER supports it
-        // (the compiler routes both sides through a single unit key, producing
-        // the full bilinear cross product, then applies the residual ON
-        // predicate). Outer joins still require an equi-key in v1 — their
-        // match-presence tracking is keyed, so a keyless outer join has no
-        // operator.
-        if (equi.Count == 0 && join.Type != JoinType.Inner)
-        {
-            throw new ResolveException($"{JoinTypeName(join.Type)} requires at least one equi-key (v1)");
-        }
-
         ResolvedExpression? residual = null;
         foreach (var r in residuals)
         {
@@ -2155,15 +2144,13 @@ public sealed class Resolver
                     new SqlBooleanType(residual.Type.Nullable || r.Type.Nullable));
         }
 
-        // v1 restriction: outer joins with non-equi conjuncts in ON are
-        // semantically subtle (failing a residual drops the match but keeps
-        // the preserved row with NULLs, which requires residual-aware logic
-        // in the operator). Defer.
-        if (join.Type != JoinType.Inner && residual is not null)
-        {
-            throw new ResolveException(
-                $"{JoinTypeName(join.Type)} with a non-equi ON conjunct is not supported in v1");
-        }
+        // An outer join may carry a residual, and may have no equi-key at all.
+        // Neither is expressible in IncrementalLeftJoin/FullJoin, whose
+        // match-presence is a per-key emptiness test; PlanToCircuit lowers both
+        // to the anti-join rewrite (CompileOuterJoinWithResidual). The plan node
+        // keeps its natural JoinPlan(LeftOuter, equi, residual) shape so
+        // BatchPlanEvaluator can implement the semantics directly and serve as
+        // an independent oracle.
 
         // Widen the inputs with any hoisted key columns. Bare-column equi-keys
         // are unaffected: JoinEquality holds per-side indices and the synthetic

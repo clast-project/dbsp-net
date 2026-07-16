@@ -251,18 +251,17 @@ compiled to a keyless unit-key cross product plus a filter — correct, quadrati
 silent. This is the same generalization `GROUP BY` got when it lifted its own
 bare-column-only rule.
 
-#### 4b. Outer join with a cross-side residual — BLOCKING
+#### 4b. Outer join with a cross-side residual — DONE
 
-`skipped.md` **[P1]**. `Resolver.cs` rejects any non-equi conjunct in an outer join's ON.
-
-Match-presence today is a per-**key** emptiness test — `IncrementalLeftJoinOp.cs:153-154`
-is `var oldMatched = !oldR.IsEmpty; var newMatched = !newR.IsEmpty;`, asking "does *any*
+Match-presence was a per-**key** emptiness test — `IncrementalLeftJoinOp.cs:153-154` is
+`var oldMatched = !oldR.IsEmpty; var newMatched = !newR.IsEmpty;`, asking "does *any*
 right row exist under this key". A residual can reference left columns, so two left rows
 under one key can disagree about whether that key is matched: the property becomes
 per-(key, left row), the O(1) check becomes O(|R_key|) per left row, and the
 stayed-matched fast path (which never enumerates `oldL × oldR`) collapses.
 
-**Decided: plan rewrite, not operator surgery.**
+Shipped as a **plan rewrite** (`PlanToCircuit.CompileOuterJoinWithResidual`), not
+operator surgery.
 
 ```
 matched   = σ_residual( L ⋈_key R )        -- INNER already fuses residuals
@@ -276,34 +275,48 @@ models — thin justification for surgery on the operator that FULL OUTER, LATEN
 the spine family all depend on. If it shows up hot, operator surgery becomes a *measured*
 optimization with the rewrite as its correctness oracle.
 
-Three things the rewrite must handle, all found while scoping:
+The rewrite, for each preserved side `S`:
 
-- **It dissolves the keyless-outer restriction too**, since it never uses the keyed
-  operator. `c1` would compile even without 4a — but as a quadratic cross product, which
-  is why 4a is a performance necessity rather than a correctness one.
-- **NULL-safe anti-join is required.** `CompileSemiJoin` filters NULL keys
-  (`PlanToCircuit.cs:2150-2151`). A whole-row anti-semi-join would therefore drop any
-  left row containing a NULL, so it would survive the difference and get a spurious
-  NULL-pad *alongside* its real join output — wrong answers on exactly the NULL-heavy
-  rows these models produce. `JoinPlan` already carries `AllowNullKeys` for this;
-  `SemiJoinPlan` needs the same.
-- **`matched` is consumed twice** (the union and the anti-join) and there is no CSE. But
-  `CompileContext.CteCache` keys on `CteRef` identity, so emitting `matched` as a
-  synthetic CTE gives guaranteed single compilation — the escape hatch `skipped.md`
-  already documents.
+```
+matched   = σ_residual( L ⋈_key R )
+unmatched = S − antisemi( S, π_S(matched) )
+result    = matched ∪ NULLPAD(unmatched…)
+```
 
-Two more, for whoever builds it:
+FULL applies it to both sides independently. Three subtleties, all found by building the
+PBT first (it failed until each was handled):
 
-- **`BatchLeftOuterJoin` ignores `plan.Residual` entirely** (`BatchPlanEvaluator.cs:295`
-  decides on `matches.Count > 0`; only `BatchInnerJoin` reads the residual). It is the
-  differential oracle, so it needs fixing first.
-- **The PBT currently proves nothing about this shape.** `RandomQuery.GenQuery` cannot
-  emit outer-joins-with-residual because the resolver rejects them, so the
-  3000-iteration pruning PBT gives zero evidence. Extending the generator is the
-  load-bearing test work.
+- **The keyless-outer restriction dissolved for free** — the rewrite never uses the keyed
+  operator, so a keyless outer join lowers as a unit-key cross product (correct,
+  quadratic). Both resolver rejections (`equi.Count == 0` and non-equi conjunct) were
+  removed together.
+- **NULL-safe anti-join.** The anti-join keys on the **whole** preserved row and must NOT
+  drop NULL-bearing rows — unlike `CompileSemiJoin`, whose keys are SQL probe values
+  where `NULL = x` is never TRUE. Here the key is row identity, so `NULL = NULL`. Dropping
+  NULL rows would let a matched row survive the subtraction and emit a spurious NULL-pad
+  beside its join output. Reached only when the residual does *not* reference the nullable
+  column (otherwise NULL there makes the residual non-TRUE and the row can't match) — so
+  the PBT needed a dedicated shape (`n LEFT JOIN t ON a.k=b.k AND b.v > p`) to exercise
+  it; mutation testing confirmed both the targeted test and that shape catch it.
+- **Presence, not positivity.** The match set is collapsed by `Distinct(x) + Distinct(−x)`
+  (weight ≠ 0), not `Distinct` alone (weight > 0, via `TWeight.IsPositive`). The join
+  operators define match as `!IsEmpty` (≠ 0), and the PBT feeds arbitrary ±1 streams, so
+  accumulated weights genuinely go negative and the two notions diverge. Projecting before
+  set-ifying would also sum a preserved row's matches and could cancel to zero — set-ify
+  the pairs first, so the projection can only sum upward.
 
-Most of the 17 `BETWEEN` joins are INNER and are fine — non-equi INNER is supported via
-the unit-key nested-loop path. Only the LEFT-joined ones fail.
+`matched` is consumed once per preserved side plus once for output; at the circuit level
+the stream is a value, so reusing the variable shares the operator — no CSE needed.
+
+The independent oracle: `BatchPlanEvaluator` now reads `plan.Residual` in all three outer
+branches (it ignored it before, deciding on `matches.Count > 0`). `BatchFullOuterJoin`
+needed its right-pad pass changed from a per-**key** `matchedRightKeys` set to a
+per-**row** `matchedRightRows` set — the same per-key-is-wrong lesson as the operator.
+Because the node keeps its natural shape, the 3000-iteration PBT compares two genuinely
+independent implementations.
+
+Most of the 17 `BETWEEN` joins are INNER and were always fine — non-equi INNER via the
+unit-key nested-loop path. This closes the LEFT-joined ones.
 
 ### 5. `STDDEV` — BLOCKING, bounded
 
@@ -404,13 +417,14 @@ a standalone docs commit before implementation started; recorded here because th
 | 2 | Nested `ROW` structs | 2 | Architectural — type system |
 | 3 | Multi-key window `ORDER BY` | 7 | **DONE** |
 | 4a | Computed equi-keys | 2 (+ latent perf bug) | **DONE** |
-| 4b | OUTER JOIN + cross-side residual | 2 | Architectural — plan rewrite |
+| 4b | OUTER JOIN + cross-side residual | 2 | **DONE** |
 | 5 | `STDDEV` | 5 | Bounded |
 | 6 | Scalar/type tail | ~10 | Trivial, partly dodgeable |
 
 Items 1–5 are the critical path. Item 1 gates 5 of 50 models and is a design decision
 rather than a coding task; the rest are ordinary implementation work. Agreed order:
-3 → 4 → 5 → 2, with 1 to be decided.
+3 → 4 → 5 → 2, with 1 to be decided. **3, 4a and 4b are done.** Remaining: 5 (`STDDEV`,
+bounded), then 2 (nested `ROW` structs, deepest), then the 1 decision.
 
 Input/output adapter work is **not** on the critical path and should follow, not lead —
 the SQL surface is what determines whether the benchmark can run at all. See the

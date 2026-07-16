@@ -281,6 +281,16 @@ internal static class BatchPlanEvaluator
             list.Add((row, w));
         }
 
+        // A residual (non-equi ON conjunct) participates in match detection:
+        // a left row whose key matches but whose residual fails is UNMATCHED
+        // and must still NULL-pad. Evaluated per (left row, right row) pair,
+        // so two left rows under one key can disagree — this is the direct,
+        // obviously-correct statement of the semantics that the circuit's
+        // anti-join rewrite has to reproduce.
+        var residualFn = plan.Residual is null
+            ? null
+            : ExpressionCompiler.CompileScalar(plan.Residual);
+
         var builder = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (lrow, lw) in left)
         {
@@ -292,16 +302,23 @@ internal static class BatchPlanEvaluator
             }
 
             var key = ExtractKey(ctx.Codec, lrow, leftIdx);
-            if (rightByKey.TryGetValue(key, out var matches) && matches.Count > 0)
+            var matchedAny = false;
+            if (rightByKey.TryGetValue(key, out var matches))
             {
-                // Circuit LEFT JOIN: when key is matched, emit inner-join
-                // output (cross product per key). No extra NULL-padded row.
                 foreach (var (rrow, rw) in matches)
                 {
-                    builder.Add(MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount), Z64.Multiply(lw, rw));
+                    var merged = MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount);
+                    if (residualFn is not null && residualFn(merged) is not true)
+                    {
+                        continue;
+                    }
+
+                    matchedAny = true;
+                    builder.Add(merged, Z64.Multiply(lw, rw));
                 }
             }
-            else
+
+            if (!matchedAny)
             {
                 builder.Add(NullPadRight(ctx.Codec, lrow, leftCount, rightCount), lw);
             }
@@ -339,6 +356,11 @@ internal static class BatchPlanEvaluator
             list.Add((row, w));
         }
 
+        // See BatchLeftOuterJoin: a residual participates in match detection.
+        var residualFn = plan.Residual is null
+            ? null
+            : ExpressionCompiler.CompileScalar(plan.Residual);
+
         var builder = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (rrow, rw) in right)
         {
@@ -349,14 +371,23 @@ internal static class BatchPlanEvaluator
             }
 
             var key = ExtractKey(ctx.Codec, rrow, rightIdx);
-            if (leftByKey.TryGetValue(key, out var matches) && matches.Count > 0)
+            var matchedAny = false;
+            if (leftByKey.TryGetValue(key, out var matches))
             {
                 foreach (var (lrow, lw) in matches)
                 {
-                    builder.Add(MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount), Z64.Multiply(lw, rw));
+                    var merged = MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount);
+                    if (residualFn is not null && residualFn(merged) is not true)
+                    {
+                        continue;
+                    }
+
+                    matchedAny = true;
+                    builder.Add(merged, Z64.Multiply(lw, rw));
                 }
             }
-            else
+
+            if (!matchedAny)
             {
                 builder.Add(NullPadLeft(ctx.Codec, rrow, leftCount, rightCount), rw);
             }
@@ -394,9 +425,17 @@ internal static class BatchPlanEvaluator
             list.Add((row, w));
         }
 
-        // Track which right keys found a left match so the right-only pass below
-        // skips them.
-        var matchedRightKeys = new HashSet<StructuralRow>();
+        // See BatchLeftOuterJoin: a residual participates in match detection.
+        var residualFn = plan.Residual is null
+            ? null
+            : ExpressionCompiler.CompileScalar(plan.Residual);
+
+        // Track which right ROWS found a left match, so the right-only pass
+        // below skips exactly those. Rows, not keys: with a residual, two right
+        // rows under one key can disagree about whether they matched (the
+        // residual may read left columns). Z-set rows are consolidated, so the
+        // row value identifies it uniquely.
+        var matchedRightRows = new HashSet<StructuralRow>();
         var builder = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (lrow, lw) in left)
         {
@@ -407,22 +446,31 @@ internal static class BatchPlanEvaluator
             }
 
             var key = ExtractKey(ctx.Codec, lrow, leftIdx);
-            if (rightByKey.TryGetValue(key, out var matches) && matches.Count > 0)
+            var matchedAny = false;
+            if (rightByKey.TryGetValue(key, out var matches))
             {
-                matchedRightKeys.Add(key);
                 foreach (var (rrow, rw) in matches)
                 {
-                    builder.Add(MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount), Z64.Multiply(lw, rw));
+                    var merged = MergeRows(ctx.Codec, lrow, rrow, leftCount, rightCount);
+                    if (residualFn is not null && residualFn(merged) is not true)
+                    {
+                        continue;
+                    }
+
+                    matchedAny = true;
+                    matchedRightRows.Add(rrow);
+                    builder.Add(merged, Z64.Multiply(lw, rw));
                 }
             }
-            else
+
+            if (!matchedAny)
             {
                 builder.Add(NullPadRight(ctx.Codec, lrow, leftCount, rightCount), lw);
             }
         }
 
-        // Right-only rows: null-keyed always pad; otherwise pad iff the key had
-        // no left match.
+        // Right-only rows: null-keyed always pad; otherwise pad iff the row
+        // itself never matched.
         foreach (var (rrow, rw) in right)
         {
             if (HasNullKey(rrow, rightIdx))
@@ -431,8 +479,7 @@ internal static class BatchPlanEvaluator
                 continue;
             }
 
-            var key = ExtractKey(ctx.Codec, rrow, rightIdx);
-            if (!matchedRightKeys.Contains(key))
+            if (!matchedRightRows.Contains(rrow))
             {
                 builder.Add(NullPadLeft(ctx.Codec, rrow, leftCount, rightCount), rw);
             }

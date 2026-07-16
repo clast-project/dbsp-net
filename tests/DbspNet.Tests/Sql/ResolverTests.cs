@@ -265,24 +265,51 @@ public class ResolverTests
     }
 
     [Fact]
-    public void FullJoin_WithoutEquiKey_Throws()
+    public void FullJoin_WithoutEquiKey_BuildsKeylessJoinWithResidual()
     {
+        // Was rejected ("requires at least one equi-key") while outer-join
+        // match-presence was per-key. The anti-join rewrite in PlanToCircuit
+        // doesn't use the keyed operator, so a keyless outer join lowers fine —
+        // as a unit-key cross product: correct, quadratic.
         var (_, r) = NewResolver(
             "CREATE TABLE a (x INT NOT NULL)",
             "CREATE TABLE b (y INT NOT NULL)");
-        Assert.Throws<ResolveException>(
-            () => ResolveQuery(r, "SELECT * FROM a FULL JOIN b ON a.x > b.y"));
+        var plan = ResolveQuery(r, "SELECT * FROM a FULL JOIN b ON a.x > b.y");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Empty(join.EquiKeys);
+        Assert.NotNull(join.Residual);
+        Assert.Equal(JoinType.FullOuter, join.JoinType);
     }
 
     [Fact]
-    public void LeftJoin_WithoutEquiKey_Throws()
+    public void LeftJoin_WithoutEquiKey_BuildsKeylessJoinWithResidual()
     {
-        // Outer joins still require an equi-key in v1 (keyed match-presence).
         var (_, r) = NewResolver(
             "CREATE TABLE a (x INT NOT NULL)",
             "CREATE TABLE b (y INT NOT NULL)");
-        Assert.Throws<ResolveException>(
-            () => ResolveQuery(r, "SELECT * FROM a LEFT JOIN b ON a.x > b.y"));
+        var plan = ResolveQuery(r, "SELECT * FROM a LEFT JOIN b ON a.x > b.y");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Empty(join.EquiKeys);
+        Assert.NotNull(join.Residual);
+        Assert.Equal(JoinType.LeftOuter, join.JoinType);
+    }
+
+    [Fact]
+    public void LeftJoin_WithResidual_KeepsEquiKeyAndResidual()
+    {
+        // The TPC-DI SCD2 temporal-validity shape.
+        var (_, r) = NewResolver(
+            "CREATE TABLE a (k INT NOT NULL, ts INT NOT NULL)",
+            "CREATE TABLE b (k INT NOT NULL, lo INT NOT NULL, hi INT NOT NULL)");
+        var plan = ResolveQuery(r,
+            "SELECT * FROM a LEFT JOIN b ON a.k = b.k AND a.ts BETWEEN b.lo AND b.hi");
+        var proj = Assert.IsType<ProjectPlan>(plan);
+        var join = Assert.IsType<JoinPlan>(proj.Input);
+        Assert.Single(join.EquiKeys);
+        Assert.NotNull(join.Residual);
+        Assert.Equal(JoinType.LeftOuter, join.JoinType);
     }
 
     // --- Type inference ---

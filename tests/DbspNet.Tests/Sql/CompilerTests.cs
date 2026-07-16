@@ -680,6 +680,139 @@ public class CompilerTests
         Assert.Equal(1, WeightOf(q.Current, 100, null));
     }
 
+    // ---- Outer join with a residual (non-equi ON conjunct) ----
+
+    [Fact]
+    public void LeftJoin_Residual_KeyMatchesButResidualFails_NullPads()
+    {
+        // The crux: a.k = b.k holds, but the residual a.v > b.w fails, so the
+        // row is UNMATCHED and must NULL-pad — not vanish (post-join filter) and
+        // not join (ignored residual).
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a LEFT JOIN b ON a.k = b.k AND a.v > b.w");
+
+        q.Table("a").Insert(1, 5);
+        q.Table("b").Insert(1, 10);   // key matches, but 5 > 10 is false
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 5, null));
+        Assert.Equal(1, q.Current.Count);
+    }
+
+    [Fact]
+    public void LeftJoin_Residual_TwoLeftRowsSameKeyDisagree()
+    {
+        // Two left rows share a key; the residual sorts them: one matches, one
+        // pads. This is exactly what a per-key match test cannot express.
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a LEFT JOIN b ON a.k = b.k AND a.v > b.w");
+
+        q.Table("a").Insert(1, 20);   // 20 > 10 → joins
+        q.Table("a").Insert(1, 5);    // 5 > 10 fails → NULL-pads
+        q.Table("b").Insert(1, 10);
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 20, 10));
+        Assert.Equal(1, WeightOf(q.Current, 5, null));
+        Assert.Equal(2, q.Current.Count);
+    }
+
+    [Fact]
+    public void LeftJoin_Residual_ResidualFlipsAcrossTicks()
+    {
+        // Incremental pad↔join transition driven by the residual, not the key.
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a LEFT JOIN b ON a.k = b.k AND a.v > b.w");
+
+        q.Table("a").Insert(1, 5);
+        q.Table("b").Insert(1, 10);   // 5 > 10 false → padded
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 5, null));
+
+        q.Table("b").Delete(1, 10);
+        q.Table("b").Insert(1, 3);    // now 5 > 3 → the pad retracts, the join appears
+        q.Step();
+        Assert.Equal(-1, WeightOf(q.Current, 5, null));
+        Assert.Equal(1, WeightOf(q.Current, 5, 3));
+    }
+
+    [Fact]
+    public void LeftJoin_Residual_NullBearingLeftRowThatMatches_NoSpuriousPad()
+    {
+        // The NULL-safety hazard. The left row has a NULL in a non-key column
+        // AND it matches. The anti-join keys on the whole row; if it dropped
+        // NULL-bearing rows (as CompileSemiJoin does for probe keys), this row
+        // would survive the subtraction and emit a NULL-pad ALONGSIDE its join
+        // output. It must produce the join row only.
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.k, a.v, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 0");
+
+        q.Table("a").Insert(new object?[] { 1, null });
+        q.Table("b").Insert(1, 10);   // key matches, 10 > 0 → joins
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, null, 10));
+        Assert.Equal(1, q.Current.Count);   // NOT 2 — no spurious pad
+    }
+
+    [Fact]
+    public void LeftJoin_ComputedKeyAndCrossSideResidual_TpcdiScdShape()
+    {
+        // The exact ivm-bench securities/financials shape: a CAST-both-sides
+        // equi-key (4a) AND a cross-side BETWEEN residual (4b), on a LEFT JOIN.
+        // sec.pts must fall within [comp.lo, comp.hi] for the matching cik.
+        var q = Compile(
+            [
+                "CREATE TABLE sec (cik INT NOT NULL, pts INT NOT NULL)",
+                "CREATE TABLE comp (cid BIGINT NOT NULL, lo INT NOT NULL, hi INT NOT NULL)",
+            ],
+            "SELECT s.cik, s.pts, c.lo FROM sec s LEFT JOIN comp c " +
+            "ON CAST(s.cik AS VARCHAR) = CAST(c.cid AS VARCHAR) " +
+            "AND s.pts BETWEEN c.lo AND c.hi");
+
+        q.Table("comp").Insert(1L, 100, 200);
+        q.Table("sec").Insert(1, 150);   // cik 1 = cid 1, 150 in [100,200] → joins
+        q.Table("sec").Insert(1, 50);    // cik matches but 50 not in [100,200] → pads
+        q.Table("sec").Insert(2, 150);   // no matching cid → pads
+        q.Step();
+        Assert.Equal(1, WeightOf(q.Current, 1, 150, 100));
+        Assert.Equal(1, WeightOf(q.Current, 1, 50, null));
+        Assert.Equal(1, WeightOf(q.Current, 2, 150, null));
+        Assert.Equal(3, q.Current.Count);
+    }
+
+    [Fact]
+    public void FullJoin_Residual_BothSidesPadIndependently()
+    {
+        var q = Compile(
+            [
+                "CREATE TABLE a (k INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE b (k INT NOT NULL, w INT NOT NULL)",
+            ],
+            "SELECT a.v, b.w FROM a FULL JOIN b ON a.k = b.k AND a.v > b.w");
+
+        q.Table("a").Insert(1, 5);    // key matches b(1,10) but 5 > 10 false
+        q.Table("b").Insert(1, 10);
+        q.Step();
+        // Neither side matches under the residual → each pads.
+        Assert.Equal(1, WeightOf(q.Current, 5, null));
+        Assert.Equal(1, WeightOf(q.Current, null, 10));
+        Assert.Equal(2, q.Current.Count);
+    }
+
     [Fact]
     public void LeftJoin_NullKeyLeftRow_ProducesNullPaddedOutput()
     {

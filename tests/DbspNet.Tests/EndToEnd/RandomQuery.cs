@@ -159,6 +159,59 @@ internal static class RandomQuery
         // 30. Derived table in FROM (subquery with projection)
         GenLiteral.Select(p => $"SELECT x.v FROM (SELECT k, v FROM t WHERE v > {p}) x"),
 
+        // 31. LEFT JOIN with a residual (non-equi ON conjunct). The circuit
+        // lowers this to the anti-join rewrite; BatchPlanEvaluator implements
+        // the semantics directly, so this comparison is a genuine differential
+        // of two independent implementations — not a lowering against itself.
+        //
+        // The residual is CROSS-SIDE on purpose: that is what makes
+        // match-presence a per-(key, left row) property rather than a per-key
+        // one, which is the whole reason the operator can't express it. A left
+        // row whose key matches but whose residual fails must still NULL-pad.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, a.v, b.v FROM t a LEFT JOIN u b ON a.k = b.k AND a.v > b.v + {p}"),
+
+        // 32. Same, right-side-only residual (the shape a filter pushdown could
+        // in principle handle) — must agree with the general path.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, a.v, b.v FROM t a LEFT JOIN u b ON a.k = b.k AND b.v > {p}"),
+
+        // 33. Residual LEFT JOIN with a nullable PRESERVED side whose residual
+        // references only the RIGHT columns. This is the shape that actually
+        // reaches the NULL-safety hazard: a left row may carry a NULL value AND
+        // still match (the residual doesn't read the NULL column), so it exercises
+        // the anti-join's whole-row keying under NULLs. A residual referencing the
+        // nullable column instead (as shape 34 does) can't reach it — NULL in the
+        // residual is never TRUE, so a NULL-bearing row can't match. The anti-join
+        // keys on the whole preserved row, NULLs included; dropping NULL rows (as
+        // CompileSemiJoin does for probe keys) would let a matched row survive the
+        // subtraction and emit a spurious NULL-pad beside its join output.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, a.v, b.v FROM n a LEFT JOIN t b ON a.k = b.k AND b.v > {p}"),
+
+        // 34. Residual over the nullable table on BOTH sides — the residual reads
+        // the nullable column, so NULL rows fall out of matching naturally.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, a.v, b.v FROM n a LEFT JOIN n b ON a.k = b.k AND a.v > b.v + {p}"),
+
+        // 35. RIGHT JOIN with a residual — the preserved side is the right one.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, a.v, b.v FROM t a RIGHT JOIN u b ON a.k = b.k AND a.v > b.v + {p}"),
+
+        // 36. FULL JOIN with a residual — both sides preserved, independently.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, a.v, b.k, b.v FROM t a FULL JOIN u b ON a.k = b.k AND a.v > b.v + {p}"),
+
+        // 37. Keyless LEFT JOIN — no equi-key at all. Was rejected outright;
+        // the rewrite lowers it as a unit-key cross product.
+        Gen.Const("SELECT a.k, a.v, b.v FROM t a LEFT JOIN u b ON a.v > b.v"),
+
+        // 38. Residual LEFT JOIN feeding a GROUP BY — pad/unpad flips must
+        // propagate correctly into an aggregate.
+        GenLiteral.Select(p =>
+            $"SELECT a.k, COUNT(b.v) AS c, COUNT(*) AS ca " +
+            $"FROM t a LEFT JOIN u b ON a.k = b.k AND a.v > b.v + {p} GROUP BY a.k"),
+
         // 31. Derived table with an aggregate inside
         Gen.Const("SELECT x.k, x.s FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) x WHERE x.s > 5"),
 
