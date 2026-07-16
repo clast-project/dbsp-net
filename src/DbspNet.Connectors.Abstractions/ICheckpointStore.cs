@@ -31,16 +31,19 @@ public interface ICheckpointStore
 }
 
 /// <summary>
-/// <see cref="ICheckpointStore"/> backed by the engine's <see cref="Snapshot"/> (for
-/// operator state) plus an <c>offsets.json</c> sidecar on the same
-/// <see cref="ITableFileSystem"/>. The two are written back to back; making them a
-/// single atomic manifest commit is gap G3 in the design (a hardening — clean
-/// checkpoints round-trip correctly today, and a crash between the two writes falls
-/// back to the prior checkpoint, i.e. at-least-once).
+/// <see cref="ICheckpointStore"/> backed by the engine's <see cref="Snapshot"/>. The
+/// per-source offsets ride in the snapshot's <b>manifest metadata</b> (a single JSON
+/// value under <see cref="OffsetsMetadataKey"/>), so they commit <b>atomically</b> with
+/// the operator state — the manifest is written before the <c>current.txt</c> pointer
+/// that makes the snapshot visible. Engine-tick T and the source offsets can therefore
+/// never diverge (the exactly-once alignment invariant): a crash mid-checkpoint leaves
+/// the prior snapshot intact, offsets and all.
 /// </summary>
 public sealed class SnapshotCheckpointStore : ICheckpointStore
 {
-    private const string OffsetsKey = "offsets.json";
+    /// <summary>Manifest-metadata key under which the offsets JSON is stored.</summary>
+    public const string OffsetsMetadataKey = "connector.offsets";
+
     private readonly ITableFileSystem _fs;
     private readonly int _retainCount;
 
@@ -56,11 +59,12 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(offsets);
 
-        await Snapshot.WriteAsync(circuit, _fs, _retainCount, cancellationToken).ConfigureAwait(false);
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [OffsetsMetadataKey] = JsonSerializer.Serialize(offsets),
+        };
 
-        var record = new OffsetRecord(circuit.TickCount, [.. offsets]);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(record);
-        await _fs.WriteAllBytesAsync(OffsetsKey, bytes, cancellationToken).ConfigureAwait(false);
+        await Snapshot.WriteAsync(circuit, _fs, metadata, _retainCount, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<CheckpointState?> TryRestoreAsync(RootCircuit circuit, CancellationToken cancellationToken)
@@ -74,24 +78,16 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore
 
         await Snapshot.ReadAsync(circuit, _fs, cancellationToken).ConfigureAwait(false);
 
-        // Read the offsets written alongside this snapshot. If the sidecar is missing
-        // or names a different tick than the restored circuit, the checkpoint is torn
-        // (a crash between the two writes) — treat it as no usable checkpoint.
-        if (!await _fs.ExistsAsync(OffsetsKey, cancellationToken).ConfigureAwait(false))
+        var metadata = await Snapshot.ReadMetadataAsync(_fs, cancellationToken).ConfigureAwait(false);
+        if (metadata is null || !metadata.TryGetValue(OffsetsMetadataKey, out var json))
         {
-            return null;
+            // A snapshot without connector offsets (e.g. one written by a non-connector
+            // path) — engine state restores, but there is no source cursor to resume.
+            return new CheckpointState(circuit.TickCount, Array.Empty<SourceCheckpoint>());
         }
 
-        var bytes = await _fs.ReadAllBytesAsync(OffsetsKey, cancellationToken).ConfigureAwait(false);
-        var record = JsonSerializer.Deserialize<OffsetRecord>(bytes)
-            ?? throw new InvalidDataException("offsets.json deserialized to null");
-        if (record.Tick != circuit.TickCount)
-        {
-            return null;
-        }
-
-        return new CheckpointState(record.Tick, record.Offsets);
+        var offsets = JsonSerializer.Deserialize<SourceCheckpoint[]>(json)
+            ?? throw new InvalidDataException("connector.offsets metadata deserialized to null");
+        return new CheckpointState(circuit.TickCount, offsets);
     }
-
-    private sealed record OffsetRecord(long Tick, IReadOnlyList<SourceCheckpoint> Offsets);
 }

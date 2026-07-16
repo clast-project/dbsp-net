@@ -68,12 +68,14 @@ version). This is the key simplification DBSP + Delta buy us.
   schema inference *and* for validating a declared schema against a source.
 - **G2 — `ToArrowView()`.** A materialized-view → `RecordBatch(es)` builder (reuses
   `ArrowColumns.Build`), the mirror of `ToArrowDelta()`, for truncate-mode sinks.
-- **G3 — checkpoint-metadata hook.** A way for a connector to persist its offsets
-  **atomically with** the engine snapshot. `Snapshot.WriteAsync` commits by rotating
-  `current.txt`; add an optional `IReadOnlyDictionary<string,string>` (or a typed
-  contributor list) written into the manifest and returned by `ReadAsync`, so
-  offset↔tick stays consistent across the single atomic commit. This is the one core
-  change exactly-once genuinely needs.
+- **G3 — checkpoint-metadata hook. DONE (phase 2, 2026-07-16).** `Snapshot.WriteAsync`
+  gained an overload taking `IReadOnlyDictionary<string,string>? metadata`, written into
+  the manifest (before the `current.txt` rotation that makes the snapshot visible) and
+  read back via `Snapshot.ReadMetadataAsync`. Additive/optional — no manifest schema-
+  version bump, backward-compatible with existing snapshots. `SnapshotCheckpointStore`
+  now stores the offsets JSON under the manifest key `connector.offsets` instead of a
+  sidecar, so engine-tick T and the source offsets commit as one atomic unit and can
+  never diverge (the exactly-once alignment invariant).
 - **G4 (maybe) — tick alignment on restore.** `RestoreTickCount`/`RestoreLogicalTime`
   are internal (only `Snapshot.ReadAsync` sets them). The runner aligns to the tick the
   snapshot restores; it never sets the tick directly. No change needed if connectors

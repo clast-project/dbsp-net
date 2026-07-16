@@ -24,7 +24,8 @@ public sealed record SnapshotManifest(
     [property: JsonPropertyName("tick")] long Tick,
     [property: JsonPropertyName("operator_count")] int OperatorCount,
     [property: JsonPropertyName("snapshotted_indices")] IReadOnlyList<int> SnapshottedIndices,
-    [property: JsonPropertyName("logical_time")] long LogicalTime = long.MinValue)
+    [property: JsonPropertyName("logical_time")] long LogicalTime = long.MinValue,
+    [property: JsonPropertyName("metadata")] IReadOnlyDictionary<string, string>? Metadata = null)
 {
     /// <summary>
     /// v1 → v2: added <see cref="SchemaFingerprint"/>. v1 caught operator-
@@ -36,6 +37,12 @@ public sealed record SnapshotManifest(
     /// clock (<c>NOW()</c>) as of end-of-tick, so a restore reproduces the same
     /// "now" rather than restarting unset. Snapshots with no temporal filters
     /// carry <see cref="long.MinValue"/> and are unaffected.
+    /// </para>
+    /// <para>
+    /// <see cref="Metadata"/> is an <b>additive, optional</b> free-form section
+    /// (e.g. connector source offsets) written into the manifest so it commits
+    /// atomically with the snapshot — no schema-version bump, since a manifest
+    /// without it reads back as "no metadata" and old readers ignore it.
     /// </para>
     /// </summary>
     public const int CurrentSchemaVersion = 3;

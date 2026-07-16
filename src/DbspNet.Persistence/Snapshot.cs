@@ -48,9 +48,24 @@ public static class Snapshot
     /// snapshots are kept; older ones are pruned. Returns the number of
     /// operators that participated.
     /// </summary>
+    public static ValueTask<int> WriteAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        int retainCount = 1,
+        CancellationToken cancellationToken = default) =>
+        WriteAsync(circuit, fs, null, retainCount, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="WriteAsync(RootCircuit, ITableFileSystem, int, CancellationToken)"/>,
+    /// but also records <paramref name="metadata"/> (e.g. connector source offsets) in
+    /// the snapshot's manifest, so it commits <b>atomically</b> with the operator state
+    /// — the manifest is written before the <c>current.txt</c> pointer that makes the
+    /// snapshot visible. Read it back with <see cref="ReadMetadataAsync(ITableFileSystem, CancellationToken)"/>.
+    /// </summary>
     public static async ValueTask<int> WriteAsync(
         RootCircuit circuit,
         ITableFileSystem fs,
+        IReadOnlyDictionary<string, string>? metadata,
         int retainCount = 1,
         CancellationToken cancellationToken = default)
     {
@@ -91,7 +106,8 @@ public static class Snapshot
             circuit.TickCount,
             circuit.Operators.Count,
             snapshotted,
-            circuit.LogicalTime);
+            circuit.LogicalTime,
+            metadata);
         await manifest.WriteAsync(fs, snapName + "/manifest.json", cancellationToken).ConfigureAwait(false);
 
         // Commit. After this, the new snapshot is the latest; before, the
@@ -301,6 +317,34 @@ public static class Snapshot
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
         return ReadAsync(circuit, new LocalTableFileSystem(snapshotDir), cancellationToken);
+    }
+
+    /// <summary>
+    /// The <see cref="SnapshotManifest.Metadata"/> recorded with the current snapshot
+    /// (the section written by <see cref="WriteAsync(RootCircuit, ITableFileSystem, IReadOnlyDictionary{string, string}, int, CancellationToken)"/>),
+    /// or <see langword="null"/> if no snapshot exists. Reads only the manifest — it
+    /// does not restore operator state. Because the metadata lives in the same manifest
+    /// as the tick, it is always consistent with the state <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
+    /// restores from the same snapshot.
+    /// </summary>
+    public static async ValueTask<IReadOnlyDictionary<string, string>?> ReadMetadataAsync(
+        ITableFileSystem fs, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fs);
+        var current = await TryReadCurrentPointerAsync(fs, cancellationToken).ConfigureAwait(false);
+        if (current is null)
+        {
+            return null;
+        }
+
+        var manifestKey = current + "/manifest.json";
+        if (!await fs.ExistsAsync(manifestKey, cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        var manifest = await SnapshotManifest.ReadAsync(fs, manifestKey, cancellationToken).ConfigureAwait(false);
+        return manifest.Metadata ?? new Dictionary<string, string>();
     }
 
     private static string SnapDirName(long tick) => $"snap-{tick}";
