@@ -11,6 +11,8 @@ using DbspNet.Connectors.Abstractions;
 using DbspNet.Connectors.EngineeredWood;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Persistence;
+using DbspNet.Persistence.IO;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
@@ -121,6 +123,53 @@ public sealed class DeltaConnectorTests : IDisposable
         Assert.True(runner.Query.CurrentView.Equals(expected), $"view={runner.Query.CurrentView}");
 
         // The truncate sink equals the engine view.
+        var sink = await DeltaTable.OpenAsync(new LocalTableFileSystem(sinkDir), cancellationToken: CancellationToken.None);
+        var sinkRows = await ReadZSet(sink);
+        sink.Dispose();
+        Assert.True(sinkRows.Equals(expected), $"sink={sinkRows}");
+
+        await input.DisposeAsync();
+        await output.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Delta_RoundTrip_Pipelined_WithCheckpointing()
+    {
+        var srcDir = Path.Combine(_root, "pipesrc");
+        var sinkDir = Path.Combine(_root, "pipesink");
+        Directory.CreateDirectory(srcDir);
+        Directory.CreateDirectory(sinkDir);
+
+        var srcFs = new LocalTableFileSystem(srcDir);
+        var src = await DeltaTable.CreateAsync(srcFs, ArrowSchemaBridge.ToArrow(Schema()), cancellationToken: CancellationToken.None);
+        await WriteVersion(src, new object?[][] { new object?[] { 1, 10 }, new object?[] { 2, 20 } }, DeltaWriteMode.Append);
+        await WriteVersion(src, new object?[][] { new object?[] { 3, 30 } }, DeltaWriteMode.Append);
+        await WriteVersion(src, new object?[][] { new object?[] { 1, 10 }, new object?[] { 4, 40 } }, DeltaWriteMode.Overwrite);
+        src.Dispose();
+
+        // Pipelined drive (read-ahead + write-behind) with a checkpoint every tick, so the
+        // flush-before-checkpoint path runs and outputs stay durable at each committed tick.
+        var checkpoint = new SnapshotCheckpointStore(new InMemoryTableFileSystem());
+        var input = new DeltaInputConnector("src", srcDir);
+        var output = new DeltaOutputConnector("v", sinkDir, OutputMode.Truncate);
+        var runner = await PipelineRunner.CreateAsync(
+            new Catalog(),
+            new (IInputConnector, SqlSchema?)[] { (input, null) },
+            cat =>
+            {
+                var resolver = new Resolver(cat);
+                var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement("SELECT id, val FROM src"))).Query;
+                return PlanToCircuit.Compile(plan, ArrowSqlSnapshotCodecs.Instance, new CompileOptions { StoredOutput = true });
+            },
+            new IOutputConnector[] { output },
+            checkpoint,
+            checkpointEveryTicks: 1);
+
+        await runner.DrainPipelinedAsync(prefetch: 2);
+
+        var expected = ExpectedOf(new[] { 1, 10 }, new[] { 4, 40 });
+        Assert.True(runner.Query.CurrentView.Equals(expected), $"view={runner.Query.CurrentView}");
+
         var sink = await DeltaTable.OpenAsync(new LocalTableFileSystem(sinkDir), cancellationToken: CancellationToken.None);
         var sinkRows = await ReadZSet(sink);
         sink.Dispose();

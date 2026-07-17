@@ -200,7 +200,12 @@ public sealed class PipelineRunner
         var readCursors = _inputs.Select(b => b.Cursor).ToArray();
         var reader = Task.Run(() => ReadAheadAsync(channel.Writer, readCursors, cts.Token), cts.Token);
 
+        // Write-behind (1-deep): the previous tick's output write runs on a background task
+        // while the engine Steps + materialises the next tick, hiding the sink I/O. Ordering
+        // is preserved by awaiting the pending write before starting the next; durability is
+        // preserved by awaiting it before each checkpoint and at the end.
         long ticks = 0;
+        var pendingWrite = Task.CompletedTask;
         try
         {
             await foreach (var dv in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
@@ -211,15 +216,24 @@ public sealed class PipelineRunner
                 ticks++;
                 b.Cursor = dv.Offset;
 
-                await WriteOutputsAsync(cancellationToken).ConfigureAwait(false);
+                // Materialise on the engine thread (CurrentView is live and mutates on the
+                // next Step); the actual writes run on a background task.
+                var writes = MaterialiseOutputs();
+                await pendingWrite.ConfigureAwait(false); // finish + surface the previous write
+                pendingWrite = writes.Count == 0
+                    ? Task.CompletedTask
+                    : Task.Run(() => RunWritesAsync(writes, cancellationToken), cancellationToken);
 
                 if (_checkpoint is not null && ++_ticksSinceCheckpoint >= _checkpointEveryTicks)
                 {
+                    await pendingWrite.ConfigureAwait(false); // flush output before checkpointing
+                    pendingWrite = Task.CompletedTask;
                     await CheckpointAsync(cancellationToken).ConfigureAwait(false);
                 }
             }
 
-            await reader.ConfigureAwait(false); // surface any reader fault after a clean drain
+            await pendingWrite.ConfigureAwait(false); // flush the last write
+            await reader.ConfigureAwait(false);       // surface any reader fault after a clean drain
         }
         catch
         {
@@ -233,11 +247,68 @@ public sealed class PipelineRunner
                 // The primary fault is being propagated; ignore the reader's cancellation.
             }
 
+            try
+            {
+                await pendingWrite.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Ditto for an in-flight write.
+            }
+
             throw;
         }
 
         return ticks;
     }
+
+    private List<OutputWrite> MaterialiseOutputs()
+    {
+        if (_outputs.Count == 0)
+        {
+            return [];
+        }
+
+        var tick = _query.Circuit.TickCount;
+        var writes = new List<OutputWrite>(_outputs.Count);
+        foreach (var o in _outputs)
+        {
+            if (o.Mode == OutputMode.Truncate)
+            {
+                var view = _query.ToArrowView();
+                writes.Add(new OutputWrite(o, view.Rows, view.Weights, tick, IsView: true));
+            }
+            else
+            {
+                var delta = _query.ToArrowDelta();
+                writes.Add(new OutputWrite(o, delta.Rows, delta.Weights, tick, IsView: false));
+            }
+        }
+
+        return writes;
+    }
+
+    private static async Task RunWritesAsync(List<OutputWrite> writes, CancellationToken cancellationToken)
+    {
+        foreach (var w in writes)
+        {
+            if (w.IsView)
+            {
+                await w.Connector.WriteViewAsync(w.Batch, w.Weights, w.Tick, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await w.Connector.WriteDeltaAsync(w.Batch, w.Weights, w.Tick, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private readonly record struct OutputWrite(
+        IOutputConnector Connector,
+        Apache.Arrow.RecordBatch Batch,
+        long[] Weights,
+        long Tick,
+        bool IsView);
 
     // Reader loop: same round-robin as DrainAsync, but only reads + decodes (no push/Step),
     // enqueuing each version's decoded deltas for the engine thread. Bounded-channel writes

@@ -238,8 +238,17 @@ expensive Arrow *decode* (`DecodeArrowDeltas`) runs on the reader thread (touchi
 immutable schema) and the cheap *push* stays on the engine thread — two versions never
 merge into one tick. The reader tracks its own read-ahead cursor; checkpoints record the
 *committed* cursor (post-Step), so read-ahead is transparent to exactly-once (a crash
-re-reads uncommitted versions from the replayable source). Write-behind (overlapping the
-output write with the next Step) is a further extension, not yet built.
+re-reads uncommitted versions from the replayable source).
+
+`DrainPipelinedAsync` also does **write-behind** (1-deep): each tick's output is
+*materialised* on the engine thread (`ToArrowView`/`ToArrowDelta` snapshot the live
+`CurrentView`/`Current` into a fresh Arrow batch before the next `Step`), and the actual
+sink write runs on a background task while the engine Steps the next version — hiding the
+sink I/O behind compute. Ordering is preserved by awaiting the previous write before
+starting the next; **durability** by awaiting the pending write before each checkpoint
+(so a committed tick's output is always flushed) and at end-of-drain. So both source I/O
+(ahead) and sink I/O (behind) overlap engine compute, while the engine stays a single
+serial `Step` loop.
 
 **Recovery**: `Snapshot.ReadAsync` restores engine state to tick T *and* returns the
 per-source offsets committed at T; the runner resumes each source from `offset + 1`.
