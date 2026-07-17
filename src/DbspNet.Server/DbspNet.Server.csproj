@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <!-- The control service reaches the engine via the connector framework + EW Delta
+         connectors. It is the DbspNet analogue of Feldera's pipeline-manager. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DbspNet.Connectors.Abstractions\DbspNet.Connectors.Abstractions.csproj" />
+    <ProjectReference Include="..\DbspNet.Connectors.EngineeredWood\DbspNet.Connectors.EngineeredWood.csproj" />
+  </ItemGroup>
+</Project>

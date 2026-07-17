@@ -17,6 +17,7 @@
     <ProjectReference Include="..\..\src\DbspNet.Persistence\DbspNet.Persistence.csproj" />
     <ProjectReference Include="..\..\src\DbspNet.Connectors.Abstractions\DbspNet.Connectors.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\DbspNet.Connectors.EngineeredWood\DbspNet.Connectors.EngineeredWood.csproj" />
+    <ProjectReference Include="..\..\src\DbspNet.Server\DbspNet.Server.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />

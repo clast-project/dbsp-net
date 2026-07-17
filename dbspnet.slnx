@@ -5,6 +5,7 @@
     <Project Path="src/DbspNet.Connectors.EngineeredWood/DbspNet.Connectors.EngineeredWood.csproj" />
     <Project Path="src/DbspNet.Core/DbspNet.Core.csproj" />
     <Project Path="src/DbspNet.Demo/DbspNet.Demo.csproj" />
+    <Project Path="src/DbspNet.Server/DbspNet.Server.csproj" />
     <Project Path="src/DbspNet.Sql/DbspNet.Sql.csproj" />
   </Folder>
   <Folder Name="/tests/">
