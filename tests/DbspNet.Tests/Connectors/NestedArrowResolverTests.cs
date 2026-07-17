@@ -89,6 +89,35 @@ public sealed class NestedArrowResolverTests
     }
 
     [Fact]
+    public void Extract_leaf_with_own_nulls_under_partly_null_parent_keeps_valid_values()
+    {
+        // Mimics parquet nested nulls (the ivm-bench dim_account bug): Customer always present,
+        // Account null on some rows, and the leaf carries its OWN null bitmap matching Account.
+        // Valid account rows must retain their value — the bug returned all-null.
+        const int n = 5;
+        var caId = new Int64Array.Builder().Append(100).AppendNull().Append(300).AppendNull().Append(500).Build();
+        var accountType = new StructType(new List<Field> { new("_CA_ID", Int64Type.Default, nullable: true) });
+        var acctValidity = new ArrowBuffer.BitmapBuilder()
+            .Append(true).Append(false).Append(true).Append(false).Append(true).Build();
+        var account = new StructArray(accountType, n, new IArrowArray[] { caId }, acctValidity, nullCount: 2);
+
+        var customerType = new StructType(new List<Field> { new("Account", accountType, nullable: true) });
+        var customer = new StructArray(customerType, n, new IArrowArray[] { account }, ArrowBuffer.Empty, nullCount: 0);
+
+        var schema = new ArrowSchema.Builder().Field(new Field("Customer", customerType, nullable: true)).Build();
+        var batch = new RecordBatch(schema, new IArrowArray[] { customer }, n);
+
+        Assert.True(NestedArrowResolver.TryResolve(schema, "Customer.Account._CA_ID", out var path, out _));
+        var col = Assert.IsType<Int64Array>(NestedArrowResolver.Extract(batch, path));
+
+        Assert.Equal(100L, col.GetValue(0));
+        Assert.False(col.IsValid(1));
+        Assert.Equal(300L, col.GetValue(2));
+        Assert.False(col.IsValid(3));
+        Assert.Equal(500L, col.GetValue(4));
+    }
+
+    [Fact]
     public void Extract_flat_column_is_unchanged()
     {
         var (schema, batch) = BuildNested();

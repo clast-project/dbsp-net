@@ -274,6 +274,26 @@ public class ArrowRoundTripTests
     }
 
     [Fact]
+    public void NestedRow_ThreeLevelFieldAccess_ResolvesCorrectLeaf()
+    {
+        // Reproduces the ivm-bench CustomerMgmt shape: a 2-level customer field and a 3-level
+        // account field. Flattened leaf columns, in declaration order: Customer._C_ID (col 0),
+        // Customer.Account._CA_ID (col 1). If the 3-level field access mis-resolves, caid is
+        // wrong/null while cid is right — exactly the dim_customer-ok / dim_account-empty split.
+        var q = Compile(
+            ["CREATE TABLE t (Customer ROW(_C_ID BIGINT, Account ROW(_CA_ID BIGINT)))"],
+            "SELECT cm.Customer._C_ID AS cid, cm.Customer.Account._CA_ID AS caid FROM t cm");
+
+        q.Table("t").Insert(100L, 200L);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        Assert.Equal(1, delta.Rows.Length);
+        Assert.Equal(100L, ((Int64Array)delta.Rows.Column(0)).Values[0]); // cid (2-level)
+        Assert.Equal(200L, ((Int64Array)delta.Rows.Column(1)).Values[0]); // caid (3-level)
+    }
+
+    [Fact]
     public void InputBatch_DecodesDecimal64AsDecimal()
     {
         // A DECIMAL column whose Parquet physical is INT64 arrives as Decimal64Array but binds
