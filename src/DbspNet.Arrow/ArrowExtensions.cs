@@ -50,6 +50,20 @@ public static class ArrowExtensions
         return BuildArrow(query.OutputSchema, query.CurrentView, expandByWeight: true);
     }
 
+    /// <summary>
+    /// Materialise an arbitrary integrated view (schema + Z-set) as an Arrow batch for a
+    /// truncate-mode sink, expanding each row by its multiplicity — the shape used by a
+    /// multi-output program's <c>ProgramOutput</c>. See <see cref="ToArrowView(CompiledQuery)"/>.
+    /// </summary>
+    public static ArrowDelta ToArrowView(
+        SqlSchema schema,
+        DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> view)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(view);
+        return BuildArrow(schema, view, expandByWeight: true);
+    }
+
     private static ArrowDelta BuildArrow(
         SqlSchema schema,
         DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> zset,

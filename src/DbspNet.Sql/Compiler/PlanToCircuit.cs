@@ -215,6 +215,87 @@ public static class PlanToCircuit
         return new CompiledQuery(circuit!, inputs!, output!, plan.Schema, view);
     }
 
+    /// <summary>
+    /// Compile a whole program — <paramref name="tables"/> (<c>CREATE TABLE</c> sources)
+    /// and <paramref name="views"/> (<c>CREATE VIEW</c>, in dependency order) — into a
+    /// single circuit. Each table gets an input handle + stream; each view is compiled
+    /// against the shared streams of the tables/views it references (so a view is computed
+    /// once and shared by all its consumers), and each output view is integrated to a
+    /// materialised <see cref="ProgramOutput"/>. Structural compile path (the typed fast
+    /// path is single-query only); see <see cref="CompiledProgram"/>.
+    /// </summary>
+    public static CompiledProgram CompileProgram(
+        IReadOnlyList<CreateTablePlan> tables,
+        IReadOnlyList<ProgramView> views,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
+        CompileOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(tables);
+        ArgumentNullException.ThrowIfNull(views);
+        options ??= CompileOptions.Default;
+        var codec = StructuralRowCodec.Instance;
+
+        RootCircuit? circuit = null;
+        Dictionary<string, TableInput>? inputs = null;
+        Dictionary<string, ProgramOutput>? outputs = null;
+
+        var emptyFrontiers = (IReadOnlyDictionary<LatenessSource, IFrontier>)
+            new Dictionary<LatenessSource, IFrontier>();
+        var emptyShareable = (IReadOnlySet<ArrangementKey>)
+            System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
+
+        var prevStagingCapacity = SpineStagingConfig.Capacity;
+        SpineStagingConfig.Capacity = options.TraceFamily == TraceFamily.Spine ? options.SpineStagingCapacity : 0;
+        try
+        {
+            circuit = RootCircuit.Build(builder =>
+            {
+                // Environment: name → circuit stream (tables first, then each view as it
+                // is compiled). Scans of a name resolve here, so a view reference is wired
+                // to that view's already-built stream — not a fresh input.
+                var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+                var schemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+                inputs = new Dictionary<string, TableInput>(StringComparer.Ordinal);
+                outputs = new Dictionary<string, ProgramOutput>(StringComparer.Ordinal);
+
+                foreach (var t in tables)
+                {
+                    var (handle, stream) = builder.ZSetInput<StructuralRow, Z64>();
+                    inputs[t.TableName] = new TableInput(handle, t.Schema, codec);
+                    streams[t.TableName] = stream;
+                    schemas[t.TableName] = t.Schema;
+
+                    // NOTE (Phase A): declared LATENESS is not enforced across the program
+                    // yet — state is unbounded (sound, just not GC'd), as for unpartitioned
+                    // ranks. Cross-view frontier wiring is a follow-on.
+                }
+
+                foreach (var v in views)
+                {
+                    var monotonicity = MonotonicityAnalyzer.Analyze(v.Query);
+                    var ctx = new CompileContext(
+                        streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable);
+                    var stream = CompilePlan(builder, v.Query, ctx);
+                    streams[v.ViewName] = stream;
+                    schemas[v.ViewName] = v.Query.Schema;
+
+                    if (v.IsOutput)
+                    {
+                        var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
+                        var integrated = builder.Integrate(stream, viewCodec);
+                        outputs[v.ViewName] = new ProgramOutput(v.Query.Schema, integrated.View);
+                    }
+                }
+            });
+        }
+        finally
+        {
+            SpineStagingConfig.Capacity = prevStagingCapacity;
+        }
+
+        return new CompiledProgram(circuit!, inputs!, outputs!);
+    }
+
     private sealed class CompileContext
     {
         public CompileContext(
