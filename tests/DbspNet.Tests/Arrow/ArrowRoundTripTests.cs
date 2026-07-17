@@ -211,6 +211,45 @@ public class ArrowRoundTripTests
     }
 
     [Fact]
+    public void InputBatch_DecodesInt96Timestamp()
+    {
+        // A Delta table whose log schema says TIMESTAMP but whose Parquet stores the legacy
+        // INT96 encoding surfaces (via engineered-wood) as FixedSizeBinary(12). The decode is
+        // driven by the declared TIMESTAMP type and must reconstruct the µs instant, with nulls.
+        var q = Compile(["CREATE TABLE t (ts TIMESTAMP)"], "SELECT ts FROM t");
+
+        var expected = Timestamp.Parse("2026-05-04 12:00:00");
+        var days = Math.DivRem(expected.Microseconds, 86_400_000_000L, out var microsOfDay);
+        var int96 = new byte[12];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(int96.AsSpan(0, 8), microsOfDay * 1000L);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(int96.AsSpan(8, 4), (int)(days + 2440588));
+
+        var fsbType = new FixedSizeBinaryType(12);
+        // FixedSizeBinaryArray has no Builder — construct via ArrayData: row 0 = the INT96
+        // bytes, row 1 = 12 padding bytes marked null by the validity bitmap.
+        var values = new ArrowBuffer.Builder<byte>().Append(int96).Append(new byte[12]).Build();
+        var validity = new ArrowBuffer.BitmapBuilder().Append(true).Append(false).Build();
+        var arr = new Apache.Arrow.Arrays.FixedSizeBinaryArray(
+            new ArrayData(fsbType, length: 2, nullCount: 1, offset: 0, new[] { validity, values }));
+
+        // The batch's Arrow field type is FixedSizeBinary — exactly what engineered-wood yields
+        // for INT96 — even though the table column is TIMESTAMP. PushArrow aligns by index.
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("ts", fsbType, nullable: true)).Build();
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, length: 2);
+
+        q.Table("t").PushArrow(batch);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        Assert.Equal(2, delta.Rows.Length);
+        var ts = (TimestampArray)delta.Rows.Column(0);
+        var nonNull = ts.IsNull(0) ? 1 : 0;
+        Assert.False(ts.IsNull(nonNull));
+        Assert.True(ts.IsNull(1 - nonNull));
+        Assert.Equal(expected.Microseconds, ts.Values[nonNull]);
+    }
+
+    [Fact]
     public void RoundTrip_DecimalPreservesScaleAndValue()
     {
         var q = Compile(

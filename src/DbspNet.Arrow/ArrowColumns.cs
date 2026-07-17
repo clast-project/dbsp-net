@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -32,7 +33,13 @@ internal static class ArrowColumns
             : ExtractString((StringArray)array, rowCount),
         SqlDateType => ExtractDate((Date32Array)array, rowCount),
         SqlTimeType => ExtractTime((Time64Array)array, rowCount),
-        SqlTimestampType => ExtractTimestamp((TimestampArray)array, rowCount),
+        // A Delta table's log schema can report TIMESTAMP while the physical Parquet stores
+        // the legacy INT96 encoding, which engineered-wood surfaces as raw FixedSizeBinary(12)
+        // rather than converting it. Decode INT96 here (driven by the declared type) so the
+        // source's data conforms to the schema it advertises.
+        SqlTimestampType => array is Apache.Arrow.Arrays.FixedSizeBinaryArray int96
+            ? ExtractTimestampInt96(int96, rowCount)
+            : ExtractTimestamp((TimestampArray)array, rowCount),
         SqlDecimalType => ExtractDecimal((Decimal128Array)array, rowCount),
         _ => throw new NotSupportedException($"no Arrow extractor for {type.Display}"),
     };
@@ -170,6 +177,41 @@ internal static class ArrowColumns
         for (var i = 0; i < n; i++)
         {
             result[i] = a.IsNull(i) ? null : (object)new Timestamp(values[i]);
+        }
+
+        return result;
+    }
+
+    // Parquet INT96 timestamp: 12 bytes little-endian = int64 nanoseconds-of-day followed by
+    // int32 Julian day. Convert to the µs-since-Unix-epoch DbspNet Timestamp. (Interpreted as
+    // an instant / UTC, matching how arrow-rs and pyarrow read INT96 — self-consistent with
+    // how the data was written.)
+    private static object?[] ExtractTimestampInt96(Apache.Arrow.Arrays.FixedSizeBinaryArray a, int n)
+    {
+        const long julianUnixEpochDay = 2440588L; // Julian day number of 1970-01-01
+        const long microsPerDay = 86_400_000_000L;
+
+        var width = ((FixedSizeBinaryType)a.Data.DataType).ByteWidth;
+        if (width != 12)
+        {
+            throw new NotSupportedException(
+                $"TIMESTAMP source column is FixedSizeBinary({width}); only INT96 (12 bytes) is decodable");
+        }
+
+        var result = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            if (a.IsNull(i))
+            {
+                result[i] = null;
+                continue;
+            }
+
+            var bytes = a.GetBytes(i);
+            var nanosOfDay = BinaryPrimitives.ReadInt64LittleEndian(bytes);
+            var julianDay = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(8));
+            var micros = ((julianDay - julianUnixEpochDay) * microsPerDay) + (nanosOfDay / 1000L);
+            result[i] = new Timestamp(micros);
         }
 
         return result;
