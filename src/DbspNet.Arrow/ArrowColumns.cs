@@ -23,7 +23,16 @@ internal static class ArrowColumns
     public static object?[] Extract(
         IArrowArray array, SqlType type, int rowCount, bool zeroCopyStrings = false) => type switch
     {
-        SqlIntegerType => ExtractInt32((Int32Array)array, rowCount),
+        // INTEGER binds against any narrow signed int (FromArrowType widens Int8/Int16/Int32
+        // → INTEGER), so the source array can be any of the three widths; widen to int here.
+        SqlIntegerType => array switch
+        {
+            Int32Array a32 => ExtractInt32(a32, rowCount),
+            Int16Array a16 => ExtractInt16(a16, rowCount),
+            Int8Array a8 => ExtractInt8(a8, rowCount),
+            _ => throw new NotSupportedException(
+                $"INTEGER source column is {array.GetType().Name}; expected Int8/Int16/Int32Array"),
+        },
         SqlBigintType => ExtractInt64((Int64Array)array, rowCount),
         SqlRealType => ExtractFloat((FloatArray)array, rowCount),
         SqlDoubleType => ExtractDouble((DoubleArray)array, rowCount),
@@ -51,6 +60,30 @@ internal static class ArrowColumns
         for (var i = 0; i < n; i++)
         {
             result[i] = a.IsNull(i) ? null : (object)values[i];
+        }
+
+        return result;
+    }
+
+    private static object?[] ExtractInt16(Int16Array a, int n)
+    {
+        var values = a.Values;
+        var result = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            result[i] = a.IsNull(i) ? null : (object)(int)values[i];
+        }
+
+        return result;
+    }
+
+    private static object?[] ExtractInt8(Int8Array a, int n)
+    {
+        var values = a.Values;
+        var result = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            result[i] = a.IsNull(i) ? null : (object)(int)values[i];
         }
 
         return result;

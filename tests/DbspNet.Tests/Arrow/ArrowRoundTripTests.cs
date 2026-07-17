@@ -250,6 +250,30 @@ public class ArrowRoundTripTests
     }
 
     [Fact]
+    public void InputBatch_DecodesNarrowIntAsInteger()
+    {
+        // A TINYINT/SMALLINT source column is Arrow Int8/Int16 but binds to SQL INTEGER
+        // (FromArrowType widens). Decode must accept the narrow width, not just Int32.
+        var q = Compile(["CREATE TABLE t (n INT)"], "SELECT n FROM t");
+
+        var i8 = new Int8Array.Builder();
+        i8.Append((sbyte)7).AppendNull();
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("n", Int8Type.Default, nullable: true)).Build();
+        var batch = new RecordBatch(schema, new IArrowArray[] { i8.Build() }, length: 2);
+
+        q.Table("t").PushArrow(batch);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        Assert.Equal(2, delta.Rows.Length);
+        var col = (Int32Array)delta.Rows.Column(0);
+        var nonNull = col.IsNull(0) ? 1 : 0;
+        Assert.Equal(7, col.Values[nonNull]);
+        Assert.True(col.IsNull(1 - nonNull));
+    }
+
+    [Fact]
     public void RoundTrip_DecimalPreservesScaleAndValue()
     {
         var q = Compile(
