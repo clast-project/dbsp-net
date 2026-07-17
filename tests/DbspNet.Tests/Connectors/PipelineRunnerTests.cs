@@ -142,6 +142,82 @@ public class PipelineRunnerTests
         }
     }
 
+    // ---- Pipelined (read-ahead) runner ----------------------------------------
+
+    [Theory]
+    [InlineData("SELECT a, b FROM t WHERE b > 1")]
+    [InlineData("SELECT a, SUM(b) AS s FROM t GROUP BY a")]
+    [InlineData("SELECT DISTINCT a FROM t")]
+    [InlineData("SELECT a, b, RANK() OVER (PARTITION BY a ORDER BY b DESC) AS r FROM t")]
+    public async Task Pipelined_MatchesSequentialAndBatch(string sql)
+    {
+        for (var seed = 0; seed < 8; seed++)
+        {
+            var versions = RandomVersions(seed);
+
+            // Sequential reference.
+            LogicalPlan? seqPlan = null;
+            var seqRunner = await PipelineRunner.CreateAsync(
+                new Catalog(),
+                new (IInputConnector, SqlSchema?)[] { (new FakeInputConnector("t", TwoInts(), versions), null) },
+                cat => CompileFor(cat, sql, out seqPlan!, stored: true, codecs: false),
+                System.Array.Empty<IOutputConnector>());
+            await seqRunner.DrainAsync();
+
+            // Pipelined.
+            LogicalPlan? pipePlan = null;
+            var pipeRunner = await PipelineRunner.CreateAsync(
+                new Catalog(),
+                new (IInputConnector, SqlSchema?)[] { (new FakeInputConnector("t", TwoInts(), versions), null) },
+                cat => CompileFor(cat, sql, out pipePlan!, stored: true, codecs: false),
+                System.Array.Empty<IOutputConnector>());
+            var ticks = await pipeRunner.DrainPipelinedAsync(prefetch: 3);
+
+            Assert.Equal(versions.Count, ticks);
+            Assert.True(
+                pipeRunner.Query.CurrentView.Equals(seqRunner.Query.CurrentView),
+                $"pipelined≠sequential seed={seed} sql={sql}");
+
+            var ctx = new BatchEvalContext(
+                new Dictionary<string, ZSet<StructuralRow, Z64>>(StringComparer.Ordinal) { ["t"] = Net(versions) },
+                new Dictionary<CteRef, ZSet<StructuralRow, Z64>>());
+            var batch = BatchPlanEvaluator.Evaluate(pipePlan!, ctx);
+            Assert.True(pipeRunner.Query.CurrentView.Equals(batch), $"pipelined≠batch seed={seed} sql={sql}");
+        }
+    }
+
+    [Fact]
+    public async Task Pipelined_ReadsAheadWhileEngineBlocked()
+    {
+        var versions = RandomVersions(seed: 2, count: 6);
+        var input = new FakeInputConnector("t", TwoInts(), versions);
+        using var gate = new System.Threading.SemaphoreSlim(0);
+        var output = new FakeOutputConnector("v", OutputMode.Truncate) { WriteGate = gate };
+
+        var runner = await PipelineRunner.CreateAsync(
+            new Catalog(),
+            new (IInputConnector, SqlSchema?)[] { (input, null) },
+            cat => CompileFor(cat, "SELECT a, b FROM t", out _, stored: true, codecs: false),
+            new IOutputConnector[] { output });
+
+        // The engine driver Steps the first version, then blocks on the gated write; the
+        // reader keeps prefetching ahead into the bounded channel meanwhile.
+        var drain = runner.DrainPipelinedAsync(prefetch: 3).AsTask();
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (input.NextCount < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(5);
+        }
+
+        Assert.True(input.NextCount >= 2, $"reader did not run ahead (NextCount={input.NextCount})");
+        Assert.Empty(output.Writes); // driver still blocked on the first (gated) write
+
+        gate.Release(int.MaxValue);
+        await drain;
+        Assert.Equal(versions.Count, output.Writes.Count);
+    }
+
     [Fact]
     public async Task Changelog_Sink_ReceivesPerTickDeltas()
     {

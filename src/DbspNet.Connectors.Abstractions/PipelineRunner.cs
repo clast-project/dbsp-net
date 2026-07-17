@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Threading.Channels;
 using DbspNet.Arrow;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Plan;
@@ -169,6 +170,126 @@ public sealed class PipelineRunner
 
         return ticks;
     }
+
+    /// <summary>
+    /// As <see cref="DrainAsync"/>, but overlaps source read + Arrow decode with engine
+    /// compute: a background reader task reads and decodes up to <paramref name="prefetch"/>
+    /// versions ahead into a bounded channel while the engine Steps the current version
+    /// (and writes its output). The engine is still single-threaded and processes versions
+    /// in the same round-robin order, so the result is identical to <see cref="DrainAsync"/>;
+    /// only the source-I/O and decode latency is hidden behind compute. The reader decodes
+    /// off the engine thread (touching only immutable schema) and hands each version's
+    /// deltas to the engine thread, which alone pushes and Steps — two versions never merge
+    /// into one tick. Checkpointing records the <em>committed</em> cursor (the engine has
+    /// Stepped it), so read-ahead is transparent to exactly-once (a crash re-reads the
+    /// un-committed versions from a replayable source).
+    /// </summary>
+    public async ValueTask<long> DrainPipelinedAsync(int prefetch = 2, CancellationToken cancellationToken = default)
+    {
+        if (prefetch < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(prefetch), prefetch, "must be >= 1");
+        }
+
+        var channel = Channel.CreateBounded<DecodedVersion>(
+            new BoundedChannelOptions(prefetch) { SingleReader = true, SingleWriter = true });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        // The reader advances its own cursors (read-ahead); the engine thread advances the
+        // committed cursors (b.Cursor). They start equal (post-restore) and end equal.
+        var readCursors = _inputs.Select(b => b.Cursor).ToArray();
+        var reader = Task.Run(() => ReadAheadAsync(channel.Writer, readCursors, cts.Token), cts.Token);
+
+        long ticks = 0;
+        try
+        {
+            await foreach (var dv in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var b = _inputs[dv.SourceIndex];
+                b.TableInput.Push(dv.Deltas);
+                _query.Step();
+                ticks++;
+                b.Cursor = dv.Offset;
+
+                await WriteOutputsAsync(cancellationToken).ConfigureAwait(false);
+
+                if (_checkpoint is not null && ++_ticksSinceCheckpoint >= _checkpointEveryTicks)
+                {
+                    await CheckpointAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            await reader.ConfigureAwait(false); // surface any reader fault after a clean drain
+        }
+        catch
+        {
+            await cts.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await reader.ConfigureAwait(false);
+            }
+            catch
+            {
+                // The primary fault is being propagated; ignore the reader's cancellation.
+            }
+
+            throw;
+        }
+
+        return ticks;
+    }
+
+    // Reader loop: same round-robin as DrainAsync, but only reads + decodes (no push/Step),
+    // enqueuing each version's decoded deltas for the engine thread. Bounded-channel writes
+    // apply backpressure so read-ahead stays within `prefetch`.
+    private async Task ReadAheadAsync(
+        ChannelWriter<DecodedVersion> writer, IConnectorOffset[] readCursors, CancellationToken cancellationToken)
+    {
+        try
+        {
+            bool progressed;
+            do
+            {
+                progressed = false;
+                for (var s = 0; s < _inputs.Count; s++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var b = _inputs[s];
+                    var latest = await b.Connector.LatestOffsetAsync(cancellationToken).ConfigureAwait(false);
+                    if (latest is null || latest.CompareTo(readCursors[s]) <= 0)
+                    {
+                        continue;
+                    }
+
+                    var batch = await b.Connector.NextAsync(readCursors[s], cancellationToken).ConfigureAwait(false);
+                    if (batch is null)
+                    {
+                        continue;
+                    }
+
+                    var deltas = new List<(object?[] Values, long Weight)>();
+                    await foreach (var vb in batch.Content.WithCancellation(cancellationToken).ConfigureAwait(false))
+                    {
+                        deltas.AddRange(b.TableInput.DecodeArrowDeltas(vb.Batch, vb.Weights));
+                    }
+
+                    readCursors[s] = batch.Offset;
+                    await writer.WriteAsync(new DecodedVersion(s, batch.Offset, deltas), cancellationToken).ConfigureAwait(false);
+                    progressed = true;
+                }
+            }
+            while (progressed);
+
+            writer.Complete();
+        }
+        catch (Exception ex)
+        {
+            writer.Complete(ex);
+        }
+    }
+
+    private readonly record struct DecodedVersion(
+        int SourceIndex, IConnectorOffset Offset, List<(object?[] Values, long Weight)> Deltas);
 
     /// <summary>Force a checkpoint now (e.g. before a clean shutdown).</summary>
     public ValueTask CheckpointAsync(CancellationToken cancellationToken = default)

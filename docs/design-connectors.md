@@ -228,6 +228,19 @@ Loop, per poll round:
 4. On the checkpoint cadence (every N ticks / T seconds), **atomically commit**: engine
    `Snapshot.WriteAsync` carrying the per-source offsets as manifest metadata (G3).
 
+`DrainAsync` runs this synchronously. **`DrainPipelinedAsync(prefetch)` overlaps source
+read + Arrow decode with engine compute**: a background reader task reads and decodes up
+to `prefetch` versions ahead into a bounded channel (backpressured) while the engine
+Steps + writes the current version. The engine stays single-threaded and processes
+versions in the same round-robin order, so the result is **identical to `DrainAsync`** —
+only the source-I/O + decode latency is hidden. `ToArrowView`/`PushArrow` are split so the
+expensive Arrow *decode* (`DecodeArrowDeltas`) runs on the reader thread (touching only
+immutable schema) and the cheap *push* stays on the engine thread — two versions never
+merge into one tick. The reader tracks its own read-ahead cursor; checkpoints record the
+*committed* cursor (post-Step), so read-ahead is transparent to exactly-once (a crash
+re-reads uncommitted versions from the replayable source). Write-behind (overlapping the
+output write with the next Step) is a further extension, not yet built.
+
 **Recovery**: `Snapshot.ReadAsync` restores engine state to tick T *and* returns the
 per-source offsets committed at T; the runner resumes each source from `offset + 1`.
 Because engine tick and source offsets were one atomic commit, they can't diverge —

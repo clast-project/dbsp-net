@@ -200,6 +200,24 @@ public static class ArrowExtensions
         PushArrowCore(input, batch, weights.ToArray(), zeroCopyStrings: true);
     }
 
+    /// <summary>
+    /// Decode an Arrow batch into row-major <c>(values, weight)</c> deltas <b>without
+    /// pushing</b> — the expensive per-column Arrow extraction, separated from the
+    /// (cheap, engine-serialized) push. A pipelined runner calls this on a reader thread
+    /// to decode the next version while the engine processes the current one, then pushes
+    /// the result via <see cref="TableInput.Push"/> on the engine thread (two versions
+    /// must never merge into one tick). Reads only the table's schema — safe to call
+    /// off-thread. Strings are copied (no zero-copy aliasing).
+    /// </summary>
+    public static List<(object?[] Values, long Weight)> DecodeArrowDeltas(
+        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(batch);
+        ValidateWeights(batch, weights);
+        return DecodeCore(input, batch, weights.ToArray(), zeroCopyStrings: false);
+    }
+
     private static void ValidateWeights(RecordBatch batch, ReadOnlySpan<long> weights)
     {
         if (weights.Length != batch.Length)
@@ -211,6 +229,10 @@ public static class ArrowExtensions
     }
 
     private static void PushArrowCore(
+        TableInput input, RecordBatch batch, long[]? weights, bool zeroCopyStrings) =>
+        input.Push(DecodeCore(input, batch, weights, zeroCopyStrings));
+
+    private static List<(object?[] Values, long Weight)> DecodeCore(
         TableInput input, RecordBatch batch, long[]? weights, bool zeroCopyStrings)
     {
         var schema = input.Schema;
@@ -256,7 +278,7 @@ public static class ArrowExtensions
             deltas.Add((row, weight));
         }
 
-        input.Push(deltas);
+        return deltas;
     }
 }
 

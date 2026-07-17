@@ -97,7 +97,13 @@ internal sealed class FakeInputConnector : IInputConnector
         _versions = versions;
     }
 
+    private int _nextCount;
+
     public string Name { get; }
+
+    /// <summary>How many times <see cref="NextAsync"/> has been called — lets a test see
+    /// the pipelined reader run ahead of the engine.</summary>
+    public int NextCount => System.Threading.Volatile.Read(ref _nextCount);
 
     public IConnectorOffset InitialOffset => LongOffset.Before;
 
@@ -123,6 +129,7 @@ internal sealed class FakeInputConnector : IInputConnector
 
     public ValueTask<InputBatch?> NextAsync(IConnectorOffset from, CancellationToken cancellationToken)
     {
+        System.Threading.Interlocked.Increment(ref _nextCount);
         var idx = ((LongOffset)from).Value + 1;
         if (idx >= _versions.Count)
         {
@@ -172,6 +179,10 @@ internal sealed class FakeOutputConnector : IOutputConnector
 
     public SqlSchema? BoundSchema { get; private set; }
 
+    /// <summary>When set, every write blocks on this gate before recording — lets a test
+    /// stall the engine driver and observe the pipelined reader running ahead.</summary>
+    public System.Threading.SemaphoreSlim? WriteGate { get; init; }
+
     public IReadOnlyList<(long Tick, int RowCount, long WeightSum)> Writes => _writes;
 
     public ValueTask BindSchemaAsync(SqlSchema viewSchema, CancellationToken cancellationToken)
@@ -180,16 +191,24 @@ internal sealed class FakeOutputConnector : IOutputConnector
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask WriteViewAsync(RecordBatch view, long[] weights, long tick, CancellationToken cancellationToken)
+    public async ValueTask WriteViewAsync(RecordBatch view, long[] weights, long tick, CancellationToken cancellationToken)
     {
+        if (WriteGate is not null)
+        {
+            await WriteGate.WaitAsync(cancellationToken);
+        }
+
         _writes.Add((tick, view.Length, Sum(weights)));
-        return ValueTask.CompletedTask;
     }
 
-    public ValueTask WriteDeltaAsync(RecordBatch delta, long[] weights, long tick, CancellationToken cancellationToken)
+    public async ValueTask WriteDeltaAsync(RecordBatch delta, long[] weights, long tick, CancellationToken cancellationToken)
     {
+        if (WriteGate is not null)
+        {
+            await WriteGate.WaitAsync(cancellationToken);
+        }
+
         _writes.Add((tick, delta.Length, Sum(weights)));
-        return ValueTask.CompletedTask;
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
