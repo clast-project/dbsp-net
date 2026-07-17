@@ -2311,8 +2311,8 @@ public sealed class Resolver
         var rightSynth = new List<ProjectionItem>();
         foreach (var ck in computed)
         {
-            var li = HoistKeySide(ck.LeftExpr, left.Schema, leftSynth, "__jkl");
-            var ri = HoistKeySide(ck.RightExpr, right.Schema, rightSynth, "__jkr");
+            var li = HoistKeySide(ck.LeftExpr, ck.KeyType, left.Schema, leftSynth, "__jkl");
+            var ri = HoistKeySide(ck.RightExpr, ck.KeyType, right.Schema, rightSynth, "__jkr");
             equi.Add(new JoinEquality(li, ri, ck.KeyType));
         }
 
@@ -2479,15 +2479,20 @@ public sealed class Resolver
     /// column. Returns the per-side index.
     /// </summary>
     private static int HoistKeySide(
-        ResolvedExpression keyExpr, Schema inputSchema, List<ProjectionItem> synth, string prefix)
+        ResolvedExpression keyExpr, SqlType keyType, Schema inputSchema, List<ProjectionItem> synth, string prefix)
     {
-        if (keyExpr is ResolvedColumn c)
+        // Cast the key expression to the common key type so both sides of the join share one
+        // representation (a BIGINT side and a VARCHAR side must both become the coerced type,
+        // or their key rows never hash-equal). A bare column already of the key type stays
+        // bare — no synthetic projection needed.
+        var keyed = MaybeCast(keyExpr, keyType);
+        if (keyed is ResolvedColumn c)
         {
             return c.Index;
         }
 
         var index = inputSchema.Count + synth.Count;
-        synth.Add(new ProjectionItem(keyExpr, prefix + synth.Count));
+        synth.Add(new ProjectionItem(keyed, prefix + synth.Count));
         return index;
     }
 
@@ -2546,6 +2551,8 @@ public sealed class Resolver
         var usingLeftIdx = new List<int>();
         var usingRightCombinedIdx = new List<int>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var leftCasts = new Dictionary<int, SqlType>();
+        var rightCasts = new Dictionary<int, SqlType>();
 
         foreach (var col in join.UsingColumns!)
         {
@@ -2556,11 +2563,34 @@ public sealed class Resolver
 
             var li = left.Schema.Resolve(null, col);
             var ri = right.Schema.Resolve(null, col);
-            var keyType = TypeInference.CommonComparableType(left.Schema[li].Type, right.Schema[ri].Type);
+            var lt = left.Schema[li].Type;
+            var rt = right.Schema[ri].Type;
+            var keyType = TypeInference.CommonComparableType(lt, rt);
+
+            // A USING key whose two sides differ in type (e.g. BIGINT vs VARCHAR under
+            // numeric<->string coercion — ivm-bench's dim_account USING(broker_id)) must be
+            // cast to the common type on each side, or the two sides' key rows carry different
+            // representations and never hash-equal, silently dropping every match. The merged
+            // output column already declares keyType, so casting only aligns the runtime value.
+            if (!SameTypeIgnoringNullable(lt, keyType))
+            {
+                leftCasts[li] = keyType;
+            }
+
+            if (!SameTypeIgnoringNullable(rt, keyType))
+            {
+                rightCasts[ri] = keyType;
+            }
+
             equi.Add(new JoinEquality(li, ri, keyType));
             usingLeftIdx.Add(li);
             usingRightCombinedIdx.Add(leftCount + ri);
         }
+
+        // Cast mismatched key columns to the common type in place (schema shape/indices
+        // preserved). No-op when every key already shares a type.
+        left = CoerceKeyColumns(left, leftCasts);
+        right = CoerceKeyColumns(right, rightCasts);
 
         var joinOutputSchema = join.Type switch
         {
@@ -2637,6 +2667,28 @@ public sealed class Resolver
         }
 
         return new ProjectPlan(joinPlan, projections, BuildProjectSchema(projections));
+    }
+
+    /// <summary>Return <paramref name="input"/> with the given columns cast to a new type
+    /// in place (same column names/qualifiers/indices), or unchanged if no casts.</summary>
+    private static LogicalPlan CoerceKeyColumns(LogicalPlan input, Dictionary<int, SqlType> casts)
+    {
+        if (casts.Count == 0)
+        {
+            return input;
+        }
+
+        var projections = new List<ProjectionItem>(input.Schema.Count);
+        for (var i = 0; i < input.Schema.Count; i++)
+        {
+            var c = input.Schema[i];
+            var expr = casts.TryGetValue(i, out var target)
+                ? MaybeCast(new ResolvedColumn(i, c.Type), target)
+                : new ResolvedColumn(i, c.Type);
+            projections.Add(new ProjectionItem(expr, c.Name, c.Qualifier));
+        }
+
+        return new ProjectPlan(input, projections, BuildProjectSchema(projections));
     }
 
     private static string JoinTypeName(JoinType t) => t switch
@@ -2733,6 +2785,16 @@ public sealed class Resolver
         }
 
         if (bin.Left is not ResolvedColumn lc || bin.Right is not ResolvedColumn rc)
+        {
+            return false;
+        }
+
+        // A bare-column equi-key requires both sides to already share a type. Mismatched
+        // types (e.g. BIGINT vs VARCHAR under numeric<->string coercion) must NOT become a
+        // bare key: the two sides' key rows would carry different representations and never
+        // hash-equal, so the join silently drops every match. Defer to the computed-key path,
+        // which hoists a CAST to the common comparable type on each side.
+        if (!SameTypeIgnoringNullable(lc.Type, rc.Type))
         {
             return false;
         }
