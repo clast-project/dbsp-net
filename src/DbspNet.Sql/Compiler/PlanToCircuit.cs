@@ -235,6 +235,32 @@ public static class PlanToCircuit
         options ??= CompileOptions.Default;
         var codec = StructuralRowCodec.Instance;
 
+        // Dead-view elimination: only compile views reachable from an output. A view with no
+        // output connector that no output transitively references is never observed, so
+        // building its stream is pure waste — and a large such view (e.g. a +stored-but-
+        // unwritten fact that fans a fact table out by a dimension version count) can dominate
+        // memory. `views` is in dependency order (a view after everything it references), so a
+        // single backward pass marks each output and then every name it transitively scans.
+        // CollectScans is the same traversal compilation resolves scans through, so the
+        // reachable set is exactly what a kept view will look up in `streams`.
+        var reachable = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = views.Count - 1; i >= 0; i--)
+        {
+            var v = views[i];
+            if (v.IsOutput)
+            {
+                reachable.Add(v.ViewName);
+            }
+
+            if (reachable.Contains(v.ViewName))
+            {
+                foreach (var referenced in CollectScans(v.Query).Scans.Keys)
+                {
+                    reachable.Add(referenced);
+                }
+            }
+        }
+
         RootCircuit? circuit = null;
         Dictionary<string, TableInput>? inputs = null;
         Dictionary<string, ProgramOutput>? outputs = null;
@@ -272,6 +298,12 @@ public static class PlanToCircuit
 
                 foreach (var v in views)
                 {
+                    // Skip dead views (no output depends on them) — never built, never stepped.
+                    if (!reachable.Contains(v.ViewName))
+                    {
+                        continue;
+                    }
+
                     var monotonicity = MonotonicityAnalyzer.Analyze(v.Query);
                     var ctx = new CompileContext(
                         streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable);

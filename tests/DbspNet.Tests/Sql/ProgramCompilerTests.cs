@@ -148,4 +148,54 @@ public class ProgramCompilerTests
         // Both trades now map to the current name_code 101, total 70.
         Assert.Equal(1, program.Outputs["company_totals"].CurrentView.WeightOf(Row(101, 70L)).Value);
     }
+
+    [Fact]
+    public void DeadView_NotReachableFromAnyOutput_IsNotCompiled()
+    {
+        // `dead` is neither an output nor referenced by one. If it were compiled, stepping it
+        // would evaluate 100 / (id - id) = divide-by-zero and throw. Dead-view elimination
+        // skips it, so the Step runs and only the live output is materialised.
+        var program = new[]
+        {
+            "CREATE TABLE t (id INT NOT NULL)",
+            "CREATE VIEW live AS SELECT id FROM t",
+            "CREATE VIEW dead AS SELECT id, 100 / (id - id) AS boom FROM t",
+        };
+        var outputs = new HashSet<string>(StringComparer.Ordinal) { "live" };
+
+        var resolved = SqlProgram.Resolve(program, outputs);
+        var compiled = PlanToCircuit.CompileProgram(resolved.Tables, resolved.Views);
+
+        Assert.True(compiled.Outputs.ContainsKey("live"));
+        Assert.False(compiled.Outputs.ContainsKey("dead"));
+
+        compiled.Table("t").Insert(5);
+        compiled.Step(); // would throw DivideByZeroException if `dead` were compiled + stepped
+
+        Assert.Equal(1, compiled.Outputs["live"].CurrentView.WeightOf(Row(5)).Value);
+    }
+
+    [Fact]
+    public void IndirectlyReferencedView_IsKept()
+    {
+        // `mid` is not an output, but the output `outv` references it, so it must be compiled;
+        // pruning it would leave `outv` unable to resolve its scan (CompileProgram would throw).
+        var program = new[]
+        {
+            "CREATE TABLE t (id INT NOT NULL, amt INT NOT NULL)",
+            "CREATE VIEW mid AS SELECT id, amt FROM t WHERE amt > 0",
+            "CREATE VIEW outv AS SELECT SUM(amt) AS total FROM mid",
+        };
+        var outputs = new HashSet<string>(StringComparer.Ordinal) { "outv" };
+
+        var resolved = SqlProgram.Resolve(program, outputs);
+        var compiled = PlanToCircuit.CompileProgram(resolved.Tables, resolved.Views);
+
+        compiled.Table("t").Insert(1, 10);
+        compiled.Table("t").Insert(2, 5);
+        compiled.Table("t").Insert(3, 0); // filtered out by mid
+        compiled.Step();
+
+        Assert.Equal(1, compiled.Outputs["outv"].CurrentView.WeightOf(Row(15L)).Value);
+    }
 }
