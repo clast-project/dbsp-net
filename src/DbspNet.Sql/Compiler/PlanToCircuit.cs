@@ -498,18 +498,29 @@ public static class PlanToCircuit
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier = null,
-        Func<StructuralRow, long>? monotoneKey = null)
+        Func<StructuralRow, long>? monotoneKey = null,
+        Func<StructuralRow, bool>? residual = null)
     {
-        return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineIncrementalInnerJoin(
+        // The residual (a non-equi ON conjunct spanning both sides, e.g. a
+        // temporal-SCD `ts BETWEEN lo AND hi`) is pushed INTO the flat join's
+        // cross-product enumeration so rows failing it never enter the output
+        // Z-set — the intermediate full product is never materialised. The spine
+        // join has no residual hook, so there it stays a post-join filter.
+        if (ctx.Options.TraceFamily == TraceFamily.Spine)
+        {
+            var spineJoined = builder.SpineIncrementalInnerJoin(
                 left, right, combine, leftCodec, rightCodec,
                 ctx.Options.Compaction,
                 keyComparer: StructuralRowComparer.Instance,
                 leftValueComparer: StructuralRowComparer.Instance,
                 rightValueComparer: StructuralRowComparer.Instance,
                 frontier: frontier,
-                monotoneKey: monotoneKey)
-            : builder.IncrementalInnerJoin(left, right, combine, leftCodec, rightCodec, frontier, monotoneKey);
+                monotoneKey: monotoneKey);
+            return residual is null ? spineJoined : builder.Filter(spineJoined, row => residual(row));
+        }
+
+        return builder.IncrementalInnerJoin(
+            left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual);
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitLeftJoin(
@@ -1737,6 +1748,20 @@ public static class PlanToCircuit
 
         var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
 
+        // Push a residual (non-equi ON conjunct spanning both sides — e.g. a
+        // temporal-SCD `ts BETWEEN lo AND hi`) INTO the join combine rather than
+        // materialising the full equi cross product and filtering it above: rows
+        // failing the residual never enter the output Z-set. The result set is
+        // identical (matched = σ_residual(join) either way); only the
+        // intermediate shrinks. GC is unaffected — key retention does not depend
+        // on which output rows survive the residual.
+        Func<StructuralRow, bool>? residualFn = null;
+        if (plan.Residual is { } residual)
+        {
+            var residualPredicate = ExpressionCompiler.CompilePredicate(residual);
+            residualFn = row => residualPredicate(row);
+        }
+
         Stream<ZSet<StructuralRow, Z64>> joined;
 
         // Arrangement CSE: when this relation+key is the right input of ≥2 INNER
@@ -1756,7 +1781,7 @@ public static class PlanToCircuit
                 builder, ctx, plan, rightIndices, rightKeySchema,
                 new ArrangementKey(shareSource, string.Join(",", rightIndices)));
             joined = EmitSharedRightInnerJoin(
-                builder, ctx, leftIndexed, shared.RightIndexed, shared.Arrangement, Combine);
+                builder, ctx, leftIndexed, shared.RightIndexed, shared.Arrangement, Combine, residualFn);
         }
         else
         {
@@ -1772,13 +1797,7 @@ public static class PlanToCircuit
             var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
             joined = EmitInnerJoin(
                 builder, ctx, leftIndexed, rightIndexed, Combine,
-                leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
-        }
-
-        if (plan.Residual is { } residual)
-        {
-            var residualPredicate = ExpressionCompiler.CompilePredicate(residual);
-            joined = builder.Filter(joined, row => residualPredicate(row));
+                leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn);
         }
 
         return joined;
@@ -1839,19 +1858,27 @@ public static class PlanToCircuit
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed,
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> rightDelta,
         object arrangement,
-        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> combine)
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> combine,
+        Func<StructuralRow, bool>? residual = null)
     {
-        return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineIncrementalInnerJoinSharedRight(
+        // Residual pushdown mirrors EmitInnerJoin: the flat shared-right join
+        // folds it into the cross product; the spine variant has no hook and
+        // post-filters.
+        if (ctx.Options.TraceFamily == TraceFamily.Spine)
+        {
+            var spineJoined = builder.SpineIncrementalInnerJoinSharedRight(
                 leftIndexed, rightDelta,
                 (ISpineArrangement<StructuralRow, StructuralRow, Z64>)arrangement,
                 combine, ctx.Options.Compaction,
                 keyComparer: StructuralRowComparer.Instance,
-                leftValueComparer: StructuralRowComparer.Instance)
-            : builder.IncrementalInnerJoinSharedRight(
-                leftIndexed, rightDelta,
-                (IArrangement<StructuralRow, StructuralRow, Z64>)arrangement,
-                combine);
+                leftValueComparer: StructuralRowComparer.Instance);
+            return residual is null ? spineJoined : builder.Filter(spineJoined, row => residual(row));
+        }
+
+        return builder.IncrementalInnerJoinSharedRight(
+            leftIndexed, rightDelta,
+            (IArrangement<StructuralRow, StructuralRow, Z64>)arrangement,
+            combine, residual);
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompileLeftOuterJoin(
@@ -1982,16 +2009,22 @@ public static class PlanToCircuit
             row => ExtractKey(codec, rightKeySchema, row, rightIndices),
             row => row);
 
-        var joined = EmitInnerJoin(
+        // Push the residual INTO the inner join's combine (flat path) instead of
+        // materialising the full product and filtering above. matched is the same
+        // set either way — σ_residual(L ⋈_key R) — so the unmatched anti-joins
+        // below and the outer-join match-presence semantics are unchanged; only
+        // the intermediate cross product shrinks (a temporal SCD join OOMs
+        // building it). On the spine path EmitInnerJoin falls back to a post-join
+        // filter internally.
+        var residualScalar = ExpressionCompiler.CompileScalar(plan.Residual!);
+        var matched = EmitInnerJoin(
             builder, ctx,
             leftIndexed,
             rightIndexed,
             (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema),
-            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema));
-
-        var residualFn = ExpressionCompiler.CompileScalar(plan.Residual!);
-        var matched = builder.Filter(joined, row => residualFn(row) is true);
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema),
+            residual: row => residualScalar(row) is true);
 
         var parts = new List<Stream<ZSet<StructuralRow, Z64>>> { matched };
 
