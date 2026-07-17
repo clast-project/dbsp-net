@@ -57,28 +57,21 @@ public sealed class ArrowSchemaMapper : ISchemaMapper
         ArgumentNullException.ThrowIfNull(declared);
         ArgumentNullException.ThrowIfNull(source);
 
-        // Index source fields by name (case-insensitive), matching how SQL identifiers
-        // are compared for a table's columns.
-        var sourceByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        for (var i = 0; i < source.FieldsList.Count; i++)
-        {
-            // First occurrence wins; a duplicate name in the source is ambiguous but
-            // only matters if a declared column asks for it.
-            sourceByName.TryAdd(source.FieldsList[i].Name, i);
-        }
-
         var indices = new int[declared.Count];
         for (var d = 0; d < declared.Count; d++)
         {
             var col = declared[d];
-            if (!sourceByName.TryGetValue(col.Name, out var srcIdx))
+
+            // A declared name matches a top-level source field or, for a dotted name (a
+            // lowered ROW leaf), a path into the source's nested structs. Only the leaf
+            // type is checked — an intermediate struct is a container, never mapped.
+            if (!NestedArrowResolver.TryResolve(source, col.Name, out var path, out var leaf) || leaf is null)
             {
                 throw new InvalidOperationException(
                     $"declared column '{col.Name}' has no matching column in the source schema");
             }
 
-            var srcField = source.FieldsList[srcIdx];
-            var inferred = ArrowSchemaBridge.FromArrowType(srcField.DataType, srcField.IsNullable);
+            var inferred = ArrowSchemaBridge.FromArrowType(leaf.DataType, leaf.IsNullable);
 
             // Compare ignoring nullability (a NOT NULL declaration over a nullable
             // source column is allowed — the source is trusted to honour it).
@@ -89,7 +82,9 @@ public sealed class ArrowSchemaMapper : ISchemaMapper
                     $"column is {inferred.Display} — incompatible (coercion is a v1 follow-on)");
             }
 
-            indices[d] = srcIdx;
+            // Records the top-level source index; the full path is re-resolved at projection
+            // time (ArrowProjection). Flat columns are unaffected.
+            indices[d] = path[0];
         }
 
         return new SchemaBinding(declared, indices);

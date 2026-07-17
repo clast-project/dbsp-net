@@ -44,13 +44,16 @@ internal static class ArrowProjection
         var dataArrays = new IArrowArray[schema.Count];
         for (var d = 0; d < schema.Count; d++)
         {
-            if (!byName.TryGetValue(schema[d].Name, out var srcIdx))
+            // Resolve each declared column to a top-level source field or a nested-struct
+            // path (a lowered ROW leaf), then extract it — flattening the nested source and
+            // propagating parent-struct nulls. Flat sources take the single-segment path.
+            if (!NestedArrowResolver.TryResolve(raw.Schema, schema[d].Name, out var path, out _))
             {
                 throw new InvalidOperationException(
                     $"source batch for '{sourceName}' has no column '{schema[d].Name}'");
             }
 
-            dataArrays[d] = raw.Column(srcIdx);
+            dataArrays[d] = NestedArrowResolver.Extract(raw, path);
         }
 
         return new VersionBatch(new RecordBatch(resolvedArrow, dataArrays, rowCount), weights);

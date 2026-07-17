@@ -7,6 +7,17 @@ builder.Services.AddSingleton<DbspNetEngine>();
 
 var app = builder.Build();
 
+// Surface the failure in the response body (not just a bare 500). The framework still
+// logs the exception, but returning the message + stack means a caller (dbt-server /
+// benchmark harness) and its captured logs carry the reason — an opaque 500 from /deploy
+// otherwise costs a full debugging round-trip in a torn-down container.
+app.UseExceptionHandler(errApp => errApp.Run(async ctx =>
+{
+    var ex = ctx.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>()?.Error;
+    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+    await ctx.Response.WriteAsJsonAsync(new { error = ex?.Message, detail = ex?.ToString() });
+}));
+
 // Health — the compose healthcheck / dbt-server depends_on polls this.
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
