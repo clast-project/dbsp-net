@@ -42,3 +42,11 @@ public sealed record OutputStat(string View, long Rows, string Status = "success
 /// <summary>Point-in-time engine stats (for polling / drain observation).</summary>
 public sealed record EngineStats(
     bool Deployed, bool BatchRunning, long TickCount, IReadOnlyList<OutputStat> Outputs);
+
+/// <summary>Dry-run compile check: the SQL program (CREATE TABLE + CREATE VIEW, in
+/// dependency order) and the output view names. No connectors / no Delta needed.</summary>
+public sealed record CompileSpec(IReadOnlyList<string> Program, IReadOnlyList<string> Outputs);
+
+/// <summary>Result of a dry-run compile: whether the whole program compiled into one
+/// circuit, the output-view count, and the first error if not.</summary>
+public sealed record CompileResult(bool Ok, int OutputViews, string? Error);

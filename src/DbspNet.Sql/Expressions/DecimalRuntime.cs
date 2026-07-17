@@ -59,6 +59,24 @@ internal static class DecimalRuntime
     public static Decimal128 FromInt32(int value) => new(value);
 
     /// <summary>
+    /// Convert a floating-point value to <see cref="Decimal128"/> at
+    /// <paramref name="type"/>'s scale — <c>CAST(DOUBLE/REAL AS DECIMAL(p, s))</c>.
+    /// Scales by <c>10^s</c> and rounds half-to-even to the mantissa. Only the source
+    /// double's ~15–16 significant digits are preserved (a double never held more), the
+    /// same lossy contract as Spark / DuckDB / Feldera. NaN / Infinity throw.
+    /// </summary>
+    public static Decimal128 FromDouble(double value, DecimalType type)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+        {
+            throw new OverflowException($"cannot cast {value} to DECIMAL");
+        }
+
+        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.ToEven);
+        return new Decimal128((Int128)scaled);
+    }
+
+    /// <summary>
     /// Narrow a <see cref="Int256"/> SUM accumulator back to <see cref="Decimal128"/>.
     /// Throws <see cref="OverflowException"/> if the accumulator's upper 128
     /// bits aren't a sign-extension of the lower bits — i.e. the running

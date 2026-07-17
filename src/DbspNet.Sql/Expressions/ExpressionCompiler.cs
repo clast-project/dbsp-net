@@ -692,6 +692,19 @@ public static class ExpressionCompiler
                 Expression.Constant((byte)target.Scale));
             converted = Expression.Convert(fromInt, typeof(object));
         }
+        else if (srcType is SqlDoubleType or SqlRealType)
+        {
+            // Scale by 10^scale and round half-to-even (DecimalRuntime.FromDouble).
+            var unboxed = Expression.Convert(operand, ClrOf(srcType));
+            var asDouble = srcType is SqlRealType
+                ? (Expression)Expression.Convert(unboxed, typeof(double))
+                : unboxed;
+            var fromDouble = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.FromDouble))!,
+                asDouble,
+                Expression.Constant(targetType));
+            converted = Expression.Convert(fromDouble, typeof(object));
+        }
         else if (srcType is SqlVarcharType)
         {
             // Parse via DecimalText, applying the target type's scale and

@@ -155,6 +155,34 @@ public class Decimal128CompilerTests
         Assert.Equal(1, q.WeightOf(D("42.00", 10, 2)).Value);
     }
 
+    [Fact]
+    public void Cast_DoubleToDecimal()
+    {
+        // The ivm-bench analytics models do CAST(ROUND(price, 4) AS DECIMAL(38, 4)) over
+        // DOUBLE prices — scale by 10^s and round half-to-even.
+        var q = Compile(
+            ["CREATE TABLE t (v DOUBLE PRECISION NOT NULL)"],
+            "SELECT CAST(v AS DECIMAL(10, 2)) FROM t");
+        q.Table("t").Insert(12.345);   // rounds half-to-even at scale 2 → 12.34
+        q.Table("t").Insert(3.14159);  // → 3.14
+        q.Step();
+
+        Assert.Equal(1, q.WeightOf(D("12.34", 10, 2)).Value);
+        Assert.Equal(1, q.WeightOf(D("3.14", 10, 2)).Value);
+    }
+
+    [Fact]
+    public void Cast_RealToDecimal()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (v REAL NOT NULL)"],
+            "SELECT CAST(v AS DECIMAL(10, 2)) FROM t");
+        q.Table("t").Insert(2.5f);
+        q.Step();
+
+        Assert.Equal(1, q.WeightOf(D("2.50", 10, 2)).Value);
+    }
+
     // ---- ABS / FLOOR / CEIL / ROUND on Decimal128 ----
 
     [Fact]

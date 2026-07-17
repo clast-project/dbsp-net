@@ -10,6 +10,9 @@ var app = builder.Build();
 // Health — the compose healthcheck / dbt-server depends_on polls this.
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
+// Dry-run compile check (no connectors) — validate the model DAG compiles as one circuit.
+app.MapPost("/compile", (CompileSpec spec) => Results.Ok(DbspNetEngine.Compile(spec)));
+
 // Deploy a program (SQL DAG + Delta input/output bindings). Compiles + wires connectors.
 app.MapPost("/deploy", async (ProgramSpec spec, DbspNetEngine engine, CancellationToken ct) =>
     Results.Ok(await engine.DeployAsync(spec, ct)));

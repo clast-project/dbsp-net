@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 using SqlParser = DbspNet.Sql.Parser.Parser;
 
 namespace DbspNet.Sql.Compiler;
@@ -25,9 +26,10 @@ public static class SqlProgram
         IReadOnlyList<string> statements,
         ISet<string> outputViews,
         ISqlSnapshotCodecs? snapshotCodecs = null,
-        CompileOptions? options = null)
+        CompileOptions? options = null,
+        bool numericStringCoercion = false)
     {
-        var resolved = Resolve(statements, outputViews);
+        var resolved = Resolve(statements, outputViews, numericStringCoercion);
         return PlanToCircuit.CompileProgram(resolved.Tables, resolved.Views, snapshotCodecs, options);
     }
 
@@ -35,12 +37,30 @@ public static class SqlProgram
     /// Resolve (without compiling) — parse each statement against a shared catalog,
     /// registering each view's schema so later views resolve references to it. Exposed so
     /// callers (and tests) can inspect the resolved plans before / instead of compiling.
+    /// <paramref name="numericStringCoercion"/> enables implicit numeric↔string comparison
+    /// coercion for the whole program (the ivm-bench / Spark / DuckDB / Feldera behaviour;
+    /// off = PostgreSQL-faithful).
     /// </summary>
-    public static ResolvedProgram Resolve(IReadOnlyList<string> statements, ISet<string> outputViews)
+    public static ResolvedProgram Resolve(
+        IReadOnlyList<string> statements, ISet<string> outputViews, bool numericStringCoercion = false)
     {
         ArgumentNullException.ThrowIfNull(statements);
         ArgumentNullException.ThrowIfNull(outputViews);
 
+        var previousCoercion = NumericStringCoercionMode.Enabled;
+        NumericStringCoercionMode.Enabled = numericStringCoercion;
+        try
+        {
+            return ResolveCore(statements, outputViews);
+        }
+        finally
+        {
+            NumericStringCoercionMode.Enabled = previousCoercion;
+        }
+    }
+
+    private static ResolvedProgram ResolveCore(IReadOnlyList<string> statements, ISet<string> outputViews)
+    {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
         var tables = new List<CreateTablePlan>();

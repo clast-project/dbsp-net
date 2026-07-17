@@ -41,7 +41,8 @@ public sealed class DbspNetEngine
         var sw = Stopwatch.StartNew();
 
         var outputViews = spec.Outputs.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
-        var program = SqlProgram.Compile(spec.Program, outputViews);
+        // ivm-bench / Spark / DuckDB / Feldera all coerce numeric<->string comparisons.
+        var program = SqlProgram.Compile(spec.Program, outputViews, numericStringCoercion: true);
 
         var inputs = spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, i.Uri))
@@ -102,6 +103,24 @@ public sealed class DbspNetEngine
         {
             _batchTimer.Stop();
             return new WaitResult(_batchTimer.Elapsed.TotalSeconds, ticks, OutputStats());
+        }
+    }
+
+    /// <summary>Dry-run: compile the whole program into one circuit (no connectors, no
+    /// Delta) and report success or the first error. Lets the harness validate that the
+    /// model DAG compiles before deploying — the analogue of Feldera's compile step.</summary>
+    public static CompileResult Compile(CompileSpec spec)
+    {
+        ArgumentNullException.ThrowIfNull(spec);
+        try
+        {
+            var program = SqlProgram.Compile(
+                spec.Program, spec.Outputs.ToHashSet(StringComparer.Ordinal), numericStringCoercion: true);
+            return new CompileResult(true, program.Outputs.Count, null);
+        }
+        catch (Exception ex)
+        {
+            return new CompileResult(false, 0, ex.Message);
         }
     }
 
