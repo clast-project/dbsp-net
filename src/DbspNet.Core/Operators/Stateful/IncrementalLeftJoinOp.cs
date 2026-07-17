@@ -237,6 +237,19 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             return;
         }
 
+        // Guard against a per-key cross-product blowup: a single join key matching millions of
+        // rows on both sides means the key is far too coarse (a low-cardinality or placeholder
+        // value), and materialising left×right would exhaust memory. Fail fast with the key and
+        // both side counts instead of an opaque OutOfMemoryException deep in the allocator.
+        var product = (long)left.Count * right.Count;
+        if (product > CrossProductGuardRows)
+        {
+            throw new InvalidOperationException(
+                $"IncrementalLeftJoin: oversized per-key cross product left={left.Count} × " +
+                $"right={right.Count} = {product} rows for join key [{key}]. The join key is too " +
+                "coarse (a low-cardinality/placeholder value); materialising this would OOM.");
+        }
+
         foreach (var (lv, lw) in left)
         {
             foreach (var (rv, rw) in right)
@@ -245,6 +258,11 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             }
         }
     }
+
+    // A single key producing more than this many joined rows is pathological for an incremental
+    // join (the whole point is bounded per-key work). Big enough not to trip legitimate fan-out,
+    // small enough to fail before a 24 GB+ working set OOMs.
+    private const long CrossProductGuardRows = 5_000_000;
 
     private void NullPadInto(
         ZSetBuilder<TOut, TWeight> output,
