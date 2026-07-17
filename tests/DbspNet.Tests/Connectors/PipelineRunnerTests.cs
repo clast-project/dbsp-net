@@ -127,10 +127,18 @@ public class PipelineRunnerTests
                 runner.Query.CurrentView.Equals(batch),
                 $"seed={seed} sql={sql}\n  view={runner.Query.CurrentView}\n  batch={batch}");
 
-            // The sink received one write per tick; the last write matches the view size.
+            // The sink received one write per tick; the last write's row count equals the
+            // view's total multiplicity (ToArrowView expands each row by its weight, so a
+            // duplicate-bearing filter view writes more physical rows than distinct ones).
             Assert.Equal(versions.Count, output.Writes.Count);
-            Assert.Equal(runner.Query.CurrentView.Count, output.Writes[^1].RowCount);
-            Assert.Equal(TwoInts().Count > 0, output.BoundSchema is not null);
+            long totalMultiplicity = 0;
+            foreach (var (_, w) in runner.Query.CurrentView)
+            {
+                totalMultiplicity += w.Value;
+            }
+
+            Assert.Equal(totalMultiplicity, output.Writes[^1].RowCount);
+            Assert.NotNull(output.BoundSchema);
         }
     }
 

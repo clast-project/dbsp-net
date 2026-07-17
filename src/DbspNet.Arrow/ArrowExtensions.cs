@@ -30,63 +30,109 @@ public static class ArrowExtensions
     public static ArrowDelta ToArrowDelta(this CompiledQuery query)
     {
         ArgumentNullException.ThrowIfNull(query);
-        return BuildArrow(query.OutputSchema, query.Current);
+        // Deltas carry signed weights that the consumer interprets — never expand.
+        return BuildArrow(query.OutputSchema, query.Current, expandByWeight: false);
     }
 
     /// <summary>
-    /// Materialise the query's full current <b>view</b> (every delta integrated so
-    /// far) as an Arrow batch plus a parallel weights array — the mirror of
-    /// <see cref="ToArrowDelta"/> for a truncate-mode sink. Requires the query to have
-    /// been compiled with <see cref="DbspNet.Sql.Compiler.CompileOptions.StoredOutput"/>
-    /// (throws otherwise, via <see cref="CompiledQuery.CurrentView"/>). <c>weights[i]</c>
-    /// is row <c>i</c>'s multiplicity in the view (≥ 1 for a well-formed query; a set
-    /// after DISTINCT/aggregation, a bag under UNION ALL).
+    /// Materialise the query's full current <b>view</b> (every delta integrated so far)
+    /// as an Arrow batch for a truncate-mode sink — the mirror of <see cref="ToArrowDelta"/>.
+    /// A row whose view multiplicity is <c>w</c> is emitted <c>w</c> times, so a bag view
+    /// (e.g. under <c>UNION ALL</c>) writes the correct number of rows; a set view (after
+    /// DISTINCT/aggregation) is unchanged. The returned <c>Weights</c> are therefore all
+    /// <c>1</c>. Requires the query to have been compiled with
+    /// <see cref="DbspNet.Sql.Compiler.CompileOptions.StoredOutput"/> (throws otherwise,
+    /// via <see cref="CompiledQuery.CurrentView"/>).
     /// </summary>
     public static ArrowDelta ToArrowView(this CompiledQuery query)
     {
         ArgumentNullException.ThrowIfNull(query);
-        return BuildArrow(query.OutputSchema, query.CurrentView);
+        return BuildArrow(query.OutputSchema, query.CurrentView, expandByWeight: true);
     }
 
     private static ArrowDelta BuildArrow(
-        SqlSchema schema, DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> zset)
+        SqlSchema schema,
+        DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> zset,
+        bool expandByWeight)
     {
-        var rowCount = zset.Count;
         var columnCount = schema.Count;
 
-        // Phase 1: walk the Z-set once, splitting per-cell values into
-        // column-major buffers + collecting weights. This is the only pass
-        // that touches the row-major Z-set.
-        var perColumn = new object?[columnCount][];
-        for (var c = 0; c < columnCount; c++)
+        if (!expandByWeight)
         {
-            perColumn[c] = new object?[rowCount];
-        }
-
-        var weights = new long[rowCount];
-        var rowIndex = 0;
-        foreach (var (row, weight) in zset)
-        {
+            // Delta path: one Arrow row per distinct Z-set row, carrying its signed weight.
+            var rowCount = zset.Count;
+            var perColumn = new object?[columnCount][];
             for (var c = 0; c < columnCount; c++)
             {
-                perColumn[c][rowIndex] = row[c];
+                perColumn[c] = new object?[rowCount];
             }
 
-            weights[rowIndex] = weight.Value;
-            rowIndex++;
+            var weights = new long[rowCount];
+            var rowIndex = 0;
+            foreach (var (row, weight) in zset)
+            {
+                for (var c = 0; c < columnCount; c++)
+                {
+                    perColumn[c][rowIndex] = row[c];
+                }
+
+                weights[rowIndex] = weight.Value;
+                rowIndex++;
+            }
+
+            return Assemble(schema, perColumn, weights, rowCount);
         }
 
-        // Phase 2: build each Arrow array with a tight typed loop. Type
-        // dispatch happens once per column, not once per cell.
-        var arrays = new IArrowArray[columnCount];
+        // View path: emit each row w times (its view multiplicity). A materialized view
+        // never carries a non-positive accumulated weight, so those are dropped.
+        var cols = new List<object?>[columnCount];
         for (var c = 0; c < columnCount; c++)
+        {
+            cols[c] = new List<object?>(zset.Count);
+        }
+
+        long total = 0;
+        foreach (var (row, weight) in zset)
+        {
+            var w = weight.Value;
+            if (w <= 0)
+            {
+                continue;
+            }
+
+            for (long k = 0; k < w; k++)
+            {
+                for (var c = 0; c < columnCount; c++)
+                {
+                    cols[c].Add(row[c]);
+                }
+            }
+
+            total += w;
+        }
+
+        var expandedCount = checked((int)total);
+        var expandedColumns = new object?[columnCount][];
+        for (var c = 0; c < columnCount; c++)
+        {
+            expandedColumns[c] = cols[c].ToArray();
+        }
+
+        var ones = new long[expandedCount];
+        System.Array.Fill(ones, 1L);
+        return Assemble(schema, expandedColumns, ones, expandedCount);
+    }
+
+    private static ArrowDelta Assemble(SqlSchema schema, object?[][] perColumn, long[] weights, int rowCount)
+    {
+        var arrays = new IArrowArray[schema.Count];
+        for (var c = 0; c < schema.Count; c++)
         {
             arrays[c] = ArrowColumns.Build(schema[c].Type, perColumn[c]);
         }
 
         var arrowSchema = ArrowSchemaBridge.ToArrow(schema);
-        var batch = new RecordBatch(arrowSchema, arrays, rowCount);
-        return new ArrowDelta(batch, weights);
+        return new ArrowDelta(new RecordBatch(arrowSchema, arrays, rowCount), weights);
     }
 
     /// <summary>

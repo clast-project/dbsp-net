@@ -131,6 +131,90 @@ public sealed class DeltaConnectorTests : IDisposable
     }
 
     [Fact]
+    public async Task Delta_TruncateSink_PreservesBagMultiplicity()
+    {
+        var srcDir = Path.Combine(_root, "bagsrc");
+        var sinkDir = Path.Combine(_root, "bagsink");
+        Directory.CreateDirectory(srcDir);
+        Directory.CreateDirectory(sinkDir);
+
+        // (id, val); a UNION ALL view where a row satisfying both branches gets weight 2.
+        var srcFs = new LocalTableFileSystem(srcDir);
+        var src = await DeltaTable.CreateAsync(srcFs, ArrowSchemaBridge.ToArrow(Schema()), cancellationToken: CancellationToken.None);
+        await WriteVersion(
+            src,
+            new object?[][]
+            {
+                new object?[] { 1, 5 },   // val 5: in (val>0) AND (val<10) → weight 2
+                new object?[] { 2, 15 },  // val 15: only (val>0)
+                new object?[] { 3, -5 },  // val -5: only (val<10)
+            },
+            DeltaWriteMode.Append);
+        src.Dispose();
+
+        const string bagView =
+            "SELECT id FROM src WHERE val > 0 UNION ALL SELECT id FROM src WHERE val < 10";
+
+        var catalog = new Catalog();
+        var input = new DeltaInputConnector("src", srcDir);
+        var output = new DeltaOutputConnector("v", sinkDir, OutputMode.Truncate);
+        var runner = await PipelineRunner.CreateAsync(
+            catalog,
+            new (IInputConnector, SqlSchema?)[] { (input, null) },
+            cat =>
+            {
+                var resolver = new Resolver(cat);
+                var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(bagView))).Query;
+                return PlanToCircuit.Compile(plan, snapshotCodecs: null, new CompileOptions { StoredOutput = true });
+            },
+            new IOutputConnector[] { output });
+
+        await runner.DrainAsync();
+
+        // The view is a bag: id 1 has weight 2, ids 2 and 3 weight 1.
+        Assert.Equal(2, runner.Query.CurrentView.WeightOf(new StructuralRow(new object?[] { 1 })).Value);
+        Assert.Equal(1, runner.Query.CurrentView.WeightOf(new StructuralRow(new object?[] { 2 })).Value);
+        Assert.Equal(1, runner.Query.CurrentView.WeightOf(new StructuralRow(new object?[] { 3 })).Value);
+
+        // The sink has 4 physical rows (2 + 1 + 1) — multiplicity was written out, not
+        // collapsed — and reading it back re-collapses to the same Z-set as the view.
+        var sink = await DeltaTable.OpenAsync(new LocalTableFileSystem(sinkDir), cancellationToken: CancellationToken.None);
+        long physicalRows = 0;
+        await foreach (var batch in sink.ReadAllAsync(null, CancellationToken.None))
+        {
+            physicalRows += batch.Length;
+        }
+
+        sink.Dispose();
+        Assert.Equal(4, physicalRows);
+
+        var sinkZ = await ReadBagSink(sinkDir);
+        Assert.True(sinkZ.Equals(runner.Query.CurrentView), $"sink={sinkZ}");
+
+        await input.DisposeAsync();
+        await output.DisposeAsync();
+    }
+
+    // Read a single-INT-column sink back into a Z-set (duplicate physical rows collapse
+    // to weight, so a faithfully-written bag reproduces the view's multiplicity).
+    private static async Task<ZSet<StructuralRow, Z64>> ReadBagSink(string dir)
+    {
+        var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(dir), cancellationToken: CancellationToken.None);
+        var b = new ZSetBuilder<StructuralRow, Z64>();
+        await foreach (var batch in table.ReadAllAsync(null, CancellationToken.None))
+        {
+            var id = (Int32Array)batch.Column(0);
+            for (var i = 0; i < batch.Length; i++)
+            {
+                b.Add(new StructuralRow(new object?[] { id.GetValue(i) }), Z64.One);
+            }
+        }
+
+        table.Dispose();
+        return b.Build();
+    }
+
+    [Fact]
     public async Task Delta_Incremental_ResumesFromCursorAcrossDrains()
     {
         var srcDir = Path.Combine(_root, "inc");

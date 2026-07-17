@@ -20,9 +20,10 @@ namespace DbspNet.Connectors.EngineeredWood;
 /// each tick's delta rows tagged with <c>__op</c> (i/d) and <c>__ts</c> (the tick).
 /// </summary>
 /// <remarks>
-/// Truncate writes each distinct view row once (set semantics). Bag multiplicity
-/// (<c>weights &gt; 1</c>, e.g. under <c>UNION ALL</c>) and changelog exactly-once via
-/// Delta's <c>txn</c> app-id are follow-ons; ivm-bench views are sets.
+/// Truncate honours multiplicity: a view row with weight <c>w</c> is written <c>w</c>
+/// times (<see cref="ArrowExtensions.ToArrowView"/> expands it), so a bag view (e.g.
+/// under <c>UNION ALL</c>) round-trips correctly. Changelog exactly-once via Delta's
+/// <c>txn</c> app-id is a follow-on.
 /// </remarks>
 public sealed class DeltaOutputConnector : IOutputConnector
 {
