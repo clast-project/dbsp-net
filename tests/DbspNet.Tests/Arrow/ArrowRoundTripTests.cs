@@ -274,6 +274,46 @@ public class ArrowRoundTripTests
     }
 
     [Fact]
+    public void InputBatch_DecodesDecimal64AsDecimal()
+    {
+        // A DECIMAL column whose Parquet physical is INT64 arrives as Decimal64Array but binds
+        // to SQL DECIMAL; the decode must widen the 8-byte mantissa, not cast to Decimal128Array.
+        var q = Compile(["CREATE TABLE t (price DECIMAL(10, 2))"], "SELECT price FROM t");
+
+        var mantissa = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(mantissa, 6789L); // 67.89 at scale 2
+        var values = new ArrowBuffer.Builder<byte>().Append(mantissa).Append(new byte[8]).Build();
+        var validity = new ArrowBuffer.BitmapBuilder().Append(true).Append(false).Build();
+        var arr = new Decimal64Array(
+            new ArrayData(new Decimal64Type(10, 2), length: 2, nullCount: 1, offset: 0, new[] { validity, values }));
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("price", new Decimal64Type(10, 2), nullable: true)).Build();
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, length: 2);
+
+        q.Table("t").PushArrow(batch);
+        q.Step();
+
+        var delta = q.ToArrowDelta();
+        var col = (Decimal128Array)delta.Rows.Column(0);
+        var nonNull = new HashSet<long>();
+        var nulls = 0;
+        for (var i = 0; i < delta.Rows.Length; i++)
+        {
+            if (col.IsNull(i))
+            {
+                nulls++;
+                continue;
+            }
+
+            nonNull.Add(System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(col.GetBytes(i)));
+        }
+
+        Assert.Equal(1, nulls);
+        Assert.Contains(6789L, nonNull);
+    }
+
+    [Fact]
     public void RoundTrip_DecimalPreservesScaleAndValue()
     {
         var q = Compile(

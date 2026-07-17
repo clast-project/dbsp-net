@@ -49,7 +49,18 @@ internal static class ArrowColumns
         SqlTimestampType => array is Apache.Arrow.Arrays.FixedSizeBinaryArray int96
             ? ExtractTimestampInt96(int96, rowCount)
             : ExtractTimestamp((TimestampArray)array, rowCount),
-        SqlDecimalType => ExtractDecimal((Decimal128Array)array, rowCount),
+        // A DECIMAL binds against the Delta log's canonical Decimal128, but the Parquet
+        // physical can pack small precisions into INT32/INT64, which engineered-wood surfaces
+        // as Decimal32/Decimal64Array. The mantissa is the same scaled integer at every width;
+        // widen it to Int128.
+        SqlDecimalType => array switch
+        {
+            Decimal128Array d128 => ExtractDecimal(d128, rowCount),
+            Decimal64Array d64 => ExtractDecimal64(d64, rowCount),
+            Decimal32Array d32 => ExtractDecimal32(d32, rowCount),
+            _ => throw new NotSupportedException(
+                $"DECIMAL source column is {array.GetType().Name}; expected Decimal32/64/128Array"),
+        },
         _ => throw new NotSupportedException($"no Arrow extractor for {type.Display}"),
     };
 
@@ -245,6 +256,34 @@ internal static class ArrowColumns
             var julianDay = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(8));
             var micros = ((julianDay - julianUnixEpochDay) * microsPerDay) + (nanosOfDay / 1000L);
             result[i] = new Timestamp(micros);
+        }
+
+        return result;
+    }
+
+    private static object?[] ExtractDecimal64(Decimal64Array a, int n)
+    {
+        var result = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            // 8-byte little-endian signed mantissa; sign-extend to Int128 (same scaled value).
+            result[i] = a.IsNull(i)
+                ? null
+                : new Decimal128((Int128)BinaryPrimitives.ReadInt64LittleEndian(a.GetBytes(i)));
+        }
+
+        return result;
+    }
+
+    private static object?[] ExtractDecimal32(Decimal32Array a, int n)
+    {
+        var result = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            // 4-byte little-endian signed mantissa; sign-extend to Int128.
+            result[i] = a.IsNull(i)
+                ? null
+                : new Decimal128((Int128)BinaryPrimitives.ReadInt32LittleEndian(a.GetBytes(i)));
         }
 
         return result;
