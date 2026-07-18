@@ -899,6 +899,20 @@ public static class TypedExpressionCompiler
 
         if (!IsNumericNonDecimal(dstClr)) throw Unsupported();
 
+        if (dstClr == typeof(float) || dstClr == typeof(double))
+        {
+            // Float targets keep the fractional part (mantissa / 10^scale);
+            // rescaling to scale 0 would drop it. See DecimalRuntime.ToDouble.
+            var toDouble = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.ToDouble))!,
+                operand,
+                Expression.Constant(src.Scale));
+            return dstClr == typeof(float)
+                ? Expression.Convert(toDouble, typeof(float))
+                : toDouble;
+        }
+
+        // Integer targets drop the fraction (rescale to scale 0), then cast.
         var mantissa = Expression.Field(operand, nameof(Decimal128.Mantissa));
         var rescaled = Expression.Call(
             typeof(ScaleHelper).GetMethod(nameof(ScaleHelper.Rescale128))!,

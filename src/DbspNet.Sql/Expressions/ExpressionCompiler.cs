@@ -758,10 +758,23 @@ public static class ExpressionCompiler
                 format);
             converted = Expression.Convert(toUtf8, typeof(object));
         }
-        else if (dstClr == typeof(int) || dstClr == typeof(long)
-            || dstClr == typeof(float) || dstClr == typeof(double))
+        else if (dstClr == typeof(float) || dstClr == typeof(double))
         {
-            // Truncate to integer mantissa (rescale to scale 0), then cast.
+            // Float targets keep the fractional part: divide the mantissa by
+            // 10^scale (DecimalRuntime.ToDouble). Rescaling to scale 0 here
+            // would drop the fraction and make CAST(60.78 AS DOUBLE) = 61.
+            var toDouble = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.ToDouble))!,
+                unboxed,
+                Expression.Constant(src.Scale));
+            var cast = dstClr == typeof(float)
+                ? (Expression)Expression.Convert(toDouble, typeof(float))
+                : toDouble;
+            converted = Expression.Convert(cast, typeof(object));
+        }
+        else if (dstClr == typeof(int) || dstClr == typeof(long))
+        {
+            // Integer targets drop the fraction (rescale to scale 0), then cast.
             var mantissa = Expression.Field(unboxed, nameof(Clast.DatabaseDecimal.Values.Decimal128.Mantissa));
             var rescaled = Expression.Call(
                 typeof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper).GetMethod(

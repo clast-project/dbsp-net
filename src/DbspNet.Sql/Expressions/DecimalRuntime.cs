@@ -77,6 +77,18 @@ internal static class DecimalRuntime
     }
 
     /// <summary>
+    /// Convert a <see cref="Decimal128"/> to <see cref="double"/> at
+    /// <paramref name="scale"/> — <c>CAST(DECIMAL(p, s) AS DOUBLE/REAL)</c>.
+    /// Divides the mantissa by <c>10^s</c> so the fractional digits are
+    /// preserved: <c>CAST(60.7834 AS DOUBLE)</c> yields <c>60.7834</c>, not
+    /// the integer part. Only the double's ~15–16 significant digits survive
+    /// (a 38-digit decimal never fit), the same lossy contract as
+    /// Spark / DuckDB / Feldera and the inverse of <see cref="FromDouble"/>.
+    /// </summary>
+    public static double ToDouble(Decimal128 value, int scale) =>
+        (double)value.Mantissa / Math.Pow(10, scale);
+
+    /// <summary>
     /// Narrow a <see cref="Int256"/> SUM accumulator back to <see cref="Decimal128"/>.
     /// Throws <see cref="OverflowException"/> if the accumulator's upper 128
     /// bits aren't a sign-extension of the lower bits — i.e. the running
