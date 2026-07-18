@@ -7,6 +7,7 @@ using DbspNet.Connectors.Abstractions;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
+using EngineeredWood.Parquet;
 using ArrowSchema = Apache.Arrow.Schema;
 using SqlSchema = DbspNet.Sql.Plan.Schema;
 
@@ -71,7 +72,18 @@ public sealed class DeltaOutputConnector : IOutputConnector
             tableArrow = dataArrow;
         }
 
-        _table = await DeltaTable.OpenOrCreateAsync(_fs, tableArrow, cancellationToken: cancellationToken)
+        // engineered-wood's ParquetWriteOptions.OmitPathInSchema defaults to true, which
+        // drops the ColumnMetaData.path_in_schema field (required by the Parquet spec). The
+        // thrift-generated readers in Apache Arrow / DuckDB / pyarrow enforce it and reject
+        // such files with "TProtocolException: Invalid data". Force it on so DbspNet's output
+        // is readable by standard tooling (the correctness-comparison harness, downstream
+        // consumers).
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with { OmitPathInSchema = false },
+        };
+
+        _table = await DeltaTable.OpenOrCreateAsync(_fs, tableArrow, options, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
     }
 
