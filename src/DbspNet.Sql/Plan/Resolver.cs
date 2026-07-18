@@ -828,9 +828,9 @@ public sealed class Resolver
             {
                 NullOrdering.NullsFirst => true,
                 NullOrdering.NullsLast => false,
-                // SQL default (PostgreSQL): NULL is the "largest" value — so it
-                // sorts last under ASC and first under DESC.
-                _ => descending,
+                // No explicit NULLS clause: default per the active null collation
+                // (High/PostgreSQL by default; Low for Calcite/Feldera).
+                _ => NullCollationMode.DefaultNullsFirst(descending),
             };
 
             if (item.Expression is LiteralExpression { Kind: LiteralKind.Integer, Value: long ordinal })
@@ -1075,7 +1075,7 @@ public sealed class Resolver
             {
                 NullOrdering.NullsFirst => true,
                 NullOrdering.NullsLast => false,
-                _ => descending,
+                _ => NullCollationMode.DefaultNullsFirst(descending),
             };
             sortKeys.Add(new SortKey(new ResolvedColumn(idx, baseSchema[idx].Type), descending, nullsFirst));
         }
@@ -1454,7 +1454,7 @@ public sealed class Resolver
             {
                 NullOrdering.NullsFirst => true,
                 NullOrdering.NullsLast => false,
-                _ => descending,
+                _ => NullCollationMode.DefaultNullsFirst(descending),
             };
             orderKeys.Add(new SortKey(resolved, descending, nullsFirst));
         }

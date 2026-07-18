@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using DbspNet.Connectors.Abstractions;
 using DbspNet.Connectors.EngineeredWood;
 using DbspNet.Sql.Compiler;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Server;
 
@@ -41,8 +42,10 @@ public sealed class DbspNetEngine
         var sw = Stopwatch.StartNew();
 
         var outputViews = spec.Outputs.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
-        // ivm-bench / Spark / DuckDB / Feldera all coerce numeric<->string comparisons.
-        var program = SqlProgram.Compile(spec.Program, outputViews, numericStringCoercion: true);
+        // ivm-bench / Spark / DuckDB / Feldera all coerce numeric<->string comparisons,
+        // and Feldera (Calcite) sorts NULLs low by default (last under DESC).
+        var program = SqlProgram.Compile(
+            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
 
         var inputs = spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, i.Uri))
@@ -115,7 +118,8 @@ public sealed class DbspNetEngine
         try
         {
             var program = SqlProgram.Compile(
-                spec.Program, spec.Outputs.ToHashSet(StringComparer.Ordinal), numericStringCoercion: true);
+                spec.Program, spec.Outputs.ToHashSet(StringComparer.Ordinal),
+                numericStringCoercion: true, nullCollation: NullCollation.Low);
             return new CompileResult(true, program.Outputs.Count, null);
         }
         catch (Exception ex)

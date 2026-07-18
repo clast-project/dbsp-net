@@ -27,9 +27,10 @@ public static class SqlProgram
         ISet<string> outputViews,
         ISqlSnapshotCodecs? snapshotCodecs = null,
         CompileOptions? options = null,
-        bool numericStringCoercion = false)
+        bool numericStringCoercion = false,
+        NullCollation nullCollation = NullCollation.High)
     {
-        var resolved = Resolve(statements, outputViews, numericStringCoercion);
+        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
         return PlanToCircuit.CompileProgram(resolved.Tables, resolved.Views, snapshotCodecs, options);
     }
 
@@ -39,16 +40,23 @@ public static class SqlProgram
     /// callers (and tests) can inspect the resolved plans before / instead of compiling.
     /// <paramref name="numericStringCoercion"/> enables implicit numeric↔string comparison
     /// coercion for the whole program (the ivm-bench / Spark / DuckDB / Feldera behaviour;
-    /// off = PostgreSQL-faithful).
+    /// off = PostgreSQL-faithful). <paramref name="nullCollation"/> selects the default NULL
+    /// placement for a bare <c>ORDER BY</c> key (<see cref="NullCollation.High"/> =
+    /// PostgreSQL/DuckDB default; <see cref="NullCollation.Low"/> = Calcite/Feldera).
     /// </summary>
     public static ResolvedProgram Resolve(
-        IReadOnlyList<string> statements, ISet<string> outputViews, bool numericStringCoercion = false)
+        IReadOnlyList<string> statements,
+        ISet<string> outputViews,
+        bool numericStringCoercion = false,
+        NullCollation nullCollation = NullCollation.High)
     {
         ArgumentNullException.ThrowIfNull(statements);
         ArgumentNullException.ThrowIfNull(outputViews);
 
         var previousCoercion = NumericStringCoercionMode.Enabled;
+        var previousCollation = NullCollationMode.Collation;
         NumericStringCoercionMode.Enabled = numericStringCoercion;
+        NullCollationMode.Collation = nullCollation;
         try
         {
             return ResolveCore(statements, outputViews);
@@ -56,6 +64,7 @@ public static class SqlProgram
         finally
         {
             NumericStringCoercionMode.Enabled = previousCoercion;
+            NullCollationMode.Collation = previousCollation;
         }
     }
 
