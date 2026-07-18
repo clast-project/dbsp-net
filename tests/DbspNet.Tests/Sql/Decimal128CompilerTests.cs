@@ -280,27 +280,42 @@ public class Decimal128CompilerTests
         q.Table("t").Insert("1.50");
         q.Step();
 
-        // Banker's rounding: 1.50 rounds to 2 (even).
+        // Round half away from zero: 1.50 → 2.
         Assert.Equal(1, q.WeightOf(D("2.00", 10, 2)).Value);
     }
 
     [Fact]
-    public void Round_BankersRoundingHalfToEven()
+    public void Round_HalfAwayFromZero()
     {
         var q = Compile(
             ["CREATE TABLE t (v DECIMAL(10, 2) NOT NULL)"],
             "SELECT ROUND(v) FROM t");
-        // Round half-to-even: 0.50 → 0 (even), 2.50 → 2 (even),
-        // 3.50 → 4 (even). Standard half-up would give 0/3/4 — the test
-        // verifies banker's rounding rejects the 0.50/2.50 half-up cases.
+        // SQL ROUND rounds half away from zero: 0.50 → 1, 2.50 → 3, 3.50 → 4
+        // (banker's rounding would give 0/2/4 — this pins the away-from-zero
+        // convention shared by Calcite/PostgreSQL-numeric/SQL Server/DuckDB).
         q.Table("t").Insert("0.50");
         q.Table("t").Insert("2.50");
         q.Table("t").Insert("3.50");
         q.Step();
 
-        Assert.Equal(1, q.WeightOf(D("0.00", 10, 2)).Value);
-        Assert.Equal(1, q.WeightOf(D("2.00", 10, 2)).Value);
+        Assert.Equal(1, q.WeightOf(D("1.00", 10, 2)).Value);
+        Assert.Equal(1, q.WeightOf(D("3.00", 10, 2)).Value);
         Assert.Equal(1, q.WeightOf(D("4.00", 10, 2)).Value);
+    }
+
+    [Fact]
+    public void Round_HalfAwayFromZero_Negative()
+    {
+        var q = Compile(
+            ["CREATE TABLE t (v DECIMAL(10, 2) NOT NULL)"],
+            "SELECT ROUND(v) FROM t");
+        // Away from zero is symmetric about 0: -0.50 → -1, -2.50 → -3.
+        q.Table("t").Insert("-0.50");
+        q.Table("t").Insert("-2.50");
+        q.Step();
+
+        Assert.Equal(1, q.WeightOf(D("-1.00", 10, 2)).Value);
+        Assert.Equal(1, q.WeightOf(D("-3.00", 10, 2)).Value);
     }
 
     [Fact]
@@ -312,9 +327,9 @@ public class Decimal128CompilerTests
         q.Table("t").Insert("1.236");
         q.Step();
 
-        // 1.236 rounded to 1 digit = 1.2 (round half-to-even on 0.36 → 0.4
-        // would be standard half-up; banker's says round 1.236 to 1.2
-        // since the dropped 36 > 50 is false). Result at scale 3 is 1.200.
+        // 1.236 rounded to 1 digit = 1.2: the dropped "36" is below the .05
+        // midpoint, so it truncates down under any rounding mode. Result at
+        // scale 3 is 1.200.
         Assert.Equal(1, q.WeightOf(D("1.200", 10, 3)).Value);
     }
 

@@ -799,10 +799,9 @@ internal static class BuiltinScalarFunctions
 
         if (argType is SqlDecimalType decType)
         {
-            // Decimal path: ROUND uses banker's rounding (matches the
-            // ScaleHelper.DivideRoundHalfEven semantics) and returns the
-            // same DecimalType — fractional digits beyond the requested
-            // precision become trailing zeros.
+            // Decimal path: ROUND rounds half away from zero (the SQL
+            // convention) and returns the same DecimalType — fractional
+            // digits beyond the requested precision become trailing zeros.
             var roundMethod = typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.Round))!;
             var scaleConst = Expression.Constant((byte)decType.Scale);
 
@@ -1654,9 +1653,13 @@ internal static class SqlBuiltinRuntime
     public static double Ceil(double x) => Math.Ceiling(x);
     public static float Ceil(float x) => (float)Math.Ceiling((double)x);
 
-    public static decimal Round(decimal x, int digits) => Math.Round(x, digits);
-    public static double Round(double x, int digits) => Math.Round(x, digits);
-    public static float Round(float x, int digits) => (float)Math.Round((double)x, digits);
+    // SQL ROUND rounds half away from zero (ROUND(2.5) = 3, ROUND(-2.5) = -3) —
+    // the de-facto convention shared by Calcite, PostgreSQL (on numeric), SQL
+    // Server, Oracle, DuckDB and Spark. .NET's Math.Round defaults to banker's
+    // (ToEven), so the midpoint mode must be set explicitly.
+    public static decimal Round(decimal x, int digits) => Math.Round(x, digits, MidpointRounding.AwayFromZero);
+    public static double Round(double x, int digits) => Math.Round(x, digits, MidpointRounding.AwayFromZero);
+    public static float Round(float x, int digits) => (float)Math.Round((double)x, digits, MidpointRounding.AwayFromZero);
 
     // ---- GREATEST / LEAST (PG semantics: NULLs skipped, all-NULL → NULL) ----
 

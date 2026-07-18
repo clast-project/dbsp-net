@@ -166,9 +166,12 @@ internal static class DecimalRuntime
     }
 
     /// <summary>
-    /// <c>ROUND</c> to <paramref name="digits"/> decimal places, with banker's
-    /// rounding (round half to even). Result type is the same as input —
-    /// dropped digits are filled back with trailing zeros so
+    /// <c>ROUND</c> to <paramref name="digits"/> decimal places, rounding half
+    /// away from zero (<c>ROUND(2.5) = 3</c>, <c>ROUND(-2.5) = -3</c>) — the SQL
+    /// convention (Calcite/PostgreSQL-numeric/SQL Server/Oracle/DuckDB/Spark).
+    /// The Clast.DatabaseDecimal <c>Rescale128</c> rounds half to even, so the
+    /// rounding step is done here directly on the Int128 mantissa. Result type is
+    /// the same as input — dropped digits are filled back with trailing zeros so
     /// <c>ROUND(1.236, 2)</c> at scale 3 returns mantissa 1240 (= 1.240).
     /// Negative <paramref name="digits"/> rounds before the decimal point
     /// (e.g. <c>ROUND(123.4, -1)</c> → <c>120.0</c> at scale 1).
@@ -180,12 +183,20 @@ internal static class DecimalRuntime
             return v;
         }
 
-        // Drop precision: scale → digits with banker's rounding (built into
-        // ScaleHelper.Rescale128's internal DivideRoundHalfEven).
-        var truncated = ScaleHelper.Rescale128(v.Mantissa, scale, digits);
+        // Drop precision from `scale` to `digits`, rounding half away from zero.
+        // pow = 10^(scale - digits); q = trunc(m / pow); if the dropped remainder
+        // is >= half a unit, step the quotient one further from zero.
+        var pow = ScaleHelper.Rescale128(Int128.One, 0, scale - digits);   // exact 10^drop
+        var m = v.Mantissa;
+        var q = m / pow;                       // truncates toward zero
+        var r = m - (q * pow);                 // remainder, carries the sign of m
+        var rAbs = r < Int128.Zero ? -r : r;
+        if (rAbs * 2 >= pow)
+        {
+            q += m < Int128.Zero ? -Int128.One : Int128.One;
+        }
 
         // Pad zeros back to the column's scale so the result type matches.
-        var padded = ScaleHelper.Rescale128(truncated, digits, scale);
-        return new Decimal128(padded);
+        return new Decimal128(q * pow);
     }
 }
