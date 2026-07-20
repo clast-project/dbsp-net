@@ -41,6 +41,24 @@ public readonly record struct OperatorStat(
 }
 
 /// <summary>
+/// Per-operator cumulative timing from <see cref="RootCircuit.CollectOperatorProfile"/>:
+/// one operator's total wall-clock across every profiled <see cref="RootCircuit.Step"/>,
+/// paired with a type label and (for stateful operators) its state / output sizes.
+/// <paramref name="RetainedRows"/> and <paramref name="LastOutputRows"/> are <c>-1</c>
+/// for stateless (linear) operators that expose no metrics.
+/// </summary>
+public readonly record struct OperatorProfile(
+    int Index,
+    string Name,
+    double CumulativeMs,
+    long RetainedRows,
+    long LastOutputRows)
+{
+    public override string ToString() => System.FormattableString.Invariant(
+        $"[{Index}] {Name}: {CumulativeMs:F1}ms state={RetainedRows} out={LastOutputRows}");
+}
+
+/// <summary>
 /// Implemented by stateful operators that expose runtime metrics to
 /// <see cref="RootCircuit.CollectStats"/>. Stateless (linear) operators do not
 /// implement it and simply don't appear in the collected stats. Reads are

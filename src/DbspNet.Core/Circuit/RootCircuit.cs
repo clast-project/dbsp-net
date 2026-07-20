@@ -26,6 +26,17 @@ public sealed class RootCircuit
     private long _tickCount;
     private long _logicalTime = long.MinValue;
     private long _lastStepTicks;
+    private long[]? _opCumTicks;
+
+    /// <summary>
+    /// When set, <see cref="Step"/> times each operator individually and
+    /// accumulates per-operator wall-clock into an internal buffer, readable via
+    /// <see cref="CollectOperatorProfile"/>. Opt-in localization aid (the extra
+    /// <c>GetTimestamp</c> per operator per tick perturbs the measured step, so
+    /// leave it off for headline timing). Set before the first profiled
+    /// <see cref="Step"/>.
+    /// </summary>
+    public bool ProfileOperators { get; set; }
 
     internal object SyncRoot { get; } = new();
 
@@ -238,13 +249,87 @@ public sealed class RootCircuit
             }
 
             var start = System.Diagnostics.Stopwatch.GetTimestamp();
-            foreach (var op in _operators)
+            if (ProfileOperators)
             {
-                op.Step();
+                StepProfiled();
+            }
+            else
+            {
+                foreach (var op in _operators)
+                {
+                    op.Step();
+                }
             }
 
             Interlocked.Exchange(ref _lastStepTicks, System.Diagnostics.Stopwatch.GetTimestamp() - start);
             Interlocked.Increment(ref _tickCount);
         }
+    }
+
+    // Instrumented firing loop — one GetTimestamp per operator, accumulated into
+    // _opCumTicks by registration index. Only reached when ProfileOperators is set.
+    private void StepProfiled()
+    {
+        _opCumTicks ??= new long[_operators.Count];
+        for (var i = 0; i < _operators.Count; i++)
+        {
+            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            _operators[i].Step();
+            _opCumTicks[i] += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+        }
+    }
+
+    /// <summary>
+    /// Zero the per-operator cumulative timers, so the next run of profiled
+    /// <see cref="Step"/>s starts fresh. Call at the start of a batch to get a
+    /// per-batch (rather than since-creation) operator profile.
+    /// </summary>
+    public void ResetOperatorProfile()
+    {
+        if (_opCumTicks is not null)
+        {
+            System.Array.Clear(_opCumTicks);
+        }
+    }
+
+    /// <summary>
+    /// Per-operator cumulative wall-clock across every profiled <see cref="Step"/>
+    /// so far, one entry per registered operator, in registration order. Requires
+    /// <see cref="ProfileOperators"/> to have been set before stepping; returns an
+    /// empty list otherwise. Pairs each operator's total time with its type label
+    /// and (for stateful operators) its retained- and last-output-row counts, so a
+    /// caller can rank the circuit's hot operators after a batch.
+    /// </summary>
+    public IReadOnlyList<OperatorProfile> CollectOperatorProfile()
+    {
+        if (_opCumTicks is null)
+        {
+            return System.Array.Empty<OperatorProfile>();
+        }
+
+        var freq = System.Diagnostics.Stopwatch.Frequency;
+        var profiles = new List<OperatorProfile>(_operators.Count);
+        for (var i = 0; i < _operators.Count; i++)
+        {
+            var op = _operators[i];
+            var ms = _opCumTicks[i] * 1000.0 / freq;
+            if (op is IIntrospectable m)
+            {
+                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows));
+            }
+            else
+            {
+                var name = op.GetType().Name;
+                var tick = name.IndexOf('`');
+                if (tick >= 0)
+                {
+                    name = name[..tick];
+                }
+
+                profiles.Add(new OperatorProfile(i, name, ms, -1, -1));
+            }
+        }
+
+        return profiles;
     }
 }
