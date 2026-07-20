@@ -295,6 +295,12 @@ public sealed class ProgramRunner
             var sb = new StringBuilder();
             sb.AppendLine();
             sb.AppendLine("===== DBSPNET BATCH PROFILE =====");
+            // Self-stamp the running build so a profile is never ambiguous about
+            // which engine commit produced it (DBSPNET_COMMIT is baked into the
+            // image by the ivm-bench Dockerfile).
+            var commit = Environment.GetEnvironmentVariable("DBSPNET_COMMIT");
+            sb.AppendLine(FormattableString.Invariant(
+                $"engine build: {(string.IsNullOrEmpty(commit) ? "(DBSPNET_COMMIT unset)" : commit)}"));
             sb.AppendLine(FormattableString.Invariant(
                 $"batch wall {Ms(TotalTicks):F0} ms over {EngineTicks} engine tick(s)"));
             var allocGiB = (GC.GetTotalAllocatedBytes() - _allocStart) / (1024.0 * 1024.0 * 1024.0);
