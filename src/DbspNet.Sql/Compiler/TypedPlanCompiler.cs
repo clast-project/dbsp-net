@@ -259,6 +259,56 @@ public static class TypedPlanCompiler
         }
     }
 
+    /// <summary>
+    /// Measurement helper (design §23 A/B — <b>not</b> part of the runtime
+    /// contract): compile a chain of dependent views with a <b>true typed seam</b>
+    /// between them. Each entry in <paramref name="chain"/> is compiled typed
+    /// against the structural scans <em>plus</em> the already-built typed streams of
+    /// the earlier entries — so a later view scanning an earlier view's name binds
+    /// directly to that view's typed stream (no <c>Adapt→StructuralRow</c> /
+    /// <c>lift→typed</c> round-trip at the seam). Only leaf scans of names in
+    /// <paramref name="structuralScans"/> pay the structural lift, and only the
+    /// <em>last</em> view's output is adapted back to <c>StructuralRow</c>. Returns
+    /// <c>null</c> if any view falls outside the typed subset. Isolates the
+    /// inter-view seam cost from the state-representation cost.
+    /// </summary>
+    internal static Stream<ZSet<StructuralRow, Z64>>? TryCompileTypedSeamChain(
+        CircuitBuilder builder,
+        IReadOnlyList<(string Name, LogicalPlan Plan)> chain,
+        IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> structuralScans,
+        IRowCodec<StructuralRow> outputCodec,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
+        CompileOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(chain);
+        ArgumentNullException.ThrowIfNull(structuralScans);
+        ArgumentNullException.ThrowIfNull(outputCodec);
+        if (chain.Count == 0) return null;
+
+        try
+        {
+            // One shared context: its LiftedScanCache carries both the structural
+            // lifts of leaf tables AND the typed streams of earlier chain views.
+            var ctx = new CompileContext(builder, structuralScans, snapshotCodecs, options ?? CompileOptions.Default);
+            TypedNode? last = null;
+            foreach (var (name, plan) in chain)
+            {
+                var node = TryCompileNode(plan, ctx) ?? throw new UnsupportedPlanException();
+                // Seed the seam: a later view's ScanPlan for `name` hits this typed
+                // stream (CompileScan checks LiftedScanCache before lifting).
+                ctx.LiftedScanCache[name] = node;
+                last = node;
+            }
+
+            return AdaptTypedToStructural(builder, last!, outputCodec);
+        }
+        catch (UnsupportedPlanException)
+        {
+            return null;
+        }
+    }
+
     private sealed class CompileContext
     {
         public CircuitBuilder Builder { get; }

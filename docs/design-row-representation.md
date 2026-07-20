@@ -3362,6 +3362,67 @@ is the larger share. The only viable representation lever against the batch-1 fl
 shared-reference row model and attacks the dict churn directly. The gate + census + harness
 are retained default-off for cheap re-measurement (e.g. after a columnar change).
 
+### 23.6 — Isolating the seam: is the inter-view round-trip the cost? (A/B/C, MEASURED — no, it's the boxed-extractor tax inside the operator)
+
+§23.4 attributed the program-level loss partly to the typed→typed seam round-trip
+(adapt→StructuralRow then lift→typed). A reasonable objection (Curt): a *proper* typed
+pipeline would carry a typed representation on every seam and only copy *inside* an operator
+when the output shape differs from the input — so the round-trip is an artifact of the
+boundary-adapter hybrid, not of typing. To test this, a single typed→typed adjacency was
+measured three ways on the `daily_market` slice — `staging_daily_market` (source, 1.28M
+rows) → `brokerage_daily_market` (stateless projection) → `daily_market` (heavy stateful
+window aggregate, 1.28M-row state). All three replay the identical pre-read Arrow input;
+only `circuit.Step()` is timed (`TypedSeamAbBenchmark`, `TryCompileTypedSeamChain` helper):
+
+- **S — structural**: both views structural (`object[]` seam, `object[]` state).
+- **H — hybrid**: both views typed, **structural seam** (the adapt/lift round-trip; today's `TypeEligibleProgramViews`).
+- **T — typed seam**: both views typed, **typed seam** — `brokerage_daily_market`'s typed stream feeds `daily_market` directly, no round-trip. This is *the design Curt described*.
+
+| config | step ms | alloc MiB | out rows |
+|---|---|---|---|
+| S structural | 9,435 | 4,044 | 1,282,768 |
+| H hybrid-seam | 16,505 | 20,902 | 1,282,768 |
+| T typed-seam | 15,086 | 20,193 | 1,282,768 |
+
+Row counts identical (the splice is correctness-equivalent). Decomposition:
+- **H−T (the seam round-trip alone): +3.5 % alloc, +9.4 % time — negligible.** The typed seam *does* remove the round-trip, exactly as expected; it just isn't where the cost is.
+- **T−S (the typed-seam design vs structural): +399 % alloc (≈5×), +60 % time.** Even a *perfect* typed seam is heavily net-negative on this slice.
+
+**Crucially, T−S is a clean representation comparison, not an algorithm confound.** Both the
+structural and typed paths emit the *same* generic operator
+`PartitionedWindowAggregateOp<TInRow,TAgg,TOutRow,TKey>` with the same affected-range
+recompute (`PlanToCircuit.CompileWindowAggregate` → `builder.PartitionedWindowAggregate<StructuralRow>`;
+`TypedPlanCompiler.CompileWindowAggregate` → the same op over emitted structs). The **only**
+difference is the row type flowing through it — and the typed struct costs 5× the allocation.
+
+**Why typed *out-allocates* `object[]` through the identical operator — the box-cache
+inversion.** The op is *row-opaque*: it reaches into rows through **boxed extractors**
+(`Func<TRow, object>`) for the partition key, the order key, and the aggregator inputs.
+- With `object[]`/`StructuralRow`, each scalar is boxed **exactly once, at the input
+  boundary**; a bare-column extractor is `row => row[i]` — it returns that **already-boxed**
+  element by reference. Zero allocation per extraction. `StructuralRow` is effectively a
+  **box cache** shared by every operator and every recompute for the row's whole life.
+- With a typed value struct there is **no cache**: `BuildBoxedExtractor` reads a struct field
+  and **boxes it afresh on every call**. The window op sorts each partition, walks running
+  frames, and re-reads keys/values many times — so the same logical DATE/DOUBLE gets re-boxed
+  over and over. The boxes typing was supposed to *eliminate* are instead *multiplied*.
+
+So the naive intuition ("typed rows avoid boxing") inverts for a deep pipeline of row-opaque
+operators: typing the *row* while the *operators* still extract via boxed delegates is
+strictly worse than `object[]`, which boxes once and shares. Typed rows only win when the
+**whole operator stack** is monomorphized to consume struct fields without boxing (typed
+comparers, typed aggregators, typed dictionary keys) — the Feldera model, and what the typed
+**parallel** path approximates, where data-parallel speedup outweighs the residual boxing.
+At W=1 the boxing tax dominates (consistent with §16.11's single-core deficit).
+
+**This refines §23.4's emphasis:** the seam adjacency is a minor contributor (~3.5 %/9 %);
+the dominant cost is the in-operator boxed-extractor re-boxing, which is present whether or
+not the seam is typed. It also re-confirms the arc's conclusion from a second angle — the
+lever is not seam typing but **removing boxed extraction from the hot operators** (typed
+monomorphized operators, or columnar/buffer-reuse that sidesteps per-row boxing entirely,
+§17–§21). `TryCompileTypedSeamChain` + `TypedSeamAbBenchmark` are retained (gated) for
+re-measurement.
+
 ---
 
 ## Appendix — sources
@@ -3401,6 +3462,9 @@ step-profile.md — §22.8, NO-BUILD);
 `CompileOptions.TypeEligibleProgramViews` + `PlanToCircuit.CompileProgram` gate +
 `LastProgramTypedTally` + `Scratch/TypedCoverageCensus.cs` + `Scratch/IvmBatchProfile.cs`
 (`IVM_TYPE_VIEWS=1`, `IVM_SPEC` census — §23, MEASURED decisively negative, default-off);
+`TypedPlanCompiler.TryCompileTypedSeamChain` + `Scratch/TypedSeamAbBenchmark.cs`
+(`IVM_SEAM_FILE` — §23.6, the S/H/T seam-isolation A/B/C: seam is ~3.5%/9%, the cost is the
+in-operator boxed-extractor tax);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,
