@@ -5,13 +5,13 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\DbspNet.Connectors.Abstractions\DbspNet.Connectors.Abstractions.csproj" />
-    <!-- engineered-wood (git submodule under external/, build-isolated from dbsp-net's
-         CPM/analyzers). Delta brings Parquet + Core transitively; Parquet is referenced
-         directly for the bounded Parquet source. -->
-    <ProjectReference Include="..\..\external\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
-    <ProjectReference Include="..\..\external\engineered-wood\src\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- engineered-wood, published to nuget.org at 0.1.0. DeltaLake.Table brings
+         DeltaLake + Expressions(.Arrow) + Parquet + Core transitively; Parquet is
+         referenced directly for the bounded Parquet source. -->
+    <PackageReference Include="EngineeredWood.DeltaLake.Table" />
+    <PackageReference Include="EngineeredWood.Parquet" />
     <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
 </Project>

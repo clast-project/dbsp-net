@@ -78,10 +78,15 @@ public sealed class DeltaOutputConnector : IOutputConnector
         // such files with "TProtocolException: Invalid data". Force it on so DbspNet's output
         // is readable by standard tooling (the correctness-comparison harness, downstream
         // consumers).
+        // EWPARQUET0002: OmitPathInSchema is marked [Experimental] in the released
+        // package. Our use is deliberate and covered by the read-back tests — suppress
+        // the experimental diagnostic for this one line rather than project-wide.
+#pragma warning disable EWPARQUET0002
         var options = new DeltaTableOptions
         {
             ParquetWriteOptions = ParquetWriteOptions.Default with { OmitPathInSchema = false },
         };
+#pragma warning restore EWPARQUET0002
 
         _table = await DeltaTable.OpenOrCreateAsync(_fs, tableArrow, options, cancellationToken: cancellationToken)
             .ConfigureAwait(false);

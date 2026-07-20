@@ -1,8 +1,7 @@
 # DbspNet control service — the engine container for ivm-bench (DbspNet's analogue of
-# Feldera's pipeline-manager). Build from the REPO ROOT as context so the engineered-wood
-# git submodule (external/engineered-wood) is present:
+# Feldera's pipeline-manager). Build from the REPO ROOT as context; engineered-wood is
+# restored from nuget.org during `dotnet publish` (no git submodule needed):
 #
-#   git submodule update --init --recursive
 #   docker build -f src/DbspNet.Server/Dockerfile -t dbspnet-server .
 #
 # At runtime it serves /deploy /resume /wait /pause /stats /healthz on :8080 and reads

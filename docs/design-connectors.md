@@ -356,11 +356,13 @@ the chosen one-tick-per-version default.
    double-buffered — one Arrow batch live at a time).
 2. **Core gaps G1/G2/G3** in `DbspNet.Arrow` / `DbspNet.Persistence`. **DONE** (G1/G2 in
    phase 1; G3 = offsets in the snapshot manifest, phase 2).
-3. **engineered-wood submodule + `DeltaInputConnector`/`DeltaOutputConnector`/`Parquet`**,
-   round-trip tests against local Delta. **DONE (2026-07-16).** Submodule at
-   `external/engineered-wood` (build-isolated via `external/Directory.Packages.props`
-   disabling CPM + `external/Directory.Build.props`); Apache.Arrow unified to **23.0.0**
-   across dbsp-net + EW (one `RecordBatch` type across the boundary). New project
+3. **engineered-wood + `DeltaInputConnector`/`DeltaOutputConnector`/`Parquet`**,
+   round-trip tests against local Delta. **DONE (2026-07-16).** Consumed as nuget.org
+   packages (`EngineeredWood.DeltaLake.Table` + `EngineeredWood.Parquet` at 0.1.0, which
+   pull DeltaLake/Expressions/Core transitively); originally a git submodule at
+   `external/engineered-wood`, swapped to packages 2026-07-20 once the fixes shipped to
+   nuget.org. Apache.Arrow unified to **23.0.0** across dbsp-net + EW (one `RecordBatch`
+   type across the boundary). New project
    `DbspNet.Connectors.EngineeredWood`: `DeltaInputConnector` (CDF-from-0 follow, one tick
    per version, `_change_type`→signed weights), `DeltaOutputConnector`
    (`Overwrite`=truncate / append changelog), `ParquetInputConnector` (bounded). Round-trip
