@@ -30,6 +30,15 @@ public sealed class CircuitBuilder
     /// </summary>
     internal DbspNet.Core.Operators.Stateful.IFrontier LogicalClock => _root.Clock;
 
+    /// <summary>Label attributed to every operator registered while set — the SQL
+    /// compiler sets it to the view being compiled so a profile can name each
+    /// operator's view. See <see cref="RootCircuit.CurrentBuildLabel"/>.</summary>
+    internal string? BuildLabel
+    {
+        get => _root.CurrentBuildLabel;
+        set => _root.CurrentBuildLabel = value;
+    }
+
     /// <summary>
     /// Create an input port with a zero value (used if no push is made on a
     /// given tick) and a merge function (used when <see cref="InputHandle{T}.Push"/>

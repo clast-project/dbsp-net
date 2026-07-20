@@ -22,6 +22,14 @@ public sealed class RootCircuit
 {
     private readonly List<IInputCommit> _inputs = [];
     private readonly List<IOperator> _operators = [];
+    private readonly List<string?> _operatorLabels = [];
+
+    /// <summary>
+    /// Label applied to every operator registered while it is set — the compiler
+    /// sets it to the SQL view being compiled so a profile can attribute each
+    /// operator to its view. <see langword="null"/> = unlabeled.
+    /// </summary>
+    internal string? CurrentBuildLabel { get; set; }
     private Dictionary<string, object>? _namedPorts;
     private long _tickCount;
     private long _logicalTime = long.MinValue;
@@ -134,6 +142,7 @@ public sealed class RootCircuit
     internal void AddOperator(IOperator op)
     {
         _operators.Add(op);
+        _operatorLabels.Add(CurrentBuildLabel);
     }
 
     /// <summary>
@@ -313,9 +322,10 @@ public sealed class RootCircuit
         {
             var op = _operators[i];
             var ms = _opCumTicks[i] * 1000.0 / freq;
+            var label = i < _operatorLabels.Count ? _operatorLabels[i] : null;
             if (op is IIntrospectable m)
             {
-                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows));
+                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label));
             }
             else
             {
@@ -326,7 +336,7 @@ public sealed class RootCircuit
                     name = name[..tick];
                 }
 
-                profiles.Add(new OperatorProfile(i, name, ms, -1, -1));
+                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label));
             }
         }
 

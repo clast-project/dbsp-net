@@ -342,7 +342,7 @@ public sealed class ProgramRunner
             {
                 var share = stepMs > 0 ? op.CumulativeMs / stepMs * 100.0 : 0.0;
                 sb.AppendLine(FormattableString.Invariant(
-                    $"  [{op.Index,4}] {op.Name,-30} {op.CumulativeMs,8:F1} ms ({share,4:F1}%)  state={op.RetainedRows} out={op.LastOutputRows}"));
+                    $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms ({share,4:F1}%)  state={op.RetainedRows,-8} out={op.LastOutputRows,-6} {op.Label}"));
             }
 
             sb.AppendLine("===== END BATCH PROFILE =====");

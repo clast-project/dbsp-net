@@ -307,6 +307,9 @@ public static class PlanToCircuit
                     var monotonicity = MonotonicityAnalyzer.Analyze(v.Query);
                     var ctx = new CompileContext(
                         streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable);
+                    // Tag every operator this view creates with its name, so a runtime
+                    // profile can attribute per-operator cost to the view (observability).
+                    builder.BuildLabel = v.ViewName;
                     var stream = CompilePlan(builder, v.Query, ctx);
                     streams[v.ViewName] = stream;
                     schemas[v.ViewName] = v.Query.Schema;
