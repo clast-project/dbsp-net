@@ -3284,6 +3284,84 @@ isolated prize is real but uncashable for q18 because the wide-row recovery it h
 only on the path that has no movement to save (the two-halves-never-coexist finding), so the
 pipeline-level build is not worth it.
 
+## 23. Typed program path — wiring the typed fast path into the 50-view program DAG (MEASURED, decisively negative, STOP)
+
+**The question (`typed-program-path-scope`).** The whole ivm-bench program runs 100 %
+structural: `CompileProgram` never invokes `TypedPlanCompiler`, so every view builds
+dict-Z-sets of `StructuralRow` (`object?[]`), boxing every scalar and hashing whole
+`object[]` rows. The single-query path *does* have a typed fast path
+(`TryCompileWithStructuralBoundary`, §16.9): it lifts scans into emitted struct rows,
+runs the inner operators typed, and adapts the output back to `StructuralRow` (lazy-boxing
+`TypedStructuralRow` wrapper). Typed rows attack the **Layer-B boxing** cost (§16.3,
+~40 % of the ~45 GiB batch-1 floor), not the **Layer-A per-tick dict** floor. The open
+question was the **prize on a deep DAG**: does typed-inner + per-view structural boundary
+net positive across 50 chained views, or does the boundary round-trip eat it?
+
+**23.1 — The gate (measurement seam).** `CompileOptions.TypeEligibleProgramViews`
+(default-off) makes `CompileProgram` attempt `TryCompileWithStructuralBoundary` per view
+first, falling back to the structural compile for any view the typed compiler cannot
+handle. A typed view lifts its scans from the shared `StructuralRow` streams and adapts
+its output back, so the shared inter-view streams stay byte-identical and a fell-back
+view downstream is unaffected. `PlanToCircuit.LastProgramTypedTally` reports the
+typed/fell-back split for the harness. Driven by `IVM_TYPE_VIEWS=1` on `IvmBatchProfile`
+(the local Docker-free SF=3 batch-1 repro).
+
+**23.2 — The coverage census (feasibility, decisive but not payoff).**
+`TypedCoverageCensus` (gated on `IVM_SPEC`): **19/50 views type today, 4/13 hot**
+(trades, watches, daily_market, fact_cash_balances). The dominant hot-view blocker is
+the typed join compiler bailing on **residual (SCD-2 temporal) joins**
+(`key AND ts BETWEEN lo AND hi`) — fact_holdings/fact_watches/fact_trade et al. So
+coverage is tractable and concentrated (~2–3 features, chiefly typed-join residual). The
+census proves feasibility, **not** payoff — which needs the gated measurement.
+
+**23.3 — The measurement (SF=3 batch-1, this i9/24-proc box, Release, identical output
+row counts across all 16 outputs):**
+
+| metric | structural (baseline) | typed (19 views) | Δ |
+|---|---|---|---|
+| allocated | 44.73 GiB | **81.26 GiB** | **+82 %** |
+| batch wall | 88.4 s | **125.1 s** | **+42 %** |
+| engine step | 77.8 s | 115.0 s | +48 % |
+
+**Decisively negative** — the typed fast path nearly *doubled* allocation and added 42 %
+wall time, with byte-identical results. Per-operator attribution places the loss squarely
+on the **typed views themselves**, not fallbacks: watches `IncrementalAggregate`
+4.0 → 10.5 s (2.6×), daily_market `WindowAggregate` 7.1 → 13.6 s, trades `WindowAggregate`
+1.8 → 4.0 s. Notably `fact_cash_balances` (typed, but downstream of a *structural* view)
+was ≈neutral — isolating the mechanism to typed→typed adjacencies.
+
+**23.4 — Why it loses (mechanism).** The fully-structural program's inter-view boundary is
+**near-free**: adjacent views/ops pass the *same* `object[]` by reference — no per-row
+conversion. Typing a view replaces that shared-reference pass-through with a
+**decode(lift) + encode(adapt) round-trip**:
+- *typed downstream of structural* (≈neutral): the lift decodes `object[]`→struct, but the
+  structural upstream had to be read anyway; the wrapper output is cheap if the consumer is
+  structural.
+- *typed→typed adjacency* (**worst, ~2×**): the upstream emits a lazy-boxing
+  `TypedStructuralRow` wrapper (deferring column boxing, §16.9's win); the downstream lift
+  then reads **all** columns → **forces exactly the boxing the wrapper deferred**, then
+  unboxes them into a struct. The lazy-boxing output optimisation is *defeated* by an
+  immediately-re-reading typed consumer. Compounded by **wide typed structs stored by value
+  in large stateful traces** — daily_market's window state holds 1.28 M rows, watches' 885 K;
+  as `object[]` those are one heap ref each, as typed structs they are the full field payload
+  copied by value into every dict/trace/builder slot.
+
+The three biggest losers (watches, daily_market, trades) are precisely the heavy typed
+views sitting downstream of the typed `brokerage_*` bronze views — the typed→typed case.
+
+**23.5 — Decision: STOP the arc.** This satisfies the pre-registered stop-condition
+(`typed-program-path-scope` phase 3 / the kickoff's "if flat or negative on the
+already-typeable views, the whole arc is likely not worth it"). Crucially the result is
+**not** "small prize we decline" but "architecturally wrong for a deep DAG": the
+shared-`object[]` representation is *already* near-optimal at inter-view boundaries, and
+typing fragments it. **Closing the typed-join residual gap (§23.2) would make it worse**,
+not better — it would type *more* wide-row fact views (fact_holdings, …), adding more lossy
+boundaries. And typing never touches the Layer-A per-tick dict floor anyway (§16.3), which
+is the larger share. The only viable representation lever against the batch-1 floor remains
+**columnar / buffer-reuse on the Layer-A inner multiset** (§17–§21), which keeps the
+shared-reference row model and attacks the dict churn directly. The gate + census + harness
+are retained default-off for cheap re-measurement (e.g. after a columnar change).
+
 ---
 
 ## Appendix — sources
@@ -3320,6 +3398,9 @@ the `PartitionedTopKNarrowing` override + `ShouldNarrow` per-operator gate +
 default-on); `Benchmarks/ExchangeGatherBenchmark.cs` + `StepProfileBenchmark` q18
 re-decomposition (`gatherbench`, `stepprofile q18`, docs/exchange-gather-bench.md +
 step-profile.md — §22.8, NO-BUILD);
+`CompileOptions.TypeEligibleProgramViews` + `PlanToCircuit.CompileProgram` gate +
+`LastProgramTypedTally` + `Scratch/TypedCoverageCensus.cs` + `Scratch/IvmBatchProfile.cs`
+(`IVM_TYPE_VIEWS=1`, `IVM_SPEC` census — §23, MEASURED decisively negative, default-off);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

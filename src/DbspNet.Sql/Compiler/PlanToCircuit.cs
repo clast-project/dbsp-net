@@ -234,6 +234,8 @@ public static class PlanToCircuit
         ArgumentNullException.ThrowIfNull(views);
         options ??= CompileOptions.Default;
         var codec = StructuralRowCodec.Instance;
+        var typedViews = new List<string>();
+        var fellBackViews = new List<string>();
 
         // Dead-view elimination: only compile views reachable from an output. A view with no
         // output connector that no output transitively references is never observed, so
@@ -318,7 +320,29 @@ public static class PlanToCircuit
                     // Tag every operator this view creates with its name, so a runtime
                     // profile can attribute per-operator cost to the view (observability).
                     builder.BuildLabel = v.ViewName;
-                    var stream = CompilePlan(builder, optimizedQuery, ctx);
+
+                    // Measurement gate (docs/design-row-representation.md): try the typed
+                    // fast path per view, structural elsewhere. A typed view lifts its
+                    // scans from the shared StructuralRow streams, runs its inner ops
+                    // typed, and adapts its output back to StructuralRow — so the shared
+                    // inter-view streams are byte-identical to the structural path and a
+                    // fell-back view downstream is unaffected. Forced off with CSE
+                    // (structural-only) and when a non-default codec is in play.
+                    Stream<ZSet<StructuralRow, Z64>>? stream = null;
+                    if (options.TypeEligibleProgramViews
+                        && !options.ShareArrangements
+                        && ReferenceEquals(codec, StructuralRowCodec.Instance))
+                    {
+                        stream = TypedPlanCompiler.TryCompileWithStructuralBoundary(
+                            builder, optimizedQuery, streams, codec, snapshotCodecs, options);
+                    }
+
+                    if (options.TypeEligibleProgramViews)
+                    {
+                        (stream is not null ? typedViews : fellBackViews).Add(v.ViewName);
+                    }
+
+                    stream ??= CompilePlan(builder, optimizedQuery, ctx);
                     streams[v.ViewName] = stream;
                     schemas[v.ViewName] = v.Query.Schema;
 
@@ -336,8 +360,26 @@ public static class PlanToCircuit
             SpineStagingConfig.Capacity = prevStagingCapacity;
         }
 
+        if (options.TypeEligibleProgramViews)
+        {
+            LastProgramTypedTally = (typedViews, fellBackViews);
+        }
+
         return new CompiledProgram(circuit!, inputs!, outputs!);
     }
+
+    /// <summary>
+    /// Diagnostic (measurement only): the typed vs fell-back program-view split
+    /// from the most recent <see cref="CompileProgram"/> call made with
+    /// <see cref="CompileOptions.TypeEligibleProgramViews"/> set. Lets the local
+    /// harness confirm the gate typed exactly the views the coverage census
+    /// predicted. Not thread-safe; not part of the runtime contract.
+    /// </summary>
+    public static (IReadOnlyList<string> Typed, IReadOnlyList<string> FellBack) LastProgramTypedTally
+    {
+        get;
+        private set;
+    } = (Array.Empty<string>(), Array.Empty<string>());
 
     private sealed class CompileContext
     {

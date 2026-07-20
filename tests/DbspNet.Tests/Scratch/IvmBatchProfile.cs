@@ -63,9 +63,24 @@ public class IvmBatchProfile
 
         var outputViews = spec.Output_Bindings.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
 
-        // Match DbspNetEngine.DeployAsync exactly.
+        // Measurement gate: IVM_TYPE_VIEWS=1 flips the program path to try the typed
+        // fast path per view (structural fallback elsewhere). Off = the shipping
+        // 100%-structural program. Everything else matches DbspNetEngine.DeployAsync.
+        var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") is "1" or "true" or "TRUE";
+        var options = typeViews
+            ? new CompileOptions { TypeEligibleProgramViews = true }
+            : CompileOptions.Default;
         var program = SqlProgram.Compile(
-            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+            spec.Program, outputViews, options: options,
+            numericStringCoercion: true, nullCollation: NullCollation.Low);
+
+        if (typeViews)
+        {
+            var (typed, fellBack) = PlanToCircuit.LastProgramTypedTally;
+            _out.WriteLine($"TYPED program views: {typed.Count} typed, {fellBack.Count} fell back");
+            _out.WriteLine("  typed:    " + string.Join(", ", typed));
+            _out.WriteLine("  fellBack: " + string.Join(", ", fellBack));
+        }
 
         var inputs = spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))

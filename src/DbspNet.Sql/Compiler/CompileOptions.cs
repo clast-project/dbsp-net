@@ -115,4 +115,33 @@ public sealed record CompileOptions
     /// fingerprint) is unchanged unless this is requested.
     /// </summary>
     public bool StoredOutput { get; init; }
+
+    /// <summary>
+    /// Opt-in (measurement gate): on the <b>program</b> path
+    /// (<see cref="PlanToCircuit.CompileProgram"/>), attempt the typed-row fast
+    /// path (<c>TypedPlanCompiler.TryCompileWithStructuralBoundary</c>) per view,
+    /// falling back to the structural compile for any view the typed compiler
+    /// cannot handle. A typed view runs its inner operators on emitted struct
+    /// rows and pays a structural↔typed conversion only at its scan (lift) and
+    /// output (adapt) boundaries; the shared inter-view streams stay
+    /// <c>StructuralRow</c>, so a typed view consuming another typed view's output
+    /// still round-trips through the structural boundary (no cross-view fusion).
+    /// This is the row-representation measurement lever
+    /// (docs/design-row-representation.md; typed rows attack the Layer-B boxing
+    /// cost, not the Layer-A per-tick dict floor). Off by default; forced off when
+    /// <see cref="ShareArrangements"/> is set (CSE is structural-only).
+    /// </summary>
+    /// <remarks>
+    /// <b>MEASURED DECISIVELY NEGATIVE — do not enable for perf</b> (ivm-bench
+    /// SF=3 batch-1, docs/design-row-representation.md §23): typing the 19
+    /// type-eligible views drove allocation <b>+82%</b> (44.7→81.3 GiB) and wall
+    /// time <b>+42%</b> (identical output row counts). The fully-structural program
+    /// shares one <c>object[]</c> by reference across adjacent views, so its
+    /// inter-view boundary is near-free; typing inserts a decode(lift)+encode(adapt)
+    /// round-trip at each boundary, and a typed→typed adjacency additionally forces
+    /// the boxing the lazy <c>TypedStructuralRow</c> deferred (worst hit:
+    /// watches/daily_market/trades). Retained solely as a default-off,
+    /// re-measurable gate for the arc (flip IVM_TYPE_VIEWS=1 on the local harness).
+    /// </remarks>
+    public bool TypeEligibleProgramViews { get; init; }
 }
