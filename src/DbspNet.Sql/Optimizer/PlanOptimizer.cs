@@ -130,8 +130,66 @@ public static class PlanOptimizer
             FilterPlan f => SimplifyFilter(f),
             ProjectPlan p => PruneJoinInputs(SimplifyProject(p)),
             AggregatePlan a => PruneJoinInputs(NarrowAggregateInput(a)),
+            SemiJoinPlan sj => NarrowSemiJoinSubquery(sj),
             _ => withOptChildren,
         };
+    }
+
+    // ---------- Semi-join subquery narrowing ----------
+
+    /// <summary>
+    /// A semi-/anti-join reads its <see cref="SemiJoinPlan.Subquery"/> purely as a
+    /// <em>set</em> of its equi-key columns — the subquery's row multiplicity never
+    /// affects the match. So when the subquery is <c>Project</c>-over-inner-<c>Join</c>
+    /// and every projection the subquery keeps references only the join's LEFT
+    /// columns (the RIGHT side contributes existence, not data), the inner join is
+    /// soundly a semi-join, which never materialises the join's product. This is the
+    /// classic <c>EXISTS/NOT EXISTS</c> shape where the subquery body joins two
+    /// tables only to test existence — e.g. ivm-bench <c>broker_performance</c>'s
+    /// <c>NOT EXISTS (SELECT 1 FROM fact_trade JOIN fact_cash_transactions …)</c>,
+    /// where the inner join was an ~8M-row many-to-many product for a boolean.
+    /// </summary>
+    private static LogicalPlan NarrowSemiJoinSubquery(SemiJoinPlan sj)
+    {
+        if (sj.Subquery is not ProjectPlan p || p.Input is not JoinPlan j)
+        {
+            return sj;
+        }
+
+        // Inner equi-join only: an outer join keeps unmatched left rows (a semi-join
+        // drops them); a residual or null-keyed join can reference the right side or
+        // change match semantics; a keyless join has no semi-join form.
+        if (j.JoinType != DbspNet.Sql.Parser.Ast.JoinType.Inner
+            || j.Residual is not null || j.AllowNullKeys || j.EquiKeys.Count == 0)
+        {
+            return sj;
+        }
+
+        // Every kept projection must reference only left columns (or constants), so
+        // repointing the project from the join (Left⧺Right) to a semi-join (Left
+        // only) leaves each projected index valid — and proves the right side
+        // contributes no data the subquery keeps.
+        var leftCount = j.Left.Schema.Count;
+        foreach (var item in p.Projections)
+        {
+            foreach (var idx in ExpressionRewriter.CollectColumnIndices(item.Expression))
+            {
+                if (idx >= leftCount)
+                {
+                    return sj;
+                }
+            }
+        }
+
+        var semiKeys = new List<SemiJoinEqui>(j.EquiKeys.Count);
+        foreach (var eq in j.EquiKeys)
+        {
+            semiKeys.Add(new SemiJoinEqui(
+                new ResolvedColumn(eq.LeftIndex, eq.KeyType), eq.RightIndex, eq.KeyType));
+        }
+
+        var innerSemi = new SemiJoinPlan(j.Left, j.Right, semiKeys, IsAnti: false);
+        return sj with { Subquery = new ProjectPlan(innerSemi, p.Projections, p.Schema) };
     }
 
     private static List<LogicalPlan> OptimizeBranches(IReadOnlyList<LogicalPlan> branches)

@@ -304,13 +304,21 @@ public static class PlanToCircuit
                         continue;
                     }
 
-                    var monotonicity = MonotonicityAnalyzer.Analyze(v.Query);
+                    // Optimize each view's plan (filter pushdown, projection/column
+                    // pruning, semi-join narrowing, …) — the single-query path does
+                    // this via its callers; the program path did not, so every view
+                    // compiled un-optimized. Optimize is result- and output-schema-
+                    // preserving, and each view is a standalone tree whose scans of
+                    // other views are untouched leaves, so per-view optimization is
+                    // safe across the shared-stream DAG.
+                    var optimizedQuery = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(v.Query);
+                    var monotonicity = MonotonicityAnalyzer.Analyze(optimizedQuery);
                     var ctx = new CompileContext(
                         streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable);
                     // Tag every operator this view creates with its name, so a runtime
                     // profile can attribute per-operator cost to the view (observability).
                     builder.BuildLabel = v.ViewName;
-                    var stream = CompilePlan(builder, v.Query, ctx);
+                    var stream = CompilePlan(builder, optimizedQuery, ctx);
                     streams[v.ViewName] = stream;
                     schemas[v.ViewName] = v.Query.Schema;
 
@@ -1069,7 +1077,14 @@ public static class PlanToCircuit
                 // differ per scan but row content is the same.
                 if (!ctx.CteCache.TryGetValue(c.Cte, out var cached))
                 {
-                    cached = CompilePlan(builder, c.Cte.Plan, ctx);
+                    // Optimize the CTE body (the top-level view/query plan is
+                    // optimized by its caller, but its CTE bodies are CteScan
+                    // leaves the optimizer doesn't descend into — so much of a
+                    // WITH-heavy query's logic, e.g. an EXISTS/NOT-EXISTS body,
+                    // would compile un-optimized). Optimize is a pass-through on
+                    // recursive plans, so a recursive CTE body is left intact.
+                    cached = CompilePlan(
+                        builder, DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(c.Cte.Plan), ctx);
                     ctx.CteCache[c.Cte] = cached;
                 }
 
