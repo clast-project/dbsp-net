@@ -568,6 +568,15 @@ public class WindowAggregateTests
     [InlineData("SELECT g, ts, SUM(v) OVER (PARTITION BY g ORDER BY ts) AS s FROM w")]
     [InlineData("SELECT g, ts, COUNT(*) OVER (PARTITION BY g ORDER BY ts) AS c FROM w")]
     [InlineData("SELECT ts, AVG(v) OVER (ORDER BY ts) AS a FROM w")]
+    // Running MIN/MAX — the daily_market 52-week-low/high shape, and the case the
+    // O(n)-pass rewrite (RecomputeRunningRange) most affects. Ties in ts (0..7)
+    // exercise RANGE peer sharing; deletes exercise the MIN/MAX rescan-on-retract.
+    [InlineData("SELECT g, ts, v, MIN(v) OVER (PARTITION BY g ORDER BY ts) AS lo FROM w")]
+    [InlineData("SELECT g, ts, v, MAX(v) OVER (PARTITION BY g ORDER BY ts) AS hi FROM w")]
+    // Running MIN over DESC order — the growing-suffix (reverse-scan) branch.
+    [InlineData("SELECT g, ts, v, MIN(v) OVER (PARTITION BY g ORDER BY ts DESC) AS lo FROM w")]
+    // Running MIN + MAX in one query (two chained running ops), daily_market-exact.
+    [InlineData("SELECT g, ts, MIN(v) OVER (PARTITION BY g ORDER BY ts) AS lo, MAX(v) OVER (PARTITION BY g ORDER BY ts) AS hi FROM w")]
     [InlineData("SELECT g, ts, v, SUM(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM w")]
     [InlineData("SELECT g, ts, v, MIN(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS m FROM w")]
     [InlineData("SELECT g, ts, v, MAX(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS m FROM w")]

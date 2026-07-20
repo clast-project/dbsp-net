@@ -235,6 +235,19 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             hi = _descending ? deltaRange.Max : deltaRange.Max + _preceding.Value;
         }
 
+        // Running frame (ORDER BY present, UNBOUNDED PRECEDING): recompute the
+        // affected rows in one ordered pass that folds each row into a running
+        // aggregate via the incremental IAggregator.Update, instead of rebuilding
+        // and re-aggregating every row's whole prefix from scratch. The old
+        // per-row FrameFor + Compute was O(partition²) in both time and
+        // allocation and dominated ivm-bench batch-1 (the running MIN/MAX 52-week
+        // windows over daily_market). Linear per touched partition.
+        if (!whole && _preceding is null)
+        {
+            RecomputeRunningRange(builder, bucket, win, key, rows, lo, hi);
+            return;
+        }
+
         // For whole-partition the aggregate is shared, so compute it once.
         var wholeAgg = whole
             ? _aggregator.Compute(ZSet.FromEntries(rows.Select(r => (r.Row, new Z64(r.Weight)))))
@@ -272,6 +285,104 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             {
                 builder.Add(old.Widened, new Z64(-old.Weight));
                 win.Remove(baseRow);
+            }
+        }
+
+        if (win.Count == 0)
+        {
+            _window.Remove(key);
+        }
+        else
+        {
+            _window[key] = win;
+        }
+    }
+
+    /// <summary>Recompute a partition's running-frame (UNBOUNDED PRECEDING →
+    /// CURRENT ROW) output in a single ordered pass. <paramref name="rows"/> is
+    /// ascending by order value; for ASC the frame is the growing prefix (scan
+    /// ascending), for DESC the growing suffix (scan descending). Each row is
+    /// folded into a running aggregate via the incremental
+    /// <see cref="IAggregator{TInRow,TAgg}.Update"/>; a whole peer group (equal
+    /// order value) is folded before any of its rows is emitted, so peers share
+    /// one frame (RANGE semantics). Only rows whose order value is in the affected
+    /// range [<paramref name="lo"/>, <paramref name="hi"/>] are diffed against the
+    /// last emitted output; earlier rows are folded but not re-emitted (their
+    /// frame is unchanged by a delta at or after them).</summary>
+    private void RecomputeRunningRange(
+        ZSetBuilder<TOutRow, Z64> builder,
+        SortedDictionary<TInRow, long>? bucket,
+        Dictionary<TInRow, (TOutRow Widened, long Weight)> win,
+        TKey key,
+        List<(TInRow Row, long Weight, long Value)> rows,
+        long lo,
+        long hi)
+    {
+        var seq = _descending ? Enumerable.Reverse(rows).ToList() : rows;
+        object? state = null;
+        var running = Optional<TAgg>.None;
+        var frame = new GrowingMultiset<TInRow>();
+        var emitted = new HashSet<TInRow>();
+
+        var i = 0;
+        while (i < seq.Count)
+        {
+            var v = seq[i].Value;
+
+            // Fold the whole peer group (equal order value) before emitting, so
+            // peers see the same frame.
+            var j = i;
+            while (j < seq.Count && seq[j].Value == v)
+            {
+                var (row, weight, _) = seq[j];
+                frame.Add(row, weight);
+                running = _aggregator.Update(
+                    ref state, running, ZSet.FromEntries(new[] { (row, new Z64(weight)) }), frame);
+                j++;
+            }
+
+            if (v >= lo && v <= hi)
+            {
+                for (var k = i; k < j; k++)
+                {
+                    var (row, weight, _) = seq[k];
+                    EmitRowDiff(builder, win, row, _widen(row, running), weight);
+                    emitted.Add(row);
+                }
+            }
+
+            i = j;
+        }
+
+        // Retract previously-emitted rows in the affected range that the delta
+        // removed (present in the last output, no longer in the partition).
+        if (win.Count > 0)
+        {
+            List<TInRow>? gone = null;
+            foreach (var baseRow in win.Keys)
+            {
+                if (emitted.Contains(baseRow))
+                {
+                    continue;
+                }
+
+                var v = _orderValueOf!(baseRow);
+                if (v < lo || v > hi || (bucket is not null && bucket.ContainsKey(baseRow)))
+                {
+                    continue;
+                }
+
+                (gone ??= new List<TInRow>()).Add(baseRow);
+            }
+
+            if (gone is not null)
+            {
+                foreach (var baseRow in gone)
+                {
+                    var old = win[baseRow];
+                    builder.Add(old.Widened, new Z64(-old.Weight));
+                    win.Remove(baseRow);
+                }
             }
         }
 
@@ -475,4 +586,49 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
+
+    /// <summary>A dictionary-backed weighted multiset grown one entry at a time,
+    /// used as the running frame in <see cref="RecomputeRunningRange"/>. Add is
+    /// O(1) and <see cref="SumWeights"/> / <see cref="WeightOf"/> are O(1) (the
+    /// two things an incremental <see cref="IAggregator{TInRow,TAgg}.Update"/>
+    /// reads), so folding a whole partition is linear — unlike rebuilding a fresh
+    /// Z-set per row.</summary>
+    private sealed class GrowingMultiset<TRow> : IMultiset<TRow, Z64>
+        where TRow : notnull
+    {
+        private readonly Dictionary<TRow, long> _entries = new();
+        private long _sum;
+
+        public void Add(TRow row, long weight)
+        {
+            _entries.TryGetValue(row, out var current);
+            var next = current + weight;
+            if (next == 0)
+            {
+                _entries.Remove(row);
+            }
+            else
+            {
+                _entries[row] = next;
+            }
+
+            _sum += weight;
+        }
+
+        public bool IsEmpty => _entries.Count == 0;
+
+        public Z64 WeightOf(TRow key) => _entries.TryGetValue(key, out var w) ? new Z64(w) : new Z64(0);
+
+        public Z64 SumWeights() => new Z64(_sum);
+
+        public IEnumerator<KeyValuePair<TRow, Z64>> GetEnumerator()
+        {
+            foreach (var (row, weight) in _entries)
+            {
+                yield return new KeyValuePair<TRow, Z64>(row, new Z64(weight));
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
 }
