@@ -202,7 +202,26 @@ public sealed class ProgramRunner
         {
             _profile.TotalTicks = Stopwatch.GetTimestamp() - wall0;
             _profile.EngineTicks = ticks;
-            Console.Error.WriteLine(_profile.BuildReport(_program.Circuit.CollectOperatorProfile()));
+            var report = _profile.BuildReport(_program.Circuit.CollectOperatorProfile());
+            Console.Error.WriteLine(report);
+
+            // Optionally persist the report so it survives harness container teardown:
+            // point DBSPNET_PROFILE_FILE at a mounted path (e.g. /data/processed/dbspnet).
+            var file = Environment.GetEnvironmentVariable("DBSPNET_PROFILE_FILE");
+            if (!string.IsNullOrEmpty(file))
+            {
+                try
+                {
+                    File.AppendAllText(file, report + Environment.NewLine);
+                }
+                catch (IOException)
+                {
+                    // Best-effort: a profile-file write must never fail the batch.
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
         }
 
         return ticks;
