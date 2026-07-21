@@ -135,6 +135,27 @@ if (args.Length > 0 && args[0] == "reprbench")
     return 0;
 }
 
+// ApplyOp alloc split: `dotnet run -- applysplit [ticks] [delta] [runs]`
+// Row-wise vs columnar (SoA) projection ApplyOp, apportioning per-row allocation
+// (container / StructuralRow wrapper+hash / object[] / boxed compute) and the
+// P→COL reduction — the B ceiling (docs/design-columnar-batch1.md §1 / §2.3).
+if (args.Length > 0 && args[0] == "applysplit")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — ApplyOp alloc split (row-wise vs columnar)");
+    sb.AppendLine();
+    DbspNet.Benchmarks.ApplyOpAllocSplitBenchmark.Run(sb, Arg(1, 20_000), Arg(2, 256), Arg(3, 5));
+    var asPath = Path.Combine(FindDocsDir(), "applyop-alloc-split.md");
+    File.WriteAllText(asPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(asPath)}");
+    return 0;
+}
+
 // Pool reclaimability microbench: `dotnet run -- poolbench`
 // Fresh vs pre-sized vs pooled delta Z-set dictionary — bounds the lever-1 prize
 // before any operator wiring (docs/design-row-representation.md §16.5/§16.7).
