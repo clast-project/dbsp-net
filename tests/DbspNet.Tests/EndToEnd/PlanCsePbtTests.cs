@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using CsCheck;
+using DbspNet.Core.Algebra;
+using DbspNet.Core.Collections;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
@@ -20,6 +22,10 @@ namespace DbspNet.Tests.EndToEnd;
 /// the batch oracle over the un-optimized plan (via
 /// <see cref="RandomQueryPbtTests.CheckOne"/>).
 /// </summary>
+// Shares the "PlanCseCompileCounter" collection with PlanCseTests so their tests
+// that reset/read the process-wide PlanToCircuit.MemoHits counter never run
+// concurrently (xUnit parallelizes across collections by default).
+[Collection("PlanCseCompileCounter")]
 public class PlanCsePbtTests
 {
     private static readonly Gen<string> Tbl = Gen.OneOfConst("t", "u");
@@ -57,6 +63,56 @@ public class PlanCsePbtTests
             .Sample((sql, ticks) => RandomQueryPbtTests.CheckOne(sql, ticks, optimize: true), iter: 2000);
     }
 
+    // Ranked (top-k) inners — the PartitionedTopK node CSE learned to intern in the
+    // ranking-family expansion. The current SQL surface reaches this family only via
+    // the incremental TOP-K pattern (ROW_NUMBER/RANK/DENSE_RANK OVER (…) with an
+    // enclosing `rn <= k` filter). Each exposes `k` so the wrappers still apply.
+    // PartitionedTopK has no batch oracle, so these are validated circuit-vs-circuit.
+    private static readonly Gen<string> RankFn = Gen.OneOfConst("ROW_NUMBER()", "RANK()", "DENSE_RANK()");
+
+    private static readonly Gen<string> WindowedInner = Gen.Select(Tbl, RankFn, Gen.Int[1, 3])
+        .Select(p =>
+            $"SELECT k, v FROM (SELECT k, v, {p.Item2} OVER (PARTITION BY k ORDER BY v) AS rn FROM {p.Item1}) z "
+            + $"WHERE rn <= {p.Item3}");
+
+    private static readonly Gen<string> WindowedDuplicated = WindowedInner.SelectMany(q => Gen.OneOfConst(
+        $"SELECT a.k FROM ({q}) a UNION ALL SELECT b.k FROM ({q}) b",
+        $"SELECT a.k FROM ({q}) a JOIN ({q}) b ON a.k = b.k",
+        $"SELECT a.k FROM ({q}) a JOIN (SELECT MAX(k) AS mk FROM ({q}) c) m ON a.k = m.mk"));
+
+    /// <summary>
+    /// Duplicated windowed / ranked / top-k subqueries: the CSE-optimized circuit
+    /// must produce the same incremental output as the un-optimized circuit over the
+    /// same tick stream. Circuit-vs-circuit (not batch oracle) because top-k has no
+    /// batch evaluator — and it isolates the optimizer against the well-tested
+    /// unoptimized baseline, which is exactly the CSE-preserves-semantics property.
+    /// </summary>
+    [Fact]
+    public void DuplicatedWindowedSubplan_CseEqualsUnoptimizedCircuit()
+    {
+        Gen.Select(WindowedDuplicated, RandomQuery.GenTicks)
+            .Sample(CircuitEquiv, iter: 1500);
+    }
+
+    private static bool CircuitEquiv(string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks)
+    {
+        var optimized = Accumulate(sql, ticks, optimize: true);
+        var raw = Accumulate(sql, ticks, optimize: false);
+        return optimized.Equals(raw);
+    }
+
+    private static ZSet<StructuralRow, Z64> Accumulate(
+        string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks, bool optimize)
+    {
+        var plan = Resolve(sql);
+        var compiled = PlanToCircuit.Compile(optimize ? PlanOptimizer.Optimize(plan) : plan);
+        var filtered = ticks
+            .Select(tick => (IReadOnlyList<InputEvent>)tick
+                .Where(e => compiled.Inputs.ContainsKey(e.Table)).ToList())
+            .ToList();
+        return IncrementalOracle.RunAndAccumulate(compiled, filtered);
+    }
+
     /// <summary>
     /// Non-vacuity guard: the symmetric injection shapes (UNION ALL, self-join) place
     /// the two copies in positions the optimizer rewrites identically, so CSE must
@@ -67,26 +123,38 @@ public class PlanCsePbtTests
     [Fact]
     public void InjectionShapes_DoTriggerSharing()
     {
-        const string q = "SELECT k, SUM(v) AS s FROM t GROUP BY k";
+        // Symmetric shapes (UNION ALL, self-join) over an aggregate AND over a
+        // ranked (top-k) subquery — the optimizer rewrites both copies identically, so
+        // CSE must share them (proving both the base and ranking-family interning fire,
+        // and that the PBTs above aren't vacuous).
+        const string topk =
+            "SELECT k, v FROM (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t) z WHERE rn <= 2";
         var shapes = new[]
         {
-            $"SELECT a.k FROM ({q}) a UNION ALL SELECT b.k FROM ({q}) b",
-            $"SELECT a.k FROM ({q}) a JOIN ({q}) b ON a.k = b.k",
+            "SELECT a.k FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) a "
+                + "UNION ALL SELECT b.k FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) b",
+            "SELECT a.k FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) a "
+                + "JOIN (SELECT k, SUM(v) AS s FROM t GROUP BY k) b ON a.k = b.k",
+            $"SELECT a.k FROM ({topk}) a JOIN ({topk}) b ON a.k = b.k",
         };
 
         foreach (var sql in shapes)
         {
             PlanToCircuit.MemoHits = 0;
-            var catalog = new Catalog();
-            var resolver = new Resolver(catalog);
-            foreach (var ddl in RandomQuery.FixedDdl)
-            {
-                resolver.Resolve(Parser.ParseStatement(ddl));
-            }
-
-            var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
-            PlanToCircuit.Compile(PlanOptimizer.Optimize(plan));
+            PlanToCircuit.Compile(PlanOptimizer.Optimize(Resolve(sql)));
             Assert.True(PlanToCircuit.MemoHits > 0, $"expected CSE sharing for: {sql}");
         }
+    }
+
+    private static LogicalPlan Resolve(string sql)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        foreach (var ddl in RandomQuery.FixedDdl)
+        {
+            resolver.Resolve(Parser.ParseStatement(ddl));
+        }
+
+        return ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
     }
 }

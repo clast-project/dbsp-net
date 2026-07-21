@@ -19,6 +19,7 @@ namespace DbspNet.Tests.Sql;
 /// for the per-auction output, once inside the per-window <c>MAX</c> — and so ran
 /// the 5× HOP fan-out + count aggregate twice before CSE.
 /// </summary>
+[Collection("PlanCseCompileCounter")]
 public class PlanCseTests
 {
     // A q5-shaped query WITHOUT the HOP window: the identical
@@ -100,6 +101,21 @@ public class PlanCseTests
         PlanToCircuit.MemoMisses = 0;
         PlanToCircuit.Compile(OptimizedPlan(DupDdl, DupQuery));
         Assert.True(PlanToCircuit.MemoHits > 0, "expected ≥1 shared-subplan compile-cache hit");
+    }
+
+    [Fact]
+    public void Cse_SharesRankedTopKSubquery()
+    {
+        // A duplicated incremental TOP-K subquery (ROW_NUMBER … <= k) — the ranking
+        // family CSE learned to intern — must collapse to a single PartitionedTopK
+        // instance shared by both self-join inputs.
+        const string topk =
+            "SELECT k, v FROM (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t) z WHERE rn <= 2";
+        var optimized = OptimizedPlan(
+            new[] { "CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)" },
+            $"SELECT a.k FROM ({topk}) a JOIN ({topk}) b ON a.k = b.k");
+
+        Assert.Single(DistinctOfType<PartitionedTopKPlan>(optimized));
     }
 
     [Fact]

@@ -124,7 +124,14 @@ public static class PlanCse
     }
 
     // Kinds we are willing to share. ScanPlan is included so identical base-table
-    // scans collapse (letting the fan-out branches above them share too).
+    // scans collapse (letting the fan-out branches above them share too). The
+    // ranking family (ORDER BY … LIMIT and ROW_NUMBER/RANK/DENSE_RANK windows) is
+    // included so a duplicated ranked/top-k subquery shares too — each carries extra
+    // sort-key / partition-key state that StructuralComparer compares below. Left
+    // pass-through: window aggregates / offset functions (not reachable from the
+    // current SQL surface, so interning them would be untested), the scalar-subquery
+    // and semi joins (correlation / batched-subquery semantics), TemporalFilter,
+    // CteScan (identity-shared already), and RecursiveCte (self-referential back-edge).
     private static bool IsInternEligible(LogicalPlan plan) => plan switch
     {
         ScanPlan => true,
@@ -135,6 +142,9 @@ public static class PlanCse
         UnionAllPlan => true,
         DistinctPlan => true,
         DifferencePlan => true,
+        TopKPlan => true,
+        PartitionedTopKPlan => true,
+        PartitionedRankPlan => true,
         _ => false,
     };
 
@@ -184,6 +194,20 @@ public static class PlanCse
                 (DistinctPlan x, DistinctPlan y) => ReferenceEquals(x.Input, y.Input),
                 (DifferencePlan x, DifferencePlan y) =>
                     ReferenceEquals(x.Left, y.Left) && ReferenceEquals(x.Right, y.Right),
+                (TopKPlan x, TopKPlan y) =>
+                    ReferenceEquals(x.Input, y.Input)
+                    && x.Limit == y.Limit && x.Offset == y.Offset
+                    && SortKeysEqual(x.SortKeys, y.SortKeys),
+                (PartitionedTopKPlan x, PartitionedTopKPlan y) =>
+                    ReferenceEquals(x.Input, y.Input)
+                    && x.Function == y.Function && x.Limit == y.Limit
+                    && ExprListEqual(x.PartitionKeys, y.PartitionKeys)
+                    && SortKeysEqual(x.SortKeys, y.SortKeys),
+                (PartitionedRankPlan x, PartitionedRankPlan y) =>
+                    ReferenceEquals(x.Input, y.Input) && x.Function == y.Function
+                    && ExprListEqual(x.PartitionKeys, y.PartitionKeys)
+                    && SortKeysEqual(x.SortKeys, y.SortKeys)
+                    && SchemaTypesEqual(x.Schema, y.Schema),
                 _ => false,
             };
         }
@@ -246,6 +270,28 @@ public static class PlanCse
                 case DifferencePlan diff:
                     h.Add(RuntimeHelpers.GetHashCode(diff.Left));
                     h.Add(RuntimeHelpers.GetHashCode(diff.Right));
+                    break;
+
+                // Ordering/window/rank/temporal/semi-join family: coarse hash on the
+                // input reference + counts + a discriminating scalar. Equality settles
+                // collisions.
+                case TopKPlan t:
+                    h.Add(RuntimeHelpers.GetHashCode(t.Input));
+                    h.Add(t.Limit);
+                    h.Add(t.SortKeys.Count);
+                    break;
+                case PartitionedTopKPlan pt:
+                    h.Add(RuntimeHelpers.GetHashCode(pt.Input));
+                    h.Add((int)pt.Function);
+                    h.Add(pt.Limit);
+                    h.Add(pt.PartitionKeys.Count);
+                    h.Add(pt.SortKeys.Count);
+                    break;
+                case PartitionedRankPlan pr:
+                    h.Add(RuntimeHelpers.GetHashCode(pr.Input));
+                    h.Add((int)pr.Function);
+                    h.Add(pr.PartitionKeys.Count);
+                    h.Add(pr.SortKeys.Count);
                     break;
             }
 
@@ -311,6 +357,29 @@ public static class PlanCse
 
         return true;
     }
+
+    private static bool SortKeysEqual(IReadOnlyList<SortKey> a, IReadOnlyList<SortKey> b)
+    {
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!SortKeyEqual(a[i], b[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool SortKeyEqual(SortKey a, SortKey b) =>
+        a.Descending == b.Descending
+        && a.NullsFirst == b.NullsFirst
+        && ExprEqual(a.Expression, b.Expression);
 
     private static bool EquiKeysEqual(IReadOnlyList<JoinEquality> a, IReadOnlyList<JoinEquality> b)
     {
