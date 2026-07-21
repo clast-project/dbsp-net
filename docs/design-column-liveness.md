@@ -222,24 +222,51 @@ keeping the width barely helps. **Confirms the §1 apportionment empirically: th
 marginal (−1 GiB / flat wall) and perturbs fusion. Keep it gated + documented as the
 foundation for §10.
 
-## 10. Next: arity-reducing rewrite (the real (b)-term prize)
+## 10. Arity-reducing rewrite — ceiling estimated, NOT WORTH BUILDING (2026-07-21)
 
-Narrow a view's output *schema* to its live columns and reindex downstream consumers'
-`ScanPlan` column references — so `daily_market` becomes a genuine 6-column view and the
-`fifty_two_week_*` object-array slots disappear (not NULL-filled). This is where the 64-dead-
-column surface pays: **`accounts 23/32`** dead columns on a wide SCD row → a 32→9-column
-narrowing on every ApplyOp that carries `accounts` rows is a much larger (b)-term cut than
-`daily_market` alone. Cost: cross-view index remapping (the piece §5.3 preserved arity to
-avoid); the per-node live-*input* sets already computed drive the remap. Validate with the
-same program-differential (byte-identical 16 outputs) — now also asserting narrowed schemas.
+The arity-reducing rewrite would narrow a view's output *schema* to its live columns and
+reindex downstream `ScanPlan` column references — so `daily_market` becomes a genuine
+6-column view and the dead object-array slots disappear (not NULL-filled). Its prize is the
+(b) row-*width* term on **passthrough**-dead columns (the producer-dead window cols are
+already handled by §9).
 
-## 11. Effort / payoff
+**Before building the invasive cross-view reindexing, the ceiling was estimated** —
+Σ(view rows × dead passthrough cols × ~2 ApplyOp passes × ~12 B/slot):
 
-- Layer 2 + analysis + diagnostic + arity-preserving rewrite: **done**; the rewrite is a
-  measured near-wash (−1 GiB), retained as gated foundation.
-- Arity-reducing rewrite (§10): **medium-large** (reindexing), and the measurement says it is
-  where the real allocation win lives — the (b) row-width term, biggest on the wide-dead-row
-  views (`accounts`, `syndicated_prospect`).
+| view | rows | dead | cell-passes |
+|---|---|---|---|
+| watches | 886K | 5 | 8.9M |
+| trades | 982K | 4 | 7.9M |
+| holdings_history | 912K | 2 | 3.6M |
+| trades_history | 982K | 2 | 3.9M |
+| accounts | 11K | 23 | 0.5M |
+| syndicated_prospect | 15K | 14 | 0.4M |
+| (rest) | | | ~1.3M |
+| **total** | | | **26.5M → ~0.3 GiB** |
 
-Needs neither the columnar storage rewrite nor expression vectorization — orthogonal to and
-composes with both.
+**~0.3 GiB (≤ ~1 GiB even at 3–4× generous assumptions) — ~1–2% of the 44.74 GiB batch,
+wall-neutral.** The wide-dead-column views (`accounts 23/32`, `syndicated_prospect 14/22`) are
+low-volume *dimensions* (~11–15K rows); the high-volume fact-shaped views have only 2–5 dead
+columns each. The correlation is adversarial: **columns are mostly dead exactly where rows are
+few.** Dead columns are a small fraction of the total row-material flowing, so pruning them
+touches a small fraction of the (b) term.
+
+**Decision: do NOT build the arity-reducing rewrite.** A large, invasive, correctness-risky
+cross-view reindexing transformation for a ≤~1 GiB / wall-neutral ceiling is not justified.
+
+## 11. Arc status / payoff
+
+- Analysis + diagnostic + Layer 2 (`ComputeProgramLiveColumns`): **done, committed** — a
+  reusable, validated tool (confirmed the `daily_market` finding; the `ColumnLivenessProbe`
+  stays as a diagnostic).
+- Arity-preserving rewrite (`EliminateDeadColumns`): **done, gated default-off** — measured a
+  −1 GiB near-wash; retained as documented foundation, not a shipping win.
+- Arity-reducing rewrite: **not built** — estimated ceiling ≤ ~1 GiB, wall-neutral (§10).
+
+**Honest conclusion for the batch-1 arc:** dead-column elimination in both forms tops out at
+~1–2 GiB (~4%), wall-neutral, because the dead fraction of the row-material is small and
+adversarially distributed. The re-profile's real prize — the ApplyOp/(b) row-materialization
+of *all* (mostly live) rows — is reachable only by the columnar/vectorized-execution rewrite
+(`docs/design-row-representation.md`), a large project with its own ~1.3–2× (not parity)
+ceiling. Column liveness is a validated tool and a modest correctness-preserving cleanup, not
+the lever that moves the ~3.4:1 batch-1 gap.
