@@ -3507,6 +3507,49 @@ order keys) — measure-first there too.
 
 ---
 
+## 24. Next arc — scoping the remaining ivm-bench batch-1 gap (3.5×, design-only)
+
+**Status (2026-07-21):** after the program-path optimizer (`6a8a9e3`), residual pushdown
+([[residual-pushdown-next]]), and the algorithmic wins, DbspNet is **~3.5× Feldera's time on the
+SF=3 batch-1 bulk historical load** — down from ~7× ([[ivm-bench-batch1-perf-gap]]). The wins that
+moved it were **algorithmic**, not the per-row micro-levers (typed ingest, barrier coalescing,
+W-sizing, §19, §20 all held flat/negative on the real benchmark — the standing caveat). This
+section scopes the next arc; it is design-only, to be run as a **fresh, design-first session**.
+
+**Where the gap now lives.** The engine is **allocation-bound**, apportioned (§16–§17) as
+**Layer A ~55–60%** (a fresh dict-backed Z-set per operator per tick + whole-row hash/equality —
+architectural, untouchable by typing per §23) and **Layer B ~40–45%** (the `object[]`/`StructuralRow`
+boxing boundary — already largely attacked; even full elimination only reaches ~mid-20s GiB). So the
+**real remaining prize is Layer A**, and the only Layer-A levers that keep the near-optimal
+shared-`object[]`-by-reference model (§23's decisive finding) are columnar / buffer-reuse on the
+inner multiset.
+
+**Candidate levers, ranked by prize × tractability (all measure-first):**
+
+1. **Re-profile batch-1 first (do before anything else).** The hot-view profile (watches agg,
+   daily_market window, trades) predates the optimizer + residual pushdown and is almost certainly
+   stale. Use the Docker-free `IvmBatchProfile` loop; aim every lever below at the *fresh* profile.
+2. **Bulk-load / batch-construction fast path (the new idea).** Batch-1 is a *one-shot historical
+   load* — a batch, not a stream — yet it flows through the incremental machinery, paying per-op
+   dict-merge churn for millions of rows. Feldera bulk-builds arrangements sorted, once. Design
+   question: can the initial load build the traces directly (sorted bulk build) instead of
+   dict-merging a giant delta? Workload-shaped, distinct from the general floor, plausibly lower
+   effort than columnar, and it targets the *exact* metric ivm-bench reports.
+3. **Columnar / buffer-reuse on the Layer-A inner multiset.** The arc every row-rep memory points
+   at; §20 delta pooling was landed partly to de-risk it. Biggest prize, biggest effort — and note
+   the naive spine *substrate* lost 1.4–2.5× at W=24 (§ row-representation-design), so it needs a
+   genuinely columnar inner rep, not a trace swap.
+4. **Memoized row hash (cheap probe / warm-up).** A `StructuralRow` is hashed repeatedly (join
+   probe + aggregate + distinct all hash the same row). If `GetHashCode` isn't already memoized,
+   caching it is a small, broad cut against the 40–48% whole-row-hash term (§17). ~30-min check +
+   measure before the big arcs.
+
+**Sequencing:** re-profile (1) → weight the workload-shaped, quickly-testable levers (2, 4) ahead of
+the columnar rewrite (3); let the numbers pick. Relates to [[per-row-execution-efficiency]],
+[[row-representation-design]], [[repr-execution-apportionment]], [[ivm-bench-arc]].
+
+---
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
