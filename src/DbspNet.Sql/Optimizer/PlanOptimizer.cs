@@ -63,13 +63,19 @@ public static class PlanOptimizer
             var next = OptimizeNode(current);
             if (ReferenceEquals(next, current))
             {
-                return next;
+                current = next;
+                break;
             }
 
             current = next;
         }
 
-        return current;
+        // Final pass: common-subexpression elimination by hash-consing. The rewrite
+        // rules above produce fresh instances each iteration and never share, so CSE
+        // runs once at the fixed point — it collapses structurally-identical subtrees
+        // (e.g. a subquery spelled twice, like Nexmark q5's windowed count) to a
+        // single shared instance the plan→circuit compiler compiles once.
+        return PlanCse.Eliminate(current);
     }
 
     private static LogicalPlan OptimizeNode(LogicalPlan plan)

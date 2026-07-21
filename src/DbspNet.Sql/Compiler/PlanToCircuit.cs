@@ -439,6 +439,17 @@ public static class PlanToCircuit
         public Dictionary<CteRef, Stream<ZSet<StructuralRow, Z64>>> CteCache { get; } = new();
 
         /// <summary>
+        /// Per-reference compiled-subplan cache. A subplan instance that appears more
+        /// than once in the plan DAG — the shape <see cref="Optimizer.PlanCse"/>
+        /// produces by interning structurally-identical subtrees — compiles once and
+        /// every subsequent reference returns the same stream. Keyed by reference
+        /// identity (records compare by value, which would wrongly collapse distinct
+        /// look-alike subplans that CSE chose <em>not</em> to share).
+        /// </summary>
+        public Dictionary<LogicalPlan, Stream<ZSet<StructuralRow, Z64>>> PlanCache { get; } =
+            new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>
         /// Arrangement keys (relation + right key columns) that ≥2 INNER joins
         /// share, found by <see cref="CollectShareableArrangements"/>. Empty
         /// unless <see cref="CompileOptions.ShareArrangements"/> is set.
@@ -1120,7 +1131,39 @@ public static class PlanToCircuit
 
     // ---- Plan → stream ----
 
+    // Diagnostic counters for the per-reference subplan memo (CSE). Not part of the
+    // runtime contract; used by benchmark/plan-dump tooling to confirm shared
+    // subplans compile once. Not thread-safe.
+    internal static int MemoHits { get; set; }
+
+    internal static int MemoMisses { get; set; }
+
     private static Stream<ZSet<StructuralRow, Z64>> CompilePlan(
+        CircuitBuilder builder,
+        LogicalPlan plan,
+        CompileContext ctx)
+    {
+        // A subplan interned by PlanCse appears at multiple parents by reference;
+        // compile it once and share the stream (each consumer adds its own downstream
+        // ops / exchanges). Scans and CTE scans have their own dedicated caches below,
+        // so skip them here to avoid a redundant second lookup.
+        if (plan is not (ScanPlan or CteScanPlan) && ctx.PlanCache.TryGetValue(plan, out var memo))
+        {
+            MemoHits++;
+            return memo;
+        }
+
+        MemoMisses++;
+        var stream = CompilePlanUncached(builder, plan, ctx);
+        if (plan is not (ScanPlan or CteScanPlan))
+        {
+            ctx.PlanCache[plan] = stream;
+        }
+
+        return stream;
+    }
+
+    private static Stream<ZSet<StructuralRow, Z64>> CompilePlanUncached(
         CircuitBuilder builder,
         LogicalPlan plan,
         CompileContext ctx)

@@ -135,6 +135,21 @@ if (args.Length > 0 && args[0] == "reprbench")
     return 0;
 }
 
+// Nexmark plan dump: `dotnet run -- nexmarkplan <qid>`
+// Compile a Nexmark query to its optimized LogicalPlan and dump the operator tree
+// + per-kind counts, tagging reference-shared subtrees — surfaces structural
+// redundancy (e.g. a subquery materialized twice because it isn't reference-shared).
+if (args.Length > 0 && args[0] == "nexmarkplan")
+{
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.Nexmark.NexmarkPlanDump.Run(sb, args.Length > 1 ? args[1] : "q5");
+    var npPath = Path.Combine(FindDocsDir(), $"nexmark-plan-{(args.Length > 1 ? args[1] : "q5")}.md");
+    File.WriteAllText(npPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(npPath)}");
+    return 0;
+}
+
 // ApplyOp alloc split: `dotnet run -- applysplit [ticks] [delta] [runs]`
 // Row-wise vs columnar (SoA) projection ApplyOp, apportioning per-row allocation
 // (container / StructuralRow wrapper+hash / object[] / boxed compute) and the

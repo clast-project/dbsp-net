@@ -354,6 +354,18 @@ public static class TypedPlanCompiler
         public Dictionary<CteRef, TypedNode> CteCache { get; } = new();
 
         /// <summary>
+        /// Per-reference compiled-subplan cache: a subplan instance appearing more
+        /// than once in the plan DAG — the shape <see cref="Optimizer.PlanCse"/>
+        /// produces by interning structurally-identical subtrees — compiles once and
+        /// every subsequent reference returns the same typed stream. Keyed by
+        /// reference identity (records compare by value, which would wrongly collapse
+        /// look-alike subplans CSE chose <em>not</em> to share). Mirrors
+        /// <see cref="PlanToCircuit.CompileContext.PlanCache"/> on the structural path.
+        /// </summary>
+        public Dictionary<LogicalPlan, TypedNode> PlanCache { get; } =
+            new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>
         /// Snapshot codec factory threaded through from the SQL
         /// compiler entry point. Stateful operators (Join, Aggregate)
         /// build typed-adapted codecs from it via the
@@ -438,7 +450,29 @@ public static class TypedPlanCompiler
 
     private sealed class UnsupportedPlanException : Exception;
 
-    private static TypedNode? TryCompileNode(LogicalPlan plan, CompileContext ctx) => plan switch
+    private static TypedNode? TryCompileNode(LogicalPlan plan, CompileContext ctx)
+    {
+        // A subplan interned by PlanCse appears at multiple parents by reference;
+        // compile it once and share the typed stream. Scans and CTE scans have their
+        // own dedicated caches, so skip them here. A null result means "no typed path,
+        // fall back to structural" and is not cached (the whole query falls back).
+        if (plan is not (ScanPlan or CteScanPlan) && ctx.PlanCache.TryGetValue(plan, out var memo))
+        {
+            PlanToCircuit.MemoHits++;
+            return memo;
+        }
+
+        var node = TryCompileNodeUncached(plan, ctx);
+        if (node is not null && plan is not (ScanPlan or CteScanPlan))
+        {
+            PlanToCircuit.MemoMisses++;
+            ctx.PlanCache[plan] = node;
+        }
+
+        return node;
+    }
+
+    private static TypedNode? TryCompileNodeUncached(LogicalPlan plan, CompileContext ctx) => plan switch
     {
         ScanPlan s => CompileScan(s, ctx),
         // Filter / Project are pointwise and stateless; a maximal run of them
