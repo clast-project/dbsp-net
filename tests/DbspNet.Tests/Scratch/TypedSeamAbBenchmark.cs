@@ -99,7 +99,10 @@ public class TypedSeamAbBenchmark
             return Measure(b.Step, b.RowCount);
         }
 
-        (long Alloc, double Ms, long Rows) RunTypedSeam()
+        // Build a typed-seam circuit (optionally with the monomorphized order key),
+        // returning the input handle + integrated view so callers can push, step,
+        // measure, and read the output.
+        (TableInput Input, Action Step, IntegratedViewHandle<StructuralRow> View) BuildTypedSeam(CompileOptions opts)
         {
             InputHandle<ZSet<StructuralRow, Z64>>? handle = null;
             IntegratedViewHandle<StructuralRow>? view = null;
@@ -117,14 +120,23 @@ public class TypedSeamAbBenchmark
                     ("daily_market", dailyPlan),
                 };
                 var outStream = TypedPlanCompiler.TryCompileTypedSeamChain(
-                    builder, chain, scans, StructuralRowCodec.Instance)
+                    builder, chain, scans, StructuralRowCodec.Instance, options: opts)
                     ?? throw new InvalidOperationException("typed-seam chain did not compile");
                 view = builder.Integrate(outStream).View;
             });
             var input = new TableInput(handle!, stagingSchema, StructuralRowCodec.Instance);
-            foreach (var vb in batches) input.PushArrow(vb.Batch, vb.Weights);
-            return Measure(circuit.Step, () => view!.Current.Count);
+            return (input, circuit.Step, view!);
         }
+
+        (long Alloc, double Ms, long Rows) RunTypedSeam(CompileOptions opts)
+        {
+            var (input, step, view) = BuildTypedSeam(opts);
+            foreach (var vb in batches) input.PushArrow(vb.Batch, vb.Weights);
+            return Measure(step, () => view.Current.Count);
+        }
+
+        var typedDefault = CompileOptions.Default;
+        var typedMono = new CompileOptions { MonomorphizeWindowOrderKey = true };
 
         // 1 warmup (discarded) + 3 measured passes per config, fresh circuit each pass.
         var results = new List<(string Cfg, long Alloc, double Ms, long Rows)>();
@@ -132,7 +144,8 @@ public class TypedSeamAbBenchmark
         {
             ("S structural", () => RunProgram(false)),
             ("H hybrid-seam", () => RunProgram(true)),
-            ("T typed-seam", RunTypedSeam),
+            ("T typed-seam", () => RunTypedSeam(typedDefault)),
+            ("T2 mono-orderkey", () => RunTypedSeam(typedMono)),
         })
         {
             run(); // warmup
@@ -158,27 +171,76 @@ public class TypedSeamAbBenchmark
         var s = results[0];
         var h = results[1];
         var t = results[2];
+        var t2 = results[3];
         double PctA(long a, long b0) => (a - b0) / (double)b0 * 100.0;
         double PctM(double a, double b0) => (a - b0) / b0 * 100.0;
         sb.AppendLine();
         sb.AppendLine("-- decomposition (relative to S) --");
         sb.AppendLine(CultureInfo.InvariantCulture,
-            $"  H-S (hybrid total)     alloc {PctA(h.Alloc, s.Alloc),6:F1}%   time {PctM(h.Ms, s.Ms),6:F1}%");
+            $"  H-S (hybrid total)      alloc {PctA(h.Alloc, s.Alloc),6:F1}%   time {PctM(h.Ms, s.Ms),6:F1}%");
         sb.AppendLine(CultureInfo.InvariantCulture,
-            $"  T-S (typed-seam design) alloc {PctA(t.Alloc, s.Alloc),6:F1}%   time {PctM(t.Ms, s.Ms),6:F1}%   <- the user's model");
+            $"  T-S (typed-seam design)  alloc {PctA(t.Alloc, s.Alloc),6:F1}%   time {PctM(t.Ms, s.Ms),6:F1}%   <- boxed order key");
         sb.AppendLine(CultureInfo.InvariantCulture,
-            $"  H-T (seam round-trip)   alloc {PctA(h.Alloc, t.Alloc),6:F1}%   time {PctM(h.Ms, t.Ms),6:F1}%");
+            $"  T2-S (monomorphized key) alloc {PctA(t2.Alloc, s.Alloc),6:F1}%   time {PctM(t2.Ms, s.Ms),6:F1}%   <- unboxed order key");
+        sb.AppendLine(CultureInfo.InvariantCulture,
+            $"  T-T2 (order-key boxing)  alloc {PctA(t.Alloc, t2.Alloc),6:F1}%   time {PctM(t.Ms, t2.Ms),6:F1}%   <- what monomorphization removed");
+        sb.AppendLine(CultureInfo.InvariantCulture,
+            $"  H-T (seam round-trip)    alloc {PctA(h.Alloc, t.Alloc),6:F1}%   time {PctM(h.Ms, t.Ms),6:F1}%");
         sb.AppendLine();
-        sb.AppendLine(s.Rows == h.Rows && h.Rows == t.Rows
-            ? $"row counts MATCH across all three ({s.Rows}) — apples-to-apples."
-            : $"WARNING: row counts differ! S={s.Rows} H={h.Rows} T={t.Rows}");
+        var allRows = new[] { s.Rows, h.Rows, t.Rows, t2.Rows };
+        sb.AppendLine(allRows.Distinct().Count() == 1
+            ? $"row counts MATCH across all four ({s.Rows}) — apples-to-apples."
+            : $"WARNING: row counts differ! S={s.Rows} H={h.Rows} T={t.Rows} T2={t2.Rows}");
+
+        // Correctness: the monomorphized order key must produce byte-identical output
+        // to structural (same multiset). Capture full outputs and compare.
+        var outS = CaptureProgram(false);
+        var outT2 = CaptureTypedSeam(typedMono);
+        var equal = ZSetsEqual(outS, outT2);
+        sb.AppendLine(equal
+            ? $"CORRECTNESS: T2 (monomorphized) output == S (structural) output — {outS.Count} rows, identical multiset."
+            : "CORRECTNESS FAILURE: T2 output differs from S!");
 
         var report = sb.ToString();
         _out.WriteLine(report);
         var outFile = Environment.GetEnvironmentVariable("IVM_SEAM_FILE");
         if (!string.IsNullOrEmpty(outFile)) File.WriteAllText(outFile, report);
 
-        Assert.Equal(s.Rows, t.Rows); // typed-seam must be correctness-equivalent
+        Assert.True(allRows.Distinct().Count() == 1, "all four configs must agree on row count");
+        Assert.True(equal, "monomorphized order key must be output-identical to structural");
+
+        // Local capture helpers (full output ZSet) for the correctness check.
+        ZSet<StructuralRow, Z64> CaptureProgram(bool typed)
+        {
+            var program = PlanToCircuit.CompileProgram(
+                resolved.Tables, resolved.Views, null,
+                typed ? new CompileOptions { TypeEligibleProgramViews = true } : CompileOptions.Default);
+            var input = program.Table("staging_daily_market");
+            foreach (var vb in batches) input.PushArrow(vb.Batch, vb.Weights);
+            program.Step();
+            return program.Outputs["daily_market"].CurrentView;
+        }
+
+        ZSet<StructuralRow, Z64> CaptureTypedSeam(CompileOptions opts)
+        {
+            var (input, step, view) = BuildTypedSeam(opts);
+            foreach (var vb in batches) input.PushArrow(vb.Batch, vb.Weights);
+            step();
+            return view.Current;
+        }
+    }
+
+    private static bool ZSetsEqual(ZSet<StructuralRow, Z64> a, ZSet<StructuralRow, Z64> b)
+    {
+        if (a.Count != b.Count) return false;
+        var mb = new Dictionary<StructuralRow, long>();
+        foreach (var (row, w) in b) mb[row] = w.Value;
+        foreach (var (row, w) in a)
+        {
+            if (!mb.TryGetValue(row, out var bw) || bw != w.Value) return false;
+        }
+
+        return true;
     }
 
     private static (long Alloc, double Ms, long Rows) Measure(Action step, Func<long> rowCount)

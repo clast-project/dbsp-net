@@ -1377,6 +1377,7 @@ public static class TypedPlanCompiler
         // ORDER BY key (boxed), if any — its presence + a bounded frame select the
         // operator's three frame shapes (see PartitionedWindowAggregateOp).
         Delegate? orderExtractor = null;
+        Delegate? unboxedOrderKey = null;
         var descending = false;
         var nullsFirst = false;
         if (plan.OrderKey is { } sk)
@@ -1385,6 +1386,13 @@ public static class TypedPlanCompiler
             orderExtractor = ex;
             descending = sk.Descending;
             nullsFirst = sk.NullsFirst;
+
+            // Measurement gate (§23.7): the unboxed monotone-long comparer, when the
+            // key is a recognised carrier. Null ⇒ keep the boxed comparer.
+            if (ctx.Options.MonomorphizeWindowOrderKey)
+            {
+                unboxedOrderKey = BuildUnboxedOrderKey(sk.Expression, rowType);
+            }
         }
 
         // Typed composite aggregator + emitted TAgg ([agg cols…]).
@@ -1414,7 +1422,7 @@ public static class TypedPlanCompiler
 
         var output = InvokePartitionedWindowAggregate(
             ctx.Builder, rowType, aggRowType, outRowType, opInput,
-            partitionExtractors, orderExtractor, descending, nullsFirst,
+            partitionExtractors, orderExtractor, unboxedOrderKey, descending, nullsFirst,
             plan.Frame?.Preceding, composite, flatten, snapshotCodec);
 
         // Output is partitioned by the PARTITION BY columns. The widen carries the
@@ -1565,6 +1573,58 @@ public static class TypedPlanCompiler
         var boxed = Expression.Convert(body, typeof(object));
         var funcType = typeof(Func<,>).MakeGenericType(rowType, typeof(object));
         return Expression.Lambda(funcType, boxed, rowParam).Compile();
+    }
+
+    /// <summary>
+    /// Builds an <b>unboxed</b> monotone order-key extractor
+    /// <c>Func&lt;TRow, long?&gt;</c> for <paramref name="expr"/> — the value
+    /// <see cref="LongKeyComparer{TRow}"/> compares — mirroring
+    /// <see cref="MonotoneKey.Extract"/>'s carrier mapping (long/int as-is,
+    /// <see cref="Timestamp"/>/<see cref="Time64"/> microseconds, <see cref="Date32"/>
+    /// days) but in-expression with no boxing. Returns <c>null</c> (caller falls back to
+    /// the boxed <c>SortKeyComparer</c>) when the key is not a recognised carrier type,
+    /// so the fast path is taken only where its <c>long</c> order provably matches.
+    /// SQL NULL maps to a <c>null</c> long? (the comparer places it via nullsFirst).
+    /// (design §23.7)
+    /// </summary>
+    private static Delegate? BuildUnboxedOrderKey(ResolvedExpression expr, Type rowType)
+    {
+        var rowParam = Expression.Parameter(rowType, "row");
+        var body = TypedExpressionCompiler.TryBuildInto(expr, rowParam);
+        if (body is null) return null;
+
+        var underlying = Nullable.GetUnderlyingType(body.Type) ?? body.Type;
+
+        Expression? MapToLong(Expression val)
+        {
+            if (underlying == typeof(long)) return val;
+            if (underlying == typeof(int)) return Expression.Convert(val, typeof(long));
+            if (underlying == typeof(Timestamp)) return Expression.Property(val, nameof(Timestamp.Microseconds));
+            if (underlying == typeof(Time64)) return Expression.Property(val, nameof(Time64.Microseconds));
+            if (underlying == typeof(Date32)) return Expression.Property(val, nameof(Date32.Days));
+            return null;
+        }
+
+        var nullableLong = typeof(long?);
+        Expression result;
+        if (Nullable.GetUnderlyingType(body.Type) is not null)
+        {
+            var mapped = MapToLong(Expression.Property(body, "Value"));
+            if (mapped is null) return null;
+            result = Expression.Condition(
+                Expression.Property(body, "HasValue"),
+                Expression.Convert(mapped, nullableLong),
+                Expression.Constant(null, nullableLong));
+        }
+        else
+        {
+            var mapped = MapToLong(body);
+            if (mapped is null) return null;
+            result = Expression.Convert(mapped, nullableLong);
+        }
+
+        var funcType = typeof(Func<,>).MakeGenericType(rowType, nullableLong);
+        return Expression.Lambda(funcType, result, rowParam).Compile();
     }
 
     /// <summary>
@@ -3434,7 +3494,8 @@ public static class TypedPlanCompiler
 
     private static object InvokePartitionedWindowAggregate(
         CircuitBuilder builder, Type inRowType, Type aggRowType, Type outRowType, object input,
-        Delegate[] partitionExtractors, Delegate? orderExtractor, bool descending, bool nullsFirst,
+        Delegate[] partitionExtractors, Delegate? orderExtractor, Delegate? unboxedOrderKey,
+        bool descending, bool nullsFirst,
         long? preceding, object aggregator, Delegate flatten, object? snapshotCodec)
     {
         var openMethod = typeof(TypedPlanCompiler)
@@ -3443,7 +3504,7 @@ public static class TypedPlanCompiler
         var closed = openMethod.MakeGenericMethod(inRowType, aggRowType, outRowType);
         return closed.Invoke(null, new object?[]
         {
-            builder, input, partitionExtractors, orderExtractor, descending, nullsFirst,
+            builder, input, partitionExtractors, orderExtractor, unboxedOrderKey, descending, nullsFirst,
             preceding, aggregator, flatten, snapshotCodec,
         })!;
     }
@@ -3455,7 +3516,7 @@ public static class TypedPlanCompiler
     /// partition columns, as in <see cref="BuildPartitionedTopK{TRow}"/>).</summary>
     private static object BuildPartitionedWindowAggregate<TInRow, TAgg, TOutRow>(
         CircuitBuilder builder, object input, Delegate[] partitionExtractors,
-        Delegate? orderExtractor, bool descending, bool nullsFirst,
+        Delegate? orderExtractor, Delegate? unboxedOrderKey, bool descending, bool nullsFirst,
         long? preceding, object aggregator, Delegate flatten, object? snapshotCodec)
         where TInRow : notnull
         where TAgg : notnull
@@ -3480,7 +3541,15 @@ public static class TypedPlanCompiler
 
         IComparer<TInRow> order;
         Func<TInRow, long>? orderValueOf = null;
-        if (orderExtractor is Func<TInRow, object?> orderBoxed)
+        if (unboxedOrderKey is Func<TInRow, long?> keyOf)
+        {
+            // Monomorphized (§23.7): compare the unboxed monotone long key — no heap
+            // box per comparison. Order-equivalent to the boxed SortKeyComparer branch
+            // (the long mapping is monotone; NULL / DESC / tiebreak logic is mirrored).
+            order = new LongKeyComparer<TInRow>(keyOf, descending, nullsFirst, Comparer<TInRow>.Default);
+            orderValueOf = row => keyOf(row) ?? long.MinValue;
+        }
+        else if (orderExtractor is Func<TInRow, object?> orderBoxed)
         {
             var keys = new[] { orderBoxed };
             order = new SortKeyComparer<TInRow>(

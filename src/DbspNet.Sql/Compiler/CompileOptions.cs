@@ -144,4 +144,18 @@ public sealed record CompileOptions
     /// re-measurable gate for the arc (flip IVM_TYPE_VIEWS=1 on the local harness).
     /// </remarks>
     public bool TypeEligibleProgramViews { get; init; }
+
+    /// <summary>
+    /// Opt-in (measurement gate, design §23.7): on the typed window-aggregate path,
+    /// key the per-partition ordered state on the <b>unboxed</b> monotone order value
+    /// (a <c>long?</c> via <see cref="DbspNet.Core.Collections.LongKeyComparer{TRow}"/>)
+    /// instead of the boxed one-key <c>SortKeyComparer</c>. On a typed struct row the
+    /// boxed comparer allocates one heap box per key per comparison (the dominant term
+    /// in the typed-vs-structural window-aggregate allocation gap — the sort comparator
+    /// runs O(log n) times per insert); the monomorphized comparer removes it. Sound
+    /// only when the order key's monotone <c>long</c> extraction preserves the boxed
+    /// comparer's order (integer/temporal carriers), and falls back to the boxed
+    /// comparer otherwise. Off by default; the structural path is unaffected.
+    /// </summary>
+    public bool MonomorphizeWindowOrderKey { get; init; }
 }

@@ -3423,6 +3423,63 @@ monomorphized operators, or columnar/buffer-reuse that sidesteps per-row boxing 
 §17–§21). `TryCompileTypedSeamChain` + `TypedSeamAbBenchmark` are retained (gated) for
 re-measurement.
 
+### 23.7 — Can a smarter compiler avoid the boxing? Building the monomorphized order key (BUILT, MEASURED — yes, it removes 72 % of the penalty; the rest is representation)
+
+§23.6 concluded the typed penalty is in-operator, not the seam. The next question (Curt):
+*shouldn't a more sophisticated compiler avoid that boxing?* To answer it, per-site
+allocation was attributed inside `PartitionedWindowAggregateOp` (`WindowAggAllocProbe`), then
+the implicated site was actually fixed and re-measured.
+
+**Attribution.** Both paths call every site the same number of times (2.57 M inserts, 89.8 M
+comparisons — **no algorithmic divergence**). The typed overhead concentrates in one place:
+the per-partition `SortedDictionary` insert, whose `SortKeyComparer` runs the **boxed** order-key
+extractor on both operands *per comparison* (`SortKeyComparer.Compare`, O(log n) per insert).
+Structural passes an extractor that returns the row's **already-boxed** `object[]` element (0
+alloc — a box cache); typed boxes `dm_date` fresh every comparison. Per-row order-key boxing
+(`orderValueOf`, once/row) is only ~59 MiB — a red herring; the cost is the *comparator*.
+(The fine-grained per-call GC probe is imprecise at 90 M calls — it swung 11.9↔4.5 GiB across
+runs — so the authoritative number comes from the stable top-line A/B below.)
+
+**The fix (a real monomorphization, ~50 lines).** `CompileOptions.MonomorphizeWindowOrderKey`
+routes the typed window-aggregate's ordered state through a new
+`LongKeyComparer<TRow>` that compares the **unboxed** monotone key (`Func<TRow, long?>`,
+built by `BuildUnboxedOrderKey` mirroring `MonotoneKey.Extract`'s carrier mapping —
+`int`/`long` as-is, `Timestamp`/`Time64` µs, `Date32` days) instead of the boxed
+`SortKeyComparer`. NULL / DESC / tiebreak logic is mirrored exactly, and the mapping is
+order-preserving, so it is provably order-equivalent; it falls back to the boxed comparer for
+non-carrier keys. Only the typed path changes; structural is untouched.
+
+**Result (SF=3 `daily_market` slice, Step-only, stable top-line `GetTotalAllocatedBytes`):**
+
+| config | step ms | alloc MiB | vs S |
+|---|---|---|---|
+| S structural | 9,657 | 4,044 | — |
+| T typed (boxed order key) | 15,064 | 20,193 | +399 % alloc |
+| **T2 typed (monomorphized order key)** | **11,565** | **8,570** | **+112 % alloc** |
+
+- **T → T2: −58 % allocation (−11.6 GiB), −23 % time — from one targeted compiler change.**
+- **Output byte-identical**: the benchmark asserts T2's full output ZSet == S's (1,282,768 rows, identical multiset). Correctness-equivalent, verified.
+- The boxing was **72 % of the entire typed penalty** (T−S gap 16.1 GiB; T−T2 removed 11.6 GiB). T and T2 differ *only* in the order comparer, so the 11.6 GiB is exactly the comparator boxing — ~4× what the fine-grained probe reported, confirming the probe undercounts and the build-and-measure approach was necessary.
+
+**So the answer is yes — and it is not a rewrite.** ~¾ of the typed penalty was one fixable
+inefficiency (boxed key extraction to keep the operator row-opaque); a monomorphized comparer
+erases it, byte-identically. This reframes §23.3–§23.6: typed rows are **not** fundamentally
+5× worse — with the boxing removed, typed is +112 %/2.1× on this slice, and the residual is
+now **representation**, not boxing:
+- `emit:diff+builder` 3.0 GiB and `fold:FromEntries` 1.8 GiB and `recompute:rowsList` 0.7 GiB —
+  wide `TOutRow`/`TInRow` structs copied **by value** into the output `ZSetBuilder`, the per-row
+  1-element frame Z-set, and the recompute list (vs `object[]` refs structurally). This is the
+  Layer-A/columnar territory (§17–§21) — a leaner value path or buffer-reuse, not de-boxing.
+
+**Standing:** `MonomorphizeWindowOrderKey` is a genuine, correctness-equivalent, low-risk win
+that also applies to the **single-query and parallel** typed window-aggregate paths (Nexmark
+window queries, the fraud view) — i.e. a rare *in-Step* per-row allocation cut that carries to
+W>1 (the [[per-row-execution-efficiency]] holy grail). Kept **default-off (gated)** pending a
+broader validation pass (full window-aggregate + parallel + spine PBTs with it on) before a
+default-on decision; the boxed comparer stays as the fallback for non-carrier keys. The same
+"unbox the key, keep the operator generic over a typed key type" pattern generalizes to the
+other row-opaque stateful operators (join/aggregate/TOP-K partition & order keys).
+
 ---
 
 ## Appendix — sources
@@ -3465,6 +3522,10 @@ step-profile.md — §22.8, NO-BUILD);
 `TypedPlanCompiler.TryCompileTypedSeamChain` + `Scratch/TypedSeamAbBenchmark.cs`
 (`IVM_SEAM_FILE` — §23.6, the S/H/T seam-isolation A/B/C: seam is ~3.5%/9%, the cost is the
 in-operator boxed-extractor tax);
+`CompileOptions.MonomorphizeWindowOrderKey` + `LongKeyComparer` + `BuildUnboxedOrderKey` +
+`WindowAggAllocProbe` + `TypedSeamAbBenchmark` T2 config (§23.7 — the monomorphized order key:
+−58% alloc / −23% time, byte-identical, 72% of the typed penalty was order-key boxing;
+gated default-off);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,
