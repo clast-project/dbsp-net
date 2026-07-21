@@ -31,6 +31,16 @@ namespace DbspNet.Sql.Compiler;
 public static class TypedPlanCompiler
 {
     /// <summary>
+    /// Diagnostic (tests only, design §23.7): the number of window-aggregate order
+    /// keys wired through the monomorphized <see cref="LongKeyComparer{TRow}"/> since
+    /// the last reset. Lets the window-aggregate validation confirm that
+    /// <see cref="CompileOptions.MonomorphizeWindowOrderKey"/> actually engaged (a
+    /// parallel compile increments once per replica) rather than passing vacuously.
+    /// Not thread-safe; not part of the runtime contract.
+    /// </summary>
+    internal static int MonomorphizedWindowOrderKeyCount { get; set; }
+
+    /// <summary>
     /// Attempts to compile <paramref name="plan"/> into a
     /// <see cref="TypedCompiledQuery"/>. Returns <c>false</c> if any
     /// part of the plan or any referenced schema falls outside the
@@ -1392,6 +1402,10 @@ public static class TypedPlanCompiler
             if (ctx.Options.MonomorphizeWindowOrderKey)
             {
                 unboxedOrderKey = BuildUnboxedOrderKey(sk.Expression, rowType);
+                if (unboxedOrderKey is not null)
+                {
+                    MonomorphizedWindowOrderKeyCount++;
+                }
             }
         }
 
@@ -1587,7 +1601,7 @@ public static class TypedPlanCompiler
     /// SQL NULL maps to a <c>null</c> long? (the comparer places it via nullsFirst).
     /// (design §23.7)
     /// </summary>
-    private static Delegate? BuildUnboxedOrderKey(ResolvedExpression expr, Type rowType)
+    internal static Delegate? BuildUnboxedOrderKey(ResolvedExpression expr, Type rowType)
     {
         var rowParam = Expression.Parameter(rowType, "row");
         var body = TypedExpressionCompiler.TryBuildInto(expr, rowParam);

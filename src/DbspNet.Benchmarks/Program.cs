@@ -222,6 +222,31 @@ if (args.Length > 0 && args[0] == "exchangefuse")
     return 0;
 }
 
+// Window-agg order-key monomorphization gate: `dotnet run -- windowmono [txns] [customers] [batch] [W] [runs]`
+// Boxed vs unboxed (LongKeyComparer) order key on the fraud rolling-window feature
+// view, A/B step throughput + allocation at W=1 and W (docs §23.7).
+if (args.Length > 0 && args[0] == "windowmono")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var txns = Arg(1, 1_000_000);
+    var customers = Arg(2, 2_000);
+    var batch = Arg(3, 10_000);
+    int? workers = args.Length > 4 && int.TryParse(args[4], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var w) ? w : null;
+    var runs = Arg(5, 3);
+
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.WindowMonoBenchmark.Run(sb, txns, customers, batch, workers, runs);
+    var wmPath = Path.Combine(FindDocsDir(), "window-mono-bench.md");
+    File.WriteAllText(wmPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(wmPath)}");
+    return 0;
+}
+
 // q4 end-to-end flat lazy-view gate: `dotnet run -- q4flat [workers] [runs]`
 // Whole q4 parallel pipeline, flat·eager vs flat·lazy aggregate
 // (docs/design-row-representation.md §14.10).

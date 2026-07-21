@@ -3472,13 +3472,38 @@ now **representation**, not boxing:
   Layer-A/columnar territory (§17–§21) — a leaner value path or buffer-reuse, not de-boxing.
 
 **Standing:** `MonomorphizeWindowOrderKey` is a genuine, correctness-equivalent, low-risk win
-that also applies to the **single-query and parallel** typed window-aggregate paths (Nexmark
-window queries, the fraud view) — i.e. a rare *in-Step* per-row allocation cut that carries to
-W>1 (the [[per-row-execution-efficiency]] holy grail). Kept **default-off (gated)** pending a
-broader validation pass (full window-aggregate + parallel + spine PBTs with it on) before a
-default-on decision; the boxed comparer stays as the fallback for non-carrier keys. The same
-"unbox the key, keep the operator generic over a typed key type" pattern generalizes to the
-other row-opaque stateful operators (join/aggregate/TOP-K partition & order keys).
+that also applies to the **single-query and parallel** typed window-aggregate paths (the fraud
+view; Nexmark's OVER queries are all `ROW_NUMBER` → rank/TOP-K, so none exercise the
+window-*aggregate* gate) — i.e. a rare *in-Step* per-row allocation cut that carries to W>1 (the
+[[per-row-execution-efficiency]] holy grail).
+
+**DEFAULT-ON (shipped).** Both gates cleared, so the flag now defaults true (the boxed comparer
+stays as the fallback for non-carrier keys and via an explicit `MonomorphizeWindowOrderKey = false`).
+*Gate (a) — correctness:* a `LongKeyComparer`-vs-`SortKeyComparer` order-equivalence PBT over
+int/long/`Date32`/`Timestamp`/`Time64` carriers × ASC/DESC × nullsFirst/Last × ties
+(`WindowOrderKeyMonomorphizeTests`), a `BuildUnboxedOrderKey` carrier/non-carrier guard test, and a
+four-way structural≡boxed≡mono≡mono·spine agreement + incremental≡batch PBT across every
+window-aggregate shape (running / bounded RANGE / MIN·MAX / DESC / INTERVAL-over-TIMESTAMP / DATE /
+nullable / multi-spec) at W=1..8 incl. LATENESS GC (`WindowAggregateMonomorphizeTests`) — all green,
+whole suite 2099 pass. *Gate (b) — competitive:* the `windowmono` benchmark (`Program.cs` →
+`WindowMonoBenchmark`) A/Bs the fraud rolling-window feature view (per-customer 1d/7d/30d
+`SUM`/`COUNT OVER … RANGE PRECEDING`, TIMESTAMP order key) boxed-vs-mono, byte-identical output:
+
+| W | throughput (mono vs boxed) | allocation |
+|---|---|---|
+| 1  | **+17–20 %** | flat … −33 % |
+| 4  | **+18–35 %** | −40 % |
+| 14 | **+13 %** | −18 % |
+
+The throughput win is consistent (1.13–1.35×) across every scale/W tested and carries to W=14; the
+allocation win is real but noisier at large *unbounded*-window scale (the struct-copy representation
+residual below dominates total allocation there, exactly as flagged). **Honest caveat:** this is a
+near-best-case workload (value-type key over large sorted partitions); string keys don't box and
+small partitions do few comparisons, so a real mixed workload sees less. Key-monomorphization
+narrows the typed-vs-structural gap; it does not reach parity on wide rows (the struct-copy residual
+is columnar territory). The same "unbox the key, keep the operator generic over a typed key type"
+pattern generalizes to the other row-opaque stateful operators (join/aggregate/TOP-K partition &
+order keys) — measure-first there too.
 
 ---
 
@@ -3524,8 +3549,11 @@ step-profile.md — §22.8, NO-BUILD);
 in-operator boxed-extractor tax);
 `CompileOptions.MonomorphizeWindowOrderKey` + `LongKeyComparer` + `BuildUnboxedOrderKey` +
 `WindowAggAllocProbe` + `TypedSeamAbBenchmark` T2 config (§23.7 — the monomorphized order key:
-−58% alloc / −23% time, byte-identical, 72% of the typed penalty was order-key boxing;
-gated default-off);
+−58% alloc / −23% time, byte-identical, 72% of the typed penalty was order-key boxing);
+`TypedPlanCompiler.MonomorphizedWindowOrderKeyCount` (engagement diagnostic) +
+`WindowOrderKeyMonomorphizeTests` + `WindowAggregateMonomorphizeTests` (correctness gate) +
+`Benchmarks/WindowMonoBenchmark.cs` (`windowmono`, docs/window-mono-bench.md — the competitive A/B;
+§23.7 shipped **default-on**);
 parallel-pipeline-perf profiling notes.
 
 Differential Dataflow: arrangements mdbook (ch. 5), `trace/mod.rs`,

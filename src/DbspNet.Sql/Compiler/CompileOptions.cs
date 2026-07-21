@@ -146,16 +146,28 @@ public sealed record CompileOptions
     public bool TypeEligibleProgramViews { get; init; }
 
     /// <summary>
-    /// Opt-in (measurement gate, design §23.7): on the typed window-aggregate path,
-    /// key the per-partition ordered state on the <b>unboxed</b> monotone order value
-    /// (a <c>long?</c> via <see cref="DbspNet.Core.Collections.LongKeyComparer{TRow}"/>)
-    /// instead of the boxed one-key <c>SortKeyComparer</c>. On a typed struct row the
-    /// boxed comparer allocates one heap box per key per comparison (the dominant term
-    /// in the typed-vs-structural window-aggregate allocation gap — the sort comparator
-    /// runs O(log n) times per insert); the monomorphized comparer removes it. Sound
-    /// only when the order key's monotone <c>long</c> extraction preserves the boxed
+    /// On the typed window-aggregate path, key the per-partition ordered state on the
+    /// <b>unboxed</b> monotone order value (a <c>long?</c> via
+    /// <see cref="DbspNet.Core.Collections.LongKeyComparer{TRow}"/>) instead of the
+    /// boxed one-key <c>SortKeyComparer</c>. On a typed struct row the boxed comparer
+    /// allocates one heap box per key per comparison (the dominant term in the
+    /// typed-vs-structural window-aggregate allocation gap — the sort comparator runs
+    /// O(log n) times per insert); the monomorphized comparer removes it. Sound only
+    /// when the order key's monotone <c>long</c> extraction preserves the boxed
     /// comparer's order (integer/temporal carriers), and falls back to the boxed
-    /// comparer otherwise. Off by default; the structural path is unaffected.
+    /// comparer otherwise. The structural path is unaffected.
     /// </summary>
-    public bool MonomorphizeWindowOrderKey { get; init; }
+    /// <remarks>
+    /// <b>Default-on</b> (design §23.7): a correctness-equivalent, byte-identical win
+    /// validated across every window-aggregate shape (running / bounded RANGE /
+    /// MIN-MAX / DESC / INTERVAL-over-TIMESTAMP / DATE / nullable / multi-spec) at
+    /// W=1..8 and on the spine trace family, incremental≡batch. The competitive A/B on
+    /// the fraud rolling-window feature view (TIMESTAMP order key, `windowmono`
+    /// benchmark) shows +13–21% step throughput W=1..14 and up to −39% allocation,
+    /// output byte-identical. The prize is workload-dependent (near-best-case: a
+    /// value-type key over large sorted partitions; string keys don't box, small
+    /// partitions do few comparisons) — set this <c>false</c> to force the boxed
+    /// comparer. The boxed comparer also stays live for any non-carrier order key.
+    /// </remarks>
+    public bool MonomorphizeWindowOrderKey { get; init; } = true;
 }
