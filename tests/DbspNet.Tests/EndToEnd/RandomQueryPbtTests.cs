@@ -69,7 +69,7 @@ public class RandomQueryPbtTests
                 iter: 3000);
     }
 
-    private static bool CheckOne(
+    internal static bool CheckOne(
         string sql,
         IReadOnlyList<IReadOnlyList<InputEvent>> ticks,
         bool optimize,
