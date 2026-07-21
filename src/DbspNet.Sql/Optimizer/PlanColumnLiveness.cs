@@ -3,7 +3,9 @@
 using System.Collections.Generic;
 using System.Linq;
 using DbspNet.Sql.Compiler;
+using DbspNet.Sql.Parser.Ast;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Optimizer;
 
@@ -86,6 +88,312 @@ public static class PlanColumnLiveness
         Walk(plan, new HashSet<int>(liveOut), acc, new HashSet<CteRef>());
         return acc;
     }
+
+    /// <summary>
+    /// Arity-preserving dead-column rewrite: given a view plan and the set of its
+    /// output columns that are live, return a plan with the SAME output schema in
+    /// which (i) a fully-dead <see cref="WindowAggregatePlan"/>/<see cref="WindowOffsetPlan"/>
+    /// (no produced column live) is replaced by a projection that reproduces its
+    /// schema with the produced columns as NULL constants — eliminating the operator —
+    /// and (ii) a dead projection item becomes a NULL constant. Output arity is
+    /// preserved at every node, so no downstream view's column indices shift.
+    /// GROUP BY / DISTINCT / join keys stay live (never NULLed at their producer), so
+    /// row multiplicity is unchanged. Single-reference CTE bodies are pruned; a CTE
+    /// referenced more than once is left intact (sound — conservative).
+    /// </summary>
+    public static LogicalPlan PruneDeadColumns(LogicalPlan plan, IReadOnlySet<int> liveOut)
+    {
+        System.ArgumentNullException.ThrowIfNull(plan);
+        System.ArgumentNullException.ThrowIfNull(liveOut);
+        var refCount = new Dictionary<CteRef, int>();
+        CountCteRefs(plan, refCount);
+        return Prune(plan, new HashSet<int>(liveOut), refCount);
+    }
+
+    private static void CountCteRefs(LogicalPlan p, Dictionary<CteRef, int> refCount)
+    {
+        if (p is CteScanPlan c)
+        {
+            if (refCount.TryGetValue(c.Cte, out var n))
+            {
+                refCount[c.Cte] = n + 1;
+                return; // body already counted on first sight
+            }
+
+            refCount[c.Cte] = 1;
+            CountCteRefs(c.Cte.Plan, refCount);
+            return;
+        }
+
+        foreach (var child in Children(p))
+        {
+            CountCteRefs(child, refCount);
+        }
+    }
+
+    private static LogicalPlan Prune(
+        LogicalPlan p, HashSet<int> liveOut, Dictionary<CteRef, int> refCount)
+    {
+        switch (p)
+        {
+            case ScanPlan:
+                return p;
+
+            case CteScanPlan c:
+            {
+                // Only single-reference CTE bodies are pruned per-reference; a shared
+                // CTE would need the union of its references' demands (deferred).
+                if (refCount.GetValueOrDefault(c.Cte) != 1)
+                {
+                    return p;
+                }
+
+                var body = Prune(c.Cte.Plan, liveOut, refCount);
+                return ReferenceEquals(body, c.Cte.Plan)
+                    ? p
+                    : new CteScanPlan(new CteRef(c.Cte.Name, body), c.Schema);
+            }
+
+            case ProjectPlan pr:
+            {
+                var items = new ProjectionItem[pr.Projections.Count];
+                var liveIn = new HashSet<int>();
+                var changed = false;
+                for (var i = 0; i < pr.Projections.Count; i++)
+                {
+                    if (liveOut.Contains(i))
+                    {
+                        items[i] = pr.Projections[i];
+                        liveIn.UnionWith(ExpressionRewriter.CollectColumnIndices(pr.Projections[i].Expression));
+                    }
+                    else
+                    {
+                        items[i] = NullItem(pr.Projections[i].Name, pr.Projections[i].Qualifier, pr.Schema.Columns[i].Type);
+                        changed = true;
+                    }
+                }
+
+                var input = Prune(pr.Input, liveIn, refCount);
+                return !changed && ReferenceEquals(input, pr.Input)
+                    ? pr
+                    : new ProjectPlan(input, items, pr.Schema);
+            }
+
+            case FilterPlan f:
+            {
+                var liveIn = new HashSet<int>(liveOut);
+                liveIn.UnionWith(ExpressionRewriter.CollectColumnIndices(f.Predicate));
+                var input = Prune(f.Input, liveIn, refCount);
+                return ReferenceEquals(input, f.Input) ? f : new FilterPlan(input, f.Predicate);
+            }
+
+            case WindowAggregatePlan wa:
+            {
+                var inCount = wa.Input.Schema.Count;
+                if (!AnyProducedLive(liveOut, inCount))
+                {
+                    return EliminateWindow(wa, wa.Input, inCount, liveOut, refCount);
+                }
+
+                var liveIn = WindowLiveIn(
+                    liveOut, inCount, wa.PartitionKeys, wa.OrderKey is { } ok ? new[] { ok } : null,
+                    k => wa.Aggregates[k].Argument);
+                var input = Prune(wa.Input, liveIn, refCount);
+                return ReferenceEquals(input, wa.Input) ? wa : wa with { Input = input };
+            }
+
+            case WindowOffsetPlan wo:
+            {
+                var inCount = wo.Input.Schema.Count;
+                if (!AnyProducedLive(liveOut, inCount))
+                {
+                    return EliminateWindow(wo, wo.Input, inCount, liveOut, refCount);
+                }
+
+                var liveIn = WindowLiveIn(
+                    liveOut, inCount, wo.PartitionKeys, wo.OrderKeys, k => wo.Functions[k].Value);
+                var input = Prune(wo.Input, liveIn, refCount);
+                return ReferenceEquals(input, wo.Input) ? wo : wo with { Input = input };
+            }
+
+            case JoinPlan j:
+            {
+                var leftCount = j.Left.Schema.Count;
+                var leftLive = new HashSet<int>();
+                var rightLive = new HashSet<int>();
+                foreach (var i in liveOut)
+                {
+                    (i < leftCount ? leftLive : rightLive).Add(i < leftCount ? i : i - leftCount);
+                }
+
+                foreach (var eq in j.EquiKeys)
+                {
+                    leftLive.Add(eq.LeftIndex);
+                    rightLive.Add(eq.RightIndex);
+                }
+
+                if (j.Residual is { } residual)
+                {
+                    foreach (var idx in ExpressionRewriter.CollectColumnIndices(residual))
+                    {
+                        (idx < leftCount ? leftLive : rightLive).Add(idx < leftCount ? idx : idx - leftCount);
+                    }
+                }
+
+                var left = Prune(j.Left, leftLive, refCount);
+                var right = Prune(j.Right, rightLive, refCount);
+                return ReferenceEquals(left, j.Left) && ReferenceEquals(right, j.Right)
+                    ? j
+                    : j with { Left = left, Right = right };
+            }
+
+            case AggregatePlan a:
+            {
+                var liveIn = new HashSet<int>();
+                foreach (var g in a.GroupKeys)
+                {
+                    liveIn.UnionWith(ExpressionRewriter.CollectColumnIndices(g));
+                }
+
+                foreach (var agg in a.Aggregates)
+                {
+                    if (agg.Argument is { } arg)
+                    {
+                        liveIn.UnionWith(ExpressionRewriter.CollectColumnIndices(arg));
+                    }
+                }
+
+                var input = Prune(a.Input, liveIn, refCount);
+                return ReferenceEquals(input, a.Input) ? a : a with { Input = input };
+            }
+
+            case UnionAllPlan u:
+            {
+                var branches = u.Branches.Select(b => Prune(b, new HashSet<int>(liveOut), refCount)).ToList();
+                return branches.Zip(u.Branches).All(t => ReferenceEquals(t.First, t.Second))
+                    ? u
+                    : u with { Branches = branches };
+            }
+
+            case DistinctPlan d:
+            {
+                var input = Prune(d.Input, FullSet(d.Input.Schema.Count), refCount);
+                return ReferenceEquals(input, d.Input) ? d : new DistinctPlan(input);
+            }
+
+            case DifferencePlan diff:
+            {
+                var left = Prune(diff.Left, FullSet(diff.Left.Schema.Count), refCount);
+                var right = Prune(diff.Right, FullSet(diff.Right.Schema.Count), refCount);
+                return ReferenceEquals(left, diff.Left) && ReferenceEquals(right, diff.Right)
+                    ? diff
+                    : new DifferencePlan(left, right);
+            }
+
+            // Conservative for the remaining node kinds (TopK / semi / scalar /
+            // correlated / temporal / recursive): leave them intact. Pruning below
+            // them would use full liveness (their inputs are all demanded), under
+            // which nothing is dead — so the subtree is unchanged anyway. Returning
+            // the node as-is is the same result without reconstructing it.
+            default:
+                return p;
+        }
+    }
+
+    private static IEnumerable<LogicalPlan> Children(LogicalPlan p) => p switch
+    {
+        ScanPlan => System.Array.Empty<LogicalPlan>(),
+        CteScanPlan => System.Array.Empty<LogicalPlan>(), // body handled by the caller
+        FilterPlan f => new[] { f.Input },
+        TemporalFilterPlan tf => new[] { tf.Input },
+        ProjectPlan pr => new[] { pr.Input },
+        JoinPlan j => new[] { j.Left, j.Right },
+        AggregatePlan a => new[] { a.Input },
+        WindowAggregatePlan wa => new[] { wa.Input },
+        WindowOffsetPlan wo => new[] { wo.Input },
+        UnionAllPlan u => u.Branches,
+        DistinctPlan d => new[] { d.Input },
+        DifferencePlan diff => new[] { diff.Left, diff.Right },
+        ScalarSubqueryJoinPlan s => new[] { s.Input }.Concat(s.Subqueries),
+        SemiJoinPlan sj => new[] { sj.Input, sj.Subquery },
+        CorrelatedScalarSubqueryJoinPlan csp => new[] { csp.Input, csp.Subquery },
+        TopKPlan t => new[] { t.Input },
+        PartitionedTopKPlan pt => new[] { pt.Input },
+        PartitionedRankPlan prk => new[] { prk.Input },
+        RecursiveCtePlan r => new[] { r.BasePlan, r.RecursivePlan },
+        _ => System.Array.Empty<LogicalPlan>(),
+    };
+
+    // Replace a fully-dead window/offset op with a projection reproducing its schema:
+    // input columns pass through by identity, the produced (window) columns become
+    // NULL constants. The op — and its partition/order/argument work — is gone.
+    private static LogicalPlan EliminateWindow(
+        LogicalPlan windowOp, LogicalPlan windowInput, int inCount,
+        HashSet<int> liveOut, Dictionary<CteRef, int> refCount)
+    {
+        var passLive = new HashSet<int>();
+        foreach (var i in liveOut)
+        {
+            if (i < inCount)
+            {
+                passLive.Add(i);
+            }
+        }
+
+        var input = Prune(windowInput, passLive, refCount);
+        var schema = windowOp.Schema;
+        var items = new ProjectionItem[schema.Count];
+        for (var i = 0; i < inCount; i++)
+        {
+            var col = windowInput.Schema.Columns[i];
+            items[i] = new ProjectionItem(new ResolvedColumn(i, col.Type), schema.Columns[i].Name, schema.Columns[i].Qualifier);
+        }
+
+        for (var i = inCount; i < schema.Count; i++)
+        {
+            items[i] = NullItem(schema.Columns[i].Name, schema.Columns[i].Qualifier, schema.Columns[i].Type);
+        }
+
+        return new ProjectPlan(input, items, schema);
+    }
+
+    private static bool AnyProducedLive(HashSet<int> liveOut, int inCount)
+    {
+        foreach (var i in liveOut)
+        {
+            if (i >= inCount)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static HashSet<int> WindowLiveIn(
+        HashSet<int> liveOut, int inCount,
+        IReadOnlyList<ResolvedExpression> partitionKeys, IReadOnlyList<SortKey>? orderKeys,
+        System.Func<int, ResolvedExpression?> argAt)
+    {
+        var liveIn = new HashSet<int>();
+        foreach (var i in liveOut)
+        {
+            if (i < inCount)
+            {
+                liveIn.Add(i);
+            }
+            else if (argAt(i - inCount) is { } arg)
+            {
+                liveIn.UnionWith(ExpressionRewriter.CollectColumnIndices(arg));
+            }
+        }
+
+        AddWindowKeys(liveIn, partitionKeys, orderKeys);
+        return liveIn;
+    }
+
+    private static ProjectionItem NullItem(string name, string? qualifier, SqlType type) =>
+        new(new ResolvedLiteral(LiteralKind.Null, null, type.WithNullable(true)), name, qualifier);
 
     // Push the set of live output columns of `p` down to its inputs, accumulating
     // per-scan-name demand into `acc`. `active` guards against CTE self-reference

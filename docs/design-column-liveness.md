@@ -193,13 +193,53 @@ computed value:
 4. Generalize the conservative node kinds (semi-join passthrough, TOP-K) as measured value
    justifies.
 
-## 9. Effort / payoff
+## 9. Measured result — arity preservation caps the win (2026-07-21)
 
-- Layer 2 + analysis + diagnostic: **done** (small).
-- Producer-dead rewrite on the hot path: **medium**, captures ~3.4 GiB / ~7.9s (7.6% of the
-  batch) — the single largest lever the re-profile surfaced, and an algorithmic-class dead-
-  code elimination, not a per-row micro-optimization.
-- Full generalization: **medium-large**, incremental, never-unsound by construction.
+The arity-preserving producer-dead rewrite (`CompileOptions.EliminateDeadColumns`, gated
+default-off) was built, unit-tested (producer-dead window elimination + GROUP BY / DISTINCT
+key soundness, all green), and run on the real batch-1 (local harness, ServerGC):
 
-Needs neither the columnar storage rewrite nor expression vectorization — it is orthogonal
-to and composes with both.
+| | alloc | wall | WindowAggregate | ApplyOp |
+|---|---|---|---|---|
+| baseline | 44.74 GiB | 59.5s | 4.9 GiB / x30 | 17.7 GiB / x310 |
+| +EliminateDeadColumns | 43.72 GiB | 60.9s | **1.86 GiB / x28** | **20.2 GiB / x335** |
+
+**All 16 output row counts byte-identical — the rewrite is sound.** The two `daily_market`
+window ops were eliminated exactly as predicted (WindowAggregate −3.0 GiB, x30→x28). But the
+**net is only −1.0 GiB and wall is flat**, far below the projected ~3.4 GiB.
+
+**Why (the measure-first correction):** arity preservation re-materializes each dead column
+as a NULL constant, so the output row *width* is unchanged — and the row-materialization term
+(b) is 73% of ApplyOp allocation (§1). Eliminating a window removed its sorted-state
+maintenance (~3 GiB), but the replacement constant-filling projections re-pay the row
+materialization (ApplyOp +2.5 GiB) and perturb operator fusion (x310→x335). The window ops'
+allocation was mostly *output-row materialization*, not state — so removing the compute while
+keeping the width barely helps. **Confirms the §1 apportionment empirically: the prize is the
+(b) row-*width* term, and it is captured only by making rows narrower — i.e. true arity
+*reduction*, not the arity-preserving elimination.**
+
+**Decision:** do **not** ship `EliminateDeadColumns` as a perf win — it is correct but
+marginal (−1 GiB / flat wall) and perturbs fusion. Keep it gated + documented as the
+foundation for §10.
+
+## 10. Next: arity-reducing rewrite (the real (b)-term prize)
+
+Narrow a view's output *schema* to its live columns and reindex downstream consumers'
+`ScanPlan` column references — so `daily_market` becomes a genuine 6-column view and the
+`fifty_two_week_*` object-array slots disappear (not NULL-filled). This is where the 64-dead-
+column surface pays: **`accounts 23/32`** dead columns on a wide SCD row → a 32→9-column
+narrowing on every ApplyOp that carries `accounts` rows is a much larger (b)-term cut than
+`daily_market` alone. Cost: cross-view index remapping (the piece §5.3 preserved arity to
+avoid); the per-node live-*input* sets already computed drive the remap. Validate with the
+same program-differential (byte-identical 16 outputs) — now also asserting narrowed schemas.
+
+## 11. Effort / payoff
+
+- Layer 2 + analysis + diagnostic + arity-preserving rewrite: **done**; the rewrite is a
+  measured near-wash (−1 GiB), retained as gated foundation.
+- Arity-reducing rewrite (§10): **medium-large** (reindexing), and the measurement says it is
+  where the real allocation win lives — the (b) row-width term, biggest on the wide-dead-row
+  views (`accounts`, `syndicated_prospect`).
+
+Needs neither the columnar storage rewrite nor expression vectorization — orthogonal to and
+composes with both.

@@ -263,6 +263,13 @@ public static class PlanToCircuit
             }
         }
 
+        // Program-level dead-column liveness (opt-in): per-view live output columns,
+        // used below to prune each view's plan to the columns some output / live view
+        // reads (docs/design-column-liveness.md).
+        var liveColumns = options.EliminateDeadColumns
+            ? DbspNet.Sql.Optimizer.PlanColumnLiveness.ComputeProgramLiveColumns(views)
+            : null;
+
         RootCircuit? circuit = null;
         Dictionary<string, TableInput>? inputs = null;
         Dictionary<string, ProgramOutput>? outputs = null;
@@ -313,7 +320,18 @@ public static class PlanToCircuit
                     // preserving, and each view is a standalone tree whose scans of
                     // other views are untouched leaves, so per-view optimization is
                     // safe across the shared-stream DAG.
-                    var optimizedQuery = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(v.Query);
+                    // Prune columns no live consumer reads BEFORE per-view optimize,
+                    // so a narrowed output lets the join/aggregate rules push further.
+                    // Arity-preserving, so a fell-back or downstream view's column
+                    // indices into this view's stream are unchanged.
+                    var viewQuery = v.Query;
+                    if (liveColumns is not null
+                        && liveColumns.TryGetValue(v.ViewName, out var liveOut))
+                    {
+                        viewQuery = DbspNet.Sql.Optimizer.PlanColumnLiveness.PruneDeadColumns(viewQuery, liveOut);
+                    }
+
+                    var optimizedQuery = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(viewQuery);
                     var monotonicity = MonotonicityAnalyzer.Analyze(optimizedQuery);
                     var ctx = new CompileContext(
                         streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable);

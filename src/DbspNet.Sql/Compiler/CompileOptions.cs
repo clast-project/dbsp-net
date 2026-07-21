@@ -170,4 +170,24 @@ public sealed record CompileOptions
     /// comparer. The boxed comparer also stays live for any non-carrier order key.
     /// </remarks>
     public bool MonomorphizeWindowOrderKey { get; init; } = true;
+
+    /// <summary>
+    /// Opt-in program-level dead-column elimination (docs/design-column-liveness.md).
+    /// On the <see cref="PlanToCircuit.CompileProgram"/> path, computes per-view
+    /// output-column liveness across the whole view DAG and prunes each view's plan
+    /// to the columns some output or live downstream view actually reads. Most
+    /// valuably it eliminates a window / offset operator all of whose produced
+    /// columns are read only by a dead-pruned leaf view — e.g. ivm-bench
+    /// <c>daily_market</c>'s two <c>fifty_two_week_*</c> window aggregates, read only
+    /// by the unreachable <c>fact_market_history</c> (~3.4 GiB / ~7.9s of batch-1).
+    /// </summary>
+    /// <remarks>
+    /// Arity-preserving: a dead column becomes a cheap NULL constant and a fully-dead
+    /// producer op becomes a constant-filling projection, so no downstream view's
+    /// column indices shift (the view's output schema is unchanged). Correctness-
+    /// preserving — a dropped column is read by nothing, and GROUP BY / DISTINCT / join
+    /// keys stay live via the liveness rules, so row multiplicity is unchanged. Off by
+    /// default while gated; program path only.
+    /// </remarks>
+    public bool EliminateDeadColumns { get; init; }
 }
