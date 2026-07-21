@@ -35,6 +35,7 @@ public sealed class RootCircuit
     private long _logicalTime = long.MinValue;
     private long _lastStepTicks;
     private long[]? _opCumTicks;
+    private long[]? _opCumAlloc;
 
     /// <summary>
     /// When set, <see cref="Step"/> times each operator individually and
@@ -280,11 +281,17 @@ public sealed class RootCircuit
     private void StepProfiled()
     {
         _opCumTicks ??= new long[_operators.Count];
+        _opCumAlloc ??= new long[_operators.Count];
         for (var i = 0; i < _operators.Count; i++)
         {
+            // Alloc delta is thread-local; the engine step is a serial foreach on
+            // this thread, so the per-op attribution is exact (no cross-thread GC
+            // leakage between successive ops).
+            var a0 = GC.GetAllocatedBytesForCurrentThread();
             var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _operators[i].Step();
             _opCumTicks[i] += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            _opCumAlloc[i] += GC.GetAllocatedBytesForCurrentThread() - a0;
         }
     }
 
@@ -298,6 +305,11 @@ public sealed class RootCircuit
         if (_opCumTicks is not null)
         {
             System.Array.Clear(_opCumTicks);
+        }
+
+        if (_opCumAlloc is not null)
+        {
+            System.Array.Clear(_opCumAlloc);
         }
     }
 
@@ -322,10 +334,11 @@ public sealed class RootCircuit
         {
             var op = _operators[i];
             var ms = _opCumTicks[i] * 1000.0 / freq;
+            var alloc = _opCumAlloc is not null ? _opCumAlloc[i] : 0L;
             var label = i < _operatorLabels.Count ? _operatorLabels[i] : null;
             if (op is IIntrospectable m)
             {
-                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label));
+                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label, alloc));
             }
             else
             {
@@ -336,7 +349,7 @@ public sealed class RootCircuit
                     name = name[..tick];
                 }
 
-                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label));
+                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label, alloc));
             }
         }
 

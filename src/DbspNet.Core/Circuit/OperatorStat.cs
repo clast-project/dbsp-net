@@ -53,10 +53,11 @@ public readonly record struct OperatorProfile(
     double CumulativeMs,
     long RetainedRows,
     long LastOutputRows,
-    string? Label = null)
+    string? Label = null,
+    long AllocBytes = 0)
 {
     public override string ToString() => System.FormattableString.Invariant(
-        $"[{Index}] {Name}{(Label is null ? "" : $" <{Label}>")}: {CumulativeMs:F1}ms state={RetainedRows} out={LastOutputRows}");
+        $"[{Index}] {Name}{(Label is null ? "" : $" <{Label}>")}: {CumulativeMs:F1}ms state={RetainedRows} out={LastOutputRows} alloc={AllocBytes}");
 }
 
 /// <summary>

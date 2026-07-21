@@ -342,7 +342,25 @@ public sealed class ProgramRunner
             {
                 var share = stepMs > 0 ? op.CumulativeMs / stepMs * 100.0 : 0.0;
                 sb.AppendLine(FormattableString.Invariant(
-                    $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms ({share,4:F1}%)  state={op.RetainedRows,-8} out={op.LastOutputRows,-6} {op.Label}"));
+                    $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms ({share,4:F1}%)  alloc {op.AllocBytes / (1024.0 * 1024.0),8:F1} MiB  state={op.RetainedRows,-8} out={op.LastOutputRows,-6} {op.Label}"));
+            }
+
+            // By operator KIND: sums time AND allocation across every operator of a
+            // kind, so the ApplyOp (map/filter/project) tail's total share of the
+            // batch pops out directly — the number the row-rep / columnar arc weighs.
+            sb.AppendLine();
+            sb.AppendLine("-- by operator kind (cumulative) --");
+            var totalAlloc = operators.Sum(o => o.AllocBytes);
+            var byKind = operators
+                .GroupBy(o => o.Name)
+                .Select(g => (Kind: g.Key, Count: g.Count(), Ms: g.Sum(o => o.CumulativeMs), Alloc: g.Sum(o => o.AllocBytes)))
+                .OrderByDescending(g => g.Alloc);
+            foreach (var g in byKind)
+            {
+                var msShare = stepMs > 0 ? g.Ms / stepMs * 100.0 : 0.0;
+                var allocShare = totalAlloc > 0 ? (double)g.Alloc / totalAlloc * 100.0 : 0.0;
+                sb.AppendLine(FormattableString.Invariant(
+                    $"  {g.Kind,-26} x{g.Count,-4} {g.Ms,8:F1} ms ({msShare,4:F1}%)  alloc {g.Alloc / (1024.0 * 1024.0),9:F1} MiB ({allocShare,4:F1}%)"));
             }
 
             sb.AppendLine("===== END BATCH PROFILE =====");
