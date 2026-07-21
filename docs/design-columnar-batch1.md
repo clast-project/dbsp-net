@@ -181,9 +181,28 @@ across boundaries) become justified — and that is where the bulk of the ~18% l
    the internal saving — i.e. is the win only realized when *adjacent* views also go columnar
    (deferring materialization)? This decides whether the first increment is one view (weaker) or a
    view-pair (stronger but larger).
-3. **Typed-column upside.** Measure the additional saving from `long[]`/typed columns over
-   object-array columns on a numeric-heavy view, to price whether the typed+columnar end-state is
-   worth its larger scope over object-array columnar.
+3. **Typed-column upside — ANSWERED (synthetic, no data needed).** Priced by the reconstructed
+   `ApplyOpAllocSplit` microbench (`dotnet run -c Release --project src/DbspNet.Benchmarks --
+   applysplit`, `docs/applyop-alloc-split.md`), which adds a typed-columnar (TCOL: `long[]`/
+   `string[]` columns, zero boxing) rung above object-columnar (COL). Measured B/row (M-series Mac,
+   ServerGC):
+
+   | projection shape | P·fresh | COL | TCOL | COL↓ vs P | typed↓ vs COL |
+   |---|---|---|---|---|---|
+   | passthrough-heavy (8+4 pass, 1 computed) | 216.6 | 137.8 | 113.9 | −36.4% | **−17.3%** |
+   | compute-heavy (2 pass, 10 computed) | 432.6 | 353.8 | 113.9 | −18.2% | **−67.8%** |
+
+   The load-bearing fact: on 64-bit a `long[]` and an `object?[]` element are **both 8 B**, so
+   typed columns never shrink column *storage* — their entire marginal win over object columns is
+   eliminating the heap *box* per **freshly-computed** numeric. Passthrough numerics share their box
+   by reference (§23), so **TCOL is flat (~114 B/row) regardless of projection shape**, while COL
+   balloons with computed-numeric width. Consequence: **object-columnar captures the bulk on the
+   common map/filter/project (passthrough-heavy) ApplyOp shape — typed adds only ~17% there and is
+   not worth its larger scope; typed becomes decisive (−68% marginal) only on compute-heavy numeric
+   projections.** Which regime the real 47% ApplyOp term sits in — how many batch-1 ApplyOps newly
+   produce many numeric columns vs pass values through — is a §7 #1 real-view question still gated
+   on the SF=3 data. **Decision: build object-columnar first (§6); defer typed columns until
+   real-view profiling shows compute-heavy numeric ApplyOps dominate.**
 
 ## 8. Honest bottom line
 
