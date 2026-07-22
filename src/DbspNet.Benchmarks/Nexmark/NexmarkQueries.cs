@@ -10,6 +10,11 @@ namespace DbspNet.Benchmarks.Nexmark;
 /// </summary>
 internal static class NexmarkQueries
 {
+    // Every table is declared `append_only`: the Nexmark generator only ever
+    // inserts events (no deletes, no updates), which is what the property asserts.
+    // It is load-bearing, not decorative — it is what lets the optimizer narrow the
+    // input of the non-linear (MIN/MAX) aggregates in q4/q7/q17
+    // (docs/design-row-representation.md §18.6).
     public static readonly string[] Ddl =
     {
         @"CREATE TABLE person (
@@ -20,7 +25,8 @@ internal static class NexmarkQueries
             city VARCHAR NOT NULL,
             state VARCHAR NOT NULL,
             date_time TIMESTAMP NOT NULL,
-            extra VARCHAR NOT NULL)",
+            extra VARCHAR NOT NULL)
+          WITH ('append_only' = 'true')",
         @"CREATE TABLE auction (
             id BIGINT NOT NULL,
             item_name VARCHAR NOT NULL,
@@ -31,7 +37,8 @@ internal static class NexmarkQueries
             expires TIMESTAMP NOT NULL,
             seller BIGINT NOT NULL,
             category BIGINT NOT NULL,
-            extra VARCHAR NOT NULL)",
+            extra VARCHAR NOT NULL)
+          WITH ('append_only' = 'true')",
         @"CREATE TABLE bid (
             auction BIGINT NOT NULL,
             bidder BIGINT NOT NULL,
@@ -39,7 +46,8 @@ internal static class NexmarkQueries
             channel VARCHAR NOT NULL,
             url VARCHAR NOT NULL,
             date_time TIMESTAMP NOT NULL,
-            extra VARCHAR NOT NULL)",
+            extra VARCHAR NOT NULL)
+          WITH ('append_only' = 'true')",
     };
 
     /// <summary>A single benchmarkable query and the tables it consumes.</summary>

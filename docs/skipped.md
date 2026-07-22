@@ -792,7 +792,15 @@ reflect that shape, not a backlog.
   recompute is O(state)); monotone-expression time-keys / non-direct-scan inputs
   for downstream GC; typed fast path; WAL per-tick clock recording.
 - **[P3]** `WATERMARK` (experimental in Feldera).
-- **[P2]** `append_only` table annotation. Feldera-specific.
+- `append_only` table annotation — **landed**, Feldera's spelling:
+  `CREATE TABLE t (…) WITH ('append_only' = 'true')`. Declares that the table's
+  rows are only inserted, so its Z-set weights are non-negative. Load-bearing,
+  not documentation: `PlanWeightPositivity` propagates it through the plan and
+  it is what lets `NarrowAggregateInput` narrow the input of MIN / MAX /
+  COUNT(DISTINCT) aggregates (`docs/design-row-representation.md` §18.6 —
+  q4 −37 % ns/event at W=1). Unknown property keys are a resolve error.
+  Deferred: other Feldera table properties, and any runtime policing of the
+  declaration (it is a contract, like `NOT NULL`).
 - **[P2]** `emit_final` view annotation. Feldera-specific.
 
 ### UDFs

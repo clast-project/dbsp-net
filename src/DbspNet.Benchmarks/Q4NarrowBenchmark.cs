@@ -86,15 +86,18 @@ internal static class Q4NarrowBenchmark
 
     private static LogicalPlan BuildPlan(string sql, bool narrow)
     {
-        var prev = NonLinearNarrowingMode.Enabled;
-        NonLinearNarrowingMode.Enabled = narrow;
+        // Force the policy in both directions: the Nexmark DDL now declares its
+        // tables append_only, so the default (Auto) would narrow BOTH arms and
+        // collapse the A/B. Never = the pre-analysis baseline.
+        var prev = NonLinearNarrowingMode.Mode;
+        NonLinearNarrowingMode.Mode = narrow ? NonLinearNarrowing.Always : NonLinearNarrowing.Never;
         try
         {
             return SpineParallelHarness.BuildPlan(NexmarkQueries.Ddl, sql);
         }
         finally
         {
-            NonLinearNarrowingMode.Enabled = prev;
+            NonLinearNarrowingMode.Mode = prev;
         }
     }
 

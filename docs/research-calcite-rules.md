@@ -2,8 +2,9 @@
 
 Status: **active research project. Phase 1 (instrument + first census) landed —
 `dotnet run --project src/DbspNet.Benchmarks -c Release -- rulecensus`, results in
-[`calcite-rule-census.md`](calcite-rule-census.md). Phases 2+ are gated on the
-census, per-candidate, and on the batch-1 corpus arriving (§6).**
+[`calcite-rule-census.md`](calcite-rule-census.md). First shortlist item **built**
+(§5.1, the MIN/MAX narrowing unblock — q4 −37 % ns/event at W=1). The rest are gated on
+the census, per-candidate, and on the batch-1 corpus arriving (§6).**
 
 Follow-on to the structural CSE pass (`src/DbspNet.Sql/Optimizer/PlanCse.cs`,
 `c91fc9b`), which was 5.2× on Nexmark q5 and which Calcite would have done for us —
@@ -25,10 +26,10 @@ catalog. This doc is the mining.
   for us.
 - **Measured, on the corpus we have** (18 Nexmark + fraud plans, post-`Optimize`):
   `REDUCE_EXPRESSIONS` 35 sites, `AGGREGATE_CASE_TO_FILTER` 9, `PROJECT_REMOVE` 6,
-  `AGGREGATE_NARROWING_BLOCKED_BY_MINMAX` 3, `JOIN_TO_SEMI_JOIN` 1,
-  `JOIN_DERIVE_IS_NOT_NULL_FILTER` 1, and **zero** for filter/aggregate transpose,
-  transitive predicates, dead aggregate calls, duplicate group keys and union
-  flattening (§4).
+  `AGGREGATE_NARROWING_BLOCKED_BY_MINMAX` 3 (now **0** — §5.1 shipped),
+  `JOIN_TO_SEMI_JOIN` 1, `JOIN_DERIVE_IS_NOT_NULL_FILTER` 1, and **zero** for
+  filter/aggregate transpose, transitive predicates, dead aggregate calls, duplicate
+  group keys and union flattening (§4).
 - **The honest read of that census: the hand-written corpora are already tight.**
   Nexmark SQL is written by humans to be minimal, and our existing pushdown/fusion
   passes cover the families that would fire on it. The rules Calcite earns its
@@ -184,23 +185,34 @@ Findings worth reading twice:
    proof we currently have no statistics for.
 4. **3 sites where our own `NarrowAggregateInput` bails on MIN/MAX** while the input
    is 2–3× wider than the aggregate reads (q4, q7, q17). That is the single most
-   concrete state win the census found, and §5.3 is about collecting it.
+   concrete state win the census found, and §5.1 collected it — a re-run after that
+   work reports **0** for this detector, the census doubling as a regression check on
+   its own finding.
 
 ## 5. Shortlist, with the gate each has to pass
 
 Ordered by (expected state saved) × (confidence), not by site count.
 
-### 5.1 MIN/MAX narrowing, unblocked — *build first*
+### 5.1 MIN/MAX narrowing, unblocked — **BUILT** (`docs/design-row-representation.md` §18.6)
 
 q4/q7/q17 each carry a MIN/MAX aggregate reading 2–3 of 7 input columns, and our
-linearity gate blocks narrowing. Two independent unblocks, both from the Calcite
-catalog: `AGGREGATE_REDUCE_FUNCTIONS` (decompose so the non-linear part sees only the
-columns it needs), or a *value-preserving* narrowing that keeps a distinct-witness
-column so cancelling weights can't erase a value MIN/MAX must see. **Gate:** an
-`AggregateProbeBenchmark`-style A/B on q4 showing per-tick allocation down; the
-existing `docs/q4-narrow-bench.md` harness is the template. **Risk:** the soundness
-argument is the whole job — the PBT (`RandomQuery`) cross-checks optimized vs
-unoptimized and is the acceptance test.
+linearity gate blocked narrowing. The unblock taken was neither of the two routes
+sketched here: rather than rewrite the aggregate, **prove the input can't cancel**.
+Non-negativity of the aggregate's input is exactly the soundness condition, and it is
+now derived per aggregate by `PlanWeightPositivity` — from a declared
+`WITH ('append_only' = 'true')` table property (Feldera's spelling), or derived free
+from a sign-laundering `DISTINCT`/aggregate in the lineage. The rule is **on by
+default** where it is provable; the old global seam became a tri-state
+(`Auto`/`Always`/`Never`) whose non-default arms exist only for the A/B.
+
+**Measured:** census blocked-sites 3 → 0; q4 at W=1 **−37 % ns/event, −23 % B/event**
+(2,183 → 1,376 ns, 2,376 → 1,841 B), control query unchanged. The W=8 harness was too
+noisy on this host to report — see §18.6.
+
+The `AGGREGATE_REDUCE_FUNCTIONS` route stays in the catalog for the case this does not
+cover: a MIN/MAX over a genuinely signed input (a `DifferencePlan` below), where the
+only way to narrow is to change the aggregate rather than to prove something about
+its input. No sites for that on the current corpus.
 
 ### 5.2 `JOIN_DERIVE_IS_NOT_NULL_FILTER` — cheapest state-shrinker
 
@@ -274,10 +286,10 @@ should be built.**
    column in a predicate). Cheap; each is one detector.
 2. **Point the census at the batch-1 program** when the spec lands (§6) — this is the
    measurement that decides §5.3, and it is now on the batch-1 arrival checklist.
-3. **Build §5.1**, gated on its A/B. It is the only shortlist item with measured
-   sites *and* a state win *and* no missing statistics.
-4. **Build §5.2** alongside — it is small, unconditionally sound, and pre-pays for the
-   batch-1 corpus.
+3. ~~**Build §5.1**, gated on its A/B.~~ **Done** — see §5.1 and
+   `docs/design-row-representation.md` §18.6.
+4. **Build §5.2** — small, unconditionally sound, and pre-pays for the batch-1 corpus.
+   It is now the head of the queue.
 5. **Write the state-weighted join-order design note** (§5.6) separately. Do not start
    it before the shared-arrangement work settles; the two share a cost model.
 

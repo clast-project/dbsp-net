@@ -2521,6 +2521,70 @@ inputs**, so it is opt-in, never a default.
 > insert-only) is a deliberate follow-up, not done here. The win (q4 W=1 −35 %,
 > W=8 1.22–1.37×) justifies coming back to it once the other representation fronts are
 > explored.
+>
+> **DONE — §18.6 took the "ideally" branch.** The lineage check exists, so the rule is
+> on by default where it is provable and the global seam is no longer the channel.
+
+### 18.6 — Productized: the envelope is now *derived*, not promised (LANDED, default-on)
+
+§18.5 deferred this with a preference — "ideally a planner check that engages it only
+when the aggregate's input lineage is provably insert-only". That is what landed, and
+it changes the character of the optimization: non-negativity stopped being a global
+promise the caller makes and became **a property of the plan the optimizer proves**.
+
+**The three pieces.**
+
+1. **A declaration** — `CREATE TABLE t (…) WITH ('append_only' = 'true')`, Feldera's
+   spelling (`Parser.ParseTablePropertiesOpt` → `Catalog.IsAppendOnly` →
+   `ScanPlan.AppendOnly`). It asserts that rows are only ever inserted. Like `NOT
+   NULL`, it is a contract the engine does not police; unlike the old thread-static, it
+   is **per table**, written by whoever knows the stream's shape, and it travels with
+   the schema instead of with the compile call. An unknown property key is a resolve
+   error — a misspelled property that silently does nothing would be worse than a
+   compile failure, because it changes which rewrites are legal.
+2. **An analysis** — `Optimizer/PlanWeightPositivity.IsNonNegative(plan)`. Two ways a
+   plan earns non-negativity: *declared* (every scan in its lineage is append-only) or
+   *derived* (the lineage passes through an operator that launders sign, whatever its
+   input did — `DISTINCT`, whose cumulative output weight per row is 0 or 1 by
+   `DistinctOp`'s contract, or an aggregate, which emits one row per live group).
+   Filter / Project / Join / UnionAll / windowing / TOP-K propagate from their inputs;
+   `DifferencePlan` and `RecursiveCtePlan` and anything unrecognized answer `false`.
+   One-sided by construction: a wrong `false` costs an optimization, a wrong `true`
+   costs correctness.
+3. **A tri-state seam** — `NonLinearNarrowing.{Auto, Always, Never}` replaces the old
+   boolean. `Auto` (default) asks the analysis per aggregate; `Always` is the old
+   blanket promise, kept for the A/B arms and for schemas that predate the property;
+   `Never` is the pre-analysis baseline, which is what the benchmarks now measure
+   against (the Nexmark DDL declares `append_only`, so without an explicit `Never` both
+   arms would narrow and the A/B would collapse).
+
+**What it unblocks, measured.** The Calcite rule census
+(`docs/research-calcite-rules.md`, `-- rulecensus`) counted the blocked sites before
+and after: **3 → 0** across the Nexmark corpus (q4, q7, q17 — each a MIN/MAX aggregate
+reading 2–3 of 7 input columns). Re-running the §18.4 W=1 gate on this host (Apple
+silicon, 1M events, batch 10k, median-3):
+
+| Query | ns/event `Never` → `Auto` | B/event `Never` → `Auto` |
+|:--|--:|--:|
+| **q4** | 2,183 → **1,376 (−37 %)** | 2,376 → **1,841 (−23 %)** |
+| q3 (control, no MIN/MAX) | 75.4 → 74.0 (noise) | 89 → 89 (unchanged) |
+
+That reproduces §18.4's i9 numbers (−35 % / −23 %) on a different machine and a
+different arrival path for the same rewrite. **The W=8 `q4narrow` gate was not
+reproducible on this host** — successive 5-run medians reported 1.54× and 0.49× on the
+same configuration, i.e. the harness is dominated by scheduler/thermal noise on this
+laptop. No W>1 claim is made from this host; §18.4's i9 W=8 numbers stand as the
+parallel evidence.
+
+**Why this is the right shape.** The old seam made the whole *process* promise
+something about every stream it would ever compile — unfalsifiable, all-or-nothing, and
+therefore permanently default-off. The declaration is local and checkable by the person
+writing the schema; the analysis makes the optimizer's use of it auditable; and the
+derived half means a plan can earn the rewrite with no declaration at all (a `DISTINCT`
+or an aggregate below the MIN/MAX is enough). The random-query PBT is unaffected — its
+tables carry no declaration, so `Auto` refuses to narrow exactly where its
+net-negative streams live, which is why it can now run against the default path
+instead of being fenced off from it.
 
 ---
 

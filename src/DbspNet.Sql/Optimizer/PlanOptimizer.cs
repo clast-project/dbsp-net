@@ -417,28 +417,25 @@ public static class PlanOptimizer
     /// </remarks>
     private static LogicalPlan NarrowAggregateInput(AggregatePlan agg)
     {
-        // Bail on the non-linear aggregates (MIN / MAX / APPROX_COUNT_DISTINCT /
-        // COUNT(DISTINCT)): they depend on which distinct values have positive
-        // weight, not on the weight sum, so narrowing can collapse two rows that
-        // share the kept columns into a single zero-weight entry and drop a
-        // value the aggregate would otherwise have seen — over an arbitrary
-        // *signed* Z-set. This bail is the safe default. When
-        // NonLinearNarrowingMode is enabled the rule narrows these too: keeping
-        // the aggregate's argument columns makes collapsing rows that share them
-        // invariant for the aggregate, and over a *well-formed* (non-negative)
-        // per-group integral the narrowed weight is > 0 iff some positive-weight
-        // row exists — exactly the value-presence MIN/MAX/DISTINCT read
-        // (docs/design-row-representation.md §18).
-        if (!NonLinearNarrowingMode.Enabled)
+        // The non-linear aggregates (MIN / MAX / APPROX_COUNT_DISTINCT /
+        // COUNT(DISTINCT)) depend on which distinct values have positive weight,
+        // not on the weight sum. Over an arbitrary *signed* Z-set, narrowing can
+        // collapse two rows that share the kept columns into a single zero-weight
+        // entry and drop a value the aggregate would otherwise have seen. Over a
+        // *non-negative* one it cannot — the narrowed weight is a sum of
+        // non-negatives, so it is > 0 iff some positive-weight row exists, which is
+        // exactly the value-presence these aggregates read (and the narrowing keeps
+        // the argument columns, so collapsing rows that agree on them is invariant
+        // for the aggregate itself). See docs/design-row-representation.md §18.
+        //
+        // So the question is only whether this aggregate's input is non-negative,
+        // and PlanWeightPositivity answers it from the plan's lineage — declared
+        // `append_only` tables, or a sign-laundering DISTINCT / aggregate below.
+        // The mode overrides that verdict in both directions for the A/B benchmarks
+        // and for callers whose schemas predate the property.
+        if (HasNonLinearAggregate(agg) && !NonLinearNarrowingAllowed(agg.Input))
         {
-            foreach (var call in agg.Aggregates)
-            {
-                if (call.Kind is AggregateKind.Min or AggregateKind.Max
-                    or AggregateKind.ApproxCountDistinct or AggregateKind.CountDistinct)
-                {
-                    return agg;
-                }
-            }
+            return agg;
         }
 
         // Collect every input column the aggregate references.
@@ -513,6 +510,28 @@ public static class PlanOptimizer
         // and aggregate-result types are preserved by the remap.
         return new AggregatePlan(narrowingProject, newGroupKeys, newAggregates, agg.Schema);
     }
+
+    private static bool HasNonLinearAggregate(AggregatePlan agg)
+    {
+        foreach (var call in agg.Aggregates)
+        {
+            if (call.Kind is AggregateKind.Min or AggregateKind.Max
+                or AggregateKind.ApproxCountDistinct or AggregateKind.CountDistinct)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool NonLinearNarrowingAllowed(LogicalPlan aggregateInput) =>
+        NonLinearNarrowingMode.Mode switch
+        {
+            NonLinearNarrowing.Always => true,
+            NonLinearNarrowing.Never => false,
+            _ => PlanWeightPositivity.IsNonNegative(aggregateInput),
+        };
 
     // ---------- Join-input column pruning (projection pushdown through join) ----------
 

@@ -13,9 +13,20 @@ public abstract record SqlNode;
 
 public abstract record SqlStatement : SqlNode;
 
+/// <param name="Properties">
+/// Table-level properties from a trailing <c>WITH ('key' = 'value', …)</c> clause,
+/// in source order; null when the clause is absent. The parser stays dumb about
+/// which keys are meaningful — the resolver validates them (see
+/// <c>Resolver.ResolveCreateTable</c>). Spelled to match Feldera's table-property
+/// surface.
+/// </param>
 public sealed record CreateTableStatement(
     string TableName,
-    IReadOnlyList<ColumnDefinition> Columns) : SqlStatement;
+    IReadOnlyList<ColumnDefinition> Columns,
+    IReadOnlyList<TableProperty>? Properties = null) : SqlStatement;
+
+/// <summary>One <c>'key' = 'value'</c> pair from a <c>CREATE TABLE … WITH (…)</c> clause.</summary>
+public sealed record TableProperty(string Key, string Value);
 
 public sealed record ColumnDefinition(
     string Name,

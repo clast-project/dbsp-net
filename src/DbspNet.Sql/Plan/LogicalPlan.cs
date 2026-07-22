@@ -21,10 +21,17 @@ public abstract record LogicalPlan(Schema Schema);
 /// keys carry no lateness. The monotonicity analyzer seeds from these, and the
 /// compiler uses the bound to build the column's frontier.
 /// </summary>
+/// <param name="AppendOnly">
+/// The table's declared <c>WITH ('append_only' = 'true')</c> property, lifted from
+/// the catalog. True ⇒ the scan's Z-set weights are non-negative at every tick,
+/// which unlocks the rewrites gated on that (<c>PlanWeightPositivity</c>). A
+/// contract the engine does not police — see <c>docs/design-row-representation.md</c> §18.6.
+/// </param>
 public sealed record ScanPlan(
     string TableName,
     Schema Schema,
-    IReadOnlyDictionary<int, long>? ColumnLateness = null) : LogicalPlan(Schema);
+    IReadOnlyDictionary<int, long>? ColumnLateness = null,
+    bool AppendOnly = false) : LogicalPlan(Schema);
 
 /// <summary>
 /// Reference to a <c>WITH name AS (...)</c> CTE definition. Reference

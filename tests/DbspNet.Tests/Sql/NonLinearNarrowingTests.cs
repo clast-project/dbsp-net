@@ -40,11 +40,21 @@ public class NonLinearNarrowingTests
         "CREATE TABLE w (k INT NOT NULL, val INT NOT NULL, x INT NOT NULL, y INT NOT NULL)",
     };
 
+    // The same table, declared append-only — the property that makes the narrowing
+    // provably sound rather than a caller-wide promise (§18.6).
+    private static readonly string[] AppendOnlyDdl =
+    {
+        "CREATE TABLE w (k INT NOT NULL, val INT NOT NULL, x INT NOT NULL, y INT NOT NULL) " +
+        "WITH ('append_only' = 'true')",
+    };
+
     // MAX and MIN over `val`, grouped by `k`. The aggregate references only
     // {k, val}; x and y are droppable — narrowing collapses rows that share
     // {k, val} but differ in x/y.
     private const string Sql =
         "SELECT k, MAX(val) AS mx, MIN(val) AS mn FROM w GROUP BY k";
+
+    private const string AppendOnlySql = Sql;
 
     [Fact]
     public void NarrowedMinMax_EqualsFullRow_OverWellFormedStreams()
@@ -80,38 +90,98 @@ public class NonLinearNarrowingTests
         Assert.Equal(2, AggregateInputArity(on));  // k, val (narrowed)
     }
 
+    // ---- the analysis-driven (default) path: §18.6 ----
+
+    [Fact]
+    public void AppendOnlyTable_NarrowsMinMax_WithNoSeamAndNoGlobalPromise()
+    {
+        // The unblock: `WITH ('append_only' = 'true')` makes non-negativity a
+        // *provable* property of this plan's lineage, so the default policy narrows
+        // — no thread-static, no caller-wide assertion.
+        var plan = ParsePlan(AppendOnlyDdl, AppendOnlySql);
+        Assert.Equal(2, AggregateInputArity(PlanOptimizer.Optimize(plan)));
+    }
+
+    [Fact]
+    public void UndeclaredTable_StillDoesNotNarrow_ByDefault()
+    {
+        // The complementary half: without the declaration the input may be an
+        // arbitrary signed Z-set, so the rule must still bail. This is what keeps
+        // the random-query PBT (which emits net-negative streams) sound.
+        var plan = ParsePlan(Ddl, Sql);
+        Assert.Equal(4, AggregateInputArity(PlanOptimizer.Optimize(plan)));
+    }
+
+    [Fact]
+    public void DistinctBelowAggregate_Narrows_WithoutAnyDeclaration()
+    {
+        // The derived (undeclared) half of the analysis: DISTINCT launders sign, so
+        // the aggregate's input is non-negative whatever the table's stream does.
+        var plan = ParsePlan(
+            Ddl,
+            "SELECT d.k, MAX(d.val) AS mx FROM (SELECT DISTINCT k, val, x, y FROM w) AS d GROUP BY d.k");
+        Assert.Equal(2, AggregateInputArity(PlanOptimizer.Optimize(plan)));
+    }
+
+    [Fact]
+    public void NarrowedMinMax_EqualsFullRow_OnAppendOnlyDeclaration()
+    {
+        // End-to-end equivalence for the path that is now on by default: same
+        // well-formed streams, narrowed-by-declaration vs. never-narrowed.
+        for (var seed = 0; seed < 100; seed++)
+        {
+            var ticks = GenerateWellFormed(seed);
+            var full = RunWithMode(NonLinearNarrowing.Never, AppendOnlyDdl, AppendOnlySql, ticks);
+            var narrowed = RunWithMode(NonLinearNarrowing.Auto, AppendOnlyDdl, AppendOnlySql, ticks);
+
+            Assert.True(
+                full.Equals(narrowed),
+                $"seed {seed}: declaration-narrowed MIN/MAX diverged from full-row.\n" +
+                $"full:     {full}\nnarrowed: {narrowed}");
+        }
+    }
+
     // ---- helpers ----
 
     private static ZSet<StructuralRow, Z64> RunCompiled(
-        bool optimizeNarrowNonLinear, IReadOnlyList<IReadOnlyList<InputEvent>> ticks)
+        bool optimizeNarrowNonLinear, IReadOnlyList<IReadOnlyList<InputEvent>> ticks) =>
+        RunWithMode(
+            optimizeNarrowNonLinear ? NonLinearNarrowing.Always : NonLinearNarrowing.Never,
+            Ddl, Sql, ticks);
+
+    private static ZSet<StructuralRow, Z64> RunWithMode(
+        NonLinearNarrowing mode, string[] ddl, string sql,
+        IReadOnlyList<IReadOnlyList<InputEvent>> ticks)
     {
-        var plan = ParsePlan(Sql);
-        var optimized = optimizeNarrowNonLinear
-            ? WithNarrowing(() => PlanOptimizer.Optimize(plan))
-            : PlanOptimizer.Optimize(plan);
+        var plan = ParsePlan(ddl, sql);
+        var optimized = WithMode(mode, () => PlanOptimizer.Optimize(plan));
         var compiled = PlanToCircuit.Compile(optimized);
         return IncrementalOracle.RunAndAccumulate(compiled, ticks);
     }
 
-    private static T WithNarrowing<T>(Func<T> body)
+    private static T WithNarrowing<T>(Func<T> body) => WithMode(NonLinearNarrowing.Always, body);
+
+    private static T WithMode<T>(NonLinearNarrowing mode, Func<T> body)
     {
-        var prev = NonLinearNarrowingMode.Enabled;
-        NonLinearNarrowingMode.Enabled = true;
+        var prev = NonLinearNarrowingMode.Mode;
+        NonLinearNarrowingMode.Mode = mode;
         try
         {
             return body();
         }
         finally
         {
-            NonLinearNarrowingMode.Enabled = prev;
+            NonLinearNarrowingMode.Mode = prev;
         }
     }
 
-    private static LogicalPlan ParsePlan(string sql)
+    private static LogicalPlan ParsePlan(string sql) => ParsePlan(Ddl, sql);
+
+    private static LogicalPlan ParsePlan(string[] ddlStatements, string sql)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
-        foreach (var ddl in Ddl)
+        foreach (var ddl in ddlStatements)
         {
             resolver.Resolve(Parser.ParseStatement(ddl));
         }

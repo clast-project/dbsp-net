@@ -105,7 +105,40 @@ public sealed class Parser
         }
 
         Expect(TokenKind.RParen);
-        return new CreateTableStatement(name, columns);
+        return new CreateTableStatement(name, columns, ParseTablePropertiesOpt());
+    }
+
+    /// <summary>
+    /// Optional trailing <c>WITH ('key' = 'value', …)</c> table-property clause.
+    /// Keys and values are string literals (Feldera's spelling); the parser does
+    /// not interpret them — unknown keys are the resolver's error to raise.
+    /// </summary>
+    private IReadOnlyList<TableProperty>? ParseTablePropertiesOpt()
+    {
+        if (Peek().Kind != TokenKind.With)
+        {
+            return null;
+        }
+
+        Advance();
+        Expect(TokenKind.LParen);
+        var properties = new List<TableProperty>();
+        while (true)
+        {
+            var key = ExpectStringLiteral("table property name");
+            Expect(TokenKind.Eq);
+            var value = ExpectStringLiteral($"value for table property '{key}'");
+            properties.Add(new TableProperty(key, value));
+            if (Peek().Kind != TokenKind.Comma)
+            {
+                break;
+            }
+
+            Advance();
+        }
+
+        Expect(TokenKind.RParen);
+        return properties;
     }
 
     private ColumnDefinition ParseColumnDefinition()
@@ -2409,6 +2442,17 @@ public sealed class Parser
         if (t.Kind != TokenKind.Identifier && !Lexer.IsKeywordKind(t.Kind))
         {
             throw Error(t, $"expected {what}, got {Describe(t)}");
+        }
+
+        return Advance().Text;
+    }
+
+    private string ExpectStringLiteral(string what)
+    {
+        var t = Peek();
+        if (t.Kind != TokenKind.StringLiteral)
+        {
+            throw Error(t, $"expected quoted {what}, got {Describe(t)}");
         }
 
         return Advance().Text;

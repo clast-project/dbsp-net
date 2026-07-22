@@ -146,7 +146,12 @@ grows and the GC frontier climbs.
 
 ## What works today
 
-- DDL: `CREATE TABLE` (with `NOT NULL`/`NULL`; `PRIMARY KEY` parsed but ignored), `CREATE VIEW`.
+- DDL: `CREATE TABLE` (with `NOT NULL`/`NULL`; `PRIMARY KEY` parsed but ignored;
+  per-column `LATENESS`; and a table-level `WITH ('append_only' = 'true')` property
+  declaring that rows are only inserted — which lets the optimizer narrow the input
+  of MIN/MAX/DISTINCT aggregates, see
+  [`design-row-representation.md`](docs/design-row-representation.md) §18.6),
+  `CREATE VIEW`.
 - Types: `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `DECIMAL(p,s)`,
   `VARCHAR`, `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP`, `INTERVAL`. `DECIMAL` is Arrow-
   aligned `Decimal128` (Int128 mantissa) via `Clast.DatabaseDecimal` with

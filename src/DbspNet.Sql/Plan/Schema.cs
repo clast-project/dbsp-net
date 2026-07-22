@@ -130,13 +130,35 @@ public sealed class Schema
 public sealed class Catalog
 {
     private readonly Dictionary<string, Schema> _tables = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _appendOnly = new(StringComparer.Ordinal);
 
-    public void Register(string name, Schema schema)
+    public void Register(string name, Schema schema) => Register(name, schema, appendOnly: false);
+
+    /// <param name="appendOnly">
+    /// The table's declared <c>WITH ('append_only' = 'true')</c> property: rows are
+    /// only ever inserted, never deleted or updated, so the table's Z-set weights
+    /// are non-negative at every tick. Optimizer rules that are sound only over a
+    /// non-negative Z-set consult this through
+    /// <c>PlanWeightPositivity</c> (see <c>docs/design-row-representation.md</c> §18.6).
+    /// It is a <i>contract</i>, like <c>NOT NULL</c>: the engine does not police it.
+    /// </param>
+    public void Register(string name, Schema schema, bool appendOnly)
     {
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(schema);
         _tables[name] = schema;
+        if (appendOnly)
+        {
+            _appendOnly.Add(name);
+        }
+        else
+        {
+            _appendOnly.Remove(name);
+        }
     }
+
+    /// <summary>Whether <paramref name="name"/> was declared <c>append_only</c>.</summary>
+    public bool IsAppendOnly(string name) => _appendOnly.Contains(name);
 
     public bool TryGet(string name, out Schema? schema) => _tables.TryGetValue(name, out schema);
 

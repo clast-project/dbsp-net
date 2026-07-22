@@ -61,7 +61,9 @@ internal static class W1ProfileBenchmark
         // Optional term-2 lever (§18): narrow non-linear (MIN/MAX) aggregate
         // inputs to {keys, args}. Thread-static seam; w1profile runs single-
         // threaded on this thread, so setting it once covers every Compile.
-        DbspNet.Sql.Optimizer.NonLinearNarrowingMode.Enabled = narrowNonLinear;
+        DbspNet.Sql.Optimizer.NonLinearNarrowingMode.Mode = narrowNonLinear
+            ? DbspNet.Sql.Optimizer.NonLinearNarrowing.Always
+            : DbspNet.Sql.Optimizer.NonLinearNarrowing.Never;
         // Optional term-1 lever (§20): cross-tick delta-builder pooling. Read at
         // operator construction; safe here because the W=1 harness never retains a
         // tick's output across the next Step.

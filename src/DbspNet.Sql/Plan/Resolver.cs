@@ -137,8 +137,41 @@ public sealed class Resolver
         }
 
         var schema = new Schema(cols);
-        _catalog.Register(stmt.TableName, schema);
+        _catalog.Register(stmt.TableName, schema, ResolveAppendOnly(stmt));
         return new CreateTablePlan(stmt.TableName, schema);
+    }
+
+    /// <summary>
+    /// Interpret the <c>WITH ('key' = 'value', …)</c> table properties. Only
+    /// <c>append_only</c> is understood in v1 — the declaration that the table's
+    /// rows are inserted and never deleted, so its Z-set weights stay non-negative.
+    /// Unknown keys are an error rather than a silent no-op: a misspelled property
+    /// that quietly does nothing is worse than a compile failure, and the property
+    /// changes which optimizer rewrites are legal.
+    /// </summary>
+    private static bool ResolveAppendOnly(CreateTableStatement stmt)
+    {
+        var appendOnly = false;
+        foreach (var p in stmt.Properties ?? Array.Empty<TableProperty>())
+        {
+            if (!string.Equals(p.Key, "append_only", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ResolveException(
+                    $"unknown table property '{p.Key}' on table '{stmt.TableName}' " +
+                    "(supported: 'append_only')");
+            }
+
+            appendOnly = p.Value.ToLowerInvariant() switch
+            {
+                "true" => true,
+                "false" => false,
+                _ => throw new ResolveException(
+                    $"table property 'append_only' on '{stmt.TableName}' must be " +
+                    $"'true' or 'false', got '{p.Value}'"),
+            };
+        }
+
+        return appendOnly;
     }
 
     /// <summary>
@@ -2253,7 +2286,8 @@ public sealed class Resolver
             }
         }
 
-        return new ScanPlan(tr.TableName, new Schema(cols), lateness);
+        return new ScanPlan(
+            tr.TableName, new Schema(cols), lateness, _catalog.IsAppendOnly(tr.TableName));
     }
 
     private LogicalPlan ResolveJoin(JoinClause join, IReadOnlyDictionary<string, CteRef> cteScope)
