@@ -500,12 +500,33 @@ public static class PlanToCircuit
     /// serial <see cref="CompileProgram"/>) when <em>any</em> reachable view uses a
     /// construct the pass cannot shard soundly — the whole program shares one
     /// circuit and one worker count, so a single un-shardable view forces serial.
+    /// <para>
+    /// Pass <paramref name="snapshotCodecs"/> to make every replica's stateful
+    /// operators snapshot-capable, so the whole program can be checkpointed with
+    /// <c>ParallelSnapshot.WriteAsync</c> (per-worker shards). The codecs are
+    /// <b>save-time only</b> — a registered codec is untouched by <c>Step</c>, so
+    /// enabling persistence does not change per-tick cost or output. Note that a
+    /// dimension the broadcast size gate replicates is held (and therefore
+    /// persisted) once per worker; the gate only broadcasts relations under
+    /// <see cref="CompileOptions.BroadcastMaxRows"/>, so the W× duplication is
+    /// bounded and small.
+    /// </para>
+    /// <para>
+    /// <b>Coverage limit.</b> A parallel program's output views are integrated on
+    /// the <em>driver</em> (<see cref="ParallelProgramOutput"/>), not by an
+    /// in-circuit operator, so they are outside the per-worker snapshot. The
+    /// checkpoint therefore restores operator state but not the materialised
+    /// output views — enough to measure checkpoint cost, not yet enough for a
+    /// parallel recovery. (The serial <see cref="CompileProgram"/> has no such gap:
+    /// its outputs are in-circuit <c>Integrate</c> operators and are snapshotted.)
+    /// </para>
     /// </summary>
     public static bool TryCompileProgramParallel(
         IReadOnlyList<CreateTablePlan> tables,
         IReadOnlyList<ProgramView> views,
         int workers,
         out ParallelCompiledProgram? compiled,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
         CompileOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(tables);
@@ -613,8 +634,11 @@ public static class PlanToCircuit
                 foreach (var (v, optimized) in prepared)
                 {
                     var monotonicity = MonotonicityAnalyzer.Analyze(optimized);
+                    // The build closure runs once per replica, so each worker's
+                    // operators get their own codec instances — exactly what the
+                    // per-worker snapshot subtree expects.
                     var ctx = new CompileContext(
-                        streams, schemas, codec, snapshotCodecs: null, options, monotonicity,
+                        streams, schemas, codec, snapshotCodecs, options, monotonicity,
                         emptyFrontiers, emptyShareable, workers, rowCounts);
                     // The scan streams (this program's tables) are whole-row-hashed
                     // inputs → shard-disjoint. A view-scan resolves to that view's

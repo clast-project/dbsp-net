@@ -227,3 +227,111 @@ a small change, but it falls back to serial for batch-1 today because (a) whole-
 (§9.2) and (b) `ProgramRunner` drives only the serial `CompiledProgram`. To land it: a parallel
 `ProgramRunner`, LEFT/semi-join coverage, and a story for the 5 global-rank views (gather-on-one-worker /
 mixed regions) or accept they cap the single-circuit approach.
+
+## 10. Per-batch state persistence (2026-07-21)
+
+§9.5 left the program path **stateless across batches**: `DeployAsync` compiled with
+`snapshotCodecs: null` and `ProgramRunner` had no checkpoint hook at all, so a batch's engine state
+lived only in memory. Two consequences, one honest-measurement and one durability:
+
+- **The batch number was not the whole batch.** Feldera's per-batch cost includes making state
+  durable; ours measured step + output write only. Comparing them is apples-to-oranges unless we can
+  at least *price* the checkpoint.
+- **Nothing survived a restart.** Batch 2/3 could only follow batch 1 inside one process lifetime.
+
+### 10.1 What was built
+
+**Serial program path (what the ivm-bench server drives).**
+- `ProgramSpec.SnapshotDir` (falling back to `DBSPNET_SNAPSHOT_DIR`) turns persistence on.
+  `DbspNetEngine.DeployAsync` then compiles with `ArrowSqlSnapshotCodecs.Instance` and wires a
+  `SnapshotCheckpointStore` over a `LocalTableFileSystem`. Unset ⇒ codec-free compile ⇒ the engine is
+  bit-for-bit what it was before the option existed. Off by default, deliberately: the head-to-head
+  against Feldera should only pay for checkpointing if Feldera's configured run does too.
+- `ProgramRunner` gained the hook it was missing, mirroring `PipelineRunner`: an optional
+  `ICheckpointStore`, `RestoreAsync`, `CheckpointAsync`, and an automatic checkpoint **at the end of
+  each `RunBatchAsync`** — the natural commit point for a runner whose contract is "drain everything,
+  then write every output once". Offsets ride in the snapshot manifest, so engine tick T and the
+  source cursors commit atomically (the exactly-once alignment invariant).
+- The checkpoint is **inside** the batch's measured span on purpose. A batch is done when its state
+  is durable; the honest per-batch number is step + output write + checkpoint. `DBSPNET_PROFILE=1`
+  now reports a `checkpoint save` phase alongside the other four.
+- Restore runs in `DeployAsync` — outside the measured batch, like the compile. `DeployResult` reports
+  `Persistent` and `RestoredTick`.
+
+**Parallel program path.** `PlanToCircuit.TryCompileProgramParallel` hardcoded `snapshotCodecs: null`
+(the §9.1 shortcut); it and `SqlProgram.TryCompileParallel` now thread an `ISqlSnapshotCodecs`
+through to the per-view `CompileContext`. The build closure runs once per replica, so each worker's
+operators register their own codecs and the program checkpoints through `ParallelSnapshot.WriteAsync`
+as W disjoint `worker-{w}/` shards, written concurrently. A dimension the broadcast size gate
+replicates is held — and therefore persisted — once per worker; the gate only broadcasts relations
+under `BroadcastMaxRows`, so the W× duplication is bounded and small.
+
+**Coverage limit, stated plainly.** A parallel program integrates each output view on the *driver*
+(`ParallelProgramOutput`), not in-circuit, so the materialised views are outside the per-worker
+snapshot. The parallel checkpoint restores **operator state exactly** — `ParallelProgramSnapshotTests`
+asserts the post-restore tick's gathered delta equals an uninterrupted run's — but the integrated
+views restart empty. That is enough to price the checkpoint, not yet enough for a parallel recovery.
+The serial path has no such gap (its outputs are in-circuit `Integrate` operators, snapshotted like
+any other stateful operator). Closing it needs either in-circuit integration per replica (which would
+add per-tick work, so: no) or a driver-side region in the snapshot tree — a follow-on, and moot until
+there is a parallel `ProgramRunner` at all (§9.2/§9.5).
+
+CI: `ProgramRunnerCheckpointTests` (restore resumes without replaying or skipping; every batch
+checkpoints; codecs do not change results) and `ParallelProgramSnapshotTests` (per-worker round-trip
+at W=1/2/4/8; W-mismatch refused; codecs do not change results).
+
+### 10.2 Measured (real SF=3, ServerGC, i9-12900K, `IVM_BCAST_MAXROWS=1000`)
+
+`IvmSubgraphScaling` now also times the checkpoint, so the same run reports the step sweep, the
+save phase, and the honest total. Output byte-identical to serial at every W, as before.
+
+**(1) The codecs do not touch the step.** The persistent W-sweep reproduces the codec-free sweep's
+shape — which is the point: a registered codec is read only by Save/Load.
+
+| subgraph | step scaling W1→W8, codec-free | step scaling W1→W8, with codecs |
+|---|--:|--:|
+| `trades_history`   | 2.76× | **2.87×** |
+| `holdings_history` | 2.17× | **2.17×** |
+
+(The serial codec-vs-codec-free ratio came out 0.87× / 0.94× — i.e. the persistent compile timed
+*faster*. That is drift between two separately-timed serial measurements in one process, not a
+speedup; the direction that would matter, a systematic penalty, is absent in both.)
+
+**(2) The checkpoint is not cheap, and it only partly parallelizes.**
+
+| subgraph | W | step ms | save ms | total ms | step vs W1 | total vs W1 | MiB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `trades_history`   | 1 | 5852 | 3059 |  8911 | 1.00× | 1.00× | 797.1 |
+|                    | 2 | 4571 | 2617 |  7188 | 1.28× | 1.24× | 797.1 |
+|                    | 4 | 3272 | 2031 |  5303 | 1.79× | 1.68× | 797.1 |
+|                    | 8 | 2036 | 1631 |  3667 | **2.87×** | **2.43×** | 797.2 |
+| `holdings_history` | 1 | 8274 | 3941 | 12215 | 1.00× | 1.00× | 1059.9 |
+|                    | 2 | 6395 | 3492 |  9887 | 1.29× | 1.24× | 1059.9 |
+|                    | 4 | 5729 | 2690 |  8420 | 1.44× | 1.45× | 1059.9 |
+|                    | 8 | 3816 | 3152 |  6968 | **2.17×** | **1.75×** | 1060.1 |
+
+Serial reference: `trades_history` step 5717 ms / save 3409 ms / 955.1 MiB; `holdings_history` step
+8694 ms / save 3908 ms / 1095.5 MiB.
+
+The save is **34–48% of the durable batch** — a ~1 GiB write per hot subgraph. Per-worker shards are
+written concurrently, so it does scale (`trades_history` 3059→1631 ms, 1.88×), but weakly and not
+monotonically (`holdings_history` 2690 ms at W=4 → 3152 ms at W=8): past W≈4 the save is disk-bandwidth
+bound, not CPU bound. Net effect on end-to-end scaling: `trades_history` 2.87× → **2.43×** (still clears
+the ≥2× gate), `holdings_history` 2.17× → **1.75×** (does not, once the checkpoint is counted).
+
+**So: persistence does not erode the parallel step at all — it dilutes the *batch* by adding a
+weakly-scaling serial-ish tail.** That is the honest number, and the reason the option is off by
+default: turn it on for a durability comparison, leave it off for a step-for-step head-to-head unless
+Feldera's configured run also checkpoints per batch.
+
+**(3) Snapshot size is flat in W — and the broadcast W× duplication is measurable and negligible.**
+797.1 MiB at W=1/2/4 and 797.2 MiB at W=8 (`trades_history`); 1059.9 → 1060.1 MiB (`holdings_history`).
+The per-worker shards *partition* state rather than replicate it; the only replicated state is the
+broadcast dimensions, costing **+0.1 / +0.2 MiB at W=8** — exactly what a ≤1000-row size gate predicts.
+
+**(4) The §10.1 driver-view gap, quantified.** The serial snapshot holds one more operator than a
+parallel worker's (6 vs 5 for `trades_history`, 9 vs 8 for `holdings_history`) and 158 MiB / 36 MiB
+more bytes — that operator is the in-circuit `Integrate` for the output view, and those bytes are the
+materialised view itself (982k / 362k rows). That difference *is* the parallel path's missing
+coverage, now priced: closing it would add ~4–20% to the parallel save, and it is what a real parallel
+recovery would need.
