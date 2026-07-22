@@ -1,6 +1,7 @@
 # Design: structural-parallel exchange insertion for `PlanToCircuit` (batch-1 competitiveness)
 
-**Status: SCOPING (design-first, not built). 2026-07-21.**
+**Status: BUILT + MEASURED. 2026-07-21.** (§0–§8 are the original scoping/plan; §9 records what was
+built and what the measurements said — read it for the outcome.)
 Companion to `docs/design-columnar-batch1.md` §9 (the reframe) and `docs/design-row-representation.md`
 (the exchange/parallel arc, §15). Same discipline: design-first, measure-first, benchmark-gated,
 retire-if-it-loses.
@@ -160,3 +161,69 @@ structural node compile; (b) branch the two `RootCircuit.Build` sites to `Parall
 elision; (d) write the one new `StructuralRow`-slot stable partition hash. No new runtime operators. The
 measured Feldera curve says this is the lever that makes batch-1 competitive; the open number Increment 2
 must land is the **real-DAG realized scaling factor**.
+
+## 9. Built + measured (session outcome, 2026-07-21)
+
+All of the below is **additive and opt-in** (off by default), **byte-identical at W=1** by the exchange
+degradation, and lands with the full suite green. Correctness oracle: `ParallelStructuralCompilerTests`
+(structural-serial ≡ structural-parallel at W=1/2/4/8 across join / aggregate / distinct / partitioned
+window / top-K / union, plus fused and broadcast variants) + `CardinalityEstimatorTests`.
+
+### 9.1 Increment 0 — shipped, gated
+Built exactly as §8: `StablePartitionHash.OfBoxed/OfRow/OfWholeRow` (the one new structural row-slot
+hash), partition-state threading + `IsKeySubset` elision + a shardability guard (`CanCompileParallel`) in
+`PlanToCircuit`, the `GroupProject → Exchange*` swaps, `PlanToCircuit.TryCompileParallel` +
+`ParallelStructuralCompiledQuery`, and the program analogue `TryCompileProgramParallel` +
+`ParallelCompiledProgram` (driver-side integrate-per-view gather). The swaps degrade to the identical
+`GroupProject` at W≤1, so the serial path is unchanged by construction.
+
+### 9.2 Increment 2 — whole-program parallel is BLOCKED (the honest finding)
+The batch-1 program is one circuit at one worker count, so a single un-shardable view forces the whole
+program serial. Probing the real SF=3 deploy spec: **11 of 50 views block it** — 6 LEFT joins (pure
+equi, tractable to add), 4 semi-joins (tractable), and **5 global-RANK leaderboards**
+(`RANK() OVER (ORDER BY … DESC)`, no PARTITION BY — inherently sequential, the hard wall). So whole-program
+parallel is not reachable on this substrate without mixed serial/parallel regions, independent of join
+coverage. (`IvmBatchParallelProbe` reports the live blocker list.)
+
+### 9.3 Increment 1 — the open number, measured (real SF=3, ServerGC, i9-12900K)
+Per-worker `StepProfiler` decomposition (split=movement, wait=coordination, gather=movement, residual=op)
+of two shardable hot fact subgraphs (`trades_history`, `holdings_history`) resolved the scaling wall:
+
+- **The wall is barrier WAIT (46–56% at W=8) driven by load IMBALANCE (1.7–2.1×), NOT data movement
+  (7–20%).** This **corrects §6 / the prior arc's "memory-bandwidth bound" conclusion** — that came from
+  `ParallelScalingProbe`'s disjoint-shard best case (no skew, no barriers). The real DAG is
+  coordination/skew-bound, which is *software-addressable*, not the hard bandwidth wall.
+- Skew source: low-cardinality dimension joins (a 5–14-value reference key hash-sharded across 8 workers
+  is inherently lopsided).
+
+### 9.4 The levers, and the result
+- **Join-exchange fusion** (`ExchangeIndexJoin`, single barrier vs two; `CompileOptions.CoalesceJoinExchange`).
+  Correct, modest: W=8 wait 56→51%, ~1.58→1.75× on `trades_history`. Barriers matter, skew dominates.
+- **Broadcast join for small dimensions** — the decisive lever. New all-gather `BroadcastExchangeOp` +
+  `CircuitBuilder.BroadcastExchange`; a join whose right side is a small dimension keeps the fact on its
+  balanced partition and replicates the dimension to every worker (each worker joins locally). Eliminates
+  the wall: imbalance → 1.0×, wait → ~2%, op ~90%.
+- **Production-ready, size-gated broadcast**: `CompileOptions.BroadcastMaxRows` + `RelationRowCounts`, with
+  a `CardinalityEstimator` deriving each dimension view's size from deployment-supplied base-table counts
+  (unknown size ⇒ hash join, never a blind broadcast). Connector helper `DeltaRowCounts` reads the counts
+  from Delta transaction-log `numRecords` (no scan; returns null on incomplete stats). **The size gate is
+  both safer and faster than broadcast-all** (it broadcasts only the tiny refs, hash-joins the large facts).
+
+Realized scaling with the production size gate (byte-identical at every W, balanced, wait-free):
+
+| subgraph | W=1 | W=2 | W=4 | W=8 |
+|---|--:|--:|--:|--:|
+| `trades_history`   | 1.00× | 1.50× | 1.97× | **2.49×** |
+| `holdings_history` | 1.00× | 1.20× | 1.88× | **2.13×** |
+
+**Both hot fact paths clear the ≥2× Increment-2 gate.** The residual ceiling past W≈4–8 (op ~90%, balanced)
+is genuinely compute / memory-bandwidth — the representation arc, the hard floor.
+
+### 9.5 What remains to make batch-1 benefit end-to-end
+Deploy is compile-once (`DbspNet.Server/DbspNetEngine.DeployAsync`, the `SqlProgram.Compile` site);
+batch-1/2/3 are `Resume`+`Wait` cycles on the same compiled program (parallelism is a build-time property,
+not per-batch — and it pays on batch-1's bulk load, not the tiny 2/3 increments). Wiring parallel there is
+a small change, but it falls back to serial for batch-1 today because (a) whole-program parallel is blocked
+(§9.2) and (b) `ProgramRunner` drives only the serial `CompiledProgram`. To land it: a parallel
+`ProgramRunner`, LEFT/semi-join coverage, and a story for the 5 global-rank views (gather-on-one-worker /
+mixed regions) or accept they cap the single-circuit approach.
