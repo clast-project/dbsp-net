@@ -29,19 +29,26 @@ public sealed class ProgramRunner
     private readonly CompiledProgram _program;
     private readonly List<InputBinding> _inputs;
     private readonly List<(IOutputConnector Connector, ProgramOutput Output)> _outputs;
+    private readonly ICheckpointStore? _checkpoint;
     private readonly BatchProfile? _profile = ProfileEnabled ? new BatchProfile() : null;
 
     private ProgramRunner(
         CompiledProgram program,
         List<InputBinding> inputs,
-        List<(IOutputConnector, ProgramOutput)> outputs)
+        List<(IOutputConnector, ProgramOutput)> outputs,
+        ICheckpointStore? checkpoint)
     {
         _program = program;
         _inputs = inputs;
         _outputs = outputs;
+        _checkpoint = checkpoint;
     }
 
     public CompiledProgram Program => _program;
+
+    /// <summary>True when this runner was wired with a checkpoint store, so each
+    /// <see cref="RunBatchAsync"/> ends with a durable state snapshot.</summary>
+    public bool HasCheckpoint => _checkpoint is not null;
 
     /// <summary>
     /// Wire connectors to a compiled program: validate each input source against the
@@ -49,11 +56,22 @@ public sealed class ProgramRunner
     /// schema. Every input connector's <see cref="IInputConnector.Name"/> must name a
     /// program source table; every output connector's <see cref="IOutputConnector.ViewName"/>
     /// must name a program output view.
+    /// <para>
+    /// Pass <paramref name="checkpoint"/> to make each batch durable: the runner
+    /// snapshots engine state + every source's committed cursor at the end of each
+    /// <see cref="RunBatchAsync"/> (batch granularity — the natural commit point for
+    /// this runner, whose whole contract is "drain, then write every output once"),
+    /// and <see cref="RestoreAsync"/> resumes from it. The program must have been
+    /// compiled with snapshot codecs
+    /// (<c>SqlProgram.Compile(..., snapshotCodecs: ArrowSqlSnapshotCodecs.Instance)</c>)
+    /// or the snapshot will hold no operator state.
+    /// </para>
     /// </summary>
     public static async ValueTask<ProgramRunner> CreateAsync(
         CompiledProgram program,
         IReadOnlyList<IInputConnector> inputs,
         IReadOnlyList<IOutputConnector> outputs,
+        ICheckpointStore? checkpoint = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
@@ -87,7 +105,57 @@ public sealed class ProgramRunner
             outputBindings.Add((connector, programOutput));
         }
 
-        return new ProgramRunner(program, inputBindings, outputBindings);
+        return new ProgramRunner(program, inputBindings, outputBindings, checkpoint);
+    }
+
+    /// <summary>
+    /// Restore engine state and every source's committed cursor from the last
+    /// checkpoint, if any. Call once after <see cref="CreateAsync"/> (before the
+    /// first <see cref="RunBatchAsync"/>) to resume a prior run; a no-op when no
+    /// checkpoint store is wired or none has been written yet. Returns the engine
+    /// tick restored to (0 for a fresh start).
+    /// </summary>
+    public async ValueTask<long> RestoreAsync(CancellationToken cancellationToken = default)
+    {
+        if (_checkpoint is null)
+        {
+            return 0;
+        }
+
+        var state = await _checkpoint.TryRestoreAsync(_program.Circuit, cancellationToken).ConfigureAwait(false);
+        if (state is null)
+        {
+            return 0;
+        }
+
+        foreach (var sc in state.Offsets)
+        {
+            var b = _inputs.FirstOrDefault(x => string.Equals(x.Connector.Name, sc.SourceName, StringComparison.Ordinal))
+                ?? throw new InvalidDataException($"checkpoint names unknown source '{sc.SourceName}'");
+            b.Cursor = b.Connector.ParseOffset(sc.Offset);
+        }
+
+        return state.Tick;
+    }
+
+    /// <summary>
+    /// Snapshot engine state together with every source's committed cursor. The two
+    /// commit atomically (the offsets ride in the snapshot manifest), so engine tick
+    /// T and the cursors can never diverge. Called automatically at the end of
+    /// <see cref="RunBatchAsync"/> when a checkpoint store is wired; exposed for a
+    /// forced checkpoint (e.g. before a clean shutdown).
+    /// </summary>
+    public ValueTask CheckpointAsync(CancellationToken cancellationToken = default)
+    {
+        if (_checkpoint is null)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        var offsets = _inputs
+            .Select(b => new SourceCheckpoint(b.Connector.Name, b.Cursor.Serialize()))
+            .ToList();
+        return _checkpoint.SaveAsync(_program.Circuit, offsets, cancellationToken);
     }
 
     /// <summary>Ingest every source version currently available (one engine tick per
@@ -181,7 +249,13 @@ public sealed class ProgramRunner
         }
     }
 
-    /// <summary>Convenience: drain all available versions, then write every output.</summary>
+    /// <summary>
+    /// Convenience: drain all available versions, write every output, then — if a
+    /// checkpoint store is wired — snapshot engine state + cursors. The checkpoint
+    /// is inside the returned batch's measured span on purpose: a batch is only
+    /// really "done" once its state is durable, so the honest per-batch number is
+    /// step + output write + checkpoint.
+    /// </summary>
     public async ValueTask<long> RunBatchAsync(CancellationToken cancellationToken = default)
     {
         if (_profile is not null)
@@ -197,6 +271,16 @@ public sealed class ProgramRunner
         var wall0 = Stopwatch.GetTimestamp();
         var ticks = await DrainAsync(cancellationToken).ConfigureAwait(false);
         await WriteOutputsAsync(cancellationToken).ConfigureAwait(false);
+
+        if (_checkpoint is not null)
+        {
+            var c0 = _profile is null ? 0 : Stopwatch.GetTimestamp();
+            await CheckpointAsync(cancellationToken).ConfigureAwait(false);
+            if (_profile is not null)
+            {
+                _profile.CheckpointTicks = Stopwatch.GetTimestamp() - c0;
+            }
+        }
 
         if (_profile is not null)
         {
@@ -248,6 +332,7 @@ public sealed class ProgramRunner
         private readonly Dictionary<string, PhaseAcc> _outputs = new(StringComparer.Ordinal);
 
         public long StepTicks;
+        public long CheckpointTicks;
         public long TotalTicks;
         public long EngineTicks;
 
@@ -261,6 +346,7 @@ public sealed class ProgramRunner
             _sources.Clear();
             _outputs.Clear();
             StepTicks = 0;
+            CheckpointTicks = 0;
             TotalTicks = 0;
             EngineTicks = 0;
         }
@@ -319,6 +405,7 @@ public sealed class ProgramRunner
             AppendPhase(sb, "engine step", stepMs, TotalTicks);
             AppendPhase(sb, "output materialize", matMs, TotalTicks);
             AppendPhase(sb, "output write (Delta)", writeMs, TotalTicks);
+            AppendPhase(sb, "checkpoint save", Ms(CheckpointTicks), TotalTicks);
 
             sb.AppendLine();
             sb.AppendLine("-- per-source ingest (read+decode / push, rows) --");

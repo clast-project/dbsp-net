@@ -17,6 +17,7 @@ using DbspNet.Connectors.EngineeredWood;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
+using DbspNet.Persistence;
 using DbspNet.Sql.Compiler;
 using Xunit;
 using Xunit.Abstractions;
@@ -54,6 +55,13 @@ public class IvmSubgraphScaling
     //   IVM_BCAST=1         broadcast ALL leaf-right dimensions (experimental override)
     //   IVM_BCAST_MAXROWS=N production size gate — broadcast a dimension only when its
     //                       estimated rows <= N (derived from the loaded base counts)
+    // Where the per-batch checkpoints are written (Windows-visible path; the test
+    // process is a Windows process). Wiped before every measured save.
+    private static string SnapshotRoot =>
+        Environment.GetEnvironmentVariable("IVM_SNAPSHOT_DIR") is { Length: > 0 } s
+            ? s
+            : Path.Combine(Path.GetTempPath(), "dbspnet-ivm-snap");
+
     private CompileOptions ParOptions => new()
     {
         CoalesceJoinExchange = Environment.GetEnvironmentVariable("IVM_FUSE") is "1" or "true",
@@ -158,7 +166,170 @@ public class IvmSubgraphScaling
             var s = ProfilePhases(spec, outputViews, tableRows, w);
             _out.WriteLine($"{w,-4} {s.Step,7:F1}   {s.MovePct,4:F0}%  {s.WaitPct,4:F0}%  {s.OpPct,4:F0}%   {s.Imbalance,4:F2}x");
         }
+
+        // ---- per-batch state persistence -------------------------------------
+        // A batch is only really done once its state is durable, so the honest
+        // per-batch cost is step + checkpoint. Two questions:
+        //   (1) do the snapshot codecs erode the STEP? They are registered at
+        //       operator construction and touched only by Save/Load, so they must
+        //       not — compare step-with-codecs against the codec-free sweep above.
+        //   (2) what does the checkpoint itself cost, and does it scale with W?
+        //       Serial → Snapshot.WriteAsync (one circuit). Parallel →
+        //       ParallelSnapshot.WriteAsync (W disjoint worker-{w}/ subtrees,
+        //       written concurrently). A broadcast dimension is held by every
+        //       worker, so it persists W× — bounded by BroadcastMaxRows, hence
+        //       small, but it shows up in the bytes column.
+        _out.WriteLine(string.Empty);
+        _out.WriteLine($"-- per-batch checkpoint (snapshot root: {SnapshotRoot}) --");
+
+        var serialSnap = await MeasureSerialCheckpoint(spec, outputViews, tableRows);
+        _out.WriteLine(
+            $"serial  step {serialSnap.StepMs,8:F1} ms  save {serialSnap.SaveMs,8:F1} ms  " +
+            $"total {serialSnap.StepMs + serialSnap.SaveMs,8:F1} ms  ops {serialSnap.Ops,-5} {serialSnap.MiB,7:F1} MiB");
+        // >1.00 = the codecs cost the step. They are registered at construction and
+        // read only by Save/Load, so the expectation is 1.00 — and anything inside the
+        // run-to-run drift between two separately-timed serial compiles (~±15% here)
+        // is consistent with "free". The parallel step column below is the stronger
+        // check: its W-sweep must reproduce the codec-free sweep's shape.
+        _out.WriteLine(
+            $"        codec step / codec-free step {serialSnap.StepMs / serialMs,5:F2}x " +
+            "(>1.00 = codecs cost the step)");
+
+        double? pw1Step = null, pw1Total = null;
+        _out.WriteLine("W    step_ms   save_ms  total_ms   step_vs_W1  total_vs_W1   ops   MiB    match");
+        foreach (var w in WorkerSweep)
+        {
+            var s = await MeasureParallelCheckpoint(spec, outputViews, tableRows, w);
+            var total = s.StepMs + s.SaveMs;
+            pw1Step ??= s.StepMs;
+            pw1Total ??= total;
+            var match = DictEquals(serialOut, s.Output);
+            _out.WriteLine(
+                $"{w,-4} {s.StepMs,8:F1}  {s.SaveMs,8:F1}  {total,8:F1}   {pw1Step.Value / s.StepMs,8:F2}x  " +
+                $"{pw1Total.Value / total,9:F2}x  {s.Ops,-5} {s.MiB,6:F1}   {(match ? "OK" : "MISMATCH")}");
+            Assert.True(match, $"W={w} persistent-compile output differs from serial (correctness)");
+        }
     }
+
+    private readonly record struct CheckpointSummary(
+        double StepMs, double SaveMs, int Ops, double MiB, Dictionary<string, long> Output);
+
+    // Serial program compiled WITH snapshot codecs: time the step, then the whole
+    // Snapshot.WriteAsync. Serial outputs are in-circuit Integrate operators, so
+    // the materialised views are part of this snapshot.
+    private async Task<CheckpointSummary> MeasureSerialCheckpoint(
+        Spec spec, HashSet<string> outputViews,
+        Dictionary<string, List<(object?[] Values, long Weight)>> tableRows)
+    {
+        var steps = new List<double>();
+        var saves = new List<double>();
+        var ops = 0;
+        double mib = 0;
+        Dictionary<string, long> output = new();
+
+        for (var r = 0; r <= CheckpointRepeats; r++) // r==0 warm-up, discarded
+        {
+            var program = SqlProgram.Compile(
+                spec.Program, outputViews, snapshotCodecs: ArrowSqlSnapshotCodecs.Instance,
+                numericStringCoercion: true, nullCollation: DbspNet.Sql.TypeSystem.NullCollation.Low);
+            foreach (var (table, rows) in tableRows)
+            {
+                program.Table(table).Push(rows);
+            }
+
+            var sw = Stopwatch.StartNew();
+            program.Step();
+            sw.Stop();
+
+            var view = program.Outputs[TargetView];
+            output = Materialize(view.CurrentView, view.Schema.Count);
+
+            var dir = FreshSnapshotDir("serial");
+            var sw2 = Stopwatch.StartNew();
+            ops = await Snapshot.WriteAsync(program.Circuit, dir);
+            sw2.Stop();
+            mib = DirectoryMiB(dir);
+
+            if (r > 0)
+            {
+                steps.Add(sw.Elapsed.TotalMilliseconds);
+                saves.Add(sw2.Elapsed.TotalMilliseconds);
+            }
+        }
+
+        return new CheckpointSummary(Median(steps), Median(saves), ops, mib, output);
+    }
+
+    // Parallel program compiled WITH snapshot codecs threaded through to every
+    // replica: time the step, then ParallelSnapshot.WriteAsync (per-worker shards,
+    // written concurrently).
+    private async Task<CheckpointSummary> MeasureParallelCheckpoint(
+        Spec spec, HashSet<string> outputViews,
+        Dictionary<string, List<(object?[] Values, long Weight)>> tableRows, int workers)
+    {
+        var steps = new List<double>();
+        var saves = new List<double>();
+        var ops = 0;
+        double mib = 0;
+        Dictionary<string, long> output = new();
+
+        for (var r = 0; r <= CheckpointRepeats; r++) // r==0 warm-up, discarded
+        {
+            Assert.True(SqlProgram.TryCompileParallel(
+                spec.Program, outputViews, workers, out var program,
+                snapshotCodecs: ArrowSqlSnapshotCodecs.Instance, options: ParOptions,
+                numericStringCoercion: true, nullCollation: DbspNet.Sql.TypeSystem.NullCollation.Low));
+
+            using (program)
+            {
+                foreach (var (table, rows) in tableRows)
+                {
+                    program!.Table(table).Push(rows);
+                }
+
+                var sw = Stopwatch.StartNew();
+                program!.Step();
+                sw.Stop();
+
+                var view = program.Outputs[TargetView];
+                output = Materialize(view.CurrentView, view.Schema.Count);
+
+                var dir = FreshSnapshotDir($"par-w{workers}");
+                var sw2 = Stopwatch.StartNew();
+                ops = await ParallelSnapshot.WriteAsync(program.Circuit, dir);
+                sw2.Stop();
+                mib = DirectoryMiB(dir);
+
+                if (r > 0)
+                {
+                    steps.Add(sw.Elapsed.TotalMilliseconds);
+                    saves.Add(sw2.Elapsed.TotalMilliseconds);
+                }
+            }
+        }
+
+        return new CheckpointSummary(Median(steps), Median(saves), ops, mib, output);
+    }
+
+    private const int CheckpointRepeats = 2;
+
+    private static string FreshSnapshotDir(string name)
+    {
+        var dir = Path.Combine(SnapshotRoot, name);
+        if (Directory.Exists(dir))
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static double DirectoryMiB(string dir) =>
+        Directory.Exists(dir)
+            ? new DirectoryInfo(dir).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length)
+                / (1024.0 * 1024.0)
+            : 0.0;
 
     private readonly record struct PhaseSummary(
         double Step, double MovePct, double WaitPct, double OpPct, double Imbalance);

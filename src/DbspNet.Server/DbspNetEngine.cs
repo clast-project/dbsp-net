@@ -8,6 +8,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using DbspNet.Connectors.Abstractions;
 using DbspNet.Connectors.EngineeredWood;
+using DbspNet.Persistence;
+using DbspNet.Persistence.IO.Local;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.TypeSystem;
 
@@ -35,17 +37,33 @@ public sealed class DbspNetEngine
 
     /// <summary>Compile the program, wire its Delta connectors, and validate each source
     /// against its declared table schema. Idempotent-replace: a second deploy discards the
-    /// prior program. Returns the compile time (excluded from measured batch duration).</summary>
+    /// prior program. Returns the compile time (excluded from measured batch duration).
+    /// <para>
+    /// When a snapshot directory is configured (<see cref="ProgramSpec.SnapshotDir"/> or
+    /// <c>DBSPNET_SNAPSHOT_DIR</c>), the program is compiled with filesystem snapshot
+    /// codecs and wired to a <see cref="SnapshotCheckpointStore"/>, so every batch ends
+    /// durable and a redeploy resumes from the last checkpoint. Restore happens here, in
+    /// deploy — outside the measured batch span, like the compile.
+    /// </para></summary>
     public async Task<DeployResult> DeployAsync(ProgramSpec spec, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(spec);
         var sw = Stopwatch.StartNew();
 
+        var snapshotDir = spec.SnapshotDir is { Length: > 0 } d
+            ? d
+            : Environment.GetEnvironmentVariable("DBSPNET_SNAPSHOT_DIR");
+        var persistent = !string.IsNullOrEmpty(snapshotDir);
+
         var outputViews = spec.Outputs.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
         // ivm-bench / Spark / DuckDB / Feldera all coerce numeric<->string comparisons,
         // and Feldera (Calcite) sorts NULLs low by default (last under DESC).
+        // The snapshot codecs are registered at construction and touched only by
+        // Save/Load — a persistent compile Steps identically to a non-persistent one.
         var program = SqlProgram.Compile(
-            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+            spec.Program, outputViews,
+            snapshotCodecs: persistent ? ArrowSqlSnapshotCodecs.Instance : null,
+            numericStringCoercion: true, nullCollation: NullCollation.Low);
 
         var inputs = spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, i.Uri))
@@ -54,8 +72,14 @@ public sealed class DbspNetEngine
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, o.Uri, OutputMode.Truncate))
             .ToList();
 
-        var runner = await ProgramRunner.CreateAsync(program, inputs, outputs, cancellationToken)
+        var checkpoint = persistent
+            ? new SnapshotCheckpointStore(new LocalTableFileSystem(snapshotDir!))
+            : null;
+
+        var runner = await ProgramRunner.CreateAsync(program, inputs, outputs, checkpoint, cancellationToken)
             .ConfigureAwait(false);
+
+        var restoredTick = await runner.RestoreAsync(cancellationToken).ConfigureAwait(false);
 
         lock (_gate)
         {
@@ -68,7 +92,8 @@ public sealed class DbspNetEngine
         }
 
         sw.Stop();
-        return new DeployResult(sw.Elapsed.TotalSeconds, inputs.Count, outputs.Count);
+        return new DeployResult(
+            sw.Elapsed.TotalSeconds, inputs.Count, outputs.Count, persistent, restoredTick);
     }
 
     /// <summary>Start ingesting the current batch (all source versions available now) in

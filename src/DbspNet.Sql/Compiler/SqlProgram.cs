@@ -39,20 +39,25 @@ public static class SqlProgram
     /// (Increment 2, docs/design-structural-parallel.md). Returns <c>false</c> —
     /// and the caller should fall back to <see cref="Compile"/> — when any
     /// reachable view uses a construct the exchange-insertion pass cannot shard
-    /// soundly. Snapshot persistence is not wired on the parallel path.
+    /// soundly. Pass <paramref name="snapshotCodecs"/> to make the replicas'
+    /// stateful operators snapshot-capable (checkpoint with
+    /// <c>ParallelSnapshot.WriteAsync</c>); see
+    /// <see cref="PlanToCircuit.TryCompileProgramParallel"/> for what the parallel
+    /// checkpoint does and does not cover.
     /// </summary>
     public static bool TryCompileParallel(
         IReadOnlyList<string> statements,
         ISet<string> outputViews,
         int workers,
         out ParallelCompiledProgram? compiled,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
         CompileOptions? options = null,
         bool numericStringCoercion = false,
         NullCollation nullCollation = NullCollation.High)
     {
         var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
         return PlanToCircuit.TryCompileProgramParallel(
-            resolved.Tables, resolved.Views, workers, out compiled, options);
+            resolved.Tables, resolved.Views, workers, out compiled, snapshotCodecs, options);
     }
 
     /// <summary>
