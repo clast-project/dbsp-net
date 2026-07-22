@@ -103,6 +103,43 @@ public sealed record CompileOptions
     public bool CoalesceJoinExchange { get; init; }
 
     /// <summary>
+    /// Opt-in broadcast join for small dimensions on the structural parallel path
+    /// (docs/design-structural-parallel.md). Hash-sharding both sides of an INNER
+    /// join by the join key skews badly when that key is low-cardinality (a
+    /// dimension code with a handful of distinct values lands its whole group on
+    /// one worker — the profiled straggler wall). When set, a join whose right
+    /// side is a small dimension (a leaf relation scan) instead keeps the left
+    /// (fact) side on its current balanced partition and <em>broadcasts</em> the
+    /// right side to every worker, so each worker joins its local fact shard
+    /// against the complete dimension — no re-shuffle of the fact, no skew. Only
+    /// affects the structural parallel path (W&gt;1); W=1 is byte-identical. Off by
+    /// default while it is gated.
+    /// </summary>
+    public bool BroadcastSmallDimensionJoins { get; init; }
+
+    /// <summary>
+    /// Production broadcast-join gate: broadcast a join's right (dimension) side
+    /// only when its estimated row count is at or below this threshold — never a
+    /// large relation. <c>0</c> (the default) disables the size-gated path;
+    /// <see cref="BroadcastSmallDimensionJoins"/> is the separate unconditional
+    /// (experimental) override that broadcasts every leaf right regardless of size.
+    /// A relation whose size cannot be estimated is treated as large and is not
+    /// broadcast, so an incomplete <see cref="RelationRowCounts"/> only ever costs a
+    /// missed broadcast (the correct hash join), never a wrong one.
+    /// </summary>
+    public long BroadcastMaxRows { get; init; }
+
+    /// <summary>
+    /// Base-relation row counts (source table name → row count) the deployment
+    /// supplies for the <see cref="BroadcastMaxRows"/> gate — e.g. from Delta table
+    /// metadata. The compiler propagates these through each view to estimate the
+    /// dimension views' sizes (a rough dimension-vs-fact estimate, not a general
+    /// optimizer cardinality model). A name absent here is "unknown" ⇒ treated as
+    /// large ⇒ not broadcast.
+    /// </summary>
+    public IReadOnlyDictionary<string, long>? RelationRowCounts { get; init; }
+
+    /// <summary>
     /// Opt-in stored / integrated output (docs/design-stored-output.md). When set,
     /// the compiler integrates the final delta stream at the output boundary (the
     /// DBSP <c>I</c> operator, an <c>IntegrateOp</c>) so

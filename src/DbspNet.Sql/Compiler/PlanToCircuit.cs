@@ -74,6 +74,109 @@ public static class PlanToCircuit
         return CompileCore(view.Query, StructuralRowCodec.Instance, snapshotCodecs: null, CompileOptions.Default);
     }
 
+    /// <summary>The logical port name the parallel single-query build wires its result to.</summary>
+    private const string ParallelResultPort = "$result";
+
+    /// <summary>
+    /// Data-parallel compile of a single query onto a <see cref="ParallelCircuit"/>
+    /// of <paramref name="workers"/> replicas: the same structural graph runs on
+    /// every worker, key-sensitive operators re-shard by their key so equal keys
+    /// co-locate, table inputs are sharded by whole-row hash, and the output is
+    /// gathered (Z-set sum). The observable result equals the single-circuit
+    /// <see cref="Compile(LogicalPlan, ISqlSnapshotCodecs, CompileOptions)"/> for
+    /// every W (docs/design-structural-parallel.md). Returns <c>false</c> (and the
+    /// caller should fall back to the serial compile) when the plan uses a
+    /// construct this pass does not shard soundly — a broadcast / correlated /
+    /// scalar-subquery join, a semi-join, a global (un-partitioned) window or
+    /// top-K / rank, a set difference, a recursive CTE, a temporal filter, a
+    /// LATENESS-GC'd input, or a partition key outside the stable-hash surface.
+    /// </summary>
+    /// <remarks>
+    /// At <paramref name="workers"/> == 1 the emitted graph is byte-identical to
+    /// the serial circuit (every <c>Exchange*</c> degrades to the same
+    /// <c>GroupProject</c>), which the correctness oracle relies on as a free
+    /// structural-identity regression guard.
+    /// </remarks>
+    public static bool TryCompileParallel(
+        LogicalPlan plan,
+        int workers,
+        out ParallelStructuralCompiledQuery? compiled,
+        ISqlSnapshotCodecs? snapshotCodecs = null,
+        CompileOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
+        compiled = null;
+        options ??= CompileOptions.Default;
+
+        var (tables, temporalFrontierSpecs) = CollectScans(plan);
+
+        // The parallel path wires neither LATENESS GC nor temporal-filter
+        // frontiers across the replicas yet (a follow-on), and refuses any plan
+        // node it cannot shard soundly. In every such case the caller falls back
+        // to the serial single circuit.
+        if (temporalFrontierSpecs.Count > 0
+            || tables.Values.Any(t => t.Lateness is { Count: > 0 })
+            || !CanCompileParallel(plan))
+        {
+            return false;
+        }
+
+        var codec = StructuralRowCodec.Instance;
+        var monotonicity = MonotonicityAnalyzer.Analyze(plan);
+        var tableSchemas = tables.ToDictionary(kv => kv.Key, kv => kv.Value.Schema, StringComparer.Ordinal);
+        var emptyFrontiers = (IReadOnlyDictionary<LatenessSource, IFrontier>)
+            new Dictionary<LatenessSource, IFrontier>();
+        var emptyShareable = (IReadOnlySet<ArrangementKey>)
+            System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
+
+        var inputSchemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+
+        var prevStagingCapacity = SpineStagingConfig.Capacity;
+        SpineStagingConfig.Capacity = options.TraceFamily == TraceFamily.Spine ? options.SpineStagingCapacity : 0;
+        ParallelCircuit circuit;
+        try
+        {
+            circuit = ParallelCircuit.Build(workers, builder =>
+            {
+                var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+                var ctx = new CompileContext(
+                    streams, tableSchemas, codec, snapshotCodecs, options, monotonicity,
+                    emptyFrontiers, emptyShareable, workers, options.RelationRowCounts);
+
+                foreach (var (name, info) in tables)
+                {
+                    // Named input port so ShardedInput can find each replica's copy.
+                    var (_, stream) = builder.ZSetInput<StructuralRow, Z64>(name);
+                    streams[name] = stream;
+                    inputSchemas[name] = info.Schema;
+                    // The input is split by whole-row hash, so equal rows co-locate:
+                    // the scan stream is shard-disjoint (not usefully key-partitioned).
+                    ctx.SetPartition(stream, new PartitionInfo(ShardDisjoint: true, PartitionKey: null));
+                }
+
+                var queryStream = CompilePlan(builder, plan, ctx);
+                builder.Output(queryStream, ParallelResultPort);
+            });
+        }
+        finally
+        {
+            SpineStagingConfig.Capacity = prevStagingCapacity;
+        }
+
+        var inputs = new Dictionary<string, ShardedTableInput>(StringComparer.Ordinal);
+        foreach (var (name, schema) in inputSchemas)
+        {
+            var handle = circuit.ShardedInput<StructuralRow, Z64>(
+                name, row => StablePartitionHash.OfWholeRow(row, schema));
+            inputs[name] = new ShardedTableInput(handle, schema, codec);
+        }
+
+        var output = circuit.ShardedOutput<StructuralRow, Z64>(ParallelResultPort);
+        compiled = new ParallelStructuralCompiledQuery(circuit, inputs, output, plan.Schema);
+        return true;
+    }
+
     private static CompiledQuery CompileCore(
         LogicalPlan plan,
         IRowCodec<StructuralRow> codec,
@@ -387,6 +490,179 @@ public static class PlanToCircuit
     }
 
     /// <summary>
+    /// Data-parallel compile of a whole multi-view program onto a
+    /// <see cref="ParallelCircuit"/> of <paramref name="workers"/> replicas — the
+    /// program analogue of <see cref="TryCompileParallel"/> and the Increment 2
+    /// entry point (docs/design-structural-parallel.md §5). Every reachable view
+    /// runs the exchange-inserting structural compile; source tables are sharded
+    /// by whole-row hash and each output view's delta is gathered (Z-set sum) and
+    /// integrated on the driver. Returns <c>false</c> (caller falls back to the
+    /// serial <see cref="CompileProgram"/>) when <em>any</em> reachable view uses a
+    /// construct the pass cannot shard soundly — the whole program shares one
+    /// circuit and one worker count, so a single un-shardable view forces serial.
+    /// </summary>
+    public static bool TryCompileProgramParallel(
+        IReadOnlyList<CreateTablePlan> tables,
+        IReadOnlyList<ProgramView> views,
+        int workers,
+        out ParallelCompiledProgram? compiled,
+        CompileOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(tables);
+        ArgumentNullException.ThrowIfNull(views);
+        ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
+        compiled = null;
+        options ??= CompileOptions.Default;
+        var codec = StructuralRowCodec.Instance;
+
+        // Dead-view elimination (identical to CompileProgram): only compile views
+        // reachable from an output.
+        var reachable = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = views.Count - 1; i >= 0; i--)
+        {
+            var v = views[i];
+            if (v.IsOutput)
+            {
+                reachable.Add(v.ViewName);
+            }
+
+            if (reachable.Contains(v.ViewName))
+            {
+                foreach (var referenced in CollectScans(v.Query).Scans.Keys)
+                {
+                    reachable.Add(referenced);
+                }
+            }
+        }
+
+        var liveColumns = options.EliminateDeadColumns
+            ? DbspNet.Sql.Optimizer.PlanColumnLiveness.ComputeProgramLiveColumns(views)
+            : null;
+
+        // Pre-pass: optimize each reachable view ONCE (the build closure runs W
+        // times, so optimizing inside it would repeat the work), refuse the whole
+        // parallel program if any reachable view is not shardable, and — for the
+        // broadcast-join size gate — estimate each view's row count from the
+        // deployment-supplied base-table counts, in dependency order so a view's
+        // estimate can consult its already-estimated inputs.
+        var rowCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+        if (options.RelationRowCounts is { } supplied)
+        {
+            foreach (var (name, count) in supplied)
+            {
+                rowCounts[name] = count;
+            }
+        }
+
+        long? CountLookup(string name) => rowCounts.TryGetValue(name, out var n) ? n : (long?)null;
+
+        var prepared = new List<(ProgramView View, LogicalPlan Optimized)>();
+        foreach (var v in views)
+        {
+            if (!reachable.Contains(v.ViewName))
+            {
+                continue;
+            }
+
+            var viewQuery = v.Query;
+            if (liveColumns is not null && liveColumns.TryGetValue(v.ViewName, out var liveOut))
+            {
+                viewQuery = DbspNet.Sql.Optimizer.PlanColumnLiveness.PruneDeadColumns(viewQuery, liveOut);
+            }
+
+            var optimized = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(viewQuery);
+            if (!CanCompileParallel(optimized))
+            {
+                return false;
+            }
+
+            if (options.BroadcastMaxRows > 0)
+            {
+                rowCounts[v.ViewName] = CardinalityEstimator.Estimate(optimized, CountLookup);
+            }
+
+            prepared.Add((v, optimized));
+        }
+
+        var emptyFrontiers = (IReadOnlyDictionary<LatenessSource, IFrontier>)
+            new Dictionary<LatenessSource, IFrontier>();
+        var emptyShareable = (IReadOnlySet<ArrangementKey>)
+            System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
+
+        var inputSchemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+        var outputSchemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+
+        var prevStagingCapacity = SpineStagingConfig.Capacity;
+        SpineStagingConfig.Capacity = options.TraceFamily == TraceFamily.Spine ? options.SpineStagingCapacity : 0;
+        ParallelCircuit circuit;
+        try
+        {
+            circuit = ParallelCircuit.Build(workers, builder =>
+            {
+                var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+                var schemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+
+                foreach (var t in tables)
+                {
+                    var (_, stream) = builder.ZSetInput<StructuralRow, Z64>(t.TableName);
+                    streams[t.TableName] = stream;
+                    schemas[t.TableName] = t.Schema;
+                    inputSchemas[t.TableName] = t.Schema;
+                }
+
+                foreach (var (v, optimized) in prepared)
+                {
+                    var monotonicity = MonotonicityAnalyzer.Analyze(optimized);
+                    var ctx = new CompileContext(
+                        streams, schemas, codec, snapshotCodecs: null, options, monotonicity,
+                        emptyFrontiers, emptyShareable, workers, rowCounts);
+                    // The scan streams (this program's tables) are whole-row-hashed
+                    // inputs → shard-disjoint. A view-scan resolves to that view's
+                    // already-built stream, whose partition state was recorded when
+                    // it was compiled.
+                    foreach (var t in tables)
+                    {
+                        ctx.SetPartition(streams[t.TableName], new PartitionInfo(ShardDisjoint: true, PartitionKey: null));
+                    }
+
+                    builder.BuildLabel = v.ViewName;
+                    var stream = CompilePlan(builder, optimized, ctx);
+                    streams[v.ViewName] = stream;
+                    schemas[v.ViewName] = v.Query.Schema;
+
+                    if (v.IsOutput)
+                    {
+                        builder.Output(stream, "view:" + v.ViewName);
+                        outputSchemas[v.ViewName] = v.Query.Schema;
+                    }
+                }
+            });
+        }
+        finally
+        {
+            SpineStagingConfig.Capacity = prevStagingCapacity;
+        }
+
+        var inputs = new Dictionary<string, ShardedTableInput>(StringComparer.Ordinal);
+        foreach (var (name, schema) in inputSchemas)
+        {
+            var handle = circuit.ShardedInput<StructuralRow, Z64>(
+                name, row => StablePartitionHash.OfWholeRow(row, schema));
+            inputs[name] = new ShardedTableInput(handle, schema, codec);
+        }
+
+        var outputs = new Dictionary<string, ParallelProgramOutput>(StringComparer.Ordinal);
+        foreach (var (name, schema) in outputSchemas)
+        {
+            var handle = circuit.ShardedOutput<StructuralRow, Z64>("view:" + name);
+            outputs[name] = new ParallelProgramOutput(schema, handle);
+        }
+
+        compiled = new ParallelCompiledProgram(circuit, inputs, outputs);
+        return true;
+    }
+
+    /// <summary>
     /// Diagnostic (measurement only): the typed vs fell-back program-view split
     /// from the most recent <see cref="CompileProgram"/> call made with
     /// <see cref="CompileOptions.TypeEligibleProgramViews"/> set. Lets the local
@@ -399,6 +675,235 @@ public static class PlanToCircuit
         private set;
     } = (Array.Empty<string>(), Array.Empty<string>());
 
+    /// <summary>
+    /// Data-parallel partition state a compiled stream carries (only meaningful
+    /// when <see cref="CompileContext.Workers"/> &gt; 1).
+    /// </summary>
+    /// <param name="ShardDisjoint">
+    /// True when the per-worker shards are provably key-disjoint — the stream is
+    /// partitioned by columns it still carries by identity, so equal rows always
+    /// land on one worker. Conservatively false when unknown.
+    /// </param>
+    /// <param name="PartitionKey">
+    /// The column indices (into the stream's own schema) the stream is
+    /// hash-partitioned by: any two rows agreeing on these columns are co-located.
+    /// <c>null</c> means "not usefully partitioned". Used to elide a redundant
+    /// aggregate exchange via <see cref="IsKeySubset"/>.
+    /// </param>
+    private readonly record struct PartitionInfo(bool ShardDisjoint, int[]? PartitionKey);
+
+    /// <summary>
+    /// True when every column in <paramref name="sub"/> also appears in
+    /// <paramref name="super"/> — i.e. the data's partition key is a subset of the
+    /// operator's key, so each operator-key group already sits on one worker and
+    /// the operator's re-shuffle can be elided. Ported verbatim from
+    /// <c>TypedPlanCompiler.IsKeySubset</c>.
+    /// </summary>
+    private static bool IsKeySubset(int[] sub, int[] super)
+    {
+        foreach (var c in sub)
+        {
+            if (Array.IndexOf(super, c) < 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Whether every node in <paramref name="plan"/> is one the exchange-insertion
+    /// pass can shard soundly. A key-sensitive node is admissible only when its
+    /// shard key is hashable (<see cref="IsHashableType"/>) and, for windows /
+    /// top-K / rank, a PARTITION BY exists (a global window has no key to shard
+    /// on). Everything not explicitly handled — a broadcast / correlated /
+    /// scalar-subquery join, a semi-join, a set difference, a recursive CTE, a
+    /// temporal filter, a non-inner join, a global top-K — is refused so the
+    /// caller falls back to the serial single circuit.
+    /// </summary>
+    private static bool CanCompileParallel(LogicalPlan plan)
+    {
+        switch (plan)
+        {
+            case ScanPlan:
+                return true;
+
+            case CteScanPlan c:
+                return CanCompileParallel(c.Cte.Plan);
+
+            case FilterPlan f:
+                return CanCompileParallel(f.Input);
+
+            case ProjectPlan p:
+                return CanCompileParallel(p.Input);
+
+            case JoinPlan j:
+            {
+                if (j.JoinType != DbspNet.Sql.Parser.Ast.JoinType.Inner)
+                {
+                    return false;
+                }
+
+                var (leftIndices, rightIndices) = ExtractEquiKeyIndices(j);
+                if (leftIndices.Length == 0)
+                {
+                    return false; // a cross join has no equi-key to shard on.
+                }
+
+                for (var k = 0; k < leftIndices.Length; k++)
+                {
+                    if (!IsHashableType(j.Left.Schema[leftIndices[k]].Type)
+                        || !IsHashableType(j.Right.Schema[rightIndices[k]].Type))
+                    {
+                        return false;
+                    }
+                }
+
+                return CanCompileParallel(j.Left) && CanCompileParallel(j.Right);
+            }
+
+            case AggregatePlan a:
+                foreach (var gk in a.GroupKeys)
+                {
+                    if (!IsHashableType(gk.Type))
+                    {
+                        return false;
+                    }
+                }
+
+                return CanCompileParallel(a.Input);
+
+            case UnionAllPlan u:
+                foreach (var b in u.Branches)
+                {
+                    if (!CanCompileParallel(b))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+
+            case DistinctPlan d:
+                foreach (var col in d.Schema.Columns)
+                {
+                    if (!IsHashableType(col.Type))
+                    {
+                        return false;
+                    }
+                }
+
+                return CanCompileParallel(d.Input);
+
+            case PartitionedTopKPlan pt:
+                return pt.PartitionKeys.Count > 0 && AllHashable(pt.PartitionKeys) && CanCompileParallel(pt.Input);
+
+            case PartitionedRankPlan pr:
+                return pr.PartitionKeys.Count > 0 && AllHashable(pr.PartitionKeys) && CanCompileParallel(pr.Input);
+
+            case WindowAggregatePlan wa:
+                return wa.PartitionKeys.Count > 0 && AllHashable(wa.PartitionKeys) && CanCompileParallel(wa.Input);
+
+            case WindowOffsetPlan wo:
+                return wo.PartitionKeys.Count > 0 && AllHashable(wo.PartitionKeys) && CanCompileParallel(wo.Input);
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="plan"/> is a plain relation scan — a base table
+    /// or a referenced view (through any number of Filter/Project wrappers), i.e. a
+    /// dimension-shaped leaf rather than a join / aggregate subtree. The
+    /// broadcast-join heuristic replicates such a right side (the star-schema build
+    /// side, conventionally the smaller relation) instead of hash-sharding it.
+    /// </summary>
+    private static bool IsLeafRelation(LogicalPlan plan, out string? relation)
+    {
+        relation = null;
+        while (true)
+        {
+            switch (plan)
+            {
+                case FilterPlan f:
+                    plan = f.Input;
+                    break;
+                case ProjectPlan p:
+                    plan = p.Input;
+                    break;
+                case ScanPlan s:
+                    relation = s.TableName;
+                    return true;
+                case CteScanPlan c:
+                    relation = c.Cte.Name;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether an INNER join with right side <paramref name="right"/> should be
+    /// compiled as a broadcast join (replicate the right dimension) rather than a
+    /// hash join. True only at W&gt;1 when the right is a leaf relation and either
+    /// the unconditional experimental override
+    /// (<see cref="CompileOptions.BroadcastSmallDimensionJoins"/>) is set, or the
+    /// production size gate (<see cref="CompileOptions.BroadcastMaxRows"/>) is set
+    /// and the right's estimated row count is known and within it. An unknown size
+    /// is treated as large ⇒ hash join, so a broadcast is never made blindly.
+    /// </summary>
+    private static bool ShouldBroadcastRight(LogicalPlan right, CompileContext ctx)
+    {
+        if (ctx.Workers <= 1 || !IsLeafRelation(right, out var relation))
+        {
+            return false;
+        }
+
+        if (ctx.Options.BroadcastSmallDimensionJoins)
+        {
+            return true;
+        }
+
+        if (ctx.Options.BroadcastMaxRows <= 0 || relation is null || ctx.RowCounts is null)
+        {
+            return false;
+        }
+
+        var estimate = CardinalityEstimator.Estimate(
+            right, name => ctx.RowCounts.TryGetValue(name, out var n) ? n : (long?)null);
+        return estimate <= ctx.Options.BroadcastMaxRows;
+    }
+
+    private static bool AllHashable(IReadOnlyList<ResolvedExpression> keys)
+    {
+        foreach (var k in keys)
+        {
+            if (!IsHashableType(k.Type))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Whether a column of this SQL type has a stable partition hash
+    /// (<see cref="StablePartitionHash.OfBoxed"/>). REAL, INTERVAL and the untyped
+    /// NULL literal have none — a stream keyed on one cannot be sharded
+    /// deterministically, mirroring the typed compiler's refuse-parallel guard.
+    /// </summary>
+    private static bool IsHashableType(SqlType type) => type switch
+    {
+        SqlIntegerType or SqlBigintType or SqlBooleanType or SqlDoubleType
+            or SqlDecimalType or SqlVarcharType or SqlDateType or SqlTimeType
+            or SqlTimestampType => true,
+        _ => false,
+    };
+
     private sealed class CompileContext
     {
         public CompileContext(
@@ -409,7 +914,9 @@ public static class PlanToCircuit
             CompileOptions options,
             MonotonicityInfo monotonicity,
             IReadOnlyDictionary<LatenessSource, IFrontier> frontiers,
-            IReadOnlySet<ArrangementKey> shareableArrangements)
+            IReadOnlySet<ArrangementKey> shareableArrangements,
+            int workers = 1,
+            IReadOnlyDictionary<string, long>? rowCounts = null)
         {
             Scans = scans;
             TableSchemas = tableSchemas;
@@ -419,7 +926,49 @@ public static class PlanToCircuit
             Monotonicity = monotonicity;
             Frontiers = frontiers;
             ShareableArrangements = shareableArrangements;
+            Workers = workers;
+            RowCounts = rowCounts;
         }
+
+        /// <summary>
+        /// Estimated row counts (base relations supplied by the deployment, plus
+        /// per-view estimates the program compile derives) for the broadcast-join
+        /// size gate. Null when no counts were supplied.
+        /// </summary>
+        public IReadOnlyDictionary<string, long>? RowCounts { get; }
+
+        /// <summary>
+        /// Replica count W when this compile targets a <see cref="ParallelCircuit"/>;
+        /// 1 for a plain single circuit. When &gt; 1 the key-sensitive operators
+        /// (join / aggregate / distinct / partitioned window / partitioned top-K)
+        /// re-shard by their key so equal keys co-locate on one worker; at W&lt;=1
+        /// every <c>Exchange*</c> the compiler emits degrades to the identical
+        /// <c>GroupProject</c> it emitted before parallelism (a free structural
+        /// regression guard — see docs/design-structural-parallel.md §1).
+        /// </summary>
+        public int Workers { get; }
+
+        /// <summary>
+        /// Per-stream partition metadata, keyed by stream identity. An
+        /// <c>Exchange*</c> records the shuffle key here; a downstream aggregate
+        /// consults it to elide a redundant re-shuffle when the data already
+        /// co-locates each of its groups (<see cref="IsKeySubset"/>). Only
+        /// consulted when <see cref="Workers"/> &gt; 1; empty / <c>default</c>
+        /// (unpartitioned) is always the safe answer.
+        /// </summary>
+        private readonly Dictionary<Stream<ZSet<StructuralRow, Z64>>, PartitionInfo> _partition =
+            new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Record the partition state a compiled stream carries.</summary>
+        public void SetPartition(Stream<ZSet<StructuralRow, Z64>> stream, PartitionInfo info) =>
+            _partition[stream] = info;
+
+        /// <summary>
+        /// The partition state of a compiled stream, or the unpartitioned default
+        /// (<c>ShardDisjoint=false, PartitionKey=null</c>) if none was recorded.
+        /// </summary>
+        public PartitionInfo GetPartition(Stream<ZSet<StructuralRow, Z64>> stream) =>
+            _partition.TryGetValue(stream, out var info) ? info : default;
 
         /// <summary>Stream per declared table — the circuit's inputs.</summary>
         public IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>> Scans { get; }
@@ -1192,8 +1741,22 @@ public static class PlanToCircuit
                 {
                     var distinctCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(d.Schema);
                     var (gcFrontier, gcMonotoneKey) = ResolveDistinctFrontier(d, ctx);
+                    var distinctInput = CompilePlan(builder, d.Input, ctx);
+
+                    // Parallel: re-shard by the whole row (DISTINCT's key) so
+                    // identical rows co-locate and dedup on one worker; the gather
+                    // then unions the disjoint survivors. `Exchange` is an
+                    // identity passthrough at W<=1, so W=1 is byte-identical.
+                    if (ctx.Workers > 1)
+                    {
+                        var distinctSchema = d.Schema;
+                        distinctInput = builder.Exchange(
+                            distinctInput,
+                            row => StablePartitionHash.OfWholeRow(row, distinctSchema));
+                    }
+
                     return EmitDistinct(
-                        builder, ctx, CompilePlan(builder, d.Input, ctx), distinctCodec,
+                        builder, ctx, distinctInput, distinctCodec,
                         gcFrontier, gcMonotoneKey);
                 }
 
@@ -1346,6 +1909,17 @@ public static class PlanToCircuit
             return new StructuralRow(values);
         }
 
+        // Parallel: co-locate each PARTITION BY group on one worker before the
+        // per-partition operator (identity passthrough at W<=1). A global (no
+        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
+        // partition list is non-empty whenever this fires.
+        if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
+        {
+            var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
+            input = builder.Exchange(
+                input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+        }
+
         // §22 narrow-key path: pass the single ORDER BY extractor so the operator can
         // key its trace by {order value, wide row} when the narrowing seam is on. Only
         // the single-column shape (q18/q19) is plumbed; multi-column ORDER BY falls back
@@ -1414,6 +1988,17 @@ public static class PlanToCircuit
             return new StructuralRow(values);
         }
 
+        // Parallel: co-locate each PARTITION BY group on one worker before the
+        // per-partition operator (identity passthrough at W<=1). A global (no
+        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
+        // partition list is non-empty whenever this fires.
+        if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
+        {
+            var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
+            input = builder.Exchange(
+                input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+        }
+
         // The snapshot codec is over the base (input) rows; the operator recovers
         // the widened output from them on load.
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
@@ -1447,6 +2032,17 @@ public static class PlanToCircuit
             }
 
             return new StructuralRow(values);
+        }
+
+        // Parallel: co-locate each PARTITION BY group on one worker before the
+        // per-partition operator (identity passthrough at W<=1). A global (no
+        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
+        // partition list is non-empty whenever this fires.
+        if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
+        {
+            var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
+            input = builder.Exchange(
+                input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
 
         IComparer<StructuralRow> order;
@@ -1580,6 +2176,17 @@ public static class PlanToCircuit
             return new StructuralRow(values);
         }
 
+        // Parallel: co-locate each PARTITION BY group on one worker before the
+        // per-partition operator (identity passthrough at W<=1). A global (no
+        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
+        // partition list is non-empty whenever this fires.
+        if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
+        {
+            var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
+            input = builder.Exchange(
+                input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+        }
+
         // Total order: the ORDER BY keys left to right (any comparable type —
         // LAG/LEAD is positional) then a full-row tiebreak so positions are
         // deterministic.
@@ -1704,6 +2311,8 @@ public static class PlanToCircuit
 
         var codec = ctx.Codec;
 
+        Stream<ZSet<StructuralRow, Z64>> result;
+
         // Single stage: lower to the original dedicated operator so the common
         // single-filter / single-project case keeps its exact prior shape.
         if (stages.Count == 1)
@@ -1712,33 +2321,62 @@ public static class PlanToCircuit
             if (only.Kind == LinearStageKind.Filter)
             {
                 var predicate = only.Predicate!;
-                return builder.Filter(input, row => predicate(row));
+                result = builder.Filter(input, row => predicate(row));
             }
-
-            return builder.MapRows(input, row => ApplyMap(only, row, codec));
-        }
-
-        var chain = stages.ToArray();
-        return builder.MapFilterRows<StructuralRow, StructuralRow, Z64>(input, row =>
-        {
-            IReadOnlyList<object?> current = row;
-            foreach (var stage in chain)
+            else
             {
-                if (stage.Kind == LinearStageKind.Filter)
+                result = builder.MapRows(input, row => ApplyMap(only, row, codec));
+            }
+        }
+        else
+        {
+            var chain = stages.ToArray();
+            result = builder.MapFilterRows<StructuralRow, StructuralRow, Z64>(input, row =>
+            {
+                IReadOnlyList<object?> current = row;
+                foreach (var stage in chain)
                 {
-                    if (!stage.Predicate!(current))
+                    if (stage.Kind == LinearStageKind.Filter)
                     {
-                        return (false, null!);
+                        if (!stage.Predicate!(current))
+                        {
+                            return (false, null!);
+                        }
+                    }
+                    else
+                    {
+                        current = ApplyMap(stage, current, codec);
                     }
                 }
-                else
+
+                return (true, (StructuralRow)current);
+            });
+        }
+
+        // Partition state survives a filters-only chain unchanged (filters touch
+        // no columns); any projection may drop or reorder columns and invalidate
+        // the partition-key indices, so it drops the tracking (docs §2). Only
+        // meaningful at W>1. Identity projections emit no Map stage (stripped
+        // above), so a pure rename still propagates.
+        if (ctx.Workers > 1)
+        {
+            var hasMap = false;
+            foreach (var s in stages)
+            {
+                if (s.Kind == LinearStageKind.Map)
                 {
-                    current = ApplyMap(stage, current, codec);
+                    hasMap = true;
+                    break;
                 }
             }
 
-            return (true, (StructuralRow)current);
-        });
+            if (!hasMap)
+            {
+                ctx.SetPartition(result, ctx.GetPartition(input));
+            }
+        }
+
+        return result;
     }
 
     private static StructuralRow ApplyMap(
@@ -1817,10 +2455,12 @@ public static class PlanToCircuit
         var codec = ctx.Codec;
         var leftCount = plan.Left.Schema.Count;
         var rightCount = plan.Right.Schema.Count;
-        var leftIndexed = builder.GroupProject(
-            leftFiltered,
-            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
-            row => row);
+        // Re-shard each side by the equi-key so matching rows co-locate on one
+        // worker, then index by that key. At W<=1 `ExchangeIndex`/`ExchangeIndexJoin`
+        // degrade to exactly `GroupProject(side, keyOf, row => row)` — byte-identical
+        // to the pre-parallel emit (docs/design-structural-parallel.md §1).
+        int LeftPart(StructuralRow row) => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema);
+        StructuralRow LeftKeyOf(StructuralRow row) => ExtractKey(codec, leftKeySchema, row, leftIndices);
         StructuralRow Combine(StructuralRow _, StructuralRow lrow, StructuralRow rrow) =>
             MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount);
 
@@ -1858,6 +2498,7 @@ public static class PlanToCircuit
             var shared = GetOrBuildSharedArrangement(
                 builder, ctx, plan, rightIndices, rightKeySchema,
                 new ArrangementKey(shareSource, string.Join(",", rightIndices)));
+            var leftIndexed = builder.ExchangeIndex(leftFiltered, LeftPart, LeftKeyOf);
             joined = EmitSharedRightInnerJoin(
                 builder, ctx, leftIndexed, shared.RightIndexed, shared.Arrangement, Combine, residualFn);
         }
@@ -1867,15 +2508,69 @@ public static class PlanToCircuit
             var rightFiltered = plan.AllowNullKeys
                 ? right
                 : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
-            var rightIndexed = builder.GroupProject(
-                rightFiltered,
-                row => ExtractKey(codec, rightKeySchema, row, rightIndices),
-                row => row);
+            int RightPart(StructuralRow row) => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema);
+            StructuralRow RightKeyOf(StructuralRow row) => ExtractKey(codec, rightKeySchema, row, rightIndices);
+
+            var broadcastRight = ShouldBroadcastRight(plan.Right, ctx);
+
+            Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed;
+            Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> rightIndexed;
+            if (broadcastRight)
+            {
+                // Broadcast join: the low-cardinality right dimension would skew a
+                // hash shuffle (its whole group lands on one worker), so instead
+                // keep the fact (left) on its current balanced partition — index it
+                // LOCALLY, no shuffle — and replicate the dimension to every worker.
+                // Each worker then joins its local fact shard against the complete
+                // dimension; summing the shards reconstructs the full join. At W<=1
+                // BroadcastExchange is identity and both GroupProjects are the serial
+                // emit, so W=1 stays byte-identical.
+                leftIndexed = builder.GroupProject(leftFiltered, LeftKeyOf, static row => row);
+                var rightFull = builder.BroadcastExchange(rightFiltered);
+                rightIndexed = builder.GroupProject(rightFull, RightKeyOf, static row => row);
+            }
+            else if (ctx.Workers > 1 && ctx.Options.CoalesceJoinExchange)
+            {
+                // Fuse both key exchanges into ONE barrier (a single all-to-all
+                // rendezvous instead of two): the shuffle is the same, but a 4-way
+                // join costs 4 barriers per step instead of 8, cutting the
+                // coordination/straggler wait the profiler attributes the W-scaling
+                // wall to (docs/design-structural-parallel.md §15). At W<=1 each
+                // side still degrades to the identical GroupProject.
+                (leftIndexed, rightIndexed) = builder.ExchangeIndexJoin(
+                    leftFiltered, LeftPart, LeftKeyOf,
+                    rightFiltered, RightPart, RightKeyOf);
+            }
+            else
+            {
+                leftIndexed = builder.ExchangeIndex(leftFiltered, LeftPart, LeftKeyOf);
+                rightIndexed = builder.ExchangeIndex(rightFiltered, RightPart, RightKeyOf);
+            }
+
             var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
             var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
             joined = EmitInnerJoin(
                 builder, ctx, leftIndexed, rightIndexed, Combine,
                 leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn);
+
+            // A broadcast join leaves the fact side on its incoming partition (not
+            // the join key), so the output is partitioned as the left was — inherit
+            // that; a hash join re-shards both sides by the key, so the output is
+            // partitioned by the left equi-key indices (left columns lead the row).
+            if (ctx.Workers > 1)
+            {
+                ctx.SetPartition(joined, broadcastRight
+                    ? new PartitionInfo(ShardDisjoint: false, PartitionKey: ctx.GetPartition(left).PartitionKey)
+                    : new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices));
+            }
+
+            return joined;
+        }
+
+        // Shared-arrangement (CSE) join output: hash-partitioned by the join key.
+        if (ctx.Workers > 1)
+        {
+            ctx.SetPartition(joined, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices));
         }
 
         return joined;
@@ -3014,19 +3709,35 @@ public static class PlanToCircuit
         // Rekey input rows by the group key; value = the entire input row so each
         // aggregator can extract its argument independently.
         var keyCodec = ctx.Codec;
-        var indexed = builder.GroupProject(
-            input,
-            row =>
+        StructuralRow KeyRowOf(StructuralRow row)
+        {
+            var vs = new object?[keyFns.Length];
+            for (var i = 0; i < keyFns.Length; i++)
             {
-                var vs = new object?[keyFns.Length];
-                for (var i = 0; i < keyFns.Length; i++)
-                {
-                    vs[i] = keyFns[i](row);
-                }
+                vs[i] = keyFns[i](row);
+            }
 
-                return keyCodec.BuildRow(groupKeySchema, vs);
-            },
-            row => row);
+            return keyCodec.BuildRow(groupKeySchema, vs);
+        }
+
+        // Parallel: re-shard by the group key so every group's rows land on one
+        // worker before the incremental aggregate. Elide the shuffle when the
+        // input already co-locates each group — i.e. it is hash-partitioned by a
+        // subset of the (bare-column) group key (docs/design-structural-parallel.md
+        // §2). At W<=1 `ExchangeIndex` degrades to the same `GroupProject` this
+        // emitted before parallelism, so W=1 is byte-identical either branch.
+        var bareGroupIndices = BareColumnIndices(plan.GroupKeys);
+        var needsExchange = ctx.Workers > 1
+            && !(bareGroupIndices is { } gi
+                 && ctx.GetPartition(input).PartitionKey is { } pk
+                 && IsKeySubset(pk, gi));
+
+        var indexed = needsExchange
+            ? builder.ExchangeIndex(
+                input,
+                row => StablePartitionHash.OfWholeRow(KeyRowOf(row), groupKeySchema),
+                KeyRowOf)
+            : builder.GroupProject(input, KeyRowOf, row => row);
 
         // Snapshot codec for the IndexedZSet trace inside IncrementalAggregateOp.
         // Bootstrap rebuilds aggregator scratch from the trace on Load, so only
@@ -3047,7 +3758,7 @@ public static class PlanToCircuit
         // exceed plan.Schema.Count (see comment above). The wrapping Project
         // narrows to plan.Schema downstream, so we don't need a typed codec
         // for this intermediate row — pass null and let the codec fall back.
-        return builder.MapRows(aggregated, pair =>
+        var mapped = builder.MapRows(aggregated, pair =>
         {
             // pair = (GroupKey, CompositeAggregate output)
             var (key, aggRow) = pair;
@@ -3064,6 +3775,66 @@ public static class PlanToCircuit
 
             return codec.BuildRow(null, vs);
         });
+
+        // The output lays the group key out as the first groupCount columns and
+        // every group is co-located on one worker, so the result is partitioned by
+        // iota(groupCount) — record it for a downstream aggregate to elide on.
+        if (ctx.Workers > 1)
+        {
+            ctx.SetPartition(mapped, new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount)));
+        }
+
+        return mapped;
+    }
+
+    /// <summary>
+    /// The column indices of a group-by / partition key when <em>every</em> key
+    /// expression is a bare column reference (so the key survives in the output by
+    /// identity and can be reasoned about for exchange elision); <c>null</c> if any
+    /// key is a computed expression.
+    /// </summary>
+    private static int[]? BareColumnIndices(IReadOnlyList<ResolvedExpression> keys)
+    {
+        var indices = new int[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+        {
+            if (keys[i] is not ResolvedColumn rc)
+            {
+                return null;
+            }
+
+            indices[i] = rc.Index;
+        }
+
+        return indices;
+    }
+
+    /// <summary>
+    /// A synthetic key-row schema whose column types are those of a PARTITION BY /
+    /// group-key expression list — the types <see cref="StablePartitionHash.OfWholeRow"/>
+    /// dispatches on when hashing the projected key row.
+    /// </summary>
+    private static Schema SyntheticKeySchema(IReadOnlyList<ResolvedExpression> keys)
+    {
+        var cols = new SchemaColumn[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+        {
+            cols[i] = new SchemaColumn("$pk" + i, keys[i].Type);
+        }
+
+        return new Schema(cols);
+    }
+
+    /// <summary>The identity index vector <c>[0, 1, …, n-1]</c>.</summary>
+    private static int[] Iota(int n)
+    {
+        var a = new int[n];
+        for (var i = 0; i < n; i++)
+        {
+            a[i] = i;
+        }
+
+        return a;
     }
 
     private static SqlAggregator BuildSqlAggregator(AggregateCall call)
