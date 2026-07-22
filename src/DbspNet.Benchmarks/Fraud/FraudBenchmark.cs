@@ -25,7 +25,9 @@ internal static class FraudBenchmark
     private const long Day = 86_400_000_000L; // micros per day.
     private const long BaseTimeMicros = 1_700_000_000_000_000L;
 
-    private static readonly string[] Ddl =
+    // internal (not private) so the plan-level research instruments —
+    // CalciteRuleCensus — can compile this workload's plan.
+    internal static readonly string[] Ddl =
     {
         @"CREATE TABLE customers (
             id BIGINT NOT NULL,
@@ -41,7 +43,7 @@ internal static class FraudBenchmark
     // Three rolling windows × {count, sum} = the classic fraud feature vector.
     // Distinct RANGE-INTERVAL frames per window exercise the multiple-OVER-spec
     // path; the join feeds all of them.
-    private const string FeatureSql =
+    internal const string FeatureSql =
         @"SELECT t.txn_id, t.cust_id, c.zip,
             COUNT(*)        OVER (PARTITION BY t.cust_id ORDER BY t.ts RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW)  AS cnt_1d,
             SUM(t.amount)   OVER (PARTITION BY t.cust_id ORDER BY t.ts RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW)  AS sum_1d,

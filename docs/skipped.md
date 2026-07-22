@@ -1014,9 +1014,20 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   <c>PlanToCircuit.Compile</c> — callers opt in with
   <c>Compile(Optimize(plan))</c>.
 - **[P1]** Subquery decorrelation.
-- **[P2]** Common subexpression elimination.
+- **[P2]** Common subexpression elimination — **intra-view done**
+  (`Optimizer/PlanCse.cs`, hash-consing to a DAG + per-reference compile
+  memo on both compile paths; Calcite's `CommonRelSubExprRegisterRule`).
+  Cross-view CSE for the program path is designed and gated on the
+  batch-1 corpus (`docs/design-cross-view-cse.md`).
 - **[P2]** Circuit-level optimizer (Feldera's `CircuitOptimizer`).
-- **[P3]** Calcite's ~200 RBO rules. v1 performs none of them.
+- **[P3]** Calcite's RBO rule set (~170 `CoreRules` constants). We implement
+  ~11 of them under other names (pushdown, projection fusion, aggregate-input
+  narrowing, column pruning, CSE); ~60 are structurally inapplicable (no
+  `Calc` / `Values` / `Sample` / `Correlate` / standalone `Sort` node). The
+  triage of the remainder — which are worth porting under an *incremental*
+  cost model, which are actively harmful, and a measured site census over the
+  Nexmark + fraud corpora — is `docs/research-calcite-rules.md`
+  (instrument: `dotnet run --project src/DbspNet.Benchmarks -c Release -- rulecensus`).
 - Row layout — typed fast path landed. `TypedPlanCompiler` walks a
   `LogicalPlan` and builds a circuit whose streams carry per-schema
   emitted structs from `TypedRowEmitter` instead of `StructuralRow`.

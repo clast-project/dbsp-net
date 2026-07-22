@@ -150,6 +150,21 @@ if (args.Length > 0 && args[0] == "nexmarkplan")
     return 0;
 }
 
+// Calcite rule-applicability census: `dotnet run -- rulecensus`
+// Counts sites where each candidate Calcite rewrite would match the OPTIMIZED plan
+// across the Nexmark + fraud corpora — the measurement instrument for the
+// rule-mining research project (docs/research-calcite-rules.md).
+if (args.Length > 0 && args[0] == "rulecensus")
+{
+    var sb = new StringBuilder();
+    DbspNet.Benchmarks.CalciteRuleCensus.Run(sb);
+    var rcPath = Path.Combine(FindDocsDir(), "calcite-rule-census.md");
+    File.WriteAllText(rcPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(rcPath)}");
+    return 0;
+}
+
 // ApplyOp alloc split: `dotnet run -- applysplit [ticks] [delta] [runs]`
 // Row-wise vs columnar (SoA) projection ApplyOp, apportioning per-row allocation
 // (container / StructuralRow wrapper+hash / object[] / boxed compute) and the
