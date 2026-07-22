@@ -314,3 +314,87 @@ table-set mismatch refused, and a view-body refactor still replaying. Full suite
 **Not yet done:** `ProgramRunner` still checkpoints unconditionally at the end of every
 `RunBatchAsync`. Nothing about the measured batch cost has changed yet — A1 makes the WAL *reachable*
 from the program path; A2 is what makes it *used*.
+
+## 7. Recovery measured — and a correctness bug that blocks A2 (2026-07-22)
+
+§5 flagged that nothing measured restore, and that A2's snapshot-interval knob cannot be set honestly
+without it. `tests/DbspNet.Tests/Scratch/IvmRecoveryProbe.cs` measures it on real SF=3 state by
+recording batches 1–3 through the WAL, snapshotting at a configurable batch, then recovering three
+ways — every recovery **verified** against output-view digests captured during recording, not just
+timed.
+
+### 7.1 The numbers (flat family, snapshot after batch 2, ~4.0 GiB state)
+
+| leg | what | wall | correct? |
+|---|---|--:|:--|
+| (a) | snapshot restore only | **34.5 s** | yes |
+| (b) | snapshot + WAL replay of 1 batch | 86.7 s (replay leg **52.2 s**) | **NO** |
+| (d) | snapshot restore + the same batch driven through the connectors, no WAL | 35.3 s (step leg **0.74 s**) | **NO** |
+
+Recording, for comparison: a full snapshot costs 18.0 s, and a WAL append for an incremental batch
+costs ~0.1 s against 0.2 MiB of log.
+
+Two independent findings fall out.
+
+### 7.2 Snapshot restore silently produces wrong state
+
+Leg (d) is the isolation: it never touches the WAL, and it is **also wrong**, in exactly the same way
+as (b) — so the fault is in **snapshot restore**, not in anything A1 added. One output view of 16,
+`market_volatility`, comes back at **exactly 2×** its correct row count (1796 → 3592). The pure
+restore at the snapshot tick (leg a) is correct; the divergence appears only on the *next step after*
+a restore.
+
+**Mechanism.** `IncrementalAggregateOp.LoadAsync` deliberately does not serialise `_aggCache` /
+`_stateCache`; it rebuilds them by calling `_aggregator.Update(ref state, None, group, group)` once
+per group over the restored trace — a **bulk fold**, in trace-enumeration order. The live run built
+the same cache by **incremental folds**, in tick-arrival order. `docs/persistence.md` argues this
+converges, and for SUM / COUNT / MIN / MAX it does — those are exact. But `SqlStddevAggregator`
+accumulates `double Sum` / `double SumSq` with repeated `+=`, and `SqlAvgAggregator` likewise:
+floating-point addition is not associative, so the two orders can differ in the last bits.
+
+The aggregate then emits a retraction of the value it holds in `_aggCache`, while the downstream
+`IntegrateOp` holds the value that was actually materialised before the snapshot. The two differ, the
+retraction does not cancel, and the view accumulates both the old row and the new one — the observed
+factor of exactly 2.
+
+Consistent with this: `market_volatility` is one of four output views using `STDDEV`/`AVG` over
+`DOUBLE` feeding a global `RANK`, and only it diverges — the fault fires only when the reconstructed
+bits actually differ *and* the row is re-emitted, which is data-dependent. That data-dependence is
+also why snapshotting after batch 1 happened to come back clean while snapshotting after batch 2 does
+not: it is luck, not correctness.
+
+**Severity.** This is **not** a bug A1 introduced — it is in the (B) snapshot path that
+`design-structural-parallel.md` §10 shipped, and it is silent. §10.3 argues restore is "fail-safe"
+because a shape mismatch hard-fails on the plan fingerprint; that reasoning covers *shape* drift and
+says nothing about *value* drift in a rebuilt cache. Practical exposure today is limited — persistence
+is off by default — but any use of the checkpoint with a float aggregate can silently corrupt a view.
+
+**It blocks A2.** A2's whole premise is "snapshot every N batches and replay the rest," which makes
+restore a routine operation rather than a rare one. Fixing this comes first. The obvious repair is to
+serialise the aggregator state rather than reconstruct it (a per-state-class codec — precisely what
+the original (B) sketch listed and the shipped design chose to avoid); a cheaper alternative is to
+have the operator re-derive its cache and then *re-emit the correction* so downstream converges.
+Either way it needs a deterministic regression test first — the SF=3 probe is a 3-minute observation,
+not CI.
+
+### 7.3 WAL replay is ~70× slower than the equivalent live ingest
+
+Legs (b) and (d) apply **the same 9 ticks** to the same restored state. Through the connectors it
+takes **0.74 s**; through WAL replay it takes **52.2 s**. Recording those ticks cost ~0.1 s.
+
+Cause not yet established. `WalRecorder.ReplaySegmentAsync` re-serialises every record batch into a
+`MemoryStream` and re-parses it just to hand it to `ReadArrowStream`, and it reads one batch per
+table per tick (20 tables, mostly empty) — wasteful, but not obviously 50 seconds of wasteful for 203
+rows. This needs profiling before A2, since replay cost is the entire justification for a *short*
+snapshot interval.
+
+### 7.4 What this does to the A2 knob
+
+Taking the measured coefficients at face value — and noting the replay coefficient is inflated by
+§7.3 — recovery is `34.5 s + N × 52.2 s`, which would force a very short interval. If §7.3 turns out
+to be a fixable inefficiency and replay approaches the live-ingest cost (0.74 s/batch), it becomes
+`34.5 s + N × 0.74 s`: ~42 s at N=10, ~2 min at N=100. That is the difference between "snapshot
+constantly" and "snapshot rarely," so **§7.3 must be resolved before N can be chosen** — the
+measurement's main conclusion is that the knob is not yet settable, and why.
+
+Revised order: fix §7.2 (correctness, blocking), profile §7.3 (sets the knob), then A2.
