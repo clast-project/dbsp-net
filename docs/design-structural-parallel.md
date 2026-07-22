@@ -335,3 +335,51 @@ more bytes — that operator is the in-circuit `Integrate` for the output view, 
 materialised view itself (982k / 362k rows). That difference *is* the parallel path's missing
 coverage, now priced: closing it would add ~4–20% to the parallel save, and it is what a real parallel
 recovery would need.
+
+### 10.3 Interaction with structural CSE — safe by fingerprint, not by stable identity
+
+Persistence (§10.1) and the structural CSE pass (`PlanCse`, run unconditionally as the last step of
+`PlanOptimizer.Optimize`) touch the same surface: **CSE changes how many stateful operators a program
+compiles to.** When a duplicated stateful subplan is interned, it compiles once and is shared, so the
+circuit carries *one* operator where a naïve compile carried two. This matters because **snapshot state
+is addressed positionally** — the on-disk key is `op-{i}`, `i` being the operator's index in
+`RootCircuit.Operators` build order (`Snapshot.cs`); there is no stable per-operator id
+(`ISnapshotable` has none). A CSE collapse therefore shifts every downstream operator's positional slot
+and lowers the operator count.
+
+**Why this is nonetheless safe.** Two properties combine:
+
+1. **CSE is deterministic** — `PlanCse.Eliminate` is a fixed bottom-up structural hash-cons (the
+   `Dictionary` is a canonicalisation lookup, not an iteration-ordered structure), so the same SQL
+   compiled by the same binary yields an identical operator set every time. Save-time and restore-time
+   circuits match by construction, and the shared operator round-trips at its (single) slot.
+2. **Restore is fingerprint-guarded, and fail-safe.** Before loading any state, `Snapshot.ReadAsync`
+   checks a schema version, a **plan fingerprint** (`i:op.GetType().FullName` in positional order), an
+   aggregate schema fingerprint, and the **operator count** — each throws `InvalidDataException` on
+   mismatch (the parallel path additionally pins worker count `W`). So a circuit-shape difference can
+   only ever *hard-fail the restore*, never silently mis-map state onto the wrong operator.
+
+**The one real hazard is a CSE on/off boundary.** A checkpoint written with CSE disabled (operator
+compiled twice) and restored into a CSE-enabled circuit (operator shared, once) — or vice versa —
+produces a different operator count / plan fingerprint and **fails restore**: the engine rebuilds from
+scratch rather than corrupting state. Because CSE is unconditional in this tree, there is no in-version
+skew; the boundary is a *version* boundary (a checkpoint from a pre-CSE binary restored by a post-CSE
+one). Practical severity is low today — persistence is off by default and newly landed, so live
+pre-CSE checkpoints are unlikely to exist — but the interaction is real and should be kept in mind
+before any decision to gate CSE behind a flag (which would reintroduce the same skew *within* a
+version).
+
+**Coverage.** `ProgramCheckpointCseTests` exercises this directly: a q5-shaped view whose identical
+`COUNT`-by-`k` subplan appears twice (CSE interns the two aggregates into one shared operator), with a
+precondition guard asserting the collapse actually fires on the persisted compile path (`MemoHits > 0`)
+and a round-trip asserting a fresh engine restores the collapsed circuit and resumes without replaying
+or skipping. The stock `ProgramRunnerCheckpointTests` / `ParallelProgramSnapshotTests` use only
+`GROUP BY` + `DISTINCT` views, which contain no duplicated subplan, so this shape was previously
+uncovered.
+
+**Optional hardening (not built).** The manifest carries no explicit compiler-config / version marker;
+a CSE-boundary skew surfaces as a generic plan-fingerprint mismatch rather than a specific "checkpoint
+written by an incompatible compiler configuration" diagnostic. Stamping such a marker into
+`SnapshotManifest` would only improve the *error message* — the behaviour is already fail-safe — so it
+is deferred as a low-priority nicety, to be picked up if/when checkpoint portability across engine
+versions becomes a real operational concern.
