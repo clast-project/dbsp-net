@@ -21,21 +21,25 @@ namespace DbspNet.Persistence;
 /// engine reaches the same state as the last write.
 /// </summary>
 /// <remarks>
+/// <para><b>Scope.</b> Works over any <see cref="ICompiledCircuit"/> — both
+/// <see cref="CompiledQuery"/> and <see cref="CompiledProgram"/> — since all it
+/// needs is the circuit to snapshot, the per-table input handles to capture and
+/// replay, and a way to commit a tick.</para>
 /// <para><b>Lifecycle.</b> Construct via
-/// <see cref="CreateAsync(CompiledQuery, ITableFileSystem, ITableFileSystem?, CancellationToken)"/>
+/// <see cref="CreateAsync(ICompiledCircuit, ITableFileSystem, ITableFileSystem?, CancellationToken)"/>
 /// (or the path-based convenience overload). The factory discovers any
 /// existing WAL segments, validates the manifest's plan fingerprint,
 /// replays existing segments to bring the engine to the post-WAL state,
 /// then opens a fresh segment for new appends. <see cref="StepAsync"/>
-/// takes over <see cref="CompiledQuery.Step"/> on the recorder side: it
+/// takes over <see cref="ICompiledCircuit.Step"/> on the recorder side: it
 /// flushes the per-tick input buffer, then steps the circuit. The new
 /// segment is closed atomically on <see cref="IAsyncDisposable.DisposeAsync"/>;
 /// the manifest is rewritten to include it.</para>
 /// <para><b>Plan fingerprint.</b> The manifest stores a hash of the
-/// query's input table schemas (column names + types). On reopen, a
+/// input table schemas (column names + types). On reopen, a
 /// mismatch throws — preventing a WAL recorded against schema A from
 /// being silently replayed into schema B. The fingerprint deliberately
-/// ignores the SELECT body, so changes to the query don't invalidate
+/// ignores the view/SELECT bodies, so changes to the query don't invalidate
 /// the WAL.</para>
 /// <para><b>Storage.</b> Backed by <see cref="ITableFileSystem"/>:
 /// file paths are <c>manifest.json</c> and per-(table, segment) entries
@@ -48,7 +52,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
 {
     private const string ManifestKey = "manifest.json";
 
-    private readonly CompiledQuery _query;
+    private readonly ICompiledCircuit _compiled;
     private readonly ITableFileSystem _fs;
     private readonly ITableFileSystem? _snapshotFs;
     private readonly string _planFingerprint;
@@ -74,12 +78,12 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
     private long _currentSegmentStartTick;
     private bool _disposed;
 
-    private WalRecorder(CompiledQuery query, ITableFileSystem walFs, ITableFileSystem? snapshotFs)
+    private WalRecorder(ICompiledCircuit compiled, ITableFileSystem walFs, ITableFileSystem? snapshotFs)
     {
-        _query = query;
+        _compiled = compiled;
         _fs = walFs;
         _snapshotFs = snapshotFs;
-        _planFingerprint = WalManifest.ComputePlanFingerprint(query);
+        _planFingerprint = WalManifest.ComputePlanFingerprint(compiled);
     }
 
     /// <summary>
@@ -88,29 +92,29 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
     /// snapshotDir is null ? null : new LocalTableFileSystem(snapshotDir))</c>.
     /// </summary>
     public static ValueTask<WalRecorder> CreateAsync(
-        CompiledQuery query,
+        ICompiledCircuit compiled,
         string walPath,
         string? snapshotDir = null,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(compiled);
         ArgumentNullException.ThrowIfNull(walPath);
         return CreateAsync(
-            query,
+            compiled,
             new LocalTableFileSystem(walPath),
             snapshotDir is null ? null : new LocalTableFileSystem(snapshotDir),
             cancellationToken);
     }
 
     public static async ValueTask<WalRecorder> CreateAsync(
-        CompiledQuery query,
+        ICompiledCircuit compiled,
         ITableFileSystem walFs,
         ITableFileSystem? snapshotFs = null,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(compiled);
         ArgumentNullException.ThrowIfNull(walFs);
-        var recorder = new WalRecorder(query, walFs, snapshotFs);
+        var recorder = new WalRecorder(compiled, walFs, snapshotFs);
         await recorder.InitializeAsync(cancellationToken).ConfigureAwait(false);
         return recorder;
     }
@@ -124,8 +128,8 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
         long snapshotTick = 0;
         if (_snapshotFs is not null && await Snapshot.ExistsAsync(_snapshotFs, cancellationToken).ConfigureAwait(false))
         {
-            await Snapshot.ReadAsync(_query.Circuit, _snapshotFs, cancellationToken).ConfigureAwait(false);
-            snapshotTick = _query.Circuit.TickCount;
+            await Snapshot.ReadAsync(_compiled.Circuit, _snapshotFs, cancellationToken).ConfigureAwait(false);
+            snapshotTick = _compiled.Circuit.TickCount;
         }
 
         if (await _fs.ExistsAsync(ManifestKey, cancellationToken).ConfigureAwait(false))
@@ -181,7 +185,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
 
         foreach (var table in _writers.Keys)
         {
-            var schema = _query.Inputs[table].Schema;
+            var schema = _compiled.Inputs[table].Schema;
             var buffer = _tickBuffers[table];
             var delta = MaterialiseTickBuffer(schema, buffer);
             _writers[table].Writer.WriteDelta(delta);
@@ -189,7 +193,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
         }
 
         _currentSegmentTicks++;
-        _query.Step();
+        _compiled.Step();
         return default;
     }
 
@@ -231,8 +235,8 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
                 _currentSegmentId, _currentSegmentTicks, _currentSegmentStartTick));
         }
 
-        await Snapshot.WriteAsync(_query.Circuit, _snapshotFs, snapshotRetainCount, cancellationToken).ConfigureAwait(false);
-        var snapshotTick = _query.Circuit.TickCount;
+        await Snapshot.WriteAsync(_compiled.Circuit, _snapshotFs, snapshotRetainCount, cancellationToken).ConfigureAwait(false);
+        var snapshotTick = _compiled.Circuit.TickCount;
 
         var keepers = new List<WalSegment>();
         var pruned = new List<WalSegment>();
@@ -263,7 +267,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
         // cleanup of the orphan files.
         foreach (var seg in pruned)
         {
-            foreach (var table in _query.Inputs.Keys)
+            foreach (var table in _compiled.Inputs.Keys)
             {
                 await _fs.DeleteAsync(SegmentKey(table, seg.Id), cancellationToken).ConfigureAwait(false);
             }
@@ -317,7 +321,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
 
     private void SubscribeToInputs()
     {
-        foreach (var (table, input) in _query.Inputs)
+        foreach (var (table, input) in _compiled.Inputs)
         {
             _tickBuffers[table] = new Dictionary<StructuralRow, long>();
             var local = table;
@@ -353,7 +357,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
 
     private async ValueTask OpenWritersAsync(CancellationToken cancellationToken)
     {
-        foreach (var (table, input) in _query.Inputs)
+        foreach (var (table, input) in _compiled.Inputs)
         {
             var dataSchema = ArrowSchemaBridge.ToArrow(input.Schema);
             var schemaWithWeight = ArrowIpcExtensions.AppendWeightField(dataSchema);
@@ -384,7 +388,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
         var readers = new Dictionary<string, (ArrowStreamReader Reader, IRandomAccessFile File, Stream Stream)>(StringComparer.Ordinal);
         try
         {
-            foreach (var table in _query.Inputs.Keys)
+            foreach (var table in _compiled.Inputs.Keys)
             {
                 var key = SegmentKey(table, segment.Id);
                 if (!await _fs.ExistsAsync(key, cancellationToken).ConfigureAwait(false))
@@ -428,13 +432,13 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
                         }
 
                         memory.Position = 0;
-                        _query.Inputs[table].ReadArrowStream(memory);
+                        _compiled.Inputs[table].ReadArrowStream(memory);
                     }
                 }
 
                 if (!alreadyApplied)
                 {
-                    _query.Step();
+                    _compiled.Step();
                 }
             }
         }
@@ -476,7 +480,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
 
     private void ValidateTablesMatch(WalManifest manifest)
     {
-        var current = _query.Inputs.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
+        var current = _compiled.Inputs.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
         var recorded = manifest.Tables.OrderBy(k => k, StringComparer.Ordinal).ToArray();
         if (!current.SequenceEqual(recorded, StringComparer.Ordinal))
         {
@@ -500,7 +504,7 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
         var manifest = new WalManifest(
             WalManifest.CurrentSchemaVersion,
             _planFingerprint,
-            _query.Inputs.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray(),
+            _compiled.Inputs.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray(),
             snapshot);
         return manifest.WriteAsync(_fs, ManifestKey, cancellationToken);
     }

@@ -262,7 +262,7 @@ The reasoning is entirely from §1:
 **Proposed staging.**
 
 1. **A1 — extract the interface**, retype `WalRecorder`, prove `CompiledProgram` works through the
-   existing WAL tests. No behaviour change on the query path.
+   existing WAL tests. No behaviour change on the query path. **DONE 2026-07-22** — see §6.
 2. **A2 — checkpoint policy on `ProgramRunner`**: WAL-per-batch, snapshot every N. Re-run
    `IvmCheckpointReuse` (it already reports step/outputs/save separately) to confirm the durable batch
    for batches 2/3 lands near the projected ~2 s.
@@ -284,3 +284,33 @@ The reasoning is entirely from §1:
   moot until a parallel `ProgramRunner` exists.
 - **Whether Feldera's commit is actually cheaper on these batches.** We have priced ours. The
   head-to-head still needs Feldera's own per-batch commit cost broken out of its batch window.
+
+## 6. A1 — built (2026-07-22)
+
+`ICompiledCircuit` (`src/DbspNet.Sql/Compiler/ICompiledCircuit.cs`) declares the three members
+`WalRecorder` actually needs — `Circuit`, `Inputs`, `Step()`. `CompiledQuery` and `CompiledProgram`
+each gained the interface in their declaration and **nothing else**: both already exposed all three
+publicly with matching signatures, so no member was added, moved, or reimplemented.
+
+`WalRecorder` and `WalManifest.ComputePlanFingerprint` are retyped from `CompiledQuery` onto
+`ICompiledCircuit`. Source-compatible for existing callers, since `CompiledQuery` implements it.
+
+Two facts made this smaller than §2 assumed:
+
+- **`WalRecorder` has no non-test call sites in `src/`.** The only production references were doc
+  comments; every real caller is a test.
+- **The per-tick capture hook was never query-specific.** `TableInput.OnPushed` — the event the
+  recorder subscribes to — lives on `TableInput`, which both compiled shapes hand out through the
+  same `IReadOnlyDictionary<string, TableInput> Inputs`. Only the top-level container type was
+  coupled.
+
+**Verification.** The 122 existing persistence tests (including `WalRecorderTests`,
+`HybridSnapshotWalTests`, `LifecycleTests`, `SnapshotRetentionTests`) pass **unmodified** — that is
+the behaviour-preservation proof. `ProgramWalRecorderTests` adds seven tests driving a two-source,
+three-view `CompiledProgram` through the same machinery: per-table segments (views are never logged),
+replay restoring every output view, snapshot+WAL and snapshot-only recovery, input-schema drift and
+table-set mismatch refused, and a view-body refactor still replaying. Full suite green (2242 passed).
+
+**Not yet done:** `ProgramRunner` still checkpoints unconditionally at the end of every
+`RunBatchAsync`. Nothing about the measured batch cost has changed yet — A1 makes the WAL *reachable*
+from the program path; A2 is what makes it *used*.

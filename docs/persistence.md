@@ -157,9 +157,9 @@ out of (A) + (B) naturally.
 
 | Approach | Status | Entry points |
 |---|---|---|
-| (A) input replay | Shipped | `WalRecorder(query, walStore)` |
+| (A) input replay | Shipped | `WalRecorder(compiled, walStore)` |
 | (B) end-of-tick snapshot | Shipped | `Snapshot.Write` / `Snapshot.Read` |
-| (C) snapshot + WAL hybrid | Shipped | `WalRecorder(query, walStore, snapshotStore)` + `WalRecorder.WriteSnapshot()` |
+| (C) snapshot + WAL hybrid | Shipped | `WalRecorder(compiled, walStore, snapshotStore)` + `WalRecorder.WriteSnapshot()` |
 | (D) log-structured trace | Shipped in Core and emitted by the SQL compiler via `CompileOptions { TraceFamily = TraceFamily.Spine }` | `DbspNet.Core.Operators.Stateful.Spine.*` (`SpineDistinct`, `SpineIncrementalAggregate`, `SpineIncrementalJoin`, `SpineIncrementalLeftJoin`); see "Spine" below |
 
 ### Storage abstraction
@@ -286,6 +286,17 @@ names a snap-T whose manifest exists.
   v2 with the new field; v1 manifests are rejected on read.
 
 ### What ships in (C)
+
+`WalRecorder` works over **any `ICompiledCircuit`** — the three-member interface
+(`Circuit`, `Inputs`, `Step()`) that both `CompiledQuery` and `CompiledProgram`
+implement — so (A) and (C) are reachable from the multi-view **program** path
+that the ivm-bench server drives, not just from a single compiled query. That
+was A1 of `docs/design-incremental-persistence.md`; before it, the recorder was
+typed on `CompiledQuery` and the program path had no route to the WAL at all.
+Coverage: `ProgramWalRecorderTests` (per-table segments over a two-source
+program, replay restoring every output view, snapshot+WAL and snapshot-only
+recovery, input-schema drift and table-set mismatch refused, and a view-body
+refactor still replaying — the fingerprint covers input schemas only).
 
 `WalRecorder` accepts an optional `snapshotDir`. On reopen, the
 recorder loads the snapshot first (via `Snapshot.Exists` so the

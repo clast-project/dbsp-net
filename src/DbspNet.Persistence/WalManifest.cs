@@ -103,20 +103,20 @@ public sealed record WalManifest(
     }
 
     /// <summary>
-    /// Compute a stable fingerprint of a query's input table schemas. The
-    /// fingerprint changes if any table's column set, types, or
-    /// nullabilities change — but is independent of the SELECT body, so an
-    /// (A) input WAL stays valid across query refactors that don't touch
+    /// Compute a stable fingerprint of a compiled circuit's input table
+    /// schemas. The fingerprint changes if any table's column set, types, or
+    /// nullabilities change — but is independent of the view/SELECT bodies, so
+    /// an (A) input WAL stays valid across query refactors that don't touch
     /// the input schema.
     /// </summary>
-    public static string ComputePlanFingerprint(CompiledQuery query)
+    public static string ComputePlanFingerprint(ICompiledCircuit compiled)
     {
         var sb = new StringBuilder();
-        var orderedTables = query.Inputs.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
+        var orderedTables = compiled.Inputs.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
         foreach (var name in orderedTables)
         {
             sb.Append(name).Append(":[");
-            var schema = query.Inputs[name].Schema;
+            var schema = compiled.Inputs[name].Schema;
             for (var c = 0; c < schema.Count; c++)
             {
                 if (c > 0)

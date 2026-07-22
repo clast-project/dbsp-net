@@ -15,7 +15,7 @@ namespace DbspNet.Sql.Compiler;
 /// deltas via <see cref="TableInput"/>) and one output handle exposing the
 /// result view as a <see cref="ZSet{StructuralRow, Z64}"/>.
 /// </summary>
-public sealed class CompiledQuery
+public sealed class CompiledQuery : ICompiledCircuit
 {
     private readonly IntegratedViewHandle<StructuralRow>? _view;
 

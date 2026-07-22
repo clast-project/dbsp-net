@@ -18,7 +18,7 @@ namespace DbspNet.Sql.Compiler;
 /// incrementally as one circuit — as opposed to <see cref="CompiledQuery"/>, which is a
 /// single query with one output.
 /// </summary>
-public sealed class CompiledProgram
+public sealed class CompiledProgram : ICompiledCircuit
 {
     internal CompiledProgram(
         RootCircuit circuit,
