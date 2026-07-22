@@ -2,6 +2,8 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.Collections;
+using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Compiler;
@@ -66,4 +68,90 @@ internal static class StablePartitionHash
     public static int Of(Time64 value) => StableHash.Of(value.Microseconds);
 
     public static int Of(Timestamp value) => StableHash.Of(value.Microseconds);
+
+    /// <summary>
+    /// Hash a boxed structural-row slot value against its declared
+    /// <see cref="SqlType"/>. The structural pipeline carries every column as a
+    /// boxed <see cref="object"/> (<see cref="StructuralRow.this"/>), so it has no
+    /// static CLR field type to overload on — this is the structural counterpart
+    /// of the typed <see cref="Of(int)"/>… overloads and MUST reduce to the very
+    /// same <see cref="StableHash"/> primitive for each type, so a value hashes to
+    /// the same worker whether it arrives typed or structural (typed↔structural
+    /// A/B parity and snapshot/restore co-location, see docs §4).
+    /// </summary>
+    /// <remarks>
+    /// NULL (a <see langword="null"/> slot) collapses to <see cref="NullHash"/>,
+    /// matching the typed Nullable path. A column type outside the stable-hash
+    /// surface (REAL, INTERVAL, the untyped NULL literal) throws
+    /// <see cref="NotSupportedException"/> — mirroring the typed compiler, which
+    /// refuses the parallel compile rather than shard on an unstable key.
+    /// </remarks>
+    public static int OfBoxed(object? value, SqlType type)
+    {
+        if (value is null)
+        {
+            return NullHash;
+        }
+
+        return type switch
+        {
+            SqlIntegerType => Of((int)value),
+            SqlBigintType => Of((long)value),
+            SqlBooleanType => Of((bool)value),
+            SqlDoubleType => Of((double)value),
+            SqlDecimalType => Of((Decimal128)value),
+            SqlVarcharType => Of((Utf8String)value),
+            SqlDateType => Of((Date32)value),
+            SqlTimeType => Of((Time64)value),
+            SqlTimestampType => Of((Timestamp)value),
+            _ => throw new NotSupportedException(
+                $"no stable partition hash for SQL column type {type.GetType().Name}"),
+        };
+    }
+
+    /// <summary>
+    /// Stable partition hash of a structural row's key columns:
+    /// <paramref name="keyIndices"/> selects the slots and the parallel
+    /// <paramref name="keySchema"/> supplies each slot's <see cref="SqlType"/>.
+    /// Single-column keys hash the one slot directly; composite keys fold the
+    /// per-column hashes through <see cref="StableHash.Combine(int[])"/> — the
+    /// exact reduction the typed <c>BuildStableRowHash</c> uses, so a typed and a
+    /// structural build place the same key on the same worker.
+    /// </summary>
+    public static int OfRow(StructuralRow row, int[] keyIndices, Schema keySchema)
+    {
+        if (keyIndices.Length == 1)
+        {
+            return OfBoxed(row[keyIndices[0]], keySchema[0].Type);
+        }
+
+        var hashes = new int[keyIndices.Length];
+        for (var k = 0; k < keyIndices.Length; k++)
+        {
+            hashes[k] = OfBoxed(row[keyIndices[k]], keySchema[k].Type);
+        }
+
+        return StableHash.Combine(hashes);
+    }
+
+    /// <summary>
+    /// Stable partition hash over every column of a structural row (the whole-row
+    /// key used by DISTINCT and by the table-input shard split). Equal rows hash
+    /// identically, so they co-locate on one worker.
+    /// </summary>
+    public static int OfWholeRow(StructuralRow row, Schema schema)
+    {
+        if (schema.Count == 1)
+        {
+            return OfBoxed(row[0], schema[0].Type);
+        }
+
+        var hashes = new int[schema.Count];
+        for (var i = 0; i < schema.Count; i++)
+        {
+            hashes[i] = OfBoxed(row[i], schema[i].Type);
+        }
+
+        return StableHash.Combine(hashes);
+    }
 }

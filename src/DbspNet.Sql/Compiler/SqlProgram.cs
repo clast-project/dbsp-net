@@ -35,6 +35,27 @@ public static class SqlProgram
     }
 
     /// <summary>
+    /// Data-parallel compile of a program onto <paramref name="workers"/> replicas
+    /// (Increment 2, docs/design-structural-parallel.md). Returns <c>false</c> —
+    /// and the caller should fall back to <see cref="Compile"/> — when any
+    /// reachable view uses a construct the exchange-insertion pass cannot shard
+    /// soundly. Snapshot persistence is not wired on the parallel path.
+    /// </summary>
+    public static bool TryCompileParallel(
+        IReadOnlyList<string> statements,
+        ISet<string> outputViews,
+        int workers,
+        out ParallelCompiledProgram? compiled,
+        CompileOptions? options = null,
+        bool numericStringCoercion = false,
+        NullCollation nullCollation = NullCollation.High)
+    {
+        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
+        return PlanToCircuit.TryCompileProgramParallel(
+            resolved.Tables, resolved.Views, workers, out compiled, options);
+    }
+
+    /// <summary>
     /// Resolve (without compiling) — parse each statement against a shared catalog,
     /// registering each view's schema so later views resolve references to it. Exposed so
     /// callers (and tests) can inspect the resolved plans before / instead of compiling.

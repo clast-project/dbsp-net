@@ -27,6 +27,11 @@ pre-captured. The recommended path is a **single benchmark-gated first increment
 validates B's ceiling on one view's apply-chain before committing to the whole-engine
 rewrite** — retire-if-it-loses, exactly as every prior increment in the companion doc.
 
+> **⚠️ Superseded by §9 (2026-07-21):** §7 falsified even that first increment (fusion invariant), and
+> §9 reframes the whole arc — the measured Feldera scaling curve shows batch-1 is a **parallelism** gap
+> (Feldera single-core ≈ ours), not a representation gap. The recommended build is now the
+> structural-parallel exchange pass (§9), not columnar. Columnar = DESIGNED-AND-MEASURED-NOT-BUILT.
+
 ## 1. The measurement (batch-1, HEAD `b510343`, per-op alloc instrumentation `16e7d76`)
 
 ServerGC wall ~59.5s, 44.74 GiB allocated, engine step 87%. Allocation by operator kind:
@@ -148,7 +153,12 @@ struct rows. **Batch-1 runs the structural, single-threaded `CompileProgram` pat
 - The `ApplyOpAllocSplit` microbench (extended here with the columnar variant) is the
   apportionment gate: an increment must beat the row-wise ApplyOp on both alloc and wall.
 
-## 6. Smallest benchmark-gated first increment
+## 6. Smallest benchmark-gated first increment — ⚠️ RETIRED by §7.2 (fusion invariant); do not build
+
+> The single-view apply-chain premise below is **falsified**: `CompileLinearChain` already fuses
+> consecutive Filter/Project into one op, so a view has no long internal apply chain — every
+> ApplyOp is bounded by materializing barriers and must materialize rows for its consumer anyway.
+> See §7.2. The real smallest increment is one barrier op + neighbors columnar. Kept for context.
 
 **Columnarize one view's ApplyOp chain internally, end-to-end within the view, and measure.**
 Pick a hot pure-apply view — e.g. `watches` (886K rows, 5 ApplyOps) or `daily_market` (1.28M
@@ -170,46 +180,201 @@ Only if the single-view increment clears the gate does generalization to a colum
 interface (multiple adjacent views/operators sharing columnar batches, deferring materialization
 across boundaries) become justified — and that is where the bulk of the ~18% lives.
 
-## 7. Open measurements to run first (before writing any operator)
+## 7. Open measurements — RAN (2026-07-21, HEAD `ce8c7de`, local `IvmBatchProfile` reproduced 44.73 GiB / 60.6s ServerGC, baseline intact)
 
-1. **Confirm the single-view ceiling on real data.** The microbench's −38% is a synthetic 12-col
-   projection. Instrument `watches`/`daily_market`'s actual apply-chain alloc and confirm the
-   columnar SoA saving holds at the real column widths/types (wider rows → bigger StructuralRow-
-   wrapper share; string columns don't box, so the boxing residual varies by view).
-2. **Price the output-boundary materialization.** A view's columnar chain still materializes
-   `StructuralRow`s at its output (consumers read them). Measure whether that boundary cost eats
-   the internal saving — i.e. is the win only realized when *adjacent* views also go columnar
-   (deferring materialization)? This decides whether the first increment is one view (weaker) or a
-   view-pair (stronger but larger).
-3. **Typed-column upside — ANSWERED (synthetic, no data needed).** Priced by the reconstructed
-   `ApplyOpAllocSplit` microbench (`dotnet run -c Release --project src/DbspNet.Benchmarks --
-   applysplit`, `docs/applyop-alloc-split.md`), which adds a typed-columnar (TCOL: `long[]`/
-   `string[]` columns, zero boxing) rung above object-columnar (COL). Measured B/row (M-series Mac,
-   ServerGC):
+### 7.1 Single-view ceiling on real data — CONFIRMED and RAISED (§7 #1)
 
-   | projection shape | P·fresh | COL | TCOL | COL↓ vs P | typed↓ vs COL |
-   |---|---|---|---|---|---|
-   | passthrough-heavy (8+4 pass, 1 computed) | 216.6 | 137.8 | 113.9 | −36.4% | **−17.3%** |
-   | compute-heavy (2 pass, 10 computed) | 432.6 | 353.8 | 113.9 | −18.2% | **−67.8%** |
+Extended `ApplyOpAllocSplit` with a **real `watches` s1 shape** (8→10 col, strings + DateTimes,
+two CASE-passthrough computed cols) alongside the synthetic numeric shape:
 
-   The load-bearing fact: on 64-bit a `long[]` and an `object?[]` element are **both 8 B**, so
-   typed columns never shrink column *storage* — their entire marginal win over object columns is
-   eliminating the heap *box* per **freshly-computed** numeric. Passthrough numerics share their box
-   by reference (§23), so **TCOL is flat (~114 B/row) regardless of projection shape**, while COL
-   balloons with computed-numeric width. Consequence: **object-columnar captures the bulk on the
-   common map/filter/project (passthrough-heavy) ApplyOp shape — typed adds only ~17% there and is
-   not worth its larger scope; typed becomes decisive (−68% marginal) only on compute-heavy numeric
-   projections.** Which regime the real 47% ApplyOp term sits in — how many batch-1 ApplyOps newly
-   produce many numeric columns vs pass values through — is a §7 #1 real-view question still gated
-   on the SF=3 data. **Decision: build object-columnar first (§6); defer typed columns until
-   real-view profiling shows compute-heavy numeric ApplyOps dominate.**
+| shape | (a) container | (b) row-materialization | (c) boxing | **columnar saving / ApplyOp** | batch if all ApplyOps columnar |
+|---|---|---|---|---|---|
+| NUMERIC 14→12 (boxed long/decimal) | 15.2% | 73.2% | 11.6% | **−38.3%** | ~18.1% |
+| **WATCHES 8→10 (string/DateTime)** | 18.8% | **81.2%** | **0.0%** | **−47.5%** | **~22.5%** |
 
-## 8. Honest bottom line
+**The real string/DateTime-heavy dimension/SCD views columnarize *better* than the synthetic
+microbench.** Their "computed" columns are CASE **reference-passthroughs**
+(`case action_type when 'Activate' then watch_timestamp else null`) that reuse an already-boxed
+ref → **zero (c) boxing residual**, so object-array columns leave nothing stranded and (b)
+row-materialization is 81% of the op. B's object-column alloc ceiling for the string-heavy tail
+is **~22%**, above the §2.3 −38%/18% synthetic estimate.
 
-Batch-1 is allocation-bound at ~3.4:1 vs Feldera. The cheap/medium levers are exhausted
-(re-profile found no algorithmic blow-ups; column liveness is a ~4% wash). The remaining prize is
-the inter-op row-materialization term (B), reachable only by a columnar execution interface —
-measured ceiling ~18% alloc (~8 GiB, object columns; more with typed columns), a large rewrite
-with a ~1.3–2× (not parity) ceiling. This doc opens the arc at that decision with the numbers; the
-first increment (§6) is designed to validate or retire the ceiling on one view before the
-whole-engine commitment.
+### 7.2 Output-boundary materialization — RESOLVED **NEGATIVE for the single-view increment** (§7 #2)
+
+The §6 "columnarize one view's apply-chain" increment does **not** work as a positive-ROI brick.
+Reason is structural, not measurable-away: **`CompileLinearChain` (PlanToCircuit.cs:1631) folds a
+*maximal* run of consecutive Filter/Project into ONE `MapFilterRows` op**, stopping at the first
+non-linear node. So after fusion:
+
+- **Every surviving ApplyOp sits between materializing barriers** — its input is a source or a
+  non-linear op (join/aggregate/window/distinct/union); its output feeds a non-linear op, an
+  output boundary, or a fork (shared stream = also materialized). **Contiguous pure-apply regions
+  have length 1.**
+- A lone ApplyOp between two barriers **must materialize `StructuralRow`s for its barrier-consumer
+  regardless of representation.** Columnarizing it in isolation = read rows → scatter to columns →
+  compute → **re-materialize rows** for the next barrier: it *adds* a column round-trip and saves
+  **zero** of the (b) term. **Strictly worse.**
+- Columnar only wins when **both** neighbors are columnar (no scatter in, no materialize out) — which
+  chains back to needing the stateful **barrier** ops (join/aggregate/window) to consume+produce
+  columns. The 47% ApplyOp materialization alloc is fundamentally **the cost of feeding rows *into*
+  the barrier ops**; it is not reclaimable one-op-at-a-time.
+
+**Consequence:** there is no valid "one view's apply-chain" first increment. The smallest increment
+that can show a *positive* number is columnarizing **one stateful barrier op + its adjacent applies**
+(e.g. the `watches` aggregate op 292 = 2.0 GiB, or a join in the fact-join tier) so the columnar
+batch spans the barrier — a substantially bigger brick than §6 proposed, and it commits the columnar
+batch as a real inter-op type. §6's "single pure-apply view" premise is **falsified by the fusion
+invariant** and should not be built.
+
+### 7.3b Barrier-slice reclaimability — the honest number CORRECTS the ceiling and shows the single-slice increment is UN-GATEABLE
+
+The §6 increment's own de-risking step (the "reclaimability microbench BEFORE wiring" pattern —
+poolbench→pooling, reprbench→columnar). `JoinBarrierSlice` reuses the **real** join kernel
+(`IncrementalJoinCore.JoinInto`) and the **real** `IndexedZSetTrace` over the `watches_history`
+slice (projection → INNER JOIN(securities) → projection, 900K probe rows, 20 ticks), differing
+between paths **only in the output sink**: ROW = StructuralRow throughout (current interface); COL =
+columnar join output → projection fused into a single boundary materialisation (StructuralRows built
+once, because the consumer `watches` is row-based). The invariant trace-integrate + match floor is
+measured separately.
+
+| slice variant | alloc | whole-slice saving vs ROW |
+|---|---|---|
+| ROW (join combine + builder + projection) | 0.382 GiB | — |
+| COL (fused projection, unpooled columns) | 0.314 GiB | **−17.7%** |
+| COL + **pooled** column buffers (§20) | 0.257 GiB | **−32.7%** |
+| invariant floor (trace-integrate + match) | 0.126 GiB | **33.0% uncapturable** |
+
+**The −47.5% pure-projection ceiling (§7.1) does NOT transfer to a real barrier slice.** Two
+structural erosions, both permanent for a single slice:
+1. **33% of the slice is representation-invariant** — folding the streamed side into the join's left
+   trace (`IndexedZSetTrace.Integrate`) allocates the same whether the *output* is rows or columns.
+   Reclaiming it needs a **columnar trace** (target A), a separate/larger change that §2.1/§21 already
+   showed is mostly pre-captured by column-pruning.
+2. **The boundary must materialise rows once** — a slice ending at a row-consuming barrier (every
+   consumer here is a row-based join/aggregate/output) pays one full StructuralRow-build pass no
+   matter what, halving the interface saving (47.5% → 26.4%).
+
+**Un-gateable as a bounded increment.** This ~1.28 GiB slice is the *cleanest, biggest* single-barrier
+target, and columnarizing it removes **0.07–0.13 GiB = 0.15–0.28% of the 44.7 GiB batch** — below the
+`IvmBatchProfile` wall-noise floor. A single wired slice cannot be gated on batch wall; clearing a
+~2–3% batch signal would require columnarizing slices totalling ~15% of the batch (~7 GiB of joins +
+projections across many views) — i.e. **most of the XL rewrite, not a bounded brick.**
+
+**Whole-engine ceiling revised DOWN.** The batch's join (27%) + aggregate (13%) + window (13%) alloc
+is dominated by **internal trace/accumulator state**, which output-columnarization does not touch (the
+33% floor here is that state for one join). Only the output-combine + projection *interface* is
+capturable, and even that keeps its boundary-materialisation cost until *adjacent* ops are columnar
+too. Realistic whole-engine reachable alloc ≈ **~10–13%** (not the §2.3/§7.1 ~18–22%), plausibly
+**~5–10% wall** — for a multi-session whole-engine rewrite at a ~1.3–2× (not parity) ceiling, on the
+**one-time** batch-1 load (the IVM benchmark's actual point is incremental batches 2/3, already
+competitive — cost there is output I/O, not engine).
+
+### 7.3 Typed-column upside (§7 #3) — ANSWERED (synthetic); §7.1 pins the real-view regime
+
+Priced by the reconstructed `ApplyOpAllocSplit` microbench (`dotnet run -c Release --project
+src/DbspNet.Benchmarks -- applysplit`, `docs/applyop-alloc-split.md`), which adds a typed-columnar
+(TCOL: `long[]`/`string[]` columns, zero boxing) rung above object-columnar (COL). Measured B/row
+(M-series Mac, ServerGC):
+
+| projection shape | P·fresh | COL | TCOL | COL↓ vs P | typed↓ vs COL |
+|---|---|---|---|---|---|
+| passthrough-heavy (8+4 pass, 1 computed) | 216.6 | 137.8 | 113.9 | −36.4% | **−17.3%** |
+| compute-heavy (2 pass, 10 computed) | 432.6 | 353.8 | 113.9 | −18.2% | **−67.8%** |
+
+The load-bearing fact: on 64-bit a `long[]` and an `object?[]` element are **both 8 B**, so typed
+columns never shrink column *storage* — their entire marginal win over object columns is eliminating
+the heap *box* per **freshly-computed** numeric. Passthrough numerics share their box by reference
+(§23), so **TCOL is flat (~114 B/row) regardless of projection shape**, while COL balloons with
+computed-numeric width. Consequence: **object-columnar captures the bulk on the common
+map/filter/project (passthrough-heavy) ApplyOp shape — typed adds only ~17% there and is not worth
+its larger scope; typed becomes decisive (−68% marginal) only on compute-heavy numeric projections.**
+
+**§7.1 now pins which regime the real views sit in** (it was the open real-data question above): the
+string/DateTime-heavy dimension/SCD tail is exactly the passthrough-heavy, **~0-boxing** regime —
+its CASE columns are reference-passthroughs (§7.1), so typed columns would add **nothing** there. The
+residual typed prize is confined to the numeric views (daily_market/trades), which keep an ~11.6%
+boxing residual that typed `long[]` columns would capture — but only as part of the (larger)
+typed+columnar engine, gated behind the go/no-go on the object-column engine first. **Decision: build
+object-columnar first (§6); defer typed columns until real-view profiling shows compute-heavy numeric
+ApplyOps dominate.**
+
+## 8. Honest bottom line — RECOMMEND STOP (declare the floor)
+
+Batch-1 is allocation-bound at ~3.4:1 vs Feldera. The cheap/medium levers are exhausted (re-profile
+found no algorithmic blow-ups; column liveness is a ~4% wash). §7 ran the three decision measurements
+and the columnar thesis came out **weaker than the opening estimate, in two compounding ways:**
+
+1. **B is all-or-nothing** (§7.2, fusion invariant): every ApplyOp sits between materialising barriers,
+   so the 47% ApplyOp term is not decomposable into a cheap single-view brick.
+2. **The realistic ceiling is lower and the smallest wireable unit is un-gateable** (§7.3b, faithful
+   barrier-slice microbench reusing the real join kernel + trace): a real barrier slice saves only
+   **17–33%** (not the 47.5% pure-projection ceiling) because ~33% is invariant trace/accumulator
+   state and the boundary re-materialises rows once. The cleanest single slice moves the batch
+   **0.15–0.28%** — below wall-noise; a gateable signal needs ~15% of the batch columnarized at once.
+   Whole-engine reachable alloc revised to **~10–13%** (was ~18–22%), plausibly **~5–10% wall**.
+
+**Recommendation: declare batch-1 at its practical floor (~3.4:1) and close the columnar arc as
+DESIGNED-AND-MEASURED-NOT-BUILT.** The remaining prize is a multi-session whole-engine columnar
+rewrite (columnar joins + aggregates + windows + applies + a columnar trace to reach the 33% floor),
+with no bounded gateable increment, a revised-down ~5–10% wall ceiling at ~1.3–2× (not parity), on the
+**one-time** historical load — while the IVM benchmark's actual value is the incremental batches 2/3,
+which are already competitive (their cost is output I/O, not engine). The measured artefacts
+(`ApplyOpAllocSplit`, `JoinBarrierSlice`) and this doc are the recorded decision; revisit only if the
+target shifts from batch-1 wall to something the columnar rewrite serves better.
+
+> **⚠️ Framing superseded by §9 (2026-07-21).** The "stop" verdict is correct *for the columnar arc*,
+> but §9 shows it answered the wrong strategic question. Batch-1 competitiveness is a **parallelism**
+> gap, not a representation gap — the columnar rewrite serves *serial* wall, and serial is already
+> ~parity with Feldera single-core. Read §9 before acting on §8.
+
+## 9. The parallel reframe — competitiveness is a PARALLELISM gap, not a representation gap (measured 2026-07-21)
+
+§8's "stop" stands *for columnar*, but the strategic question is Curt's: **is competitive (50–80% of
+Feldera) plausible with enough engineering, or a fool's errand?** The columnar rewrite serves batch-1
+**serial** wall; the actual gap is **parallelism**. Two findings settle it.
+
+**(1) The Exchange substrate is already generic over `StructuralRow` — structural-parallel needs no new
+runtime ops.** `ExchangeOp<TKey,TWeight>`, `CircuitBuilder.Exchange`/`ExchangeIndex`,
+`ParallelCircuit.Build`/`ShardedInput`/`ShardedOutput` are all `<TKey>`-generic; the typing lives ONLY
+in `TypedPlanCompiler`'s exchange-INSERTION pass. Structural-parallel = port that insertion strategy
+(shard scans, shuffle-by-key before joins/aggs/distinct, propagate partitioning) to
+`PlanToCircuit`/`CompileProgram` over `StructuralRow` with a `Func<StructuralRow,int>` key-hash
+(`StablePartitionHash` exists). It AVOIDS the §23 typing penalty (Exchange shuffles row *refs*, no
+decode/encode). `PlanToCircuit` currently inserts ZERO exchanges (single-circuit only) — this is the
+whole build.
+
+**(2) Feldera's ~21s batch-1 is 12-worker parallel, and its full scaling curve is now measured**
+(SF=3 batch-1, faithful OAT harness, `duration_s` from `run-feldera-batch1.json`, this i9-12900K box,
+8P+8E; workers is `runtime_config` → no recompile, but the harness recompiles per sweep regardless):
+
+| Workers | duration_s | vs 1-core | Efficiency |
+|--:|--:|--:|--:|
+| 1 | 56.07 | 1.00× | 100% |
+| 2 | 34.36 | 1.63× | 82% |
+| 4 | 23.93 | 2.34× | 59% |
+| **8** | **18.56** | **3.02× (peak)** | 38% |
+| 12 | 20.47 | 2.74× | 23% |
+
+Two facts, one conclusion:
+- **Feldera single-core (56.07s) ≈ dbsp-net serial (~59.5s local ServerGC).** On batch-1 Feldera's
+  per-row representation edge is only ~1.06×, NOT the 2–5× it holds on Nexmark — the algorithmic wins
+  (O(N²) window fix, semi-join narrowing, program-path optimizer) already closed the per-row gap. **A
+  columnar/rep rewrite would buy little on batch-1: serial is already ~parity.**
+- **Feldera saturates at ~3× with the knee at W=8, and goes NEGATIVE at W=12** (−10% vs W=8,
+  oversubscribing the 8-P-core box) — the same synchronous-BSP bandwidth+coordination wall documented
+  in the exchange-scaling arc (§15). dbsp-net is W-insensitive (§15.8), so it would not take that
+  oversubscription hit; its configured default (workers=12) is not even Feldera's best here.
+
+**Reframed bottom line:** batch-1 competitiveness is decisively a **parallelism-implementation**
+problem. dbsp-net structural-parallel at a realized 2.5–3× (our `ParallelScalingProbe` hit 3.07×
+best-case, disjoint-shard join+proj) takes ~59.5s → **~20–24s**: vs Feldera's peak 18.56s = **77–92%**,
+vs its configured 20.47s = **up to parity** — squarely in the 50–80%+ "competitive" band, plausibly
+parity, WITHOUT the columnar rewrite. **The recommended build is the structural-parallel
+exchange-insertion pass in `PlanToCircuit`, not columnar.** Columnar stays
+DESIGNED-AND-MEASURED-NOT-BUILT (§8); it re-enters only as a *further* multiplier once parallel lands
+(a bandwidth-efficient rep raises the parallel ceiling — the compound thesis; the scaling probe showed
+output-columnar alone does NOT lift the factor because the bottleneck is INPUT-side object[] bandwidth),
+not as the batch-1 lever. Caveat on the estimate: the 2.5–3× is from a single best-case disjoint-shard
+op; the real batch-1 DAG (SCD-2 temporal joins, wide-row window aggs, skew, exchange tax) may realize
+lower (2–2.5×) → ~24–30s → 62–77% — still competitive, but the real-DAG factor is the open number the
+build must validate.

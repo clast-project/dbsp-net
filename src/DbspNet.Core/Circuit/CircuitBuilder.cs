@@ -205,6 +205,39 @@ public sealed class CircuitBuilder
     }
 
     /// <summary>
+    /// The all-gather (broadcast) exchange: replicate a sharded Z-set stream so
+    /// every worker holds the union of all shards. Used to broadcast a small
+    /// dimension for a broadcast join — the large fact side keeps its balanced
+    /// partition while the dimension is replicated to every worker, sidestepping
+    /// the load skew a hash shuffle on a low-cardinality join key would create.
+    /// </summary>
+    /// <remarks>
+    /// Outside a <see cref="ParallelCircuit"/>, or with a single worker, there is
+    /// only one shard, which already holds everything — so this returns
+    /// <paramref name="input"/> unchanged and adds no operator.
+    /// </remarks>
+    public Stream<ZSet<TRow, TWeight>> BroadcastExchange<TRow, TWeight>(
+        Stream<ZSet<TRow, TWeight>> input)
+        where TRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return input;
+        }
+
+        var workers = _parallel.Workers;
+        var coordinator = _parallel.NextCoordinator(
+            () => new ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>>(workers));
+        var output = new Stream<ZSet<TRow, TWeight>>(ZSet<TRow, TWeight>.Empty);
+        _root.AddOperator(new BroadcastExchangeOp<TRow, TWeight>(
+            input, output, coordinator, _parallel.WorkerId, _parallel.Abort));
+        return output;
+    }
+
+    /// <summary>
     /// Fused <see cref="Exchange{TKey,TWeight}"/> + <c>GroupProject(keyOf,
     /// identity)</c>: re-partition a sharded Z-set by <paramref name="partition"/>
     /// and group the result by <paramref name="keyOf"/> into an indexed Z-set,
