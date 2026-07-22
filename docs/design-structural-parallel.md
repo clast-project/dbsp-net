@@ -1,0 +1,162 @@
+# Design: structural-parallel exchange insertion for `PlanToCircuit` (batch-1 competitiveness)
+
+**Status: SCOPING (design-first, not built). 2026-07-21.**
+Companion to `docs/design-columnar-batch1.md` §9 (the reframe) and `docs/design-row-representation.md`
+(the exchange/parallel arc, §15). Same discipline: design-first, measure-first, benchmark-gated,
+retire-if-it-loses.
+
+## 0. Why this, why now
+
+The Feldera SF=3 batch-1 scaling curve was measured 2026-07-21 (faithful OAT harness, this i9-12900K
+box, 8P+8E):
+
+| Feldera workers | duration_s | vs 1-core | Eff |
+|--:|--:|--:|--:|
+| 1 | 56.07 | 1.00× | 100% |
+| 2 | 34.36 | 1.63× | 82% |
+| 4 | 23.93 | 2.34× | 59% |
+| **8** | **18.56** | **3.02× (peak)** | 38% |
+| 12 | 20.47 | 2.74× | 23% (regresses) |
+
+Two facts reframe the whole batch-1 arc:
+1. **Feldera single-core (56.07s) ≈ dbsp-net serial (~59.5s local ServerGC).** Batch-1 per-row
+   representation edge is only ~1.06× — the algorithmic wins already closed the per-row gap the
+   columnar arc was chasing. **Columnar buys ~nothing on batch-1; serial is already ~parity.**
+2. **Feldera's whole batch-1 advantage over us (20.5s vs ~60s, ~2.9:1) is parallelism**, and it
+   saturates at ~3× / knee W=8 (negative at W=12 — the synchronous-BSP straggler wall, §15). We are
+   W-insensitive (§15.8), so we would not take that oversubscription hit.
+
+**Therefore batch-1 competitiveness is a parallelism-implementation problem.** `PlanToCircuit` (the
+structural program compiler the ivm-bench server uses) inserts **zero exchanges** today — it builds one
+single-threaded circuit. Porting the typed compiler's exchange-insertion strategy to the structural
+path, at a realized 2.5–3×, takes ~59.5s → **~20–24s = 77–92% of Feldera's peak, up to parity vs its
+configured run** — inside the 50–80%+ "competitive" goal, plausibly parity, with **no rep rewrite**.
+
+## 1. Premise confirmed by code (2026-07-21 map)
+
+- **The runtime substrate is already generic over `StructuralRow` — NO new operators.**
+  `ExchangeOp<TKey,TWeight>` (`Core/Circuit/Operators/ExchangeOp.cs:21`), `ExchangeIndexOp<TKey,TRow,TWeight>`
+  (`ExchangeIndexOp.cs:25`), `ExchangeIndexJoinOp` (`ExchangeIndexJoinOp.cs:34`), and the
+  `CircuitBuilder.Exchange`/`ExchangeIndex`/`ExchangeIndexJoin` wrappers
+  (`Core/Circuit/CircuitBuilder.cs:184/221/260`) are all `<TKey,TRow>`-generic and directly
+  `<StructuralRow>`-instantiable. `ParallelCircuit.Build`/`ShardedInput`/`ShardedOutput`
+  (`Core/Circuit/ParallelCircuit.cs:114/356/375`) drive the whole thing.
+- **Key elision is free on the serial path.** `CircuitBuilder.ExchangeIndex` at `Workers<=1` degrades to
+  exactly `GroupProject(input, keyOf, row=>row)` (`CircuitBuilder.cs:233-236`) — **byte-identical to what
+  structural `CompileInnerJoin`/`CompileAggregate` already emit**. So the parallel path is a superset;
+  W=1 must reproduce today's circuit bit-for-bit (a built-in regression guard).
+- **The typed path already does all of this** (`TypedPlanCompiler.TryCompileParallel`,
+  `TypedPlanCompiler.cs:107`) — but only for typed struct rows, paying the §23 typing penalty. The
+  structural port shuffles `StructuralRow` *refs* → avoids that penalty entirely.
+
+## 2. The algorithm to port (from `TypedPlanCompiler`)
+
+Thread a partition-key annotation through the compile and insert an exchange only when the data is not
+already co-partitioned on the operator's key.
+
+- **Partition state.** The typed compiler threads `TypedNode(… bool ShardDisjoint, int[]? PartitionKey)`
+  (`TypedPlanCompiler.cs:216`). `PartitionKey` = the column indices the stream is currently hash-partitioned
+  by. The structural compiler passes a bare `Stream<ZSet<StructuralRow,Z64>>` with **no partition
+  metadata** → the port must add the equivalent (a small struct or a side-table keyed on the compiled
+  stream carrying `int[]? PartitionKey` + `bool ShardDisjoint`).
+- **Elision test.** `IsKeySubset(dataKey, opKey)` (`:223`): if the current partition key ⊆ the operator's
+  key, no shuffle. Reuse verbatim.
+- **Per-node decisions (typed → structural):**
+  - **Scan:** sharded by whole-row hash, `ShardDisjoint=true`, `PartitionKey=null` (`:527-540`).
+  - **Join:** shuffle both sides by equi-key indices, fused via `ExchangeIndexJoin` (single barrier) or two
+    `ExchangeIndex`; output `PartitionKey = leftIndices` (`:827/834/930`).
+  - **Aggregate:** `needsExchange = Workers>1 && !(inner.PartitionKey ⊆ groupIndices)`; else plain
+    `GroupProject`; output `PartitionKey = iota(keyCount)` (`:1735-1797`).
+  - **Distinct:** shuffle by whole row when `Workers>1` (`:1227-1231`).
+  - **Partitioned window / TopK:** shuffle by the PARTITION BY column list (`:1296/1373`).
+  - Also: SemiJoin, scalar-subquery joins (extra `GroupProject` sites).
+
+## 3. Concrete insertion points in `PlanToCircuit.cs`
+
+All line numbers per the 2026-07-21 map (`src/DbspNet.Sql/Compiler/PlanToCircuit.cs`).
+
+| Site | Today | Parallel change |
+|---|---|---|
+| Single-query build | `RootCircuit.Build(…)` **:105** | branch to `ParallelCircuit.Build(workers,…)` |
+| Program build | `RootCircuit.Build(…)` **:286** | same; sharded inputs replace **:298**, sharded/gathered output replaces `Integrate` **:370** |
+| Table input | `builder.ZSetInput<StructuralRow,Z64>()` **:112** | `ShardedInput` when parallel |
+| Inner join (both sides) | `builder.GroupProject(…)` **:1820 / :1870** | `builder.ExchangeIndexJoin` (or 2× `ExchangeIndex`) keyed on `ExtractEquiKeyIndices` (**:2905**) |
+| Aggregate | `builder.GroupProject(…)` **:3017** | `builder.ExchangeIndex` on group indices, with `IsKeySubset` elision |
+| Distinct | before `EmitDistinct` (helper **:548**) | `builder.Exchange` by whole-row hash |
+| Partitioned window/TopK | dispatched **:1210-1223** | `builder.Exchange` by PARTITION BY indices |
+
+Key columns are **already available** at each site as `int[]` indices: joins via
+`ExtractEquiKeyIndices`/`ExtractKey` (**:2905/:2942**), aggregates via `AggregatePlan.GroupKeys` (bare
+`ResolvedColumn.Index`), distinct = whole row. So building the partition delegate needs no new plan
+analysis — only the hash (below).
+
+## 4. The one genuinely new piece: a `StructuralRow`-slot partition hash
+
+`StablePartitionHash` (`src/DbspNet.Sql/Compiler/StablePartitionHash.cs`) has one overload per **typed**
+CLR column type. `StructuralRow[i]` returns a **boxed `object?`** (`StructuralRow.cs:64`). Need a
+structural variant:
+
+```
+int PartitionOf(StructuralRow row, int[] keyIndices, SchemaColumn[] keyCols)
+  // fold StableHash.Combine over StablePartitionHash.OfBoxed(row[keyIndices[k]], keyCols[k].Type)
+```
+
+`OfBoxed(object?, SqlType)` dispatches on the column's `SqlType` to the **same underlying `StableHash`
+reductions** the typed overloads use — so a value hashes to the same worker whether it arrives typed or
+structural (required for snapshot/restore co-location and for typed↔structural A/B parity). Null → the
+existing `NullHash` sentinel. This is the only new code; everything else is reuse.
+
+## 5. Build increments (gate-first, retire-if-loses)
+
+1. **Increment 0 — partition-hash + threading, W=1 byte-identical.** Add `OfBoxed`, the node partition-key
+   threading, and the `ParallelCircuit.Build` branch, but keep `workers=1`. **Gate: `IvmBatchProfile` 16
+   outputs byte-identical + full suite green + circuit structurally identical to today (W≤1 exchange
+   degradation proves this by construction).** No perf claim — this is the safe scaffold.
+2. **Increment 1 — one hot join+agg subgraph parallel.** Enable exchanges on the highest-volume fact
+   path (e.g. `fact_holdings`/`fact_watches` joins + `watches` aggregate). **Gate: byte-identical outputs
+   at W=2/4/8 (correctness) + that subgraph's wall scales positively (measure via the operator profiler,
+   `DBSPNET_PROFILE=1`).** Retire if it doesn't scale.
+3. **Increment 2 — whole batch-1 program parallel, W-swept.** Turn on program-wide exchange insertion;
+   sweep W=1/2/4/8/12 on `IvmBatchProfile` (ServerGC). **Gate: byte-identical + realized scaling ≥ ~2×
+   (→ ≤30s → ≥62% of Feldera).** This is where the **open number** lands (see §6).
+
+## 6. Risks & open numbers (the honest part)
+
+- **Real-DAG scaling factor is THE unknown.** The 2.5–3× projection is from `ParallelScalingProbe` — a
+  single best-case disjoint-shard join+proj (3.07× @ W=8). The real batch-1 DAG has: SCD-2 temporal
+  joins (skew on hot keys), wide-row window aggregates (partition-key shuffle of fat rows), an all-view
+  program with many exchanges (barrier coordination tax, §15's 40% wait), and gather-side re-materialize.
+  Realized could be 2–2.5× → ~24–30s → 62–77%. Increment 2 measures it before any parity claim.
+- **Coordination tax is real and rises with W (§15).** Our own arc found ops scale 7–9× but realized step
+  only 3.5–5×, barrier WAIT → 40% at high W. Batch-1's coarse ticks (bulk load, big batches) should HELP
+  (lower relative variance than Nexmark's fine ticks) — but this is a hypothesis to test, not a given.
+- **Skew on SCD-2 keys.** Hash-partitioning by join/group key can land a hot symbol/account on one worker.
+  The co-location invariant blocks work-stealing (§15). If a single fact key dominates, scaling caps below
+  the probe. Measure Imbal via the step profiler on the real DAG.
+- **W-sizing.** Feldera peaks at W=8 and regresses at W=12 on this box; we are W-insensitive but should
+  still default W to the P-core count, not oversubscribe. `ParallelCircuit` already spawns no thread at
+  W=1.
+- **Output gather / re-materialize.** ivm-bench truncate-output re-materializes full state per batch;
+  `ShardedOutput` sums Z-sets across workers. Confirm the gather cost doesn't eat the parallel win on the
+  output-heavy views (it's ~output I/O, which Feldera pays too).
+
+## 7. Correctness strategy
+
+- **Oracle:** mirror `tests/DbspNet.Tests/Sql/ParallelTypedCompilerTests.cs` (+ `TumbleParallelTests`,
+  `WindowAggregateParallelTests`) for the structural path: structural-serial ≡ structural-parallel(W) ≡
+  batch, across inserts/deletes/group-growth/retractions, W=1/2/4/8.
+- **End-to-end gate:** `IvmBatchProfile` 16 output row-counts + value-diff byte-identical serial vs parallel.
+- **W=1 identity:** the `Workers<=1` exchange→`GroupProject` degradation makes W=1 structurally identical to
+  today's circuit — a free regression guard.
+- **Assembly patterns to copy:** `tests/DbspNet.Tests/Circuit/{ExchangeOpTests,ParallelCircuitTests,
+  ShardedIoTests}.cs`; the structural-parallel thesis probe `Scratch/ParallelScalingProbe.cs`.
+
+## 8. Bottom line
+
+The port is compiler-only and additive: (a) thread `PartitionKey int[]?`/`ShardDisjoint` through the
+structural node compile; (b) branch the two `RootCircuit.Build` sites to `ParallelCircuit.Build` with
+`ShardedInput`/`ShardedOutput`; (c) swap the four `GroupProject` shuffle points for
+`Exchange`/`ExchangeIndex`/`ExchangeIndexJoin` keyed on already-available column indices, with `IsKeySubset`
+elision; (d) write the one new `StructuralRow`-slot stable partition hash. No new runtime operators. The
+measured Feldera curve says this is the lever that makes batch-1 competitive; the open number Increment 2
+must land is the **real-DAG realized scaling factor**.
