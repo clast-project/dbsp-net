@@ -1,6 +1,6 @@
 # Design: incremental (O(delta)) state persistence
 
-**Status: PHASE 0 MEASURED, DESIGN PROPOSED. 2026-07-22.**
+**Status: PHASE 0 MEASURED; A1 + the §7.2 restore fix BUILT. 2026-07-22.**
 Follows `docs/design-structural-parallel.md` §10 (per-batch persistence, landed 2026-07-21) and
 `docs/persistence.md` (approaches A–D). Same discipline as the arcs before it: measure the headroom
 first, let the number pick the track, retire what loses.
@@ -370,12 +370,9 @@ says nothing about *value* drift in a rebuilt cache. Practical exposure today is
 is off by default — but any use of the checkpoint with a float aggregate can silently corrupt a view.
 
 **It blocks A2.** A2's whole premise is "snapshot every N batches and replay the rest," which makes
-restore a routine operation rather than a rare one. Fixing this comes first. The obvious repair is to
-serialise the aggregator state rather than reconstruct it (a per-state-class codec — precisely what
-the original (B) sketch listed and the shipped design chose to avoid); a cheaper alternative is to
-have the operator re-derive its cache and then *re-emit the correction* so downstream converges.
-Either way it needs a deterministic regression test first — the SF=3 probe is a 3-minute observation,
-not CI.
+restore a routine operation rather than a rare one. Fixing this comes first.
+
+**FIXED 2026-07-22 — see §8.**
 
 ### 7.3 WAL replay is ~70× slower than the equivalent live ingest
 
@@ -398,3 +395,48 @@ constantly" and "snapshot rarely," so **§7.3 must be resolved before N can be c
 measurement's main conclusion is that the knob is not yet settable, and why.
 
 Revised order: fix §7.2 (correctness, blocking), profile §7.3 (sets the knob), then A2.
+
+## 8. §7.2 fixed (2026-07-22)
+
+Scoped by measurement, per §7.2's own warning that the perf argument had to be checked rather than
+assumed. Temporary instrumentation on a real SF=3 restore said the aggregate cache rebuild is only
+**4.5% of restore** (1899 ms of 42072 ms; 11 aggregate ops, 1.19M groups over 3.08M rows), and
+persisting state for every aggregator would add ~27 MiB to a 4005 MiB snapshot (0.7%). So **neither
+speed nor size argues for persisting state uniformly** — the decision rests on correctness and code
+surface alone, and the scope is therefore narrow.
+
+**What persists.** Only the order-sensitive accumulators: `SUM`/`AVG` over `DOUBLE`, and
+`STDDEV`/`VAR`. Everything exact — integer `SUM`, `COUNT`, `MIN`/`MAX`, the `Decimal128` forms —
+still reconstructs by folding the restored group, because folding lands on the same state either way.
+
+**Per-slot, not per-composite.** `CompositeAggregator` holds one state slot per sub-aggregate, so an
+all-or-nothing rule would write no blob for `SELECT AVG(x), MIN(y) … GROUP BY k` and let the `AVG`
+drift exactly as before. The blob is framed per slot (`[present][length][bytes]`); on load the
+operator folds first (correct everywhere a blob is absent), then overlays only the persisted slots.
+
+**Recovering the emitted value.** Rather than persist the value too, the operator re-derives it with
+`Update(ref state, None, delta: empty, after: group)`. Every aggregator answers an empty delta from
+its current state without mutating it — true of all ten, including `SqlSumAggregator`, whose
+`DistinctNonNullRows` transition tracking looked like the likely exception but sits inside the delta
+loop. That was an unenforced assumption spread across ten implementations, so it is now pinned per
+aggregate kind by `AggregatorEmptyDeltaTests` (13 cases × value / no-mutation / idempotence /
+agreement with `Compute`). `SqlApproxCountDistinct` is the one documented exception — with a *null*
+state it rebuilds its sketch from `after` — pinned separately.
+
+**Where the blob lives.** Per-key state cannot be persisted by the operator alone: it is generic in
+`TKey` and only the codec knows how to encode one. `IIndexedZSetTraceCodec` therefore gained an
+optional keyed-blob capability (default members, so only the Arrow codec implements it; the typed
+adapter and test doubles are untouched). A missing blob file loads as "no blobs", so the fold path
+stays reachable.
+
+**Manifest v3 → v4.** Deliberate despite the format being additive: a v3 snapshot has no state file,
+so a v4 reader would silently fall back to the reconstruction that was wrong. Rejecting it makes the
+engine rebuild from scratch rather than resume from state it cannot vouch for.
+
+**Verification.** `FloatAggregateRestoreTests` — the deterministic repro landed before the fix —
+passes for both `AVG` and `STDDEV`, including its strict assertion that restore-then-continue equals
+an uninterrupted run **bit for bit**. Full suite green (2279 passed).
+
+**Still open, unchanged by this:** §7.3 (WAL replay ~70× slower than live ingest) is not addressed
+and still gates the A2 snapshot-interval knob. The revised order remains: profile §7.3 → layering
+review → A2/Track B.

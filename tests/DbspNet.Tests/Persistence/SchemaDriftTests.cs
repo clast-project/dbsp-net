@@ -223,7 +223,9 @@ public class SchemaDriftTests : IDisposable
 
         var snapDir = Path.Combine(_snapshotDir, "snap-" + producer.Circuit.TickCount);
         var manifest = await SnapshotManifest.ReadAsync(Path.Combine(snapDir, "manifest.json"));
-        Assert.Equal(3, manifest.SchemaVersion);
+        // Hardcoded on purpose: a bump must be a deliberate edit here, not a silent
+        // consequence of changing a constant. v4 added the persisted aggregator state.
+        Assert.Equal(4, manifest.SchemaVersion);
         Assert.False(string.IsNullOrEmpty(manifest.SchemaFingerprint));
         Assert.Equal(16, manifest.SchemaFingerprint.Length);   // xxh3-64 hex
     }

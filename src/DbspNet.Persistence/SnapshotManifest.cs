@@ -44,8 +44,19 @@ public sealed record SnapshotManifest(
     /// atomically with the snapshot — no schema-version bump, since a manifest
     /// without it reads back as "no metadata" and old readers ignore it.
     /// </para>
+    /// <para>
+    /// v3 → v4: <c>IncrementalAggregateOp</c> now persists each group's aggregator
+    /// state (<c>aggstate.arrows</c>) instead of re-deriving it by folding the
+    /// restored trace, which was lossy for floating-point accumulators and let a
+    /// restored circuit emit retractions that did not cancel — see
+    /// <c>docs/design-incremental-persistence.md</c> §7.2. The bump is deliberate
+    /// even though the format is technically additive: a v3 snapshot has no state
+    /// file, so a v4 reader would silently fall back to the very reconstruction
+    /// that was wrong. Rejecting it makes the engine rebuild from scratch rather
+    /// than resume from state it cannot vouch for.
+    /// </para>
     /// </summary>
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

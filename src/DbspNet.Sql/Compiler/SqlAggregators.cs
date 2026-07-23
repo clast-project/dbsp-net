@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Buffers;
 using System.Collections.Generic;
 using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Algebra;
@@ -38,6 +39,32 @@ internal abstract class SqlAggregator
         object? oldValue,
         ZSet<StructuralRow, Z64> delta,
         IMultiset<StructuralRow, Z64> after) => Compute(after);
+
+    /// <summary>
+    /// True when this aggregator's per-group state must survive a snapshot verbatim
+    /// because re-deriving it by folding the restored group is lossy. Only the
+    /// floating-point accumulators need this — see
+    /// <see cref="IAggregator{TValue,TOut}.CanPersistState"/> for why.
+    /// </summary>
+    public virtual bool CanPersistState => false;
+
+    /// <summary>Serialise one group's <paramref name="state"/>.</summary>
+    public virtual void WriteState(IBufferWriter<byte> writer, object? state)
+        => throw new NotSupportedException($"{GetType().Name} does not persist state.");
+
+    /// <summary>Restore state from a blob written by <see cref="WriteState"/>.</summary>
+    public virtual void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+        => throw new NotSupportedException($"{GetType().Name} does not persist state.");
+
+    /// <summary>Writes a <c>double</c> then a <c>long</c> — the shape every persisted
+    /// accumulator here starts with.</summary>
+    private protected static void WriteDoubleLong(IBufferWriter<byte> writer, double d, long n)
+    {
+        var span = writer.GetSpan(16);
+        BitConverter.TryWriteBytes(span[..8], d);
+        BitConverter.TryWriteBytes(span.Slice(8, 8), n);
+        writer.Advance(16);
+    }
 }
 
 internal sealed class SqlCountStarAggregator : SqlAggregator
@@ -335,6 +362,26 @@ internal sealed class SqlSumAggregator : SqlAggregator
                 throw new InvalidOperationException($"SUM not supported on result type {_resultType.Display}");
         }
     }
+
+    // Only the DOUBLE accumulator is order-sensitive. The BIGINT and DECIMAL forms
+    // accumulate in exact integer arithmetic (long / Int256), so folding the restored
+    // group reproduces them bit-for-bit and there is nothing to persist.
+    public override bool CanPersistState => _resultType is SqlDoubleType;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var s = state as SumStateDouble ?? new SumStateDouble();
+        WriteDoubleLong(writer, s.Sum, s.DistinctNonNullRows);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+    {
+        state = new SumStateDouble
+        {
+            Sum = BitConverter.ToDouble(blob[..8]),
+            DistinctNonNullRows = BitConverter.ToInt64(blob.Slice(8, 8)),
+        };
+    }
 }
 
 internal sealed class SqlMinMaxAggregator : SqlAggregator
@@ -580,6 +627,25 @@ internal sealed class SqlAvgAggregator : SqlAggregator
             return s.NonNullCount == 0 ? null : (object)(s.Sum / s.NonNullCount);
         }
     }
+
+    // As with SUM: the DECIMAL form accumulates an exact Int256 mantissa, so only the
+    // DOUBLE accumulator can drift when re-derived by folding.
+    public override bool CanPersistState => _resultType is not SqlDecimalType;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var s = state as AvgStateDouble ?? new AvgStateDouble();
+        WriteDoubleLong(writer, s.Sum, s.NonNullCount);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+    {
+        state = new AvgStateDouble
+        {
+            Sum = BitConverter.ToDouble(blob[..8]),
+            NonNullCount = BitConverter.ToInt64(blob.Slice(8, 8)),
+        };
+    }
 }
 
 /// <summary>
@@ -683,6 +749,29 @@ internal sealed class SqlStddevAggregator : SqlAggregator
 
         state = s;
         return Finish(s.Sum, s.SumSq, s.NonNullCount);
+    }
+
+    // Both moments are double accumulators, so this form is always order-sensitive.
+    public override bool CanPersistState => true;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var s = state as MomentState ?? new MomentState();
+        var span = writer.GetSpan(24);
+        BitConverter.TryWriteBytes(span[..8], s.Sum);
+        BitConverter.TryWriteBytes(span.Slice(8, 8), s.SumSq);
+        BitConverter.TryWriteBytes(span.Slice(16, 8), s.NonNullCount);
+        writer.Advance(24);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+    {
+        state = new MomentState
+        {
+            Sum = BitConverter.ToDouble(blob[..8]),
+            SumSq = BitConverter.ToDouble(blob.Slice(8, 8)),
+            NonNullCount = BitConverter.ToInt64(blob.Slice(16, 8)),
+        };
     }
 }
 
@@ -1055,5 +1144,93 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
         }
 
         return Optional<StructuralRow>.Some(_codec.BuildRow(_outputSchema, results));
+    }
+
+    /// <summary>
+    /// True when <b>any</b> sub-aggregate needs its state persisted. Deliberately not
+    /// "all": the blob is framed per slot, so a mixed group like
+    /// <c>SELECT AVG(x), MIN(y) … GROUP BY k</c> persists the AVG slot and leaves the
+    /// MIN slot to be re-derived by folding. An all-or-nothing rule would write no blob
+    /// for that group and let the AVG drift — the exact bug this fixes.
+    /// </summary>
+    public bool CanPersistState
+    {
+        get
+        {
+            foreach (var a in _aggs)
+            {
+                if (a.CanPersistState)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    // Framing: one entry per sub-aggregate, in declaration order —
+    //   [byte present][int32 length][length bytes]
+    // A slot the sub-aggregate does not persist (or that has no state yet) writes
+    // present = 0 and no payload. The length prefix keeps the format tolerant of a
+    // future variable-length state without a version bump.
+    public void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        var slots = state as object?[];
+
+        var scratch = new ArrayBufferWriter<byte>();
+        for (var i = 0; i < _aggs.Count; i++)
+        {
+            var slot = slots is not null && i < slots.Length ? slots[i] : null;
+            if (!_aggs[i].CanPersistState || slot is null)
+            {
+                var absent = writer.GetSpan(1);
+                absent[0] = 0;
+                writer.Advance(1);
+                continue;
+            }
+
+            scratch.Clear();
+            _aggs[i].WriteState(scratch, slot);
+            var payload = scratch.WrittenSpan;
+
+            var header = writer.GetSpan(5);
+            header[0] = 1;
+            BitConverter.TryWriteBytes(header.Slice(1, 4), payload.Length);
+            writer.Advance(5);
+            writer.Write(payload);
+        }
+    }
+
+    public void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+    {
+        // The caller has already folded the restored group into every slot, so an
+        // absent entry simply keeps that folded value.
+        var slots = state as object?[] ?? new object?[_aggs.Count];
+        var cursor = 0;
+        for (var i = 0; i < _aggs.Count; i++)
+        {
+            if (cursor >= blob.Length)
+            {
+                break;  // blob written by a build with fewer aggregates; keep the folded rest
+            }
+
+            var present = blob[cursor];
+            cursor += 1;
+            if (present == 0)
+            {
+                continue;
+            }
+
+            var length = BitConverter.ToInt32(blob.Slice(cursor, 4));
+            cursor += 4;
+            var slot = slots[i];
+            _aggs[i].MergePersistedState(ref slot, blob.Slice(cursor, length));
+            slots[i] = slot;
+            cursor += length;
+        }
+
+        state = slots;
     }
 }

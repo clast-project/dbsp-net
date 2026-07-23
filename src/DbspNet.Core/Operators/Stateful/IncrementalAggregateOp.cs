@@ -83,7 +83,36 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
                 "pass one to CircuitBuilder.IncrementalAggregate to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Current, cancellationToken);
+        return SaveTraceAndStateAsync(writer, cancellationToken);
+    }
+
+    // The trace alone is not enough. Rebuilding the per-group aggregator state by folding
+    // the restored trace is lossy for a non-associative accumulator (float SUM/AVG/STDDEV),
+    // and the operator would then retract a value the downstream view never held — see
+    // docs/design-incremental-persistence.md §7.2. So when the aggregator asks for it, and
+    // the codec can address blobs by key, each group's state rides alongside the trace.
+    private async ValueTask SaveTraceAndStateAsync(
+        ISnapshotWriter writer, CancellationToken cancellationToken)
+    {
+        await _snapshotCodec!.SaveAsync(writer, "trace.arrows", _trace.Current, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (!_aggregator.CanPersistState || !_snapshotCodec.SupportsKeyedBlobs)
+        {
+            return;
+        }
+
+        var entries = new List<(TKey Key, byte[] Blob)>(_stateCache.Count);
+        var scratch = new System.Buffers.ArrayBufferWriter<byte>();
+        foreach (var (key, state) in _stateCache)
+        {
+            scratch.Clear();
+            _aggregator.WriteState(scratch, state);
+            entries.Add((key, scratch.WrittenSpan.ToArray()));
+        }
+
+        await _snapshotCodec.SaveKeyedBlobsAsync(writer, "aggstate.arrows", entries, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -110,6 +139,52 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             object? state = null;
             var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
             _aggCache[key] = agg;
+            _stateCache[key] = state;
+        }
+
+        await MergePersistedStateAsync(reader, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Overlay the persisted per-group state on top of what the fold above produced, then
+    /// re-derive each affected group's emitted value from the restored state.
+    /// </summary>
+    /// <remarks>
+    /// <para>Overlay rather than replace: the fold is exact for aggregators whose
+    /// accumulator is associative, and a composite aggregate persists only the slots that
+    /// need it (see <c>CompositeAggregator.MergePersistedState</c>), so the folded value is
+    /// the right answer everywhere a blob is absent.</para>
+    /// <para>The emitted value is recovered by calling <c>Update</c> with an <b>empty</b>
+    /// delta, which every aggregator answers from its current state without mutating it —
+    /// an invariant pinned per aggregate kind by <c>AggregatorEmptyDeltaTests</c>. That
+    /// avoids persisting the value separately.</para>
+    /// <para>No blobs (an older snapshot, a codec without keyed-blob support, or an
+    /// aggregator that needs none) leaves the folded reconstruction exactly as it was.</para>
+    /// </remarks>
+    private async ValueTask MergePersistedStateAsync(
+        ISnapshotReader reader, CancellationToken cancellationToken)
+    {
+        if (!_aggregator.CanPersistState || !_snapshotCodec!.SupportsKeyedBlobs)
+        {
+            return;
+        }
+
+        var blobs = await _snapshotCodec
+            .LoadKeyedBlobsAsync(reader, "aggstate.arrows", cancellationToken)
+            .ConfigureAwait(false);
+
+        foreach (var (key, blob) in blobs)
+        {
+            if (!_trace.Current.ContainsKey(key))
+            {
+                continue;   // a group the trace no longer holds; its state is moot
+            }
+
+            var group = _trace.Current.GroupFor(key);
+            _stateCache.TryGetValue(key, out var state);
+            _aggregator.MergePersistedState(ref state, blob);
+            _stateCache[key] = state;
+            _aggCache[key] = _aggregator.Update(ref state, Optional<TOut>.None, ZSet<TValue, Z64>.Empty, group);
             _stateCache[key] = state;
         }
     }

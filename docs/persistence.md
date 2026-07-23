@@ -229,12 +229,38 @@ format is Arrow IPC under per-operator `op-{i}/` subdirectories with a
 top-level `manifest.json` recording schema version, plan fingerprint
 (operator type sequence), and tick.
 
-The `_aggCache` / `_stateCache` problem from the original B sketch is
-solved by *not* serialising them: on `Load` the operator walks the
-restored trace and calls `aggregator.Update(ref state, None, group,
-group)` per group — which is the existing increment path with a fresh
-state — so SUM/COUNT/AVG/MIN/MAX all converge to the right
-steady-state without per-state-class codecs.
+The `_aggCache` / `_stateCache` problem from the original B sketch was
+originally solved by *not* serialising them: on `Load` the operator walked
+the restored trace and called `aggregator.Update(ref state, None, group,
+group)` per group — the existing increment path with a fresh state.
+
+**That is exact only for an associative accumulator, and it shipped a silent
+bug for the ones that aren't.** A bulk fold of a restored group can differ in
+the last bits from the incremental per-tick fold that built the live state,
+because `+=` over `double` is not associative. The operator then retracted a
+value the downstream view never held, the retraction failed to cancel, and the
+view kept both the stale row and the new one — plus a negative-weight ghost.
+Found on real SF=3 state; see `docs/design-incremental-persistence.md` §7.2.
+
+The fix is narrow. Aggregators whose accumulator is order-sensitive
+(`SUM`/`AVG` over DOUBLE, `STDDEV`/`VAR`) now persist their per-group state
+verbatim; everything exact (integer SUM, COUNT, MIN/MAX, the Decimal128 forms)
+still reconstructs by folding, since folding lands on the same state either
+way. The blob is framed **per sub-aggregate**, so a mixed group such as
+`SELECT AVG(x), MIN(y) … GROUP BY k` persists the AVG slot and folds the MIN
+slot — an all-or-nothing rule would have written nothing for that group and let
+the AVG drift.
+
+Mechanically: `IAggregator` gained `CanPersistState` / `WriteState` /
+`MergePersistedState` (defaulted, so only the three lossy aggregators override
+them), and `IIndexedZSetTraceCodec` gained an optional keyed-blob capability —
+per-key state cannot be persisted by the operator alone, which is generic in
+`TKey`, so only the codec can encode one. On `Load` the operator still folds
+first, then overlays the persisted slots, then re-derives each affected group's
+emitted value by calling `Update` with an **empty delta** (every aggregator
+answers that from state without mutating it — pinned per aggregate kind by
+`AggregatorEmptyDeltaTests`). Manifest schema bumped to v4: a v3 snapshot has
+no state file, so accepting it would silently re-enter the buggy path.
 
 **Layout and retention.** Each snapshot lives under its own
 `snap-{tick}/` key prefix in the store, with the per-op `op-{i}/`
