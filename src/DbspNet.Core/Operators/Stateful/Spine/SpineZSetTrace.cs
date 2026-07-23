@@ -533,9 +533,10 @@ public sealed class SpineZSetTrace<TKey, TWeight>
             saveTask.AsTask().GetAwaiter().GetResult();
         }
 
+        // Spilling relocates a batch; it does not create one, so the id carries over.
         return new SpilledSpineBatch<TKey, TWeight>(
             _spillConfig.FileSystem, path, _spillConfig.Codec, _comparer, batch.Bloom, batch.Count,
-            batch.MinMonotoneKey, batch.MaxMonotoneKey);
+            batch.Id, batch.MinMonotoneKey, batch.MaxMonotoneKey);
     }
 
     private static void SyncDelete(SpilledSpineBatch<TKey, TWeight> spilled)

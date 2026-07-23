@@ -8,6 +8,28 @@ using DbspNet.Core.IO;
 namespace DbspNet.Core.Operators.Stateful.Spine;
 
 /// <summary>
+/// Source of batch ids, shared by every spine batch family.
+/// </summary>
+/// <remarks>
+/// <para>Deliberately NON-generic. A <c>static</c> field inside a generic type is per closed
+/// constructed type, so putting the counter on <see cref="SpineBatch{TKey,TWeight}"/> would hand
+/// out the same id to batches of different instantiations. One sequence per process avoids that
+/// and costs nothing.</para>
+/// <para>Stage 1 of <c>docs/design-durable-identity.md</c> §2.3 — ids only, no behaviour change.
+/// When reference-manifest snapshots need these to survive a restart, the sequence is seeded above
+/// the highest id named by any restored manifest before the first batch is constructed. A monotone
+/// counter is O(1); content-addressed ids would give dedup for free but cost a hash of every batch
+/// on the compaction path, so that trade belongs with Track B, not here.</para>
+/// </remarks>
+internal static class SpineBatchId
+{
+    private static long _next;
+
+    /// <summary>A fresh id. Ids are positive and strictly increasing.</summary>
+    internal static long Next() => Interlocked.Increment(ref _next);
+}
+
+/// <summary>
 /// A sealed spine batch. Conceptually a sorted columnar
 /// <see cref="ZSet{TKey,TWeight}"/> snapshot plus a per-batch bloom
 /// filter; concretely either fully resident in memory
@@ -26,6 +48,24 @@ internal abstract class SpineBatch<TKey, TWeight>
 {
     protected const double TargetFpp = 0.01;
     protected const int MaxBloomBytes = 1 << 16;
+
+    /// <summary>
+    /// Identity of this batch, stable for as long as the batch exists.
+    /// </summary>
+    /// <remarks>
+    /// A spine batch is immutable once sealed, so an id names a fixed set of contents forever —
+    /// which is what lets a snapshot reference a batch instead of copying it. Compaction does not
+    /// mutate batches: it produces a NEW batch from several inputs, and that batch gets a new id.
+    /// Moving a batch between resident and spilled representations is not a new batch, so the id
+    /// carries over.
+    /// </remarks>
+    public long Id { get; }
+
+    /// <param name="id">
+    /// <c>null</c> for a newly created batch; an existing id when this instance is the same batch
+    /// in a different representation (resident ⇄ spilled).
+    /// </param>
+    protected SpineBatch(long? id = null) => Id = id ?? SpineBatchId.Next();
 
     public BloomFilter<TKey>? Bloom { get; protected init; }
 
@@ -137,7 +177,9 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
     internal IComparer<TKey> Comparer => _comparer;
 
     private ResidentSpineBatch(
-        TKey[] keys, TWeight[] weights, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey)
+        TKey[] keys, TWeight[] weights, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey,
+        long? id = null)
+        : base(id)
     {
         _keys = keys;
         _weights = weights;
@@ -177,8 +219,12 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
     public static ResidentSpineBatch<TKey, TWeight> Empty(IComparer<TKey> comparer) =>
         new(Array.Empty<TKey>(), Array.Empty<TWeight>(), comparer, monotoneKey: null);
 
+    /// <param name="id">Supplied only when rebuilding an existing batch in a different
+    /// representation — see <see cref="SpilledSpineBatch{TKey,TWeight}.Materialise"/>. A delta
+    /// being sealed into a new batch leaves it null.</param>
     public static ResidentSpineBatch<TKey, TWeight> FromZSet(
-        ZSet<TKey, TWeight> data, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey = null)
+        ZSet<TKey, TWeight> data, IComparer<TKey> comparer, Func<TKey, long>? monotoneKey = null,
+        long? id = null)
     {
         if (data.IsEmpty)
         {
@@ -197,7 +243,7 @@ internal sealed class ResidentSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeig
         }
 
         Array.Sort(keys, weights, comparer);
-        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer, monotoneKey);
+        return new ResidentSpineBatch<TKey, TWeight>(keys, weights, comparer, monotoneKey, id);
     }
 
     /// <summary>Reconstructs a resident batch from its sorted columnar pair without re-sorting.</summary>
@@ -303,8 +349,10 @@ internal sealed class SpilledSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeigh
         IComparer<TKey> comparer,
         BloomFilter<TKey>? bloom,
         int count,
+        long id,
         long? minMonotoneKey = null,
         long? maxMonotoneKey = null)
+        : base(id)
     {
         _fileSystem = fileSystem;
         _filePath = filePath;
@@ -346,7 +394,9 @@ internal sealed class SpilledSpineBatch<TKey, TWeight> : SpineBatch<TKey, TWeigh
         var ctx = new SpillContext(_fileSystem);
         var loadTask = _codec.LoadAsync(ctx, _filePath, default);
         var loaded = loadTask.IsCompletedSuccessfully ? loadTask.Result : loadTask.AsTask().GetAwaiter().GetResult();
-        return ResidentSpineBatch<TKey, TWeight>.FromZSet(loaded, _comparer);
+
+        // Same batch, resident again — not a new one, so the id is preserved.
+        return ResidentSpineBatch<TKey, TWeight>.FromZSet(loaded, _comparer, monotoneKey: null, id: Id);
     }
 }
 
@@ -360,6 +410,16 @@ internal abstract class SpineIndexedBatch<TKey, TValue, TWeight>
 {
     protected const double TargetFpp = 0.01;
     protected const int MaxBloomBytes = 1 << 16;
+
+    /// <summary><inheritdoc cref="SpineBatch{TKey,TWeight}.Id" path="/summary"/></summary>
+    /// <remarks><inheritdoc cref="SpineBatch{TKey,TWeight}.Id" path="/remarks"/></remarks>
+    public long Id { get; }
+
+    /// <param name="id">
+    /// <c>null</c> for a newly created batch; an existing id when this instance is the same batch
+    /// in a different representation (resident ⇄ spilled).
+    /// </param>
+    protected SpineIndexedBatch(long? id = null) => Id = id ?? SpineBatchId.Next();
 
     public BloomFilter<TKey>? Bloom { get; protected init; }
 
@@ -469,7 +529,8 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
     private ResidentSpineIndexedBatch(
         TKey[] keys, int[] offsets, TValue[] values, TWeight[] weights,
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
-        Func<TKey, long>? monotoneKey)
+        Func<TKey, long>? monotoneKey, long? id = null)
+        : base(id)
     {
         _keys = keys;
         _offsets = offsets;
@@ -550,10 +611,12 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
             keys, offsets, values, weights, keyComparer, valueComparer, monotoneKey);
     }
 
+    /// <param name="id">Supplied only when rebuilding an existing batch in a different
+    /// representation; a delta being sealed into a new batch leaves it null.</param>
     public static ResidentSpineIndexedBatch<TKey, TValue, TWeight> FromIndexed(
         IndexedZSet<TKey, TValue, TWeight> data,
         IComparer<TKey> keyComparer, IComparer<TValue> valueComparer,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null, long? id = null)
     {
         if (data.IsEmpty)
         {
@@ -599,7 +662,7 @@ internal sealed class ResidentSpineIndexedBatch<TKey, TValue, TWeight> : SpineIn
         offsets[groups.Count] = cursor;
 
         return new ResidentSpineIndexedBatch<TKey, TValue, TWeight>(
-            keys, offsets, values, weights, keyComparer, valueComparer, monotoneKey);
+            keys, offsets, values, weights, keyComparer, valueComparer, monotoneKey, id);
     }
 
     internal static ResidentSpineIndexedBatch<TKey, TValue, TWeight> MergePair(
@@ -775,8 +838,10 @@ internal sealed class SpilledSpineIndexedBatch<TKey, TValue, TWeight> : SpineInd
         IComparer<TValue> valueComparer,
         BloomFilter<TKey>? bloom,
         int groupCount,
+        long id,
         long? minMonotoneKey = null,
         long? maxMonotoneKey = null)
+        : base(id)
     {
         _fileSystem = fileSystem;
         _filePath = filePath;
@@ -814,7 +879,9 @@ internal sealed class SpilledSpineIndexedBatch<TKey, TValue, TWeight> : SpineInd
         var ctx = new SpillContext(_fileSystem);
         var loadTask = _codec.LoadAsync(ctx, _filePath, default);
         var loaded = loadTask.IsCompletedSuccessfully ? loadTask.Result : loadTask.AsTask().GetAwaiter().GetResult();
-        return ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(loaded, _keyComparer, _valueComparer);
+        // Same batch, resident again — not a new one, so the id is preserved.
+        return ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
+            loaded, _keyComparer, _valueComparer, monotoneKey: null, id: Id);
     }
 }
 

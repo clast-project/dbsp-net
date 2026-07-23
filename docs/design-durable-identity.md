@@ -1,6 +1,6 @@
 # Design: durable identity for operators and spine batches
 
-**Status: DESIGN, 2026-07-22.** Item 2 of `docs/design-layering-review.md` §8. §5 of that review
+**Status: DESIGN; stage 1 BUILT. 2026-07-22.** Item 2 of `docs/design-layering-review.md` §8. §5 of that review
 found that "identity" is currently answered three different ways, each a workaround for the same
 missing concept, and that Track B would need it a fourth time. This settles what to build before
 Track B rather than after.
@@ -92,8 +92,14 @@ several inputs and drops the inputs. So:
 - The id must be durable across process restarts, because a restored spine holds batches written by a
   previous run. A monotone counter seeded from the restored manifest's high-water mark is sufficient
   and avoids the size and comparison costs of a UUID.
-- Scope: ids need to be unique **per trace**, not globally, since files already live under a
-  per-operator prefix. That keeps the counter small and the seeding local.
+- Scope: **process-global**, revised during stage 1. The design first called for per-trace ids —
+  files already live under a per-operator prefix, so per-trace uniqueness is all correctness needs,
+  and it keeps seeding local. But per-trace scope requires the *trace* to be the factory for batches,
+  and it is not: batches are constructed by static factories (`FromZSet`, `MergePair`, `Merge`) that
+  have no trace reference. Threading one through every construction site is a large change for no
+  correctness gain, since a global sequence is a strict superset of per-trace uniqueness. The only
+  cost is larger numbers, and the only price is that seeding on restore becomes one global maximum
+  over restored manifests rather than several local ones.
 
 ### 2.2 The part that is actually dangerous
 
@@ -119,9 +125,23 @@ silently didn't".
 
 ### 2.3 Staging
 
-1. **Ids only, no behaviour change.** Assign an id at `SpineBatch` construction; carry it through
-   merge and spill; expose it for tests. Snapshot still copies batches. Verifiable in isolation: ids
-   are unique, stable across a save/load round trip, and a merged batch's id differs from its inputs'.
+1. **Ids only, no behaviour change. DONE 2026-07-22.** `SpineBatch` and `SpineIndexedBatch` carry an
+   `Id`, assigned at construction from a shared monotone sequence. Snapshot still copies batches;
+   full suite unchanged.
+
+   Two details are worth recording because getting either backwards is a data-loss bug rather than a
+   cosmetic one, and `SpineBatchIdentityTests` pins both:
+   - **Creation vs relocation.** Compaction produces a *new* batch (new contents ⇒ new id), while
+     spilling and materialising move an *existing* batch between representations (same contents ⇒
+     same id). A new id on spill would orphan a referenced file; a reused id after a merge would make
+     a manifest name contents it never recorded. `Merge([x])` short-circuits to `Materialise(x)` and
+     so is relocation, not creation — it must not burn an id.
+   - **The counter is non-generic on purpose.** A `static` field inside `SpineBatch{TKey,TWeight}`
+     would be per closed constructed type, handing the same id to batches of different
+     instantiations. `SpineBatchId` is a plain static class for that reason, with a test that pins it.
+
+   Deferred to the point of need: seeding the sequence above a restored manifest's high-water mark
+   (nothing persists ids yet, so there is nothing to collide with).
 2. **Stop deleting on compaction; sweep instead.** Change `SyncDelete` to a no-op and add a sweep
    over retained manifests. Behaviour-neutral for correctness, and it can be measured for leak growth
    before anything depends on it.
