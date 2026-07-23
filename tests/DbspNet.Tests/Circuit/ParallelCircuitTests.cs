@@ -139,7 +139,7 @@ public class ParallelCircuitTests
             }), name: "out");
         });
 
-        await Task.Run(pc.Step).WaitAsync(TimeSpan.FromSeconds(10));
+        await HangGuard.CompletesWithoutHangingAsync("ParallelCircuit.Step", pc.Step);
         Assert.Equal(workers, Volatile.Read(ref observed));
     }
 
@@ -157,8 +157,8 @@ public class ParallelCircuitTests
         // the timeout guards against a hang if a thrower stranded the barrier.
         pc.WorkerInput<int>("in", 1).Push(5);
 
-        var agg = await Assert.ThrowsAsync<AggregateException>(
-            () => Task.Run(pc.Step).WaitAsync(TimeSpan.FromSeconds(10)));
+        var agg = await HangGuard.ThrowsWithoutHangingAsync<AggregateException>(
+            "ParallelCircuit.Step", pc.Step);
         Assert.Equal(2, agg.InnerExceptions.Count);
         Assert.All(agg.InnerExceptions, e => Assert.IsType<InvalidOperationException>(e));
     }
@@ -265,8 +265,9 @@ public class ParallelCircuitTests
         // and the controller must surface the root cause. The timeout guards a hang.
         using var pc = ParallelCircuit.Build(3, _ => { });
 
-        var agg = await Assert.ThrowsAsync<AggregateException>(() => Task.Run(() =>
-            pc.RunDataParallel((worker, sync) =>
+        var agg = await HangGuard.ThrowsWithoutHangingAsync<AggregateException>(
+            "ParallelCircuit.RunDataParallel",
+            () => pc.RunDataParallel((worker, sync) =>
             {
                 if (worker == 0)
                 {
@@ -274,7 +275,7 @@ public class ParallelCircuitTests
                 }
 
                 sync.Sync();
-            })).WaitAsync(TimeSpan.FromSeconds(10)));
+            }));
 
         Assert.Single(agg.InnerExceptions);
         Assert.IsType<InvalidOperationException>(agg.InnerExceptions[0]);

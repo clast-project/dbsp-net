@@ -233,8 +233,8 @@ public class ExchangeOpTests
             pc.WorkerInput<ZSet<int, Z64>>("in", w).Push(ZSet.FromKeys<int, Z64>([w, w + 10]));
         }
 
-        var agg = await Assert.ThrowsAsync<AggregateException>(
-            () => Task.Run(pc.Step).WaitAsync(TimeSpan.FromSeconds(10)));
+        var agg = await HangGuard.ThrowsWithoutHangingAsync<AggregateException>(
+            "ParallelCircuit.Step", pc.Step);
 
         // The root cause surfaces; the peers' cascaded cancellations are filtered.
         Assert.Contains(agg.InnerExceptions, e => e is InvalidOperationException);
