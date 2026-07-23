@@ -202,6 +202,125 @@ internal sealed class ArrowIndexedZSetTraceCodec
         return b.Build();
     }
 
+    /// <inheritdoc/>
+    /// <remarks>Reuses exactly the key-column encoding the trace file already uses,
+    /// with a single trailing <c>__blob : Binary</c> column.</remarks>
+    public bool SupportsKeyedBlobs => true;
+
+    public async ValueTask SaveKeyedBlobsAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        IReadOnlyList<(StructuralRow Key, byte[] Blob)> entries,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(fileName);
+        ArgumentNullException.ThrowIfNull(entries);
+
+        var keyCount = _keySchema.Count;
+        var rowCount = entries.Count;
+        var keyColumns = new object?[keyCount][];
+        for (var c = 0; c < keyCount; c++)
+        {
+            keyColumns[c] = new object?[rowCount];
+        }
+
+        var blobBuilder = new BinaryArray.Builder().Reserve(rowCount);
+        for (var i = 0; i < rowCount; i++)
+        {
+            var (key, blob) = entries[i];
+            for (var c = 0; c < keyCount; c++)
+            {
+                keyColumns[c][i] = key[c];
+            }
+
+            blobBuilder.Append(blob ?? System.Array.Empty<byte>());
+        }
+
+        var arrays = new IArrowArray[keyCount + 1];
+        for (var c = 0; c < keyCount; c++)
+        {
+            arrays[c] = ArrowColumns.Build(_keySchema[c].Type, keyColumns[c]);
+        }
+
+        arrays[keyCount] = blobBuilder.Build();
+
+        var schema = BuildBlobArrowSchema(_keySchema);
+        using var batch = new RecordBatch(schema, arrays, rowCount);
+        await using var file = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false);
+        await using var stream = file.AsStream();
+        using var ipcWriter = new ArrowStreamWriter(stream, schema, leaveOpen: true);
+        ipcWriter.WriteRecordBatch(batch);
+        ipcWriter.WriteEnd();
+    }
+
+    public async ValueTask<IReadOnlyList<(StructuralRow Key, byte[] Blob)>> LoadKeyedBlobsAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentNullException.ThrowIfNull(fileName);
+
+        // A snapshot written before the operator started emitting blobs has no such
+        // file; that is "no blobs", not a failure.
+        if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            return System.Array.Empty<(StructuralRow, byte[])>();
+        }
+
+        await using var file = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
+        await using var stream = file.AsStream();
+        using var ipcReader = new ArrowStreamReader(stream, leaveOpen: true);
+        var batch = ipcReader.ReadNextRecordBatch();
+        if (batch is null)
+        {
+            return System.Array.Empty<(StructuralRow, byte[])>();
+        }
+
+        using (batch)
+        {
+            var keyCount = _keySchema.Count;
+            var rowCount = batch.Length;
+            var keyColumns = new object?[keyCount][];
+            for (var c = 0; c < keyCount; c++)
+            {
+                keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, rowCount);
+            }
+
+            var blobs = (BinaryArray)batch.Column(keyCount);
+            var result = new List<(StructuralRow, byte[])>(rowCount);
+            for (var i = 0; i < rowCount; i++)
+            {
+                var keyValues = new object?[keyCount];
+                for (var c = 0; c < keyCount; c++)
+                {
+                    keyValues[c] = keyColumns[c][i];
+                }
+
+                result.Add((new StructuralRow(keyValues), blobs.GetBytes(i).ToArray()));
+            }
+
+            return result;
+        }
+    }
+
+    private static ArrowSchema BuildBlobArrowSchema(SqlSchema keySchema)
+    {
+        var fields = new Field[keySchema.Count + 1];
+        for (var c = 0; c < keySchema.Count; c++)
+        {
+            var col = keySchema[c];
+            fields[c] = new Field(
+                "__k" + c + "_" + col.Name,
+                ArrowSchemaBridge.ToArrowType(col.Type),
+                col.Type.Nullable);
+        }
+
+        fields[^1] = new Field("__blob", BinaryType.Default, nullable: false);
+        return new ArrowSchema(fields, metadata: null);
+    }
+
     private static ArrowSchema BuildArrowSchema(SqlSchema keySchema, SqlSchema valueSchema)
     {
         var fields = new Field[keySchema.Count + valueSchema.Count + 1];

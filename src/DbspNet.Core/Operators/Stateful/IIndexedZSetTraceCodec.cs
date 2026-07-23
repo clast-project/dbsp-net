@@ -49,4 +49,50 @@ public interface IIndexedZSetTraceCodec<TKey, TValue, TWeight>
     /// same role, just over a (key schema, value schema) pair.
     /// </summary>
     string SchemaFingerprint { get; }
+
+    /// <summary>
+    /// True when this codec can persist an opaque byte blob per key alongside
+    /// the trace. Default <c>false</c>: a codec that does not implement it simply
+    /// forces its operator down whatever reconstruction path it used before.
+    /// </summary>
+    /// <remarks>
+    /// <para>This exists because per-key derived state cannot be persisted by the
+    /// operator alone — the operator is generic in <typeparamref name="TKey"/> and
+    /// only the codec knows how to encode one. <c>IncrementalAggregateOp</c> is the
+    /// motivating consumer: it must persist each group's aggregator scratch state,
+    /// because rebuilding that state by re-folding the restored trace does not
+    /// reproduce what an uninterrupted run held whenever the fold is not associative
+    /// (float SUM/AVG/STDDEV). See <c>docs/design-incremental-persistence.md</c> §7.2.</para>
+    /// <para>The blob is opaque to the codec: it round-trips bytes and nothing more.
+    /// What is inside them, and whether they are still meaningful, is the caller's
+    /// problem.</para>
+    /// </remarks>
+    bool SupportsKeyedBlobs => false;
+
+    /// <summary>
+    /// Persist <paramref name="entries"/> as (key, blob) pairs under
+    /// <paramref name="fileName"/>. Keys need not appear in the trace, and order
+    /// is not significant — <see cref="LoadKeyedBlobsAsync"/> is free to return
+    /// them in any order.
+    /// </summary>
+    ValueTask SaveKeyedBlobsAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        IReadOnlyList<(TKey Key, byte[] Blob)> entries,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support keyed blobs; check SupportsKeyedBlobs first.");
+
+    /// <summary>
+    /// Read back what <see cref="SaveKeyedBlobsAsync"/> wrote. Returns an empty
+    /// list when <paramref name="fileName"/> does not exist, so a snapshot taken
+    /// before the operator started writing blobs loads as "no blobs" rather than
+    /// failing.
+    /// </summary>
+    ValueTask<IReadOnlyList<(TKey Key, byte[] Blob)>> LoadKeyedBlobsAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support keyed blobs; check SupportsKeyedBlobs first.");
 }
