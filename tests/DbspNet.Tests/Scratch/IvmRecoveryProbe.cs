@@ -97,32 +97,55 @@ public class IvmRecoveryProbe
         _out.WriteLine("");
         _out.WriteLine("-- recovery --");
 
-        // (a) snapshot only. Restores to the end of batch `snapshotAfter`.
-        var snapOnly = Compile(spec, traceFamily);
-        var swA = Stopwatch.StartNew();
-        await Snapshot.ReadAsync(snapOnly.Circuit, new LocalTableFileSystem(snapshotDir));
-        swA.Stop();
-        var restoreMs = swA.Elapsed.TotalMilliseconds;
-        var okA = CheckDigest(rec.DigestAtSnapshot, Digest(snapOnly), "snapshot-only restore");
-        _out.WriteLine(FormattableString.Invariant(
-            $"  (a) snapshot restore          {restoreMs,10:F0} ms   -> tick {snapOnly.Circuit.TickCount} (end of batch {snapshotAfter}), {(okA ? "verified" : "WRONG")}"));
-
-        // (b) snapshot + WAL replay. Restores to the end of the last batch.
-        var hybrid = Compile(spec, traceFamily);
-        bool okB;
-        var swB = Stopwatch.StartNew();
-        await using (await WalRecorder.CreateAsync(
-            hybrid, new LocalTableFileSystem(walDir), new LocalTableFileSystem(snapshotDir)))
+        // Each leg runs in its own scope, with the previous leg's circuit released and a
+        // collection forced first. Without that, leg (b) restores a second ~4 GiB circuit
+        // while leg (a)'s is still reachable, and the (b) - (a) subtraction charges the extra
+        // GC pressure to "replay" — which is exactly how the bogus 70x in §7.3 arose.
+        static void ReleaseHeap()
         {
-            swB.Stop();
-            okB = CheckDigest(rec.DigestAtEnd, Digest(hybrid), "snapshot+WAL recovery");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
         }
 
-        var hybridMs = swB.Elapsed.TotalMilliseconds;
+        // (a) snapshot only. Restores to the end of batch `snapshotAfter`.
+        ReleaseHeap();
+        async Task<(double Ms, bool Ok, long Tick)> MeasureSnapshotOnly()
+        {
+            var snapOnly = Compile(spec, traceFamily);
+            var sw = Stopwatch.StartNew();
+            await Snapshot.ReadAsync(snapOnly.Circuit, new LocalTableFileSystem(snapshotDir));
+            sw.Stop();
+            return (sw.Elapsed.TotalMilliseconds,
+                    CheckDigest(rec.DigestAtSnapshot, Digest(snapOnly), "snapshot-only restore"),
+                    snapOnly.Circuit.TickCount);
+        }
+
+        var (restoreMs, okA, tickA) = await MeasureSnapshotOnly();
+        _out.WriteLine(FormattableString.Invariant(
+            $"  (a) snapshot restore          {restoreMs,10:F0} ms   -> tick {tickA} (end of batch {snapshotAfter}), {(okA ? "verified" : "WRONG")}"));
+
+        // (b) snapshot + WAL replay. Restores to the end of the last batch.
+        ReleaseHeap();
+        async Task<(double Ms, bool Ok, long Tick)> MeasureHybrid()
+        {
+            var hybrid = Compile(spec, traceFamily);
+            var sw = Stopwatch.StartNew();
+            await using (await WalRecorder.CreateAsync(
+                hybrid, new LocalTableFileSystem(walDir), new LocalTableFileSystem(snapshotDir)))
+            {
+                sw.Stop();
+                return (sw.Elapsed.TotalMilliseconds,
+                        CheckDigest(rec.DigestAtEnd, Digest(hybrid), "snapshot+WAL recovery"),
+                        hybrid.Circuit.TickCount);
+            }
+        }
+
+        var (hybridMs, okB, tickB) = await MeasureHybrid();
         var replayMs = hybridMs - restoreMs;
         var replayedBatches = Math.Max(1, batches - snapshotAfter);
         _out.WriteLine(FormattableString.Invariant(
-            $"  (b) snapshot + WAL replay     {hybridMs,10:F0} ms   -> tick {hybrid.Circuit.TickCount} (end of batch {batches}), {(okB ? "verified" : "WRONG")}"));
+            $"  (b) snapshot + WAL replay     {hybridMs,10:F0} ms   -> tick {tickB} (end of batch {batches}), {(okB ? "verified" : "WRONG")}"));
         _out.WriteLine(FormattableString.Invariant(
             $"      replay leg = (b) - (a)    {replayMs,10:F0} ms   over {replayedBatches} batch(es) = {replayMs / replayedBatches:F0} ms/batch"));
 
@@ -135,8 +158,12 @@ public class IvmRecoveryProbe
         //     checkpoint (design-structural-parallel §10) silently corrupts on recovery.
         if (stagingRoot is { Length: > 0 } && snapshotAfter < batches)
         {
+            ReleaseHeap();
             var afterRestore = Compile(spec, traceFamily);
+            var swDRestore = Stopwatch.StartNew();
             await Snapshot.ReadAsync(afterRestore.Circuit, new LocalTableFileSystem(snapshotDir));
+            swDRestore.Stop();
+            var dRestoreMs = swDRestore.Elapsed.TotalMilliseconds;
 
             // Rewind staging to the snapshot point, then replay the later batches as the
             // connectors would have delivered them.
@@ -165,10 +192,21 @@ public class IvmRecoveryProbe
             swD.Stop();
             okD = CheckDigest(rec.DigestAtEnd, Digest(afterRestore), "restore + connector replay (no WAL)");
             _out.WriteLine(FormattableString.Invariant(
-                $"  (d) restore + connectors      {restoreMs + swD.Elapsed.TotalMilliseconds,10:F0} ms   -> tick {afterRestore.Circuit.TickCount}, {(okD ? "verified" : "WRONG")}  (step-only leg {swD.Elapsed.TotalMilliseconds:F0} ms)"));
-            _out.WriteLine(okD
-                ? "      => (b) WRONG but (d) right: the fault is in WAL REPLAY."
-                : "      => (d) also wrong: the fault is in SNAPSHOT RESTORE, not the WAL.");
+                $"  (d) restore + connectors      {dRestoreMs + swD.Elapsed.TotalMilliseconds,10:F0} ms   -> tick {afterRestore.Circuit.TickCount}, {(okD ? "verified" : "WRONG")}  (own restore {dRestoreMs:F0} ms + step leg {swD.Elapsed.TotalMilliseconds:F0} ms)"));
+            _out.WriteLine(FormattableString.Invariant(
+                $"      cross-check: (a) restore {restoreMs:F0} ms vs (d) restore {dRestoreMs:F0} ms — if these diverge, the (b)-(a) subtraction is not trustworthy"));
+            if (okB && okD)
+            {
+                _out.WriteLine("      => both correct: nothing to isolate.");
+            }
+            else if (okD)
+            {
+                _out.WriteLine("      => (b) WRONG but (d) right: the fault is in WAL REPLAY.");
+            }
+            else
+            {
+                _out.WriteLine("      => (d) also wrong: the fault is in SNAPSHOT RESTORE, not the WAL.");
+            }
         }
 
         // (c) WAL-only: a fresh recording that never snapshots, so nothing is pruned and the
@@ -201,12 +239,35 @@ public class IvmRecoveryProbe
         _out.WriteLine("");
         _out.WriteLine("-- what this means for the A2 snapshot interval --");
         var perBatchReplay = replayMs / replayedBatches;
-        _out.WriteLine(FormattableString.Invariant(
-            $"  recovery(N batches since snapshot) ~= {restoreMs:F0} ms + N * {perBatchReplay:F0} ms"));
-        foreach (var n in new[] { 1, 10, 100, 1000 })
+
+        // The replay coefficient is a DIFFERENCE of two ~35 s restores, so anything within a
+        // few percent of a restore is indistinguishable from zero. Extrapolating such a
+        // coefficient produces nonsense (a negative one predicts negative recovery time), so
+        // say what was actually measured instead of projecting through the noise.
+        var noiseFloorMs = restoreMs * 0.05;
+        if (Math.Abs(perBatchReplay) < noiseFloorMs)
         {
             _out.WriteLine(FormattableString.Invariant(
-                $"    N = {n,5}  ->  {(restoreMs + n * perBatchReplay) / 1000.0,9:F1} s"));
+                $"  replay of {replayedBatches} incremental batch(es) measured {perBatchReplay:F0} ms — below the"));
+            _out.WriteLine(FormattableString.Invariant(
+                $"  +/-{noiseFloorMs:F0} ms noise floor of differencing two ~{restoreMs / 1000.0:F0} s restores, i.e. not measurable."));
+            _out.WriteLine(FormattableString.Invariant(
+                $"  recovery is dominated by the {restoreMs / 1000.0:F1} s snapshot restore; replaying a SMALL batch is free."));
+            _out.WriteLine("");
+            _out.WriteLine("  Caveat: replay cost tracks the WORK in the replayed ticks, not the batch count.");
+            _out.WriteLine("  These batches are ~200 rows. Replaying a BULK batch costs what that batch's step");
+            _out.WriteLine("  cost originally (batch 1 here: ~60 s), so the interval is bounded by the largest");
+            _out.WriteLine("  batch left in the log, not by how many batches are.");
+        }
+        else
+        {
+            _out.WriteLine(FormattableString.Invariant(
+                $"  recovery(N batches since snapshot) ~= {restoreMs:F0} ms + N * {perBatchReplay:F0} ms"));
+            foreach (var n in new[] { 1, 10, 100, 1000 })
+            {
+                _out.WriteLine(FormattableString.Invariant(
+                    $"    N = {n,5}  ->  {(restoreMs + n * perBatchReplay) / 1000.0,9:F1} s"));
+            }
         }
 
         _out.WriteLine("");

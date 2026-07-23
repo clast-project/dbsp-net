@@ -315,7 +315,7 @@ table-set mismatch refused, and a view-body refactor still replaying. Full suite
 `RunBatchAsync`. Nothing about the measured batch cost has changed yet — A1 makes the WAL *reachable*
 from the program path; A2 is what makes it *used*.
 
-## 7. Recovery measured — and a correctness bug that blocks A2 (2026-07-22)
+## 7. Recovery measured — a correctness bug (real) and a replay-cost scare (retracted) (2026-07-22)
 
 §5 flagged that nothing measured restore, and that A2's snapshot-interval knob cannot be set honestly
 without it. `tests/DbspNet.Tests/Scratch/IvmRecoveryProbe.cs` measures it on real SF=3 state by
@@ -325,16 +325,23 @@ timed.
 
 ### 7.1 The numbers (flat family, snapshot after batch 2, ~4.0 GiB state)
 
-| leg | what | wall | correct? |
+As first recorded — **these timings are wrong; the correctness column is right**:
+
+| leg | what | wall (as measured then) | correct? |
 |---|---|--:|:--|
-| (a) | snapshot restore only | **34.5 s** | yes |
-| (b) | snapshot + WAL replay of 1 batch | 86.7 s (replay leg **52.2 s**) | **NO** |
-| (d) | snapshot restore + the same batch driven through the connectors, no WAL | 35.3 s (step leg **0.74 s**) | **NO** |
+| (a) | snapshot restore only | 34.5 s | yes |
+| (b) | snapshot + WAL replay of 1 batch | 86.7 s (replay leg 52.2 s) | **NO** |
+| (d) | snapshot restore + the same batch driven through the connectors, no WAL | 35.3 s (step leg 0.74 s) | **NO** |
 
-Recording, for comparison: a full snapshot costs 18.0 s, and a WAL append for an incremental batch
-costs ~0.1 s against 0.2 MiB of log.
+The **timings** were contaminated by the measurement defect retracted in §7.3 — corrected numbers
+there. The **correctness** column stood up and is the substance of §7.2: leg (d) never touches the
+WAL and was wrong the same way as (b), which is what localised the fault to snapshot restore. Both
+read `verified` once §7.2 was fixed (§8).
 
-Two independent findings fall out.
+Recording, for comparison: a full snapshot costs ~18.6 s, and a WAL append for an incremental batch
+costs ~0.25 s against 0.2 MiB of log.
+
+Two findings fell out — one real (§7.2), one an artifact of my own measurement (§7.3).
 
 ### 7.2 Snapshot restore silently produces wrong state
 
@@ -374,27 +381,61 @@ restore a routine operation rather than a rare one. Fixing this comes first.
 
 **FIXED 2026-07-22 — see §8.**
 
-### 7.3 WAL replay is ~70× slower than the equivalent live ingest
+### 7.3 ~~WAL replay is ~70× slower than the equivalent live ingest~~ — RETRACTED (2026-07-22)
 
-Legs (b) and (d) apply **the same 9 ticks** to the same restored state. Through the connectors it
-takes **0.74 s**; through WAL replay it takes **52.2 s**. Recording those ticks cost ~0.1 s.
+**This finding was wrong — an artifact of how the number was computed, not a property of the replay
+path.** The original claim was that legs (b) and (d) applied the same 9 ticks at 52.2 s vs 0.74 s.
 
-Cause not yet established. `WalRecorder.ReplaySegmentAsync` re-serialises every record batch into a
-`MemoryStream` and re-parses it just to hand it to `ReadArrowStream`, and it reads one batch per
-table per tick (20 tables, mostly empty) — wasteful, but not obviously 50 seconds of wasteful for 203
-rows. This needs profiling before A2, since replay cost is the entire justification for a *short*
-snapshot interval.
+**How it was wrong.** The probe computed `replay = (b) − (a)`, subtracting leg (a)'s snapshot restore
+from leg (b)'s total. But leg (b) restores its *own* ~4 GiB circuit, and it ran while leg (a)'s
+circuit was **still reachable** — two 4 GiB circuits live in one process. The second restore paid far
+more GC pressure than the first, and the subtraction charged all of that excess to "replay".
+Compounding it, leg (d)'s reported total reused leg (a)'s restore time instead of timing its own, so
+the (b)-vs-(d) comparison behind the "70×" was never like-for-like.
+
+**What broke the story.** `tests/DbspNet.Tests/Scratch/WalReplayProfile.cs` reproduces the *ratio*
+away from SF=3 but not the *magnitude*: net per-tick replay is sub-millisecond to ~1.5 ms and does
+not scale with table or tick count, so 9 ticks is ~10 ms. Most of what a naive measurement calls
+"replay" is fixed `CreateAsync` setup — manifest read/rewrite, input subscription, and opening a
+fresh segment file per table. Ten milliseconds cannot be 52 seconds, which sent the investigation
+back to the measurement rather than the code.
+
+**Corrected numbers** — same configuration, but each leg scoped so the prior circuit is unreachable,
+a collection forced between legs, and leg (d)'s own restore timed:
+
+| leg | what | wall | correct? |
+|---|---|--:|:--|
+| (a) | snapshot restore only | 35055 ms | yes |
+| (b) | snapshot + WAL replay of 1 batch | 34779 ms | yes |
+| | **replay leg = (b) − (a)** | **−276 ms** | — |
+| (d) | restore + same batch via connectors | 35524 ms (own restore 35464 + step 60) | yes |
+
+The (a)-vs-(d) restore cross-check agrees within ~1%, so the subtraction is now trustworthy. **The
+replay leg is −276 ms: zero within noise.** Replaying a small batch from the WAL costs nothing
+measurable.
+
+The probe now refuses to extrapolate a coefficient inside the noise floor of differencing two ~35 s
+restores — the old code happily projected *negative* recovery time at N = 1000 — and its isolation
+verdict no longer prints a fault diagnosis when both legs are correct.
+
+**Incidental confirmation:** all three legs now read `verified`, where (b) and (d) were WRONG before.
+That is §7.2's fix independently re-confirmed on real SF=3 state.
 
 ### 7.4 What this does to the A2 knob
 
-Taking the measured coefficients at face value — and noting the replay coefficient is inflated by
-§7.3 — recovery is `34.5 s + N × 52.2 s`, which would force a very short interval. If §7.3 turns out
-to be a fixable inefficiency and replay approaches the live-ingest cost (0.74 s/batch), it becomes
-`34.5 s + N × 0.74 s`: ~42 s at N=10, ~2 min at N=100. That is the difference between "snapshot
-constantly" and "snapshot rarely," so **§7.3 must be resolved before N can be chosen** — the
-measurement's main conclusion is that the knob is not yet settable, and why.
+With §7.3 retracted, recovery is **dominated by the snapshot restore** — ~35 s for ~4 GiB of state —
+and replaying a small batch on top is free. The knob is far less constrained than §7.3 implied: there
+is no per-batch replay tax pushing toward a short interval.
 
-Revised order: fix §7.2 (correctness, blocking), profile §7.3 (sets the knob), then A2.
+The real bound is different, and worth stating precisely because the "N batches" framing invited the
+wrong intuition. **Replay cost tracks the work in the replayed ticks, not the number of batches.**
+These incremental batches are ~200 rows, so replaying them is free; replaying a *bulk* batch costs
+roughly what that batch's step cost originally — batch 1 here was ~60 s. The interval is bounded by
+the largest batch still in the log, not by how many batches are.
+
+For the ivm-bench shape that is an easy trade: snapshot once after the bulk load, then WAL the
+incremental batches essentially indefinitely. Recovery stays ~35 s plus trivial replay, and the
+per-batch checkpoint tax §1.2 measured at ~90% of a durable batch disappears.
 
 ## 8. §7.2 fixed (2026-07-22)
 
@@ -437,6 +478,6 @@ engine rebuild from scratch rather than resume from state it cannot vouch for.
 passes for both `AVG` and `STDDEV`, including its strict assertion that restore-then-continue equals
 an uninterrupted run **bit for bit**. Full suite green (2279 passed).
 
-**Still open, unchanged by this:** §7.3 (WAL replay ~70× slower than live ingest) is not addressed
-and still gates the A2 snapshot-interval knob. The revised order remains: profile §7.3 → layering
-review → A2/Track B.
+**Still open, unchanged by this:** nothing in the recovery path. §7.3's replay-cost scare was
+retracted after profiling — a measurement artifact, not a defect — so the revised order is now
+**layering review → A2/Track B**.
