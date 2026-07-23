@@ -182,11 +182,15 @@ obvious first slice. On its own it is churn.
    **WITHDRAWN 2026-07-22** — see §7. It would not remove the dependency, and the dependency is not
    an inversion. Trivially doable, but it buys nothing until §1's decomposition is actually on the
    table, at which point it is the natural first slice.
-4. **Decide the trace-family axis** (§3) — *with a measurement gate, not from this document.* Either
-   complete spine (8 missing siblings) and retire flat, or accept flat as the persistence-relevant
-   family and stop growing spine. The persistence arc says spine's checkpoint reuse is real (71–79%)
-   but that it currently costs +16% step and a worse save, so it is not yet a win end to end. That
-   number is the gate.
+4. ~~**Decide the trace-family axis**~~ **DECIDED 2026-07-22 — `docs/decision-trace-family.md`:
+   stop growing spine.** Measured rather than argued, as required. Spine's checkpoint reuse is real
+   and reproducible (91.3% of spine-backed bytes unchanged), and would make the incremental save ~3x
+   cheaper than flat — but Track A amortises that difference to at or below the cost of writing the
+   outputs, so it is immaterial. Spine's other argument, bounded memory, is unavailable because the
+   8 sibling-less operators are 29.4% of state and include `IntegrateOp`, so spill cannot cap memory
+   until all of them exist. Retires Track B and stages 2-3 of the durable-identity design.
+   Note this section overstated the cost: the "+16% step" is **bulk-batch only**; incremental
+   batches are indistinguishable between families.
 5. **Re-measure the typed path's premise** (§6) before investing in either half of axis 1.
 6. **Decide what `internal` means in Core** (§2) — either narrow the `InternalsVisibleTo` set so the
    keyword carries information, or drop the pretence and make the real seam the assembly boundary.

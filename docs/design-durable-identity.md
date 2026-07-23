@@ -142,7 +142,10 @@ silently didn't".
 
    Deferred to the point of need: seeding the sequence above a restored manifest's high-water mark
    (nothing persists ids yet, so there is nothing to collide with).
-2. **Stop deleting on compaction; sweep instead.** Change `SyncDelete` to a no-op and add a sweep
+2. ~~**Stop deleting on compaction; sweep instead.**~~ **RETIRED 2026-07-22** — see
+   `docs/decision-trace-family.md`. Stages 2 and 3 existed to serve Track B, whose premise Track A
+   removes. Stage 1 stands: it is small, already built, and clarifies the model.
+   ~~**Stop deleting on compaction; sweep instead.**~~ Change `SyncDelete` to a no-op and add a sweep
    over retained manifests. Behaviour-neutral for correctness, and it can be measured for leak growth
    before anything depends on it.
 3. **Reference-manifest snapshots** — Track B proper, and only now cheap to build.
