@@ -32,13 +32,27 @@ public static class TypedPlanCompiler
 {
     /// <summary>
     /// Diagnostic (tests only, design §23.7): the number of window-aggregate order
-    /// keys wired through the monomorphized <see cref="LongKeyComparer{TRow}"/> since
-    /// the last reset. Lets the window-aggregate validation confirm that
-    /// <see cref="CompileOptions.MonomorphizeWindowOrderKey"/> actually engaged (a
-    /// parallel compile increments once per replica) rather than passing vacuously.
-    /// Not thread-safe; not part of the runtime contract.
+    /// keys wired through the monomorphized <see cref="LongKeyComparer{TRow}"/> by
+    /// compiles on <b>the current thread</b>. Lets the window-aggregate validation
+    /// confirm that <see cref="CompileOptions.MonomorphizeWindowOrderKey"/> actually
+    /// engaged (a parallel compile increments once per replica) rather than passing
+    /// vacuously. Not part of the runtime contract.
     /// </summary>
-    internal static int MonomorphizedWindowOrderKeyCount { get; set; }
+    /// <remarks>
+    /// <para><b>Thread-static on purpose.</b> As a plain static this was a
+    /// process-wide counter that any concurrently-running test could bump —
+    /// <see cref="CompileOptions.MonomorphizeWindowOrderKey"/> defaults to
+    /// <c>true</c>, and xUnit parallelises across test classes — which made an
+    /// "unchanged" assertion flaky and a "strictly increased" assertion capable of
+    /// passing spuriously off someone else's compile.</para>
+    /// <para>Thread affinity is the right scope because a compile runs entirely on
+    /// its calling thread: <c>ParallelCircuit.Build</c> constructs replicas
+    /// sequentially by design, so the per-replica increments land on the caller's
+    /// thread. If that ever becomes parallel this under-counts, and the
+    /// "strictly increased" assertion fails loudly rather than silently.</para>
+    /// </remarks>
+    [ThreadStatic]
+    internal static int MonomorphizedWindowOrderKeyCount;
 
     /// <summary>
     /// Attempts to compile <paramref name="plan"/> into a
