@@ -96,12 +96,39 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
                 "SpineIncrementalAggregateOp was constructed without a snapshot codec.");
         }
 
-        return SpineSnapshot.SaveAsync(
+        return SaveTraceAndStateAsync(writer, cancellationToken);
+    }
+
+    // Mirrors IncrementalAggregateOp.SaveTraceAndStateAsync: the batches alone are not enough,
+    // because rebuilding per-group aggregator state by re-folding them is lossy for a
+    // non-associative accumulator. See docs/design-incremental-persistence.md §7.2 — this operator
+    // had the same defect as the flat one and the same fix applies.
+    private async ValueTask SaveTraceAndStateAsync(
+        ISnapshotWriter writer, CancellationToken cancellationToken)
+    {
+        await SpineSnapshot.SaveAsync(
             writer,
             prefix: "trace",
             batches: _trace.GetBatches(),
-            saveOne: (name, batch) => _snapshotCodec.SaveAsync(writer, name, batch, cancellationToken),
-            cancellationToken);
+            saveOne: (name, batch) => _snapshotCodec!.SaveAsync(writer, name, batch, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+
+        if (!_aggregator.CanPersistState || !_snapshotCodec!.SupportsKeyedBlobs)
+        {
+            return;
+        }
+
+        var entries = new List<(TKey Key, byte[] Blob)>(_stateCache.Count);
+        var scratch = new System.Buffers.ArrayBufferWriter<byte>();
+        foreach (var (key, state) in _stateCache)
+        {
+            scratch.Clear();
+            _aggregator.WriteState(scratch, state);
+            entries.Add((key, scratch.WrittenSpan.ToArray()));
+        }
+
+        await _snapshotCodec.SaveKeyedBlobsAsync(writer, "aggstate.arrows", entries, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -130,6 +157,33 @@ internal sealed class SpineIncrementalAggregateOp<TKey, TValue, TOut> : IOperato
             object? state = null;
             var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
             _aggCache[key] = agg;
+            _stateCache[key] = state;
+        }
+
+        // Overlay the persisted per-group state on the fold above, then re-derive each affected
+        // group's emitted value from the restored state. Same contract as the flat operator: the
+        // fold is right wherever a blob is absent, and an empty-delta Update answers from state
+        // without mutating it (pinned by AggregatorEmptyDeltaTests).
+        if (!_aggregator.CanPersistState || !_snapshotCodec.SupportsKeyedBlobs)
+        {
+            return;
+        }
+
+        var blobs = await _snapshotCodec
+            .LoadKeyedBlobsAsync(reader, "aggstate.arrows", cancellationToken)
+            .ConfigureAwait(false);
+
+        foreach (var (key, blob) in blobs)
+        {
+            var group = _trace.GroupFor(key);
+            if (group.IsEmpty)
+            {
+                continue;   // a group the trace no longer holds; its state is moot
+            }
+
+            _stateCache.TryGetValue(key, out var state);
+            _aggregator.MergePersistedState(ref state, blob);
+            _aggCache[key] = _aggregator.Update(ref state, Optional<TOut>.None, ZSet<TValue, Z64>.Empty, group);
             _stateCache[key] = state;
         }
     }

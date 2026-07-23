@@ -476,7 +476,14 @@ engine rebuild from scratch rather than resume from state it cannot vouch for.
 
 **Verification.** `FloatAggregateRestoreTests` — the deterministic repro landed before the fix —
 passes for both `AVG` and `STDDEV`, including its strict assertion that restore-then-continue equals
-an uninterrupted run **bit for bit**. Full suite green (2279 passed).
+an uninterrupted run **bit for bit**.
+
+**Follow-up: the spine sibling had the same defect.** The fix above covered the flat
+`IncrementalAggregateOp` only. `SpineIncrementalAggregateOp` rebuilt its caches the same lossy way
+(its `LoadAsync` even says "same logic as `IncrementalAggregateOp.LoadAsync`"), and nothing caught it
+until the conformance harness of `docs/design-layering-review.md` §8.1 ran the same shape against
+both trace families and failed on `agg_float/spine`. Same fix applied. That is the duplication axis
+of the layering review biting exactly as predicted: one bug, two implementations, one of them fixed.
 
 **Still open, unchanged by this:** nothing in the recovery path. §7.3's replay-cost scare was
 retracted after profiling — a measurement artifact, not a defect — so the revised order is now

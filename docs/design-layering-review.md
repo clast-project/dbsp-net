@@ -147,7 +147,12 @@ chain. This is the cheapest item in the review and the only one that is nearly m
 
 ## 8. What I would actually do, ranked
 
-1. **A persistence conformance harness** (cheap, highest value). One parametrised suite asserting,
+1. **A persistence conformance harness** — **BUILT 2026-07-22**, and it immediately found a second
+   instance of the §7.2 bug in `SpineIncrementalAggregateOp` that the original fix had missed.
+   A mutation test (reverting the §7.2 fix and confirming the harness fails) was necessary to make it
+   trustworthy: the first version passed *with the bug reintroduced*, because its tick driver used
+   distinct row keys and so never produced the weight-coalesced trace entries the defect needs.
+   (cheap, highest value). One parametrised suite asserting,
    for every stateful operator and every trace family: save → restore → step ≡ uninterrupted step,
    including value equality, not just shape. This is the harness whose absence caused §7.2, and it
    generalises the two one-off tests that arc produced (`FloatAggregateRestoreTests`,
