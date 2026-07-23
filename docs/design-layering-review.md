@@ -132,7 +132,7 @@ structural-parallel arc closed much of the gap it was built to address (broadcas
 fusion, >2× scaling on the hot paths), so the premise deserves re-measurement before more is invested
 in either half.
 
-## 7. `DbspNet.Arrow` points the wrong way, for two reasons only
+## 7. `DbspNet.Arrow` is misnamed — ~~and points the wrong way~~ (CORRECTED 2026-07-22)
 
 `Arrow` depends on `Sql`, which is why Persistence must depend on both. The entire coupling is:
 
@@ -140,10 +140,26 @@ in either half.
 - `DbspNet.Sql.Compiler` — `TableInput` (15 uses), `CompiledQuery` (8), `CompileOptions` (1), all in
   the ingest extension methods (`ArrowExtensions`, `ArrowIpc`)
 
-So `Arrow` is two things glued together: a **type-system-aware column codec**, which needs only
-`SqlType`, and **ingest extensions for the compiler's handles**, which need `Sql`. Splitting those —
-or moving `SqlType` below `Sql` — would let the codec half sit under `Sql` and make the graph a clean
-chain. This is the cheapest item in the review and the only one that is nearly mechanical.
+**The original version of this section called that an inversion and rated extracting `SqlType` the
+cheapest win in the review. That was wrong on both counts, and checking it before doing it is how it
+was caught.**
+
+- **It is not an inversion.** `Arrow` sits *above* `Sql` in an acyclic chain, and what it contains is
+  Arrow interop *for the SQL layer* — column conversion defined in terms of `SqlType`, and ingest
+  extensions over the compiler's handles. That is the correct position for what it does. The real
+  defect is only that the name reads as a low-level Arrow utility.
+- **Extracting `SqlType` would not remove the edge.** It is one of two causes; `ArrowExtensions` and
+  `ArrowIpc` would still need `TableInput` and `CompiledQuery`. Removing the edge needs a second,
+  separate change — splitting the ingest extensions out of the assembly.
+- **Removing the edge would benefit nobody today.** Every consumer of `DbspNet.Sql.TypeSystem` —
+  Arrow (2 files), Persistence (1), Server (1), Benchmarks (3), Demo (1) — already depends on `Sql`.
+  Core does not reference `SqlType` at all, and names `Utf8String` only in a doc comment: it compares
+  VARCHAR cells through the runtime `IComparable` interface, never the concrete type. Core is
+  genuinely SQL-agnostic and gains nothing.
+
+What *is* true: `TypeSystem` is trivially extractable — its 7 files contain **zero** `using
+DbspNet.*`. So if §1's decomposition of the 36k-LOC `DbspNet.Sql` is ever taken up, this is the
+obvious first slice. On its own it is churn.
 
 ## 8. What I would actually do, ranked
 
@@ -157,9 +173,15 @@ chain. This is the cheapest item in the review and the only one that is nearly m
    including value equality, not just shape. This is the harness whose absence caused §7.2, and it
    generalises the two one-off tests that arc produced (`FloatAggregateRestoreTests`,
    `AggregatorEmptyDeltaTests`). Do this regardless of every other decision here.
-2. **Settle identity before Track B** (§5). One durable-id concept for operators and batches, rather
-   than a third positional scheme. Track B needs it; the CSE fragility wants it.
-3. **Extract `SqlType` (or split `Arrow`)** (§7). Mechanical, removes the one inversion.
+2. **Settle identity before Track B** (§5). **DESIGNED 2026-07-22** —
+   `docs/design-durable-identity.md`. The two halves turned out to have very different urgency, so
+   the answer is *not* "one durable-id concept for both": build **batch** identity (Track B cannot
+   exist without it) and **defer operator** identity (nothing requires checkpoint portability across
+   a program edit, and a colliding stable id would fail silently where positions fail loudly).
+3. ~~**Extract `SqlType` (or split `Arrow`)** (§7). Mechanical, removes the one inversion.~~
+   **WITHDRAWN 2026-07-22** — see §7. It would not remove the dependency, and the dependency is not
+   an inversion. Trivially doable, but it buys nothing until §1's decomposition is actually on the
+   table, at which point it is the natural first slice.
 4. **Decide the trace-family axis** (§3) — *with a measurement gate, not from this document.* Either
    complete spine (8 missing siblings) and retire flat, or accept flat as the persistence-relevant
    family and stop growing spine. The persistence arc says spine's checkpoint reuse is real (71–79%)
@@ -170,9 +192,10 @@ chain. This is the cheapest item in the review and the only one that is nearly m
    keyword carries information, or drop the pretence and make the real seam the assembly boundary.
    Low urgency, but it is why "is this a supported seam?" currently has no mechanical answer.
 
-Items 1–3 are independent and can proceed immediately. Items 4–5 are measurement-gated and should not
-be decided from architecture argument alone — the same discipline that made the persistence arc
-produce a retraction instead of a bad build.
+Items 1–2 are independent and can proceed immediately (1 is done). Item 3 is withdrawn. Items 4–5 are
+measurement-gated and should not be decided from architecture argument alone — the same discipline
+that made the persistence arc produce a retraction instead of a bad build, and that caught item 3
+before it cost anything.
 
 ## 9. What this review is not
 
