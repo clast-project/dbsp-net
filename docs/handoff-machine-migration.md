@@ -115,10 +115,26 @@ ServerGC, Windows. The Mac Mini is Apple Silicon with fewer cores and no SMT. Co
   allocation-bound (~50–60% fresh-dict allocation, ~40–48% whole-row hashing). Apple Silicon's unified
   memory and different allocator behaviour move precisely that term, so old and new numbers must never
   be compared directly, even at the same W.
-- **Docker architecture may invalidate comparisons outright.** `docker-compose.benchmark.feldera.yml`
-  pins `images.feldera.com/feldera/pipeline-manager:latest` with no `platform:` key. If that image has
-  no arm64 manifest, Docker will emulate amd64 and **every DbspNet-vs-Feldera number from the Mac is
-  meaningless**. This could not be checked from Windows (the registry requires auth).
+- **Docker architecture: RESOLVED, the stack is arm64-clean on our path.** Confirmed 2026-08-30.
+  Feldera publishes an arm64 image (verified by Curt; the registry needs auth so it was not checkable
+  from Windows). Audited the rest of the stack at the same time — only **two** images are pulled
+  rather than built:
+
+  | Image | Arch | On the DbspNet-vs-Feldera path? |
+  |---|---|---|
+  | `images.feldera.com/feldera/pipeline-manager:latest` | arm64 ✔ | yes |
+  | `mcr.microsoft.com/mssql/server:2022-latest` | **amd64 only** (single-arch manifest) | **no** — Hive metastore for the `spark` / `spark-openivm` engines only |
+
+  Everything else is built locally, and every base image on our path publishes arm64 (verified by
+  registry manifest for the Temurin and sbt images): `mcr.microsoft.com/dotnet/{sdk,aspnet}:10.0`
+  (dbspnet), `python:3.11-slim[-bookworm]` (dbt-server, benchmark-server),
+  `sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.6_2.12.21` + `eclipse-temurin:17-jre`
+  (spark-batch-loader, spark-digen-delta), `eclipse-temurin:8-jre` (tpc-di-gen).
+
+  So SQL Server is the only emulation exposure, and only if the Spark comparison engines are run.
+
+- **EngineeredWood is pure managed** — `lib/{net10.0,net8.0,netstandard2.0}`, no `runtimes/`
+  directory and no native payload — so the connector layer carries no architecture risk.
 
 **Recommendation:** treat the Mac as the development and correctness machine, and keep an x86 Linux or
 Windows box as the measurement machine. If that is not possible, the honest move is to declare a new
@@ -127,9 +143,8 @@ across machines.
 
 ## 6. First actions on the new machine
 
-1. **Check the Feldera image architecture** — this gates everything comparative:
-   `docker manifest inspect images.feldera.com/feldera/pipeline-manager:latest | grep architecture`
-   If there is no `arm64`, stop and read §5 before running any benchmark.
+1. ~~Check the Feldera image architecture.~~ **Done 2026-08-30 — arm64 exists**, and the rest of the
+   stack was audited with it (§5). Nothing on the DbspNet-vs-Feldera path needs emulation.
 2. Clone both repos (§2); check ivm-bench out on `dbspnet-engine-experiments`.
 3. Restore the memory snapshot (§4.1).
 4. `dotnet build` + `dotnet test` to confirm the toolchain and the nuget.org restore.
