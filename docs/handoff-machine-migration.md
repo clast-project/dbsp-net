@@ -9,10 +9,12 @@ Read §5 before trusting any performance number measured on the new machine.
 ## 0. The short version
 
 - **Everything that matters is now in git and pushed.** The Windows box holds no unique source.
-- **The ivm-bench environment here is already gone** — no `d:\src\ivm-bench`, no `~/ivm-bench` in WSL,
-  and Docker is not installed in WSL. Nothing was lost in the move; it was dismantled earlier.
+- **The ivm-bench environment here was already gone before the move** — no `d:\src\ivm-bench`, no
+  `~/ivm-bench` in WSL, and Docker not installed in WSL. That was lost in an earlier reinstall of this
+  machine, not dismantled for the migration. Everything is recoverable from GitHub (§2).
 - **The Mac can develop and test, but it cannot rebaseline our benchmarks.** §5.
-- **One thing did not travel and is still at risk**: uncommitted engineered-wood work in WSL (§4.3).
+- **The Windows box is not being wiped.** It stays available, so anything left on it (§4.3) is parked
+  rather than lost — and it remains the only machine that can reproduce the x86 measurement baseline.
 
 ## 1. Why pushing was mandatory, not hygiene
 
@@ -88,7 +90,7 @@ Two probes carry stale Windows-specific advice in comments — `IvmCheckpointReu
 `IvmRecoveryProbe.cs:27` both say to put the snapshot dir "on /mnt/d" because a run writes several GB.
 The several-GB part still holds; the path does not.
 
-### 4.3 At risk: uncommitted engineered-wood work in WSL
+### 4.3 Parked on the old box: uncommitted engineered-wood work in WSL
 
 `~/ew` in the WSL Ubuntu distro is on branch `chore/python-313` with **15 modified files**. Most of
 the raw diff is CRLF noise, but ignoring line endings there is genuine work: **311 insertions / 220
@@ -96,10 +98,21 @@ deletions across 14 files**, including an `Xunit.SkippableFact` mechanism that l
 decide at runtime whether a JDK or `deltalake` is present.
 
 Its `origin` is a **local path** (`/mnt/c/src/GitHub/engineered-wood`), not GitHub — so even
-committing it only moves it to another folder on this machine. **This is the only content on this box
-that is not recoverable from a remote.** It belongs to a different project, so it was deliberately
-left alone here. Decide before the box is wiped: commit and push it through the C: clone to
-`clast-project/engineered-wood`, or discard it consciously.
+committing it only moves it to another folder on that machine. The commit it sits on (`eacb02e`,
+"chore(ci): move to Python 3.13") is likewise not on GitHub; branch `chore/python-313` exists only
+locally.
+
+The work is complete and coherent as far as static inspection goes — zero leftover `EnsureAvailable`
+call sites, zero plain `[Fact]`/`[Theory]` remaining in the Interop tests, 95 `SkippableFact` /
+`SkippableTheory` — but it has never been compiled (no `dotnet` in that WSL distro). Substance is in
+three files: `delta_rs_driver.py` (hard `os._exit` past CPython finalization, which gh-87135 turned
+from a post-result abort into a permanent hang on 3.13), `InteropDriver.cs` (`EnsureAvailable()`
+early-return reported skipped tiers as *passed*; plus a stdout-drain deadlock that defeated the
+`WaitForExit` timeout), and the test csproj (`Xunit.SkippableFact`).
+
+**Not urgent:** the Windows box is staying, so this is parked, not at risk. It belongs to a different
+project and should be picked up in a fresh session in that repo, where it can actually be built and
+the interop tiers run.
 
 ## 5. What cannot travel: the measurement baseline
 
@@ -173,7 +186,55 @@ every N), from `docs/design-incremental-persistence.md` §4. Note that item 1 ab
 justification: if the benchmark never required a per-batch checkpoint, A2's payoff needs re-pricing
 before it is built.
 
-## 8. What this handoff does not cover
+## 8. Starting prompt for the first session on the new machine
+
+Paste this into a fresh Claude Code session in the cloned repo. It deliberately ends without starting
+work — the first session should orient and propose, not plunge.
+
+```
+This is DbspNet: a C#/.NET implementation of DBSP (incremental view maintenance)
+with its own SQL front end. Development has just moved here from a Windows i9
+box, and this machine has no history of the project.
+
+Read `docs/handoff-machine-migration.md` first — it is the migration record
+(repo inventory, environment, what did and did not travel). Then read
+`docs/comparison-feldera-decisions.md`, which is the newest and most important
+work: a source-level comparison against Feldera that challenges several of our
+standing decisions.
+
+Before anything else, two setup steps:
+
+1. Restore project memory. Copy `docs/handoff/memory/*.md` (all except
+   README.md) into this machine's Claude project memory directory. That is 51
+   files indexing every completed arc, decision and landmine; without them you
+   are missing most of the project's history. Once restored, treat the copy
+   under docs/ as stale — do not edit it.
+2. Verify the toolchain: `dotnet build`, then `dotnet test`. Report anything
+   that fails, especially anything arm64-specific — nothing here has ever been
+   built on Apple Silicon.
+
+Three things to hold onto while you read:
+
+- Every performance number in `docs/` was measured on the old i9 (8P+8E, x86,
+  ServerGC). Never compare a number measured on this machine against them, and
+  never quote them as current. W=24 experiments cannot be reproduced here at
+  all — that is core count, not architecture.
+- Do not reverse any decision on the strength of the Feldera comparison alone.
+  Its §9 names, for each challenged decision, the measurement that would
+  actually settle it.
+- The docs are the source of truth for project state and roadmap, not memory
+  and not git history.
+
+When you have finished reading, tell me what you think the first piece of work
+should be and why, with the alternatives you rejected. Do not start it yet.
+```
+
+Why it is shaped this way: the memory restore has to happen before the model forms a plan, or it will
+re-derive things we already settled; the "do not quote i9 numbers" rule is the single easiest mistake
+to make on a new machine; and asking for a proposal rather than an action gives you a checkpoint
+before any work starts on hardware whose behaviour we have not characterised.
+
+## 9. What this handoff does not cover
 
 - No decision was reversed, and nothing in `docs/` was rewritten to match the Feldera findings. The
   comparison doc records the challenges; the original decision docs still state what they stated.
