@@ -126,6 +126,48 @@ implementation (bounded-history trace GC): we should confirm what our materialis
 a lateness bound is declared, because "GC the trace" and "never admit the record to the integral in
 the first place" are different guarantees.
 
+### 4.2 CHECKED (2026-08-31): we do *not* integrate non-output views — but the two program paths are inconsistent in opposite directions
+
+§4's "we may be materialising views they simply don't" was checked against the compiler. **In its
+literal form it is wrong**, and the item should not be built as stated:
+
+- `CompileProgram` inserts the integral **only** `if (v.IsOutput)` (`PlanToCircuit.cs:470-476`).
+  A non-output view gets a delta stream and nothing else — the same gate Feldera applies with
+  `MATERIALIZED` vs `STANDARD`.
+- Views not reachable from any output are pruned outright before compilation
+  (`PlanToCircuit.cs:352-360`, `:545`), and `ColumnLivenessProbe` confirmed the live set: 5 whole dead
+  views already pruned, all 16 outputs live.
+- For ivm-bench specifically the integral is **required, not waste**: the benchmark measures full view
+  *state* and diffs view contents across engines, so both sides must materialise those 16.
+
+So there is no pile of needless integrals to delete. Two real findings came out of the check instead,
+and both matter for **pause/resume**, which is a different goal from ivm-bench's per-batch durability.
+
+**(1) The serial path has no delta-only output.** `IsOutput` ⇒ integral *structurally*: `ProgramOutput`
+is defined as an `IntegratedViewHandle` (`CompiledProgram.cs:58`), so a program cannot declare "emit
+this view's deltas to a sink, retain nothing". That is exactly Feldera's `STANDARD` shape. For a
+streaming deployment whose consumer takes deltas, the integral is checkpoint bytes written and restore
+time paid for state nobody reads — on the §4 table's own numbers, `IntegrateOp` is **11.2% of SF=3
+state**. The machinery already exists: the parallel path emits `builder.Output(stream, "view:" + name)`
+(`PlanToCircuit.cs:657-661`). This is a missing *option*, not missing capability.
+
+**(2) The parallel path has the opposite defect — its view is outside the snapshot tree.**
+`ParallelProgramOutput` holds the sharded delta handle plus a **plain driver-side `ZSet` field**
+(`ParallelStructuralCompiledQuery.cs:129-130`), accumulated by the driver rather than by an in-circuit
+`IntegrateOp`. It is therefore not an `ISnapshotable` and **not covered by `Snapshot.WriteAsync`**.
+`design-structural-parallel.md` §10.1 records this as the "driver-side view gap" and calls it moot
+until a parallel `ProgramRunner` exists — **for pause/resume it is not moot, it is the blocker**:
+resuming a parallel program would silently come back with empty views, the same *class* of failure as
+`design-incremental-persistence.md` §7.2 (restore silently producing wrong state), which is the bug
+this codebase has already been bitten by once.
+
+**Net:** serial always integrates and cannot opt out; parallel integrates where it cannot be persisted.
+Neither is Feldera's arrangement, and the gap for a pause/resume stream is a *policy* knob plus closing
+the parallel gap — not deleting integrals.
+
+**Not measured.** This is a source-level check only; no SF=3 data exists on the current machine, so the
+11.2% is quoted from the earlier i9 measurement and nothing here was re-timed.
+
 ## 5. Persistence: they built Track B *and* Track A
 
 Our `design-incremental-persistence.md` framed these as alternatives and chose A. Feldera has both,
@@ -303,7 +345,7 @@ Ordered by (value / cost), all of them separable from the trace question:
    their own spill/checkpoint path".
 6. **Accumulate-then-evaluate** (§6.2) — potentially a real slice of the batch-1 gap, and entirely
    absent from our roadmap.
-7. **Don't integrate non-materialised views** (§4) — possible direct cut to resident state.
+7. ~~**Don't integrate non-materialised views** (§4)~~ — **CHECKED and refuted in its literal form (§4.2)**: we already gate the integral on `IsOutput`. The live items it turned up are a delta-only output *option* on the serial path, and the parallel path's un-snapshotted driver-side view.
 
 ## 11. What this research did not establish
 
