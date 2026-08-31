@@ -175,9 +175,7 @@ public sealed class ShardedTableInput
     public void Push(IEnumerable<(object?[] Values, long Weight)> deltas)
     {
         ArgumentNullException.ThrowIfNull(deltas);
-        var b = deltas.TryGetNonEnumeratedCount(out var n)
-            ? new ZSetBuilder<StructuralRow, Z64>(n)
-            : new ZSetBuilder<StructuralRow, Z64>();
+        var b = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (vs, w) in deltas)
         {
             ValidateArity(vs);
@@ -190,7 +188,7 @@ public sealed class ShardedTableInput
     private void PushSingle(object?[] values, long weight)
     {
         ValidateArity(values);
-        var b = new ZSetBuilder<StructuralRow, Z64>(1);
+        var b = new ZSetBuilder<StructuralRow, Z64>();
         b.Add(_codec.BuildRow(Schema, BoundaryEncoder.Encode(Schema, values)), new Z64(weight));
         _handle.Push(b.Build());
     }

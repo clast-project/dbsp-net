@@ -46,10 +46,6 @@ internal sealed class IncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOut, TW
     private readonly Func<TOut, bool>? _residual;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
 
-    // Last tick's output count, used to pre-size this tick's delta builder
-    // (docs/design-row-representation.md §16.8).
-    private int _lastOutputSize;
-
     public IncrementalJoinSharedRightOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
         Stream<IndexedZSet<TKey, TRight, TWeight>> rightDelta,
@@ -77,14 +73,12 @@ internal sealed class IncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOut, TW
         var dl = _leftIn.Current;
         var dr = _rightDelta.Current;
 
-        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        var builder = new ZSetBuilder<TOut, TWeight>();
         // dl ⋈ R_t — the shared arrangement already folded dr into R_t this tick.
         IncrementalJoinCore.JoinInto(dl, _rightArrangement.Current, _combine, _residual, builder);
         // L_{t-1} ⋈ dr — the delayed left trace against this tick's right delta.
         IncrementalJoinCore.JoinInto(_leftTrace.Current, dr, _combine, _residual, builder);
-        var result = builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
+        _output.SetCurrent(builder.Build());
 
         _leftTrace.Integrate(dl);
     }

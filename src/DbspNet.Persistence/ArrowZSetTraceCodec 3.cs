@@ -133,8 +133,7 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>
         var weightArray = (Int64Array)batch.Column(columnCount);
         var weightValues = weightArray.Values;
 
-        // One output row per Arrow row — rowCount is exact.
-        var b = new ZSetBuilder<StructuralRow, Z64>(rowCount);
+        var b = new ZSetBuilder<StructuralRow, Z64>();
         for (var i = 0; i < rowCount; i++)
         {
             var values = new object?[columnCount];

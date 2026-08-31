@@ -349,12 +349,7 @@ public static class ZSet
         where TWeight : struct, IZRing<TWeight>
     {
         ArgumentNullException.ThrowIfNull(entries);
-        // Size exactly when the source can report a count without enumerating
-        // (array/list/collection — the common case at ingest); otherwise fall
-        // back to growing from empty. Capacity is a pure allocation hint.
-        var b = entries.TryGetNonEnumeratedCount(out var n)
-            ? new ZSetBuilder<TKey, TWeight>(n)
-            : new ZSetBuilder<TKey, TWeight>();
+        var b = new ZSetBuilder<TKey, TWeight>();
         foreach (var (k, w) in entries)
         {
             b.Add(k, w);
@@ -368,9 +363,7 @@ public static class ZSet
         where TWeight : struct, IZRing<TWeight>
     {
         ArgumentNullException.ThrowIfNull(entries);
-        var b = entries.TryGetNonEnumeratedCount(out var n)
-            ? new ZSetBuilder<TKey, TWeight>(n)
-            : new ZSetBuilder<TKey, TWeight>();
+        var b = new ZSetBuilder<TKey, TWeight>();
         foreach (var (k, w) in entries)
         {
             b.Add(k, w);
@@ -388,9 +381,7 @@ public static class ZSet
         where TWeight : struct, IZRing<TWeight>
     {
         ArgumentNullException.ThrowIfNull(keys);
-        var b = keys.TryGetNonEnumeratedCount(out var n)
-            ? new ZSetBuilder<TKey, TWeight>(n)
-            : new ZSetBuilder<TKey, TWeight>();
+        var b = new ZSetBuilder<TKey, TWeight>();
         foreach (var k in keys)
         {
             b.Add(k, TWeight.One);

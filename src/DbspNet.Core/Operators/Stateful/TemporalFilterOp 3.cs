@@ -116,8 +116,7 @@ internal sealed class TemporalFilterOp<TRow> : IOperator, ISnapshotable, IIntros
         var now = _clock.Value;
         var valid = ComputeValid(now);
 
-        // At most one entry per row in either set — a small exact bound.
-        var builder = new ZSetBuilder<TRow, Z64>(valid.Count + _emitted.Count);
+        var builder = new ZSetBuilder<TRow, Z64>();
         foreach (var (row, weight) in valid)
         {
             _emitted.TryGetValue(row, out var old);

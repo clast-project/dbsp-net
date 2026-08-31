@@ -98,8 +98,7 @@ internal sealed class TopKOp<TRow> : IOperator, ISnapshotable, IIntrospectable
         }
 
         var newWindow = ComputeWindow();
-        // At most one entry per row in either window — a small exact bound.
-        var builder = new ZSetBuilder<TRow, Z64>(newWindow.Count + _window.Count);
+        var builder = new ZSetBuilder<TRow, Z64>();
         foreach (var (row, weight) in newWindow)
         {
             _window.TryGetValue(row, out var old);

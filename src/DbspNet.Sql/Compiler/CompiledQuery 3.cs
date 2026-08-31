@@ -199,9 +199,7 @@ public sealed class TableInput
     public void Push(IEnumerable<(object?[] Values, long Weight)> deltas)
     {
         ArgumentNullException.ThrowIfNull(deltas);
-        var b = deltas.TryGetNonEnumeratedCount(out var n)
-            ? new ZSetBuilder<StructuralRow, Z64>(n)
-            : new ZSetBuilder<StructuralRow, Z64>();
+        var b = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (vs, w) in deltas)
         {
             ValidateArity(vs);

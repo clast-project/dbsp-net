@@ -118,8 +118,7 @@ internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntros
         }
         else
         {
-            // Drops only late rows, so the input count is a tight upper bound.
-            var b = new ZSetBuilder<TRow, Z64>(delta.Count);
+            var b = new ZSetBuilder<TRow, Z64>();
             foreach (var (row, w) in delta)
             {
                 var t = _monotone(row);

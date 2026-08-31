@@ -101,13 +101,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     /// </summary>
     public ZSet<(TKey Key, TValue Value), TWeight> Flatten()
     {
-        var total = 0L;
-        foreach (var g in _groups.Values)
-        {
-            total += g.Count;
-        }
-
-        var b = new ZSetBuilder<(TKey, TValue), TWeight>((int)Math.Min(total, int.MaxValue));
+        var b = new ZSetBuilder<(TKey, TValue), TWeight>();
         foreach (var (k, g) in _groups)
         {
             foreach (var (v, w) in g)

@@ -7,42 +7,46 @@ using DbspNet.Core.Collections;
 namespace DbspNet.Core.Operators.Stateful;
 
 /// <summary>
-/// Incremental LEFT OUTER equi-join of two indexed Z-set streams. Behaves
-/// like <see cref="IncrementalJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/> on
-/// keys that have a right-side match, and additionally emits a NULL-padded
-/// row for every left row whose key currently has no right-side entries.
+/// Incremental FULL OUTER equi-join of two indexed Z-set streams. Emits the
+/// inner join on keys matched on both sides, a NULL-padded-right row for every
+/// left row whose key has no right-side match, and a NULL-padded-left row for
+/// every right row whose key has no left-side match.
 /// </summary>
 /// <remarks>
 /// <para>
-/// LEFT JOIN is not bilinear, so the <c>dl⋈R + L⋈dr + dl⋈dr</c> factoring
-/// that works for inner joins doesn't directly apply. This operator works
-/// per key via a small case analysis on the match-presence transition:
+/// The full-outer content of a key is
+/// <c>F(L,R) = inner + leftPad + rightPad</c> where
+/// <c>inner = (L,R both non-empty) ? L⋈R : ∅</c>,
+/// <c>leftPad = (R empty) ? nullPadRight(L) : ∅</c>, and
+/// <c>rightPad = (L empty) ? nullPadLeft(R) : ∅</c>. The
+/// <c>inner + leftPad</c> part is exactly
+/// <see cref="IncrementalLeftJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/>'s
+/// per-key case analysis keyed on right-presence; FULL OUTER adds the symmetric
+/// <c>rightPad</c> delta keyed on left-presence:
 /// </para>
 /// <list type="bullet">
-/// <item><b>stayed-matched</b> (old ∃ right, new ∃ right): the standard
-/// inner-join bilinear delta, in its two-pass asymmetric form
-/// <c>dlK ⋈ newR + oldL ⋈ drK</c> (where <c>newR = oldR + drK</c> is
-/// already computed for the case-selection check below).</item>
-/// <item><b>stayed-unmatched</b> (old ∄ right, new ∄ right):
-/// <c>delta = dl × {NULL}</c>.</item>
-/// <item><b>gained-match</b> (old ∄ right, new ∃ right):
-/// retract <c>oldL × {NULL}</c>, emit <c>newL ⋈ newR</c>.</item>
-/// <item><b>lost-match</b> (old ∃ right, new ∄ right):
-/// retract <c>oldL ⋈ oldR</c>, emit <c>newL × {NULL}</c>.</item>
+/// <item><b>left stayed present</b> (old ∃ left, new ∃ left): rightPad is ∅
+/// both ticks ⇒ nothing.</item>
+/// <item><b>left stayed absent</b> (old ∄ left, new ∄ left):
+/// <c>delta = nullPadLeft(drK)</c>.</item>
+/// <item><b>left gained presence</b> (old ∄ left, new ∃ left): retract
+/// <c>nullPadLeft(oldR)</c> (now covered by the inner part).</item>
+/// <item><b>left lost presence</b> (old ∃ left, new ∄ left): emit
+/// <c>nullPadLeft(newR)</c>.</item>
 /// </list>
 /// <para>
-/// Correctness hinges on the Z-set invariant that an indexed Z-set's group
-/// is non-empty iff at least one entry has non-zero weight — i.e.
-/// "match-presence" is cheap to check (<c>!group.IsEmpty</c>).
+/// The two decompositions are independent, so simultaneous both-side
+/// match-flips compose correctly: total per-key delta is exactly
+/// <c>F(new) − F(old)</c>.
 /// </para>
 /// <para>
-/// NULL-keyed rows on the left must be handled by the caller (the
-/// <see cref="DbspNet.Sql.Compiler"/> plan→circuit layer routes them
-/// directly to a NULL-padded output branch): this operator works on
-/// non-null-keyed rows only, since the key must be hashable and equality-comparable.
+/// NULL-keyed rows on either side are handled by the caller (the
+/// <see cref="DbspNet.Sql.Compiler"/> plan→circuit layer routes NULL-keyed
+/// left rows to the NULL-padded-right branch and NULL-keyed right rows to the
+/// NULL-padded-left branch): this operator works on non-null-keyed rows only.
 /// </para>
 /// </remarks>
-internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
+internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IOperator, ISnapshotable, IIntrospectable
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -56,7 +60,8 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private readonly Stream<IndexedZSet<TKey, TRight, TWeight>> _rightIn;
     private readonly Stream<ZSet<TOut, TWeight>> _output;
     private readonly Func<TKey, TLeft, TRight, TOut> _joinCombine;
-    private readonly Func<TKey, TLeft, TOut> _nullPadCombine;
+    private readonly Func<TKey, TLeft, TOut> _nullPadRightCombine;
+    private readonly Func<TKey, TRight, TOut> _nullPadLeftCombine;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
     private readonly IndexedZSetTrace<TKey, TRight, TWeight> _rightTrace = new();
     private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
@@ -66,17 +71,13 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private long _lastGcFrontier = long.MinValue;
     private long _gcDropped;
 
-    // Last tick's output count, used to pre-size this tick's delta builder
-    // (docs/design-row-representation.md §16.8). IncrementalJoinOp has carried this since §16.8; the
-    // outer-join siblings were missed.
-    private int _lastOutputSize;
-
-    public IncrementalLeftJoinOp(
+    public IncrementalFullJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
         Stream<IndexedZSet<TKey, TRight, TWeight>> rightIn,
         Stream<ZSet<TOut, TWeight>> output,
         Func<TKey, TLeft, TRight, TOut> joinCombine,
-        Func<TKey, TLeft, TOut> nullPadCombine,
+        Func<TKey, TLeft, TOut> nullPadRightCombine,
+        Func<TKey, TRight, TOut> nullPadLeftCombine,
         IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
         IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
         IFrontier? frontier = null,
@@ -86,7 +87,8 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         _rightIn = rightIn;
         _output = output;
         _joinCombine = joinCombine;
-        _nullPadCombine = nullPadCombine;
+        _nullPadRightCombine = nullPadRightCombine;
+        _nullPadLeftCombine = nullPadLeftCombine;
         _leftSnapshotCodec = leftSnapshotCodec;
         _rightSnapshotCodec = rightSnapshotCodec;
         _frontier = frontier;
@@ -101,8 +103,8 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         if (_leftSnapshotCodec is null || _rightSnapshotCodec is null)
         {
             throw new NotSupportedException(
-                "IncrementalLeftJoinOp was constructed without snapshot codecs; pass " +
-                "them to CircuitBuilder.IncrementalLeftJoin to enable Snapshot.WriteAsync/ReadAsync.");
+                "IncrementalFullJoinOp was constructed without snapshot codecs; pass " +
+                "them to CircuitBuilder.IncrementalFullJoin to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
         await _leftSnapshotCodec.SaveAsync(writer, LeftTraceFile, _leftTrace.Current, cancellationToken).ConfigureAwait(false);
@@ -114,7 +116,7 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         if (_leftSnapshotCodec is null || _rightSnapshotCodec is null)
         {
             throw new NotSupportedException(
-                "IncrementalLeftJoinOp was constructed without snapshot codecs.");
+                "IncrementalFullJoinOp was constructed without snapshot codecs.");
         }
 
         _leftTrace.Integrate(await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false));
@@ -131,11 +133,9 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var leftOld = _leftTrace.Current;
         var rightOld = _rightTrace.Current;
 
-        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        var builder = new ZSetBuilder<TOut, TWeight>();
 
-        // Every key that could have a non-zero delta this tick shows up in
-        // dl or dr; keys not touched either way contribute nothing.
-        var touched = new HashSet<TKey>(dl.GroupCount + dr.GroupCount);
+        var touched = new HashSet<TKey>();
         foreach (var k in dl.Keys)
         {
             touched.Add(k);
@@ -155,56 +155,67 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             var newL = oldL + dlK;
             var newR = oldR + drK;
 
-            var oldMatched = !oldR.IsEmpty;
-            var newMatched = !newR.IsEmpty;
+            var oldRMatched = !oldR.IsEmpty;
+            var newRMatched = !newR.IsEmpty;
 
-            if (oldMatched && newMatched)
+            // Part A — inner + left-pad, keyed on right-presence (identical to
+            // IncrementalLeftJoinOp).
+            if (oldRMatched && newRMatched)
             {
-                // Bilinear inner-join delta, just for this key. Two-pass
-                // asymmetric form: dlK ⋈ newR absorbs both dlK ⋈ oldR and
-                // the cross term dlK ⋈ drK.
                 JoinInto(builder, key, dlK, newR);
                 JoinInto(builder, key, oldL, drK);
             }
-            else if (!oldMatched && !newMatched)
+            else if (!oldRMatched && !newRMatched)
             {
-                // Still no right match for this key: the left delta becomes
-                // NULL-padded output deltas 1:1.
-                NullPadInto(builder, key, dlK);
+                NullPadRightInto(builder, key, dlK);
             }
-            else if (!oldMatched && newMatched)
+            else if (!oldRMatched && newRMatched)
             {
-                // Key gained a match this tick. Retract every NULL-padded
-                // row that was present (oldL), emit the full join on newL × newR.
-                NullPadInto(builder, key, oldL.Negate());
+                NullPadRightInto(builder, key, oldL.Negate());
                 JoinInto(builder, key, newL, newR);
             }
             else
             {
-                // Key lost all matches this tick. Retract the prior joined
-                // rows, emit newL × NULL.
                 JoinInto(builder, key, oldL.Negate(), oldR);
-                NullPadInto(builder, key, newL);
+                NullPadRightInto(builder, key, newL);
+            }
+
+            // Part B — right-pad, keyed on left-presence (the FULL-OUTER
+            // addition). Independent of part A.
+            var oldLMatched = !oldL.IsEmpty;
+            var newLMatched = !newL.IsEmpty;
+            if (oldLMatched && newLMatched)
+            {
+                // rightPad ∅ both ticks — nothing.
+            }
+            else if (!oldLMatched && !newLMatched)
+            {
+                NullPadLeftInto(builder, key, drK);
+            }
+            else if (!oldLMatched && newLMatched)
+            {
+                NullPadLeftInto(builder, key, oldR.Negate());
+            }
+            else
+            {
+                NullPadLeftInto(builder, key, newR);
             }
         }
 
-        var result = builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
+        _output.SetCurrent(builder.Build());
 
         _leftTrace.Integrate(dl);
         _rightTrace.Integrate(dr);
         CollectGarbage();
     }
 
-    // Frontier-driven GC: when the join key is monotone on BOTH sides, no
-    // future delta can arrive at a sub-frontier key on either input — so that
-    // key's match-presence state is frozen and its already-emitted output
-    // (joined or NULL-padded) is final. Drop those keys from both traces.
-    // The both-sides-monotone license is stricter than the analyzer's output
-    // marking (which flags only the preserved side for an outer join): a future
-    // row on the non-monotone side could still flip a match below the frontier,
-    // so the caller must verify both sides before supplying the frontier here.
+    // Frontier-driven GC: when the join key is monotone on BOTH sides, no future
+    // delta can arrive at a sub-frontier key on either input, so that key's
+    // match-presence state on both sides is frozen and its already-emitted
+    // output (joined or either-side NULL-padded) is final. Drop those keys from
+    // both traces. See IncrementalLeftJoinOp.CollectGarbage for the full
+    // correctness argument and the both-sides-monotone license the caller must
+    // verify.
     private void CollectGarbage()
     {
         if (_frontier is null || _monotoneKey is null)
@@ -223,7 +234,7 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
     }
 
-    public string MetricName => "IncrementalLeftJoin";
+    public string MetricName => "IncrementalFullJoin";
 
     public long RetainedRows => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
 
@@ -244,19 +255,6 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             return;
         }
 
-        // Guard against a per-key cross-product blowup: a single join key matching millions of
-        // rows on both sides means the key is far too coarse (a low-cardinality or placeholder
-        // value), and materialising left×right would exhaust memory. Fail fast with the key and
-        // both side counts instead of an opaque OutOfMemoryException deep in the allocator.
-        var product = (long)left.Count * right.Count;
-        if (product > CrossProductGuardRows)
-        {
-            throw new InvalidOperationException(
-                $"IncrementalLeftJoin: oversized per-key cross product left={left.Count} × " +
-                $"right={right.Count} = {product} rows for join key [{key}]. The join key is too " +
-                "coarse (a low-cardinality/placeholder value); materialising this would OOM.");
-        }
-
         foreach (var (lv, lw) in left)
         {
             foreach (var (rv, rw) in right)
@@ -266,12 +264,7 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         }
     }
 
-    // A single key producing more than this many joined rows is pathological for an incremental
-    // join (the whole point is bounded per-key work). Big enough not to trip legitimate fan-out,
-    // small enough to fail before a 24 GB+ working set OOMs.
-    private const long CrossProductGuardRows = 5_000_000;
-
-    private void NullPadInto(
+    private void NullPadRightInto(
         ZSetBuilder<TOut, TWeight> output,
         TKey key,
         ZSet<TLeft, TWeight> left)
@@ -283,7 +276,23 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
 
         foreach (var (lv, lw) in left)
         {
-            output.Add(_nullPadCombine(key, lv), lw);
+            output.Add(_nullPadRightCombine(key, lv), lw);
+        }
+    }
+
+    private void NullPadLeftInto(
+        ZSetBuilder<TOut, TWeight> output,
+        TKey key,
+        ZSet<TRight, TWeight> right)
+    {
+        if (right.IsEmpty)
+        {
+            return;
+        }
+
+        foreach (var (rv, rw) in right)
+        {
+            output.Add(_nullPadLeftCombine(key, rv), rw);
         }
     }
 }

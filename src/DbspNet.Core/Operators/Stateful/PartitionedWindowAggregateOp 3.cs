@@ -63,10 +63,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     private readonly IFrontier? _frontier;
     private long _lastGcFrontier = long.MinValue;
     private long _gcDropped;
-    // Last tick's output count, used to pre-size this tick's delta builder
-    // (docs/design-row-representation.md §16.8). The emitted diff spans only
-    // the touched partitions, so no cheap exact bound exists up front.
-    private int _lastOutputSize;
 
     // Per-partition integrated input, sorted by the total-order comparer.
     private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
@@ -141,7 +137,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     public void Step()
     {
         var delta = _input.Current;
-        var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
+        var builder = new ZSetBuilder<TOutRow, Z64>();
 
         if (!delta.IsEmpty)
         {
@@ -190,9 +186,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         CollectGarbage();
-        var result = builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
+        _output.SetCurrent(builder.Build());
     }
 
     /// <summary>Recompute the output rows of one partition whose frame the delta

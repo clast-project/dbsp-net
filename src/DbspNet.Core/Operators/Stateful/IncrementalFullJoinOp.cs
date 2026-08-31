@@ -71,6 +71,10 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private long _lastGcFrontier = long.MinValue;
     private long _gcDropped;
 
+    // Last tick's output count, used to pre-size this tick's delta builder
+    // (docs/design-row-representation.md §16.8).
+    private int _lastOutputSize;
+
     public IncrementalFullJoinOp(
         Stream<IndexedZSet<TKey, TLeft, TWeight>> leftIn,
         Stream<IndexedZSet<TKey, TRight, TWeight>> rightIn,
@@ -133,9 +137,9 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var leftOld = _leftTrace.Current;
         var rightOld = _rightTrace.Current;
 
-        var builder = new ZSetBuilder<TOut, TWeight>();
+        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
 
-        var touched = new HashSet<TKey>();
+        var touched = new HashSet<TKey>(dl.GroupCount + dr.GroupCount);
         foreach (var k in dl.Keys)
         {
             touched.Add(k);
@@ -202,7 +206,9 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             }
         }
 
-        _output.SetCurrent(builder.Build());
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
 
         _leftTrace.Integrate(dl);
         _rightTrace.Integrate(dr);

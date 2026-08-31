@@ -27,12 +27,6 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
     private long _lastGcFrontier = long.MinValue;
     private long _gcDropped;
 
-    // Last tick's output count, used to pre-size this tick's delta builder.
-    // Only presence flips emit, so this is far tighter than the delta count
-    // (docs/design-row-representation.md §16.8 chose last-output for exactly
-    // this selective shape).
-    private int _lastOutputSize;
-
     public DistinctOp(
         Stream<ZSet<TKey, TWeight>> input,
         Stream<ZSet<TKey, TWeight>> output,
@@ -86,7 +80,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
             return;
         }
 
-        var outputBuilder = new ZSetBuilder<TKey, TWeight>(_lastOutputSize);
+        var outputBuilder = new ZSetBuilder<TKey, TWeight>();
         foreach (var (key, dw) in delta)
         {
             var before = _trace.Current.WeightOf(key);
@@ -105,9 +99,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
             }
         }
 
-        var result = outputBuilder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
+        _output.SetCurrent(outputBuilder.Build());
         _trace.Integrate(delta);
         CollectGarbage();
     }

@@ -75,11 +75,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
     private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
     private readonly Dictionary<TKey, Dictionary<TOutRow, long>> _window;
 
-    // Last tick's output count, used to pre-size this tick's delta builder
-    // (docs/design-row-representation.md §16.8). The emitted diff spans only
-    // the touched partitions, so no cheap exact bound exists up front.
-    private int _lastOutputSize;
-
     public PartitionedOffsetOp(
         Stream<ZSet<TInRow, Z64>> input,
         Stream<ZSet<TOutRow, Z64>> output,
@@ -165,7 +160,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             }
         }
 
-        var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
+        var builder = new ZSetBuilder<TOutRow, Z64>();
         if (touched is not null)
         {
             foreach (var key in touched)
@@ -187,9 +182,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             }
         }
 
-        var result = builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
+        _output.SetCurrent(builder.Build());
     }
 
     private static void EmitDiff(

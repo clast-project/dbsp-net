@@ -43,8 +43,7 @@ internal sealed class TypedZSetTraceCodecAdapter<TKey>
         ZSet<TKey, Z64> trace,
         CancellationToken cancellationToken = default)
     {
-        // Key-for-key re-encode — the source count is exact.
-        var b = new ZSetBuilder<StructuralRow, Z64>(trace.Count);
+        var b = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var (key, weight) in trace)
         {
             b.Add(_keyToStruct(key), weight);
@@ -59,7 +58,7 @@ internal sealed class TypedZSetTraceCodecAdapter<TKey>
         CancellationToken cancellationToken = default)
     {
         var loaded = await _inner.LoadAsync(reader, fileName, cancellationToken).ConfigureAwait(false);
-        var b = new ZSetBuilder<TKey, Z64>(loaded.Count);
+        var b = new ZSetBuilder<TKey, Z64>();
         foreach (var (sk, w) in loaded)
         {
             b.Add(_structToKey(sk), w);
