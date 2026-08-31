@@ -844,7 +844,8 @@ public static class TypedExpressionCompiler
                 typeof(ScaleHelper).GetMethod(nameof(ScaleHelper.Rescale128))!,
                 mantissa,
                 Expression.Constant(srcDec.Scale),
-                Expression.Constant(target.Scale));
+                Expression.Constant(target.Scale),
+                Expression.Constant(DecimalRounding.HalfEven));
             var ctor = typeof(Decimal128).GetConstructor([typeof(Int128)])!;
             return Expression.New(ctor, rescaled);
         }
@@ -871,9 +872,10 @@ public static class TypedExpressionCompiler
             return Expression.Call(
                 typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
                     nameof(Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128),
-                    [typeof(ReadOnlySpan<char>), typeof(DecimalType)])!,
+                    [typeof(ReadOnlySpan<char>), typeof(DecimalType), typeof(DecimalRounding)])!,
                 asSpan,
-                Expression.Constant(targetType));
+                Expression.Constant(targetType),
+                Expression.Constant(DecimalRounding.HalfEven));
         }
 
         throw Unsupported();
@@ -918,7 +920,8 @@ public static class TypedExpressionCompiler
             typeof(ScaleHelper).GetMethod(nameof(ScaleHelper.Rescale128))!,
             mantissa,
             Expression.Constant(src.Scale),
-            Expression.Constant(0));
+            Expression.Constant(0),
+            Expression.Constant(DecimalRounding.HalfEven));
         return Expression.Convert(rescaled, dstClr);
     }
 

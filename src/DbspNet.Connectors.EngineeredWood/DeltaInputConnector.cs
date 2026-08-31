@@ -100,7 +100,8 @@ public sealed class DeltaInputConnector : IInputConnector
     private async IAsyncEnumerable<VersionBatch> StreamVersion(
         DeltaTable table, long version, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await foreach (var raw in table.ReadChangesAsync(version, version, cancellationToken).ConfigureAwait(false))
+        var options = new DeltaChangeReadOptions { StartVersion = version, EndVersion = version };
+        await foreach (var raw in table.ReadChangesAsync(options, cancellationToken).ConfigureAwait(false))
         {
             yield return ArrowProjection.Project(raw, _schema!, _resolvedArrow!, Name);
         }

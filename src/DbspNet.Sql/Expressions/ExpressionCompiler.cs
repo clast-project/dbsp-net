@@ -674,7 +674,8 @@ public static class ExpressionCompiler
                     nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
                 mantissa,
                 Expression.Constant(srcDec.Scale),
-                Expression.Constant(target.Scale));
+                Expression.Constant(target.Scale),
+                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
             var ctor = typeof(Clast.DatabaseDecimal.Values.Decimal128).GetConstructor([typeof(Int128)])!;
             converted = Expression.Convert(Expression.New(ctor, rescale), typeof(object));
         }
@@ -716,11 +717,16 @@ public static class ExpressionCompiler
             var parse = Expression.Call(
                 typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
                     nameof(Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128),
-                    [typeof(ReadOnlySpan<char>), typeof(Clast.DatabaseDecimal.DecimalType)])!,
+                    [
+                        typeof(ReadOnlySpan<char>),
+                        typeof(Clast.DatabaseDecimal.DecimalType),
+                        typeof(Clast.DatabaseDecimal.DecimalRounding),
+                    ])!,
                 Expression.Call(
                     typeof(MemoryExtensions).GetMethod(nameof(MemoryExtensions.AsSpan), [typeof(string)])!,
                     asString),
-                Expression.Constant(targetType));
+                Expression.Constant(targetType),
+                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
             converted = Expression.Convert(parse, typeof(object));
         }
         else
@@ -781,7 +787,8 @@ public static class ExpressionCompiler
                     nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
                 mantissa,
                 Expression.Constant(src.Scale),
-                Expression.Constant(0));
+                Expression.Constant(0),
+                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
             var cast = Expression.Convert(rescaled, dstClr);
             converted = Expression.Convert(cast, typeof(object));
         }
