@@ -53,6 +53,15 @@ if (args.Length > 0 && args[0] == "mergeprobe")
 // W=1 per-row cost profile: `dotnet run -- w1profile [events] [batch] [runs]`
 // Per-tuple ns/event + bytes/event + GC across the Nexmark queries at W=1, to
 // locate where per-row execution cost goes (docs/design-row-representation.md §16).
+// SCRATCH: q9 alloc-mode probe — `dotnet run -- allocmode [query] [events] [batch] [iters]`
+if (args.Length > 0 && args[0] == "allocmode")
+{
+    int A(int i, int fb) => args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var v) ? v : fb;
+    DbspNet.Benchmarks.Q9AllocProbe.Run(args.Length > 1 ? args[1] : "q9", A(2, 1_000_000), A(3, 10_000), A(4, 3));
+    return 0;
+}
+
 if (args.Length > 0 && args[0] == "w1profile")
 {
     int Arg(int i, int fallback) =>

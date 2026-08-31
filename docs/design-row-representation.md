@@ -3692,23 +3692,88 @@ q9 (join + partitioned TOP-1) is the one query whose `B/ev` does not reproduce, 
 - M4 Pro HEAD: **bimodal** — 2253 (4 processes) or 2634 (2 processes), never between, stable
   within a process, with `out=1,430` identical in every case.
 
-Identical output with two discrete allocation totals is an internal mode flip, not noise. The
-leading hypothesis is per-process randomized string hashing changing `Dictionary` collision
-distribution and so crossing a resize boundary — q9 carries `item_name` through a string-keyed
-join into a partitioned TOP-K. **This is a hypothesis, not a measurement**; nothing here confirms
-it. What *is* established: both post-arc modes are below the 2727 pre-arc value, so the direction
-is a win either way, and **q9 must not be used as a single-run A/B target.** The other nine
-queries are exact and can be.
+Identical output with two discrete allocation totals is an internal mode flip, not noise.
+**Root-caused in §25.4 — it is a JIT effect over a real boxing cost, and the string-hashing
+hypothesis first recorded here was wrong.** Until the underlying cost is removed, q9 must not be
+used as a single-run A/B target; the other nine queries are exact and can be.
 
-### 25.4 What this changes
+### 25.4 q9 root-caused — the boxed order-key comparer, hidden by escape analysis (MEASURED)
 
-Nothing in the ranked levers — which is the point. The apportionment survived the machine move
-intact, so §16/§17 and the two divergent verdicts (per-row is the whole gap on Nexmark; per-row is
-already at ~parity on batch-1, where the gap is parallelism) stand as written. What the exercise
-bought is a **validated instrument**: `w1profile` `B/ev`, one process, nine queries, byte-exact
-across hosts.
+`allocmode` (`dotnet run -- allocmode q9 1000000 10000 8`) runs q9 N times in ONE process with
+per-operator allocation attribution. Two facts fall straight out:
 
-### 25.5 Measurement landmine found en route
+- **Exactly one operator varies.** Every other operator in q9's circuit is byte-identical across
+  iterations (ApplyOps 101.0 / 76.8 / 47.3 / 26.8 / 18.2 / 12.1 / 8.3 / 7.8 / 3.3 B/ev,
+  `IncrementalInnerJoin` 59.3). Only `op4 PartitionedTopK` moves.
+- **It varies *within* a process** — iteration 0 is low (1196.9, itself varying), iterations 1..7
+  are all exactly 1418.2. A per-process string-hash seed cannot do that. **Hypothesis falsified.**
+
+Bisecting the runtime knobs isolates the mechanism:
+
+| configuration | `PartitionedTopK` B/ev |
+|:--|--:|
+| default (tiered + PGO) | 1418.2, after a varying first iteration |
+| `DOTNET_TieredCompilation=0` | **658.1**, stable |
+| `DOTNET_TieredPGO=0` | **658.1**, stable |
+| `DOTNET_TC_QuickJitForLoops=0` | **658.1**, stable |
+| `DOTNET_TieredCompilationQuickJit=0` | 1418.2 — *not* the cause |
+| `DOTNET_JitObjectStackAllocation=0` (PGO off) | **1796.5**, stable |
+
+The last row is the decisive one. **1796.5 B/ev is the true allocation; the JIT's escape-analysis
+stack allocation is what removes up to 1138 B/ev of it** — and dynamic PGO's inlining decisions
+cost most of that elision back. In the default configuration the engine banks only
+`1796.5 − 1418.2 = 378` of the available `1796.5 − 658.1 = 1138` B/ev — **33%. ~760 B/ev is left
+on the floor**, and *which* side of the transition the measured pass lands on is what makes q9
+bimodal.
+
+**What is actually being allocated.** q9 compiles through the typed inner path — the probe reports
+`sinkRowType = TypedStructuralRow<TRow>` — so `PartitionedTopKOp<TRow,TKey>` is instantiated on a
+**typed struct row**, and its order is a `SortKeyComparer<TRow>` holding
+`Func<TRow, object?>` key extractors. On a typed struct row every extraction is **a heap box per
+key per comparison**, and `SortedDictionary` runs the comparer **O(log n) times per insert**. This
+is precisely the cost `CompileOptions.MonomorphizeWindowOrderKey` (§23.7) was built to remove —
+and that option fires at exactly one site (`TypedPlanCompiler.cs:1450`, the window-aggregate path).
+**Partitioned TOP-K is not covered.**
+
+This also explains why q9 is the *only* affected query, which is the check that makes the story
+hold together rather than merely fit:
+
+- **q18** is partitioned TOP-1 over **size-1 partitions** — near-zero comparisons per insert, so
+  near-zero boxing. Measured byte-identical (2107) under every JIT configuration above.
+- **q19** (limit 10) takes the §22 narrow operator, a different path.
+- **q9**'s partitions are bids-per-auction, averaging ~7.7 rows (920,000 bids over 119,942
+  auctions), so every insert pays several boxed comparisons.
+
+**The lever this surfaces.** Extending §23.7's monomorphized unboxed order key from the
+window-aggregate path to `PartitionedTopKOp` would remove the boxing outright rather than leaving
+it to escape analysis — worth ~760 B/ev against today's default on q9 (−34% of its 2222 B/ev), and
+it would make q9 deterministic again. **Honest scoping:** §23.7's `LongKeyComparer` handles a
+*single* monotone long key; q9 orders by **two** (`price BIGINT DESC, date_time TIMESTAMP ASC`).
+Both are monotone-long-extractable, so a two-key unboxed comparer is feasible — but it is a real
+extension of §23.7, not a reuse of it. **Not built; not measured beyond q9.** The prize scales with
+partition size × comparisons, so it is worth nothing on q18-shaped plans. Whether it matters on
+ivm-bench batch-1 is **unverified** (that data does not exist on this machine) — though the five
+global-`RANK` leaderboard views found in `design-structural-parallel.md` §9.2 are single-partition
+over all rows, which is the maximal case for this cost. That is a lead, not a measurement.
+
+Probe: `Q9AllocProbe.cs` / `dotnet run -- allocmode [query] [events] [batch] [iters]`.
+
+### 25.5 What this changes
+
+The apportionment survived the machine move intact, so §16/§17 and the two divergent verdicts
+(per-row is the whole gap on Nexmark; per-row is already at ~parity on batch-1, where the gap is
+parallelism) stand as written. The exercise bought a **validated instrument** — `w1profile`
+`B/ev`, one process, byte-exact across hosts — and, via §25.4, **one new bounded lever**: extend
+§23.7's unboxed order-key comparer to `PartitionedTopKOp`.
+
+That lever is worth stating carefully, because it is a different *kind* of finding from the rest
+of this arc. Every other remaining per-row lever is blocked behind the columnar/vectorized
+rewrite. This one is bounded, has a shipped precedent (§23.7, byte-identical, default-on), and
+attacks allocation the engine is paying **today, in its default configuration**, that the JIT is
+only accidentally and partially hiding. It is also narrow: it pays only where partitions are large
+enough to make `SortedDictionary` compare repeatedly, which on the Nexmark ladder is q9 alone.
+
+### 25.6 Measurement landmine found en route
 
 `main` had not compiled since `b3d5351`, which committed 15 iCloud `"<name> 3.cs"` conflict copies
 alongside the real edits (131 × CS0111). `git status` reported clean throughout **because the
