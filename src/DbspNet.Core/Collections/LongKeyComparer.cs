@@ -46,23 +46,32 @@ public sealed class LongKeyComparer<TRow> : IComparer<TRow>
 
     public int Compare(TRow? x, TRow? y)
     {
-        if (ReferenceEquals(x, y))
+        // Reference identity and null are meaningful only for a reference row. On a
+        // typed STRUCT row `ReferenceEquals(x, y)` and `x is null` box both operands on
+        // every comparison. `typeof(TRow).IsValueType` is a JIT-time constant in the
+        // struct specialisation, so the whole branch (and its boxing) folds away there,
+        // while reference rows keep the fast identity/null path. Semantics-preserving:
+        // two boxes are never reference-equal, and a value-type row is never null.
+        if (!typeof(TRow).IsValueType)
         {
-            return 0;
+            if (ReferenceEquals(x, y))
+            {
+                return 0;
+            }
+
+            if (x is null)
+            {
+                return -1;
+            }
+
+            if (y is null)
+            {
+                return 1;
+            }
         }
 
-        if (x is null)
-        {
-            return -1;
-        }
-
-        if (y is null)
-        {
-            return 1;
-        }
-
-        var a = _keyOf(x);
-        var b = _keyOf(y);
+        var a = _keyOf(x!);
+        var b = _keyOf(y!);
 
         int c;
         if (a is null || b is null)
@@ -90,6 +99,6 @@ public sealed class LongKeyComparer<TRow> : IComparer<TRow>
             }
         }
 
-        return c != 0 ? c : _tieBreak.Compare(x, y);
+        return c != 0 ? c : _tieBreak.Compare(x!, y!);
     }
 }

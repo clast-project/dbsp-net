@@ -58,6 +58,12 @@ if (args.Length > 0 && args[0] == "allocmode")
 {
     int A(int i, int fb) => args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
         CultureInfo.InvariantCulture, out var v) ? v : fb;
+    if (args.Contains("verify"))
+    {
+        DbspNet.Benchmarks.Q9AllocProbe.Verify(args.Length > 1 ? args[1] : "q9", A(2, 1_000_000), A(3, 10_000));
+        return 0;
+    }
+
     DbspNet.Benchmarks.Q9AllocProbe.Run(args.Length > 1 ? args[1] : "q9", A(2, 1_000_000), A(3, 10_000), A(4, 3));
     return 0;
 }

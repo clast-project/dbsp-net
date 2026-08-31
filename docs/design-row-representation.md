@@ -3694,8 +3694,9 @@ q9 (join + partitioned TOP-1) is the one query whose `B/ev` does not reproduce, 
 
 Identical output with two discrete allocation totals is an internal mode flip, not noise.
 **Root-caused in §25.4 — it is a JIT effect over a real boxing cost, and the string-hashing
-hypothesis first recorded here was wrong.** Until the underlying cost is removed, q9 must not be
-used as a single-run A/B target; the other nine queries are exact and can be.
+hypothesis first recorded here was wrong. RESOLVED in §26: the boxing is gone, and q9 is now
+stable at 1116 B/ev across processes — it is a usable A/B target again, so this exclusion is
+RETIRED.**
 
 ### 25.4 q9 root-caused — the boxed order-key comparer, hidden by escape analysis (MEASURED)
 
@@ -3780,6 +3781,113 @@ alongside the real edits (131 × CS0111). `git status` reported clean throughout
 copies were tracked** — the `icloud-conflict-copies-break-builds` guard looks for *untracked*
 strays and does not catch this. Fixed in `f97874b`. Before trusting any measurement loop, build
 from clean and check `git ls-files | grep ' [0-9]\.'`.
+
+---
+## 26. Unboxed order keys for partitioned TOP-K — the §25.4 lever, BUILT (default-on)
+
+§25.4 root-caused q9's bimodal allocation to the boxed order-key comparer on the typed
+partitioned-TOP-K path and estimated the prize at ~760 B/ev. Built, and the prize was larger than
+the estimate — because chasing it exposed a second, broader boxing source that had been hiding
+behind the first.
+
+### 26.1 What shipped
+
+- **`MultiLongKeyComparer<TRow>`** (Core) — the N-key generalisation of §23.7's
+  `LongKeyComparer<TRow>`. Reads every sort key as an unboxed `long?` and compares longs directly,
+  mirroring `SortKeyComparer`'s semantics key by key: absolute NULL position (never flipped by
+  `DESC`), per-key direction, first non-zero key decides, then the row-level tiebreak.
+- **`CompileOptions.MonomorphizeTopKOrderKey`** (default **on**) — in
+  `TypedPlanCompiler.CompilePartitionedTopK`, build an unboxed extractor for every sort key via the
+  existing `BuildUnboxedOrderKey`. **All-or-nothing**: one non-carrier key and the whole operator
+  keeps the boxed comparer (a mixed comparer would box that key anyway, and all-or-nothing keeps
+  the induced order trivially identical). One key reuses the shipped `LongKeyComparer`; several use
+  `MultiLongKeyComparer`. Both `order` (row-total-order tiebreak) and `sortKeyOnly` (zero tiebreak,
+  RANK/DENSE_RANK tie groups) get unboxed twins.
+- **No operator or `CircuitBuilder` signature changed** — `PartitionedTopKOp` takes an
+  `IComparer<TRow>`, so this only passes a different implementation. The one reflected call
+  (`InvokePartitionedTopK` → `BuildPartitionedTopK<TRow>`) is name-based and both ends were updated
+  together (`typed-compiler-reflection-gotcha`).
+
+### 26.2 The bigger find: the comparers boxed their own null checks
+
+Wiring the unboxed keys moved q9's `PartitionedTopK` from 1418.2 → 1038.7 B/ev — real, but far
+short of the 658.1 floor §25.4 had measured. The residual was in the comparers' own preamble:
+
+```csharp
+if (ReferenceEquals(x, y)) return 0;
+if (x is null) return -1;
+```
+
+For an **unconstrained generic `TRow` instantiated on a struct row, both of these box `x` and `y`**
+— on every comparison, which is exactly the cost the unboxed key extraction had just removed.
+Guarding them with `if (!typeof(TRow).IsValueType) { … }` folds the branch away entirely in the
+struct specialisation (a JIT-time constant) while reference rows keep the fast identity/null path.
+It is semantics-preserving: two fresh boxes are never reference-equal, and a value-type row is
+never null.
+
+Applied to `MultiLongKeyComparer`, then to its two siblings `LongKeyComparer` (§23.7) and
+`SortKeyComparer`:
+
+| stage | q9 `PartitionedTopK` B/ev |
+|:--|--:|
+| before §26 | 1418.2 (bimodal) |
+| + unboxed key extraction | 1038.7 |
+| + `IsValueType` guard | **278.6** |
+
+**−80.4% on the operator**, and *below* the 658.1 the JIT could reach when the boxing was still
+there to elide — because the boxing is now gone rather than optimistically elided.
+
+### 26.3 Measured (M4 Pro, `w1profile` `B/ev`, the §25.1 instrument)
+
+| Query | before (§25) | after §26 | Δ |
+|:--|--:|--:|--:|
+| q9 | 2253 / 2634 (**bimodal**) | **1116, stable** | **−50.5% / −57.6%** |
+| q18 | 2107 | 2106 | −1 |
+| q0, q1, q2, q22, q3, q20, q4, q19 | — | byte-identical | 0 |
+
+**The bimodality is gone** — q9 now reproduces exactly across processes, so it rejoins the nine
+usable A/B targets (§25.3 is retired). The q18 result is the prediction landing: size-1 partitions
+do ~no comparisons, so there is nothing to win, exactly as §25.4 said.
+
+**Window path (`windowmono`, fraud rolling-window, W=1, 400k txns), the shipped default-on §23.7
+surface this change also touches:**
+
+| arm | before | after |
+|:--|--:|--:|
+| boxed (fallback, non-carrier keys) | 33,751.9 MiB | **25,804.0 MiB (−23.5%)** |
+| mono (default) | 22,687.0 MiB | 22,687.0 MiB (**identical**) |
+
+The default arm is untouched — `LongKeyComparer`'s preamble boxing was already being elided there.
+The *fallback* got 23.5% cheaper. Note the mono-vs-boxed ratio moves ×0.672 → ×0.879: that is the
+**baseline improving**, not mono regressing.
+
+### 26.4 Soundness
+
+- **2336 tests green** (+19 new `PartitionedTopKMonomorphizeTests`), mirroring §23.7's structure:
+  every case drives one incremental op-script (inserts *and* retractions) through the structural
+  oracle, the typed boxed circuit and the typed monomorphized circuit at W ∈ {1,2,4,8} and asserts
+  all agree after every tick. Shapes: single DESC key, the **two-key q9 shape** (`BIGINT DESC,
+  TIMESTAMP ASC`) including retracting the current winner so the tie-broken runner-up takes over,
+  RANK and DENSE_RANK tie groups, nullable key with `DESC` (absolute NULL position — the one place
+  the comparers could silently disagree), `DATE` key, and a randomized 25-tick churn over a tiny
+  value domain (heavy tie pressure). Engagement is asserted through a diagnostic counter, and both
+  the non-carrier and mixed-carrier cases assert the gate **declines** and stays correct.
+- **End-to-end equivalence gate**: `dotnet run -- allocmode <q> 1000000 10000 1 verify` A/Bs the
+  option on the full 1M-event stream and compares outputs row-for-row and weight-for-weight.
+  **q9, q18 and q19 all IDENTICAL.**
+
+### 26.5 Scope, honestly
+
+The prize tracks **partition size × comparisons per insert**. It pays on q9 (~7.7 bids/auction) and
+is worth ~nothing on size-1 partitions (q18) — measured, not assumed. Nothing here is measured
+beyond Nexmark: the ivm-bench batch-1 relevance floated in §25.4 (five global-`RANK` leaderboard
+views, single-partition over all rows = the maximal case) **remains unverified** — that data does
+not exist on this machine.
+
+The `IsValueType` guard is the more portable finding. It is a property of every unconstrained
+generic comparer over struct rows, and `SortKeyComparer` is used well beyond TOP-K. Anywhere the
+engine compares typed struct rows through an `IComparer<TRow>`, the same preamble was boxing twice
+per call.
 
 ---
 ## Appendix — sources

@@ -209,6 +209,33 @@ public sealed record CompileOptions
     public bool MonomorphizeWindowOrderKey { get; init; } = true;
 
     /// <summary>
+    /// On the typed partitioned TOP-K path, order the per-partition
+    /// <c>SortedDictionary</c> on <b>unboxed</b> <c>long</c> sort keys (via
+    /// <see cref="DbspNet.Core.Collections.LongKeyComparer{TRow}"/> for one key,
+    /// <see cref="DbspNet.Core.Collections.MultiLongKeyComparer{TRow}"/> for several)
+    /// instead of the boxed <see cref="DbspNet.Core.Collections.SortKeyComparer{TRow}"/>.
+    /// This is <see cref="MonomorphizeWindowOrderKey"/> (§23.7) applied to the second
+    /// operator with the same cost shape: on a typed struct row the boxed comparer
+    /// allocates one heap box per key per comparison, and the TOP-K operator's
+    /// <c>SortedDictionary</c> runs it O(log n) times per insert. Requires <b>every</b>
+    /// sort key to be a monotone-long carrier (integer / TIMESTAMP / TIME / DATE);
+    /// a single non-carrier key keeps the boxed comparer for the whole operator.
+    /// The structural path is unaffected — there the extractors return already-boxed
+    /// <c>object?[]</c> slots, so nothing is allocated per comparison.
+    /// </summary>
+    /// <remarks>
+    /// <b>Default-on</b> (design §26): correctness-equivalent by construction — the
+    /// unboxed comparer mirrors <c>SortKeyComparer</c>'s semantics key-by-key
+    /// (absolute NULL position, per-key DESC, first non-zero key wins, same row-level
+    /// tiebreak), and the long extraction is order-preserving on the carriers it
+    /// accepts. The prize is workload-dependent and tracks <i>partition size</i>: it
+    /// pays where a partition holds enough rows for <c>SortedDictionary</c> to compare
+    /// repeatedly (Nexmark q9, ~7.7 rows/partition) and is worth nothing on size-1
+    /// partitions (q18). Set <c>false</c> to force the boxed comparer.
+    /// </remarks>
+    public bool MonomorphizeTopKOrderKey { get; init; } = true;
+
+    /// <summary>
     /// Opt-in program-level dead-column elimination (docs/design-column-liveness.md).
     /// On the <see cref="PlanToCircuit.CompileProgram"/> path, computes per-view
     /// output-column liveness across the whole view DAG and prunes each view's plan

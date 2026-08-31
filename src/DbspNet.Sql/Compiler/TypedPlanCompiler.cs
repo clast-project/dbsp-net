@@ -54,6 +54,10 @@ public static class TypedPlanCompiler
     [ThreadStatic]
     internal static int MonomorphizedWindowOrderKeyCount;
 
+    /// <summary>Diagnostic counter: typed partitioned TOP-K operators compiled with the
+    /// unboxed order-key comparer (§26). Read by the monomorphization tests.</summary>
+    internal static int MonomorphizedTopKOrderKeyCount;
+
     /// <summary>
     /// Attempts to compile <paramref name="plan"/> into a
     /// <see cref="TypedCompiledQuery"/>. Returns <c>false</c> if any
@@ -1361,6 +1365,37 @@ public static class TypedPlanCompiler
             nullsFirst[i] = sortKey.NullsFirst;
         }
 
+        // §26: the unboxed monotone-long comparer, the TOP-K twin of §23.7. On a typed
+        // struct row the boxed SortKeyComparer allocates one heap box per key per
+        // comparison and SortedDictionary runs it O(log n) times per insert. ALL keys
+        // must be carriers — one non-carrier key and the whole operator keeps the boxed
+        // comparer (a mixed comparer would have to box the non-carrier key anyway, and
+        // the all-or-nothing rule keeps the order trivially identical).
+        Delegate[]? unboxedSortKeys = null;
+        if (ctx.Options.MonomorphizeTopKOrderKey && count > 0)
+        {
+            var unboxed = new Delegate[count];
+            var allCarriers = true;
+            for (var i = 0; i < count; i++)
+            {
+                if (BuildUnboxedOrderKey(plan.SortKeys[i].Expression, rowType) is { } uk)
+                {
+                    unboxed[i] = uk;
+                }
+                else
+                {
+                    allCarriers = false;
+                    break;
+                }
+            }
+
+            if (allCarriers)
+            {
+                unboxedSortKeys = unboxed;
+                MonomorphizedTopKOrderKeyCount++;
+            }
+        }
+
         var partitionExtractors = new Delegate[plan.PartitionKeys.Count];
         for (var i = 0; i < plan.PartitionKeys.Count; i++)
         {
@@ -1391,7 +1426,7 @@ public static class TypedPlanCompiler
         var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Schema, rowType);
         var output = InvokePartitionedTopK(
             ctx.Builder, rowType, topKInput, sortExtractors, descending, nullsFirst,
-            partitionExtractors, plan.Function, plan.Limit, snapshotCodec);
+            partitionExtractors, plan.Function, plan.Limit, snapshotCodec, unboxedSortKeys);
         return new TypedNode(rowType, inner.Schema, output);
     }
 
@@ -3485,7 +3520,7 @@ public static class TypedPlanCompiler
     private static object InvokePartitionedTopK(
         CircuitBuilder builder, Type rowType, object input, Delegate[] sortExtractors,
         bool[] descending, bool[] nullsFirst, Delegate[] partitionExtractors,
-        RankFunction function, long limit, object? snapshotCodec)
+        RankFunction function, long limit, object? snapshotCodec, Delegate[]? unboxedSortKeys)
     {
         var openMethod = typeof(TypedPlanCompiler)
             .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
@@ -3493,7 +3528,8 @@ public static class TypedPlanCompiler
         var closed = openMethod.MakeGenericMethod(rowType);
         return closed.Invoke(null, new object?[]
         {
-            builder, input, sortExtractors, descending, nullsFirst, partitionExtractors, function, limit, snapshotCodec,
+            builder, input, sortExtractors, descending, nullsFirst, partitionExtractors, function, limit,
+            snapshotCodec, unboxedSortKeys,
         })!;
     }
 
@@ -3501,7 +3537,7 @@ public static class TypedPlanCompiler
     private static object BuildPartitionedTopK<TRow>(
         CircuitBuilder builder, object input, Delegate[] sortExtractors,
         bool[] descending, bool[] nullsFirst, Delegate[] partitionExtractors,
-        RankFunction function, long limit, object? snapshotCodec)
+        RankFunction function, long limit, object? snapshotCodec, Delegate[]? unboxedSortKeys)
         where TRow : notnull
     {
         var keys = new Func<TRow, object?>[sortExtractors.Length];
@@ -3510,8 +3546,42 @@ public static class TypedPlanCompiler
             keys[i] = (Func<TRow, object?>)sortExtractors[i];
         }
 
-        var order = new SortKeyComparer<TRow>(keys, descending, nullsFirst, Comparer<TRow>.Default);
-        var sortKeyOnly = new SortKeyComparer<TRow>(keys, descending, nullsFirst, ConstantZeroComparer<TRow>.Instance);
+        // §26: prefer the unboxed comparers when every sort key is a monotone-long
+        // carrier. `order` keeps the row-level total-order tiebreak (SortedDictionary
+        // keying needs Compare(x,y)==0 ⟺ x equals y); `sortKeyOnly` keeps the
+        // zero tiebreak that RANK / DENSE_RANK use to detect tie groups. Both mirror
+        // the boxed comparer's semantics exactly, so the induced order is identical.
+        IComparer<TRow> order;
+        IComparer<TRow> sortKeyOnly;
+        if (unboxedSortKeys is not null)
+        {
+            var longKeys = new Func<TRow, long?>[unboxedSortKeys.Length];
+            for (var i = 0; i < unboxedSortKeys.Length; i++)
+            {
+                longKeys[i] = (Func<TRow, long?>)unboxedSortKeys[i];
+            }
+
+            if (longKeys.Length == 1)
+            {
+                // Reuse the shipped, validated single-key comparer (§23.7).
+                order = new LongKeyComparer<TRow>(
+                    longKeys[0], descending[0], nullsFirst[0], Comparer<TRow>.Default);
+                sortKeyOnly = new LongKeyComparer<TRow>(
+                    longKeys[0], descending[0], nullsFirst[0], ConstantZeroComparer<TRow>.Instance);
+            }
+            else
+            {
+                order = new MultiLongKeyComparer<TRow>(
+                    longKeys, descending, nullsFirst, Comparer<TRow>.Default);
+                sortKeyOnly = new MultiLongKeyComparer<TRow>(
+                    longKeys, descending, nullsFirst, ConstantZeroComparer<TRow>.Instance);
+            }
+        }
+        else
+        {
+            order = new SortKeyComparer<TRow>(keys, descending, nullsFirst, Comparer<TRow>.Default);
+            sortKeyOnly = new SortKeyComparer<TRow>(keys, descending, nullsFirst, ConstantZeroComparer<TRow>.Instance);
+        }
 
         var partKeys = new Func<TRow, object?>[partitionExtractors.Length];
         for (var i = 0; i < partitionExtractors.Length; i++)

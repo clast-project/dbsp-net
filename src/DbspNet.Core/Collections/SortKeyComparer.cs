@@ -55,27 +55,36 @@ public sealed class SortKeyComparer<TRow> : IComparer<TRow>
 
     public int Compare(TRow? x, TRow? y)
     {
-        if (ReferenceEquals(x, y))
+        // Reference identity and null are meaningful only for a reference row. On a
+        // typed STRUCT row `ReferenceEquals(x, y)` and `x is null` box both operands on
+        // every comparison. `typeof(TRow).IsValueType` is a JIT-time constant in the
+        // struct specialisation, so the whole branch (and its boxing) folds away there,
+        // while reference rows keep the fast identity/null path. Semantics-preserving:
+        // two boxes are never reference-equal, and a value-type row is never null.
+        if (!typeof(TRow).IsValueType)
         {
-            return 0;
-        }
+            if (ReferenceEquals(x, y))
+            {
+                return 0;
+            }
 
-        // IComparer must define a total order over the nullable parameter type;
-        // SQL rows are never null references.
-        if (x is null)
-        {
-            return -1;
-        }
+            // IComparer must define a total order over the nullable parameter type;
+            // SQL rows are never null references.
+            if (x is null)
+            {
+                return -1;
+            }
 
-        if (y is null)
-        {
-            return 1;
+            if (y is null)
+            {
+                return 1;
+            }
         }
 
         for (var i = 0; i < _keys.Length; i++)
         {
-            var a = _keys[i](x);
-            var b = _keys[i](y);
+            var a = _keys[i](x!);
+            var b = _keys[i](y!);
 
             int c;
             if (a is null || b is null)
@@ -109,6 +118,6 @@ public sealed class SortKeyComparer<TRow> : IComparer<TRow>
             }
         }
 
-        return _tieBreak.Compare(x, y);
+        return _tieBreak.Compare(x!, y!);
     }
 }

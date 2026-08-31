@@ -20,6 +20,60 @@ namespace DbspNet.Benchmarks;
 
 internal static class Q9AllocProbe
 {
+    /// <summary>
+    /// A/Bs MonomorphizeTopKOrderKey on the same stream and asserts the two output
+    /// Z-sets are identical row-for-row and weight-for-weight — the §26 soundness gate.
+    /// </summary>
+    public static void Verify(string queryId, int totalEvents, int batchSize)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"=== {queryId} monomorphized-TOP-K equivalence gate (events={totalEvents:N0}) ===");
+        var query = NexmarkQueries.All.First(q => q.Id == queryId);
+        var consumed = query.Tables.ToHashSet();
+        var events = Generate(totalEvents);
+
+        var boxed = RunOnce(query.Sql, events, consumed, batchSize, monomorphize: false);
+        var unboxed = RunOnce(query.Sql, events, consumed, batchSize, monomorphize: true);
+
+        Console.WriteLine($"  boxed   : {boxed.Count:N0} distinct output rows");
+        Console.WriteLine($"  unboxed : {unboxed.Count:N0} distinct output rows");
+
+        var mismatches = 0;
+        foreach (var (row, w) in boxed)
+        {
+            if (!unboxed.TryGetValue(row, out var w2) || w2 != w)
+            {
+                if (mismatches++ < 5) Console.WriteLine($"    MISMATCH boxed[{row}]={w} unboxed={(unboxed.TryGetValue(row, out var v) ? v.ToString() : "<absent>")}");
+            }
+        }
+
+        foreach (var (row, _) in unboxed)
+        {
+            if (!boxed.ContainsKey(row) && mismatches++ < 5) Console.WriteLine($"    MISMATCH extra row in unboxed: {row}");
+        }
+
+        Console.WriteLine(mismatches == 0
+            ? "  RESULT: IDENTICAL — every row and weight matches."
+            : $"  RESULT: {mismatches} MISMATCHES.");
+    }
+
+    private static Dictionary<string, long> RunOnce(
+        string sql, List<Event> events, HashSet<NexmarkTable> consumed, int batchSize, bool monomorphize)
+    {
+        var q = Compile(sql, monomorphize);
+        Feed(q, events, consumed, batchSize);
+        var rows = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var (k, w) in q.Current)
+        {
+            if (w.Value == 0) continue;
+            var sb = new StringBuilder();
+            for (var i = 0; i < k.Count; i++) sb.Append(k[i]?.ToString() ?? "<null>").Append('\u001f');
+            rows[sb.ToString()] = w.Value;
+        }
+
+        return rows;
+    }
+
     public static void Run(string queryId, int totalEvents, int batchSize, int iterations)
     {
         Console.WriteLine();
@@ -92,12 +146,14 @@ internal static class Q9AllocProbe
         }
     }
 
-    private static CompiledQuery Compile(string sql)
+    private static CompiledQuery Compile(string sql, bool monomorphizeTopK = true)
     {
         var catalog = new Catalog();
         var resolver = new Resolver(catalog);
         foreach (var s in NexmarkQueries.Ddl) resolver.Resolve(Parser.ParseStatement(s));
         var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
-        return PlanToCircuit.Compile(PlanOptimizer.Optimize(plan));
+        return PlanToCircuit.Compile(
+            PlanOptimizer.Optimize(plan), null,
+            new CompileOptions { MonomorphizeTopKOrderKey = monomorphizeTopK });
     }
 }
