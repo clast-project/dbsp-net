@@ -1,10 +1,12 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/DbspNet.Arrow/DbspNet.Arrow.csproj" />
     <Project Path="src/DbspNet.Benchmarks/DbspNet.Benchmarks.csproj" />
     <Project Path="src/DbspNet.Connectors.Abstractions/DbspNet.Connectors.Abstractions.csproj" />
     <Project Path="src/DbspNet.Connectors.EngineeredWood/DbspNet.Connectors.EngineeredWood.csproj" />
     <Project Path="src/DbspNet.Core/DbspNet.Core.csproj" />
     <Project Path="src/DbspNet.Demo/DbspNet.Demo.csproj" />
+    <Project Path="src/DbspNet.Persistence/DbspNet.Persistence.csproj" />
     <Project Path="src/DbspNet.Server/DbspNet.Server.csproj" />
     <Project Path="src/DbspNet.Sql/DbspNet.Sql.csproj" />
   </Folder>
