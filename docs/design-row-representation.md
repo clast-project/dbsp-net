@@ -3890,6 +3890,63 @@ engine compares typed struct rows through an `IComparer<TRow>`, the same preambl
 per call.
 
 ---
+### 26.6 Audit: every other generic comparer, and a standing detector
+
+§26.2's `IsValueType` finding is a property of unconstrained generic code, not of TOP-K, so the
+rest of the engine was audited for it — by census and, more usefully, empirically.
+
+**Source census.** Seven `IComparer<T>` implementations and two `IEqualityComparer<T>`:
+
+| type | verdict |
+|:--|:--|
+| `SortKeyComparer<TRow>`, `LongKeyComparer<TRow>`, `MultiLongKeyComparer<TRow>` | **had the preamble — fixed in §26.2** |
+| `OrderRowComparer<TRow>` (§22 narrow TOP-K, q19) | clean — takes the `OrderRowKey<TRow>` struct by value, and its null checks are on the `object? Order` field, a genuine reference |
+| `OrderRowEquality<TRow>` | clean — same shape, then delegates to `IEqualityComparer<TRow>` |
+| `ConstantZeroComparer<T>` | clean — `Compare(T? x, T? y) => 0`, no preamble at all |
+| `StructuralRowComparer` | non-generic over a reference type; its `ReferenceEquals` is correct and free |
+| `SqlAggregators.ComparableComparer : IComparer<object>` | object-typed, nothing to box |
+| `PlanCse.StructuralComparer : IEqualityComparer<LogicalPlan>` | compile-time, reference-typed plans |
+
+All ~40 `ReferenceEquals` call sites in `src/` were checked: every one outside the three fixed
+comparers is on a genuine reference type (optimizer plan/expression identity, `ZSet` /
+`IndexedZSet` / `StructuralRow` equality, codec identity). **None is on an unconstrained generic.**
+
+A related trap that is *not* present, worth recording because it would be invisible: emitted row
+structs get `Comparer<TRow>.Default` and `EqualityComparer<TRow>.Default` as tiebreak and dictionary
+equality. Those box on every call if the struct does not implement the matching interface —
+`TypedRowEmitter` implements `IEquatable<TSelf>`, `IComparable<TSelf>` **and** non-generic
+`IComparable` on every emitted type, and its `CompareTo` compares field-by-field through
+strongly-typed `Comparer<TField>.Default`. Nothing boxes. If a future row shape ever skips one of
+those interface implementations, the Defaults silently fall back to boxing reflection comparers.
+
+**The empirical detector, which is the stronger result.** A census only finds what you think to
+grep for. `DOTNET_JitObjectStackAllocation=0` disables escape-analysis stack allocation, so any
+allocation the JIT was *optimistically eliding* — the §25.4 failure mode, where PGO can take the
+elision away and nobody notices until a number goes bimodal — shows up as an allocation increase.
+Sweeping the whole ladder after §26:
+
+| configuration | result |
+|:--|:--|
+| default (tiered + PGO) | baseline |
+| `DOTNET_JitObjectStackAllocation=0` | **byte-identical, all 10 queries** |
+| `DOTNET_TieredCompilation=0` | **byte-identical, all 10 queries** |
+| `DOTNET_TieredPGO=0` | **byte-identical, all 10 queries** |
+| `DOTNET_TC_QuickJitForLoops=0` | **byte-identical, all 10 queries** |
+
+`windowmono` (the other typed surface) likewise: boxed 25,968.8 vs 25,968.7 MiB and mono 22,851.8
+in both, across stack-alloc-off and PGO-off.
+
+**So the engine's allocation is now JIT-configuration-independent on every measured surface.**
+Before §26, q9 varied across every one of those axes. That is a stronger statement than the census:
+it says there is no *remaining* non-escaping heap allocation being elided anywhere the benchmarks
+reach — not merely none in the places we knew to look.
+
+**Standing check.** Add `DOTNET_JitObjectStackAllocation=0` to any allocation A/B. If a query's
+`B/ev` moves, the engine is relying on escape analysis there, and that reliance is fragile: it can
+be silently withdrawn by inlining changes, which is exactly how §25.3's bimodality arose. A number
+that holds under this knob is one you can trust across runtime upgrades.
+
+---
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
