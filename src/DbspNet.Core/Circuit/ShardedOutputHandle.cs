@@ -37,7 +37,16 @@ public sealed class ShardedOutputHandle<TKey, TWeight>
     {
         get
         {
-            var gathered = new ZSetBuilder<TKey, TWeight>();
+            // Every shard is already materialised, so Count is O(1) and the
+            // total is known before the first insert — size once instead of
+            // growing the backing from empty.
+            var total = 0L;
+            foreach (var shard in _shards)
+            {
+                total += shard.Current.Count;
+            }
+
+            var gathered = new ZSetBuilder<TKey, TWeight>((int)Math.Min(total, int.MaxValue));
             foreach (var shard in _shards)
             {
                 gathered.AddRange(shard.Current);

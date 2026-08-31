@@ -90,15 +90,22 @@ internal sealed class BroadcastExchangeOp<TRow, TWeight> : IOperator
         // Gather every worker's shard from our column into the full replica. Each
         // input row lives on one worker, so the union is a concatenation; the
         // builder still sums, harmless if an upstream ever duplicates a row.
-        var gathered = new ZSetBuilder<TRow, TWeight>();
+        // Exact-size the gather before filling it — see the note in ExchangeOp.
+        // Here the union really is a concatenation (each row lives on one
+        // worker), so the sum is the exact final count.
         long gatherRows = 0;
+        for (var src = 0; src < workers; src++)
+        {
+            gatherRows += _coordinator.Read(src, _worker)?.Count ?? 0;
+        }
+
+        var gathered = new ZSetBuilder<TRow, TWeight>((int)Math.Min(gatherRows, int.MaxValue));
         for (var src = 0; src < workers; src++)
         {
             var bucket = _coordinator.Read(src, _worker);
             if (bucket is not null)
             {
                 gathered.AddRange(bucket);
-                gatherRows += bucket.Count;
             }
         }
 

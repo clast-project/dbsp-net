@@ -98,15 +98,26 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         // The sum still goes through a builder because a column-dropping map
         // upstream can place the same row on two source workers, so distinct
         // sources may carry the same key.
-        var gathered = new ZSetBuilder<TKey, TWeight>();
+        // Size the gather to the exact row total first. Reads are plain array
+        // loads off the mailbox, so the counting pass is W loads; growing from
+        // empty instead reallocates the backing ~log2(rows) times, which at
+        // exchange widths is the dominant allocation of the gather
+        // (docs/design-row-representation.md §16.7). The sum is an upper bound,
+        // not exact, only when duplicate keys arrive from two sources (see
+        // above) — over-sizing by the duplicate count is the safe direction.
         long gatherRows = 0;
+        for (var src = 0; src < workers; src++)
+        {
+            gatherRows += _coordinator.Read(src, _worker)?.Count ?? 0;
+        }
+
+        var gathered = new ZSetBuilder<TKey, TWeight>((int)Math.Min(gatherRows, int.MaxValue));
         for (var src = 0; src < workers; src++)
         {
             var bucket = _coordinator.Read(src, _worker);
             if (bucket is not null)
             {
                 gathered.AddRange(bucket);
-                gatherRows += bucket.Count;
             }
         }
 

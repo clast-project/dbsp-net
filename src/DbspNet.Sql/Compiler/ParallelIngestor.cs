@@ -105,7 +105,7 @@ internal sealed class ParallelIngestor<TRow> : ITableIngestor
     {
         var row = Encode(values);
         var shard = NonNegativeShard(_partition(row));
-        var builder = new ZSetBuilder<TRow, Z64>();
+        var builder = new ZSetBuilder<TRow, Z64>(1);
         builder.Add(row, new Z64(weight));
         _handles[shard].Push(builder.Build());
     }
@@ -127,10 +127,12 @@ internal sealed class ParallelIngestor<TRow> : ITableIngestor
     private void PushSerial(IReadOnlyList<(object?[] Values, long Weight)> raw)
     {
         var workers = _workers;
+        // ~raw/W rows per bucket under the hash split (see ShardedInputHandle).
+        var perBucket = (raw.Count / workers) + 1;
         var buckets = new ZSetBuilder<TRow, Z64>[workers];
         for (var j = 0; j < workers; j++)
         {
-            buckets[j] = new ZSetBuilder<TRow, Z64>();
+            buckets[j] = new ZSetBuilder<TRow, Z64>(perBucket);
         }
 
         foreach (var (values, weight) in raw)
@@ -173,7 +175,7 @@ internal sealed class ParallelIngestor<TRow> : ITableIngestor
             sync.Sync();
 
             // Phase 2 — build and push this worker's shard (no re-encoding).
-            var builder = new ZSetBuilder<TRow, Z64>();
+            var builder = new ZSetBuilder<TRow, Z64>((n / workers) + 1);
             for (var i = 0; i < n; i++)
             {
                 if (target[i] == worker)

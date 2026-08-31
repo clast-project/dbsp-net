@@ -49,10 +49,15 @@ public sealed class ShardedInputHandle<TKey, TWeight>
             return;
         }
 
+        // A hash split sends ~delta/W rows to each bucket; size to that rather
+        // than growing all W backings from empty every push. Skew costs a
+        // resize on the heavy bucket, which is what growing from empty already
+        // paid on every bucket.
+        var perBucket = (delta.Count / workers) + 1;
         var buckets = new ZSetBuilder<TKey, TWeight>[workers];
         for (var j = 0; j < workers; j++)
         {
-            buckets[j] = new ZSetBuilder<TKey, TWeight>();
+            buckets[j] = new ZSetBuilder<TKey, TWeight>(perBucket);
         }
 
         foreach (var (key, weight) in delta)
