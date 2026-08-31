@@ -67,9 +67,12 @@ public class IvmBatchProfile
         // fast path per view (structural fallback elsewhere). Off = the shipping
         // 100%-structural program. Everything else matches DbspNetEngine.DeployAsync.
         var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") is "1" or "true" or "TRUE";
-        var options = typeViews
-            ? new CompileOptions { TypeEligibleProgramViews = true }
-            : CompileOptions.Default;
+        var deadCols = Environment.GetEnvironmentVariable("IVM_DEAD_COLS") is "1" or "true" or "TRUE";
+        var options = new CompileOptions
+        {
+            TypeEligibleProgramViews = typeViews,
+            EliminateDeadColumns = deadCols,
+        };
         var program = SqlProgram.Compile(
             spec.Program, outputViews, options: options,
             numericStringCoercion: true, nullCollation: NullCollation.Low);
