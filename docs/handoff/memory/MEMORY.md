@@ -3,8 +3,8 @@
 - [Residual pushdown](residual-pushdown-next.md) — DONE+pushed: join residuals pushed into flat join combine (structural) so temporal SCD joins don't OOM at SF=3. Landmine: Sql.dll incremental build flaky → clean-rebuild before trusting mutation tests
 - [DbspNet overview](dbspnet-overview.md) — what the project is; docs are the source of truth for state/roadmap
 - [Works directly on main](works-directly-on-main.md) — commit/push straight to main; no feature branches unless asked
-- [Docker runs in WSL](docker-runs-in-wsl.md) — don't invoke docker; hand Curt WSL commands for the ivm-bench comparison
-- [ivm-bench repo topology](ivm-bench-repo-topology.md) — TWO checkouts: I edit D:\src\ivm-bench, Curt runs Docker from ~/ivm-bench (WSL); COMMIT+PUSH ivm-bench edits or they never reach him. /mnt/d==D:\
+- [Docker runs in WSL](docker-runs-in-wsl.md) — OBSOLETE after the Mac move; don't invoke docker, hand Curt the commands. See [[machine-migration-to-mac]]
+- [ivm-bench repo topology](ivm-bench-repo-topology.md) — both old checkouts GONE; clone fresh, branch dbspnet-engine-experiments; edits must be COMMITTED+PUSHED or no run sees them
 - [ivm-bench batch-1 perf gap](ivm-bench-batch1-perf-gap.md) — Feldera ~7x faster on SF=3 bulk historical load (20.9s vs 147.6s); the per-row/allocation gap; profile-first. UPDATE: now ~3.5x (gap halved via algorithmic wins) → see [[batch1-next-arc-scoping]]
 - [Batch-1 next-arc scoping](batch1-next-arc-scoping.md) — design §24: at 3.5x, allocation-bound Layer-A floor is the prize; ranked levers (re-profile → bulk-load fast path → columnar → memoized hash); fresh design-first session
 - [Spine SQL integration](spine-sql-integration.md) — DONE: spine traces wired into the compiler
@@ -47,3 +47,6 @@
 - [engineered-wood path_in_schema](engineered-wood-path-in-schema.md) — ROOT CAUSE of "TProtocolException: Invalid data" reading DbspNet parquet: OmitPathInSchema defaulted true; FIXED via DbspNet-side override; committed/pushed, verified pyarrow+DuckDB
 - [ivm-bench validation findings](ivm-bench-validation-findings.md) — SF=3 correctness comparison RAN: 9 views correct; FIXED #1 CAST(DECIMAL AS DOUBLE) fraction drop, #4 default NULL collation (NullCollationMode/Low). Pending: #2 market_volatility input-layer row loss, #3 SCD-2 boundary ties, #5 engineered-wood snappy. diff_columns.py added
 - [Event-time windowing](event-time-windowing.md) — TUMBLE/HOP/SESSION → Nexmark q7/q8/q5/q11/q12; TUMBLE (pure lowering) + typed temporal±INTERVAL → q8/q12 parallel (q8 beats Feldera 1c 1.91×); HOP TVF → q5 (W=24 3.49×, GC unbounded). q7 single (typed-join residual gap); q11/session gated. Levers left: HOP GC, q7 parallelize, q12 per-row
+- [Machine migration to Mac](machine-migration-to-mac.md) — moved off the i9 2026-08-30; Apple Silicon CANNOT rebaseline our benchmarks (W=24 gone, allocation term moves); check the Feldera arm64 manifest first
+- [Feldera source comparison](feldera-source-comparison.md) — one LSM trace, NO hash map on the row path, merging off the step thread; our alloc+hash floor is a hash-indexed-Z-set cost, not a DBSP cost
+- [ivm-bench checkpoint premise wrong](ivm-bench-checkpoint-premise-wrong.md) — Feldera writes ZERO checkpoints in ivm-bench; our per-batch checkpoint cost ~18.7s/batch for nothing

@@ -1,37 +1,35 @@
 ---
 name: ivm-bench-repo-topology
-description: "Two checkouts + WSL/Windows split for the ivm-bench work — where I edit vs where Curt runs Docker, and how they sync"
+description: "ivm-bench topology — both old checkouts are GONE; clone fresh, branch dbspnet-engine-experiments, and edits must be COMMITTED+PUSHED to reach any run"
 metadata: 
   node_type: memory
   type: project
-  originSessionId: 59c84cbd-f811-435b-8b7b-3f6e874d8a8b
-  modified: 2026-07-20T19:48:44.783Z
+  modified: 2026-08-31T02:18:47.278Z
+  originSessionId: 76b7e6c9-eb62-4996-8dd2-e02c5fd00969
 ---
 
-The ivm-bench work spans TWO checkouts on the SAME physical machine (`columnar`):
+**Updated 2026-08-30 for the move off the Windows box** — see
+[[machine-migration-to-mac]]. The old two-checkout topology no longer exists.
 
-- **`D:\src\ivm-bench`** (Windows) — where I (the agent) edit ivm-bench files. My edits
-  land in this working tree.
-- **`/home/curt/ivm-bench`** (WSL-native ext4) — where Curt runs Docker (`benchmark.sh`,
-  compose). Its `mount/` (raw data, results, logs) is **root-owned** (Docker writes as root
-  → needs `sudo` to copy/rm). Branch: `dbspnet-engine-experiments`.
+**Gone from the Windows machine:** `D:\src\ivm-bench` (deleted), `/home/curt/ivm-bench` in WSL
+(deleted), and Docker is not installed in WSL any more. Only `D:\src\ivm-bench-bak` remains — clean,
+fully pushed, kept as a reference copy.
 
-**Sync = git.** Curt commits my `D:\src\ivm-bench` working-tree edits, pushes to GitHub, and
-`git pull`s into `~/ivm-bench`. So **for an ivm-bench edit to reach Curt's Docker runs it must
-be COMMITTED + PUSHED** (origin/dbspnet-engine-experiments), not just left in the D: working
-tree. (dbsp-net is different: its Dockerfile clones from GitHub `clast-project/dbsp-net` at a
-pinned commit, and I push dbsp-net straight to main — so dbsp-net changes reach Docker via the
-DBSPNET_COMMIT bump, independent of the ivm-bench checkout.)
+**Current shape:** clone `https://github.com/CurtHagenlocher/ivm-bench.git`, check out branch
+**`dbspnet-engine-experiments`** (NOT `main` — and note that counting unpushed commits against
+`origin/main` gives a bogus number; use `git rev-list --count '@{u}..HEAD'`). Upstream is
+`mdrakiburrahman/ivm-bench`.
 
-**Landmine that cost a round-trip:** I edited `oat_runner.py` (PRESERVE_RAW patch) in the D:
-working tree but the ivm-bench changes were uncommitted → not on GitHub → Curt's `git pull`
-couldn't get them. Symptom: "mount/raw is empty" after a PRESERVE_RAW=1 run. **ALWAYS commit +
-push ivm-bench edits (to Curt's branch) so the pull works** — don't leave them uncommitted.
+**The rule that survives the move, and the one that caused a lost round-trip:** an ivm-bench edit
+reaches a run only if it is **committed AND pushed**. Nothing reads a local working tree.
 
-**Windows↔WSL data bridge:** `/mnt/d/...` in WSL == `D:\...` in Windows (same disk). So the
-local Docker-free harness ([[ivm-bench-batch1-perf-gap]]) reads data at `D:\ivm-data\...` that
-Curt copies from `~/ivm-bench/mount/raw/3/delta` via `sudo cp -r ... /mnt/d/ivm-data/...`.
-Windows can also reach WSL files via `\\wsl.localhost\<distro>\home\curt\...` if a copy is
-undesirable. dbsp-net local harness + `dotnet` run on the Windows side (D:\src\dbsp-net).
+dbsp-net is separate and the same rule bites harder: `src/containers/dbspnet/Dockerfile` clones
+`clast-project/dbsp-net` from GitHub at a pinned `DBSPNET_COMMIT`, so unpushed dbsp-net commits are
+invisible to every benchmark run on every machine. Bump `DBSPNET_COMMIT` (or `DBSPNET_REPO` for a
+fork) to move the engine.
 
-Related: [[docker-runs-in-wsl]], [[ivm-bench-arc]], [[ivm-bench-batch1-perf-gap]].
+**Prerequisites are just Docker** (`ivm-bench/DBSPNET.md`) — the container clones and builds the
+engine itself. No SF=3 data exists anywhere any more; regenerate via the `spark-batch-loader` datagen
+when a full 3-batch run is actually needed.
+
+Related: [[docker-runs-in-wsl]], [[ivm-bench-arc]], [[ivm-bench-checkpoint-premise-wrong]].
