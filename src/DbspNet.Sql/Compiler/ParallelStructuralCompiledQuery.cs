@@ -104,45 +104,91 @@ public sealed class ParallelCompiledProgram : IDisposable
     public ShardedTableInput Table(string name) => Inputs[name];
 
     /// <summary>
-    /// Commit queued input deltas, fire the whole circuit one tick, then integrate
-    /// each output view's gathered delta into its materialised full-view state.
+    /// Commit queued input deltas and fire the whole circuit one tick. Output views
+    /// are integrated in-circuit, per replica (§10.4), so there is no driver-side
+    /// per-tick view work here.
     /// </summary>
-    public void Step()
-    {
-        Circuit.Step();
-        foreach (var output in Outputs.Values)
-        {
-            output.Accumulate();
-        }
-    }
+    public void Step() => Circuit.Step();
 
     public void Dispose() => Circuit.Dispose();
 }
 
 /// <summary>
-/// One output view of a <see cref="ParallelCompiledProgram"/>: its schema and the
-/// full materialised view contents, integrated on the driver from the per-tick
-/// gathered (summed-across-workers) delta. Mirrors <see cref="ProgramOutput"/>.
+/// One output view of a <see cref="ParallelCompiledProgram"/>: its schema, its
+/// per-tick gathered delta, and the full materialised view contents.
 /// </summary>
+/// <remarks>
+/// <para><b>The view is integrated in-circuit, one integral per replica</b>
+/// (docs/design-structural-parallel.md §10.4). Each worker folds its own shard of
+/// the delta in place — O(|delta|) per tick, sharded across W — and
+/// <see cref="CurrentView"/> is the sum of those W shard integrals, formed on
+/// read. A row produced by two workers has its weights summed, exactly as the
+/// delta gather does.</para>
+/// <para>This replaced a driver-side <c>_view += delta</c>, which copied the whole
+/// view on every tick (<c>ZSet.Plus</c> rebuilds the dictionary), making a run
+/// quadratic in tick count. The cost moved from every tick to every read — and it
+/// also put the view inside the per-worker snapshot subtrees, which is what makes
+/// restore reproduce it (§10.1's gap).</para>
+/// <para>Reads are cached per tick, so repeated reads between steps are free, and
+/// at <c>W == 1</c> the single shard integral is returned directly with no copy.</para>
+/// </remarks>
 public sealed class ParallelProgramOutput
 {
     private readonly ShardedOutputHandle<StructuralRow, Z64> _delta;
-    private ZSet<StructuralRow, Z64> _view = ZSet<StructuralRow, Z64>.Empty;
+    private readonly IReadOnlyList<IntegratedViewHandle<StructuralRow>> _shards;
+    private readonly ParallelCircuit _circuit;
+    private ZSet<StructuralRow, Z64>? _cached;
+    private long _cachedTick = -1;
 
-    internal ParallelProgramOutput(Schema schema, ShardedOutputHandle<StructuralRow, Z64> delta)
+    internal ParallelProgramOutput(
+        Schema schema,
+        ShardedOutputHandle<StructuralRow, Z64> delta,
+        IReadOnlyList<IntegratedViewHandle<StructuralRow>> shards,
+        ParallelCircuit circuit)
     {
         Schema = schema;
         _delta = delta;
+        _shards = shards;
+        _circuit = circuit;
     }
 
     public Schema Schema { get; }
 
+    /// <summary>This tick's gathered output delta (summed across workers).</summary>
+    public ZSet<StructuralRow, Z64> CurrentDelta => _delta.Current;
+
     /// <summary>The full current view contents (valid until the next
     /// <see cref="ParallelCompiledProgram.Step"/>).</summary>
-    public ZSet<StructuralRow, Z64> CurrentView => _view;
+    public ZSet<StructuralRow, Z64> CurrentView
+    {
+        get
+        {
+            // One shard: its integral *is* the view — no sum, no copy.
+            if (_shards.Count == 1)
+            {
+                return _shards[0].Current;
+            }
 
-    /// <summary>Add this tick's gathered output delta into the integrated view.</summary>
-    internal void Accumulate() => _view += _delta.Current;
+            var tick = _circuit.TickCount;
+            if (_cached is not null && _cachedTick == tick)
+            {
+                return _cached;
+            }
+
+            var builder = new ZSetBuilder<StructuralRow, Z64>();
+            foreach (var shard in _shards)
+            {
+                foreach (var (row, weight) in shard.Current)
+                {
+                    builder.Add(row, weight);
+                }
+            }
+
+            _cached = builder.Build();
+            _cachedTick = tick;
+            return _cached;
+        }
+    }
 }
 
 /// <summary>

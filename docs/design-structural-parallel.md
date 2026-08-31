@@ -441,3 +441,48 @@ which is precisely where a per-tick full-view copy is most punishing.
 
 Probe: `ParallelViewProbe.cs` / `dotnet run -- parallelview [ticks] [rowsPerTick]`.
 
+### 10.5 BUILT — in-circuit per-replica integration (2026-08-31)
+
+Shipped exactly as §10.4 concluded. `TryCompileProgramParallel` now emits, per output view,
+`builder.Integrate(stream, viewCodec)` inside the per-replica build closure and outputs the
+pass-through delta; `ParallelProgramOutput` holds the W resulting `IntegratedViewHandle`s and forms
+`CurrentView` as their **sum** (weights summed, as the delta gather does), cached per tick, with
+`W == 1` returning the single shard integral directly and copying nothing. `Accumulate()` and the
+driver-side `_view` are gone, so `ParallelCompiledProgram.Step()` is now just `Circuit.Step()`.
+
+**Performance — the quadratic term is gone.** Same probe, same shapes:
+
+| ticks | view rows | serial | parallel *before* | parallel *after* |
+|--:|--:|--:|--:|--:|
+| 200 | 40,000 | 156.8 MiB | 284.0 MiB | **157.8 MiB** |
+| 400 | 80,000 | 314.0 MiB | 803.5 MiB | **315.8 MiB** |
+| 800 | 160,000 | 628.5 MiB | 2541.5 MiB | **632.2 MiB** |
+
+Parallel allocation is now linear and tracks serial to within ~0.6% (the residue is the sharded-output
+gather). Wall at 800 ticks: **1284 ms → 194 ms**, a 6.6× improvement, and it goes from 3.7× *slower*
+than serial to 1.8× faster.
+
+**Correctness.** `ParallelProgramSnapshotTests` previously asserted the gap as expected behaviour
+(restored view == the delta since restore); it now asserts the **full view is back immediately after
+restore, before any further tick**, and stays equal for a subsequent tick — at W = 1/2/4/8.
+
+The shard sum needed its own oracle, because every other test in that file compares parallel against
+parallel and would pass while being consistently wrong. `ParallelView_EqualsSerialView_AtEveryTick`
+compares against the **serial** program's single in-circuit integral at every tick and every W. Its
+program gained a deliberately non-partitioned view (`SELECT k FROM t` — not grouped, not distinct) so
+one output row really is produced by several workers: `per_k` and `distinct_k` both partition by `k`
+and have shard-disjoint outputs, so they would pass even if the combine were a union. **Verified by
+mutation**: replacing the sum with a union fails the oracle at W=4 and W=8.
+
+Suite 2340 green, repeated three times.
+
+**One unrelated defect this surfaced and fixed:** §26's `MonomorphizedTopKOrderKeyCount` was a
+process-wide static, and two §26 tests assert a shape does *not* engage the gate. Any concurrently
+running test class that compiled a TOP-K bumped it and failed them spuriously — latent flakiness that
+only appeared once the test count grew. It is now `[ThreadStatic]`, which is sound because compilation
+runs entirely on the calling thread. (§23.7's window counter only asserts a strict increase, which is
+race-free, so it stays a plain static.)
+
+**Still open:** this does not by itself give a parallel `ProgramRunner` (§9.5), and nothing here is
+measured on a real sharded program — the probe is W=1 and synthetic, though the mechanism does not
+depend on W.

@@ -613,6 +613,11 @@ public static class PlanToCircuit
         var inputSchemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
         var outputSchemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
 
+        // Per-output-view, one IntegratedViewHandle per replica, filled in shard order
+        // by the build closure below (§10.4).
+        var viewShards = new Dictionary<string, List<IntegratedViewHandle<StructuralRow>>>(
+            StringComparer.Ordinal);
+
         var prevStagingCapacity = SpineStagingConfig.Capacity;
         SpineStagingConfig.Capacity = options.TraceFamily == TraceFamily.Spine ? options.SpineStagingCapacity : 0;
         ParallelCircuit circuit;
@@ -656,7 +661,28 @@ public static class PlanToCircuit
 
                     if (v.IsOutput)
                     {
-                        builder.Output(stream, "view:" + v.ViewName);
+                        // §10.4: integrate IN-CIRCUIT, per replica. Each worker keeps the
+                        // integral of its own shard of the view — O(|delta|) per tick and
+                        // sharded — where the previous driver-side `_view += delta` copied
+                        // the whole view every tick, serially (quadratic in tick count).
+                        // It also makes the view ordinary ISnapshotable operator state, so
+                        // it lands inside the per-worker subtrees ParallelSnapshot already
+                        // writes, closing the §10.1 restore gap with no driver-side region.
+                        // The delta still flows through unchanged for the sharded output.
+                        var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
+                        var integrated = builder.Integrate(stream, viewCodec);
+                        builder.Output(integrated.Output, "view:" + v.ViewName);
+
+                        // The build closure runs once per replica, sequentially in worker
+                        // order (ParallelCircuit.Build), so appending here collects the W
+                        // handles in shard order.
+                        if (!viewShards.TryGetValue(v.ViewName, out var shardList))
+                        {
+                            shardList = new List<IntegratedViewHandle<StructuralRow>>(workers);
+                            viewShards[v.ViewName] = shardList;
+                        }
+
+                        shardList.Add(integrated.View);
                         outputSchemas[v.ViewName] = v.Query.Schema;
                     }
                 }
@@ -679,7 +705,7 @@ public static class PlanToCircuit
         foreach (var (name, schema) in outputSchemas)
         {
             var handle = circuit.ShardedOutput<StructuralRow, Z64>("view:" + name);
-            outputs[name] = new ParallelProgramOutput(schema, handle);
+            outputs[name] = new ParallelProgramOutput(schema, handle, viewShards[name], circuit);
         }
 
         compiled = new ParallelCompiledProgram(circuit, inputs, outputs);

@@ -18,12 +18,13 @@ namespace DbspNet.Tests.Persistence;
 /// operator state checkpoints through <see cref="ParallelSnapshot"/> as W disjoint
 /// <c>worker-{w}/</c> shards.
 /// <para>
-/// <b>Coverage limit, asserted explicitly below.</b> A parallel program integrates
-/// each output view on the <em>driver</em>, not in-circuit, so the materialised view
-/// is outside the per-worker snapshot. Restore therefore reproduces operator state
-/// exactly — the next tick's gathered delta matches an uninterrupted run's — but the
-/// integrated view restarts from empty. (The serial program path has no such gap: its
-/// outputs are in-circuit <c>Integrate</c> operators.)
+/// <b>The former coverage limit is closed (§10.4).</b> Output views used to be
+/// integrated on the <em>driver</em>, outside the per-worker snapshot, so restore
+/// reproduced operator state exactly but the integrated view restarted from empty.
+/// Views are now integrated <em>in-circuit, one integral per replica</em>, so they
+/// are ordinary <c>ISnapshotable</c> state inside the <c>worker-{w}/</c> subtrees.
+/// The tests below assert the full view survives a restore — not merely the delta —
+/// which is what a parallel pause/resume needs.
 /// </para>
 /// </summary>
 public class ParallelProgramSnapshotTests
@@ -33,10 +34,16 @@ public class ParallelProgramSnapshotTests
         "CREATE TABLE t (k INT NOT NULL, v BIGINT NOT NULL)",
         "CREATE VIEW per_k AS SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k",
         "CREATE VIEW distinct_k AS SELECT DISTINCT k FROM t",
+        // Deliberately NOT distinct and NOT grouped: distinct input rows collapse to
+        // the same output row, and `t` shards by whole-row hash, so one output row can
+        // be produced by several workers with weights that must be SUMMED. per_k and
+        // distinct_k both partition by k and so have shard-disjoint outputs — they
+        // would pass even if §10.4's shard combine were a union rather than a sum.
+        "CREATE VIEW k_only AS SELECT k FROM t",
     ];
 
     private static readonly HashSet<string> OutputViews =
-        new(["per_k", "distinct_k"], StringComparer.Ordinal);
+        new(["per_k", "distinct_k", "k_only"], StringComparer.Ordinal);
 
     private static ParallelCompiledProgram CompileParallel(int workers, bool persistent)
     {
@@ -48,27 +55,50 @@ public class ParallelProgramSnapshotTests
         return p!;
     }
 
-    private static void Tick1(ParallelCompiledProgram p)
+    // One definition of the op-script, so serial and parallel are driven from the
+    // same data (the §10.4 oracle below needs both).
+    private static readonly (object?[] Row, long Weight)[][] TickScript =
+    [
+        [([1, 10L], 1), ([1, 20L], 1), ([2, 5L], 1), ([3, 7L], 1)],
+        [([2, 50L], 1), ([1, 10L], -1), ([4, 1L], 1)],
+        [([3, 300L], 1), ([4, 1L], -1), ([5, 9L], 1)],
+    ];
+
+    private static void Apply(ParallelCompiledProgram p, int tick)
     {
-        p.Table("t").Insert(1, 10L);
-        p.Table("t").Insert(1, 20L);
-        p.Table("t").Insert(2, 5L);
-        p.Table("t").Insert(3, 7L);
+        foreach (var (row, weight) in TickScript[tick])
+        {
+            if (weight > 0)
+            {
+                p.Table("t").Insert(row);
+            }
+            else
+            {
+                p.Table("t").Delete(row);
+            }
+        }
     }
 
-    private static void Tick2(ParallelCompiledProgram p)
+    private static void Apply(CompiledProgram p, int tick)
     {
-        p.Table("t").Insert(2, 50L);
-        p.Table("t").Delete(1, 10L);
-        p.Table("t").Insert(4, 1L);
+        foreach (var (row, weight) in TickScript[tick])
+        {
+            if (weight > 0)
+            {
+                p.Table("t").Insert(row);
+            }
+            else
+            {
+                p.Table("t").Delete(row);
+            }
+        }
     }
 
-    private static void Tick3(ParallelCompiledProgram p)
-    {
-        p.Table("t").Insert(3, 300L);
-        p.Table("t").Delete(4, 1L);
-        p.Table("t").Insert(5, 9L);
-    }
+    private static void Tick1(ParallelCompiledProgram p) => Apply(p, 0);
+
+    private static void Tick2(ParallelCompiledProgram p) => Apply(p, 1);
+
+    private static void Tick3(ParallelCompiledProgram p) => Apply(p, 2);
 
     private static Dictionary<string, long> Materialize(ZSet<StructuralRow, Z64> zset, int width)
     {
@@ -92,30 +122,12 @@ public class ParallelProgramSnapshotTests
         return map;
     }
 
-    // reference-after-tick3 minus reference-after-tick2 == the delta a restored
-    // engine (whose driver view starts empty) accumulates on tick 3.
-    private static Dictionary<string, long> Difference(
-        Dictionary<string, long> after, Dictionary<string, long> before)
-    {
-        var d = new Dictionary<string, long>(after, StringComparer.Ordinal);
-        foreach (var (k, v) in before)
-        {
-            d[k] = d.GetValueOrDefault(k) - v;
-            if (d[k] == 0)
-            {
-                d.Remove(k);
-            }
-        }
-
-        return d;
-    }
-
     [Theory]
     [InlineData(1)]
     [InlineData(2)]
     [InlineData(4)]
     [InlineData(8)]
-    public async Task SnapshotAndRestore_Program_ReproducesOperatorState(int workers)
+    public async Task SnapshotAndRestore_Program_ReproducesViewAndOperatorState(int workers)
     {
         var fs = new InMemoryTableFileSystem();
 
@@ -132,10 +144,14 @@ public class ParallelProgramSnapshotTests
         reference.Step();
         producer.Step();
 
-        var referenceAfter2 = new Dictionary<string, Dictionary<string, long>>(StringComparer.Ordinal);
+        // The producer's views must match the reference before we checkpoint —
+        // otherwise a post-restore match would prove nothing.
         foreach (var (name, o) in reference.Outputs)
         {
-            referenceAfter2[name] = Materialize(o.CurrentView, o.Schema.Count);
+            var producerOut = producer.Outputs[name];
+            Assert.Equal(
+                Materialize(o.CurrentView, o.Schema.Count),
+                Materialize(producerOut.CurrentView, producerOut.Schema.Count));
         }
 
         // Checkpoint the producer's W shards. Threading the codecs is what makes
@@ -151,6 +167,18 @@ public class ParallelProgramSnapshotTests
         Assert.Equal(ops, loaded);
         Assert.Equal(producer.Circuit.TickCount, restored.Circuit.TickCount);
 
+        // Immediately after restore — before any further tick — the full view must
+        // already be back. This is the assertion the driver-side design could not make.
+        foreach (var (name, o) in reference.Outputs)
+        {
+            var restoredOut = restored.Outputs[name];
+            Assert.Equal(
+                Materialize(o.CurrentView, o.Schema.Count),
+                Materialize(restoredOut.CurrentView, restoredOut.Schema.Count));
+        }
+
+        // And it keeps tracking: one more tick on both sides stays equal, so the
+        // restored integral is genuinely live state, not a one-shot reload.
         Tick3(reference);
         Tick3(restored);
         reference.Step();
@@ -158,11 +186,45 @@ public class ParallelProgramSnapshotTests
 
         foreach (var (name, o) in reference.Outputs)
         {
-            var expectedDelta = Difference(
-                Materialize(o.CurrentView, o.Schema.Count), referenceAfter2[name]);
             var restoredOut = restored.Outputs[name];
             Assert.Equal(
-                expectedDelta, Materialize(restoredOut.CurrentView, restoredOut.Schema.Count));
+                Materialize(o.CurrentView, o.Schema.Count),
+                Materialize(restoredOut.CurrentView, restoredOut.Schema.Count));
+        }
+    }
+
+    /// <summary>
+    /// The oracle for §10.4's shard sum: a parallel program's <c>CurrentView</c> is
+    /// formed by summing W per-replica integrals, so it must equal the <b>serial</b>
+    /// program's single in-circuit integral at every W. Without this, the other tests
+    /// in this file would pass while being consistently wrong — they compare parallel
+    /// against parallel.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void ParallelView_EqualsSerialView_AtEveryTick(int workers)
+    {
+        var serial = SqlProgram.Compile(ProgramSql, OutputViews);
+        using var parallel = CompileParallel(workers, persistent: false);
+
+        for (var tick = 0; tick < TickScript.Length; tick++)
+        {
+            Apply(serial, tick);
+            Apply(parallel, tick);
+            serial.Step();
+            parallel.Step();
+
+            foreach (var name in OutputViews)
+            {
+                var s = serial.Outputs[name];
+                var p = parallel.Outputs[name];
+                Assert.Equal(
+                    Materialize(s.CurrentView, s.Schema.Count),
+                    Materialize(p.CurrentView, p.Schema.Count));
+            }
         }
     }
 

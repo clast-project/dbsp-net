@@ -54,8 +54,20 @@ public static class TypedPlanCompiler
     [ThreadStatic]
     internal static int MonomorphizedWindowOrderKeyCount;
 
-    /// <summary>Diagnostic counter: typed partitioned TOP-K operators compiled with the
-    /// unboxed order-key comparer (§26). Read by the monomorphization tests.</summary>
+    /// <summary>
+    /// Diagnostic counter: typed partitioned TOP-K operators compiled with the unboxed
+    /// order-key comparer (§26). Read by the monomorphization tests.
+    /// </summary>
+    /// <remarks>
+    /// <b>Thread-static deliberately.</b> The §26 tests include *negative* assertions —
+    /// "this shape must NOT engage the gate" — which a process-wide counter cannot
+    /// support: any concurrently-running test class that compiles a TOP-K would bump it
+    /// and fail them spuriously. (§23.7's window counter only ever asserts a strict
+    /// increase, which is race-free, so it stays a plain static.) Compilation runs
+    /// entirely on the calling thread — <c>ParallelCircuit.Build</c> builds its replicas
+    /// sequentially — so a thread-local count is exactly this caller's compiles.
+    /// </remarks>
+    [ThreadStatic]
     internal static int MonomorphizedTopKOrderKeyCount;
 
     /// <summary>
