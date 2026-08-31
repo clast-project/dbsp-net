@@ -53,6 +53,15 @@ if (args.Length > 0 && args[0] == "mergeprobe")
 // W=1 per-row cost profile: `dotnet run -- w1profile [events] [batch] [runs]`
 // Per-tuple ns/event + bytes/event + GC across the Nexmark queries at W=1, to
 // locate where per-row execution cost goes (docs/design-row-representation.md §16).
+// SCRATCH: parallel output-view integrate probe — `dotnet run -- parallelview [ticks] [rows]`
+if (args.Length > 0 && args[0] == "parallelview")
+{
+    int P(int i, int fb) => args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var v) ? v : fb;
+    DbspNet.Benchmarks.ParallelViewProbe.Run(P(1, 200), P(2, 200));
+    return 0;
+}
+
 // SCRATCH: q9 alloc-mode probe — `dotnet run -- allocmode [query] [events] [batch] [iters]`
 if (args.Length > 0 && args[0] == "allocmode")
 {

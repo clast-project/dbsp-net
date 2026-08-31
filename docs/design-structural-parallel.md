@@ -272,9 +272,11 @@ snapshot. The parallel checkpoint restores **operator state exactly** — `Paral
 asserts the post-restore tick's gathered delta equals an uninterrupted run's — but the integrated
 views restart empty. That is enough to price the checkpoint, not yet enough for a parallel recovery.
 The serial path has no such gap (its outputs are in-circuit `Integrate` operators, snapshotted like
-any other stateful operator). Closing it needs either in-circuit integration per replica (which would
-add per-tick work, so: no) or a driver-side region in the snapshot tree — a follow-on, and moot until
-there is a parallel `ProgramRunner` at all (§9.2/§9.5).
+any other stateful operator). ~~Closing it needs either in-circuit integration per replica (which would
+add per-tick work, so: no) or a driver-side region in the snapshot tree~~ — **this reasoning is
+inverted; see §10.4.** The driver-side accumulate is O(|view|) *per tick* and serial, where in-circuit
+integration is O(|delta|) and sharded. In-circuit is strictly better on both correctness and
+performance.
 
 CI: `ProgramRunnerCheckpointTests` (restore resumes without replaying or skipping; every batch
 checkpoints; codecs do not change results) and `ParallelProgramSnapshotTests` (per-worker round-trip
@@ -383,3 +385,59 @@ written by an incompatible compiler configuration" diagnostic. Stamping such a m
 `SnapshotManifest` would only improve the *error message* — the behaviour is already fail-safe — so it
 is deferred as a low-priority nicety, to be picked up if/when checkpoint portability across engine
 versions becomes a real operational concern.
+
+### 10.4 The driver-side view is O(|view|) per tick — §10.1's reasoning was inverted (MEASURED 2026-08-31)
+
+§10.1 called the driver-side view a *coverage limit* and rejected the alternative — in-circuit
+integration per replica — on the grounds that it "would add per-tick work". **That is backwards, and
+the cost is quadratic.**
+
+```csharp
+// ParallelProgramOutput.Accumulate(), called for every output view, every Step():
+internal void Accumulate() => _view += _delta.Current;
+```
+
+`ZSet.operator+` → `Plus` → `ZSetBuilder.From(_entries)`, which allocates a `Dictionary` sized to the
+**whole view** and copies every entry (`ZSetBuilder.cs:120-131`) before folding in the delta. So each
+tick copies the entire materialised view, on the driver, serially. The in-circuit operator it was
+compared against does the opposite: `IntegrateOp.Step()` is `_view.Integrate(delta)` — **O(|delta|),
+in place**.
+
+**Measured** (`dotnet run -- parallelview <ticks> 200`, same program / data / final view on both
+paths; only the integrate differs):
+
+| ticks | final view | serial alloc | parallel alloc | serial wall | parallel wall |
+|--:|--:|--:|--:|--:|--:|
+| 200 | 40,000 | 156.8 MiB | 284.0 MiB | 214 ms | 104 ms |
+| 400 | 80,000 | 314.0 MiB | 803.5 MiB | 252 ms | 331 ms |
+| 800 | 160,000 | 628.5 MiB | **2541.5 MiB** | 345 ms | **1284 ms** |
+
+Serial doubles exactly with the work (156.8 → 314.0 → 628.5 = linear). Parallel goes
+284 → 803 → 2541 — **≈4× per doubling of ticks, i.e. quadratic in tick count**. Wall follows
+(3.2×, 3.9×). At 200 ticks the parallel path is *faster*; the crossover is before 400, and by 800 it
+is **3.7× slower than serial** — on the path whose entire purpose is to be faster.
+
+It does not improve with W. The gather shards; `Accumulate` stays on the driver, so raising W speeds
+up everything *except* this term and makes its relative share worse.
+
+**This changes the fix.** Moving the integrate in-circuit, per replica, is not a trade — it is
+strictly better on both axes at once:
+
+- **Correctness (the reason this was opened):** the view becomes ordinary `ISnapshotable` operator
+  state, inside the per-worker subtrees `ParallelSnapshot` already writes. The §10.1 gap closes with
+  no new "driver-side region" in the snapshot tree, and pause/resume on the parallel path becomes
+  possible at all.
+- **Performance:** O(|delta|) per tick instead of O(|view|), and sharded across W instead of serial
+  on the driver.
+
+Open design point, tractable but not free: `CurrentView` would become a gather across the W replica
+integrals (their sum, since a row produced by two workers must have its weights summed, exactly as
+the delta gather already does). That moves an O(|view|) cost from *every tick* to *every read* — and
+reads are rare (a pause, or an explicit query) where ticks are not.
+
+**Also worth noting for the ivm-bench arc:** this is a plausible part of why the parallel program path
+was never wired into `ProgramRunner` (§9.5). Batch-1 drives many ticks against million-row views,
+which is precisely where a per-tick full-view copy is most punishing.
+
+Probe: `ParallelViewProbe.cs` / `dotnet run -- parallelview [ticks] [rowsPerTick]`.
+
