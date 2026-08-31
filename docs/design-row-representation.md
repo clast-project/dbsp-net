@@ -3614,6 +3614,109 @@ the columnar rewrite (3); let the numbers pick. Relates to [[per-row-execution-e
 
 ---
 
+## 25. Re-baselining the W=1 allocation apportionment on the M4 Pro (MEASURED)
+
+The machine moved (i9-12900K → M4 Pro, `machine-migration-to-mac`), and every number in §16/§17
+— the whole ranked-lever structure — was measured on the i9. Before committing to any further
+lever, the apportionment needed re-establishing on the new host. It was, and the result is more
+useful than a fresh baseline.
+
+### 25.1 Allocation is machine- and runtime-independent — the i9 apportionment stands
+
+A detached worktree at the pre-arc commit (`b5f90aa~1`), built and run on the M4 Pro, reproduces
+the i9 table **byte-exactly** on 9 of 10 queries:
+
+| Query | i9 B/ev (`7e4d054`, .NET 10.0.9, 24c) | M4 Pro B/ev (same commit, .NET 10.0.8, 14c) |
+|:------|--------:|--------:|
+| q0  | 719  | **719**  |
+| q1  | 835  | **835**  |
+| q2  | 581  | **581**  |
+| q22 | 948  | **948**  |
+| q3  | 89   | **89**   |
+| q20 | 1291 | **1291** |
+| q4  | 2376 | **2376** |
+| q18 | 2175 | 2173 (−2) |
+| q19 | 1734 | **1734** |
+| q9  | 2345 | 2727 — *see §25.3* |
+
+Different CPU architecture, different core count, different .NET patch level, identical allocated
+bytes per event. **`B/ev` is a deterministic property of the code, not of the host.** Two
+consequences:
+
+- **The §16/§17 apportionment does not need re-deriving.** Layer A ≈ 55–60% / Layer B ≈ 40–45%,
+  and the ranked levers that follow from it, carry over to this machine unchanged. The concern
+  that "the allocation term moves on Apple Silicon" is **falsified** — it does not move at all.
+- **`w1profile`'s `B/ev` is the trustworthy A/B instrument on this box**, and one process is
+  enough. This is the deterministic probe the recent memories keep pointing at
+  (`parallel-path-presizing`, `range-shaped-dispatch-repriced`); now it has a cross-machine proof.
+
+**Wall time is the opposite** — the M4 Pro runs the *same commit* ~1.3–1.6× faster per event
+(q0 494→305, q4 2046→1282, q18 1978→1380 ns/ev). Cross-machine `ns/ev` comparisons are
+meaningless, and within this machine q18's ns/ev alone spans 1279–1930 across processes.
+**Never claim a wall delta from `w1profile`.**
+
+### 25.2 The three recent commits, isolated on one machine
+
+With the host controlled, `b5f90aa` (de-boxed enumerators) + `ef82b33` (parallel pre-sizing) +
+`b3d5351` (pre-sizing audit) are cleanly attributable:
+
+| Query | pre-arc | HEAD | Δ B/ev | Δ % |
+|:------|--------:|-----:|-------:|----:|
+| q0  | 719  | 653  | **−66**  | −9.2%  |
+| q1  | 835  | 769  | **−66**  | −7.9%  |
+| q2  | 581  | 515  | **−66**  | −11.4% |
+| q22 | 948  | 882  | **−66**  | −7.0%  |
+| q19 | 1734 | 1668 | **−66**  | −3.8%  |
+| q18 | 2173 | 2107 | **−66**  | −3.0%  |
+| q3  | 89   | 83   | −6       | −6.7%  |
+| q20 | 1291 | 1190 | −101     | −7.8%  |
+| q4  | 2376 | 2222 | −154     | −6.5%  |
+
+The **−66 B/ev is a constant**, identical across passthrough, projection, filter, string-projection
+and both TOP-K shapes. It is not a per-operator saving — it is a fixed per-event cost on the
+**shared ingest/egest path**, which is why q3 shows only −6 (q3 reads `auction`+`person` ≈ 8% of
+the stream, and 8% × 66 ≈ 5–6). Queries with join-heavy internals bank more on top: q20 −101,
+q4 −154.
+
+Note what this says about `b5f90aa`: `range-shaped-dispatch-repriced` recorded its allocation
+saving as "0.32% of total" and its value as dispatch. On the shared path that framing holds, but
+the three commits together move **3–11% of B/ev on every query**, and −6.5% on q4 — the arc's
+worst gap query, which §16.9's lazy-boxing lever could not move at all.
+
+### 25.3 q9 is not a reproducible measurement — exclude it from A/B
+
+q9 (join + partitioned TOP-1) is the one query whose `B/ev` does not reproduce, at any commit:
+
+- i9 `7e4d054`: 2345
+- M4 Pro pre-arc: 2727, twice
+- M4 Pro HEAD: **bimodal** — 2253 (4 processes) or 2634 (2 processes), never between, stable
+  within a process, with `out=1,430` identical in every case.
+
+Identical output with two discrete allocation totals is an internal mode flip, not noise. The
+leading hypothesis is per-process randomized string hashing changing `Dictionary` collision
+distribution and so crossing a resize boundary — q9 carries `item_name` through a string-keyed
+join into a partitioned TOP-K. **This is a hypothesis, not a measurement**; nothing here confirms
+it. What *is* established: both post-arc modes are below the 2727 pre-arc value, so the direction
+is a win either way, and **q9 must not be used as a single-run A/B target.** The other nine
+queries are exact and can be.
+
+### 25.4 What this changes
+
+Nothing in the ranked levers — which is the point. The apportionment survived the machine move
+intact, so §16/§17 and the two divergent verdicts (per-row is the whole gap on Nexmark; per-row is
+already at ~parity on batch-1, where the gap is parallelism) stand as written. What the exercise
+bought is a **validated instrument**: `w1profile` `B/ev`, one process, nine queries, byte-exact
+across hosts.
+
+### 25.5 Measurement landmine found en route
+
+`main` had not compiled since `b3d5351`, which committed 15 iCloud `"<name> 3.cs"` conflict copies
+alongside the real edits (131 × CS0111). `git status` reported clean throughout **because the
+copies were tracked** — the `icloud-conflict-copies-break-builds` guard looks for *untracked*
+strays and does not catch this. Fixed in `f97874b`. Before trusting any measurement loop, build
+from clean and check `git ls-files | grep ' [0-9]\.'`.
+
+---
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,
