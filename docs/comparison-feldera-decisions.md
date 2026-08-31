@@ -270,6 +270,54 @@ DbspNet has no equivalent. **Part of the residual 3.5× on ivm-bench batch 1 may
 than per-row** — we are computing intermediate states they skip entirely. This is a separate axis from
 everything above and was not on our roadmap.
 
+### 6.3 `+stored: true` — a whole view chain Feldera computes and we skip (2026-08-31)
+
+A second premise problem, found while checking §4.2 and confirmed in both dbt projects.
+
+`ivm-bench`'s `dbt_project.yml` — **identically in the `feldera` and `dbspnet` projects** — declares
+one gold view with no output connector at all:
+
+```yaml
+fact_market_history:
+  # NOTE: At SF=100, the truncate-mode delta_table_output for this
+  # 54M+ row materialized view never drains … Drop the output connector so
+  # Feldera computes the view in-memory but skips the Delta write …
+  # The benchmark still measures the compute cost; no Delta is persisted.
+  +stored: true
+```
+
+The intent is explicit: **Feldera still computes and materialises the view**; only the Delta write is
+dropped.
+
+**We do not compute it at all.** `dbt_to_program.py` derives `outputs` / `output_bindings` from
+`+connectors` alone and skips `+stored` as a config key it does not model
+(`services/dbt_to_program.py:117` — *"a config key (+materialized, +stored, …), not a model"*). With
+no connector there is no output binding, so `fact_market_history` is not an output, and
+`CompileProgram`'s dead-view pruning removes it **together with its whole upstream chain** —
+`finwire_financial → financials → wrk_company_financials → fact_market_history`, exactly the 4-view
+chain `ColumnLivenessProbe` reported as already-pruned (design-row-representation §24).
+
+**This makes the ivm-bench batch-1 comparison asymmetric in our favour.** Feldera computes a view
+chain we never build. The asymmetry is at least:
+
+- `fact_market_history` itself (54M+ rows at SF=100; unmeasured at SF=3), plus its three upstream views;
+- and the `daily_market` window operators that exist *only* to feed it — op348 + op350 + op349, measured
+  at **~3.4 GiB, ≈7.6% of the 44.74 GiB batch-1 allocation** (§24). Our column-liveness work correctly
+  called those dead *for our outputs*, but Feldera is not given the same licence by this config.
+
+So the headline **~3.4:1 batch-1 ratio is measured with DbspNet doing strictly less work**, and the
+true engine-to-engine gap on the same workload is wider by whatever that chain costs. This does not
+touch the Nexmark numbers (§26/§25, different harness entirely), and it does not change any
+*allocation* result — but every ivm-bench batch-1 ratio in these docs inherits the caveat.
+
+**Fixing it is a spec-generation change, not an engine change:** teach `dbt_to_program.py` to honour
+`+stored: true` as "materialise this view even though nothing reads it" — which needs the delta-only
+vs stored distinction §4.2 says we lack, since the honest translation is "stored, no output binding".
+Until then, quote batch-1 ratios with this caveat attached.
+
+**Not measured.** No SF=3 data exists on the current machine; the ~3.4 GiB figure is the earlier i9
+measurement of the upstream window ops only, and `fact_market_history`'s own cost at SF=3 is unknown.
+
 ## 7. Parallelism: they pay *more* coordination, over bigger ticks
 
 Our exchange/scaling arc concluded (design §15) that the ceiling is barrier coordination at fine ticks,
