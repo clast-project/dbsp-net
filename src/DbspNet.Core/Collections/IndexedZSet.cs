@@ -42,7 +42,16 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     public bool ContainsKey(TKey key) => _groups.ContainsKey(key);
 
-    public IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>> GetEnumerator() => _groups.GetEnumerator();
+    /// <summary>
+    /// The dictionary's own struct enumerator, returned by value so
+    /// <c>foreach</c> binds to it by pattern rather than through
+    /// <see cref="IEnumerable{T}"/> — see the note on
+    /// <see cref="ZSet{TKey,TWeight}.GetEnumerator"/> for the cost this avoids.
+    /// </summary>
+    public Dictionary<TKey, ZSet<TValue, TWeight>>.Enumerator GetEnumerator() => _groups.GetEnumerator();
+
+    IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
+        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => _groups.GetEnumerator();
 
     IEnumerator IEnumerable.GetEnumerator() => _groups.GetEnumerator();
 

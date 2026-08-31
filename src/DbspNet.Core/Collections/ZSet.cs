@@ -227,7 +227,31 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         return new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>(_entries));
     }
 
-    public IEnumerator<KeyValuePair<TKey, TWeight>> GetEnumerator() => _entries.GetEnumerator();
+    /// <summary>
+    /// The dictionary's own struct enumerator, returned by value so
+    /// <c>foreach</c> binds to it by pattern rather than through
+    /// <see cref="IEnumerable{T}"/>.
+    /// </summary>
+    /// <remarks>
+    /// Returning <c>IEnumerator&lt;&gt;</c> here would box this struct once per
+    /// enumeration and turn every <c>MoveNext</c>/<c>Current</c> into an
+    /// interface call — a per-row dispatch tax paid by every operator on every
+    /// tick. Measured end-to-end through a fused map/filter circuit (4
+    /// alternating A/B reps, M4 Pro): -13.5% wall on the many-ticks/few-rows
+    /// shape (100 rows x 20k ticks), -2.3% on the wide shape (10k rows x 300
+    /// ticks), inconclusive on 8-row ticks. Allocation drops by exactly 28 B
+    /// per enumeration, which is 3.0% of total on the tiny shape but only
+    /// 0.003% on the wide one — the dominant allocation is the fresh output
+    /// dictionary, not this. So this buys back dispatch, not the Layer-A
+    /// allocation floor. Exposing the concrete enumerator is deliberate: this
+    /// type is the dictionary-backed multiset, and the abstraction that lets a
+    /// sorted run stand in its place is <see cref="IMultiset{TKey,TWeight}"/>,
+    /// not this method.
+    /// </remarks>
+    public Dictionary<TKey, TWeight>.Enumerator GetEnumerator() => _entries.GetEnumerator();
+
+    IEnumerator<KeyValuePair<TKey, TWeight>> IEnumerable<KeyValuePair<TKey, TWeight>>.GetEnumerator() =>
+        _entries.GetEnumerator();
 
     IEnumerator IEnumerable.GetEnumerator() => _entries.GetEnumerator();
 
