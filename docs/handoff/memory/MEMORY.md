@@ -57,4 +57,4 @@
 - [Parallel-path pre-sizing](parallel-path-presizing.md) — ef82b33: exact-size the exchange gather/shard/ingest builders → W>1 allocation −42–50%, Nexmark q4 +24%; ~45 bare-ctor sites still unaudited
 - [iCloud conflict copies break builds](icloud-conflict-copies-break-builds.md) — repo is under iCloud-synced ~/Documents; A/B loops spawn 'File 2.cs' → CS0101, and --no-build then measures a STALE binary. Guard every measurement loop
 - [Delta-builder pre-sizing audit](delta-builder-presizing-audit.md) — b3d5351: audited all remaining bare ZSetBuilder ctors; what was sized, and what was deliberately left (spine, batch evaluator, the unsizable inner multiset)
-- [Repo location and siblings](repo-location-and-siblings.md) — moved to ~/src/dbsp-net 2026-08-31 (out of iCloud); feldera/ivm-bench stayed in ~/Documents/GitHub so they are no longer siblings
+- [Repo location and siblings](repo-location-and-siblings.md) — dbsp-net + feldera + ivm-bench all moved to ~/src 2026-08-31 (out of iCloud); still siblings, so ../feldera resolves
