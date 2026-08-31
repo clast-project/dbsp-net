@@ -27,7 +27,16 @@ does almost nothing and commit does all view computation. Maps to our *step*, no
 
 **Why:** it inflated our ivm-bench numbers and it was the stated urgency behind Track A / A2.
 
-**How to apply:** turn the per-batch checkpoint off for ivm-bench runs and fix that comment before
-quoting any batch timing. Re-price A2 before building it — see [[feldera-source-comparison]],
+**DONE + PUSHED 2026-08-30 (ivm-bench `d91597c`, branch `dbsp-engine`):** the comment is
+corrected, and the compose file now records why `DBSPNET_SNAPSHOT_DIR` is deliberately absent. Note
+what the fix actually found: the dbspnet integration in `mdrakiburrahman/ivm-bench` was rewritten from
+scratch on the Mac (`c7bafae`, 2026-08-30) and **never enabled the checkpoint** — `SNAPSHOT_DIR` has
+never appeared in that repo's history. The ~18.7 s/batch belonged to the old Windows-era integration.
+So there was nothing to switch off; the note exists to stop it being switched on again.
+
+DbspNet-side default is already correct: persistence is off unless `ProgramSpec.SnapshotDir` or
+`DBSPNET_SNAPSHOT_DIR` is set (`DbspNetEngine.DeployAsync`).
+
+**How to apply:** never quote a batch timing taken with the snapshot dir set against Feldera. Re-price A2 before building it — see [[feldera-source-comparison]],
 [[ivm-bench-arc]]. New axis found: Feldera accumulates then evaluates ONE coalesced delta; we evaluate
 the sequence, so part of the 3.5× batch-1 gap may be algorithmic.

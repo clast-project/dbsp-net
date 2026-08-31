@@ -20,16 +20,17 @@ detail in `docs/handoff-machine-migration.md`; project memory was snapshotted to
   different.
 - Unified memory moves **allocation cost specifically** — the exact term our per-row thesis turns on
   ([[per-row-execution-efficiency]]). Never compare old and new numbers directly, even at equal W.
-- **Verify before trusting any comparative run:**
-  `docker manifest inspect images.feldera.com/feldera/pipeline-manager:latest | grep architecture`.
-  The compose file pins no `platform:`; if there is no arm64 manifest, Docker emulates amd64 and every
-  DbspNet-vs-Feldera number from the Mac is meaningless.
+- **RESOLVED 2026-08-30 on the Mac: the Feldera image has a native `linux/arm64` manifest.**
+  `docker manifest inspect images.feldera.com/feldera/pipeline-manager:latest` lists both amd64 and
+  arm64 (no auth needed). The compose file pins no `platform:`, but Docker will pull arm64 natively —
+  so there is no amd64 emulation and comparative runs on the Mac are *architecturally* valid. The
+  cross-machine caution above still stands in full: valid against each other, never against the i9.
 
 **How to apply:** treat the Mac as the development/correctness machine and keep an x86 box for
 measurement. If that is not possible, declare a new baseline explicitly and re-measure the few results
 decisions actually rest on — do not quote i9 numbers alongside Mac numbers.
 
-**Environment:** .NET SDK 10.0.400; Docker Desktop (no WSL in the story any more —
+**Environment:** .NET 10 (the Mac has 10.0.300 at `~/.dotnet/dotnet`; the `dotnet` on PATH is 8.0.405 — see [[nexmark-feldera-benchmark-setup]]); Docker Desktop (no WSL in the story any more —
 [[docker-runs-in-wsl]] is obsolete); EngineeredWood packages restore from nuget.org with no custom
 feed.
 

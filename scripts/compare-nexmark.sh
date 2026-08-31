@@ -59,7 +59,17 @@ BATCH="${BATCH:-10000}"
 RUNS="${RUNS:-3}"
 GENERATORS="${GENERATORS:-$CORES}"
 QUERIES="${QUERIES:-q0 q1 q2 q3 q4 q5 q7 q8 q9 q12 q15 q16 q17 q18 q19 q20 q22}"
-FELDERA_DIR="${FELDERA_DIR:-/Users/curt/Documents/GitHub/feldera}"
+# Default to a sibling checkout, then the old GitHub Desktop location, so this
+# survives moving either repo. The previous default hard-coded a /Users/curt
+# home that does not exist on this machine. Override with FELDERA_DIR= or
+# --feldera=PATH.
+if [ -z "${FELDERA_DIR:-}" ]; then
+  if [ -d "$REPO/../feldera" ]; then
+    FELDERA_DIR="$(cd "$REPO/.." && pwd)/feldera"
+  else
+    FELDERA_DIR="$HOME/Documents/GitHub/feldera"
+  fi
+fi
 DBSP_ONLY=0
 
 for a in "$@"; do

@@ -50,3 +50,11 @@
 - [Machine migration to Mac](machine-migration-to-mac.md) — moved off the i9 2026-08-30; Apple Silicon CANNOT rebaseline our benchmarks (W=24 gone, allocation term moves); check the Feldera arm64 manifest first
 - [Feldera source comparison](feldera-source-comparison.md) — one LSM trace, NO hash map on the row path, merging off the step thread; our alloc+hash floor is a hash-indexed-Z-set cost, not a DBSP cost
 - [ivm-bench checkpoint premise wrong](ivm-bench-checkpoint-premise-wrong.md) — Feldera writes ZERO checkpoints in ivm-bench; our per-batch checkpoint cost ~18.7s/batch for nothing
+- [Nexmark/Feldera benchmark setup](nexmark-feldera-benchmark-setup.md) — how to run compare-nexmark.sh + toolchain quirks (.NET 10 lives in ~/.dotnet, Feldera at ../feldera needs a patch)
+- [DATAS GC and Nexmark throughput](datas-gc-nexmark-throughput.md) — GC DATAS throttles parallel W=N throughput; GCDynamicAdaptationMode=0 helps both .NET 10 and 11
+- [Decimal-cast reflection binding](decimal-cast-reflection-binding.md) — decimal casts bind Clast.DatabaseDecimal via GetMethod+Expression.Call in BOTH compilers (6 sites); an added OPTIONAL param breaks them, and the structural path has NO test coverage
+- [Range-shaped dispatch re-priced](range-shaped-dispatch-repriced.md) — de-boxed Z-set enumerators (b5f90aa): -13.5% many-ticks/few-rows, -2.3% wide; prize is DISPATCH not the allocation floor, so scope the rest of §10 item 1 accordingly
+- [Parallel-path pre-sizing](parallel-path-presizing.md) — ef82b33: exact-size the exchange gather/shard/ingest builders → W>1 allocation −42–50%, Nexmark q4 +24%; ~45 bare-ctor sites still unaudited
+- [iCloud conflict copies break builds](icloud-conflict-copies-break-builds.md) — repo is under iCloud-synced ~/Documents; A/B loops spawn 'File 2.cs' → CS0101, and --no-build then measures a STALE binary. Guard every measurement loop
+- [Delta-builder pre-sizing audit](delta-builder-presizing-audit.md) — b3d5351: audited all remaining bare ZSetBuilder ctors; what was sized, and what was deliberately left (spine, batch evaluator, the unsizable inner multiset)
+- [Repo location and siblings](repo-location-and-siblings.md) — moved to ~/src/dbsp-net 2026-08-31 (out of iCloud); feldera/ivm-bench stayed in ~/Documents/GitHub so they are no longer siblings
