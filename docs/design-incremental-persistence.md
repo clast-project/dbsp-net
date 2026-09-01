@@ -592,3 +592,76 @@ here — so the interval is bounded by the largest batch still in the log, not b
 many small batches follow the snapshot. The lever is the restore path, not replay — which is what the
 lazy/one-serializer direction attacks, and which §4's "Track A first" ordering does not.
 
+## 10. Radix-tree re-expression — ceiling measured before building (branch `radix-tree-state`)
+
+The premise for re-expressing operator state as an indexed Z-set (comparison §4: Feldera "did not
+write a spillable window aggregate: they expressed the window aggregate's state *as* an indexed
+Z-set, so it inherits spill, checkpoint and GC for free"). Measured against the real SF=3 restore
+before writing the rewrite.
+
+### 10.1 The premise needed correcting first
+
+**We already persist as a Z-set.** `PartitionedWindowAggregateOp.SaveAsync` flattens its
+`Dictionary<TKey, SortedDictionary<TInRow,long>>` into a flat `ZSet` and hands it to the **generic**
+codec — there is no bespoke serializer. The "one serializer per operator" framing was wrong.
+
+What is bespoke is the **restore rebuild**. Across the stateful operators, restore falls into two
+shapes:
+
+| operator | work beyond deserialize |
+|:--|:--|
+| `DistinctOp`, `IncrementalJoinOp`, `IncrementalLeftJoinOp` | **none** — `_trace.Integrate(loaded)` |
+| `IncrementalAggregateOp` | rebuild per-group aggregator caches (one pass) |
+| `PartitionedTopKOp` | re-partition every row, insert into a comparer-ordered `SortedDictionary`, recompute windows |
+| `PartitionedWindowAggregateOp` | the same, plus `RecomputePartition` over every partition |
+
+Operators whose state *is* a trace restore in deserialize time. Operators keeping a **parallel
+runtime structure** must rebuild it from the flat Z-set. **That** is what the radix-tree trick
+removes — not a codec.
+
+### 10.2 Apportioned (real SF=3, flat, ServerGC, 4.05 GiB snapshot, ~20 s restore)
+
+`Snapshot.ProfileLoad` (new, opt-in, free when off) times each operator's `LoadAsync`;
+`PartitionedWindowAggregateLoadProfile` splits that operator's own restore into its two legs.
+
+| kind | ms | share | count | rebuild? |
+|:--|--:|--:|--:|:--|
+| `IncrementalJoinOp` | 7432 | **37.6%** | 37 | **none** |
+| `PartitionedWindowAggregateOp` | 5867 | 29.7% | 30 | yes |
+| `IncrementalAggregateOp` | 2614 | 13.2% | 11 | partial |
+| `PartitionedOffsetOp` | 2549 | 12.9% | 6 | yes |
+| `IntegrateOp` | 1088 | 5.5% | 16 | none |
+| `DistinctOp` / `IncrementalLeftJoinOp` / `PartitionedRankOp` | 199 | 1.0% | 26 | none |
+
+And the split inside the target operator (30 ops, 5759 ms/restore — cross-checks against the 5867 ms
+row above to ±2%):
+
+- deserialize **1893 ms — 9.6% of restore** (irreducible; every trace-shaped operator pays it)
+- **rebuild 3866 ms — 19.6% of restore** ← the prize
+
+### 10.3 The ceiling, and what it means
+
+**Re-expressing `PartitionedWindowAggregateOp`'s state as an indexed Z-set can remove ~20% of
+restore** — ~3.9 s of ~20 s. Adding `PartitionedOffsetOp` (same shape, split unmeasured; at the same
+2:1 ratio ≈ 8.6%) takes the ceiling to **~28%**.
+
+**It cannot touch the majority.** `IncrementalJoinOp` alone is **37.6% with zero rebuild** — pure
+deserialize and `Integrate` — and deserialize is another ~10% inside the target operator itself. So
+**most of restore is reading bytes back, not rebuilding structure.**
+
+That reframes the arc, and it is the more useful finding: the radix-tree re-expression is the
+**smaller half** of Feldera's advantage. Their restore is `O(#files)` because batches stay on disk and
+pages come through a buffer cache (comparison §5) — i.e. they mostly **do not deserialize**. Against
+that, re-expressing state buys ~20–28%; lazy, file-backed restore attacks the ~70% that deserialize
+and trace-integrate account for.
+
+**Recommendation: do not start with the rewrite.** A 20% cut on a 20 s restore is ~4 s, for an
+invasive change to the operator's runtime representation, and the same effort spent on lazy restore
+targets three times the term. If the window operator's rebuild is worth removing on its own merits
+(it also costs on every recovery, and `PartitionedTopKOp` shares the shape), it should be sequenced
+*after* the restore path stops being deserialize-bound — otherwise it is optimising 20% of the wrong
+thing.
+
+**Measurement caveats.** Restore wall varies ~15% between legs in one run (§9.1), so the shares are
+±2 points. The `PartitionedOffsetOp` split is inferred, not measured. All of this is one workload —
+ivm-bench's 50-view program — and the mix of operator kinds is what sets these shares.
