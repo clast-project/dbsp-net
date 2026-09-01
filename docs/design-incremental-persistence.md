@@ -921,3 +921,54 @@ shipping one and materializes an extra array per file — read the *shares*, not
 allocation figures reproduce to within 4 MiB across runs and are the more trustworthy instrument. The
 zero-copy VARCHAR leg is a measurement path (it retains every `RecordBatch` deliberately), not a
 shipping design; the buffers must outlive the state before it can become one.
+
+### 11.7 The row hash is no longer seeded (built and measured, 2026-08-31)
+
+§11.1's by-product — *every* row hash is process-randomized, because `StructuralRow.ComputeHash`
+was built on `System.HashCode` — is fixed. `StructuralRowHash` (Core) is a deterministic 64-bit mix
+over per-cell value seeds, folded to 32 for the `GetHashCode` contract; `SqlCellHash` (Sql) supplies
+seeds for the types Core cannot name, installed through one hook by a module initializer. Only two
+cell types were ever the problem — `string` (absent from these rows) and `Decimal128`, whose
+third-party `GetHashCode` is seeded but which exposes a content-based `StableHash64()`.
+
+**Three implementations had to move together**, and this is the part worth remembering: the boxed
+walk in `StructuralRow.ComputeHash`, the Expression-tree delegate behind `StructuralRowShape`
+(what a `TypedStructuralRow` carries), and the IL the emitted row struct carries. They must agree or
+a typed key and a backing-array key stop finding each other in one dictionary — a silent miss, no
+exception. **Nothing tested that**; `TypedRowHashAgreementTests` now does, across all three, and the
+emitted struct — which previously omitted the arity and so never matched — agrees for the first time.
+
+**Measured.** Two instruments, saying different things, both worth recording:
+
+| | HashCode (was) | StructuralRowHash (is) |
+|:--|--:|--:|
+| `w1profile` B/event, all 10 queries | — | **byte-identical** |
+| `w1profile` ns/event, median of 3×5-run samples per arm | — | **9 of 10 queries faster, −2% to −18%** (q18 +5%, inside its own ±12% spread) |
+| `rowhash` isolated, wide row (7 cells incl. Utf8String, Date32, Decimal128) | 19.5 ns | 22.6 ns (**+16%**) |
+| `rowhash` isolated, narrow row (2 longs) | 7.4 ns | 7.1 ns (−4%) |
+| `rowhash` cell-seed dispatch only, wide | 11.5 ns | 22.5 ns (**+96%**) |
+
+The two disagree because they are not the same call shape: `rowhash` invokes both arms through a
+`Func<>` so neither inlines, which penalises the new code's deeper call tree, while the engine calls
+`ComputeHash` from inside Core where it inlines. The in-situ number is the one that decides, and it
+says this is not a regression. What the isolated split *does* locate is the residual cost, and it is
+all in **cell dispatch for the SQL types** — a delegate hop into `SqlCellHash` plus a type-test chain,
+where `HashCode` made one virtual call. That is the thing to attack if hashing ever shows up as a
+bottleneck again; the combiner itself is now at parity (the narrow row is almost entirely combiner).
+
+Getting there took two false starts worth recording. The first version fed one accumulator through a
+dependent multiply per cell and put the SQL types *after* twelve primitive type tests: **+138%** on a
+wide row. Four independent lanes (as `HashCode` and xxHash32 use, with each cell's lane fixed by its
+position so every caller knows it at compile time — no runtime index, no accumulator struct to copy)
+plus hook-first dispatch took that to +16%. And the first isolated benchmark was simply wrong: it
+indexed a raw array in the old arm while `ComputeHash` takes `IReadOnlyList<object?>`, charging the
+interface dispatch to the new algorithm.
+
+**What this unlocks** (none of it built): a persisted row hash — restore currently recomputes 30.5M
+of them inside the 15.5% materialize term — a persisted Bloom block, which `SpineBatch` rebuilds from
+keys on every load precisely because it could not trust a seeded hash, and cross-process digests that
+do not need a separate `StableHash` path. **What it gives up**: `HashCode`'s per-process seed was our
+only HashDoS protection, and the BCL's collision fallback covers `string`-keyed dictionaries only,
+not custom key types like ours. Nothing in this engine's threat model needs it today; if it ever
+does, the answer is a keyed hash with the seed persisted in the snapshot manifest, not a return to a
+per-process one.

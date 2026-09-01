@@ -139,16 +139,51 @@ public class StructuralRow : IEquatable<StructuralRow>, IReadOnlyList<object?>
     /// and the typed-subclass path. Includes the arity so the empty row
     /// hashes distinctly from a row of one NULL.
     /// </summary>
+    /// <summary>
+    /// The canonical row hash. Deterministic across processes — see
+    /// <see cref="StructuralRowHash"/> for why that matters and for the agreement contract the
+    /// typed compile path's field-wise twin has to honour.
+    /// </summary>
     public static int ComputeHash(IReadOnlyList<object?> values)
     {
         ArgumentNullException.ThrowIfNull(values);
-        var hc = default(HashCode);
-        hc.Add(values.Count);
-        for (var i = 0; i < values.Count; i++)
+        return values is object?[] array
+            ? ComputeHash(array)
+            : Narrow(StructuralRowHash.Of(values));
+    }
+
+    /// <summary>
+    /// The shape every row actually has; kept separate so the cells are read straight out of the
+    /// array.
+    /// </summary>
+    public static int ComputeHash(object?[] values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        var n = values.Length;
+        ulong l0 = StructuralRowHash.LaneSeed(0, n), l1 = StructuralRowHash.LaneSeed(1, n),
+            l2 = StructuralRowHash.LaneSeed(2, n), l3 = StructuralRowHash.LaneSeed(3, n);
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
-            hc.Add(values[i]);
+            l0 = StructuralRowHash.StepLane(l0, StructuralRowHash.Cell(values[i]));
+            l1 = StructuralRowHash.StepLane(l1, StructuralRowHash.Cell(values[i + 1]));
+            l2 = StructuralRowHash.StepLane(l2, StructuralRowHash.Cell(values[i + 2]));
+            l3 = StructuralRowHash.StepLane(l3, StructuralRowHash.Cell(values[i + 3]));
         }
 
-        return hc.ToHashCode();
+        for (; i < n; i++)
+        {
+            switch (i & 3)
+            {
+                case 0: l0 = StructuralRowHash.StepLane(l0, StructuralRowHash.Cell(values[i])); break;
+                case 1: l1 = StructuralRowHash.StepLane(l1, StructuralRowHash.Cell(values[i])); break;
+                case 2: l2 = StructuralRowHash.StepLane(l2, StructuralRowHash.Cell(values[i])); break;
+                default: l3 = StructuralRowHash.StepLane(l3, StructuralRowHash.Cell(values[i])); break;
+            }
+        }
+
+        return StructuralRowHash.Fold(l0, l1, l2, l3);
     }
+
+    private static int Narrow(ulong wide) => (int)(wide ^ (wide >> 32));
 }

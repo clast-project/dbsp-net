@@ -37,5 +37,14 @@ public class HashDeterminismProbe
         _out.WriteLine($"DateTime(2020,1,1)          {new DateTime(2020, 1, 1).GetHashCode()}");
         _out.WriteLine($"StructuralRow(long,Utf8)    {new StructuralRow(42L, u).GetHashCode()}");
         _out.WriteLine($"StructuralRow(long,long)    {new StructuralRow(42L, 7L).GetHashCode()}");
+        var dec = new Clast.DatabaseDecimal.Values.Decimal128((System.Int128)12345);
+        _out.WriteLine($"Decimal128.GetHashCode      {dec.GetHashCode()}");
+        _out.WriteLine($"Decimal128.StableHash64     {dec.StableHash64()}");
+        _out.WriteLine($"Date32.GetHashCode          {new Date32(19000).GetHashCode()}");
+        _out.WriteLine($"Timestamp.GetHashCode       {new Timestamp(1234567).GetHashCode()}");
+        _out.WriteLine($"Interval.GetHashCode        {new Interval(3, 500).GetHashCode()}");
+        _out.WriteLine($"GOLD row(42L,7L)            {new StructuralRow(42L, 7L).GetHashCode()}");
+        _out.WriteLine($"GOLD row(Utf8 ACME,1.5)     {new StructuralRow(Utf8String.Of("ACME"), 1.5).GetHashCode()}");
+        _out.WriteLine($"GOLD row(null,null)         {new StructuralRow(null, null).GetHashCode()}");
     }
 }

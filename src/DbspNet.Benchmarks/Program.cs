@@ -50,6 +50,17 @@ if (args.Length > 0 && args[0] == "mergeprobe")
     return 0;
 }
 
+// Row-hash A/B: `dotnet run -- rowhash [rows] [runs]`
+// The shipped StructuralRowHash against the System.HashCode formulation it replaced, over
+// identical cells in one process — the isolated form of what w1profile prices in situ.
+if (args.Length > 0 && args[0] == "rowhash")
+{
+    var rhRows = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 2_000_000;
+    var rhRuns = args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 5;
+    RowHashBenchmark.Run(rhRows, rhRuns);
+    return 0;
+}
+
 // W=1 per-row cost profile: `dotnet run -- w1profile [events] [batch] [runs]`
 // Per-tuple ns/event + bytes/event + GC across the Nexmark queries at W=1, to
 // locate where per-row execution cost goes (docs/design-row-representation.md §16).

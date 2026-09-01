@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Reflection.Emit;
+using DbspNet.Core.Collections;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
 
@@ -474,9 +475,14 @@ public static class TypedRowEmitter
     private static void EmitGetHashCode(TypeBuilder tb, Fingerprint fp, FieldBuilder[] fields)
     {
         // public override int GetHashCode():
-        //   var hc = new HashCode();
-        //   hc.Add(F0); hc.Add(F1); ...
-        //   return hc.ToHashCode();
+        //   var h = StructuralRowHash.Start(arity);
+        //   h = StructuralRowHash.Step(h, seed(F0)); …
+        //   return StructuralRowHash.Fold(h);
+        //
+        // Same algorithm and same per-column seed methods as StructuralRow.ComputeHash and the
+        // typed hash delegate (SqlCellHash.MethodFor), so the emitted struct, a wrapped typed row
+        // and a backing-array row all hash alike — and none of them is process-seeded, which
+        // HashCode was.
         var method = tb.DefineMethod(
             nameof(object.GetHashCode),
             MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
@@ -484,24 +490,44 @@ public static class TypedRowEmitter
             Type.EmptyTypes);
         var il = method.GetILGenerator();
 
-        var hcLocal = il.DeclareLocal(typeof(HashCode));
-        il.Emit(OpCodes.Ldloca_S, (byte)hcLocal.LocalIndex);
-        il.Emit(OpCodes.Initobj, typeof(HashCode));
+        var laneSeed = typeof(StructuralRowHash).GetMethod(nameof(StructuralRowHash.LaneSeed))!;
+        var stepLane = typeof(StructuralRowHash).GetMethod(nameof(StructuralRowHash.StepLane))!;
+        var fold = typeof(StructuralRowHash).GetMethod(nameof(StructuralRowHash.Fold))!;
+
+        var lanes = new LocalBuilder[4];
+        for (var j = 0; j < 4; j++)
+        {
+            lanes[j] = il.DeclareLocal(typeof(ulong));
+            il.Emit(OpCodes.Ldc_I4, j);
+            il.Emit(OpCodes.Ldc_I4, fp.Columns.Length);
+            il.Emit(OpCodes.Call, laneSeed);
+            il.Emit(OpCodes.Stloc, lanes[j]);
+        }
 
         for (var i = 0; i < fp.Columns.Length; i++)
         {
-            il.Emit(OpCodes.Ldloca_S, (byte)hcLocal.LocalIndex);
-            il.Emit(OpCodes.Ldarg_0);                  // this (ptr)
+            var lane = lanes[i & 3];
+            il.Emit(OpCodes.Ldloc, lane);
+            il.Emit(OpCodes.Ldarg_0);                  // this (ptr for a value type)
             il.Emit(OpCodes.Ldfld, fields[i]);
-            var addGeneric = typeof(HashCode).GetMethods()
-                .Single(m => m.Name == nameof(HashCode.Add) && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
-            var addClosed = addGeneric.MakeGenericMethod(fp.Columns[i]);
-            il.Emit(OpCodes.Call, addClosed);
+            var seedMethod = SqlCellHash.MethodFor(fp.Columns[i]);
+            if (seedMethod is null)
+            {
+                il.Emit(OpCodes.Box, fp.Columns[i]);
+                seedMethod = SqlCellHash.BoxedMethod;
+            }
+
+            il.Emit(OpCodes.Call, seedMethod);
+            il.Emit(OpCodes.Call, stepLane);
+            il.Emit(OpCodes.Stloc, lane);
         }
 
-        il.Emit(OpCodes.Ldloca_S, (byte)hcLocal.LocalIndex);
-        var toHashCode = typeof(HashCode).GetMethod(nameof(HashCode.ToHashCode))!;
-        il.Emit(OpCodes.Call, toHashCode);
+        foreach (var lane in lanes)
+        {
+            il.Emit(OpCodes.Ldloc, lane);
+        }
+
+        il.Emit(OpCodes.Call, fold);
         il.Emit(OpCodes.Ret);
     }
 
