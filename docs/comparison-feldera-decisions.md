@@ -310,13 +310,42 @@ true engine-to-engine gap on the same workload is wider by whatever that chain c
 touch the Nexmark numbers (§26/§25, different harness entirely), and it does not change any
 *allocation* result — but every ivm-bench batch-1 ratio in these docs inherits the caveat.
 
-**Fixing it is a spec-generation change, not an engine change:** teach `dbt_to_program.py` to honour
-`+stored: true` as "materialise this view even though nothing reads it" — which needs the delta-only
-vs stored distinction §4.2 says we lack, since the honest translation is "stored, no output binding".
-Until then, quote batch-1 ratios with this caveat attached.
+### 6.3.1 FIXED and MEASURED (2026-09-01)
 
-**Not measured.** No SF=3 data exists on the current machine; the ~3.4 GiB figure is the earlier i9
-measurement of the upstream window ops only, and `fact_market_history`'s own cost at SF=3 is unknown.
+The fix turned out not to need the delta-only/stored distinction §4.2 says we lack, and not to need a
+spec-generation change either: **`dbt_to_program.py` was already emitting the right thing.** Its
+`outputs` list (18) contains both stored views; its `output_bindings` (16) is the write list. Every
+*consumer* was collapsing the two — `dbspnet_client.deploy()` sent `outputs: prog["output_bindings"]`,
+and all nine local probes built their compile set from the bindings.
+
+- `ProgramSpec` gains `StoredViews`; `DbspNetEngine.DeployAsync` unions it into the compile set while
+  binding sinks only for `Outputs`. `DbspNetEngineTests.StoredViewsAreComputedThoughNotWritten` pins
+  it — a view nothing reads is absent from the compiled program unless named, and naming it does not
+  add a sink.
+- `dbspnet_client.deploy()` sends `storedViews` = `outputs` − bound (ivm-bench `b79f2cb`).
+- The probes go through `IvmSpecViews.ToCompile`, one documented rule rather than nine copies, with
+  `IVM_BINDINGS_ONLY=1` to reproduce the old behaviour — which is what makes the asymmetry a
+  measurable A/B rather than an argument.
+
+**What it costs us** (SF=3 batch 1, local harness, flat, step timed separately from ingest, two runs
+each, digests stable within each arm):
+
+| compile set | step | output rows |
+|:--|--:|--:|
+| bindings only (16) — what every quoted number used | 39.5 / 39.6 s | 3,002,826 |
+| **+ stored views (18) — what Feldera runs** | **65.7 / 67.1 s** | **43,272,656** |
+
+**+68% on the step, and 14× the output rows** — `fact_market_history` alone is ~40M rows at SF=3.
+Feldera's recorded 21 s already paid for that work; ours did not. So the gap does not merely gain a
+caveat, it moves: the ~3.4:1 headline was comparing our 16-view program against their 18-view one,
+and the same-workload ratio is materially worse. The exact figure needs a full re-run of the
+comparison harness, which this does not do.
+
+**It also invalidates a queued win.** `batch1-next-arc-scoping` §24 identified `daily_market`'s
+52-week window ops (op348 + op350 + op349, ~3.4 GiB, 7.6% of batch-1 allocation) as dead computation
+and made them the headline case for the column-liveness pass. They are dead only for our pruned
+output set. Once `fact_market_history` is computed they are live, and `docs/design-column-liveness.md`
+needs re-scoping against the corrected program before its rewrite half is built.
 
 ## 7. Parallelism: they pay *more* coordination, over bigger ticks
 

@@ -55,7 +55,12 @@ public sealed class DbspNetEngine
             : Environment.GetEnvironmentVariable("DBSPNET_SNAPSHOT_DIR");
         var persistent = !string.IsNullOrEmpty(snapshotDir);
 
-        var outputViews = spec.Outputs.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
+        // Everything the program must COMPUTE: the written views plus any stored-but-unwritten
+        // ones. A view missing from this set is dead-view-pruned along with its upstream chain,
+        // so leaving StoredViews out silently deletes work the benchmark is measuring.
+        var outputViews = spec.Outputs.Select(o => o.View)
+            .Concat(spec.StoredViews ?? Array.Empty<string>())
+            .ToHashSet(StringComparer.Ordinal);
         // ivm-bench / Spark / DuckDB / Feldera all coerce numeric<->string comparisons,
         // and Feldera (Calcite) sorts NULLs low by default (last under DESC).
         // The snapshot codecs are registered at construction and touched only by

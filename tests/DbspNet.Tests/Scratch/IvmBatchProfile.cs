@@ -61,7 +61,7 @@ public class IvmBatchProfile
         string InUri(string uri) => Path.Combine(dataRoot, StripPrefix(uri, "/data/raw/delta/"));
         string OutUri(string view) => Path.Combine(outRoot, view);
 
-        var outputViews = spec.Output_Bindings.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
+        var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
 
         // Measurement gate: IVM_TYPE_VIEWS=1 flips the program path to try the typed
         // fast path per view (structural fallback elsewhere). Off = the shipping
@@ -109,6 +109,7 @@ public class IvmBatchProfile
 
     private sealed record Spec(
         List<string> Program,
+        List<string>? Outputs,
         List<InputBinding> Inputs,
         List<OutputBinding> Output_Bindings);
 

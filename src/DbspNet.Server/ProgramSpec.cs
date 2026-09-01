@@ -17,12 +17,22 @@ namespace DbspNet.Server;
 /// unset; persistence is off when neither is given (the codec-free compile, so the
 /// engine is bit-for-bit what it was before this option existed).
 /// </para>
+/// <para>
+/// <paramref name="StoredViews"/> names views the program must <b>compute but not write</b> —
+/// dbt's <c>+stored: true</c> with no output connector. ivm-bench declares two
+/// (<c>fact_market_history</c>, <c>daily_market_pulse</c>) because their truncate-mode Delta
+/// writers cannot drain at SF=100; Feldera still computes them and the benchmark still measures
+/// that compute. Without this, a view with no connector is not an output, so the dead-view prune
+/// drops it <em>and its whole upstream chain</em> — which made our batch-1 numbers flatter than the
+/// workload they claimed to measure (<c>docs/comparison-feldera-decisions.md</c> §6.3).
+/// </para>
 /// </summary>
 public sealed record ProgramSpec(
     IReadOnlyList<string> Program,
     IReadOnlyList<InputSpec> Inputs,
     IReadOnlyList<OutputSpec> Outputs,
-    string? SnapshotDir = null);
+    string? SnapshotDir = null,
+    IReadOnlyList<string>? StoredViews = null);
 
 /// <summary>An input binding: a program source <paramref name="Table"/> fed from the
 /// Delta table at <paramref name="Uri"/>. <paramref name="Mode"/> is accepted for parity

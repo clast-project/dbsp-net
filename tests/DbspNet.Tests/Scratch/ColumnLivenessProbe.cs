@@ -35,7 +35,7 @@ public class ColumnLivenessProbe
         }
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
-        var outputViews = spec.Output_Bindings.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
+        var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
 
         // Same resolve knobs as DbspNetEngine.DeployAsync / IvmBatchProfile.
         var resolved = SqlProgram.Resolve(
@@ -132,7 +132,10 @@ public class ColumnLivenessProbe
         }
     }
 
-    private sealed record Spec(List<string> Program, List<OutputBinding> Output_Bindings);
+    private sealed record Spec(
+        List<string> Program,
+        List<string>? Outputs,
+        List<OutputBinding> Output_Bindings);
 
     private sealed record OutputBinding(string View, string Uri, string Mode);
 }

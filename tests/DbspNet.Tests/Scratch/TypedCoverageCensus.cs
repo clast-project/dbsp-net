@@ -48,7 +48,7 @@ public class TypedCoverageCensus
         }
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
-        var outputs = spec.Output_Bindings.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
+        var outputs = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         var resolved = SqlProgram.Resolve(spec.Program, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low);
 
         var results = new List<(string View, bool Typed, bool IsOutput, string Nodes)>();
@@ -172,7 +172,10 @@ public class TypedCoverageCensus
         _ => Array.Empty<LogicalPlan>(),
     };
 
-    private sealed record Spec(List<string> Program, List<OutputBinding> Output_Bindings);
+    private sealed record Spec(
+        List<string> Program,
+        List<string>? Outputs,
+        List<OutputBinding> Output_Bindings);
 
     private sealed record OutputBinding(string View, string Uri, string Mode);
 }

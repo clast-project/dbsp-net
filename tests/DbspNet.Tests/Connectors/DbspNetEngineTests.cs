@@ -181,4 +181,49 @@ public sealed class DbspNetEngineTests : IDisposable
         company.Dispose();
         trade.Dispose();
     }
+    /// <summary>
+    /// A view declared `+stored: true` with no output connector must still be COMPUTED. ivm-bench
+    /// has two (fact_market_history, daily_market_pulse): Feldera computes them and the benchmark
+    /// measures that compute, only the Delta write is skipped. Because DbspNet prunes any view that
+    /// is not an output — together with its whole upstream chain — leaving them out silently
+    /// deleted work the benchmark was measuring (docs/comparison-feldera-decisions.md §6.3).
+    /// </summary>
+    [Fact]
+    public async Task StoredViewsAreComputedThoughNotWritten()
+    {
+        var companyDir = Path.Combine(_root, "s_company");
+        var tradeDir = Path.Combine(_root, "s_trade");
+        var totalsDir = Path.Combine(_root, "s_out");
+        Directory.CreateDirectory(totalsDir);
+
+        var company = await CreateTable(companyDir, CompanySchema());
+        await Append(company, CompanySchema(), new List<object?[]>(), new object?[] { 1, 100, 1 });
+        var trade = await CreateTable(tradeDir, TradeSchema());
+        await Append(trade, TradeSchema(), new List<object?[]>(), new object?[] { 10, 1, 50 });
+
+        // company_current is read by company_totals, so it survives the prune either way; use a
+        // view nothing else reads, which is the shape of fact_market_history / daily_market_pulse.
+        var sql = ProgramSql.Append(
+            "CREATE VIEW unbound_tally AS SELECT company_id, COUNT(*) AS n FROM company GROUP BY company_id").ToArray();
+        var inputs = new[] { new InputSpec("company", companyDir), new InputSpec("trade", tradeDir) };
+        var outputs = new[] { new OutputSpec("company_totals", totalsDir) };
+
+        // The property is about the COMPILE SET, which DeployAsync fixes — no batch needed.
+        var withoutStored = new DbspNetEngine();
+        await withoutStored.DeployAsync(new ProgramSpec(sql, inputs, outputs));
+        Assert.DoesNotContain(
+            "unbound_tally", withoutStored.GetStats().Outputs.Select(o => o.View));
+
+        var withStored = new DbspNetEngine();
+        var deploy = await withStored.DeployAsync(new ProgramSpec(
+            sql, inputs, outputs, SnapshotDir: null, StoredViews: new[] { "unbound_tally" }));
+
+        // One Delta sink either way — the stored view is computed, not written.
+        Assert.Equal(1, deploy.OutputCount);
+
+        var views = withStored.GetStats().Outputs.Select(o => o.View).ToList();
+        Assert.Contains("company_totals", views);
+        Assert.Contains("unbound_tally", views);
+    }
+
 }

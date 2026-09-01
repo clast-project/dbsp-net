@@ -422,7 +422,7 @@ public class IvmRestoreProfile
 
     private static CompiledProgram Compile(Spec spec, TraceFamily traceFamily)
     {
-        var outputViews = spec.Output_Bindings.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
+        var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         return SqlProgram.Compile(
             spec.Program, outputViews,
             snapshotCodecs: ArrowSqlSnapshotCodecs.Instance,
@@ -589,6 +589,7 @@ public class IvmRestoreProfile
 
     private sealed record Spec(
         List<string> Program,
+        List<string>? Outputs,
         List<InputBinding> Inputs,
         List<OutputBinding> Output_Bindings);
 

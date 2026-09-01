@@ -32,7 +32,7 @@ public class IvmBatchParallelProbe
         }
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
-        var outputViews = spec.Output_Bindings.Select(o => o.View).ToHashSet(StringComparer.Ordinal);
+        var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
 
         // Resolve the program the same way SqlProgram.Compile does (ivm-bench
         // coercion + NULL collation), then report which reachable views the
@@ -174,6 +174,7 @@ public class IvmBatchParallelProbe
 
     private sealed record Spec(
         List<string> Program,
+        List<string>? Outputs,
         List<InputBinding> Inputs,
         List<OutputBinding> Output_Bindings);
 
