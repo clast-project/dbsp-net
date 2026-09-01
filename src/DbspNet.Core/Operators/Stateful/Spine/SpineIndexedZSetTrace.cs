@@ -79,8 +79,14 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         {
             // Memtable disabled: one sorted batch per delta (original behaviour).
             EnsureLevel(0);
+            var tb = System.Diagnostics.Stopwatch.GetTimestamp();
             _levels[0].Add(ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
                 delta, _keyComparer, _valueComparer, _monotoneKey));
+            if (SpineCompactionProfile.Enabled)
+            {
+                SpineCompactionProfile.AddBuild(SpineCompactionProfile.MsSince(tb));
+            }
+
             RunCompaction();
             return;
         }
@@ -107,8 +113,14 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         }
 
         EnsureLevel(0);
+        var tb = System.Diagnostics.Stopwatch.GetTimestamp();
         _levels[0].Add(ResidentSpineIndexedBatch<TKey, TValue, TWeight>.FromIndexed(
             _memtable, _keyComparer, _valueComparer, _monotoneKey));
+        if (SpineCompactionProfile.Enabled)
+        {
+            SpineCompactionProfile.AddBuild(SpineCompactionProfile.MsSince(tb));
+        }
+
         _memtable = new IndexedZSet<TKey, TValue, TWeight>(new Dictionary<TKey, ZSet<TValue, TWeight>>());
         RunCompaction();
     }
@@ -745,8 +757,15 @@ public sealed class SpineIndexedZSetTrace<TKey, TValue, TWeight>
         }
 
         var toMerge = src.GetRange(0, action.BatchCount);
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var merged = SpineIndexedBatch<TKey, TValue, TWeight>.Merge(
             toMerge, _keyComparer, _valueComparer, _monotoneKey);
+        if (SpineCompactionProfile.Enabled)
+        {
+            SpineCompactionProfile.AddMerge(
+                SpineCompactionProfile.MsSince(t0), toMerge.Count, merged.GroupCount);
+        }
+
         src.RemoveRange(0, action.BatchCount);
 
         foreach (var input in toMerge)

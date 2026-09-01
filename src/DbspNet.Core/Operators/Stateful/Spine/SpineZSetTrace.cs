@@ -86,7 +86,13 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         {
             // Memtable disabled: one sorted batch per delta (original behaviour).
             EnsureLevel(0);
+            var tb = System.Diagnostics.Stopwatch.GetTimestamp();
             _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(delta, _comparer, _monotoneKey));
+            if (SpineCompactionProfile.Enabled)
+            {
+                SpineCompactionProfile.AddBuild(SpineCompactionProfile.MsSince(tb));
+            }
+
             RunCompaction();
             return;
         }
@@ -113,7 +119,13 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         }
 
         EnsureLevel(0);
+        var tb = System.Diagnostics.Stopwatch.GetTimestamp();
         _levels[0].Add(ResidentSpineBatch<TKey, TWeight>.FromZSet(_memtable, _comparer, _monotoneKey));
+        if (SpineCompactionProfile.Enabled)
+        {
+            SpineCompactionProfile.AddBuild(SpineCompactionProfile.MsSince(tb));
+        }
+
         _memtable = new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>());
         RunCompaction();
     }
@@ -483,7 +495,14 @@ public sealed class SpineZSetTrace<TKey, TWeight>
         // don't get pushed deep into the tier hierarchy on every
         // compaction round.
         var toMerge = src.GetRange(0, action.BatchCount);
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var merged = SpineBatch<TKey, TWeight>.Merge(toMerge, _comparer, _monotoneKey);
+        if (SpineCompactionProfile.Enabled)
+        {
+            SpineCompactionProfile.AddMerge(
+                SpineCompactionProfile.MsSince(t0), toMerge.Count, merged.Count);
+        }
+
         src.RemoveRange(0, action.BatchCount);
 
         // Delete on-disk files for any spilled inputs — they have been
