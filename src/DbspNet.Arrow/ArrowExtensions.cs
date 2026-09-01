@@ -267,7 +267,8 @@ public static class ArrowExtensions
         for (var c = 0; c < columnCount; c++)
         {
             perColumn[c] = ArrowColumns.Extract(
-                batch.Column(c), schema[c].Type, rowCount, zeroCopyStrings);
+                batch.Column(c), schema[c].Type, rowCount,
+                zeroCopyStrings ? StringDecoding.Alias : StringDecoding.Transcode);
         }
 
         // Phase 2: assemble row-major deltas from the column-major buffers.

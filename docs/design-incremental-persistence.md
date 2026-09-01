@@ -1031,3 +1031,59 @@ count.
 remaining architectural prize (§11.6) is that ~10 s → ~2.5 s, and it still costs a storage-format
 change plus the radix-tree rewrite. Nothing about that ordering changes; the cheap half is simply
 taken now.
+
+### 11.9 Zero-copy VARCHAR, resolved: an arena, not an alias (2026-09-01)
+
+§11.4(b) left this half-done. Aliasing the Arrow buffer cut the extract term 58% and allocation 25%,
+but handed ~40% of that back at the hash (+152% on the index pass), and the leg was explicitly a
+measurement path because it retained every `RecordBatch`. Two questions were open: why hashing got
+worse, and whether the buffers could be owned safely.
+
+**One probe answered both.** `ArrowBufferBackingProbe` asks whether an IPC read buffer is a managed
+array: **it is not** — it is native memory behind a `MemoryManager`. So
+
+- every `Utf8String.Span` on an aliased value is a **virtual call**, not an array slice, which is the
+  +152% hash cost; and
+- after `batch.Dispose()` the memory is freed — the probe's read-after-dispose **faulted**. Aliasing
+  is a use-after-free unless the batch is retained for the life of the state, which is exactly the
+  leak the experiment took on.
+
+**So the answer is neither transcoding nor aliasing: copy once per column into a managed arena.**
+`ArrowColumns.ExtractStringArena` bulk-copies a column's UTF-8 bytes into one `byte[]` and slices each
+row's `Utf8String` out of it — one allocation per column instead of two per cell, no UTF-8 → UTF-16 →
+UTF-8 round trip, ordinary GC ownership, and `Span` back on the fast array path.
+
+**Measured** (real SF=3 snapshot, sequential, stage profile on, every leg digest-verified):
+
+| stage | transcode (was) | **arena** | alias (§11.4b) |
+|:--|--:|--:|--:|
+| extract | 13.0 s (47.3%) | **3.0 s (17.6%)** | 5.4 s |
+| of which VARCHAR | 8.8 s | **1.0 s (−88%)** | 2.9 s |
+| **index (hash → Z-set)** | 2.0 s | **1.9 s (unchanged)** | **7.0 s (+253%)** |
+| total restore | 27.5 s | **17.1 s** | 22.4 s |
+
+And on the shipping path (no stage profile, three samples at the shipped parallel degree):
+
+| | transcode (was) | **arena (now)** |
+|:--|--:|--:|
+| restore, sequential | 20.3 / 25.5 s | **19.1 / 19.5 s** |
+| restore, degree 7 | 11.5 / 13.9 / 15.8 s | **9.34 / 9.44 / 9.44 s** |
+| allocated (sequential) | 42.24 GiB | **32.84 GiB (−22%)** |
+
+**−32% at the shipped default**, and the arena arm's spread collapses to ±0.1 s against the transcode
+arm's ±2 s — what you would expect from removing a fifth of the allocation. Allocation reproduces to
+2 MiB across runs, so it is the number to trust.
+
+**Where it is and is not used.** Restore only. The arena's cost is that **every surviving row pins the
+whole arena**, which is exactly right where rows live and die together — a snapshot restores all of
+its rows — and wrong on an ingest path that filters, where one surviving row would pin every string in
+the batch. Ingest keeps transcoding, and `StringDecoding` names the three modes so the choice is
+explicit at each call site. The shipping loader also **downgrades `Alias` to `Arena`** structurally:
+that path disposes the batch, so an aliased value there would dangle silently; only the profiled
+loader, which retains batches, can use it, and only to reproduce this table.
+
+**What this closes.** §11.4b's caution — *"a representation cheaper to produce can be more expensive to
+probe"* — was right about the alias and wrong as a general law. The probe-side cost was not inherent
+to keeping bytes in their source layout; it was a virtual call from a native-backed buffer. Copying
+once into managed memory keeps the production win and pays nothing at the probe. Restore is now
+**~9.4 s for 4 GiB** against the ~20.6 s this arc started from.

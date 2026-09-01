@@ -164,8 +164,26 @@ internal sealed class ArrowIndexedZSetTraceCodec
     // Utf8 -> string -> Utf8 round-tripping every cell. Aliasing means the batch's buffers must
     // outlive the restored state, so the batches are retained deliberately for the duration of
     // the measurement (this path is the profiled one, never a shipping restore).
-    private static readonly bool ZeroCopyStrings =
-        Environment.GetEnvironmentVariable("DBSPNET_RESTORE_ZEROCOPY_STRINGS") is "1";
+    // Restore is the case a string arena is built for: every row of a snapshot survives, so the
+    // arena is pinned exactly as long as the data it holds, and one allocation per column replaces
+    // two per cell plus a UTF-8 -> UTF-16 -> UTF-8 round trip
+    // (docs/design-incremental-persistence.md §11.4b).
+    private static readonly StringDecoding RestoreStrings =
+        Environment.GetEnvironmentVariable("DBSPNET_RESTORE_STRINGS") switch
+        {
+            "transcode" => StringDecoding.Transcode,
+            "alias" => StringDecoding.Alias,
+            _ => StringDecoding.Arena,
+        };
+
+    /// <summary>
+    /// What the <b>shipping</b> loader may use. <see cref="StringDecoding.Alias"/> is downgraded
+    /// here on purpose: it points values into the batch's native buffer, and this path disposes the
+    /// batch — the values would dangle, silently. Only the profiled loader can use it, because only
+    /// that one retains the batch, and it exists solely to reproduce the §11.4b measurement.
+    /// </summary>
+    private static readonly StringDecoding ShippingStrings =
+        RestoreStrings == StringDecoding.Alias ? StringDecoding.Arena : RestoreStrings;
 
     private static readonly List<object> RetainedBatches = new();
 
@@ -219,7 +237,7 @@ internal sealed class ArrowIndexedZSetTraceCodec
             {
                 var isVarchar = _keySchema[c].Type is DbspNet.Sql.TypeSystem.SqlVarcharType;
                 var tc = System.Diagnostics.Stopwatch.GetTimestamp();
-                keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, rowCount, ZeroCopyStrings);
+                keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, rowCount, RestoreStrings);
                 if (isVarchar)
                 {
                     stringMs += SnapshotRestoreProfile.MsSince(tc);
@@ -233,7 +251,7 @@ internal sealed class ArrowIndexedZSetTraceCodec
                 var isVarchar = _valueSchema[c].Type is DbspNet.Sql.TypeSystem.SqlVarcharType;
                 var tc = System.Diagnostics.Stopwatch.GetTimestamp();
                 valueColumns[c] = ArrowColumns.Extract(
-                    batch.Column(keyCount + c), _valueSchema[c].Type, rowCount, ZeroCopyStrings);
+                    batch.Column(keyCount + c), _valueSchema[c].Type, rowCount, ShippingStrings);
                 if (isVarchar)
                 {
                     stringMs += SnapshotRestoreProfile.MsSince(tc);
@@ -274,8 +292,11 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
             var result = b.Build();
             var t5 = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (ZeroCopyStrings)
+            if (RestoreStrings == StringDecoding.Alias)
             {
+                // Only the alias mode needs this, and only because an IPC read buffer is
+                // native-backed: disposing frees the memory the values point at. It leaks by
+                // design and exists to reproduce the §11.4b measurement, nothing more.
                 Retain(batch);
             }
             else
@@ -305,14 +326,14 @@ internal sealed class ArrowIndexedZSetTraceCodec
         for (var c = 0; c < keyCount; c++)
         {
             keyColumns[c] = ArrowColumns.Extract(
-                batch.Column(c), _keySchema[c].Type, rowCount);
+                batch.Column(c), _keySchema[c].Type, rowCount, ShippingStrings);
         }
 
         var valueColumns = new object?[valueCount][];
         for (var c = 0; c < valueCount; c++)
         {
             valueColumns[c] = ArrowColumns.Extract(
-                batch.Column(keyCount + c), _valueSchema[c].Type, rowCount);
+                batch.Column(keyCount + c), _valueSchema[c].Type, rowCount, ShippingStrings);
         }
 
         var weightArray = (Int64Array)batch.Column(keyCount + valueCount);

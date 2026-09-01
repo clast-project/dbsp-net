@@ -16,12 +16,31 @@ namespace DbspNet.Arrow;
 /// concrete <c>IArrowArray</c> reads / <c>IArrowArrayBuilder</c> writes
 /// without per-cell virtual dispatch.
 /// </summary>
+/// <summary>How VARCHAR columns are turned into <see cref="Utf8String"/> values.</summary>
+public enum StringDecoding
+{
+    /// <summary>Decode to a .NET string and re-encode to UTF-8 — two allocations and two
+    /// transcodes per cell. The default, and safe for any retention pattern.</summary>
+    Transcode,
+
+    /// <summary>Alias the Arrow buffer with no copy. Requires the caller to keep the
+    /// <c>RecordBatch</c> alive for as long as any row survives; on a native-backed buffer
+    /// (what the IPC reader produces) a disposed batch leaves the values dangling.</summary>
+    Alias,
+
+    /// <summary>Copy the column's bytes once into a managed arena and slice out of it: one
+    /// allocation per column, no transcode, ordinary GC ownership. Every surviving row pins the
+    /// whole arena, so use it where rows live and die together.</summary>
+    Arena,
+}
+
 internal static class ArrowColumns
 {
     // ---- Extraction: Arrow column → DbspNet typed object?[] ----
 
     public static object?[] Extract(
-        IArrowArray array, SqlType type, int rowCount, bool zeroCopyStrings = false) => type switch
+        IArrowArray array, SqlType type, int rowCount,
+        StringDecoding strings = StringDecoding.Transcode) => type switch
     {
         // INTEGER binds against any narrow signed int (FromArrowType widens Int8/Int16/Int32
         // → INTEGER), so the source array can be any of the three widths; widen to int here.
@@ -37,9 +56,12 @@ internal static class ArrowColumns
         SqlRealType => ExtractFloat((FloatArray)array, rowCount),
         SqlDoubleType => ExtractDouble((DoubleArray)array, rowCount),
         SqlBooleanType => ExtractBool((BooleanArray)array, rowCount),
-        SqlVarcharType => zeroCopyStrings
-            ? ExtractStringAlias((StringArray)array, rowCount)
-            : ExtractString((StringArray)array, rowCount),
+        SqlVarcharType => strings switch
+        {
+            StringDecoding.Alias => ExtractStringAlias((StringArray)array, rowCount),
+            StringDecoding.Arena => ExtractStringArena((StringArray)array, rowCount),
+            _ => ExtractString((StringArray)array, rowCount),
+        },
         SqlDateType => ExtractDate((Date32Array)array, rowCount),
         SqlTimeType => ExtractTime((Time64Array)array, rowCount),
         // A Delta table's log schema can report TIMESTAMP while the physical Parquet stores
@@ -185,6 +207,53 @@ internal static class ArrowColumns
             var start = offsets[i];
             var end = offsets[i + 1];
             result[i] = Utf8String.FromBytes(memory.Slice(start, end - start));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Copies the column's UTF-8 bytes once into a single managed arena and slices each row's
+    /// <see cref="Utf8String"/> out of it: one allocation per column instead of two per cell, and no
+    /// UTF-8 → UTF-16 → UTF-8 round trip (which <see cref="ExtractString"/> pays via
+    /// <c>Utf8String.Of(a.GetString(i))</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>The middle ground between <see cref="ExtractString"/> and
+    /// <see cref="ExtractStringAlias"/>, and it exists because pure aliasing turned out to be
+    /// unusable here: an Arrow IPC read buffer is <b>native-backed</b>, so an aliased value both
+    /// dangles once the batch is disposed and pays a virtual <c>MemoryManager</c> call on every
+    /// <c>Span</c> access — measured at +152% on the hash pass in
+    /// docs/design-incremental-persistence.md §11.4. A managed arena has neither problem: ownership
+    /// is ordinary GC, and <c>Span</c> is a plain array slice.</para>
+    /// <para><b>Retention.</b> Every surviving row pins the whole arena, so this suits a caller
+    /// where the rows live or die together — restore, where all of them survive. It is the wrong
+    /// choice where a small fraction of a batch is retained (an ingest path that filters), because
+    /// one surviving row would pin every string in the batch.</para>
+    /// </remarks>
+    private static object?[] ExtractStringArena(StringArray a, int n)
+    {
+        var result = new object?[n];
+        if (n == 0)
+        {
+            return result;
+        }
+
+        var offsets = a.ValueOffsets;
+        var first = offsets[0];
+        var arena = new byte[offsets[n] - first];
+        a.ValueBuffer.Memory.Span.Slice(first, arena.Length).CopyTo(arena);
+
+        for (var i = 0; i < n; i++)
+        {
+            if (a.IsNull(i))
+            {
+                result[i] = null;
+                continue;
+            }
+
+            result[i] = Utf8String.FromBytes(
+                new ReadOnlyMemory<byte>(arena, offsets[i] - first, offsets[i + 1] - offsets[i]));
         }
 
         return result;
