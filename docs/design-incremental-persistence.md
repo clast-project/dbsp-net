@@ -488,3 +488,50 @@ of the layering review biting exactly as predicted: one bug, two implementations
 **Still open, unchanged by this:** nothing in the recovery path. §7.3's replay-cost scare was
 retracted after profiling — a measurement artifact, not a defect — so the revised order is now
 **layering review → A2/Track B**.
+
+## 9. Recovery re-measured on the M4 Pro, real SF=3 (2026-08-31)
+
+First run since the data was regenerated locally (`docs/ivm-bench-gap-analysis.md`). Flat family,
+`IVM_BATCHES=1`, snapshot after batch 1. **Both recovery legs verified** against the output-view
+digests captured during recording — this is a timing of a *correct* answer, which §7.2 taught us not
+to assume.
+
+| leg | wall |
+|:--|--:|
+| record batch 1 (ingest + WAL + step, 20 ticks) | 40,982 ms |
+| snapshot write at tick 20 | **11,501 ms** |
+| (a) snapshot restore → tick 20, verified | **21,701 ms** |
+| (b) snapshot + WAL replay → tick 20, verified | 20,045 ms |
+
+Snapshot on disk **4050.7 MiB**, WAL 0.0 MiB.
+
+**The restore number is the one that matters for pause/resume: ~21.7 s to bring back 4.05 GiB of
+state.** Note it is nearly **2× the cost of writing it** (11.5 s) — reading is the expensive
+direction, which is the opposite of the intuition the per-batch-checkpoint framing encourages, and it
+is exactly why §4's "Track A first" ordering does not serve a pause/resume goal (§4 was chosen when
+the *write* ran every batch; a deliberate pause pays the write once and the read every time).
+
+### What this run cannot measure — and the printed extrapolation is meaningless
+
+Leg (b) came out **1,656 ms faster than leg (a)**, i.e. a *negative* replay coefficient, and the
+probe's own linear projection dutifully printed `N = 100 -> -143.9 s`. That table is nonsense and
+should be ignored.
+
+The cause is configuration, not the engine: with `IVM_BATCHES=1` and the snapshot taken *after* batch
+1, **there are no ticks past the snapshot to replay**. The WAL is 0.0 MiB on disk (the log is dropped
+once a snapshot supersedes it), so leg (b) is leg (a) plus nothing, and the −1.6 s is run-to-run
+variance between two ~21 s measurements. This is the same trap §7.3 already had to retract once:
+**differencing two large, noisy legs to extract a small coefficient.**
+
+A real replay coefficient needs ≥2 batches, which needs `IVM_STAGING_ROOT` — a multi-version staging
+copy, built by running the batch loader's `append 2` / `append 3` and snapshotting `staging/` between
+each. Not built here.
+
+### Not comparable to the i9
+
+§7.1 recorded restore at ~34.5 s and the snapshot write at ~18.6 s. **Do not read 21.7 s vs 34.5 s as
+an improvement** — different machine, and wall time does not transfer (§25.1 established that
+*allocation* is host-independent; wall emphatically is not). What *is* comparable is the state size:
+4050.7 MiB here against the recorded ~4.0 GiB, confirming the regenerated dataset puts the same state
+in memory.
+
