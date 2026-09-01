@@ -535,3 +535,60 @@ an improvement** — different machine, and wall time does not transfer (§25.1 
 4050.7 MiB here against the recorded ~4.0 GiB, confirming the regenerated dataset puts the same state
 in memory.
 
+### 9.1 Multi-batch staging built; replay measured directly (2026-08-31)
+
+§9 could not price replay because a one-batch run leaves nothing past the snapshot. Multi-version
+staging now exists, so batches 2 and 3 replay for real.
+
+**How the staging is built** (the mechanism `IVM_STAGING_ROOT` expects, undocumented until now).
+The probe drives Delta versions by hand: `RewindPendingCommits` removes any `_pending/*.json` that
+also sits in `_delta_log/`, and `PromotePendingCommits(root, b-1)` copies `_pending/<version>.json`
+into `_delta_log/` before batch `b`. Only the **commit JSON** is held back — the parquet data files
+are already on disk from the append, so promoting the commit is what makes a batch visible. So:
+
+```bash
+cd ~/src/ivm-bench/docker                       # after datagen + batch-loader `init`
+cp -R …/delta/staging …/delta/staging-batch1-pristine     # keep the batch-1-only copy
+… docker compose -f docker-compose.batch-loader.yml run --rm spark-batch-loader append 2
+… docker compose -f docker-compose.batch-loader.yml run --rm spark-batch-loader append 3
+cp -R …/delta/staging …/delta/staging-multi     # now at versions 0,1,2
+# in staging-multi, per table: move _delta_log/…0001.json and …0002.json into _pending/,
+# and delete that version's orphaned .crc / .<name>.crc sidecars
+rm -rf …/delta/staging && mv …/delta/staging-batch1-pristine …/delta/staging
+```
+
+The last line matters: `staging/` must stay batch-1-only or `IvmBatchProfile`'s batch-1 run silently
+ingests all three batches. `staging-multi/` is the probe's copy; the two coexist.
+
+**Measured** (`IVM_BATCHES=3 IVM_SNAPSHOT_AFTER=1`, flat, ServerGC):
+
+| leg | wall | reaches |
+|:--|--:|:--|
+| record batch 1 (20 ticks) | 46,033 ms | |
+| snapshot write | 17,253 ms | 4050.7 MiB |
+| record batch 2 (9 ticks) | **36 ms** | |
+| record batch 3 (9 ticks) | **52 ms** | |
+| (a) snapshot restore | 22,640 ms | tick 20, verified |
+| (b) snapshot + WAL replay | 21,189 ms | **tick 38 (end of batch 3)**, verified |
+| (d) restore + connectors | 19,674 ms | tick 38, verified — restore 19,611 ms + **step leg 62 ms** |
+
+**Recovery is restore-dominated; replaying small incremental batches is free.** The direct number is
+leg (d)'s step leg: **62 ms to apply batches 2 and 3**, against a ~20 s restore. That is measured, not
+subtracted.
+
+**The subtraction is still unusable, and the probe now says so itself.** `(b) - (a)` came out
+**−1,451 ms** — negative again — and the probe reports it as below its own ±1,132 ms noise floor for
+differencing two ~23 s restores. Leg (d) exists precisely to avoid that subtraction, and its
+cross-check (a) 22,640 ms vs (d) 19,611 ms is the honest picture: **two restores of the same snapshot,
+in the same run, differ by 15%.** Treat any restore figure as ±2–3 s. The snapshot *write* is noisier
+still — 11,501 ms in the §9 run vs 17,253 ms here for the identical 4050.7 MiB.
+
+**The caveat that actually bounds a snapshot interval** (the probe prints it, and it is the important
+part): replay cost tracks the **work in the replayed ticks, not the batch count**. These batches are
+~200 rows. Replaying a *bulk* batch costs what that batch's step originally cost — ~46 s for batch 1
+here — so the interval is bounded by the largest batch still in the log, not by how many batches are.
+
+**For pause/resume:** resume latency ≈ restore ≈ **20–23 s for 4 GiB**, essentially independent of how
+many small batches follow the snapshot. The lever is the restore path, not replay — which is what the
+lazy/one-serializer direction attacks, and which §4's "Track A first" ordering does not.
+
