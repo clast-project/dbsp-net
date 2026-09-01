@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using DbspNet.Core.Circuit;
 using DbspNet.Core.IO;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Persistence.IO.Local;
 
 namespace DbspNet.Persistence;
@@ -237,6 +238,14 @@ public static class Snapshot
     /// </remarks>
     public static bool ProfileLoad { get; set; }
 
+    /// <summary>
+    /// Operators to restore concurrently. 1 (the default) is the shipping sequential walk;
+    /// <c>DBSPNET_RESTORE_PARALLEL=&lt;n&gt;</c> raises it. Measurement scaffolding for §11 —
+    /// see the comment at its use site.
+    /// </summary>
+    internal static readonly int RestoreParallelism =
+        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RESTORE_PARALLEL"), out var p) && p > 1 ? p : 1;
+
     private static IReadOnlyList<(int Index, string Operator, double Ms)> _lastLoadProfile =
         System.Array.Empty<(int, string, double)>();
 
@@ -314,30 +323,71 @@ public static class Snapshot
 
         var restored = 0;
         var profile = ProfileLoad ? new List<(int, string, double)>(manifest.SnapshottedIndices.Count) : null;
-        foreach (var i in manifest.SnapshottedIndices)
+
+        // Stage apportionment inside deserialize (§11): the codecs and the operators' own
+        // integrate/rebuild legs write into SnapshotRestoreProfile while this is set.
+        // EXPERIMENT (docs/design-incremental-persistence.md §11): restore is a per-operator
+        // walk with no data dependencies between operators, and it runs on one thread. Setting
+        // DBSPNET_RESTORE_PARALLEL=<n> loads n operators at a time to price what that costs and
+        // buys. Not a shipping default: the per-operator profile counters are not thread-safe,
+        // so this path leaves them off.
+        if (RestoreParallelism > 1)
         {
-            if (circuit.Operators[i] is not ISnapshotable s)
-            {
-                throw new InvalidDataException(
-                    $"snapshot expected operator {i} to be ISnapshotable, " +
-                    $"but actual type {circuit.Operators[i].GetType().Name} is not");
-            }
+            await Parallel.ForEachAsync(
+                manifest.SnapshottedIndices,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = RestoreParallelism,
+                    CancellationToken = cancellationToken,
+                },
+                async (i, ct) =>
+                {
+                    if (circuit.Operators[i] is not ISnapshotable s)
+                    {
+                        throw new InvalidDataException(
+                            $"snapshot expected operator {i} to be ISnapshotable, " +
+                            $"but actual type {circuit.Operators[i].GetType().Name} is not");
+                    }
 
-            var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
-            if (profile is null)
-            {
-                await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
-                var ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0
-                    / System.Diagnostics.Stopwatch.Frequency;
-                profile.Add((i, circuit.Operators[i].GetType().Name, ms));
-            }
+                    var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+                    await s.LoadAsync(ctx, ct).ConfigureAwait(false);
+                }).ConfigureAwait(false);
 
-            restored++;
+            return manifest.SnapshottedIndices.Count;
+        }
+
+        SnapshotRestoreProfile.Enabled = ProfileLoad;
+        try
+        {
+            foreach (var i in manifest.SnapshottedIndices)
+            {
+                if (circuit.Operators[i] is not ISnapshotable s)
+                {
+                    throw new InvalidDataException(
+                        $"snapshot expected operator {i} to be ISnapshotable, " +
+                        $"but actual type {circuit.Operators[i].GetType().Name} is not");
+                }
+
+                var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+                if (profile is null)
+                {
+                    await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+                    var ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0
+                        / System.Diagnostics.Stopwatch.Frequency;
+                    profile.Add((i, circuit.Operators[i].GetType().Name, ms));
+                }
+
+                restored++;
+            }
+        }
+        finally
+        {
+            SnapshotRestoreProfile.Enabled = false;
         }
 
         if (profile is not null)

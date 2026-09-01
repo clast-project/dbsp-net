@@ -598,9 +598,12 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         // window, which must be re-partitioned, re-sorted and recomputed from the flat Z-set.
         // Two Stopwatch reads per restore; not on any hot path.
         var freq = (double)System.Diagnostics.Stopwatch.Frequency;
-        PartitionedWindowAggregateLoadProfile.Add(
-            (t1 - t0) * 1000.0 / freq,
-            (System.Diagnostics.Stopwatch.GetTimestamp() - t1) * 1000.0 / freq);
+        var rebuildMs = (System.Diagnostics.Stopwatch.GetTimestamp() - t1) * 1000.0 / freq;
+        PartitionedWindowAggregateLoadProfile.Add((t1 - t0) * 1000.0 / freq, rebuildMs);
+        if (SnapshotRestoreProfile.Enabled)
+        {
+            SnapshotRestoreProfile.AddRebuild(rebuildMs);
+        }
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;

@@ -124,7 +124,9 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        var tIntegrate = System.Diagnostics.Stopwatch.GetTimestamp();
         _trace.Integrate(loaded);
+        var tRebuild = System.Diagnostics.Stopwatch.GetTimestamp();
 
         // Rebuild the per-group caches from the restored trace. Each
         // aggregator's Update is already the function that maps a
@@ -140,6 +142,12 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
             _aggCache[key] = agg;
             _stateCache[key] = state;
+        }
+
+        if (SnapshotRestoreProfile.Enabled)
+        {
+            SnapshotRestoreProfile.AddIntegrate(SnapshotRestoreProfile.Ms(tIntegrate, tRebuild));
+            SnapshotRestoreProfile.AddRebuild(SnapshotRestoreProfile.MsSince(tRebuild));
         }
 
         await MergePersistedStateAsync(reader, cancellationToken).ConfigureAwait(false);

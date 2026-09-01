@@ -28,6 +28,12 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
         _groups = groups;
     }
 
+    // Registered in a side table only when DBSPNET_TRACE_ACCESS_PROFILE is set and a trace marks
+    // this instance as its state (docs/design-incremental-persistence.md §11). No field here: one
+    // would cost 8 bytes on every Z-set, which the w1profile B/ev instrument picks up.
+    internal void MarkTraceState() =>
+        TraceAccessProfile.Mark(this, "indexed", () => _groups.Count);
+
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =
         new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
 
@@ -37,10 +43,27 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     public IEnumerable<TKey> Keys => _groups.Keys;
 
-    public ZSet<TValue, TWeight> GroupFor(TKey key) =>
-        _groups.TryGetValue(key, out var g) ? g : ZSet<TValue, TWeight>.Empty;
+    public ZSet<TValue, TWeight> GroupFor(TKey key)
+    {
+        var found = _groups.TryGetValue(key, out var g);
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Probe(key, found);
+        }
 
-    public bool ContainsKey(TKey key) => _groups.ContainsKey(key);
+        return found ? g! : ZSet<TValue, TWeight>.Empty;
+    }
+
+    public bool ContainsKey(TKey key)
+    {
+        var found = _groups.ContainsKey(key);
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Probe(key, found);
+        }
+
+        return found;
+    }
 
     /// <summary>
     /// The dictionary's own struct enumerator, returned by value so
@@ -48,7 +71,15 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     /// <see cref="IEnumerable{T}"/> — see the note on
     /// <see cref="ZSet{TKey,TWeight}.GetEnumerator"/> for the cost this avoids.
     /// </summary>
-    public Dictionary<TKey, ZSet<TValue, TWeight>>.Enumerator GetEnumerator() => _groups.GetEnumerator();
+    public Dictionary<TKey, ZSet<TValue, TWeight>>.Enumerator GetEnumerator()
+    {
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Scan();
+        }
+
+        return _groups.GetEnumerator();
+    }
 
     IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
         IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => _groups.GetEnumerator();
@@ -211,6 +242,11 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     /// </summary>
     internal IReadOnlyList<TKey> RemoveKeysBelow(long threshold, Func<TKey, long> monotoneKey)
     {
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Scan();
+        }
+
         ArgumentNullException.ThrowIfNull(monotoneKey);
         List<TKey>? removed = null;
         foreach (var key in _groups.Keys)

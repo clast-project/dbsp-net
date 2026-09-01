@@ -21,8 +21,18 @@ internal sealed class ZSetTrace<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    public ZSet<TKey, TWeight> Current { get; } =
-        new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>());
+    public ZSet<TKey, TWeight> Current { get; } = NewState();
+
+    private static ZSet<TKey, TWeight> NewState()
+    {
+        var z = new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>());
+        if (TraceAccessProfile.Enabled)
+        {
+            z.MarkTraceState();
+        }
+
+        return z;
+    }
 
     public void Integrate(ZSet<TKey, TWeight> delta)
     {
@@ -57,8 +67,18 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight>
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    public IndexedZSet<TKey, TValue, TWeight> Current { get; } =
-        new IndexedZSet<TKey, TValue, TWeight>(new Dictionary<TKey, ZSet<TValue, TWeight>>());
+    public IndexedZSet<TKey, TValue, TWeight> Current { get; } = NewState();
+
+    private static IndexedZSet<TKey, TValue, TWeight> NewState()
+    {
+        var z = new IndexedZSet<TKey, TValue, TWeight>(new Dictionary<TKey, ZSet<TValue, TWeight>>());
+        if (TraceAccessProfile.Enabled)
+        {
+            z.MarkTraceState();
+        }
+
+        return z;
+    }
 
     public void Integrate(IndexedZSet<TKey, TValue, TWeight> delta)
     {

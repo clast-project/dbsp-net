@@ -123,8 +123,18 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
                 "IncrementalFullJoinOp was constructed without snapshot codecs.");
         }
 
-        _leftTrace.Integrate(await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false));
-        _rightTrace.Integrate(await _rightSnapshotCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false));
+        var left = await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false);
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        _leftTrace.Integrate(left);
+        var integrateMs = SnapshotRestoreProfile.MsSince(t0);
+
+        var right = await _rightSnapshotCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false);
+        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        _rightTrace.Integrate(right);
+        if (SnapshotRestoreProfile.Enabled)
+        {
+            SnapshotRestoreProfile.AddIntegrate(integrateMs + SnapshotRestoreProfile.MsSince(t1));
+        }
     }
 
     public string SchemaFingerprint =>

@@ -140,6 +140,11 @@ internal sealed class ArrowIndexedZSetTraceCodec
             return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
         }
 
+        if (SnapshotRestoreProfile.Enabled)
+        {
+            return await LoadProfiledAsync(reader, fileName, cancellationToken).ConfigureAwait(false);
+        }
+
         await using var file = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
         await using var stream = file.AsStream();
         using var ipcReader = new ArrowStreamReader(stream, leaveOpen: true);
@@ -152,6 +157,141 @@ internal sealed class ArrowIndexedZSetTraceCodec
         using (batch)
         {
             return BuildIndexedZSet(batch);
+        }
+    }
+
+    // EXPERIMENT (§11): decode VARCHAR columns as aliases into the Arrow buffer instead of
+    // Utf8 -> string -> Utf8 round-tripping every cell. Aliasing means the batch's buffers must
+    // outlive the restored state, so the batches are retained deliberately for the duration of
+    // the measurement (this path is the profiled one, never a shipping restore).
+    private static readonly bool ZeroCopyStrings =
+        Environment.GetEnvironmentVariable("DBSPNET_RESTORE_ZEROCOPY_STRINGS") is "1";
+
+    private static readonly List<object> RetainedBatches = new();
+
+    private static void Retain(object batch)
+    {
+        lock (RetainedBatches)
+        {
+            RetainedBatches.Add(batch);
+        }
+    }
+
+    // Stage-split twin of LoadAsync (docs/design-incremental-persistence.md §11); see the
+    // matching comment in ArrowZSetTraceCodec.
+    private async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadProfiledAsync(
+        ISnapshotReader reader, string fileName, CancellationToken cancellationToken)
+    {
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        MemoryStream memory;
+        await using (var file = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            await using var stream = file.AsStream();
+            memory = new MemoryStream(stream.CanSeek ? (int)stream.Length : 0);
+            await stream.CopyToAsync(memory, cancellationToken).ConfigureAwait(false);
+        }
+
+        memory.Position = 0;
+        var bytes = memory.Length;
+        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        using var ipcReader = new ArrowStreamReader(memory, leaveOpen: true);
+        var batch = ipcReader.ReadNextRecordBatch();
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (batch is null)
+        {
+            SnapshotRestoreProfile.AddCodec(
+                SnapshotRestoreProfile.Ms(t0, t1), SnapshotRestoreProfile.Ms(t1, t2),
+                0, 0, 0, bytes, 0, 0);
+            return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+        }
+
+        // Disposed below unless the alias experiment retains it.
+        {
+            var keyCount = _keySchema.Count;
+            var valueCount = _valueSchema.Count;
+            var rowCount = batch.Length;
+
+            var stringMs = 0.0;
+            var stringCols = 0L;
+            var keyColumns = new object?[keyCount][];
+            for (var c = 0; c < keyCount; c++)
+            {
+                var isVarchar = _keySchema[c].Type is DbspNet.Sql.TypeSystem.SqlVarcharType;
+                var tc = System.Diagnostics.Stopwatch.GetTimestamp();
+                keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, rowCount, ZeroCopyStrings);
+                if (isVarchar)
+                {
+                    stringMs += SnapshotRestoreProfile.MsSince(tc);
+                    stringCols++;
+                }
+            }
+
+            var valueColumns = new object?[valueCount][];
+            for (var c = 0; c < valueCount; c++)
+            {
+                var isVarchar = _valueSchema[c].Type is DbspNet.Sql.TypeSystem.SqlVarcharType;
+                var tc = System.Diagnostics.Stopwatch.GetTimestamp();
+                valueColumns[c] = ArrowColumns.Extract(
+                    batch.Column(keyCount + c), _valueSchema[c].Type, rowCount, ZeroCopyStrings);
+                if (isVarchar)
+                {
+                    stringMs += SnapshotRestoreProfile.MsSince(tc);
+                    stringCols++;
+                }
+            }
+
+            var weightValues = ((Int64Array)batch.Column(keyCount + valueCount)).Values;
+            var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            var keys = new StructuralRow[rowCount];
+            var values = new StructuralRow[rowCount];
+            for (var i = 0; i < rowCount; i++)
+            {
+                var keyValues = new object?[keyCount];
+                for (var c = 0; c < keyCount; c++)
+                {
+                    keyValues[c] = keyColumns[c][i];
+                }
+
+                var rowValues = new object?[valueCount];
+                for (var c = 0; c < valueCount; c++)
+                {
+                    rowValues[c] = valueColumns[c][i];
+                }
+
+                keys[i] = new StructuralRow(keyValues);
+                values[i] = new StructuralRow(rowValues);
+            }
+
+            var t4 = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            for (var i = 0; i < rowCount; i++)
+            {
+                b.Add(keys[i], values[i], new Z64(weightValues[i]));
+            }
+
+            var result = b.Build();
+            var t5 = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (ZeroCopyStrings)
+            {
+                Retain(batch);
+            }
+            else
+            {
+                batch.Dispose();
+            }
+
+
+            SnapshotRestoreProfile.AddCodec(
+                SnapshotRestoreProfile.Ms(t0, t1),
+                SnapshotRestoreProfile.Ms(t1, t2),
+                SnapshotRestoreProfile.Ms(t2, t3),
+                SnapshotRestoreProfile.Ms(t3, t4),
+                SnapshotRestoreProfile.Ms(t4, t5),
+                bytes, rowCount, keyCount + valueCount, stringMs, stringCols);
+            return result;
         }
     }
 

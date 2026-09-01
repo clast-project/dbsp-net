@@ -282,6 +282,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        var tRebuild = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
         _window.Clear();
         foreach (var (row, weight) in loaded)
@@ -308,6 +309,13 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             {
                 _window[key] = window;
             }
+        }
+
+        // §10 inferred this operator's rebuild share from PartitionedWindowAggregateOp's
+        // measured 2:1 split; measure it instead (docs/design-incremental-persistence.md §11).
+        if (SnapshotRestoreProfile.Enabled)
+        {
+            SnapshotRestoreProfile.AddRebuild(SnapshotRestoreProfile.MsSince(tRebuild));
         }
     }
 

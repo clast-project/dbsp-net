@@ -71,7 +71,12 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         _trace.Integrate(loaded);
+        if (SnapshotRestoreProfile.Enabled)
+        {
+            SnapshotRestoreProfile.AddIntegrate(SnapshotRestoreProfile.MsSince(t0));
+        }
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;

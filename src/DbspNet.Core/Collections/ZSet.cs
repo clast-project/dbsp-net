@@ -23,6 +23,12 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         _entries = entries;
     }
 
+    // Registered in a side table only when DBSPNET_TRACE_ACCESS_PROFILE is set and a trace marks
+    // this instance as its state (docs/design-incremental-persistence.md §11). No field here: one
+    // would cost 8 bytes on every Z-set, which the w1profile B/ev instrument picks up.
+    internal void MarkTraceState() =>
+        TraceAccessProfile.Mark(this, "flat", () => _entries.Count);
+
     public static ZSet<TKey, TWeight> Empty { get; } = new(new Dictionary<TKey, TWeight>());
 
     public int Count => _entries.Count;
@@ -55,10 +61,27 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// <summary>
     /// Returns the weight of <paramref name="key"/>, or <c>Zero</c> if absent.
     /// </summary>
-    public TWeight WeightOf(TKey key) =>
-        _entries.TryGetValue(key, out var w) ? w : TWeight.Zero;
+    public TWeight WeightOf(TKey key)
+    {
+        var found = _entries.TryGetValue(key, out var w);
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Probe(key, found);
+        }
 
-    public bool Contains(TKey key) => _entries.ContainsKey(key);
+        return found ? w : TWeight.Zero;
+    }
+
+    public bool Contains(TKey key)
+    {
+        var found = _entries.ContainsKey(key);
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Probe(key, found);
+        }
+
+        return found;
+    }
 
     public IEnumerable<TKey> Keys => _entries.Keys;
 
@@ -194,6 +217,11 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// </summary>
     internal int RemoveKeysBelow(long threshold, Func<TKey, long> monotoneKey)
     {
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Scan();
+        }
+
         ArgumentNullException.ThrowIfNull(monotoneKey);
         List<TKey>? removed = null;
         foreach (var key in _entries.Keys)
@@ -248,7 +276,15 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// sorted run stand in its place is <see cref="IMultiset{TKey,TWeight}"/>,
     /// not this method.
     /// </remarks>
-    public Dictionary<TKey, TWeight>.Enumerator GetEnumerator() => _entries.GetEnumerator();
+    public Dictionary<TKey, TWeight>.Enumerator GetEnumerator()
+    {
+        if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
+        {
+            TraceAccessProfile.For(this)?.Scan();
+        }
+
+        return _entries.GetEnumerator();
+    }
 
     IEnumerator<KeyValuePair<TKey, TWeight>> IEnumerable<KeyValuePair<TKey, TWeight>>.GetEnumerator() =>
         _entries.GetEnumerator();

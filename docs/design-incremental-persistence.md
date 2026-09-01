@@ -665,3 +665,237 @@ thing.
 **Measurement caveats.** Restore wall varies ~15% between legs in one run (§9.1), so the shares are
 ±2 points. The `PartitionedOffsetOp` split is inferred, not measured. All of this is one workload —
 ivm-bench's 50-view program — and the mix of operator kinds is what sets these shares.
+
+## 11. Lazy / file-backed restore — the deserialize term apportioned (2026-08-31)
+
+The arc kicked off by `docs/next-arc-lazy-restore-prompt.md`. §10 left restore **deserialize-bound**
+("most of restore is reading bytes back, not rebuilding structure") and pointed at Feldera's lazy,
+file-backed recovery — `O(#files)`, not `O(state)`. That is a slogan until the deserialize term is
+itself apportioned, so this section answers the arc's four questions in order, on the real SF=3
+program, flat family, ServerGC, M4 Pro.
+
+**Every restore timed below was verified** against recorded output-view digests. §7.2 was a restore
+that silently produced wrong state; a timing of a wrong answer is worthless.
+
+### 11.1 The instrument (and one trap it had to remove first)
+
+`tests/DbspNet.Tests/Scratch/IvmRestoreProfile.cs` splits the run so the expensive half is paid once:
+`record` ingests batch 1, snapshots, keeps ingesting batches 2–3 and writes `restore-probe.json`
+(digest at the snapshot, digest at the end, connector cursors) beside the snapshot; `profile` and
+`replay` then restore that snapshot repeatedly — ~25 s a run instead of ~80 s — and check the recorded
+digests. Two opt-in instruments, both free when off:
+
+- **`SnapshotRestoreProfile`** (`DbspNet.Core`, written by the Arrow codecs and by each operator's
+  `LoadAsync`) splits restore into **read** (file → memory), **decode** (Arrow IPC framing),
+  **extract** (Arrow columns → `object?[]`, i.e. the boxing pass, timed separately for VARCHAR),
+  **materialize** (one row object per row), **index** (hashing rows into the loaded Z-set),
+  **integrate** (folding that Z-set into the operator's trace) and **rebuild** (re-partition /
+  re-sort / recompute for operators whose runtime state is not a Z-set). Enabled for the duration of
+  a restore when `Snapshot.ProfileLoad` is set.
+- **`TraceAccessProfile`** (`DbspNet.Core.Collections`) counts key probes, distinct keys probed and
+  whole-collection scans against **trace-state** collections only. Its gate is a `static readonly`
+  environment read (`DBSPNET_TRACE_ACCESS_PROFILE`), so with the variable unset the JIT folds every
+  call site out of the join probe path — the shipping code is untouched, not merely un-taken.
+
+The access counters live in a `ConditionalWeakTable` keyed by the collection, not in a field on it.
+The field version was written first, and `w1profile` caught it: **+2 to +4 B/event on q20/q4/q9** —
+8 bytes on every Z-set, including the per-key inner group of every indexed one, on exactly the join
+queries. With the side table, `w1profile` B/event is **byte-identical to the committed baseline on all
+ten queries**. That instrument earns its keep again (`docs/w1-profile.md`, §25.1).
+
+**The trap.** The probe's digest hashed cells with `object.GetHashCode()`, which for `string` is
+randomized per process. That is invisible in `IvmRecoveryProbe`, which records and verifies inside
+one process, but a digest written by the `record` run and checked by a later `profile` run reported
+**3 of 16 views as differing with identical row counts**. It looked exactly like §7.2. It was the hash.
+Cells are now hashed with `StableHash`, and all 16 views match on every run below. Any cross-process
+verification in this repo needs the same care.
+
+### 11.2 Q1 — restore is not I/O-bound. It is boxing-bound
+
+Four fresh-process restores of the same 4050.7 MiB snapshot (168 files, 30,464,849 rows,
+3,539 columns of which 1,730 are VARCHAR), profiling on:
+
+| stage | A | B | C | D | mean | share |
+|:--|--:|--:|--:|--:|--:|--:|
+| read (file I/O) | 631 | 847 | 695 | 513 | 671 ms | **2.5%** |
+| decode (Arrow IPC framing) | 332 | 246 | 270 | 252 | 275 ms | 1.0% |
+| **extract (Arrow → boxed `object?[]`)** | 9962 | 11899 | 12851 | 11413 | **11531 ms** | **43.0%** |
+| materialize (row objects) | 3955 | 3807 | 4599 | 4235 | 4149 ms | 15.5% |
+| index (hash rows into the Z-set) | 2023 | 2358 | 1663 | 1560 | 1901 ms | 7.1% |
+| integrate (fold into the trace) | 975 | 866 | 2697 | 1605 | 1536 ms | 5.7% |
+| rebuild (operator-specific state) | 7870 | 7419 | 5246 | 5547 | 6521 ms | 24.3% |
+| unattributed | 236 | 237 | 230 | 217 | 230 ms | 0.9% |
+| **total restore** | **25985** | **27679** | **28250** | **25342** | **26814 ms** | |
+
+VARCHAR columns were timed separately in the two runs that carried that instrument: **6444 ms
+(22.8%)** and **7159 ms (28.3%)** — over half the extract term, a quarter of the whole restore.
+
+**Reading the bytes back costs 2.5%.** The premise that restore is dominated by "reading bytes" is
+wrong in the way that matters: the bytes arrive in 0.7 s and then cost 25 s to become engine state.
+`ArrowColumns.Extract` boxes every cell into an `object`, and for VARCHAR it runs
+`Utf8String.Of(a.GetString(i))` — decode the Arrow UTF-8 into a UTF-16 `string`, then re-encode that
+back to UTF-8 — two allocations and two transcodes per string cell. Restoring a 4.05 GiB snapshot
+**allocates 42.3 GiB** (44.85 GiB with profiling on), and that figure reproduces to within 4 MiB across
+runs, exactly as §25.1 of `design-row-representation.md` says allocation should.
+
+This also settles something that looked odd before: arity-preserving dead-column elimination removed
+~1 GiB of snapshot and was **wall-neutral**. Of course it was — it was cutting into the 2.5%.
+
+The profiled path reads each file fully into memory before decoding (that is what makes the read leg
+separable) and materializes rows into a temporary array; it costs ~20–25% more wall than the shipping
+path (26.8 s profiled vs **21.9 s / 21.6 s** unprofiled on the same build, matching §9.1's 20–23 s).
+Read the *shares*, not the totals.
+
+### 11.3 Q2 — a resumed pipeline touches 0.0135% of what it restored
+
+`replay` mode restores the snapshot (verified, 23.0 s), then drives batches 2 and 3 through the real
+connectors with the access counters armed (128 ms, end state verified):
+
+| | |
+|:--|--:|
+| restored keys across 118 non-empty trace collections | 8,338,691 |
+| **distinct keys probed by the resumed ticks** | **1,124 — 0.0135%** |
+| probes including repeats | 1,481 |
+| full scans of a trace | 2, over one 1-key collection |
+| keys in any scanned collection | 1 |
+
+The largest collections — 982k, 912k, 886k, and seven of ~391k keys — were probed 0 to 75 times each.
+**Nothing large was scanned.** So for the pause/resume goal this arc exists to serve, laziness would
+not merely *defer* the deserialize work; on this workload it would **never do it**. That is the
+strongest possible answer to the question the kickoff flagged as the one that could sink the arc.
+
+Two honest limits on that number:
+
+- It covers **trace-shaped** state only. `PartitionedWindowAggregateOp` / `PartitionedOffsetOp` keep a
+  partition-keyed `SortedDictionary`, not a Z-set, and are not counted — they are the rebuild term,
+  which is eager by construction (§11.6).
+- The probe drives ingest, not output. `ProgramRunner.WriteOutputsAsync` writes **every output view's
+  full contents** every batch, so a real ivm-bench resume scans all 16 output views on its first
+  batch — that is exactly the `IntegrateOp` state (4.4–5.5% of restore). Laziness cannot skip those,
+  and a deployment that emits full views on every tick has no lazy state at all downstream of the
+  integral.
+
+### 11.4 Two cheaper levers, measured before the architectural one
+
+**(a) Restore is single-threaded, and the operators are independent.** `Snapshot.ReadAsync` walks
+`SnapshottedIndices` in a `foreach`. There is no data dependency between operators, so
+`DBSPNET_RESTORE_PARALLEL=<n>` (gated, measurement scaffolding) loads *n* at a time. Same snapshot,
+same build, every leg digest-verified:
+
+| degree | restore | vs sequential |
+|--:|--:|--:|
+| 1 (shipping) | 21.9 s / 21.6 s | — |
+| 4 | 12.6 s | 1.73× |
+| 6 | 15.1 s | 1.44× |
+| 8 | 9.6 s / 14.7 s / 15.4 s (mean 13.2 s) | **1.64×** |
+| 10 | 10.1 s | 2.15× |
+| 14 | 17.1 s | 1.27× |
+
+The spread at a fixed degree (9.6, 14.7, 15.4 s at 8) is wider than the difference between degrees,
+and 14 threads is *worse* than 8 — restore allocates 42 GiB, so what is being scheduled is as much GC
+as CPU, and the M4 Pro's 10 P + 4 E cores are not interchangeable. Treat this as **"roughly 1.4–2.3×,
+best around 8, for a change that fits on one screen"**, not as a scaling curve. It is the only lever
+measured here that needs no representation, format or substrate decision.
+
+**(b) The VARCHAR round-trip is removable without laziness.** `ArrowColumns` already has a zero-copy
+path (`ExtractStringAlias`) that aliases the Arrow buffer instead of transcoding; the snapshot codecs
+do not use it. Wiring it into the profiled loader (retaining the `RecordBatch` so the buffers outlive
+the state) and re-running, **digest-verified — aliased `Utf8String` values compare byte-identical to
+transcoded ones**:
+
+| stage | baseline (mean of 4) | zero-copy VARCHAR (mean of 3) | |
+|:--|--:|--:|--:|
+| extract | 11531 ms | **4864 ms** | −58% |
+| of which VARCHAR | 6802 ms | 1717 ms | −75% |
+| materialize | 4149 ms | 4477 ms | +8% |
+| **index (hash into the Z-set)** | 1901 ms | **4795 ms** | **+152%** |
+| integrate | 1536 ms | 1515 ms | — |
+| rebuild | 6521 ms | 5622 ms | −14% |
+| **total restore** | **26.8 s** (25.3–28.3) | **22.9 s** (21.6–24.2) | **−14.6%** |
+| allocated | 44.85 GiB | **33.66 GiB** | **−25%** |
+
+Two results, one of them a warning. The lever works: 11 GiB of allocation and 58% of the extract term
+disappear, and the two sample ranges do not overlap, so the −14.6% wall is real rather than noise.
+But **hashing got 2.5× more expensive**: an aliased `Utf8String` points into one large retained
+buffer, so every hash and every comparison during the index pass is a scattered read, where a
+freshly-transcoded value sits in newly-allocated, adjacent memory. Roughly 40% of the extract saving
+is handed straight back at the index step. That is the same pattern §16.9 and the dead-column work
+hit from the other side, and it is the single most useful caution this arc produces for any future
+"keep it columnar / keep it in the file" design: **a representation that is cheaper to produce can be
+more expensive to probe, and the probe side is where the engine already lives.**
+
+### 11.5 Q3 — the flat family cannot be made lazy. Laziness is a storage-format change
+
+The kickoff asked whether the flat family is compatible with file-backing. It is not, and the reason
+is in the codec rather than in the trace:
+
+- A flat operator's state is written as **one Arrow IPC batch per operator**, in **dictionary
+  iteration order** (`ArrowZSetTraceCodec.SaveAsync` iterates the trace). It is unsorted, has no key
+  index, and no per-key locator.
+- A lazy probe therefore cannot find a key without scanning the whole file — the exact opposite of
+  Feldera's 512-byte trailer plus Bloom block, which works because their batches are **sorted,
+  immutable runs with an index**.
+- Their laziness is not a property of their restore code. It is a property of their **on-disk batch
+  format** plus a buffer cache, a shared batch store, and two-level GC (comparison §5).
+
+So "lazy restore" on the flat family means: define a sorted, indexed, immutable on-disk batch format;
+teach the trace to serve probes from it; add a page cache and a file-lifetime/GC discipline. That is
+the LSM programme — i.e. the spine substrate, which `decision-trace-family.md` §4 decided to stop
+growing, and which §9 row 3 of `comparison-feldera-decisions.md` says was measured unfairly (our
+compaction ran on the step thread; theirs does not). **This arc does not settle that**; it does
+establish that the lazy-restore question and the spine question are the *same* question, and that
+whoever reopens it should run §9 row 3's experiment (compaction off the step thread) first, because a
+file-backed flat family would be a second LSM implementation.
+
+Note also what laziness costs on the other side: every steady-state probe that today hits a RAM
+dictionary becomes a potential page fault plus a decode, on a workload whose per-row cost is already
+the standing bottleneck (`repr-execution-apportionment.md`).
+
+### 11.6 Q4 — the ceiling, and what to do
+
+Take the shipping sequential restore, **21.9 s**, and apply the shares from §11.2:
+
+| what a design can remove | share | 21.9 s becomes |
+|:--|--:|--:|
+| perfect laziness over trace-shaped state (read+decode+extract+materialize+index+integrate, minus the ~0.01% actually touched) | ~75% | **~5.5 s** |
+| …plus §10's radix-tree re-expression, which removes the rebuild term too | ~99% | ~0.2 s |
+| parallel restore alone, **measured**, degree 8 | — | **13.2 s** (9.6–15.4) |
+| zero-copy VARCHAR alone, **measured** | — | **18.7 s** (−14.6%, allocation −25%) |
+| both of the above together (not measured; they attack different terms) | — | ~11 s |
+| eliminating file I/O entirely — the intuition this arc started from | 2.5% | 21.3 s |
+
+Three conclusions, in the order they matter:
+
+1. **The rebuild term is the part laziness cannot touch, and §10's rewrite is the part laziness needs.**
+   §10 recommended deferring the radix-tree work until restore stopped being deserialize-bound. That
+   was right, and it also means the two are **complements, not alternatives**: laziness caps out at
+   ~75% precisely because `PartitionedWindowAggregateOp` + `PartitionedOffsetOp` + the aggregate cache
+   rebuild is 25% of restore and is eager by construction. A lazy design that does not also
+   re-express those operators' state buys 21.9 s → 5.5 s, not → 0.
+2. **Parallel restore is the largest prize available today.** ~1.6× (1.4–2.3×) for a `Parallel.ForEachAsync`,
+   no format change, no representation change, no new substrate, digest-verified at every degree
+   tried. It should ship (as an opt-in `Snapshot.ReadAsync` degree, defaulting to something modest —
+   the 14-thread regression says the degree needs to be chosen, not maximised). With zero-copy
+   VARCHAR alongside it, resume of 4 GiB plausibly lands near ~11 s, and the remaining architectural
+   prize is ~11 s → ~3 s.
+3. **Do not build lazy/file-backed restore now.** Not because the ceiling is small — it is the largest
+   one on the table — but because §11.5 shows the cost is a second LSM storage layer, and the arc that
+   would have to authorise it (`decision-trace-family.md`) is decided the other way on evidence that
+   §9 row 3 of the Feldera comparison already flags as needing a re-run. The honest sequence is:
+   ship parallel restore → run the compaction-off-the-step-thread experiment → if spine wins that,
+   lazy restore comes with it, and the radix-tree work becomes the completing half.
+
+**What this arc retires.** "Restore is expensive because reading 4 GiB back is expensive" — no: 2.5%.
+"Lazy restore is a restore-path change" — no: it is a storage-format change. "Restore is
+deserialize-bound, so make deserialize cheaper" — half right: the cheap version of that (zero-copy
+strings) removes a quarter of the allocation and a seventh of the wall — and gives 40% of it back at
+the hash; the expensive version is the columnar row representation
+— a different arc, with a different constituency (`design-row-representation.md`), which can now
+claim restore as a second beneficiary, since extract + materialize is **58%** of one.
+
+**Measurement caveats.** One workload; the operator mix sets every share. Restore wall varies ~15%
+between legs and the parallel legs vary more than that. The profiled path is ~20–25% slower than the
+shipping one and materializes an extra array per file — read the *shares*, not the totals. The
+allocation figures reproduce to within 4 MiB across runs and are the more trustworthy instrument. The
+zero-copy VARCHAR leg is a measurement path (it retains every `RecordBatch` deliberately), not a
+shipping design; the buffers must outlive the state before it can become one.
