@@ -142,11 +142,18 @@ public static class ParallelSnapshot
 
         // Restore each replica concurrently; disjoint subtrees, disjoint state. A
         // per-worker fingerprint mismatch surfaces as an InvalidDataException.
+        //
+        // The replicas are already W-way concurrent, so each one restores its own operators with a
+        // SHARE of Snapshot.DefaultRestoreParallelism rather than all of it: the product is what
+        // decides how many operator files decode at once, and that is what bounds peak memory
+        // (docs/design-incremental-persistence.md §11.4). Each replica also holds only 1/W of the
+        // state, so there is less per-replica work to spread.
+        var perReplica = Math.Max(1, Snapshot.DefaultRestoreParallelism / replicas.Count);
         var tasks = new Task<int>[replicas.Count];
         for (var w = 0; w < replicas.Count; w++)
         {
             var workerFs = new PrefixedTableFileSystem(fs, WorkerPrefix(w));
-            tasks[w] = Snapshot.ReadAsync(replicas[w], workerFs, cancellationToken).AsTask();
+            tasks[w] = Snapshot.ReadAsync(replicas[w], workerFs, perReplica, cancellationToken).AsTask();
         }
 
         var counts = await Task.WhenAll(tasks).ConfigureAwait(false);

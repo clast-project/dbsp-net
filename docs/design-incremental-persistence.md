@@ -984,3 +984,50 @@ only HashDoS protection, and the BCL's collision fallback covers `string`-keyed 
 not custom key types like ours. Nothing in this engine's threat model needs it today; if it ever
 does, the answer is a keyed hash with the seed persisted in the snapshot manifest, not a return to a
 per-process one.
+
+### 11.8 Parallel restore shipped (2026-08-31)
+
+§11.6's conclusion 2 — "parallel restore is the largest prize available today" — is now the shipping
+path, not an env-var experiment.
+
+**API.** `Snapshot.ReadAsync(circuit, fs, parallelism, ct)` (and the local-directory overload) load
+that many operators at once; the existing overloads use `Snapshot.DefaultRestoreParallelism`, which
+defaults to **half the machine's processors, capped at 8**. `DBSPNET_RESTORE_PARALLEL` still
+overrides it, and setting the property to 1 restores the sequential walk.
+
+**Measured on the real SF=3 snapshot** (4050.7 MiB, same build, every leg digest-verified):
+
+| degree | restore | allocated |
+|--:|--:|--:|
+| 1 (was) | 20.7 s / 20.6 s | 42.28 GiB |
+| **7 (the default here, 14 cores)** | **10.1 s / 10.7 s** | 45.5 GiB |
+
+**~2.0×, for a change that fits on one screen.** Allocation rises ~8% — concurrency is not free —
+and peak memory rises with the degree, since that many operator files decode at once. That, plus the
+measured degree-14 regression (§11.4), is why the default is capped rather than set to the processor
+count.
+
+**Why it is safe, which is the part that needed checking rather than asserting:**
+
+- **Snapshotted operators own disjoint state.** The one place the compiler shares state between
+  operators is arrangement CSE, and its guard already includes `ctx.SnapshotCodecs is null` — shared
+  arrangements are disabled whenever snapshotting is on. (`IncrementalJoinSharedRightOp` is not
+  `ISnapshotable` at all.)
+- **The degree cannot change the result.** `ParallelRestoreTests` restores the same snapshot at
+  degrees 1, 2, 4 and 16 and drives each restored circuit through the same continuation, asserting
+  identical output — state is only observable through what it makes the circuit emit.
+- **Failures surface unwrapped.** `Parallel.ForEachAsync` reports body exceptions in an
+  `AggregateException`; callers catch `InvalidDataException` / `NotSupportedException` from
+  `ReadAsync`. The concurrent path rethrows the first inner exception through
+  `ExceptionDispatchInfo`, and a test corrupts an operator's trace file to prove the exception that
+  comes out of a concurrent restore is not a wrapper.
+- **`ProfileLoad` forces the sequential walk**, because per-operator timings taken from overlapping
+  loads would not mean anything — and the §11.2 stage counters are not thread-safe. A test pins that.
+- **Parallel circuits divide, not multiply.** `ParallelSnapshot.ReadAsync` already restores its `W`
+  replicas concurrently, so each replica now gets `DefaultRestoreParallelism / W` rather than all of
+  it: the product is what bounds how many operator files decode at once.
+
+**Where this leaves resume latency.** 4 GiB of state comes back in ~10 s instead of ~21 s. The
+remaining architectural prize (§11.6) is that ~10 s → ~2.5 s, and it still costs a storage-format
+change plus the radix-tree rewrite. Nothing about that ordering changes; the cheap half is simply
+taken now.

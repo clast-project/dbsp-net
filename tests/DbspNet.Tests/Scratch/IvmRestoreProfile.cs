@@ -168,13 +168,17 @@ public class IvmRestoreProfile
 
             SnapshotRestoreProfile.Reset();
             PartitionedWindowAggregateLoadProfile.Reset();
-            // The parallel-restore experiment races the profile counters; leave them off there.
-            Snapshot.ProfileLoad = Environment.GetEnvironmentVariable("DBSPNET_RESTORE_PARALLEL") is null;
+            // IVM_RESTORE_DEGREE=1 gives the sequential walk with the stage profile; anything
+            // higher measures the shipping concurrent restore, where per-operator timings would be
+            // meaningless (ReadAsync forces sequential while ProfileLoad is set, so ask for it
+            // explicitly rather than silently getting the slow path).
+            var degree = Env("IVM_RESTORE_DEGREE", Snapshot.DefaultRestoreParallelism);
+            Snapshot.ProfileLoad = degree <= 1 && Environment.GetEnvironmentVariable("IVM_NO_STAGE_PROFILE") is null;
 
             var program = Compile(spec, traceFamily);
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
             var sw = Stopwatch.StartNew();
-            await Snapshot.ReadAsync(program.Circuit, new LocalTableFileSystem(snapshotDir));
+            await Snapshot.ReadAsync(program.Circuit, new LocalTableFileSystem(snapshotDir), degree);
             sw.Stop();
             var allocMiB = (GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (1024.0 * 1024.0);
             Snapshot.ProfileLoad = false;
@@ -187,7 +191,7 @@ public class IvmRestoreProfile
             var ok = CheckDigest(sidecar.DigestAtSnapshot, Digest(program), "restore");
             _out.WriteLine("");
             _out.WriteLine(FormattableString.Invariant(
-                $"== restore #{r + 1}: {sw.Elapsed.TotalMilliseconds:F0} ms, {allocMiB:F0} MiB allocated, tick {program.Circuit.TickCount}, {(ok ? "verified" : "WRONG")} =="));
+                $"== restore #{r + 1}: {sw.Elapsed.TotalMilliseconds:F0} ms, {allocMiB:F0} MiB allocated, degree {degree}, tick {program.Circuit.TickCount}, {(ok ? "verified" : "WRONG")} =="));
             if (Snapshot.LastLoadProfile.Count > 0 && SnapshotRestoreProfile.Files > 0)
             {
                 ReportStages(sw.Elapsed.TotalMilliseconds);

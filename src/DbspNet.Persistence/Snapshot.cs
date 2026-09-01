@@ -239,12 +239,26 @@ public static class Snapshot
     public static bool ProfileLoad { get; set; }
 
     /// <summary>
-    /// Operators to restore concurrently. 1 (the default) is the shipping sequential walk;
-    /// <c>DBSPNET_RESTORE_PARALLEL=&lt;n&gt;</c> raises it. Measurement scaffolding for §11 —
-    /// see the comment at its use site.
+    /// Degree of concurrency <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
+    /// uses when no explicit degree is passed. Restore is a per-operator walk with no data
+    /// dependency between operators — snapshotted operators own disjoint state — so it parallelises
+    /// directly, and doing so is the largest resume-latency lever available without changing the
+    /// storage format (docs/design-incremental-persistence.md §11.4).
     /// </summary>
-    internal static readonly int RestoreParallelism =
-        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RESTORE_PARALLEL"), out var p) && p > 1 ? p : 1;
+    /// <remarks>
+    /// <para>Default is half the machine's processors, capped at 8. The cap is measured, not
+    /// arbitrary: on a 14-core M4 Pro, degree 8 restored a 4 GiB snapshot in 9.6–15.4 s against
+    /// 21.9 s sequential, while degree <b>14 was worse</b> (17.1 s) — a restore allocates ~10× the
+    /// state it rebuilds, so past a point what is being scheduled is garbage collection, and
+    /// performance cores and efficiency cores are not interchangeable. Peak memory also rises with
+    /// the degree, since that many operator files decode at once.</para>
+    /// <para><c>DBSPNET_RESTORE_PARALLEL</c> overrides the default for measurement. Setting this
+    /// property to 1 restores the sequential walk.</para>
+    /// </remarks>
+    public static int DefaultRestoreParallelism { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RESTORE_PARALLEL"), out var p) && p > 0
+            ? p
+            : Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
 
     private static IReadOnlyList<(int Index, string Operator, double Ms)> _lastLoadProfile =
         System.Array.Empty<(int, string, double)>();
@@ -254,13 +268,38 @@ public static class Snapshot
     /// <see cref="ProfileLoad"/> set. Empty otherwise.</summary>
     public static IReadOnlyList<(int Index, string Operator, double Ms)> LastLoadProfile => _lastLoadProfile;
 
+    public static ValueTask<int> ReadAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        CancellationToken cancellationToken = default) =>
+        ReadAsync(circuit, fs, DefaultRestoreParallelism, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>, restoring up to
+    /// <paramref name="parallelism"/> operators concurrently. Operators that participate in a
+    /// snapshot own disjoint state — the compiler refuses to share an arrangement across joins when
+    /// snapshot codecs are present — so the walk carries no data dependency and the restored state
+    /// does not depend on the degree.
+    /// </summary>
+    /// <param name="parallelism">
+    /// Operators to load at once; 1 is the sequential walk. See
+    /// <see cref="DefaultRestoreParallelism"/> for why the default is capped well below the
+    /// processor count. Ignored (forced to 1) while <see cref="ProfileLoad"/> is set, because
+    /// per-operator timings taken from overlapping loads would not mean anything.
+    /// </param>
     public static async ValueTask<int> ReadAsync(
         RootCircuit circuit,
         ITableFileSystem fs,
+        int parallelism,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        if (parallelism < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(parallelism), parallelism, "parallelism must be at least 1");
+        }
 
         var current = await TryReadCurrentPointerAsync(fs, cancellationToken).ConfigureAwait(false);
         if (current is null)
@@ -324,50 +363,22 @@ public static class Snapshot
         var restored = 0;
         var profile = ProfileLoad ? new List<(int, string, double)>(manifest.SnapshottedIndices.Count) : null;
 
-        // Stage apportionment inside deserialize (§11): the codecs and the operators' own
-        // integrate/rebuild legs write into SnapshotRestoreProfile while this is set.
-        // EXPERIMENT (docs/design-incremental-persistence.md §11): restore is a per-operator
-        // walk with no data dependencies between operators, and it runs on one thread. Setting
-        // DBSPNET_RESTORE_PARALLEL=<n> loads n operators at a time to price what that costs and
-        // buys. Not a shipping default: the per-operator profile counters are not thread-safe,
-        // so this path leaves them off.
-        if (RestoreParallelism > 1)
+        if (parallelism > 1 && !ProfileLoad && manifest.SnapshottedIndices.Count > 1)
         {
-            await Parallel.ForEachAsync(
-                manifest.SnapshottedIndices,
-                new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = RestoreParallelism,
-                    CancellationToken = cancellationToken,
-                },
-                async (i, ct) =>
-                {
-                    if (circuit.Operators[i] is not ISnapshotable s)
-                    {
-                        throw new InvalidDataException(
-                            $"snapshot expected operator {i} to be ISnapshotable, " +
-                            $"but actual type {circuit.Operators[i].GetType().Name} is not");
-                    }
-
-                    var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
-                    await s.LoadAsync(ctx, ct).ConfigureAwait(false);
-                }).ConfigureAwait(false);
-
+            await RestoreConcurrentlyAsync(circuit, fs, current, manifest, parallelism, cancellationToken)
+                .ConfigureAwait(false);
             return manifest.SnapshottedIndices.Count;
         }
 
+        // Stage apportionment inside deserialize (§11): the codecs and the operators' own
+        // integrate/rebuild legs write into SnapshotRestoreProfile while this is set. Sequential
+        // only — the counters are not thread-safe, and overlapping legs would not be readable.
         SnapshotRestoreProfile.Enabled = ProfileLoad;
         try
         {
             foreach (var i in manifest.SnapshottedIndices)
             {
-                if (circuit.Operators[i] is not ISnapshotable s)
-                {
-                    throw new InvalidDataException(
-                        $"snapshot expected operator {i} to be ISnapshotable, " +
-                        $"but actual type {circuit.Operators[i].GetType().Name} is not");
-                }
-
+                var s = Snapshottable(circuit, i);
                 var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
                 if (profile is null)
                 {
@@ -398,6 +409,45 @@ public static class Snapshot
         return restored;
     }
 
+    private static ISnapshotable Snapshottable(RootCircuit circuit, int i) =>
+        circuit.Operators[i] as ISnapshotable
+        ?? throw new InvalidDataException(
+            $"snapshot expected operator {i} to be ISnapshotable, " +
+            $"but actual type {circuit.Operators[i].GetType().Name} is not");
+
+    private static async Task RestoreConcurrentlyAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        string current,
+        SnapshotManifest manifest,
+        int parallelism,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Parallel.ForEachAsync(
+                manifest.SnapshottedIndices,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = parallelism,
+                    CancellationToken = cancellationToken,
+                },
+                async (i, ct) =>
+                {
+                    var s = Snapshottable(circuit, i);
+                    var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+                    await s.LoadAsync(ctx, ct).ConfigureAwait(false);
+                }).ConfigureAwait(false);
+        }
+        catch (AggregateException ex) when (ex.InnerExceptions.Count > 0)
+        {
+            // A failing load must surface exactly as it does on the sequential path — callers
+            // catch InvalidDataException / NotSupportedException from ReadAsync, not a wrapper.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(ex.InnerExceptions[0]).Throw();
+        }
+    }
+
     /// <summary>
     /// Convenience overload for the local filesystem case.
     /// </summary>
@@ -408,6 +458,20 @@ public static class Snapshot
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
         return ReadAsync(circuit, new LocalTableFileSystem(snapshotDir), cancellationToken);
+    }
+
+    /// <summary>
+    /// Local-filesystem overload of
+    /// <see cref="ReadAsync(RootCircuit, ITableFileSystem, int, CancellationToken)"/>.
+    /// </summary>
+    public static ValueTask<int> ReadAsync(
+        RootCircuit circuit,
+        string snapshotDir,
+        int parallelism,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshotDir);
+        return ReadAsync(circuit, new LocalTableFileSystem(snapshotDir), parallelism, cancellationToken);
     }
 
     /// <summary>
