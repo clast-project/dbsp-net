@@ -222,6 +222,29 @@ public static class Snapshot
     /// <exception cref="FileNotFoundException">
     /// No snapshot present (missing or unreadable <c>current.txt</c>).
     /// </exception>
+    /// <summary>
+    /// Opt-in diagnostic: when set before <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>,
+    /// each operator's <see cref="ISnapshotable.LoadAsync"/> is timed individually and the result
+    /// left in <see cref="LastLoadProfile"/>.
+    /// </summary>
+    /// <remarks>
+    /// Restore is not uniform across operator kinds: an operator whose state <em>is</em> a trace
+    /// (<c>DistinctOp</c>, <c>IncrementalJoinOp</c>) restores in deserialize time, while one that
+    /// keeps a differently-shaped runtime structure (a partition-keyed <c>SortedDictionary</c> plus a
+    /// materialised window — <c>PartitionedTopKOp</c>, <c>PartitionedWindowAggregateOp</c>) has to
+    /// rebuild it, re-partitioning and re-sorting every row. This flag apportions those. Off by
+    /// default and free when off.
+    /// </remarks>
+    public static bool ProfileLoad { get; set; }
+
+    private static IReadOnlyList<(int Index, string Operator, double Ms)> _lastLoadProfile =
+        System.Array.Empty<(int, string, double)>();
+
+    /// <summary>Per-operator <c>LoadAsync</c> durations from the most recent
+    /// <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/> that ran with
+    /// <see cref="ProfileLoad"/> set. Empty otherwise.</summary>
+    public static IReadOnlyList<(int Index, string Operator, double Ms)> LastLoadProfile => _lastLoadProfile;
+
     public static async ValueTask<int> ReadAsync(
         RootCircuit circuit,
         ITableFileSystem fs,
@@ -290,6 +313,7 @@ public static class Snapshot
         circuit.RestoreLogicalTime(manifest.LogicalTime);
 
         var restored = 0;
+        var profile = ProfileLoad ? new List<(int, string, double)>(manifest.SnapshottedIndices.Count) : null;
         foreach (var i in manifest.SnapshottedIndices)
         {
             if (circuit.Operators[i] is not ISnapshotable s)
@@ -300,8 +324,25 @@ public static class Snapshot
             }
 
             var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
-            await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+            if (profile is null)
+            {
+                await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+                var ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0
+                    / System.Diagnostics.Stopwatch.Frequency;
+                profile.Add((i, circuit.Operators[i].GetType().Name, ms));
+            }
+
             restored++;
+        }
+
+        if (profile is not null)
+        {
+            _lastLoadProfile = profile;
         }
 
         return restored;

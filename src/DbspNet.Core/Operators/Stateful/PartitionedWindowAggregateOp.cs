@@ -561,7 +561,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             throw new NotSupportedException("PartitionedWindowAggregateOp was constructed without a snapshot codec.");
         }
 
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
         _window.Clear();
         foreach (var (row, weight) in loaded)
@@ -589,6 +591,16 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             RecomputePartition(sink, key, (long.MinValue, long.MaxValue));
         }
+
+        // Diagnostic (design-incremental-persistence §10): split this operator's restore into
+        // the part any trace-shaped operator pays — deserialize — and the part that exists only
+        // because the runtime state is a partition-keyed SortedDictionary plus a materialised
+        // window, which must be re-partitioned, re-sorted and recomputed from the flat Z-set.
+        // Two Stopwatch reads per restore; not on any hot path.
+        var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+        PartitionedWindowAggregateLoadProfile.Add(
+            (t1 - t0) * 1000.0 / freq,
+            (System.Diagnostics.Stopwatch.GetTimestamp() - t1) * 1000.0 / freq);
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
@@ -636,5 +648,39 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+}
+
+/// <summary>
+/// Restore-cost split for <see cref="PartitionedWindowAggregateOp{TInRow,TAgg,TOutRow,TKey}"/>,
+/// accumulated across every generic instantiation (a static on the generic type would be per
+/// closed type). <see cref="DeserializeMs"/> is the codec read every trace-shaped operator also
+/// pays; <see cref="RebuildMs"/> is the re-partition + re-sort + recompute that exists only
+/// because the runtime state is not itself an indexed Z-set.
+/// </summary>
+internal static class PartitionedWindowAggregateLoadProfile
+{
+    private static double _deserializeMs;
+    private static double _rebuildMs;
+    private static int _count;
+
+    public static double DeserializeMs => _deserializeMs;
+
+    public static double RebuildMs => _rebuildMs;
+
+    public static int Count => _count;
+
+    public static void Add(double deserializeMs, double rebuildMs)
+    {
+        _deserializeMs += deserializeMs;
+        _rebuildMs += rebuildMs;
+        _count++;
+    }
+
+    public static void Reset()
+    {
+        _deserializeMs = 0;
+        _rebuildMs = 0;
+        _count = 0;
     }
 }

@@ -39,6 +39,7 @@ using DbspNet.Connectors.Abstractions;
 using DbspNet.Connectors.EngineeredWood;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Persistence;
 using DbspNet.Persistence.IO.Local;
 using DbspNet.Sql.Compiler;
@@ -96,6 +97,13 @@ public class IvmRecoveryProbe
         // ---------------- Phase 2: measure the recovery legs ----------------
         _out.WriteLine("");
         _out.WriteLine("-- recovery --");
+
+        // IVM_PROFILE_RESTORE=1: apportion leg (a) across operator kinds. An operator whose
+        // state IS a trace restores in deserialize time; one that rebuilds a partition-keyed
+        // SortedDictionary + materialised window pays for the rebuild. This is the number that
+        // decides whether re-expressing that state as an indexed Z-set is worth the rewrite.
+        var profileRestore = Environment.GetEnvironmentVariable("IVM_PROFILE_RESTORE") is "1" or "true" or "TRUE";
+        Snapshot.ProfileLoad = profileRestore;
 
         // Each leg runs in its own scope, with the previous leg's circuit released and a
         // collection forced first. Without that, leg (b) restores a second ~4 GiB circuit
@@ -236,6 +244,49 @@ public class IvmRecoveryProbe
         }
 
         // ---------------- The knob ----------------
+        if (profileRestore && Snapshot.LastLoadProfile.Count > 0)
+        {
+            Snapshot.ProfileLoad = false;
+            var prof = Snapshot.LastLoadProfile;
+            var total = prof.Sum(p => p.Ms);
+            _out.WriteLine("");
+            _out.WriteLine(FormattableString.Invariant(
+                $"-- restore apportioned by operator kind ({prof.Count} ops, {total:F0} ms of LoadAsync) --"));
+            foreach (var g in prof.GroupBy(p => p.Operator).OrderByDescending(g => g.Sum(p => p.Ms)))
+            {
+                var ms = g.Sum(p => p.Ms);
+                _out.WriteLine(FormattableString.Invariant(
+                    $"  {g.Key,-42} {ms,9:F0} ms ({ms / total * 100,5:F1}%)  x{g.Count()}"));
+            }
+
+            // The operator-level counters accumulate across EVERY restore this run performs
+            // (legs a, b and d), while `prof` is the last restore only. Normalise by the number
+            // of restores — derived, not assumed: total WA op-loads / WA ops in one restore.
+            var waOpsPerRestore = prof.Count(x => x.Operator.StartsWith("PartitionedWindowAggregateOp", StringComparison.Ordinal));
+            if (PartitionedWindowAggregateLoadProfile.Count > 0 && waOpsPerRestore > 0)
+            {
+                var restores = PartitionedWindowAggregateLoadProfile.Count / (double)waOpsPerRestore;
+                var deser = PartitionedWindowAggregateLoadProfile.DeserializeMs / restores;
+                var rebuild = PartitionedWindowAggregateLoadProfile.RebuildMs / restores;
+                var waTotal = deser + rebuild;
+                _out.WriteLine("");
+                _out.WriteLine(FormattableString.Invariant(
+                    $"  PartitionedWindowAggregate split ({waOpsPerRestore} ops, {waTotal:F0} ms per restore, averaged over {restores:F0} restores):"));
+                _out.WriteLine(FormattableString.Invariant(
+                    $"    deserialize (irreducible)              {deser,8:F0} ms ({deser / waTotal * 100,5:F1}% of the kind, {deser / total * 100,5:F1}% of restore)"));
+                _out.WriteLine(FormattableString.Invariant(
+                    $"    rebuild (repartition+sort+recompute)   {rebuild,8:F0} ms ({rebuild / waTotal * 100,5:F1}% of the kind, {rebuild / total * 100,5:F1}% of restore)"));
+            }
+
+            _out.WriteLine("");
+            _out.WriteLine("  slowest single operators:");
+            foreach (var op in prof.OrderByDescending(p => p.Ms).Take(8))
+            {
+                _out.WriteLine(FormattableString.Invariant(
+                    $"    [{op.Index,4}] {op.Operator,-42} {op.Ms,9:F0} ms"));
+            }
+        }
+
         _out.WriteLine("");
         _out.WriteLine("-- what this means for the A2 snapshot interval --");
         var perBatchReplay = replayMs / replayedBatches;
