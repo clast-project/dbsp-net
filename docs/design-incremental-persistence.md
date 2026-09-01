@@ -703,12 +703,34 @@ The field version was written first, and `w1profile` caught it: **+2 to +4 B/eve
 queries. With the side table, `w1profile` B/event is **byte-identical to the committed baseline on all
 ten queries**. That instrument earns its keep again (`docs/w1-profile.md`, §25.1).
 
-**The trap.** The probe's digest hashed cells with `object.GetHashCode()`, which for `string` is
-randomized per process. That is invisible in `IvmRecoveryProbe`, which records and verifies inside
-one process, but a digest written by the `record` run and checked by a later `profile` run reported
-**3 of 16 views as differing with identical row counts**. It looked exactly like §7.2. It was the hash.
-Cells are now hashed with `StableHash`, and all 16 views match on every run below. Any cross-process
-verification in this repo needs the same care.
+**The trap, and what it exposed.** The probe's digest hashed cells with `object.GetHashCode()`. That
+is invisible in `IvmRecoveryProbe`, which records and verifies inside one process, but a digest
+written by the `record` run and checked by a later `profile` run reported **3 of 16 views as differing
+with identical row counts**. It looked exactly like §7.2. It was the hash, and the mechanism is worth
+recording because it is not the obvious one:
+
+| hash | process-stable? |
+|:--|:--|
+| `Utf8String.GetHashCode` (XxHash3 over the bytes) | **yes** |
+| `long` / `double` / `decimal` / `DateTime` / the record-struct temporal types | yes |
+| `string.GetHashCode` | no (randomized by design) |
+| `System.HashCode` (`Combine` / `Add`) | **no — seeded per process** |
+| `Clast.DatabaseDecimal.Decimal128.GetHashCode` | **no** |
+
+The three views that mismatched are **exactly the three whose output rows carry `Decimal128`**
+(`IVM_DUMP_CELL_TYPES=1` prints the CLR types per view: no raw `string` appears anywhere — VARCHAR
+arrives as `Utf8String`, which is stable). Cells are now hashed with `StableHash`, and all 16 views
+match on every run below.
+
+The larger fact this turned up: **`StructuralRow.ComputeHash` is built on `System.HashCode`, so every
+row hash in the engine is process-randomized** — even a row of nothing but `long`s
+(`HashDeterminismProbe` prints it; two runs disagree). The engine already owns a deterministic,
+value-based hash **twice** — `StablePartitionHash`/`StableHash` (32-bit, for shard assignment, because
+worker placement must survive a restore) and `HllHashing` (64-bit, for `APPROX_COUNT_DISTINCT`) — and
+the row-equality path is the one that still delegates. Consequences worth knowing before any
+file-backed work: a persisted hash, a persisted Bloom block, or any cross-process digest is
+unavailable while row hashing is seeded, and `SpineBatch` rebuilds its Bloom filter from keys on every
+load for exactly that reason.
 
 ### 11.2 Q1 — restore is not I/O-bound. It is boxing-bound
 

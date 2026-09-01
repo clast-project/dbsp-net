@@ -179,6 +179,11 @@ public class IvmRestoreProfile
             var allocMiB = (GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (1024.0 * 1024.0);
             Snapshot.ProfileLoad = false;
 
+            if (Environment.GetEnvironmentVariable("IVM_DUMP_CELL_TYPES") is "1")
+            {
+                DumpCellTypes(program);
+            }
+
             var ok = CheckDigest(sidecar.DigestAtSnapshot, Digest(program), "restore");
             _out.WriteLine("");
             _out.WriteLine(FormattableString.Invariant(
@@ -190,6 +195,33 @@ public class IvmRestoreProfile
             }
 
             Assert.True(ok, "restore produced wrong state — see report above");
+        }
+    }
+
+    // Which CLR types actually reach an output row? The answer decides whether a cross-process
+    // digest can use object.GetHashCode() at all (§11.1): Utf8String hashes with XxHash3 and is
+    // process-stable, a raw string is not.
+    private void DumpCellTypes(CompiledProgram program)
+    {
+        _out.WriteLine("  cell CLR types per output view:");
+        foreach (var (name, output) in program.Outputs.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            var types = new SortedSet<string>(StringComparer.Ordinal);
+            var seen = 0;
+            foreach (var (row, _) in output.CurrentView)
+            {
+                for (var i = 0; i < output.Schema.Count; i++)
+                {
+                    types.Add(row[i]?.GetType().Name ?? "null");
+                }
+
+                if (++seen >= 200)
+                {
+                    break;
+                }
+            }
+
+            _out.WriteLine($"    {name,-28} {string.Join(", ", types)}");
         }
     }
 
