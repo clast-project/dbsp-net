@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <PackageReference Include="Clast.BloomFilter" />
+    <!-- Named by StructuralRowHash: Decimal128 is the one cell type whose own GetHashCode is
+         seeded per process, and the row hash has to be deterministic. Naming it here costs one
+         package reference and removes a registration hook from the hottest path in the engine. -->
+    <PackageReference Include="Clast.DatabaseDecimal" />
   </ItemGroup>
   <ItemGroup>
     <!-- DbspNet.Sql implements its own IOperator for the recursive-CTE

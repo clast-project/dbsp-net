@@ -24,7 +24,7 @@ public class StructuralRowHashTests
     public void RowHashIsPinnedToValues()
     {
         Assert.Equal(1996530801, new StructuralRow(42L, 7L).GetHashCode());
-        Assert.Equal(677868674, new StructuralRow(Utf8String.Of("ACME"), 1.5).GetHashCode());
+        Assert.Equal(232275324, new StructuralRow(Utf8String.Of("ACME"), 1.5).GetHashCode());
         Assert.Equal(-1001248903, new StructuralRow(null, null).GetHashCode());
     }
 

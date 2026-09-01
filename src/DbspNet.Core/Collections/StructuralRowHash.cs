@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Numerics;
+using Clast.DatabaseDecimal.Values;
 
 namespace DbspNet.Core.Collections;
 
@@ -16,6 +17,11 @@ namespace DbspNet.Core.Collections;
 /// carried two hand-written deterministic hashes elsewhere (<c>StablePartitionHash</c> for shard
 /// placement, <c>HllHashing</c> for sketches). This is the third caller, and the one on the hot
 /// path.</para>
+/// <para><b>No dispatch hook.</b> An earlier revision routed the types Core cannot name through a
+/// delegate the SQL layer installed. That put an indirect call and a second type-test chain on
+/// every cell — measured at roughly double the cost of the virtual <c>GetHashCode</c> it replaced.
+/// Only one cell type actually needed fixing, so Core names that one and lets every other type
+/// answer for itself.</para>
 /// <para><b>Contract.</b> <see cref="Cell(object?)"/> and the typed overloads must agree for the
 /// same logical value — <c>Cell(42L)</c> and <c>Cell((object)42L)</c> return the same seed — because
 /// the typed compile path hashes struct fields directly while the structural path hashes boxed
@@ -32,36 +38,6 @@ public static class StructuralRowHash
     /// column do not produce the same row hash. Public because the SQL layer's nullable overloads
     /// must use the identical value.</summary>
     public const ulong NullSeed = 0xD1B54A32D192ED03UL;
-
-    private static Func<object, ulong>? _externalCellHash;
-    private static bool _externalUsed;
-
-    /// <summary>
-    /// Seeds for value types <c>DbspNet.Core</c> cannot name — the SQL scalar types
-    /// (<c>Utf8String</c>, <c>Decimal128</c>, the temporal record structs). Installed once by
-    /// <c>DbspNet.Sql</c>'s module initializer, which runs before any SQL value can exist.
-    /// </summary>
-    /// <exception cref="InvalidOperationException">
-    /// Thrown on an attempt to replace the hook after it has already been used. Two different
-    /// seeds for one value inside a process would silently corrupt every dictionary holding it, so
-    /// this fails loudly instead.
-    /// </exception>
-    public static Func<object, ulong>? ExternalCellHash
-    {
-        get => _externalCellHash;
-        set
-        {
-            if (_externalUsed && !ReferenceEquals(_externalCellHash, value))
-            {
-                throw new InvalidOperationException(
-                    "StructuralRowHash.ExternalCellHash was replaced after it had already hashed a " +
-                    "value; rows hashed before and after would disagree. Install it once, from a " +
-                    "module initializer.");
-            }
-
-            _externalCellHash = value;
-        }
-    }
 
     /// <summary>
     /// Seed for one of four independent accumulator lanes, as <see cref="HashCode"/> and xxHash32
@@ -133,55 +109,58 @@ public static class StructuralRowHash
     /// <see cref="object.GetHashCode"/> (which is content-based and stable for every type the SQL
     /// runtime produces except <c>Decimal128</c>, the case the hook exists for).
     /// </summary>
-    public static ulong Cell(object? value)
-    {
-        if (value is null)
-        {
-            return NullSeed;
-        }
-
-        var hook = _externalCellHash;
-        if (hook is null)
-        {
-            return CoreCell(value);
-        }
-
-        _externalUsed = true;
-        return hook(value);
-    }
-
     /// <summary>
-    /// Seeds for the types Core can name. Reached directly when no SQL layer is loaded, and as the
-    /// hook's own fallback, so one algorithm covers every type however it arrives.
+    /// Value seed for a boxed cell. The hot primitives are named here; everything else falls
+    /// through to the type's own <see cref="object.GetHashCode"/>, which is content-based — and so
+    /// process-stable — for every type the SQL runtime puts in a row
+    /// (<c>Utf8String</c> hashes with XxHash3, the temporal types are record structs over their
+    /// tick counts). <see cref="Decimal128"/> is the single exception: its
+    /// <see cref="object.GetHashCode"/> is seeded per process, and it exposes a content-based
+    /// <c>StableHash64</c>, so it is named explicitly.
     /// </summary>
-    public static ulong CoreCell(object value) => value switch
+    /// <remarks>
+    /// A cell type whose equality is by reference (a raw array, say) would hash by identity and
+    /// break cross-process determinism. No such type reaches a row today, and one that did would
+    /// already be broken for row equality, which compares cells with <see cref="object.Equals(object, object)"/>.
+    /// </remarks>
+    public static ulong Cell(object? value) => value switch
     {
+        null => NullSeed,
         long l => Cell(l),
         double d => Cell(d),
-        int i => Cell(i),
-        bool b => Cell(b),
         string s => Cell(s),
-        float f => Cell(f),
-        short s => Cell((long)s),
-        byte b => Cell((long)b),
-        sbyte b => Cell((long)b),
-        uint u => Cell((long)u),
-        ulong u => u,
-        DateTime dt => Cell(dt.Ticks),
-        _ => (ulong)(uint)value.GetHashCode(),
+        Decimal128 m => Cell(m),
+        _ => Opaque(value),
     };
+
+    /// <summary>
+    /// Seed for a type this class does not name — its own content-based hash, widened. The typed
+    /// compile path must use exactly this for the same column type, which is what
+    /// <c>SqlCellHash</c>'s overloads do.
+    /// </summary>
+    public static ulong Opaque(object value) => (ulong)(uint)value.GetHashCode();
+
+    /// <summary>Content-based, unlike <see cref="Decimal128.GetHashCode"/>, which is seeded.</summary>
+    public static ulong Cell(Decimal128 value) => value.StableHash64();
 
     public static ulong Cell(long value) => (ulong)value;
 
-    public static ulong Cell(int value) => (ulong)(long)value;
+    /// <summary>
+    /// Deliberately the same as <see cref="Opaque"/> of the boxed form, so <c>int</c> need not sit
+    /// in <see cref="Cell(object?)"/>'s type-test chain. Every cell type in that chain costs ~3 ns
+    /// to the types below it, which on a SQL row is most of them.
+    /// </summary>
+    public static ulong Cell(int value) => (ulong)(uint)value.GetHashCode();
 
-    public static ulong Cell(bool value) => value ? 0x9E3779B1UL : 0x85EBCA77UL;
+    /// <inheritdoc cref="Cell(int)"/>
+    public static ulong Cell(bool value) => (ulong)(uint)value.GetHashCode();
 
     /// <summary>Collapses -0.0 to +0.0 so the two compare-equal zeros seed alike.</summary>
     public static ulong Cell(double value) =>
         (ulong)BitConverter.DoubleToInt64Bits(value == 0.0 ? 0.0 : value);
 
-    public static ulong Cell(float value) => Cell((double)value);
+    /// <inheritdoc cref="Cell(int)"/>
+    public static ulong Cell(float value) => (ulong)(uint)value.GetHashCode();
 
     /// <summary>FNV-1a/64 over the UTF-16 code units. Content-based, unlike
     /// <see cref="string.GetHashCode()"/>, which is randomized per process.</summary>

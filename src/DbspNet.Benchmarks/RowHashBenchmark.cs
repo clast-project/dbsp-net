@@ -32,6 +32,25 @@ internal static class RowHashBenchmark
         // GetHashCode is seeded costs us to hash deterministically.
         var noDec = BuildRows(rows, wide: true, decimals: false);
         Split("wide-nodec", noDec, runs);
+
+        // Is the residual the type-test chain SQL cells fall through, or the hash they end at?
+        // Opaque() is the chain's destination, called directly.
+        var sqlOnly = BuildSqlRows(rows);
+        Split("sql-only", sqlOnly, runs);
+        Console.WriteLine("  chain cost (sql-only row: Utf8,Date32,Timestamp,Decimal128):");
+        var chain = new double[runs];
+        var dest = new double[runs];
+        for (var r = 0; r < runs; r++)
+        {
+            chain[r] = Time(sqlOnly, CellsOnlyNew);
+            dest[r] = Time(sqlOnly, CellsOpaque);
+        }
+
+        Array.Sort(chain);
+        Array.Sort(dest);
+        Console.WriteLine(
+            $"    Cell() {chain[runs / 2],6:F1}   Opaque() direct {dest[runs / 2],6:F1}   chain = {chain[runs / 2] - dest[runs / 2],5:F1} ns/row");
+
     }
 
     private static void Report(string label, object?[][] data, int runs)
@@ -74,6 +93,35 @@ internal static class RowHashBenchmark
         var o = old[runs / 2];
         Console.WriteLine(
             $"    {label,-6} GetHashCode {o,7:F1} ns/row   Cell() {n,7:F1} ns/row   {(n - o) / o * 100,+6:F1}%");
+    }
+
+    private static int CellsOpaque(object?[] values)
+    {
+        var acc = 0UL;
+        for (var i = 0; i < values.Length; i++)
+        {
+            var v = values[i];
+            acc ^= v is null ? 0UL : StructuralRowHash.Opaque(v);
+        }
+
+        return (int)acc;
+    }
+
+    private static object?[][] BuildSqlRows(int rows)
+    {
+        var data = new object?[rows][];
+        for (var i = 0; i < rows; i++)
+        {
+            data[i] = new object?[]
+            {
+                Utf8String.Of("SYMBOL" + (i % 997)),
+                new Date32(19000 + (i % 365)),
+                new Timestamp(i * 1000L),
+                new Decimal128((System.Int128)(i * 100)),
+            };
+        }
+
+        return data;
     }
 
     private static int CellsOnlyNew(object?[] values)

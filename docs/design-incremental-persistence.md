@@ -926,10 +926,13 @@ shipping design; the buffers must outlive the state before it can become one.
 
 §11.1's by-product — *every* row hash is process-randomized, because `StructuralRow.ComputeHash`
 was built on `System.HashCode` — is fixed. `StructuralRowHash` (Core) is a deterministic 64-bit mix
-over per-cell value seeds, folded to 32 for the `GetHashCode` contract; `SqlCellHash` (Sql) supplies
-seeds for the types Core cannot name, installed through one hook by a module initializer. Only two
-cell types were ever the problem — `string` (absent from these rows) and `Decimal128`, whose
-third-party `GetHashCode` is seeded but which exposes a content-based `StableHash64()`.
+over per-cell value seeds (four independent lanes, one rotate+multiply a cell, a SplitMix64
+finalizer), folded to 32 for the `GetHashCode` contract. Only two cell types were ever the problem —
+`string`, which Core hashes itself, and `Decimal128`, whose third-party `GetHashCode` is seeded but
+which exposes a content-based `StableHash64()`. Every other type the SQL runtime puts in a row
+already hashes by content, so it is left to answer for itself; `SqlCellHash` (Sql) exists to give the
+typed compile path a non-boxing seed per column type that agrees with the boxed path by
+construction.
 
 **Three implementations had to move together**, and this is the part worth remembering: the boxed
 walk in `StructuralRow.ComputeHash`, the Expression-tree delegate behind `StructuralRowShape`
@@ -938,31 +941,40 @@ a typed key and a backing-array key stop finding each other in one dictionary �
 exception. **Nothing tested that**; `TypedRowHashAgreementTests` now does, across all three, and the
 emitted struct — which previously omitted the arity and so never matched — agrees for the first time.
 
-**Measured.** Two instruments, saying different things, both worth recording:
+**Measured.** Two instruments. `w1profile` prices the change in situ (its B/event is the
+deterministic one — §25.1 of `design-row-representation.md`); the new `rowhash` bench isolates the
+term, invoking both arms through a `Func<>` so neither inlines.
 
-| | HashCode (was) | StructuralRowHash (is) |
-|:--|--:|--:|
-| `w1profile` B/event, all 10 queries | — | **byte-identical** |
-| `w1profile` ns/event, median of 3×5-run samples per arm | — | **9 of 10 queries faster, −2% to −18%** (q18 +5%, inside its own ±12% spread) |
-| `rowhash` isolated, wide row (7 cells incl. Utf8String, Date32, Decimal128) | 19.5 ns | 22.6 ns (**+16%**) |
-| `rowhash` isolated, narrow row (2 longs) | 7.4 ns | 7.1 ns (−4%) |
-| `rowhash` cell-seed dispatch only, wide | 11.5 ns | 22.5 ns (**+96%**) |
+| | HashCode (was) | first cut | **shipped** |
+|:--|--:|--:|--:|
+| `w1profile` B/event, all 10 queries | — | byte-identical | **byte-identical** |
+| `w1profile` ns/event, median of 3×5-run samples per arm | — | 9/10 faster | **8/10 faster, −5.7% to −16.5%** (q2, q3 neutral) |
+| `rowhash` wide row (7 cells incl. Utf8String, Date32, Decimal128) | 20.5 ns | 22.6 ns (+16%) | **19.7 ns (−3.9%)** |
+| `rowhash` narrow row (2 longs) | 8.7 ns | 7.1 ns (−4%) | **5.0 ns (−42%)** |
+| `rowhash` type-test chain, per SQL-typed cell | — | ~3.1 ns | **~1.4 ns** |
 
-The two disagree because they are not the same call shape: `rowhash` invokes both arms through a
-`Func<>` so neither inlines, which penalises the new code's deeper call tree, while the engine calls
-`ComputeHash` from inside Core where it inlines. The in-situ number is the one that decides, and it
-says this is not a regression. What the isolated split *does* locate is the residual cost, and it is
-all in **cell dispatch for the SQL types** — a delegate hop into `SqlCellHash` plus a type-test chain,
-where `HashCode` made one virtual call. That is the thing to attack if hashing ever shows up as a
-bottleneck again; the combiner itself is now at parity (the narrow row is almost entirely combiner).
+**Getting from the first cut to the shipped version is the instructive part**, because two of the
+three things that looked expensive were not:
 
-Getting there took two false starts worth recording. The first version fed one accumulator through a
-dependent multiply per cell and put the SQL types *after* twelve primitive type tests: **+138%** on a
-wide row. Four independent lanes (as `HashCode` and xxHash32 use, with each cell's lane fixed by its
-position so every caller knows it at compile time — no runtime index, no accumulator struct to copy)
-plus hook-first dispatch took that to +16%. And the first isolated benchmark was simply wrong: it
-indexed a raw array in the old arm while `ComputeHash` takes `IReadOnlyList<object?>`, charging the
-interface dispatch to the new algorithm.
+- **The registration hook was not the cost.** The first cut routed every type Core cannot name
+  through a delegate the SQL layer installed, and doubled the dispatch cost. Deleting the delegate
+  (Core takes the `Clast.DatabaseDecimal` package reference and names `Decimal128` directly, exactly
+  as it already names `Clast.BloomFilter`) fixed *narrow* rows — dispatch went from +110% to −45% —
+  and left wide rows **unchanged**. Only one cell type ever needed fixing; every other SQL type's own
+  `GetHashCode` is already content-based, so it can answer for itself.
+- **The cost was the `isinst` chain.** A boxed `Utf8String` or `Date32` fell through *thirteen*
+  failed type tests before reaching its hash: measured at **12.5 ns per four-cell row, ~3.1 ns a
+  cell**, against a virtual `GetHashCode` that costs ~2.4. Cutting the chain to the types that
+  genuinely must be named — `long`, `double` (full 64-bit seeds for the common key types), `string`
+  and `Decimal128` (the two that are seeded) — took it to ~1.4 ns. Everything else, `int`/`bool`/
+  `float` included, now agrees with the fallback by definition, so it costs nothing to leave out.
+- **A per-cell static write** (`_externalUsed = true`, guarding hook replacement) was on the hot
+  path in the first cut. It is a shared cache line dirtied by every worker thread. Set-once
+  semantics on the property give the same guarantee with no per-call write.
+
+One bug worth naming: the typed overloads first forwarded to `StructuralRowHash.Opaque(object)`,
+which **boxes** — on the one path that exists to avoid boxing. They now call `GetHashCode` on the
+statically-typed value.
 
 **What this unlocks** (none of it built): a persisted row hash — restore currently recomputes 30.5M
 of them inside the 15.5% materialize term — a persisted Bloom block, which `SpineBatch` rebuilds from
