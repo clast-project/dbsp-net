@@ -593,3 +593,67 @@ change-sites in `docs/design-stored-output.md`; differential (view ≡ accumulat
 ≡ batch) + snapshot round-trip tests. **Remaining for an end-to-end run: input adapter
 (Delta/Parquet → `InputHandle`), output adapter (`EnumerateView` → Delta truncate write +
 drain signal), and a real-data correctness pass.**
+
+## Local ivm-bench SF=3 on the Mac (2026-08-31)
+
+The SF=3 dataset was regenerated on the M4 Pro and the batch-1 harness runs end to end again, after
+the Windows box took `D:/ivm-data` with it.
+
+### Generating the data — it is THREE stages, not two
+
+`docker/docker-compose.datagen.yml` produces `batch1/`, `batch2/`, `batch3/`, `audit/` — but the
+deploy spec's input URIs are `/data/raw/delta/**staging**/<table>`. A third container materialises
+that: `docker-compose.batch-loader.yml`, whose `init` mode *"Initialize staging from batch1"*. Without
+it every input fails with `DeltaFormatException: No Delta table found (no commits in _delta_log/)`.
+
+**`SCALE_FACTOR` cannot go below 3.** DIGen refuses it outright — *"Incorect Scale factor:1 Value must
+be in range: 3 - 2147483647"*. SF=1 / SF=2 are not options, so SF=3 is both the floor and (per §25.1,
+allocation being host-independent) the scale that keeps the recorded 44.74 GiB comparable.
+
+Both stages are idempotent — they skip if output exists — so a failed attempt resumes cheaply.
+
+```bash
+cd ~/src/ivm-bench/docker
+SCALE_FACTOR=3 DATAGEN_CPUS=10 DATAGEN_MEM=26g DATAGEN_HEAP=18g \
+BATCH_1_PCT=100 BATCH_2_PCT=1 BATCH_3_PCT=2 \
+  docker compose -f docker-compose.datagen.yml up --build          # ~90 s
+SCALE_FACTOR=3 BATCH_LOADER_CPUS=10 BATCH_LOADER_MEM=26g BATCH_LOADER_HEAP=18g \
+BATCH_LOADER_GC_THREADS=6 BATCH_LOADER_CONC_GC_THREADS=3 \
+  docker compose -f docker-compose.batch-loader.yml run --rm --build spark-batch-loader init
+```
+
+The compose defaults (`32` CPUs, `128g` limit, `80g` heap) assume a far larger host and must be
+overridden; Docker Desktop's VM also has to be raised from its 8 GiB default (32 GiB used here).
+Output is small — 268 MiB `digen` + 113 MiB `delta` — nothing like the multi-GB the old `D:/ivm-data`
+implied.
+
+The spec generator needs `pyyaml`, which the system Python lacks; a throwaway venv avoids touching it:
+`python3 -m venv <tmp>/venv && <tmp>/venv/bin/pip install pyyaml`, then
+`<venv>/bin/python services/dbt_to_program.py dbt-projects/dbspnet > ivm_spec.json`.
+
+### The dataset reproduces exactly
+
+Operator state counts match the i9 run's recorded values **to the row**: `watches` aggregate 885,922
+(recorded ~886K), `trades` window 982,180 (recorded 982180), `daily_market` 1,282,768 (recorded
+1.28M). DIGen is deterministic at a given scale factor, so this is the same data, not merely the same
+shape.
+
+### Batch-1 numbers
+
+| | i9 (`3f2c1a4`, recorded) | M4 Pro (`6840128`) |
+|:--|--:|--:|
+| allocation | 44.74 GiB | **42.61 GiB** |
+| wall (ServerGC) | 59.5 s | 50.6 s over 20 ticks |
+
+**Allocation −4.8%, and that one is a code delta**: §25.1 established allocated bytes as a property of
+the code rather than the host, and the state counts above confirm the work is identical. The wall
+figures are *not* comparable across the two machines and are recorded only for completeness.
+
+### §6.3 confirmed on a live run
+
+`fact_market_history`, `wrk_company_financials` and `finwire_financial` appear **zero times** in the
+operator profile — the `+stored: true` chain really is not built on our side, which until now rested
+on reading `dbt_to_program.py`. The deploy path binds outputs from `output_bindings` (16), confirmed
+in `dbspnet_client.py:45` (`"outputs": prog["output_bindings"]`); the spec's own 18-name `outputs`
+list is compile-only validation (`:57`) and includes the two unbound views.
+
