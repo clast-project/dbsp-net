@@ -287,7 +287,10 @@ public static partial class TypedPlanCompiler
 
         try
         {
-            var ctx = new CompileContext(builder, structuralScans, snapshotCodecs, options ?? CompileOptions.Default);
+            var ctx = new CompileContext(builder, structuralScans, snapshotCodecs, options ?? CompileOptions.Default)
+            {
+                ScanRefCounts = PlanToCircuit.CountReferences(plan).Scans,
+            };
             var topNode = TryCompileNode(plan, ctx)
                 ?? throw new UnsupportedPlanException();
 
@@ -366,6 +369,13 @@ public static partial class TypedPlanCompiler
         /// mode. <c>null</c> in standalone mode.
         /// </summary>
         public IReadOnlyDictionary<string, Stream<ZSet<StructuralRow, Z64>>>? StructuralScans { get; }
+
+        /// <summary>
+        /// How many times each table is scanned in the plan being compiled (boundary-adapter
+        /// mode only). A table scanned once can have its structural→typed lift deferred into
+        /// its consumer's fused indexing step (§9.13); null disables the deferral.
+        /// </summary>
+        public IReadOnlyDictionary<string, int>? ScanRefCounts { get; init; }
 
         /// <summary>
         /// Cache of structural-row scans already lifted to their typed
@@ -644,23 +654,7 @@ public static partial class TypedPlanCompiler
     /// </remarks>
     private static TypedNode? CompileLinearChain(LogicalPlan plan, CompileContext ctx)
     {
-        // Walk outermost→innermost collecting the linear nodes; identity
-        // projections are pure renames and contribute no runtime stage.
-        var nodes = new List<LogicalPlan>();
-        var node = plan;
-        while (node is FilterPlan or ProjectPlan)
-        {
-            if (node is ProjectPlan ip
-                && IsIdentityProjection(ip.Projections, ip.Input.Schema, ip.Schema))
-            {
-                node = ip.Input;
-                continue;
-            }
-
-            nodes.Add(node);
-            node = node is FilterPlan f ? f.Input : ((ProjectPlan)node).Input;
-        }
-
+        var (nodes, node) = CollectLinearNodes(plan);
         var baseNode = TryCompileNode(node, ctx);
         if (baseNode is null) return null;
 
@@ -669,10 +663,6 @@ public static partial class TypedPlanCompiler
         {
             return baseNode;
         }
-
-        // Collected outermost-first; data flows from the input upward, so build
-        // the stages innermost-first.
-        nodes.Reverse();
 
         // Disjointness is preserved by filters and by injective projections (those
         // that keep every input column by identity, so the output row still
@@ -699,34 +689,9 @@ public static partial class TypedPlanCompiler
         }
 
         var stages = new List<TypedStage>(nodes.Count);
-        var currentRowType = baseNode.RowType;
-        var currentSchema = baseNode.Schema;
-        foreach (var n in nodes)
+        if (!TryAppendStages(nodes, stages, baseNode.RowType, baseNode.Schema, out var currentRowType, out var currentSchema))
         {
-            if (n is FilterPlan f)
-            {
-                // Nullable<bool> WHERE predicates are coerced to plain bool inside
-                // BuildTypedPredicateDelegate (GetValueOrDefault) — TRUE keeps the
-                // row; FALSE and NULL both drop it.
-                var predicate = BuildTypedPredicateDelegate(f.Predicate, currentRowType);
-                if (predicate is null) return null;
-                stages.Add(new TypedStage(TypedStageKind.Filter, predicate, currentRowType, currentSchema));
-            }
-            else
-            {
-                // Respect the resolver's per-column nullability on the output
-                // schema so genuinely-nullable expressions (NULLIF, NULL literal)
-                // are carried as Nullable<T> fields downstream.
-                var p = (ProjectPlan)n;
-                var outRowType = TypedRowEmitter.EmitRowType(p.Schema);
-                if (outRowType is null) return null;
-                var projDelegate = BuildTypedProjectionDelegate(
-                    currentRowType, outRowType, p.Schema, p.Projections);
-                if (projDelegate is null) return null;
-                stages.Add(new TypedStage(TypedStageKind.Map, projDelegate, outRowType, p.Schema));
-                currentRowType = outRowType;
-                currentSchema = p.Schema;
-            }
+            return null;
         }
 
         // Single stage: lower to the original dedicated operator so the common
@@ -752,6 +717,179 @@ public static partial class TypedPlanCompiler
             ctx.Builder, baseNode.RowType, currentRowType, baseNode.Stream, fused);
         return new TypedNode(currentRowType, currentSchema, fusedStream, shardDisjoint, partitionKey);
     }
+
+    /// <summary>
+    /// Walks a maximal run of <see cref="FilterPlan"/> / <see cref="ProjectPlan"/> nodes.
+    /// Returns them innermost-first (data-flow order), skipping identity projections (pure
+    /// renames, no runtime stage), plus the first non-linear node (the chain's input).
+    /// </summary>
+    private static (List<LogicalPlan> Nodes, LogicalPlan Input) CollectLinearNodes(LogicalPlan plan)
+    {
+        var nodes = new List<LogicalPlan>();
+        var node = plan;
+        while (node is FilterPlan or ProjectPlan)
+        {
+            if (node is ProjectPlan ip
+                && IsIdentityProjection(ip.Projections, ip.Input.Schema, ip.Schema))
+            {
+                node = ip.Input;
+                continue;
+            }
+
+            nodes.Add(node);
+            node = node is FilterPlan f ? f.Input : ((ProjectPlan)node).Input;
+        }
+
+        nodes.Reverse();
+        return (nodes, node);
+    }
+
+    /// <summary>
+    /// Appends one typed stage per linear node to <paramref name="stages"/>, threading the
+    /// row type from <paramref name="rowType"/>. False when a stage is outside typed scope
+    /// (the whole compile then falls back to structural).
+    /// </summary>
+    private static bool TryAppendStages(
+        List<LogicalPlan> nodes, List<TypedStage> stages, Type rowType, Schema schema,
+        out Type outRowType, out Schema outSchema)
+    {
+        outRowType = rowType;
+        outSchema = schema;
+        foreach (var n in nodes)
+        {
+            if (n is FilterPlan f)
+            {
+                // Nullable<bool> WHERE predicates are coerced to plain bool inside
+                // BuildTypedPredicateDelegate (GetValueOrDefault) — TRUE keeps the
+                // row; FALSE and NULL both drop it.
+                var predicate = BuildTypedPredicateDelegate(f.Predicate, outRowType);
+                if (predicate is null) return false;
+                stages.Add(new TypedStage(TypedStageKind.Filter, predicate, outRowType, outSchema));
+            }
+            else
+            {
+                // Respect the resolver's per-column nullability on the output
+                // schema so genuinely-nullable expressions (NULLIF, NULL literal)
+                // are carried as Nullable<T> fields downstream.
+                var p = (ProjectPlan)n;
+                var projRowType = TypedRowEmitter.EmitRowType(p.Schema);
+                if (projRowType is null) return false;
+                var projDelegate = BuildTypedProjectionDelegate(
+                    outRowType, projRowType, p.Schema, p.Projections);
+                if (projDelegate is null) return false;
+                stages.Add(new TypedStage(TypedStageKind.Map, projDelegate, projRowType, p.Schema));
+                outRowType = projRowType;
+                outSchema = p.Schema;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// A join / aggregate input as its indexing pass sees it. <see cref="RowType"/> and
+    /// <see cref="Schema"/> describe the rows that get indexed. When <see cref="Step"/> is
+    /// set, <see cref="Stream"/> is the <i>un-mapped</i> base stream of
+    /// <see cref="BaseRowType"/> rows and the step (<c>TBase ⇒ (Keep, TRow)</c>) runs inside
+    /// the indexing pass; otherwise <see cref="Stream"/> already carries
+    /// <see cref="RowType"/> rows.
+    /// </summary>
+    private sealed record IndexInput(
+        Type RowType, Schema Schema, object Stream, int[]? PartitionKey,
+        Type? BaseRowType = null, Delegate? Step = null);
+
+    /// <summary>
+    /// Compiles a join or aggregate input so its pointwise work runs inside the indexing
+    /// pass (docs/design-state-representation.md §9.13): the input's own Filter/Project
+    /// chain and, for a table scanned once in boundary-adapter mode, the structural→typed
+    /// lift. Exact (pure row functions; Z-set addition is associative). A chain already
+    /// compiled for another consumer (<c>PlanCache</c>), or a scan already lifted, is
+    /// reused as a plain stream.
+    /// </summary>
+    private static IndexInput? TryCompileIndexInput(LogicalPlan plan, CompileContext ctx)
+    {
+        IndexInput? Plain()
+        {
+            var compiled = TryCompileNode(plan, ctx);
+            return compiled is null
+                ? null
+                : new IndexInput(compiled.RowType, compiled.Schema, compiled.Stream, compiled.PartitionKey);
+        }
+
+        if (!IndexFusionMode.Enabled || ctx.PlanCache.ContainsKey(plan))
+        {
+            return Plain();
+        }
+
+        var (nodes, baseNode) = CollectLinearNodes(plan);
+        var stages = new List<TypedStage>();
+        object baseStream;
+        Type baseRowType, rowType;
+        Schema schema;
+        int[]? partitionKey;
+
+        if (baseNode is ScanPlan scan
+            && ctx.StructuralScans is { } structural
+            && ctx.ScanRefCounts is { } counts && counts.GetValueOrDefault(scan.TableName) == 1
+            && !ctx.LiftedScanCache.ContainsKey(scan.TableName)
+            && structural.TryGetValue(scan.TableName, out var structuralStream)
+            && TypedRowEmitter.EmitRowType(scan.Schema) is { } scanRowType)
+        {
+            // Deferred lift: index straight from the structural input; the lift becomes
+            // the first stage of the fused step.
+            var lifter = BuildStructuralToTypedDelegate(scan.Schema, scanRowType);
+            stages.Add(new TypedStage(TypedStageKind.Map, lifter, scanRowType, scan.Schema));
+            baseStream = structuralStream;
+            baseRowType = typeof(StructuralRow);
+            rowType = scanRowType;
+            schema = scan.Schema;
+            partitionKey = null;
+        }
+        else if (nodes.Count > 0)
+        {
+            var compiledBase = TryCompileNode(baseNode, ctx);
+            if (compiledBase is null) return null;
+            baseStream = compiledBase.Stream;
+            baseRowType = compiledBase.RowType;
+            rowType = compiledBase.RowType;
+            schema = compiledBase.Schema;
+            partitionKey = compiledBase.PartitionKey;
+        }
+        else
+        {
+            return Plain();
+        }
+
+        if (!TryAppendStages(nodes, stages, rowType, schema, out var finalRowType, out var finalSchema))
+        {
+            return null;
+        }
+
+        // A filter keeps the partition key; any projection may move the key columns.
+        if (nodes.Any(n => n is ProjectPlan))
+        {
+            partitionKey = null;
+        }
+
+        var step = BuildFusedTypedDelegate(baseRowType, finalRowType, stages);
+        return new IndexInput(finalRowType, finalSchema, baseStream, partitionKey, baseRowType, step);
+    }
+
+    /// <summary>The <see cref="IndexInput"/>'s rows as a stream: its stream, or its step run
+    /// as a separate MapFilterRows when one is pending.</summary>
+    private static object Materialize(CircuitBuilder builder, IndexInput input) =>
+        input.Step is null
+            ? input.Stream
+            : InvokeMapFilterRows(builder, input.BaseRowType!, input.RowType, input.Stream, input.Step);
+
+    /// <summary>Exchange-and-index an <see cref="IndexInput"/> by <paramref name="keyExtractor"/>,
+    /// fusing its step when it has one.</summary>
+    private static object IndexByKey(
+        CircuitBuilder builder, IndexInput input, Type keyRowType, Delegate partition, Delegate keyExtractor) =>
+        input.Step is null
+            ? InvokeExchangeIndex(builder, input.RowType, keyRowType, input.Stream, partition, keyExtractor)
+            : InvokeExchangeIndexStep(
+                builder, input.BaseRowType!, input.RowType, keyRowType, input.Stream, input.Step, partition, keyExtractor);
 
     /// <summary>
     /// Builds the fused per-row delegate
@@ -832,9 +970,11 @@ public static partial class TypedPlanCompiler
         var keyless = plan.EquiKeys.Count == 0;
         if (keyless && plan.JoinType is not AstJoinType.Inner) return null;
 
-        var left = TryCompileNode(plan.Left, ctx);
+        // Each side's pointwise work (Filter/Project chain, and a once-scanned table's
+        // structural→typed lift) runs inside its indexing pass (§9.13).
+        var left = TryCompileIndexInput(plan.Left, ctx);
         if (left is null) return null;
-        var right = TryCompileNode(plan.Right, ctx);
+        var right = TryCompileIndexInput(plan.Right, ctx);
         if (right is null) return null;
 
         // Equi-key columns must be NOT NULL on both sides. For INNER
@@ -888,17 +1028,16 @@ public static partial class TypedPlanCompiler
             // Fuse the two key exchanges into one shared barrier (§15): both sides
             // are independent and adjacent (no dependency between them), so a single
             // rendezvous serves both, halving the join's barrier straggler tax.
+            // The coalesced exchange has no fused pre-step: materialise any step first.
             (leftIndexed, rightIndexed) = InvokeExchangeIndexJoin(
                 ctx.Builder, keyRowType, left.RowType, right.RowType,
-                left.Stream, leftPartition, leftKeyExtractor,
-                right.Stream, rightPartition, rightKeyExtractor);
+                Materialize(ctx.Builder, left), leftPartition, leftKeyExtractor,
+                Materialize(ctx.Builder, right), rightPartition, rightKeyExtractor);
         }
         else
         {
-            leftIndexed = InvokeExchangeIndex(
-                ctx.Builder, left.RowType, keyRowType, left.Stream, leftPartition, leftKeyExtractor);
-            rightIndexed = InvokeExchangeIndex(
-                ctx.Builder, right.RowType, keyRowType, right.Stream, rightPartition, rightKeyExtractor);
+            leftIndexed = IndexByKey(ctx.Builder, left, keyRowType, leftPartition, leftKeyExtractor);
+            rightIndexed = IndexByKey(ctx.Builder, right, keyRowType, rightPartition, rightKeyExtractor);
         }
 
         var leftSnapshotCodec = BuildAdaptedIndexedCodec(
@@ -1789,7 +1928,8 @@ public static partial class TypedPlanCompiler
             }
         }
 
-        var inner = TryCompileNode(plan.Input, ctx);
+        // The input's pointwise work runs inside the indexing pass (§9.13).
+        var inner = TryCompileIndexInput(plan.Input, ctx);
         if (inner is null) return null;
 
         // Nullable group-key columns flow through naturally: the
@@ -1871,13 +2011,14 @@ public static partial class TypedPlanCompiler
                 return null;
             }
 
-            indexed = InvokeExchangeIndex(
-                ctx.Builder, inner.RowType, keyRowType, inner.Stream, partition, keyExtractor);
+            indexed = IndexByKey(ctx.Builder, inner, keyRowType, partition, keyExtractor);
         }
         else
         {
-            indexed = InvokeGroupProject(
-                ctx.Builder, inner.RowType, keyRowType, inner.Stream, keyExtractor);
+            indexed = inner.Step is null
+                ? InvokeGroupProject(ctx.Builder, inner.RowType, keyRowType, inner.Stream, keyExtractor)
+                : InvokeStepGroupProject(
+                    ctx.Builder, inner.BaseRowType!, inner.RowType, keyRowType, inner.Stream, inner.Step, keyExtractor);
         }
 
         // IncrementalAggregate<TKey, TIn, TAgg>(indexed, composite)
@@ -4061,6 +4202,34 @@ public static partial class TypedPlanCompiler
             .Single(m => m.Name == nameof(CircuitBuilder.ExchangeIndex) && m.IsGenericMethodDefinition);
         var closed = openMethod.MakeGenericMethod(keyRowType, rowType, typeof(Z64));
         return closed.Invoke(builder, new[] { stream, partition, keyExtractor })!;
+    }
+
+    /// <summary>
+    /// <c>builder.ExchangeIndexStep&lt;TKey, TIn, TRow, Z64&gt;(stream, step, partition, keyOf)</c>:
+    /// exchange-and-index with a fused pointwise pre-step (§9.13). Bound by name, which is
+    /// why the builder method is not an <c>ExchangeIndex</c> overload.
+    /// </summary>
+    private static object InvokeExchangeIndexStep(
+        CircuitBuilder builder, Type baseRowType, Type rowType, Type keyRowType,
+        object stream, Delegate step, Delegate partition, Delegate keyExtractor)
+    {
+        var openMethod = typeof(CircuitBuilder)
+            .GetMethods()
+            .Single(m => m.Name == nameof(CircuitBuilder.ExchangeIndexStep) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, baseRowType, rowType, typeof(Z64));
+        return closed.Invoke(builder, new[] { stream, step, partition, keyExtractor })!;
+    }
+
+    /// <summary><c>builder.StepGroupProject&lt;TKey, TIn, TRow, Z64&gt;(stream, step, keyOf)</c>.</summary>
+    private static object InvokeStepGroupProject(
+        CircuitBuilder builder, Type baseRowType, Type rowType, Type keyRowType,
+        object stream, Delegate step, Delegate keyExtractor)
+    {
+        var openMethod = typeof(StatefulOperators)
+            .GetMethods()
+            .Single(m => m.Name == nameof(StatefulOperators.StepGroupProject) && m.IsGenericMethodDefinition);
+        var closed = openMethod.MakeGenericMethod(keyRowType, baseRowType, rowType, typeof(Z64));
+        return closed.Invoke(null, new object[] { builder, stream, step, keyExtractor })!;
     }
 
     /// <summary>

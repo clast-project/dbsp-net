@@ -1200,6 +1200,51 @@ partition and index). (2) A new Core operator needs new reflection-bound `Invoke
 `TypedPlanCompiler`, the known landmine. Worth doing only as one lever (lift + chain + index,
 W≥1); it ranks below the per-row cost inside joins/windows/aggregates.
 
+### 9.13 Typed-path index fusion built (lift + chain + index, W=1 and W>1)
+
+The combined lever §9.12 recommended. A typed join's or aggregate's input compiles through
+`TryCompileIndexInput` to a base stream plus one fused step delegate (`TBase ⇒ (Keep,
+TRow)`). The step is the input's Filter/Project chain (`CollectLinearNodes` /
+`TryAppendStages`, factored out of `CompileLinearChain`). In boundary-adapter mode it is
+also, for a table scanned exactly once (`ScanRefCounts`), the structural→typed **lift**, so
+the index is built straight from the structural input rows. Two new Core entry points run
+it:
+
+- `StatefulOperators.StepGroupProject` (W≤1, and the W>1 aggregate path whose shuffle is
+  elided);
+- `CircuitBuilder.ExchangeIndexStep` → `ExchangeIndexStepOp` (W>1). It maps or drops each
+  row, partitions by the mapped row, and gathers into the key index. Two inputs mapping to
+  one row land in the same bucket and merge in the gather's `IndexedZSetBuilder`.
+
+Both are bound by **distinct names**, not overloads, because `TypedPlanCompiler` resolves
+builder methods with `.Single(name)` (the reflection landmine). The coalesced
+`ExchangeIndexJoin` (off by default) materialises the step first. A chain already in
+`PlanCache`, or a scan already lifted, stays a plain stream. The `IndexFusionMode` switch
+(`DBSPNET_INDEX_FUSION=off`) gates both paths.
+
+**Tests.** `TypedIndexFusionTests`: fused ≡ unfused, single circuit and W=3, over 60
+arbitrary ±1 streams for each of 8 shapes. The shapes are pruning projections with a
+deferred lift, filter chains, a collapsing projection, a self-join (shared lift, not
+deferred), linear, expression-keyed and MIN/MAX aggregates, and join → aggregate. A
+fusion-fires test asserts fewer ApplyOps. Mutations caught: the W>1 step ignoring `Keep`
+(2) and the W=1 step ignoring `Keep` (2). Full suite 2493 passed, 1 skipped.
+
+**B/ev** (1M events, `NEXMARK_GEN=feldera`, deterministic):
+
+| query | w1profile (single, lift fused) off → on | r3par W=14 (parallel, chain fused) off → on |
+|---|---|---|
+| q3 | 99 → 86 (**−13.1%**) | 112.7 → 109.9 (−2.5%) |
+| q4 | 1266 → 1107 (**−12.6%**) | 1560 → 1475 (**−5.5%**) |
+| q20 | 1170 → 1056 (**−9.7%**) | 1512 → 1508 (−0.3%) |
+| q9 | 921 → 910 (−1.2%) | — |
+| q0/q1/q2/q22/q18/q19 | identical | — |
+
+r3par output digests are identical in every cell. The single-circuit gain is twice the
+§9.12 estimate, because the deferred lift removes a full-width Z-set of every input row.
+The parallel compile has no lift (inputs are already typed), so W>1 keeps only the
+chain → exchange part: −5.5% on q4. **Wall-clock not yet measured**, and on this host it
+needs ≥5 alternating runs per arm (§9.11).
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim

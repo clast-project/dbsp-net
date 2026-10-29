@@ -507,6 +507,44 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// <see cref="GroupProject{TKey,TRow,TValue,TWeight}"/> keyed by a fused pointwise
+    /// pre-step that rewrites each row or drops it (<c>Keep = false</c>), the row becoming
+    /// the value. The struct-friendly sibling of
+    /// <see cref="MapFilterGroupProject{TKey,TIn,TRow,TValue,TWeight}"/>, shaped like the
+    /// typed compiler's fused step delegates. Exact for the same reason.
+    /// </summary>
+    public static Stream<IndexedZSet<TKey, TRow, TWeight>> StepGroupProject<TKey, TIn, TRow, TWeight>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TIn, TWeight>> input,
+        Func<TIn, (bool Keep, TRow Row)> step,
+        Func<TRow, TKey> keyOf)
+        where TKey : notnull
+        where TIn : notnull
+        where TRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(step);
+        ArgumentNullException.ThrowIfNull(keyOf);
+
+        return builder.Apply(input, z =>
+        {
+            var b = new IndexedZSetBuilder<TKey, TRow, TWeight>();
+            foreach (var (row, w) in z)
+            {
+                var (keep, mapped) = step(row);
+                if (keep)
+                {
+                    b.Add(keyOf(mapped), mapped, w);
+                }
+            }
+
+            return b.Build();
+        });
+    }
+
+    /// <summary>
     /// Incremental inner equi-join. Both inputs must already be indexed on
     /// the shared key. <paramref name="combine"/> produces the output row
     /// from the join key, the left row and the right row.

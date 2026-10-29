@@ -1541,7 +1541,7 @@ public static class PlanToCircuit
     /// <paramref name="inlineViews"/> also count that view's body, which compiles in place.
     /// Self-references of recursive CTEs are reported separately: never inlinable.
     /// </summary>
-    private static (Dictionary<string, int> Scans, Dictionary<CteRef, int> Ctes, HashSet<CteRef> Recursive)
+    internal static (Dictionary<string, int> Scans, Dictionary<CteRef, int> Ctes, HashSet<CteRef> Recursive)
         CountReferences(LogicalPlan root, IReadOnlyDictionary<string, LogicalPlan>? inlineViews = null)
     {
         var scans = new Dictionary<string, int>(StringComparer.Ordinal);

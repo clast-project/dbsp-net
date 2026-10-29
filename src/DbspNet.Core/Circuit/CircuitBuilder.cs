@@ -279,6 +279,44 @@ public sealed class CircuitBuilder
     }
 
     /// <summary>
+    /// <see cref="ExchangeIndex{TKey,TRow,TWeight}"/> with a fused pointwise pre-step:
+    /// <paramref name="step"/> rewrites each input row or drops it (<c>Keep = false</c>)
+    /// before it is partitioned and indexed, so the upstream map/filter never materialises
+    /// its own Z-set. With a single worker it degrades to
+    /// <see cref="StatefulOperators.StepGroupProject{TKey,TIn,TRow,TWeight}"/>.
+    /// A distinct name (not an overload): the typed compiler binds these by name.
+    /// </summary>
+    public Stream<IndexedZSet<TKey, TRow, TWeight>> ExchangeIndexStep<TKey, TIn, TRow, TWeight>(
+        Stream<ZSet<TIn, TWeight>> input,
+        Func<TIn, (bool Keep, TRow Row)> step,
+        Func<TRow, int> partition,
+        Func<TRow, TKey> keyOf)
+        where TKey : notnull
+        where TIn : notnull
+        where TRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(step);
+        ArgumentNullException.ThrowIfNull(partition);
+        ArgumentNullException.ThrowIfNull(keyOf);
+
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return this.StepGroupProject(input, step, keyOf);
+        }
+
+        var workers = _parallel.Workers;
+        var coordinator = _parallel.NextCoordinator(
+            () => new ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>>(workers));
+        var output = new Stream<IndexedZSet<TKey, TRow, TWeight>>(
+            IndexedZSet<TKey, TRow, TWeight>.Empty);
+        _root.AddOperator(new ExchangeIndexStepOp<TKey, TIn, TRow, TWeight>(
+            input, output, step, partition, keyOf, coordinator, _parallel.WorkerId, _parallel.Abort));
+        return output;
+    }
+
+    /// <summary>
     /// A join's <em>dual</em> <see cref="ExchangeIndex{TKey,TRow,TWeight}"/>: shuffle
     /// and re-index both inputs by the same join key across <b>one</b> shared
     /// rendezvous instead of two independent ones. Returns the left and right
