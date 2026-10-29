@@ -821,94 +821,172 @@ public static class PlanToCircuit
     /// temporal filter, a non-inner join, a global top-K — is refused so the
     /// caller falls back to the serial single circuit.
     /// </summary>
-    private static bool CanCompileParallel(LogicalPlan plan)
+    private static bool CanCompileParallel(LogicalPlan plan) => CollectParallelBlockers(plan, blockers: null);
+
+    /// <summary>
+    /// Every construct in <paramref name="plan"/> (an optimized view plan) that keeps the
+    /// parallel compile from sharding it, described in SQL terms. Empty means it shards. The
+    /// same rules as <see cref="CanCompileParallel"/>, but it keeps walking past the first
+    /// blocker, so a view's whole to-do list shows (the ivm-bench parallel census).
+    /// </summary>
+    internal static IReadOnlyList<string> ParallelBlockers(LogicalPlan plan)
     {
+        var blockers = new List<string>();
+        CollectParallelBlockers(plan, blockers);
+        return blockers;
+    }
+
+    // With blockers == null this short-circuits on the first blocker (CanCompileParallel);
+    // with a list it records each blocker and keeps walking.
+    private static bool CollectParallelBlockers(LogicalPlan plan, List<string>? blockers)
+    {
+        bool Block(string why)
+        {
+            blockers?.Add(why);
+            return false;
+        }
+
+        bool Walk(LogicalPlan child) => CollectParallelBlockers(child, blockers);
+
+        // A node-level verdict, then (when it passed, or when collecting) its children.
+        bool Then(bool ok, params LogicalPlan[] children)
+        {
+            if (!ok && blockers is null)
+            {
+                return false;
+            }
+
+            foreach (var child in children)
+            {
+                if (!Walk(child))
+                {
+                    ok = false;
+                    if (blockers is null)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return ok;
+        }
+
+        bool Partitioned(string what, IReadOnlyList<ResolvedExpression> keys) =>
+            keys.Count == 0 ? Block("unpartitioned " + what)
+            : AllHashable(keys) || Block(what + " with a non-hashable PARTITION BY key");
+
         switch (plan)
         {
             case ScanPlan:
                 return true;
 
             case CteScanPlan c:
-                return CanCompileParallel(c.Cte.Plan);
+                return Walk(c.Cte.Plan);
 
             case FilterPlan f:
-                return CanCompileParallel(f.Input);
+                return Walk(f.Input);
 
             case ProjectPlan p:
-                return CanCompileParallel(p.Input);
+                return Walk(p.Input);
 
             case JoinPlan j:
             {
-                if (j.JoinType != DbspNet.Sql.Parser.Ast.JoinType.Inner)
+                var ok = j.JoinType == DbspNet.Sql.Parser.Ast.JoinType.Inner
+                         || Block(j.JoinType switch
+                         {
+                             DbspNet.Sql.Parser.Ast.JoinType.LeftOuter => "LEFT OUTER JOIN",
+                             DbspNet.Sql.Parser.Ast.JoinType.RightOuter => "RIGHT OUTER JOIN",
+                             DbspNet.Sql.Parser.Ast.JoinType.FullOuter => "FULL OUTER JOIN",
+                             var other => other + " join",
+                         });
+                if (ok || blockers is not null)
                 {
-                    return false;
-                }
-
-                var (leftIndices, rightIndices) = ExtractEquiKeyIndices(j);
-                if (leftIndices.Length == 0)
-                {
-                    return false; // a cross join has no equi-key to shard on.
-                }
-
-                for (var k = 0; k < leftIndices.Length; k++)
-                {
-                    if (!IsHashableType(j.Left.Schema[leftIndices[k]].Type)
-                        || !IsHashableType(j.Right.Schema[rightIndices[k]].Type))
+                    var (leftIndices, rightIndices) = ExtractEquiKeyIndices(j);
+                    if (leftIndices.Length == 0)
                     {
-                        return false;
+                        ok = Block("cross join (no equi-key to shard on)") && ok;
+                    }
+
+                    for (var k = 0; k < leftIndices.Length; k++)
+                    {
+                        if (!IsHashableType(j.Left.Schema[leftIndices[k]].Type)
+                            || !IsHashableType(j.Right.Schema[rightIndices[k]].Type))
+                        {
+                            ok = Block("join on a non-hashable key type " + j.Left.Schema[leftIndices[k]].Type) && ok;
+                            break;
+                        }
                     }
                 }
 
-                return CanCompileParallel(j.Left) && CanCompileParallel(j.Right);
+                return Then(ok, j.Left, j.Right);
             }
 
             case AggregatePlan a:
+            {
+                var ok = true;
                 foreach (var gk in a.GroupKeys)
                 {
                     if (!IsHashableType(gk.Type))
                     {
-                        return false;
+                        ok = Block("GROUP BY on a non-hashable key type " + gk.Type);
+                        break;
                     }
                 }
 
-                return CanCompileParallel(a.Input);
+                return Then(ok, a.Input);
+            }
 
             case UnionAllPlan u:
-                foreach (var b in u.Branches)
-                {
-                    if (!CanCompileParallel(b))
-                    {
-                        return false;
-                    }
-                }
-
-                return true;
+                return Then(true, u.Branches.ToArray());
 
             case DistinctPlan d:
+            {
+                var ok = true;
                 foreach (var col in d.Schema.Columns)
                 {
                     if (!IsHashableType(col.Type))
                     {
-                        return false;
+                        ok = Block("DISTINCT over a non-hashable column type " + col.Type);
+                        break;
                     }
                 }
 
-                return CanCompileParallel(d.Input);
+                return Then(ok, d.Input);
+            }
 
             case PartitionedTopKPlan pt:
-                return pt.PartitionKeys.Count > 0 && AllHashable(pt.PartitionKeys) && CanCompileParallel(pt.Input);
+                return Then(Partitioned("TOP-K (ROW_NUMBER/RANK filter)", pt.PartitionKeys), pt.Input);
 
             case PartitionedRankPlan pr:
-                return pr.PartitionKeys.Count > 0 && AllHashable(pr.PartitionKeys) && CanCompileParallel(pr.Input);
+                return Then(Partitioned("rank in output (RANK/ROW_NUMBER OVER)", pr.PartitionKeys), pr.Input);
 
             case WindowAggregatePlan wa:
-                return wa.PartitionKeys.Count > 0 && AllHashable(wa.PartitionKeys) && CanCompileParallel(wa.Input);
+                return Then(Partitioned("window aggregate (agg OVER)", wa.PartitionKeys), wa.Input);
 
             case WindowOffsetPlan wo:
-                return wo.PartitionKeys.Count > 0 && AllHashable(wo.PartitionKeys) && CanCompileParallel(wo.Input);
+                return Then(Partitioned("LAG/LEAD", wo.PartitionKeys), wo.Input);
 
             default:
+            {
+                var why = plan switch
+                {
+                    SemiJoinPlan sj => sj.IsAnti ? "anti-join (NOT EXISTS / NOT IN)" : "semi-join (EXISTS / IN)",
+                    ScalarSubqueryJoinPlan => "scalar subquery",
+                    CorrelatedScalarSubqueryJoinPlan => "correlated scalar subquery",
+                    DifferencePlan => "EXCEPT / set difference",
+                    TopKPlan => "unpartitioned TOP-K (ORDER BY … LIMIT)",
+                    RecursiveCtePlan => "recursive CTE",
+                    TemporalFilterPlan => "temporal filter (NOW())",
+                    _ => plan.GetType().Name,
+                };
+                Block(why);
+                if (blockers is not null)
+                {
+                    ForEachChild(plan, child => Walk(child));
+                }
+
                 return false;
+            }
         }
     }
 
