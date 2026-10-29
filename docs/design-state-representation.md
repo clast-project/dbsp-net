@@ -1313,6 +1313,19 @@ both modes after batch 3, in row counts and digests:
 Batches 2/3's drain is 26–243 ms, so with Incremental output their whole processing time is
 now ~0.05–0.3 s locally (Feldera on CI: 6.5 s / 6.4 s).
 
+**ivm-bench CI** (PR #89, run 40958968899 attempt 2, engine pin `a02772b`, SF=3, Feldera vs
+DbspNet on the same runner):
+
+| batch | Feldera | DbspNet | CPU-s (Feldera / DbspNet) | visible output MB (F / D) |
+|---|---|---|---|---|
+| 1 (bulk load) | 25.82 s | 90.81 s (Feldera 3.5× faster) | 283.6 / 272.4 | 155.9 / 117.3 |
+| 2 | 6.18 s | **0.13 s (48×)** | 56.1 / 0.1 | 156.0 / 117.4 |
+| 3 | 3.50 s | **0.09 s (39×)** | 31.0 / 0.1 | 156.2 / 117.5 |
+
+The incremental batches went from 3.44 / 2.95 s (truncate output, previous run) to
+0.13 / 0.09 s. Storage is flat. Batch 1 is unchanged: equal CPU, but Feldera uses ~11 cores
+and the DbspNet server one circuit. **Next lever: run the ivm-bench program in parallel.**
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
