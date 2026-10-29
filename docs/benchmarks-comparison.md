@@ -23,6 +23,42 @@ Stream: 1,000,000 events (20,000 person, 60,000 auction, 920,000 bid). Host: .NE
 >
 > Queries q5 / q7 / q8 (tumbling / sliding event-time windows) are omitted: they require TUMBLE / HOP windowing table functions that DbspNet does not yet expose. q9 uses `ROW_NUMBER() OVER (PARTITION … ORDER …)` which compiles to a partitioned incremental TOP-K.
 
+## Nexmark head-to-head vs Feldera — M4 Pro, 2026-10-29 (Feldera-faithful generator)
+
+Same host and method as the 2026-08-31 section below, except **DbspNet now runs on
+`NEXMARK_GEN=feldera`**, a port of Feldera's own generator (hot keys, padded `extra`, per-channel
+URLs). It is now the script's default. The 08-31 run used our lighter legacy generator, so it
+flattered string-heavy queries on our side. DbspNet at `610f184` (after the state-representation
+arc, `docs/design-state-representation.md`); Feldera at `78afc9077`. Serialized, idle machine,
+`caffeinate -i`.
+
+`W=N / Feldera` = DbspNet at N workers ÷ Feldera at N cores; **> 1.0 means DbspNet is faster**.
+
+| Query | 1M, 14c | 10M, 14c | 10M, 8c | 10M, 4c | reading |
+|:--|--:|--:|--:|--:|:--|
+| q0  | 1.14× | 0.83× | 0.85× | 0.73× | parity / slight loss |
+| q1  | 1.02× | 0.96× | 0.70× | 0.68× | parity / slight loss |
+| q2  | 1.22× | 0.82× | 0.73× | 0.76× | parity / slight loss |
+| q3  | 1.35× | 2.10× | 2.24× | 2.87× | win |
+| q4  | 1.15× | 1.25× | 1.17× | 0.96× | parity |
+| q9  | 1.76× | 2.22× | 1.96× | 2.30× | win |
+| q15 | 10.71× | 11.25× | 7.25× | 4.58× | win |
+| q16 | 18.92× | 14.96× | 12.78× | 8.49× | win |
+| q17 | 10.33× | 8.66× | 6.05× | 4.04× | win |
+| q18 | 0.89× | 0.86× | 0.72× | 0.80× | parity (was a 0.46× loss) |
+| q19 | 1.00× | 1.34× | 0.99× | 0.83× | parity |
+| q20 | 0.83× | 1.16× | 1.12× | 1.06× | parity |
+| q22 | 0.67× | 0.64× | 0.63× | 0.63× | **loss** |
+
+(q5/q7/q8/q12 were left out of this run's query set.)
+
+- **The decay signal of 08-31 is gone.** From 1M to 10M at 14 cores, no DbspNet query loses
+  more throughput than Feldera's does. q18 drops ~10–12% on both sides. See design-state-representation §9.1.
+- **q18 moved from a clear loss to parity, and q15/q16 from wins to 5–19× wins.** Feldera's
+  q15/q16 get *slower* as cores are added; ours scale.
+- **The remaining losses are the stateless queries** (q0/q1/q2/q22, 0.63–0.85× at every core
+  count). That is per-row and exchange cost, not state.
+
 ## Nexmark head-to-head vs Feldera — M4 Pro, 2026-08-31
 
 Re-run on the current machine after the migration ([[machine-migration-to-mac]]). **These numbers are

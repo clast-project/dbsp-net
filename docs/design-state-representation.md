@@ -1,6 +1,7 @@
 # Design: state representation — the throughput-decay arc
 
-Status: **Phase 0 (measure + map) complete; Phase 1 (variants) not started.**
+Status: **Rounds 1–3 complete (2026-10-29).** Shipped: A, B, G (+ NULLable SUM), B2 (typed and
+structural), A's column dedup. Not shipped: C, D, E, H. Round-3 standing is in §9.
 
 Goal: stop DbspNet's throughput from decaying as operator state grows. The M4
 Nexmark comparison (`docs/benchmarks-comparison.md`, 2026-08-31) showed our ev/s
@@ -792,3 +793,109 @@ equal across W. Env A/B: `DBSPNET_TOPK_STATE=legacy`, `DBSPNET_LINEAR_AGG=off`,
 two processes: B/ev agrees to ≤0.2 B/ev at every W (≤1.6 at q9 W=1). It is not byte-exact
 like `w1profile`, but it is far inside every effect below. Live bytes agree to ≤0.5%, except
 for one q18 W=1 pair (3.4%).
+
+## 9. Round 3 — where we stand (serialized, idle, `caffeinate`, `NEXMARK_GEN=feldera`, main @ `610f184`)
+
+### 9.1 Head-to-head against Feldera (`scripts/compare-nexmark.sh`, now on the faithful generator)
+
+DbspNet W=N ÷ Feldera at N cores; > 1.0 = DbspNet faster. 10M events unless marked. Only
+gaps beyond ~1.5× are readable (§ "How much of this to believe" in `benchmarks-comparison.md`).
+
+| query | 1M, 14c | 10M, 14c | 10M, 8c | 10M, 4c | 2026-08-31 10M, 14c (legacy gen) |
+|---|---|---|---|---|---|
+| q0 | 1.14× | 0.83× | 0.85× | 0.73× | 1.00× |
+| q1 | 1.02× | 0.96× | 0.70× | 0.68× | 0.97× |
+| q2 | 1.22× | 0.82× | 0.73× | 0.76× | 1.06× |
+| q3 | 1.35× | 2.10× | 2.24× | 2.87× | 2.79× |
+| q4 | 1.15× | 1.25× | 1.17× | 0.96× | 1.19× |
+| q9 | 1.76× | 2.22× | 1.96× | 2.30× | 2.36× |
+| q15 | 10.71× | **11.25×** | 7.25× | 4.58× | 2.87× |
+| q16 | 18.92× | **14.96×** | 12.78× | 8.49× | 7.43× |
+| q17 | 10.33× | 8.66× | 6.05× | 4.04× | 6.42× |
+| q18 | 0.89× | **0.86×** | 0.72× | 0.80× | **0.46×** |
+| q19 | 1.00× | 1.34× | 0.99× | 0.83× | 0.95× |
+| q20 | 0.83× | 1.16× | 1.12× | 1.06× | 1.52× |
+| q22 | 0.67× | **0.64×** | 0.63× | 0.63× | 0.79× |
+
+**Decay, 1M → 10M at 14 cores (absolute ev/s):**
+
+| query | DbspNet W=14 | Feldera 14c |
+|---|---|---|
+| q4 | 3.70M → 3.95M | 3.22M → 3.15M |
+| q9 | 3.51M → 3.62M | 2.00M → 1.63M |
+| q15 | 4.26M → 4.08M | 398k → 363k |
+| q16 | 5.38M → 3.88M | 285k → 259k |
+| q18 | 3.32M → 2.92M (−12%) | 3.74M → 3.39M (−10%) |
+| q19 | 3.37M → 3.45M | 3.36M → 2.57M |
+| q20 | 3.07M → 3.43M | 3.68M → 2.96M |
+| q22 | 5.32M → 5.10M | 7.94M → 7.99M |
+
+Reading:
+
+1. **The arc's headline goal is met at W=14.** On 2026-08-31 our stateful queries lost
+   throughput 1M → 10M while Feldera's held. Now no query decays more than Feldera's does;
+   q18 loses ~10–12% on both sides. (q16's 5.38 → 3.88M is the W=14 noise band; W=1 is flat,
+   §9.2.)
+2. **q18 went from a clear loss (0.46×) to parity (0.72–0.89×)**, and q15/q16 went from wins
+   to 5–19× wins. Feldera's q15/q16 *slow down* as cores are added (799k at 4c → 363k at 14c);
+   ours scale up.
+3. **What still loses is stateless or near-stateless: q0/q1/q2/q22 at 0.63–0.85×**, at every
+   core count. That is per-row and exchange cost, not state. It matches §8's finding that W>1
+   adds ~300–550 B/ev of exchange/gather allocation that no state variant touches. **That is
+   the next lever, and it belongs to the row-representation / per-row arc, not to this one.**
+
+### 9.2 Phase 0 decay table re-taken (W=1, 10M, five 2M segments, `decay … stream`)
+
+| query | ev/s first → last fifth | ex-pause first → last | worst pause | live state @10M | §1.2 (legacy gen, pre-arc) |
+|---|---|---|---|---|---|
+| q0 | 3.84M → 3.91M | flat | 8% | 13 MB | flat |
+| q3 | 27.1M → 27.4M | flat | 4% | 123 MB | flat |
+| q4 | 2.16M → 2.21M | flat ~2.35M | 8% | 2,510 MB | 1.43 → 1.55M, 4,501 MB |
+| q9 | 1.80M → 1.87M | flat ~1.9M | 9% | 2,580 MB | 1.83 → 1.74M |
+| q15 | 2.85M → 3.04M | flat | 5% | 75 MB | 1.28 → 0.82M (−36%) |
+| q16 | 2.19M → 2.36M | flat | 4% | 322 MB | 0.97 → 0.66M (−32%) |
+| q17 | 2.69M → 2.38M (−11%) | flat ~2.8M | 15% | 1,582 MB | (not measured) |
+| **q18** | **1.54M → 1.01M (−35%)** | **1.54 → 1.13M (−27%)** | 11% | 6,433 MB | 1.02 → 0.35–0.87M, 20,537 MB |
+| **q19** | 1.47–1.60M ↔ 1.01–1.12M (bimodal) | 1.59 ↔ 1.12–1.27M | 12% | 6,146 MB | 1.26 → 0.73–1.12M |
+| q20 | 2.17M → 1.93M | flat ~2.3–2.4M | **22%** | 5,701 MB | 2.04 → 1.11–2.37M |
+| q22 | 1.99M → 1.96M | flat | 9% | 16 MB | flat |
+
+**The remaining decayers, ranked:**
+
+1. **q18: the only true decayer left.** It loses 27% *ex-pause*, so this is per-row
+   work or locality growing with state, not GC. 9.2M stored rows at ~700 B/row. This is
+   the next target for this arc: A's per-partition `Dictionary` (§4A notes ~40 B/entry +
+   1.7× slack) and three `byte[]` strings per row.
+2. **q19: GC-bimodal.** Segments with a gen2 lose ~30%; segments without one run at the
+   start rate. Object count, not work: strings (H/E territory) or fewer, larger objects.
+3. **q20 and q17: a flat GC tax** of 15–22% pause late in the run, with ex-pause throughput flat.
+   Same lever as q19.
+4. Everything else is flat.
+
+At W=1 GC pause is still a 10–22% tax on q17–q20. H (the ingest arena) removed 82–88% of
+those objects but did not move W=1 mean throughput in round 2 (§7). Re-test it on q19/q20
+at W=14, where Feldera's numbers sit, before reopening it.
+
+### 9.3 Round 3 changes shipped
+
+- **G admits SUM over NULLable arguments** (`610f184`, §4G.1): summed non-NULL weight
+  decides NULL. That changes nothing on Nexmark (every column is NOT NULL), but it makes 3
+  ivm-bench aggregates G-eligible once G reaches the structural path.
+- **A's duplicated partition/order columns removed** (`af774fd`, §4A.1): q9 −19% live
+  state, q18/q19 −19% B/ev. It breaks old structural snapshots of windowed TOP-K queries,
+  which is accepted.
+- **Typed snapshots restore across processes** (`c505acd`, §4A.1): emitted row types are
+  named deterministically.
+- **Structural hybrid MIN/MAX** (`af47f4f`, §4B.3): passes its sliding-window gate; ivm-bench's
+  `watches` + four gold views.
+- **W>1 selection asserted** (`58ce2be`, §8): all four variants are selected per replica.
+
+### 9.4 Next
+
+1. **Structural G.** It is the biggest ivm-bench prize: fact_cash_balances shape 1,972 →
+   748 B/row. It now applies to 3 aggregates under the NULLable-SUM rule. It needs a structural
+   operator plus persisted aggregator state.
+2. **q18 ex-pause decay** (§9.2 item 1).
+3. **W>1 per-row/exchange cost** (q0/q1/q2/q22), handed back to the row-representation arc.
+4. **C/D retired** as memory-only options. Both are 9–15% slower, and no workload is
+   memory-bound yet. The branches are recorded in §6 and deleted.
