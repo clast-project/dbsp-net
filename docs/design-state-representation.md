@@ -598,3 +598,27 @@ of five 2M-event segments.
 macOS idle sleep at ~2–3 am: its 5 s `sleep` loop counted 15 s across 14.5
 wall-minutes. The table above is the re-run with sleep prevented. Run every
 unattended timing benchmark under `caffeinate -i`.
+
+## 8. Round 3 — are A/B/G/B2 selected at W>1? (`exp/state-r3-parallel`)
+
+**Yes, all four, in every replica — no fix was needed.** `TypedPlanCompiler.TryCompileParallel`
+runs the same `TryCompileNode` per replica inside `ParallelCircuit.Build`, which builds
+replicas sequentially **on the calling thread**, and every switch (`PartitionedTopKStateMode`,
+`LinearAggregateMode`, `CompactAggregatorStateMode.CompactDistinct/MinMax`) is read at
+compile time, with no `Workers` condition. So the thread-static opt-outs reach the replicas
+too. Evidence: `r3par` (below) prints each replica's state operators. `ParallelStateSelectionTests`
+asserts selection and each opt-out per replica at W=1/2/4, and checks parallel-on ≡ single-off
+on every tick plus ≡ a one-tick batch for q4/q16/q18/q19 shapes. Mutating the G gate to
+`ctx.Workers == 1` fails 4 cases. Caveat: the *structural* parallel path
+(`PlanToCircuit.TryCompileParallel`) and the program path get only A's container (no unboxed
+key, no B/G/B2), by design.
+
+**Instrument.** `dotnet run -c Release -- r3par [events] [batch] [W,W,..] [q..]` compiles
+through `TryCompileParallel` for every W (W=1 included). It reports live bytes after a forced
+full GC and B/ev from `GC.GetTotalAllocatedBytes(precise)` around push+step only, so
+worker-thread allocation counts. It also gives an order-independent output digest, checked
+equal across W. Env A/B: `DBSPNET_TOPK_STATE=legacy`, `DBSPNET_LINEAR_AGG=off`,
+`DBSPNET_MINMAX_STATE=legacy`, `DBSPNET_COMPACT_DISTINCT=off` (new). Determinism across
+two processes: B/ev agrees to ≤0.2 B/ev at every W (≤1.6 at q9 W=1). It is not byte-exact
+like `w1profile`, but it is far inside every effect below. Live bytes agree to ≤0.5%, except
+for one q18 W=1 pair (3.4%).

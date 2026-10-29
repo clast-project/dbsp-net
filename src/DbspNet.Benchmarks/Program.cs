@@ -19,6 +19,20 @@ switch (Environment.GetEnvironmentVariable("DBSPNET_MINMAX_STATE"))
     case "hybrid": CompactAggregatorStateMode.MinMax = MinMaxStateKind.Hybrid; break;
 }
 
+// A/B aid: DBSPNET_COMPACT_DISTINCT=off selects the boxed COUNT(DISTINCT) state (§4B)
+// for queries compiled on this (main) thread.
+if (Environment.GetEnvironmentVariable("DBSPNET_COMPACT_DISTINCT") == "off")
+{
+    CompactAggregatorStateMode.CompactDistinct = false;
+}
+
+// State-representation round 3: deterministic live-bytes / B/ev at W>1.
+// `dotnet run -- r3par [events] [batch] [W,W,..] [q..]`
+if (args.Length > 0 && args[0] == "r3par")
+{
+    return DbspNet.Benchmarks.ParallelStateBenchmark.Run(args);
+}
+
 // Profiling sub-command: `dotnet run -- profile {typed|structural|handwired} [seconds]`
 if (args.Length > 0 && args[0] == "profile")
 {
