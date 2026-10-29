@@ -119,3 +119,62 @@ Sequencing: **A, B, E** are independent and operator-local — run them in
 parallel now. **C/D** need the seam first; I extract it serially (a pure
 refactor, gated by the existing suites and byte-identical B/ev), then C and D
 fan out on it.
+
+## 4. Variant B — COUNT(DISTINCT) and MIN/MAX sub-state (`exp/state-B-distinct`)
+
+**Built** (`TypedCompactAggregatorState.cs`, default-on via `CompactAggregatorStateMode`,
+old aggregators kept as the fallback):
+
+- **Shared unboxed COUNT(DISTINCT).** At compile time, COUNT(DISTINCT) calls whose
+  argument is a column `x` or its FILTER lowering `CASE WHEN p THEN x END` are grouped
+  by `x`; each group becomes one `TypedSharedCountDistinctAggregator<TIn,T>` whose
+  per-group state is one open-addressing table (`DistinctValueTable<T>`: linear
+  probing, backward-shift delete, Fibonacci-mixed hash) from the **unboxed** value to
+  k `int` row counters. q15/q16 go from 8 `Dictionary<object,long>` per group to 2
+  tables (bidder ×4, auction ×4). `x` is extracted once per row, and the post-delta
+  weight is probed once per row per table (8 → 2 trace probes), only when some member's
+  predicate holds. The semantics are unchanged: it still counts positive-weight row
+  transitions, so incremental ≡ batch stays exact. The composite gained multi-result
+  units (`ResultCount` / `UpdateInto` + a slot map).
+- **MIN/MAX as (best, count).** The state is the extreme value plus the number of
+  positive rows that hold it. If a tick retracts the last holder (or is inconsistent),
+  the aggregator rescans the post-delta multiset once at the end of the tick, which
+  reads the trace the operator already keeps.
+
+**Results** (1M events, batch 10k, W=1, clean rebuild; baseline = `910fa89`):
+
+| query | live bytes base → variant | ratio | B/ev base → variant |
+|---|---|---|---|
+| q15 | 117,953,664 → 102,895,400 | 1.15× | 1015 → 918 (decay) |
+| q16 | 248,180,312 → 199,725,952 | 1.24× | 1155 → 1043 (decay) |
+| q4 | 491,567,576 → 331,349,544 | **1.48×** | 2222 → 2116 (w1profile); 1396 → 1291 (decay) |
+
+The other w1profile rungs are byte-identical (q0/q1/q2/q22/q3/q20/q9/q18/q19).
+
+**Where q15/q16's bytes actually are.** To isolate the distinct sub-state, I stubbed
+it out (COUNT(DISTINCT) returns 0, no state; measurement only). Without it, q15 is
+98.3 MB and q16 is 181.7 MB. So at baseline the distinct state is only **19.6 MB
+(17%) of q15** and **66.5 MB (27%) of q16**. The variant cuts it to ~4.6 MB and
+~18 MB (4.3× and 3.7×). The remaining ~95% of q15 is the aggregate operator's
+**trace**: every bid row of the day, kept so `after.WeightOf(row)` can answer
+positivity transitions. Further aggregator-local work cannot produce a large
+multiple on q15/q16. That needs a **trace-free** aggregate for composites made only
+of COUNT(*) and COUNT(DISTINCT). Such an aggregate counts *weights* per (value,
+member), not positive rows. That is equivalent whenever the integrated group has no
+negative weights (true for every well-formed SQL table), but it is not identical on
+transient negative-weight Z-sets. It would also need persisted aggregator state,
+because there is no trace to fold on restore. Projected size: ~5 MB for q15 (~20×).
+That is an operator-level change, so it is listed as follow-up, not built.
+
+**Risks.** The MIN/MAX cost model changes. A workload that keeps retracting the
+current extreme (sliding windows) now pays O(group) per such tick instead of
+O(log n) per row; `CompactMinMax = false` restores the sorted set. Values that
+compare equal but are not `Equals` (Decimal128 1.0 vs 1.00) count as one holder.
+
+**Tests.** `CompactAggregatorStateTests` runs a 3-way differential: compact typed,
+fallback typed and structural must integrate to the same view after every tick of
+random insert/delete streams. The streams include duplicated values, NULLs, a
+VARCHAR argument, a non-column argument, FILTERed MIN/MAX and biased extreme
+deletes. The test ends with a batch recompute. It also runs a 200k-op churn test of
+`DistinctValueTable` against a `Dictionary` oracle. Full suite: 2379 passed, 1
+skipped, 0 failed.
