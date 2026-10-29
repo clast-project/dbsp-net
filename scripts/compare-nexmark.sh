@@ -19,7 +19,12 @@
 #                              [--feldera=PATH] [--dbsp-only]
 #
 # Env overrides (same names, upper-case): EVENTS, CORES, BATCH, RUNS, GENERATORS,
-#   QUERIES, FELDERA_DIR
+#   QUERIES, FELDERA_DIR, NEXMARK_GEN
+#
+# Generator: DbspNet runs with NEXMARK_GEN=feldera by default — a port of Feldera's
+# own generator (hot keys, padded `extra`, per-channel URLs), so both sides see the
+# same data shape. NEXMARK_GEN=legacy reproduces pre-2026-10-29 runs, whose lighter
+# rows flattered DbspNet on string-heavy queries (design-state-representation §5.1).
 #
 # METHODOLOGY — both sides measure engine compute only (apples-to-apples):
 #   * DbspNet pre-generates the whole event stream, then times push + Step() only.
@@ -58,6 +63,7 @@ CORES="${CORES:-$HOSTCORES}"
 BATCH="${BATCH:-10000}"
 RUNS="${RUNS:-3}"
 GENERATORS="${GENERATORS:-$CORES}"
+NEXMARK_GEN="${NEXMARK_GEN:-feldera}"
 QUERIES="${QUERIES:-q0 q1 q2 q3 q4 q5 q7 q8 q9 q12 q15 q16 q17 q18 q19 q20 q22}"
 # Default to a sibling checkout, then the old GitHub Desktop location, so this
 # survives moving either repo. The previous default hard-coded a /Users/curt
@@ -93,14 +99,14 @@ DBSP_OUT="$WORK/dbsp.txt"
 FELDERA_CSV="$WORK/feldera.csv"
 
 echo "== Nexmark comparison =="
-echo "   events=$EVENTS  cores=$CORES  batch=$BATCH  runs=$RUNS  feldera-generators=$GENERATORS"
+echo "   events=$EVENTS  cores=$CORES  batch=$BATCH  runs=$RUNS  feldera-generators=$GENERATORS  dbspnet-gen=$NEXMARK_GEN"
 echo "   queries=$QUERIES"
 echo "   host: $(uname -mrs)"
 echo
 
 # ---- 1. DbspNet ----------------------------------------------------------------
 echo "-- DbspNet (dotnet, W=1 and W=$CORES) ----------------------------------------"
-dotnet run -c Release --project "$REPO/src/DbspNet.Benchmarks" -- \
+NEXMARK_GEN="$NEXMARK_GEN" dotnet run -c Release --project "$REPO/src/DbspNet.Benchmarks" -- \
   nexmark "$EVENTS" "$BATCH" "$RUNS" "$CORES" | tee "$DBSP_OUT"
 echo
 
