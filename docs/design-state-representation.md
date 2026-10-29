@@ -892,13 +892,43 @@ at W=14, where Feldera's numbers sit, before reopening it.
 
 ### 9.4 Next
 
-1. **Structural G.** It is the biggest ivm-bench prize: fact_cash_balances shape 1,972 →
+1. ~~**Structural G.**~~ *Demoted by §9.5: all aggregates are 6–7% of ivm-bench batch-1 step.* It was billed as the biggest ivm-bench prize: fact_cash_balances shape 1,972 →
    748 B/row. It now applies to 3 aggregates under the NULLable-SUM rule. It needs a structural
    operator plus persisted aggregator state.
 2. **q18 ex-pause decay** (§9.2 item 1).
 3. **W>1 per-row/exchange cost** (q0/q1/q2/q22), handed back to the row-representation arc.
 4. **C/D retired** as memory-only options. Both are 9–15% slower, and no workload is
    memory-bound yet. The branches are recorded in §6 and deleted.
+
+### 9.5 ivm-bench SF=3 batch 1 on main (`0b847c4`) — the priority changes
+
+Local `IvmBatchProfile` (structural program path, ServerGC, DATAS off, `caffeinate`), 18-view compile
+set (16 outputs + the 2 `+stored` views). Two runs per arm, alternating:
+
+| arm | engine step | batch wall | allocated |
+|---|---|---|---|
+| structural MIN/MAX **hybrid** (default) | 63.4 / 63.6 s | 70.2 / 67.6 s | **84.53 GiB** |
+| `DBSPNET_STRUCT_MINMAX=legacy` | 63.6 / 64.2 s | 67.9 / 69.3 s | 85.64 GiB |
+
+- **The hybrid is time-neutral on the real workload and saves 1.1 GiB (−1.3%) of allocation.** The
+  per-operator profile charged `watches`' aggregate +1.5 s under the hybrid. That is GC-pause
+  attribution: the whole step is equal, and a counter probe found 549,669 promotions that rescanned
+  **0 rows** each (groups emptying), 68 ms in total, with no group staying promoted. Per-operator
+  ms under ServerGC is not an A/B instrument; whole-step and per-operator alloc are.
+- **One view is half the batch.** `fact_market_history`'s left join (18.7 s, 25.8 GiB), the Apply
+  after it (6.8 s, 12.4 GiB) and its Apply2 (2.7 s) are **~28 of 63 s of step and ~39 of 84.5 GiB**.
+  Its `LEFT JOIN wrk_company_financials USING (sk_company_id)` has no temporal predicate, so each
+  `daily_market` row fans out to every financials row of its company (~40M output rows,
+  [[ivm-bench-stored-view-asymmetry]]). That is ~1 KB allocated per output row: wide joined
+  `StructuralRow` built, then projected by the next Apply. Feldera computes the same view.
+- **All 13 aggregates together are 3.9–4.5 s (6–7%).** Structural G (§9.4 item 1) is worth a few
+  percent here, not the ~2.6× its per-row state shrink suggested. **Demoted.**
+
+**Next for ivm-bench:** the per-output-row cost of a fan-out join on the structural path. Build the
+projected row directly in the join's combine (fuse the following Apply into it, as join column
+pruning does for inputs), and check whether the joined row can stay unboxed. Measure with whole-step
+and allocation; this is a row-construction lever, so it belongs with per-row-execution-efficiency,
+not with state representation.
 
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
