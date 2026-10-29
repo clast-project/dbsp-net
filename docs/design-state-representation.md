@@ -899,3 +899,254 @@ at W=14, where Feldera's numbers sit, before reopening it.
 3. **W>1 per-row/exchange cost** (q0/q1/q2/q22), handed back to the row-representation arc.
 4. **C/D retired** as memory-only options. Both are 9–15% slower, and no workload is
    memory-bound yet. The branches are recorded in §6 and deleted.
+
+## 10. Appendix — unshipped variants (write-ups archived from their branches)
+
+These sections lived only on their experiment branches. They are copied here verbatim
+(headings renumbered) so the record survives deleting the branches. Their wall-clock
+verdicts are in §6 (C, D) and §7 (H). The `IIndexedTrace` seam C and D were built on is
+`exp/state-trace-seam`. Cited as §4C/§4D/§4E/§4H elsewhere in this doc.
+
+### 10.C Flat hash trace (`exp/state-C-flathash` @ `682ce09`, `DBSP_TRACE_REPR=FlatHash`)
+
+**Design** (`FlatHashIndexedTrace.cs`). One trace = two struct arrays + two
+`int[]` bucket arrays. `KeySlot {key, hash, head, tail, count, next}` in a chained
+hash table over keys; `Entry {value, weight, valueHash, slot, nextInBucket,
+nextInGroup, prevInGroup}` in a second chained table keyed on `(slot, value)`
+(O(1) `WeightOf`/integrate), with each key's values on a doubly-linked run in
+insertion order (group enumeration, join probe). Both hashes stored, so a rehash
+never re-hashes a row; free lists recycle retracted slots. The struct arrays are
+`PagedArray<T>` (first page doubles to 4,096 elements, then grows a page at a
+time) — the first cut used plain doubling arrays and *raised* B/ev (q4 2,351 vs
+2,222) from the 2× cumulative copy; paging turned that into a −14% win and also
+cut live bytes further (q4 333 → 308 MB). Container objects per trace:
+4 + ⌈entries/4096⌉ + ⌈keys/4096⌉, versus 4 per key for `Flat`.
+
+The aggregate gets a lazy after-group view through a new
+`IIndexedTrace.AfterGroupView(key, delta)` (default `null` → the eager rebuild);
+FlatHash returns `MergedGroupMultiset`, the generalization of `LazyMergeMultiset`
+(or the delta itself when the key is absent). `Flat`'s concrete fast path is
+untouched: Flat B/ev byte-identical to the seam commit.
+
+**Measurements** (1M events, batch 10k, W=1, same build):
+
+| query | live bytes Flat | live bytes FlatHash | Δ | B/ev Flat | B/ev FlatHash | Δ |
+|---|---|---|---|---|---|---|
+| q4  | 490,422,568 | 307,757,688 | **−37.2%** | 2,222 | 1,913 | −13.9% |
+| q9  | 361,307,768 | 295,496,152 | −18.2% | 1,116 | 1,077 | −3.5% |
+| q20 | 557,884,520 | 368,664,208 | **−33.9%** | 1,190 | 1,079 | −9.3% |
+| q3  | 12,138,144 | 5,088,096 | −58.1% | 83 | 80 | −3.6% |
+
+q9's smaller gain is because its TOP-1 state (row A) is untouched. **Tests:**
+2,379 pass / 1 skip under both `Flat` (default) and `FlatHash` (2,375 existing +
+4 new differential tests vs. `IndexedZSetTrace`: random cancelling deltas,
+colliding hashes, multi-page growth, frontier GC, join both directions, lazy view).
+
+**Loose ends.** Nothing shrinks (a trace that GCs most of its keys keeps its
+peak arrays); per-key iteration is a linked-list walk (pointer-chasing inside one
+array rather than across objects, but not sequential); remaining live objects
+are dominated by `Utf8String` `byte[]`s (row E), which this variant does not touch.
+
+### 10.D Sorted runs + LSM (`exp/state-D-sorted` @ `f788fe0`, `DBSP_TRACE_REPR=Sorted`)
+
+**Design** (`src/DbspNet.Core/Operators/Stateful/SortedIndexedTrace.cs`). The trace is
+a short list of immutable runs. Each run is seven flat arrays — key hash, keys, offsets,
+value hash, values, weights (typed struct rows stored inline) — with no per-key object.
+`Integrate` sorts the delta once into a new run, then does a size-tiered compaction:
+when the newest tier holds `F` runs (default 8, `DBSP_SORTED_FANOUT`; tier = ⌊log_F(values/1024)⌋)
+they are k-way merged into one run, consolidating equal (k, v) and dropping zero nets.
+A join sorts the delta's keys once and gallop-walks every run, with no per-key hash
+probes. The aggregate gets `PrepareTouchedGroups`: one walk of each run locates every
+touched key's segments, and `SortedGroupView` is a lazy before+delta view over them,
+the sorted analogue of `LazyMergeMultiset`, so the eager `MergeView` fallback is never
+used. `Flat` keeps its concrete fast path. Its B/ev is byte-identical: 2222 / 1116 / 1190 / 83.
+
+**How this differs from the old spine, and whether it mattered.** The old spine also
+used inline typed struct arrays on the typed path (keys/offsets/values/weights), so
+"objects vs structs" is not the difference. What differs:
+1. **Order by stored 32-bit equality hash**, not `Comparer<T>.Default`. Ties are resolved
+   by `EqualityComparer<T>.Default`. Every merge or probe comparison is an `int` compare
+   against an array, never a field-by-field `IComparable` walk. Equality semantics are
+   exactly flat's, and any row type works (records, tuples, `StructuralRow`) with no
+   comparer plumbing. The cost is 4 B per key and per value, and no range locality for
+   monotone keys (GC scans, as flat does).
+2. **No per-batch bloom filter**: the walk is a merge, so it needs no point-probe filter.
+3. **Larger fan-out (8 vs 4) and no memtable**: a run per tick, merged geometrically.
+4. **Aggregate view over segments** instead of the spine's own aggregate operator.
+Only wall-clock can show whether (1)–(3) fix the spine's 20% build cost. On the
+deterministic instruments, the representation wins on bytes and objects without
+losing allocation.
+
+**Results** (1M events, batch 10k, W=1, same build; live bytes reproduce within 0.1%):
+
+| query | live bytes Flat | live bytes Sorted | Δ | B/ev Flat | B/ev Sorted | live objects Flat → Sorted |
+|---|---:|---:|---:|---:|---:|---:|
+| q4  | 490,419,552 | 264,285,232 | **−46%** | 2222 | 2259 (+1.7%) | 1,981,674 → 1,262,488 (−36%) |
+| q9  | 362,684,992 | 293,702,776 | −19% | 1116 | 1101 (−1.4%) | 2,126,209 → 1,646,571 (−23%) |
+| q20 | 556,794,736 | 345,083,688 | **−38%** | 1190 | 1198 (+0.7%) | 3,182,775 → 2,895,628 (−9%) |
+| q3  | 12,139,352 | 4,428,928 | −64% | 83 | 91 (+10%) | 84,819 → 30,987 (−63%) |
+
+At 2M events: q4 963.8 MB → 505.4 MB (−48%), q20 1,099.8 MB → 673.6 MB (−39%). The
+ratio holds as state grows. The objects left behind are VARCHAR `byte[]`s (row E) and
+the aggregate/TOP-K side state (rows A/B). q9's state is mostly its TOP-K. Live objects
+were counted by a reflection walk from the compiled query (`DBSP_COUNT_OBJECTS=1`, decay bench).
+
+**Merge work** (F=8, 1M events): q4 52 merges, 2.89 rows moved/ev, max 14 runs/trace;
+q9 26 merges, 0.26/ev, max 13; q20 27 merges, 1.53/ev, max 14; q3 28 merges, 0.10/ev,
+max 8. At 2M events, q4 moves 3.57/ev with max 16 runs (logarithmic growth). Fan-out
+trades merge allocation against probe fan-in:
+
+| F | q4 B/ev | q20 B/ev | q4 rows moved/ev | q4 max runs |
+|---|---:|---:|---:|---:|
+| 4  | 2524 | 1287 | 4.77 | 9 |
+| 8  | 2259 | 1198 | 2.89 | 14 |
+| 16 | 2115 | 1140 | 1.85 | 20 |
+
+**Wall-clock phase should look at** (1) the per-run walk cost with 14–20 runs, versus
+the merge allocation saved at higher F; (2) merge latency spikes, since compaction runs
+on the step thread and the largest merge rewrites the whole trace; (3) gen2/LOH churn
+from the discarded run arrays (B/ev counts it, but LOH sweeps are not counted).
+
+**Correctness.** `DBSP_TRACE_REPR=Sorted`: 2380 pass / 1 skip, which is the full
+suite plus 5 new differential tests (`SortedIndexedTraceTests`: random insert/retract
+streams against flat with a colliding hash, covering join both ways, the lazy views,
+GC and full retraction). Snapshot save/restore round-trips through `Materialize`/`Integrate`.
+The default and `Reference` suites are also 2380 / 1.
+
+### 10.E Strings — ingest interning (`exp/state-E-strings` @ `e60bf95`)
+
+**Built:** a bounded per-column intern table at `TableInput` ingest
+(`IngestStringInterner`, `CompileOptions.InternIngestStrings`, **default-on**,
+`false` = old path). Strings ≤64 chars in a VARCHAR column map to one shared
+*boxed* `Utf8String`, so equal values share the box **and** the `byte[]` in the
+input delta and in every trace that keeps the row. ≤1,024 entries per column;
+once full, a column whose next 4,096 lookups are mostly misses releases its
+table and stops probing (ids, card numbers, free text). Semantics-neutral by
+construction: same bytes, content-based hash/equality/order — no hash path
+touched. Not built: an ingest arena (§ below).
+
+**Results** (1M events, batch 10k, W=1, `stream`; objects from `dotnet-gcdump`
+via the new `DECAY_GCDUMP` hook — gcdump caps at 10M objects, so q18 objects are
+taken at 400k events). `DECAY_INTERN=0` gives the A/B arm in one binary.
+
+| query | live bytes base → E | Δ | objects base → E | Δ | B/ev base → E |
+|---|---|---|---|---|---|
+| q4 | 490,409,992 → 486,110,832 | −0.9% | 1,987,995 → 1,931,626 | −2.8% | 2222 → 2010 |
+| q9 | 361,854,256 → 357,258,384 | −1.3% | 2,137,047 → 2,080,667 | −2.6% | 1116 → 905 |
+| q18 | 1,967,932,856 → 1,724,811,664 | **−12.4%** | (400k ev) 5,218,629 → 4,087,068 | **−21.7%** | 2106 → 1898 |
+| q19 | 874,508,824 → 631,444,872 | **−27.8%** | 5,242,493 → 2,455,012 | **−53.2%** | 1668 → 1461 |
+| q20 | 558,312,416 → 314,791,120 | **−43.6%** | 3,194,963 → 394,509 | **−87.7%** | 1190 → 979 |
+
+B/ev falls by ~208 B on every query that ingests bids (q0 653→445, q1 769→561,
+q2 515→307, q22 882→674, q3 83→73). q4/q9 barely move in live state because
+column pruning already drops the bid strings before their traces; q19/q20 store
+the strings and lose most of their objects (q20: 2.80M `byte[]` → 25k).
+
+**Caveat — the prize is workload-shaped.** Our generator's bid strings are
+low-cardinality (4 channels, 4 URLs, constant extras). Feldera's Nexmark
+generator pads `extra` with random text and randomises some URLs, so on that
+data only `channel` (and part of `url`) would intern; high-cardinality columns
+fall back to today's encoding at the cost of one bounded probe window. An
+ingest **arena** for those columns was not built: on these five queries the
+remaining string objects after interning are ≤61k per query (nothing to win),
+and arena retention (one surviving row pins its batch's chunk) is a real risk
+for q18-style replace-heavy state. It needs a high-cardinality generator to be
+measured honestly.
+
+**Recommendation: ship** (default-on, cheap, bounded, semantics-neutral; full
+suite 2,383 pass / 1 skip). Arena = follow-on, only with high-cardinality data.
+
+### 10.H VARCHAR ingest arena (`exp/state-H-arena` @ `9aa41aa`)
+
+**Built.** `TableInput.Push` encodes each batch's VARCHAR cells into a few shared
+`byte[]` chunks and hands out `Utf8String` slices of them
+(`src/DbspNet.Sql/Compiler/Utf8IngestArena.cs`). Before this, every cell got its
+own array. There are two passes. The first sums each column's exact UTF-8 length
+and plans the chunks. The second encodes into those chunks, so every chunk is
+filled exactly and none of the retained bytes are slack.
+
+- **Chunks are per column, not per batch.** Columns that are pruned before
+  state therefore free their chunks after the tick.
+- **Chunk size is ≤ 64 KiB.** That is under the 85,000 B LOH threshold, so
+  chunks are ordinary gen0 small-object-heap arrays that can be compacted and
+  add no LOH budget pressure toward gen2. A single string bigger than the cap
+  gets its own exact chunk.
+- **The switch is on by default.** `Utf8ArenaMode.Enabled` is thread-static and
+  read per `TableInput` at compile time. `DBSP_UTF8_ARENA=0` turns it off, and
+  `DBSP_UTF8_ARENA_CHUNK` overrides the chunk size.
+- `Utf8String` is untouched, so hash, equality and ordering are the same bytes
+  as before. `Insert`/`Delete` of a single row keep the per-cell path.
+
+**Measured** at 1M events, batch 10k, W=1. The baseline is main at `c53e782`;
+q3's baseline is the same binary with the arena off, whose numbers match main's
+(B/ev byte-identical, bytes within 0.4%). Live objects come from
+`DBSP_COUNT_OBJECTS=1` (`ObjectGraphCounter`, cherry-picked from D).
+
+| gen | query | live objects | live bytes | B/ev |
+|---|---|---|---|---|
+| feldera | q3 | 94,245 → 62,093 (−34%) | 14,962,912 → 13,532,424 | 116 → 108 |
+| | q4 | 1,848,444 → 1,819,070 (−2%) | 422,360,568 → 420,977,904 | 1978 → 1900 |
+| | q9 | 1,189,514 → 1,100,839 (−7%) | 285,525,688 → 281,190,136 | 1022 → 943 |
+| | q18 | **3,271,164 → 512,965 (−84%)** | 641,515,320 → 492,989,440 (−23%) | 1070 → 996 |
+| | q19 | **3,372,472 → 614,273 (−82%)** | 655,819,576 → 507,710,848 (−23%) | 1081 → 1008 |
+| | q20 | **3,180,837 → 385,565 (−88%)** | 611,280,320 → 502,693,560 (−18%) | 1170 → 1091 |
+| legacy | q3 | 84,819 → 64,394 | 12,140,392 → 11,506,984 | 83 → 75 |
+| | q4 | 1,981,678 → 1,952,291 | 490,393,640 → 488,859,800 | 2222 → 2140 |
+| | q9 | 734,007 → 645,319 | 274,942,592 → 270,347,888 | 1030 → 948 |
+| | q18 | **2,854,816 → 95,617 (−97%)** | 472,689,584 → 319,950,400 (−32%) | 1429 → 1353 |
+| | q19 | **2,918,923 → 159,724 (−95%)** | 538,058,640 → 384,911,528 (−28%) | 1270 → 1193 |
+| | q20 | **3,182,775 → 386,842 (−88%)** | 556,291,864 → 405,613,968 (−27%) | 1190 → 1109 |
+
+On q18, q19 and q20, per-cell `byte[]` were 84–88% of all live objects (2.76M
+for 920k bids). They are now about 1,800 chunks. Every query's B/ev drops by
+about 75–80, because array headers disappear.
+
+**Retention: chunks do pin garbage.** The counter now reports referenced slice
+bytes against the bytes of the arrays that hold them.
+
+- **Nexmark is mostly benign.** q18 and q19 are 100% utilised, because the
+  TOP-K multiset keeps every bid. q20 is 84.3% utilised (feldera): the
+  `category = 10` filter keeps ~21% of auctions, which pins ~21 MB of unused
+  auction strings, but the query still nets −108 MB. q3 is 71% (feldera) and
+  35.5% (legacy), but it still nets smaller.
+- **The worst case is severe.** `arenaretain` keeps 1 row in 100 of
+  ~100-byte unique strings, either through a filter or through retractions.
+
+  | chunk | arena off | arena on |
+  |---|---|---|
+  | 64 KiB | 9.5 MB | 204 MB (2% utilised) |
+  | 4 KiB | 9.5 MB | 86 MB |
+  | 1 KiB | 9.5 MB | 27 MB |
+
+  At 20% survival, 64 KiB chunks give 219 MB against 72 MB with the arena off.
+  Smaller chunks only help at very low survival. Under uniform sparse survival,
+  every chunk is pinned. The bound is: each survivor pins at most one chunk per
+  string column. That makes retention up to ~1/selectivity × string bytes,
+  capped by the bytes ingested.
+
+**Correctness.**
+
+- The full suite passes: 2413, plus 1 skipped.
+- `Utf8IngestArenaTests` adds 28 tests:
+  - slice bytes, hash, `StructuralRowHash`, equality and order match
+    `Utf8String.Of`, for multibyte strings, emoji, empty strings, nulls and a
+    70 KB string;
+  - exact chunk fill;
+  - an on/off differential, where 8 queries (string-keyed join, TOP-K partitioned
+    by string, COUNT DISTINCT, MIN/MAX(s), UPPER/LIKE/concat, DISTINCT) × 3
+    paths (typed, structural, spine) get 40 ticks of random inserts and deletes
+    and must give identical deltas on every tick.
+- Persistence round-trips run with the arena on, since it is the default.
+
+**Verdict: iterate. Do not ship default-on as is.** The object kill is the
+largest seen in this arc and matches §6's diagnosis. But a selective filter, or
+CDC retractions, can multiply string retention by 1/selectivity. Next steps:
+
+1. A compile-time gate: no arena for a table that has a filter between its scan
+   and its first stateful consumer. This fixes q20's auction side and q3.
+2. A state-side copy that covers retraction-heavy inputs, with this arena kept
+   as the ingest half. The design is to rebase a row's `Utf8String`s into a
+   paged arena owned by the trace, at integrate time.
+
+Wall-clock was not measured; the machine was shared.
+
