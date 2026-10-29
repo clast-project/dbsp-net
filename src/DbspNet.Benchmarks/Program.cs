@@ -88,6 +88,12 @@ if (args.Length > 0 && args[0] == "allocmode")
     return 0;
 }
 
+// Nexmark generator sanity probe: `dotnet run -- genstats [events] [legacy|feldera]`
+if (args.Length > 0 && args[0] == "genstats")
+{
+    return DbspNet.Benchmarks.Nexmark.NexmarkGenStats.Run(args);
+}
+
 // Throughput-vs-state-size profile: `dotnet run -- decay [events] [batch] [segments] [stream|pregen] [q..]`
 // Per-segment W=1 throughput + in-step GC pause + heap + retained state, to tell
 // state-representation decay apart from GC-tracing-a-live-heap decay.
