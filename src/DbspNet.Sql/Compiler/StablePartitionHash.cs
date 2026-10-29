@@ -55,6 +55,9 @@ internal static class StablePartitionHash
     public static int Of(double value) =>
         StableHash.Of(BitConverter.DoubleToInt64Bits(value == 0.0 ? 0.0 : value));
 
+    /// <summary>Hash a REAL as the double it widens to, exactly — equal floats hash equal.</summary>
+    public static int Of(float value) => Of((double)value);
+
     public static int Of(string? value) => value is null ? NullHash : StableHash.Of(value);
 
     /// <summary>Hash a UTF-8 string by its bytes (Utf8String equality is byte-wise).</summary>
@@ -68,6 +71,9 @@ internal static class StablePartitionHash
     public static int Of(Time64 value) => StableHash.Of(value.Microseconds);
 
     public static int Of(Timestamp value) => StableHash.Of(value.Microseconds);
+
+    public static int Of(Interval value) =>
+        unchecked((StableHash.Of(value.Months) * 31) + StableHash.Of(value.Micros));
 
     /// <summary>
     /// Hash a boxed structural-row slot value against its declared
@@ -98,12 +104,14 @@ internal static class StablePartitionHash
             SqlIntegerType => Of((int)value),
             SqlBigintType => Of((long)value),
             SqlBooleanType => Of((bool)value),
+            SqlRealType => Of((float)value),
             SqlDoubleType => Of((double)value),
             SqlDecimalType => Of((Decimal128)value),
             SqlVarcharType => Of((Utf8String)value),
             SqlDateType => Of((Date32)value),
             SqlTimeType => Of((Time64)value),
             SqlTimestampType => Of((Timestamp)value),
+            SqlIntervalType => Of((Interval)value),
             _ => throw new NotSupportedException(
                 $"no stable partition hash for SQL column type {type.GetType().Name}"),
         };

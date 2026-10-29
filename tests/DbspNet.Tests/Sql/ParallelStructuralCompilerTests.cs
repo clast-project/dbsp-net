@@ -42,7 +42,15 @@ public class ParallelStructuralCompilerTests
             var cells = new string[width];
             for (var i = 0; i < width; i++)
             {
-                cells[i] = kv.Key[i]?.ToString() ?? "<null>";
+                // -0.0 equals +0.0, so a group keeps whichever copy arrived first —
+                // an order serial and parallel need not share. Compare by value.
+                cells[i] = kv.Key[i] switch
+                {
+                    null => "<null>",
+                    float f when f == 0 => "0",
+                    double d when d == 0 => "0",
+                    var v => v.ToString()!,
+                };
             }
 
             var key = string.Join("|", cells);
@@ -760,40 +768,38 @@ public class ParallelStructuralCompilerTests
     }
 
     [Fact]
-    public void OuterJoinResidual_OverRealPreservedColumn_RefusesParallel()
+    public void OuterJoinResidual_OverRealPreservedColumn_Shards()
     {
-        // An equi LEFT JOIN shards (ParallelOuterSemiJoinTests), and so does one with a
-        // residual, but the residual lowering shuffles the preserved side by its WHOLE
-        // row, and REAL has no stable partition hash. A REAL on the non-preserved side
-        // is fine.
-        string[] ddl =
-        [
-            "CREATE TABLE l (k INT NOT NULL, a REAL NOT NULL)",
-            "CREATE TABLE r (k INT NOT NULL, b REAL NOT NULL)",
-        ];
-        Assert.True(PlanToCircuit.TryCompileParallel(
-            CompilePlan(ddl, "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k"), 4, out var plain));
-        plain!.Dispose();
-        Assert.False(PlanToCircuit.TryCompileParallel(
-            CompilePlan(ddl, "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k AND l.a < r.b"), 4, out _));
-        Assert.True(PlanToCircuit.TryCompileParallel(
-            CompilePlan(
-                ["CREATE TABLE l (k INT NOT NULL, a BIGINT NOT NULL)", "CREATE TABLE r (k INT NOT NULL, b REAL NOT NULL)"],
-                "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k AND l.a < r.b"),
+        // The residual lowering shuffles the preserved side by its WHOLE row, so a REAL
+        // there must partition-hash; -0.0 and +0.0 (equal) must land together.
+        AssertParallelMatchesSerial(
+            ["CREATE TABLE l (k INT NOT NULL, a REAL NOT NULL)", "CREATE TABLE r (k INT NOT NULL, b REAL NOT NULL)"],
+            "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k AND l.a < r.b",
             4,
-            out var nonPreservedReal));
-        nonPreservedReal!.Dispose();
+            tbl =>
+            {
+                Insert(tbl("l"), 1, 0.0f);
+                Insert(tbl("l"), 1, -0.0f);
+                Insert(tbl("l"), 2, 1.5f);
+                Insert(tbl("r"), 1, 0.5f);
+            },
+            tbl => Insert(tbl("r"), 2, 3.0f));
     }
 
     [Fact]
-    public void RealGroupKey_RefusesParallel()
+    public void RealGroupKey_Shards()
     {
-        // REAL has no stable partition hash ⇒ refuse rather than shard on an
-        // unstable key.
-        var plan = CompilePlan(
+        AssertParallelMatchesSerial(
             ["CREATE TABLE t (k REAL NOT NULL, v BIGINT NOT NULL)"],
-            "SELECT k, SUM(v) FROM t GROUP BY k");
-        Assert.False(PlanToCircuit.TryCompileParallel(plan, 4, out _));
+            "SELECT k, SUM(v) FROM t GROUP BY k",
+            4,
+            tbl =>
+            {
+                Insert(tbl("t"), 0.0f, 1L);
+                Insert(tbl("t"), -0.0f, 2L);
+                Insert(tbl("t"), 2.5f, 4L);
+            },
+            tbl => Insert(tbl("t"), 2.5f, 8L));
     }
 
     [Fact]

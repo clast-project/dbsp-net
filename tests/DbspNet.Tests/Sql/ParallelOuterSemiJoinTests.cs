@@ -3,6 +3,7 @@
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Sql.Compiler;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Tests.Sql;
 
@@ -33,6 +34,10 @@ public class ParallelOuterSemiJoinTests
         // subquery column) so the IN / NOT IN key takes the resolver's common-type cast.
         "CREATE TABLE c (x INT NOT NULL, tag VARCHAR NOT NULL)",
         "CREATE TABLE d (y BIGINT NOT NULL, g INT NOT NULL)",
+        // A DATE correlated against a TIMESTAMP (the common type), and a REAL column:
+        // every column type must partition-hash, at ingest and as a key.
+        "CREATE TABLE e (dt DATE NOT NULL, r REAL)",
+        "CREATE TABLE f (ts TIMESTAMP NOT NULL, n INT NOT NULL)",
     ];
 
     private static readonly (string Name, string Sql)[] Views =
@@ -79,6 +84,9 @@ public class ParallelOuterSemiJoinTests
         ("ex_agg", "SELECT a.k1, COUNT(*) AS n FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k1 = a.k1) GROUP BY a.k1"),
         // Semi / anti join read directly by an aggregate (every outer column used).
         ("ex_direct", "SELECT a.k1, COUNT(*) AS n, SUM(a.v) AS sv, MIN(a.k2) AS mk, SUM(a.ts) AS st FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k1 = a.k1) GROUP BY a.k1"),
+        ("ex_mixed", "SELECT e.dt, e.r FROM e WHERE EXISTS (SELECT 1 FROM f WHERE f.ts = e.dt)"),
+        ("nex_mixed", "SELECT e.dt FROM e WHERE NOT EXISTS (SELECT 1 FROM f WHERE CAST(f.ts AS DATE) = e.dt)"),
+        ("real_agg", "SELECT e.r, COUNT(*) AS n FROM e GROUP BY e.r"),
         ("nex_direct", "SELECT a.k1, COUNT(*) AS n, SUM(a.v) AS sv, MIN(a.k2) AS mk, SUM(a.ts) AS st FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k1 = a.k1) GROUP BY a.k1"),
     ];
 
@@ -93,7 +101,15 @@ public class ParallelOuterSemiJoinTests
             var cells = new string[width];
             for (var i = 0; i < width; i++)
             {
-                cells[i] = kv.Key[i]?.ToString() ?? "<null>";
+                // -0.0 equals +0.0, so a group keeps whichever copy arrived first —
+                // an order serial and parallel need not share. Compare by value.
+                cells[i] = kv.Key[i] switch
+                {
+                    null => "<null>",
+                    float f when f == 0 => "0",
+                    double d when d == 0 => "0",
+                    var v => v.ToString()!,
+                };
             }
 
             var key = string.Join("|", cells);
@@ -107,19 +123,23 @@ public class ParallelOuterSemiJoinTests
         return map;
     }
 
+    private const long Day = 86_400_000_000L;
+
     private static object? Pick(Random rng, params object?[] domain) => domain[rng.Next(domain.Length)];
 
     // One tick's deltas per table. Weights are ±1 / ±2 with no regard for what was
     // inserted before, so deletes of never-inserted rows (negative accumulations) occur.
-    private static Dictionary<string, List<(object?[] Values, long Weight)>> RandomTick(Random rng)
+    // Tables e/f draw from their own generator (typedRng) so adding them left the a–d
+    // streams, and so every existing view's coverage, unchanged.
+    private static Dictionary<string, List<(object?[] Values, long Weight)>> RandomTick(Random rng, Random typedRng)
     {
-        long W() => rng.Next(4) switch { 0 => -2, 1 => -1, 2 => 1, _ => 2 };
-        List<(object?[], long)> Rows(int max, Func<object?[]> row)
+        List<(object?[], long)> Rows(int max, Func<object?[]> row, Random? from = null)
         {
+            var r = from ?? rng;
             var list = new List<(object?[], long)>();
-            for (var n = rng.Next(max + 1); n > 0; n--)
+            for (var n = r.Next(max + 1); n > 0; n--)
             {
-                list.Add((row(), W()));
+                list.Add((row(), r.Next(4) switch { 0 => -2, 1 => -1, 2 => 1, _ => 2 }));
             }
 
             return list;
@@ -131,6 +151,14 @@ public class ParallelOuterSemiJoinTests
             ["b"] = Rows(6, () => [Pick(rng, null, 1, 2, 3), Pick(rng, null, "x", "y"), Pick(rng, 1L, 3L, 6L), Pick(rng, null, 0, 1), Pick(rng, 1, 2, 3)]),
             ["c"] = Rows(4, () => [Pick(rng, 1, 2, 3, 4)!, Pick(rng, "p", "q")!]),
             ["d"] = Rows(4, () => [Pick(rng, 1L, 2L, 3L)!, Pick(rng, 1, 2, 3, 4)!]),
+            ["e"] = Rows(
+                4,
+                () => [Pick(typedRng, new Date32(1), new Date32(2), new Date32(3))!, Pick(typedRng, null, 0.5f, -0.0f, 0.0f, 2.25f)],
+                typedRng),
+            ["f"] = Rows(
+                4,
+                () => [Pick(typedRng, new Timestamp(Day), new Timestamp(2 * Day), new Timestamp((2 * Day) + 7))!, Pick(typedRng, 1, 2)!],
+                typedRng),
         };
     }
 
@@ -149,9 +177,10 @@ public class ParallelOuterSemiJoinTests
         using (parallel)
         {
             var rng = new Random(seed);
+            var typedRng = new Random(seed + 1_000);
             for (var t = 0; t < ticks; t++)
             {
-                foreach (var (table, deltas) in RandomTick(rng))
+                foreach (var (table, deltas) in RandomTick(rng, typedRng))
                 {
                     serial.Table(table).Push(deltas);
                     parallel!.Table(table).Push(deltas);

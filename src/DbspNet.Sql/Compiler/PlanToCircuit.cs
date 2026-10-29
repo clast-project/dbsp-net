@@ -1126,9 +1126,9 @@ public static partial class PlanToCircuit
     /// </summary>
     private static bool IsHashableType(SqlType type) => type switch
     {
-        SqlIntegerType or SqlBigintType or SqlBooleanType or SqlDoubleType
+        SqlIntegerType or SqlBigintType or SqlBooleanType or SqlRealType or SqlDoubleType
             or SqlDecimalType or SqlVarcharType or SqlDateType or SqlTimeType
-            or SqlTimestampType => true,
+            or SqlTimestampType or SqlIntervalType => true,
         _ => false,
     };
 
