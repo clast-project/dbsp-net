@@ -88,8 +88,19 @@ internal static class NexmarkGenerator
     /// </summary>
     public static List<Event> Generate(int count, int seed = 42)
     {
-        var rng = new Random(seed);
         var events = new List<Event>(count);
+        events.AddRange(Stream(count, seed));
+        return events;
+    }
+
+    /// <summary>
+    /// Lazily yield the same stream <see cref="Generate"/> materializes. Lets a
+    /// long-running benchmark feed millions of events without keeping them all
+    /// live — a pre-generated list is itself a heap every full GC must trace.
+    /// </summary>
+    public static IEnumerable<Event> Stream(int count, int seed = 42)
+    {
+        var rng = new Random(seed);
 
         long personCount = 0;
         long auctionCount = 0;
@@ -102,14 +113,14 @@ internal static class NexmarkGenerator
             if (rem < PersonProportion && personCount < int.MaxValue)
             {
                 var id = FirstPersonId + personCount;
-                events.Add(new Event(NexmarkTable.Person, MakePerson(id, when, rng)));
+                yield return new Event(NexmarkTable.Person, MakePerson(id, when, rng));
                 personCount++;
             }
             else if (rem < PersonProportion + AuctionProportion && personCount > 0)
             {
                 var id = FirstAuctionId + auctionCount;
                 var seller = FirstPersonId + NextLong(rng, personCount);
-                events.Add(new Event(NexmarkTable.Auction, MakeAuction(id, seller, when, rng)));
+                yield return new Event(NexmarkTable.Auction, MakeAuction(id, seller, when, rng));
                 auctionCount++;
             }
             else if (auctionCount > 0 && personCount > 0)
@@ -119,19 +130,17 @@ internal static class NexmarkGenerator
                 var auctionIndex = lo + NextLong(rng, auctionCount - lo);
                 var auction = FirstAuctionId + auctionIndex;
                 var bidder = FirstPersonId + NextLong(rng, personCount);
-                events.Add(new Event(NexmarkTable.Bid, MakeBid(auction, bidder, when, rng)));
+                yield return new Event(NexmarkTable.Bid, MakeBid(auction, bidder, when, rng));
             }
             else
             {
                 // Warm-up region before any person/auction exists: emit a
                 // person so downstream foreign keys have something to point at.
                 var id = FirstPersonId + personCount;
-                events.Add(new Event(NexmarkTable.Person, MakePerson(id, when, rng)));
+                yield return new Event(NexmarkTable.Person, MakePerson(id, when, rng));
                 personCount++;
             }
         }
-
-        return events;
     }
 
     // person: id, name, email_address, credit_card, city, state, date_time, extra

@@ -88,6 +88,33 @@ if (args.Length > 0 && args[0] == "allocmode")
     return 0;
 }
 
+// Throughput-vs-state-size profile: `dotnet run -- decay [events] [batch] [segments] [stream|pregen] [q..]`
+// Per-segment W=1 throughput + in-step GC pause + heap + retained state, to tell
+// state-representation decay apart from GC-tracing-a-live-heap decay.
+if (args.Length > 0 && args[0] == "decay")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    var pregen = args.Contains("pregen");
+    var ids = args.Skip(1).Where(a => a.StartsWith('q')).ToArray();
+    if (ids.Length == 0)
+    {
+        ids = ["q0", "q22", "q4", "q9", "q15", "q16", "q18", "q20"];
+    }
+
+    var sb = new StringBuilder();
+    sb.AppendLine("# DbspNet — throughput decay vs state size");
+    sb.AppendLine();
+    DbspNet.Benchmarks.DecayBenchmark.Run(sb, ids, Arg(1, 10_000_000), Arg(2, 10_000), Arg(3, 10), pregen);
+    var decayPath = Path.Combine(FindDocsDir(), $"decay-{(pregen ? "pregen" : "stream")}.md");
+    File.WriteAllText(decayPath, sb.ToString());
+    Console.WriteLine();
+    Console.WriteLine($"Report written to {Path.GetFullPath(decayPath)}");
+    return 0;
+}
+
 if (args.Length > 0 && args[0] == "w1profile")
 {
     int Arg(int i, int fallback) =>
