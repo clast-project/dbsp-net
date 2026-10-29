@@ -94,6 +94,17 @@ if (args.Length > 0 && args[0] == "genstats")
     return DbspNet.Benchmarks.Nexmark.NexmarkGenStats.Run(args);
 }
 
+// MIN/MAX sliding-window retraction check: `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps]`
+if (args.Length > 0 && args[0] == "minmaxslide")
+{
+    int Arg(int i, int fallback) =>
+        args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    DbspNet.Benchmarks.MinMaxSlideBenchmark.Run(Arg(1, 100), Arg(2, 10_000), Arg(3, 10), Arg(4, 500), Arg(5, 2));
+    return 0;
+}
+
 // Throughput-vs-state-size profile: `dotnet run -- decay [events] [batch] [segments] [stream|pregen] [q..]`
 // Per-segment W=1 throughput + in-step GC pause + heap + retained state, to tell
 // state-representation decay apart from GC-tracing-a-live-heap decay.

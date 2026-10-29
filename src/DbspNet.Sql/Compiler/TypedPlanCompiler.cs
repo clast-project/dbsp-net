@@ -2049,6 +2049,23 @@ public static class TypedPlanCompiler
         var icmp = typeof(IComparable<>).MakeGenericType(underlyingClr);
         if (!icmp.IsAssignableFrom(underlyingClr)) return null;
 
+        if (CompactAggregatorStateMode.CompactMinMax)
+        {
+            // (best, count) state that rescans the trace on loss of the best
+            // (design-state-representation §4) — takes a T? extractor either way.
+            var inParam = Expression.Parameter(inputRowType, "in");
+            var built = TypedExpressionCompiler.TryBuildInto(call.Argument, inParam);
+            var nullableType = typeof(Nullable<>).MakeGenericType(underlyingClr);
+            if (built is not null && TypedExpressionCompiler.UnderlyingType(built.Type) == underlyingClr)
+            {
+                var asNullable = built.Type == nullableType ? built : Expression.Convert(built, nullableType);
+                var nullableExtract = Expression.Lambda(
+                    typeof(Func<,>).MakeGenericType(inputRowType, nullableType), asNullable, inParam).Compile();
+            var compact = typeof(TypedSqlMinMaxCompactAggregator<,>).MakeGenericType(inputRowType, underlyingClr);
+                return Activator.CreateInstance(compact, nullableExtract, wantMin);
+            }
+        }
+
         if (argNullable)
         {
             var open = typeof(TypedSqlMinMaxNullableAggregator<,>);
@@ -2345,16 +2362,27 @@ public static class TypedPlanCompiler
         var aggRowType = TypedRowEmitter.EmitRowType(aggSchema);
         if (aggRowType is null) return null;
 
-        // Build the per-aggregator typed objects.
-        var aggregators = new object[aggregates.Count];
-        for (var i = 0; i < aggregates.Count; i++)
+        // Build the per-aggregator typed objects. COUNT(DISTINCT) calls over the
+        // same unboxed base argument (FILTER variants included) collapse into one
+        // shared multi-result aggregator (design-state-representation §4).
+        var units = new List<object>(aggregates.Count);
+        var unitSlots = new List<int[]>(aggregates.Count);
+        var handled = new bool[aggregates.Count];
+        if (CompactAggregatorStateMode.CompactDistinct)
         {
-            var agg = BuildTypedAggregator(aggregates[i], inputRowType);
-            if (agg is null) return null;
-            aggregators[i] = agg;
+            BuildSharedCountDistinct(aggregates, inputRowType, handled, units, unitSlots);
         }
 
-        var aggArray = CastAggregatorArray(inputRowType, aggregators);
+        for (var i = 0; i < aggregates.Count; i++)
+        {
+            if (handled[i]) continue;
+            var agg = BuildTypedAggregator(aggregates[i], inputRowType);
+            if (agg is null) return null;
+            units.Add(agg);
+            unitSlots.Add([i]);
+        }
+
+        var aggArray = CastAggregatorArray(inputRowType, units.ToArray());
 
         // packResults returns object; wrap into a typed Func<object?[], TAgg>.
         var packResults = TypedRowEmitter.BuildBoxedFactory(aggSchema)!;
@@ -2366,9 +2394,126 @@ public static class TypedPlanCompiler
 
         // new TypedCompositeAggregator<TIn, TAgg>(aggArray, typedPack)
         var compositeClosed = typeof(TypedCompositeAggregator<,>).MakeGenericType(inputRowType, aggRowType);
-        var composite = Activator.CreateInstance(compositeClosed, aggArray, typedPack)!;
+        var composite = Activator.CreateInstance(
+            compositeClosed, aggArray, unitSlots.ToArray(), aggregates.Count, typedPack)!;
         return (composite, aggRowType);
     }
+
+    /// <summary>
+    /// Groups the <c>COUNT(DISTINCT …)</c> calls whose argument is a column
+    /// <c>x</c> or its FILTER lowering <c>CASE WHEN p THEN x END</c> by
+    /// <c>x</c>, and builds one <see cref="TypedSharedCountDistinctAggregator{TIn,T}"/>
+    /// per group (unboxed <c>x</c>, one table per group key). Calls it can't
+    /// type (reference-typed or un-lowerable argument) are left unhandled for
+    /// the boxed fallback.
+    /// </summary>
+    private static void BuildSharedCountDistinct(
+        IReadOnlyList<AggregateCall> aggregates,
+        Type inputRowType,
+        bool[] handled,
+        List<object> units,
+        List<int[]> unitSlots)
+    {
+        var groups = new List<(ResolvedExpression Base, List<(int Index, ResolvedExpression? Pred)> Members)>();
+        for (var i = 0; i < aggregates.Count; i++)
+        {
+            var call = aggregates[i];
+            if (call.Kind != AggregateKind.CountDistinct || call.Argument is null) continue;
+            var (baseExpr, pred) = SplitFilteredArgument(call.Argument);
+            var group = pred is null && baseExpr is not ResolvedColumn
+                ? -1   // a non-column, unfiltered arg: its own group (never shared)
+                : groups.FindIndex(g => g.Base is ResolvedColumn && g.Base.Equals(baseExpr) && g.Members.Count < 64);
+            if (group < 0)
+            {
+                groups.Add((baseExpr, []));
+                group = groups.Count - 1;
+            }
+
+            groups[group].Members.Add((i, pred));
+        }
+
+        var inParam = Expression.Parameter(inputRowType, "in");
+        foreach (var (baseExpr, members) in groups)
+        {
+            var baseBuilt = TypedExpressionCompiler.TryBuildInto(baseExpr, inParam);
+            if (baseBuilt is null) continue;
+            var underlying = TypedExpressionCompiler.UnderlyingType(baseBuilt.Type);
+            if (!underlying.IsValueType) continue;
+            var nullableType = typeof(Nullable<>).MakeGenericType(underlying);
+            var baseNullable = baseBuilt.Type == nullableType ? baseBuilt : Expression.Convert(baseBuilt, nullableType);
+            var baseExtract = Expression.Lambda(
+                typeof(Func<,>).MakeGenericType(inputRowType, nullableType), baseNullable, inParam).Compile();
+
+            var predicates = new Delegate?[members.Count];
+            var ok = true;
+            for (var j = 0; j < members.Count && ok; j++)
+            {
+                if (members[j].Pred is not { } p) continue;
+                var built = TypedExpressionCompiler.TryBuildInto(p, inParam);
+                if (built is null)
+                {
+                    ok = false;
+                    break;
+                }
+
+                // A WHEN arm is taken only on a definite TRUE.
+                Expression definite = built.Type == typeof(bool)
+                    ? built
+                    : built.Type == typeof(bool?)
+                        ? Expression.Equal(built, Expression.Constant(true, typeof(bool?)))
+                        : null!;
+                if (definite is null)
+                {
+                    ok = false;
+                    break;
+                }
+
+                predicates[j] = Expression.Lambda(
+                    typeof(Func<,>).MakeGenericType(inputRowType, typeof(bool)), definite, inParam).Compile();
+            }
+
+            if (!ok) continue;
+
+            var predArray = Array.CreateInstance(typeof(Func<,>).MakeGenericType(inputRowType, typeof(bool)), members.Count);
+            for (var j = 0; j < members.Count; j++) predArray.SetValue(predicates[j], j);
+
+            var closed = typeof(TypedSharedCountDistinctAggregator<,>).MakeGenericType(inputRowType, underlying);
+            units.Add(Activator.CreateInstance(closed, baseExtract, predArray)!);
+            var slots = new int[members.Count];
+            for (var j = 0; j < members.Count; j++)
+            {
+                slots[j] = members[j].Index;
+                handled[members[j].Index] = true;
+            }
+
+            unitSlots.Add(slots);
+        }
+    }
+
+    /// <summary>
+    /// <c>CASE WHEN p THEN x [ELSE NULL] END</c> with a column <c>x</c> (the
+    /// FILTER lowering) → (<c>x</c>, <c>p</c>); anything else → (arg, null).
+    /// Only a column is split off, so evaluating <c>x</c> eagerly (before
+    /// <c>p</c>) can never fault where the lazy CASE would not.
+    /// </summary>
+    private static (ResolvedExpression Base, ResolvedExpression? Pred) SplitFilteredArgument(ResolvedExpression arg)
+    {
+        if (arg is ResolvedCaseWhen { Whens.Count: 1 } ce
+            && ce.ElseResult is null or ResolvedLiteral { Value: null }
+            && UnwrapNullableCast(ce.Whens[0].Result) is ResolvedColumn col)
+        {
+            return (col, ce.Whens[0].Condition);
+        }
+
+        return (UnwrapNullableCast(arg), null);
+    }
+
+    // A CAST that only widens nullability (the CASE result type is nullable)
+    // doesn't change the value; see through it so FILTER members share a base.
+    private static ResolvedExpression UnwrapNullableCast(ResolvedExpression e)
+        => e is ResolvedCast { Operand: ResolvedColumn c } cast && c.Type.WithNullable(true).Equals(cast.Type.WithNullable(true))
+            ? c
+            : e;
 
     /// <summary>
     /// Repackage <c>object[]</c> of <c>TypedSqlAggregator&lt;TIn&gt;</c>
