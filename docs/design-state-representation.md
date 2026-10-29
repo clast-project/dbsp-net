@@ -952,6 +952,17 @@ pruned ≠ unpruned in 8–47% of cases, per query shape. It is exact whenever n
 weight is negative, which holds for every well-formed table. Curt accepted this on
 2026-10-29, the same envelope as §4G.1. `Corner_OuterJoinUnderNegativeRowWeights_*` pins it.
 
+**Feldera does the same** (checked at `78afc9077`). Its circuit pass `RemoveUnusedFields`
+narrows the inputs of `DBSPLeftJoinOperator` / `LeftJoinIndex` / `LeftJoinFilterMap`, as it
+does for inner joins, so a right side whose columns are unused is projected to its key before
+the join and its weights sum. Its generic outer-join path is stricter still: unmatched rows
+come from `dyn_antijoin`, which projects the right side to keys and applies `distinct`, so
+presence is *always* the summed key weight. On the pinned corner case Feldera pads the left
+row, as our pruned join does; our old unpruned join was the outlier. Its dedicated LEFT JOIN
+(`saturate`) uses per-row presence, but only over the columns that survive trimming. Feldera
+disables Calcite's `PROJECT_JOIN_TRANSPOSE` as "unsound, replaced with UnusedFields done
+later", and the replacement still trims outer-join inputs.
+
 **Results** (SF=3 batch 1, two runs, same harness as §9.5; all 16 outputs identical to main,
 row for row with multiplicities):
 
