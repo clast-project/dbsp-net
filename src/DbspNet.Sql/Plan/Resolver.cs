@@ -3827,8 +3827,10 @@ public sealed class Resolver
 
             projCols.Add(new ProjectionItem(projected, "__corr_" + i, null));
             newSchemaCols.Add(new SchemaColumn("__corr_" + i, common, null));
+            // The inner side is cast to the common type above; the outer key must be
+            // too, or (say) a DATE key tuple never equals a TIMESTAMP one.
             keys.Add(new SemiJoinEqui(
-                new ResolvedColumn(outerIdx, outerSchema[outerIdx].Type),
+                MaybeCast(new ResolvedColumn(outerIdx, outerSchema[outerIdx].Type), common),
                 InnerColumnIndex: i,
                 Type: common));
         }
@@ -4057,7 +4059,7 @@ public sealed class Resolver
             newGroupKeys.Add(projected);
             correlationInnerSchemaCols.Add(new SchemaColumn($"__corr_{i}", common));
             equiKeys.Add(new SemiJoinEqui(
-                new ResolvedColumn(outerIdx, outerSchema[outerIdx].Type),
+                MaybeCast(new ResolvedColumn(outerIdx, outerSchema[outerIdx].Type), common),
                 InnerColumnIndex: i,
                 Type: common));
         }

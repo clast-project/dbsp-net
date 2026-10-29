@@ -263,4 +263,28 @@ public class CorrelatedExistsTests
         Assert.Equal(1, WeightOf(q.Current, "a"));
         Assert.Equal(1, WeightOf(q.Current, "b"));
     }
+
+    [Fact]
+    public void CorrelationKeysOfDifferentTypes_MatchOnTheCommonType()
+    {
+        // DATE outer column = TIMESTAMP inner column: the comparison happens at the
+        // common type (TIMESTAMP), so the outer key must be cast too, or a Date32 key
+        // tuple never equals the inner side's Timestamp tuple.
+        var q = Compile(
+            [
+                "CREATE TABLE orders (cust INT NOT NULL, d DATE NOT NULL)",
+                "CREATE TABLE evts (id INT NOT NULL, ts TIMESTAMP NOT NULL)",
+            ],
+            "SELECT cust FROM orders WHERE EXISTS (SELECT 1 FROM evts WHERE evts.ts = orders.d)");
+
+        const long MicrosPerDay = 86_400_000_000L;
+        q.Table("orders").Insert(1, new Date32(10));
+        q.Table("orders").Insert(2, new Date32(11));
+        q.Table("evts").Insert(7, new Timestamp(10 * MicrosPerDay));
+        q.Table("evts").Insert(8, new Timestamp((11 * MicrosPerDay) + 1));
+        q.Step();
+
+        Assert.Equal(1, WeightOf(q.Current, 1));
+        Assert.Equal(1, q.Current.Count);
+    }
 }
