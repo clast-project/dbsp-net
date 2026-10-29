@@ -28,6 +28,7 @@ namespace DbspNet.Benchmarks;
 internal static class DecayBenchmark
 {
     private static long LastLiveBytes;
+    private static long LastOutputRows;
 
     private sealed record Segment(
         long EventsEnd, double EngineMs, double PauseMs, int Gen0, int Gen1, int Gen2,
@@ -67,7 +68,10 @@ internal static class DecayBenchmark
             GC.WaitForPendingFinalizers();
             var segs = MeasureOne(query, events ?? Stream(totalEvents), totalEvents, batchSize, segments);
             Report(output, id, segs);
-            output.AppendLine(CultureInfo.InvariantCulture, $"Live state after full GC: **{LastLiveBytes / (double)(1 << 20):N0} MB**.");
+            output.AppendLine(
+                CultureInfo.InvariantCulture,
+                $"Live state after full GC: **{LastLiveBytes / (double)(1 << 20):N0} MB** ({LastLiveBytes:N0} B); " +
+                $"output delta rows (sum over steps): {LastOutputRows:N0}; generator: {DefaultProfile}.");
             output.AppendLine();
         }
     }
@@ -85,6 +89,7 @@ internal static class DecayBenchmark
         double engineMs = 0;
         double pauseMs = 0;
         long alloc = 0;
+        long outputRows = 0;
         int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
         long seen = 0;
         var sinceStep = 0;
@@ -108,6 +113,8 @@ internal static class DecayBenchmark
             engineMs += Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
             alloc += GC.GetAllocatedBytesForCurrentThread() - a0;
             pauseMs += (GC.GetTotalPauseDuration() - p0).TotalMilliseconds;
+            outputRows += q.Current.Count; // outside the timer
+
         }
 
         void CloseSegment()
@@ -172,7 +179,10 @@ internal static class DecayBenchmark
             var live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
             GC.KeepAlive(q);
             LastLiveBytes = live;
-            Console.WriteLine($"  {query.Id,-4} live state after full GC: {live / (double)(1 << 20):N0} MB ({live:N0} B)");
+            LastOutputRows = outputRows;
+            Console.WriteLine(
+                $"  {query.Id,-4} live state after full GC: {live / (double)(1 << 20):N0} MB ({live:N0} B), " +
+                $"output delta rows {outputRows:N0} [gen={DefaultProfile}]");
         }
 
         return result;
