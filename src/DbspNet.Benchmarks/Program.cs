@@ -129,7 +129,7 @@ if (args.Length > 0 && args[0] == "genstats")
     return DbspNet.Benchmarks.Nexmark.NexmarkGenStats.Run(args);
 }
 
-// MIN/MAX sliding-window retraction check: `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps] [append]`
+// MIN/MAX sliding-window retraction check: `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps] [append] [structural]`
 if (args.Length > 0 && args[0] == "minmaxslide")
 {
     int Arg(int i, int fallback) =>
@@ -137,7 +137,7 @@ if (args.Length > 0 && args[0] == "minmaxslide")
             CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
     DbspNet.Benchmarks.MinMaxSlideBenchmark.Run(Arg(1, 100), Arg(2, 10_000), Arg(3, 10), Arg(4, 500), Arg(5, 2),
-        args.Length > 6 && args[6] == "append");
+        args.Contains("append"), args.Contains("structural"));
     return 0;
 }
 

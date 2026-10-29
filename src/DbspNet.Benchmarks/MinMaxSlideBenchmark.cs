@@ -25,17 +25,21 @@ internal static class MinMaxSlideBenchmark
     private const string Sql = "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g";
 
     /// <param name="appendOnly">Inserts only (no deletes): the extreme is never retracted.</param>
-    public static void Run(int groups, int window, int perTick, int ticks, int reps, bool appendOnly = false)
+    /// <param name="structural">A/B the structural path's arms (§4B.3) instead of the typed path's.</param>
+    public static void Run(int groups, int window, int perTick, int ticks, int reps, bool appendOnly = false,
+        bool structural = false)
     {
         Console.WriteLine(
-            $"=== MIN/MAX {(appendOnly ? "append-only" : "sliding window")}: groups={groups} window={window} " +
-            $"perTick={perTick} ticks={ticks} ===");
-        var kinds = new[] { MinMaxStateKind.Legacy, MinMaxStateKind.RescanOnly, MinMaxStateKind.Hybrid };
+            $"=== MIN/MAX {(appendOnly ? "append-only" : "sliding window")}{(structural ? " (structural)" : "")}: " +
+            $"groups={groups} window={window} perTick={perTick} ticks={ticks} ===");
+        var kinds = structural
+            ? new[] { MinMaxStateKind.Legacy, MinMaxStateKind.Hybrid }
+            : new[] { MinMaxStateKind.Legacy, MinMaxStateKind.RescanOnly, MinMaxStateKind.Hybrid };
         for (var rep = 0; rep < reps; rep++)
         {
             foreach (var kind in kinds)
             {
-                var (ms, bytes, live) = Measure(kind, groups, window, perTick, ticks, appendOnly);
+                var (ms, bytes, live) = Measure(kind, groups, window, perTick, ticks, appendOnly, structural);
                 var label = kind switch
                 {
                     MinMaxStateKind.Legacy => "legacy",
@@ -50,21 +54,28 @@ internal static class MinMaxSlideBenchmark
     }
 
     private static (double Ms, long Bytes, long Live) Measure(
-        MinMaxStateKind kind, int groups, int window, int perTick, int ticks, bool appendOnly)
+        MinMaxStateKind kind, int groups, int window, int perTick, int ticks, bool appendOnly, bool structural)
     {
         var prev = CompactAggregatorStateMode.MinMax;
+        var prevStructural = StructuralCompactAggregatorStateMode.MinMax;
         CompactAggregatorStateMode.MinMax = kind;
+        StructuralCompactAggregatorStateMode.MinMax =
+            kind == MinMaxStateKind.Legacy ? StructuralMinMaxStateKind.Legacy : StructuralMinMaxStateKind.Hybrid;
         CompiledQuery q;
         try
         {
             var resolver = new Resolver(new Catalog());
             resolver.Resolve(Parser.ParseStatement(Ddl));
             var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(Sql))).Query;
-            q = PlanToCircuit.Compile(PlanOptimizer.Optimize(plan));
+            // ShareArrangements is implemented on the structural path only, so it forces
+            // that compile; this query has no join, so it changes nothing else.
+            q = PlanToCircuit.Compile(PlanOptimizer.Optimize(plan),
+                options: structural ? new CompileOptions { ShareArrangements = true } : null);
         }
         finally
         {
             CompactAggregatorStateMode.MinMax = prev;
+            StructuralCompactAggregatorStateMode.MinMax = prevStructural;
         }
 
         var batch = new List<(object?[], long)>(groups * window);
