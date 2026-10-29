@@ -659,4 +659,34 @@ public static class StatefulOperators
                 input, output, aggregator, snapshotCodec, frontier, monotoneKey));
         return output;
     }
+
+    /// <summary>
+    /// Trace-free per-group aggregate for linear aggregators (COUNT/SUM/AVG and
+    /// COUNT(DISTINCT) via per-value weights): same output contract as
+    /// <see cref="IncrementalAggregate{TKey,TValue,TOut}"/>, but keeps only per-group
+    /// running state instead of integrating every input row
+    /// (docs/design-state-representation.md §4G). Snapshotting needs a codec with
+    /// keyed-blob support.
+    /// </summary>
+    public static Stream<ZSet<(TKey Key, TOut Value), Z64>> LinearAggregate<TKey, TValue, TOut>(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<TKey, TValue, Z64>> input,
+        ILinearAggregator<TValue, TOut> aggregator,
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<TKey, long>? monotoneKey = null)
+        where TKey : notnull
+        where TValue : notnull
+        where TOut : notnull
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(aggregator);
+
+        var output = new Stream<ZSet<(TKey, TOut), Z64>>(ZSet<(TKey, TOut), Z64>.Empty);
+        builder.AddRawOperator(
+            new LinearAggregateOp<TKey, TValue, TOut>(
+                input, output, aggregator, snapshotCodec, frontier, monotoneKey));
+        return output;
+    }
 }

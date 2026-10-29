@@ -140,4 +140,38 @@ internal sealed class TypedIndexedZSetTraceCodecAdapter<TKey, TValue>
 
         return b.Build();
     }
+
+    // Keyed blobs pass through with the key projected like the trace's keys
+    // (LinearAggregateOp persists its per-group state this way, §4G).
+    public bool SupportsKeyedBlobs => _inner.SupportsKeyedBlobs;
+
+    public ValueTask SaveKeyedBlobsAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        IReadOnlyList<(TKey Key, byte[] Blob)> entries,
+        CancellationToken cancellationToken = default)
+    {
+        var projected = new List<(StructuralRow Key, byte[] Blob)>(entries.Count);
+        foreach (var (key, blob) in entries)
+        {
+            projected.Add((_keyToStruct(key), blob));
+        }
+
+        return _inner.SaveKeyedBlobsAsync(writer, fileName, projected, cancellationToken);
+    }
+
+    public async ValueTask<IReadOnlyList<(TKey Key, byte[] Blob)>> LoadKeyedBlobsAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken = default)
+    {
+        var loaded = await _inner.LoadKeyedBlobsAsync(reader, fileName, cancellationToken).ConfigureAwait(false);
+        var result = new List<(TKey Key, byte[] Blob)>(loaded.Count);
+        foreach (var (key, blob) in loaded)
+        {
+            result.Add((_structToKey(key), blob));
+        }
+
+        return result;
+    }
 }

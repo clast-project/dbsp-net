@@ -264,6 +264,8 @@ public class PersistenceConformanceTests : IDisposable
             ["SemiNaiveFixpointOperator"] = "recursive-CTE machinery; RecursiveCteSnapshotTests " +
                                             "asserts restore-then-step in both trace families",
             ["PartitionedTopKNarrowOp"] = "a narrowed variant the planner picks by shape; not selectable from SQL directly",
+            ["LinearAggregateOp"] = "typed single-query path only (the program path compiles structurally); " +
+                                    "LinearAggregateTests restores it mid-stream and from a legacy-operator snapshot",
             ["PartitionedTopKOp"] = "the Legacy state arm (PartitionedTopKStateMode); the default is " +
                                     "PartitionedTopKCompactOp. PartitionedTopKSnapshotTests restores across both arms",
         };

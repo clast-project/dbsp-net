@@ -260,7 +260,8 @@ internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
             count += w.Value;
         }
 
-        return DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
+        // An emptied group: the operator drops it, but may still ask for its value.
+        return count == 0 ? null : DecimalRuntime.NarrowToDecimal128(sum / (Int256)count);
     }
 
     public override object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
@@ -273,7 +274,7 @@ internal sealed class TypedAvgDecimalAggregator<TIn> : TypedSqlAggregator<TIn>
         }
 
         state = s;
-        return DecimalRuntime.NarrowToDecimal128(s.Sum / (Int256)s.Count);
+        return s.Count == 0 ? null : DecimalRuntime.NarrowToDecimal128(s.Sum / (Int256)s.Count);
     }
 }
 

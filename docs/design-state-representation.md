@@ -267,6 +267,131 @@ compaction (the q15/q16 +35–38% of §6) ships **on**; `CompactMinMax` ships
 a sorted structure the first time its extreme is retracted. That keeps q4's
 append-only −33% and costs a sliding window one rescan per group.
 
+## 4G. Variant G — trace-free linear aggregate (branch `exp/state-G-lineragg`)
+
+**Built.** `LinearAggregateOp<TKey,TValue,TOut>` (Core) over a new
+`ILinearAggregator<TValue,TOut>` (fold a delta / result / is-zero / write / read).
+Per group it keeps only `{summed row weight, linear state, last emitted value}` in
+one `Dictionary<TKey, struct>`. It has **no input trace**. The typed compiler
+(`TypedPlanCompiler.LinearAggregate.cs`) selects it when **every** aggregate in the
+GROUP BY is one of:
+
+- `COUNT(*)`, `COUNT(x)`, or a FILTERed count (`COUNT(CASE WHEN p THEN 1 END)`);
+- `SUM(x)` over a **NOT NULL** argument (BIGINT, DOUBLE or DECIMAL accumulator);
+- `AVG(x)` over any argument, NULLable or not, DOUBLE or DECIMAL;
+- `COUNT(DISTINCT x)`, FILTERed or not, sharing per-base tables like variant B. The
+  base value must be blittable or `Utf8String`.
+
+Anything else keeps `IncrementalAggregateOp`: MIN/MAX, sketches, STDDEV, a SUM over
+a NULLable argument, the spine trace family, or a snapshot codec without keyed
+blobs. `LinearAggregateMode` is default-on, uses the inverse thread-static flag, and
+`DBSPNET_LINEAR_AGG=off` turns it off. The structural path is unchanged, so the
+program path and LATENESS still compile to the trace-backed operator.
+
+Nexmark coverage: q15 and q16 compile completely to the new path. In q4, only the
+outer `AVG(final) GROUP BY category` does. Its inner `MAX(price)` keeps the trace.
+
+**Semantics.**
+
+- A group is present while its summed row weight is non-zero. That is the
+  composite's `SumWeights() != 0` gate, so retract/insert pairs are emitted exactly
+  as today, including when a group appears or disappears.
+- State is dropped only when the weight is 0 **and** every integer accumulator has
+  cancelled. A weight-0 group whose sums have not cancelled therefore survives, as
+  it does in the trace.
+- COUNT(x) counts non-NULL weight. AVG returns NULL when the summed non-NULL weight
+  is 0; this was already the rule in the trace-backed aggregators.
+- FILTER is evaluated per row.
+- BIGINT SUM uses the same `checked(sum + v*w)` per delta row. DECIMAL sums keep
+  the same Int256 accumulator and narrow at output.
+- **SUM over a NULLable argument is excluded on purpose.** Its NULL rule is "no
+  non-NULL row has non-zero weight". That is a per-row fact: rows `{+1 x=4, −1 x=2}`
+  sum to weight 0 but give 2. The existing arbitrary-Z-set PBTs
+  (`RandomQuery*`) caught this.
+- **COUNT(DISTINCT) corner, documented and tested.** G counts values whose
+  *summed* weight is positive. The trace-backed operator counts values held by
+  *some positive-weight row*. The two agree whenever no integrated row weight is
+  negative, which holds for every well-formed table. They differ otherwise:
+  `{+1 (id1,v=5), −1 (id2,v=5), +1 v=7}` gives G 1 and trace 2.
+  `Corner_CountDistinctUnderNegativeRowWeights_*` pins this.
+- **Pre-existing bug found.** The trace-backed `TypedAvgDecimalAggregator`
+  (AVG of a DECIMAL NOT NULL argument) divides by its count on every Update, so
+  emptying a group throws `DivideByZeroException`. G only asks for a result while
+  the group is present. This is pinned by a test, and the old aggregator is left
+  unfixed: it lives in a file another branch is editing.
+
+**Persistence.** Each group's (weight, state) is written verbatim, double bits
+included, as keyed blobs in `lagg.arrows`. `TypedIndexedZSetTraceCodecAdapter` now
+forwards keyed blobs; it did not before, so the typed path never persisted
+aggregator state. G implements `IFingerprintAlias` → `IncrementalAggregateOp`. A
+legacy snapshot restores by folding its `trace.arrows`, which is exact for integer
+and DECIMAL sums. For DOUBLE sums it carries the same §7.2 re-fold drift that the
+trace-backed typed op already had on its own restores.
+
+**Frontier GC.** The op drops groups whose monotone key is below the frontier, as
+the current operator does. The typed path passes no frontier today, because
+LATENESS forces the structural compile.
+
+**Results** (1M events, batch 10k, W=1). The baseline is `c53e782`, built clean
+from the same tree. The `=off` arm reproduces it: B/ev is identical and live bytes
+are within 0.15%. B/ev comes from the decay report, and q4 also from `w1profile`.
+The other `w1profile` rungs are byte-identical.
+
+| gen | query | live bytes base → G | ratio | B/ev base → G (decay) | q4 w1profile |
+|---|---|---|---|---|---|
+| feldera | q15 | 78,938,344 → **19,066,752** | **4.14×** | 933 → 819 (−12%) | |
+| feldera | q16 | 181,330,824 → **52,219,648** | **3.47×** | 1060 → 929 (−12%) | |
+| feldera | q4 | 422,340,008 → 419,943,632 | 1.006× | 1317 → 1311 | 1978 → 1973 |
+| legacy | q15 | 102,883,376 → **18,375,616** | **5.60×** | 918 → 756 (−18%) | |
+| legacy | q16 | 199,963,704 → **40,426,576** | **4.95×** | 1043 → 850 (−19%) | |
+| legacy | q4 | 490,380,720 → 487,350,848 | 1.006× | 1396 → 1392 | 2222 → 2217 |
+
+The stateless q0/q2 retain 11–13 MB in the same harness. So q15's aggregate
+state is now about 6–8 MB, close to B's ~5 MB projection; the old figure was about
+66–90 MB. q4 barely moves, because its outer AVG trace holds only one MAX row per
+auction. q4's state is the join plus the inner MAX trace.
+
+**Tests.** `LinearAggregateTests` has 14 cases:
+
+- `Linear_EqualsTraceBacked_EveryTick` checks output deltas tick by tick on 4 seeds:
+  18 aggregates, NULLs, FILTERs, VARCHAR/DECIMAL/expression DISTINCT, duplicate
+  rows, and groups emptied and refilled. Doubles are compared by bit pattern.
+- `NonDistinctMembers_*` checks arbitrary ±1 streams with negative weights.
+- `RestoreMidStream_*` covers linear→linear restores, with floats, and
+  legacy→linear restores through the alias.
+- A selection/fallback test, the two corner tests, and a churn and round-trip
+  test of `DistinctWeightTable`.
+
+Six deliberate mutations were all caught:
+
+- the DISTINCT sign test;
+- no retraction when a group empties;
+- persisted double drift;
+- ignoring a FILTER;
+- dropping state at weight 0, caught only by the negative-weight PBT;
+- the legacy restore not folding.
+
+Full suite: 2399 passed, 1 skipped.
+
+**Risks.**
+
+- The COUNT(DISTINCT) negative-weight corner above.
+- A NULLable SUM keeps the trace, so a query with one such SUM loses the whole win.
+  An exact fix would need per-row presence.
+- Per-group state is an `object[]` of cells, which is fine for few, large groups.
+  Many-group linear aggregates (q12-like) have not been measured.
+- Wall-clock has not been measured under contention. The decay ev/s moved up
+  (q15 2.1M → 2.9M, q16 1.6M → 2.2M), but that is noise-grade evidence.
+
+**Recommendation: ship.** It is default-on, with the trace-backed fallback kept.
+Before quoting a throughput number, run a serialized 10M decay on q15/q16 to check
+whether the decay curve flattens. Follow-ups:
+
+1. Make nullable SUM linear if the SQL semantics on negative weights are allowed to
+   follow the summed weight.
+2. Give the structural path the same operator.
+3. Fix the `TypedAvgDecimalAggregator` divide-by-zero.
+
 ## 5. Cross-cutting findings
 
 ### 5.1 Our Nexmark generator under-represents strings (found by variant E)
