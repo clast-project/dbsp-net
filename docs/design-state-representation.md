@@ -452,6 +452,23 @@ inputs, batch oracle, promotion/demotion unit test). Mutations caught: loss neve
 detected, wrong end, no demotion, duplicate holders not counted; "promotion keeps
 non-positive rows" is equivalent (the fold skips them anyway).
 
+**Wall-clock gate** (`minmaxslide … structural`, serialized, idle, `caffeinate`; reps 1–2
+of 3, ms/tick; the shapes of §4B.2):
+
+| shape (groups × window, change/tick, ticks) | legacy | hybrid | hybrid/legacy | live MB L → H |
+|---|---|---|---|---|
+| 100 × 10k, 10, 300 | 2.29 / 2.32 | 2.41 / 2.38 | 1.03–1.05× | 343 → 246 |
+| 10 × 100k, 10, 300 | 1.37 / 1.38 | 1.71 / 1.70 | 1.24× | 334 → 242 |
+| 10 × 100k, 10, **1500** | 1.36 / 1.37 | 1.42 / 1.42 | **1.04–1.05×** | 334 → 242 |
+| 1000 × 1k, 1, 300 | 4.36 / 4.24 | 3.51 / 3.41 | 0.80× | 357 → 255 |
+| 100 × 10k, 1000, 50 | 78.0 / 79.1 | 64.4 / 65.2 | 0.82× | 372 → 275 |
+| append 100 × 10k, 10, 300 | 1.94 / 1.94 | 1.69 / 1.72 | 0.88× | 438 → 215 |
+| append 1000 × 1k, 1, 300 | 2.73 / 2.71 | 2.12 / 2.12 | 0.78× | 456 → 223 |
+
+The 1.24× on few large groups is the one-time promotion rescan (100k values per group),
+amortised over only 300 ticks; at 1,500 ticks it is 1.04–1.05×. Every shape meets the
+≤1.10× gate at steady state, and live state falls 28–51%. **Shipped default-on.**
+
 ## 4G. Variant G — trace-free linear aggregate (branch `exp/state-G-lineragg`)
 
 **Built.** `LinearAggregateOp<TKey,TValue,TOut>` (Core) over a new
