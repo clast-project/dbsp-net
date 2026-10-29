@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Concurrent;
+using System.IO.Hashing;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -44,6 +45,12 @@ public static class TypedRowEmitter
 {
     private static readonly ConcurrentDictionary<Fingerprint, Type?> _cache = new();
     private static readonly ModuleBuilder _module = CreateModule();
+
+    // Guards type definition: GetOrAdd may run its factory more than once under a
+    // race, and a second DefineType under the same deterministic name would throw.
+    private static readonly Lock _defineLock = new();
+    private static readonly Dictionary<Fingerprint, Type> _defined = new();
+    private static readonly HashSet<string> _definedNames = new(StringComparer.Ordinal);
 
     private static ModuleBuilder CreateModule()
     {
@@ -172,7 +179,42 @@ public static class TypedRowEmitter
 
     private static Type BuildTypeFor(Fingerprint fp)
     {
-        var typeName = "TypedRow_" + Guid.NewGuid().ToString("N");
+        lock (_defineLock)
+        {
+            if (_defined.TryGetValue(fp, out var existing))
+            {
+                return existing;
+            }
+
+            var type = DefineTypeFor(fp, StableTypeName(fp));
+            _defined.Add(fp, type);
+            return type;
+        }
+    }
+
+    /// <summary>
+    /// The emitted type's name, derived only from its column types, so the same schema gets
+    /// the same name in every process. Snapshot plan fingerprints hash operator
+    /// <see cref="Type.FullName"/>s, whose generic arguments include this name; a random
+    /// name made every typed-path snapshot unrestorable outside the process that wrote it.
+    /// A (vanishingly unlikely) hash collision gets a numeric suffix.
+    /// </summary>
+    private static string StableTypeName(Fingerprint fp)
+    {
+        var desc = string.Join(";", fp.Columns.Select(static c => c.FullName));
+        var hash = XxHash3.HashToUInt64(System.Text.Encoding.UTF8.GetBytes(desc));
+        var name = "TypedRow_" + hash.ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
+        var candidate = name;
+        for (var n = 2; !_definedNames.Add(candidate); n++)
+        {
+            candidate = name + "_" + n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        return candidate;
+    }
+
+    private static Type DefineTypeFor(Fingerprint fp, string typeName)
+    {
         var tb = _module.DefineType(
             typeName,
             TypeAttributes.Public | TypeAttributes.Sealed

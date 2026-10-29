@@ -253,10 +253,21 @@ q18-shaped query:
   a deterministic emitted name (e.g. a hash of the field-type fingerprint) or a
   fingerprint that hashes schemas instead of CLR names.
 
+  **Fixed (2026-10-29):** `TypedRowEmitter` now names each struct
+  `TypedRow_<XxHash3 of its column types>`, so the same schema gets the same name
+  in every process (definition is serialised under a lock, because a fixed name
+  can't be defined twice). `TypedSnapshotCrossContextTests` writes a snapshot from
+  a second `AssemblyLoadContext`, which has its own emitter statics, and restores it
+  in the default one. With the old GUID names restored, it fails with exactly
+  "plan fingerprint mismatch". (The context must not be collectible: a collectible
+  copy of the engine slowed the whole suite from ~17 s to ~13 min.) Typed snapshots
+  written before the fix carry GUID-based fingerprints and stay unrestorable, as
+  they always were outside their writer process.
+
 **Recommendation: ship.** It is a deterministic memory and allocation win on all
 three queries with identical output. Its compatibility cost is confined to
 structural-path snapshots of windowed TOP-K queries, which (like every
-operator-shape change) need a re-snapshot. Fix the typed fingerprint separately.
+operator-shape change) need a re-snapshot. **Shipped**, with that break accepted.
 
 ## 4B. Variant B — COUNT(DISTINCT) and MIN/MAX sub-state (`exp/state-B-distinct`)
 
