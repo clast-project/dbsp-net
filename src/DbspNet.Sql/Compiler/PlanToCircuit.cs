@@ -291,7 +291,10 @@ public static class PlanToCircuit
                     ? CollectShareableArrangements(plan)
                     : (IReadOnlySet<ArrangementKey>)System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
                 var ctx = new CompileContext(
-                    streams, tableSchemas, codec, snapshotCodecs, options, monotonicity, frontiers, shareable);
+                    streams, tableSchemas, codec, snapshotCodecs, options, monotonicity, frontiers, shareable)
+                {
+                    SingleUseCtes = SingleUseCtes(plan),
+                };
                 queryStream = CompilePlan(builder, plan, ctx);
             }
 
@@ -366,6 +369,36 @@ public static class PlanToCircuit
             }
         }
 
+        // Single-use view inlining (§9.9 lever 3): a reachable, non-output view referenced
+        // exactly once across the reachable views compiles in place at that reference, so its
+        // trailing Filter/Project chain fuses with the consumer's instead of materialising a
+        // separate stream. Off with the typed program path, whose consumers wire straight to
+        // view streams.
+        var inlinable = new HashSet<string>(StringComparer.Ordinal);
+        if (InlineSingleUseMode.Enabled && !options.TypeEligibleProgramViews)
+        {
+            var refCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var v in views)
+            {
+                if (reachable.Contains(v.ViewName))
+                {
+                    foreach (var (name, count) in CountReferences(v.Query).Scans)
+                    {
+                        refCounts[name] = refCounts.GetValueOrDefault(name) + count;
+                    }
+                }
+            }
+
+            foreach (var v in views)
+            {
+                if (reachable.Contains(v.ViewName) && !v.IsOutput
+                    && refCounts.GetValueOrDefault(v.ViewName) == 1)
+                {
+                    inlinable.Add(v.ViewName);
+                }
+            }
+        }
+
         // Program-level dead-column liveness (opt-in): per-view live output columns,
         // used below to prune each view's plan to the columns some output / live view
         // reads (docs/design-column-liveness.md).
@@ -393,6 +426,7 @@ public static class PlanToCircuit
                 // to that view's already-built stream — not a fresh input.
                 var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
                 var schemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+                var inlineViews = new Dictionary<string, LogicalPlan>(StringComparer.Ordinal);
                 inputs = new Dictionary<string, TableInput>(StringComparer.Ordinal);
                 outputs = new Dictionary<string, ProgramOutput>(StringComparer.Ordinal);
 
@@ -435,9 +469,24 @@ public static class PlanToCircuit
                     }
 
                     var optimizedQuery = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(viewQuery);
+
+                    // An inlined view builds no stream of its own: its consumer compiles
+                    // this plan in place of the reference (its operators carry the
+                    // consumer's profile label).
+                    if (inlinable.Contains(v.ViewName))
+                    {
+                        inlineViews[v.ViewName] = optimizedQuery;
+                        schemas[v.ViewName] = v.Query.Schema;
+                        continue;
+                    }
+
                     var monotonicity = MonotonicityAnalyzer.Analyze(optimizedQuery);
                     var ctx = new CompileContext(
-                        streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable);
+                        streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable)
+                    {
+                        InlineViews = inlineViews,
+                        SingleUseCtes = SingleUseCtes(optimizedQuery, inlineViews),
+                    };
                     // Tag every operator this view creates with its name, so a runtime
                     // profile can attribute per-operator cost to the view (observability).
                     builder.BuildLabel = v.ViewName;
@@ -1038,6 +1087,20 @@ public static class PlanToCircuit
         public Dictionary<CteRef, Stream<ZSet<StructuralRow, Z64>>> CteCache { get; } = new();
 
         /// <summary>
+        /// Program views compiled inline at their single reference instead of as their own
+        /// stream (<see cref="InlineSingleUseMode"/>): view name → that view's optimized plan.
+        /// Shared by every view's context, so an inlined view inside an inlined view resolves.
+        /// </summary>
+        public IReadOnlyDictionary<string, LogicalPlan>? InlineViews { get; init; }
+
+        /// <summary>CTEs referenced exactly once in this compile (and not recursive), which
+        /// compile inline at that reference (<see cref="InlineSingleUseMode"/>).</summary>
+        public IReadOnlySet<CteRef>? SingleUseCtes { get; init; }
+
+        /// <summary>Optimized bodies of inlined CTEs, so each is optimized once.</summary>
+        public Dictionary<CteRef, LogicalPlan> InlinedCteBodies { get; } = new();
+
+        /// <summary>
         /// Per-reference compiled-subplan cache. A subplan instance that appears more
         /// than once in the plan DAG — the shape <see cref="Optimizer.PlanCse"/>
         /// produces by interning structurally-identical subtrees — compiles once and
@@ -1445,6 +1508,175 @@ public static class PlanToCircuit
     private readonly record struct TemporalFrontierSpec(
         LatenessSource Source, long Offset, TemporalClock Clock, bool CastTimestampToDate);
 
+    /// <summary>
+    /// The body to compile in place of a single-use CTE reference or an inlined program
+    /// view reference, or <see langword="null"/> when <paramref name="plan"/> is not one.
+    /// A CTE body is optimized here, as the cached path optimizes it, once per CTE.
+    /// </summary>
+    private static LogicalPlan? Unwrap(LogicalPlan plan, CompileContext ctx)
+    {
+        switch (plan)
+        {
+            case ScanPlan s when ctx.InlineViews is { } views && views.TryGetValue(s.TableName, out var view):
+                return view;
+            // A CTE with a stream already registered (e.g. a recursive feedback stream)
+            // always resolves to that stream.
+            case CteScanPlan c when ctx.SingleUseCtes is { } ctes && ctes.Contains(c.Cte)
+                                    && !ctx.CteCache.ContainsKey(c.Cte):
+                if (!ctx.InlinedCteBodies.TryGetValue(c.Cte, out var body))
+                {
+                    body = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(c.Cte.Plan);
+                    ctx.InlinedCteBodies[c.Cte] = body;
+                }
+
+                return body;
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>
+    /// Counts references under <paramref name="root"/>: each scanned name, and each CTE
+    /// (a CTE's body is walked once, at its first reference). Scans of a view in
+    /// <paramref name="inlineViews"/> also count that view's body, which compiles in place.
+    /// Self-references of recursive CTEs are reported separately: never inlinable.
+    /// </summary>
+    private static (Dictionary<string, int> Scans, Dictionary<CteRef, int> Ctes, HashSet<CteRef> Recursive)
+        CountReferences(LogicalPlan root, IReadOnlyDictionary<string, LogicalPlan>? inlineViews = null)
+    {
+        var scans = new Dictionary<string, int>(StringComparer.Ordinal);
+        var ctes = new Dictionary<CteRef, int>();
+        var recursive = new HashSet<CteRef>();
+        Walk(root);
+        return (scans, ctes, recursive);
+
+        void Walk(LogicalPlan p)
+        {
+            switch (p)
+            {
+                case ScanPlan s:
+                    scans[s.TableName] = scans.GetValueOrDefault(s.TableName) + 1;
+                    if (inlineViews is not null && inlineViews.TryGetValue(s.TableName, out var view))
+                    {
+                        Walk(view);
+                    }
+
+                    break;
+                case CteScanPlan c:
+                    var n = ctes.GetValueOrDefault(c.Cte) + 1;
+                    ctes[c.Cte] = n;
+                    if (n == 1 && !recursive.Contains(c.Cte))
+                    {
+                        Walk(c.Cte.Plan);
+                    }
+
+                    break;
+                case RecursiveCtePlan r:
+                    recursive.Add(r.SelfRef);
+                    ForEachChild(r, Walk);
+                    break;
+                default:
+                    ForEachChild(p, Walk);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Visits every child plan of <paramref name="p"/> (not CTE bodies: a
+    /// <see cref="CteScanPlan"/> is a leaf). Exhaustive, like <see cref="CollectScans"/>:
+    /// an unknown node type throws rather than being silently skipped.
+    /// </summary>
+    private static void ForEachChild(LogicalPlan p, Action<LogicalPlan> visit)
+    {
+        switch (p)
+        {
+            case ScanPlan or CteScanPlan:
+                break;
+            case FilterPlan f:
+                visit(f.Input);
+                break;
+            case TemporalFilterPlan tf:
+                visit(tf.Input);
+                break;
+            case ProjectPlan pr:
+                visit(pr.Input);
+                break;
+            case JoinPlan j:
+                visit(j.Left);
+                visit(j.Right);
+                break;
+            case AggregatePlan a:
+                visit(a.Input);
+                break;
+            case ScalarSubqueryJoinPlan s:
+                visit(s.Input);
+                foreach (var sub in s.Subqueries)
+                {
+                    visit(sub);
+                }
+
+                break;
+            case SemiJoinPlan sj:
+                visit(sj.Input);
+                visit(sj.Subquery);
+                break;
+            case CorrelatedScalarSubqueryJoinPlan csp:
+                visit(csp.Input);
+                visit(csp.Subquery);
+                break;
+            case UnionAllPlan u:
+                foreach (var branch in u.Branches)
+                {
+                    visit(branch);
+                }
+
+                break;
+            case DistinctPlan d:
+                visit(d.Input);
+                break;
+            case TopKPlan t:
+                visit(t.Input);
+                break;
+            case PartitionedTopKPlan pt:
+                visit(pt.Input);
+                break;
+            case PartitionedRankPlan prk:
+                visit(prk.Input);
+                break;
+            case WindowAggregatePlan wa:
+                visit(wa.Input);
+                break;
+            case WindowOffsetPlan wo:
+                visit(wo.Input);
+                break;
+            case DifferencePlan diff:
+                visit(diff.Left);
+                visit(diff.Right);
+                break;
+            case RecursiveCtePlan r:
+                visit(r.BasePlan);
+                visit(r.RecursivePlan);
+                break;
+            default:
+                throw new InvalidOperationException($"unsupported plan node {p.GetType().Name}");
+        }
+    }
+
+    /// <summary>The CTEs under <paramref name="root"/> that compile inline: referenced
+    /// exactly once and not recursive. Empty when <see cref="InlineSingleUseMode"/> is off.</summary>
+    private static IReadOnlySet<CteRef> SingleUseCtes(
+        LogicalPlan root, IReadOnlyDictionary<string, LogicalPlan>? inlineViews = null)
+    {
+        if (!InlineSingleUseMode.Enabled)
+        {
+            return new HashSet<CteRef>();
+        }
+
+        var (_, ctes, recursive) = CountReferences(root, inlineViews);
+        return ctes.Where(kv => kv.Value == 1 && !recursive.Contains(kv.Key)).Select(kv => kv.Key).ToHashSet();
+    }
+
     private static (Dictionary<string, ScanInfo> Scans, List<TemporalFrontierSpec> Temporal) CollectScans(
         LogicalPlan plan)
     {
@@ -1769,6 +2001,10 @@ public static class PlanToCircuit
     {
         switch (plan)
         {
+            case ScanPlan or CteScanPlan when Unwrap(plan, ctx) is { } inlined:
+                // A single-use CTE / non-output view compiles inline at its reference.
+                return CompilePlan(builder, inlined, ctx);
+
             case ScanPlan s:
                 return ctx.Scans[s.TableName];
 
@@ -2351,7 +2587,7 @@ public static class PlanToCircuit
         LogicalPlan plan,
         CompileContext ctx)
     {
-        var (inputPlan, stages) = CollectLinearStages(plan);
+        var (inputPlan, stages) = CollectLinearStages(plan, ctx);
         var input = CompilePlan(builder, inputPlan, ctx);
 
         // No runtime stages (e.g. a chain of identity projections) → pass through.
@@ -2418,13 +2654,20 @@ public static class PlanToCircuit
     /// stages in data-flow order (innermost first). Identity projections are pure renames
     /// and contribute no stage.
     /// </summary>
-    private static (LogicalPlan Input, List<LinearStage> Stages) CollectLinearStages(LogicalPlan plan)
+    private static (LogicalPlan Input, List<LinearStage> Stages) CollectLinearStages(
+        LogicalPlan plan, CompileContext ctx)
     {
         var stages = new List<LinearStage>();
         var node = plan;
         while (true)
         {
-            if (node is FilterPlan f)
+            if (Unwrap(node, ctx) is { } inlined)
+            {
+                // A single-use CTE / view reference: keep walking into its body, so the
+                // body's trailing Filter/Project chain fuses with this one.
+                node = inlined;
+            }
+            else if (node is FilterPlan f)
             {
                 stages.Add(new LinearStage(
                     LinearStageKind.Filter,
@@ -2435,6 +2678,14 @@ public static class PlanToCircuit
             }
             else if (node is ProjectPlan p)
             {
+                // Compose with projections directly beneath (through inlined references),
+                // so the chain builds one row instead of one per projection.
+                while ((Unwrap(p.Input, ctx) ?? p.Input) is ProjectPlan inner
+                       && TryComposeProjections(p, inner) is { } composed)
+                {
+                    p = composed;
+                }
+
                 if (IsIdentityProjection(p))
                 {
                     node = p.Input;
@@ -2459,6 +2710,41 @@ public static class PlanToCircuit
         // Collected outermost-first; data flows from the input upward.
         stages.Reverse();
         return (node, stages);
+    }
+
+    /// <summary>
+    /// <c>outer(inner(x))</c> as one projection over <c>x</c>: each outer expression with
+    /// every column reference replaced by the inner expression it reads (the optimizer's
+    /// <c>SimplifyProject</c> rule, applied across an inlined CTE / view boundary).
+    /// Declines (null) when that would compute a non-trivial inner expression more than
+    /// once per row, which composition would turn into repeated work.
+    /// </summary>
+    private static ProjectPlan? TryComposeProjections(ProjectPlan outer, ProjectPlan inner)
+    {
+        var uses = new Dictionary<int, int>();
+        foreach (var item in outer.Projections)
+        {
+            DbspNet.Sql.Optimizer.ExpressionRewriter.CountColumnReferences(item.Expression, uses);
+        }
+
+        foreach (var (index, count) in uses)
+        {
+            if (count > 1 && inner.Projections[index].Expression is not (ResolvedColumn or ResolvedLiteral))
+            {
+                return null;
+            }
+        }
+
+        var composed = new List<ProjectionItem>(outer.Projections.Count);
+        foreach (var item in outer.Projections)
+        {
+            composed.Add(new ProjectionItem(
+                DbspNet.Sql.Optimizer.ExpressionRewriter.SubstituteViaProjection(item.Expression, inner.Projections),
+                item.Name,
+                item.Qualifier));
+        }
+
+        return new ProjectPlan(inner.Input, composed, outer.Schema);
     }
 
     /// <summary>Runs <paramref name="chain"/> over one row: the rewritten row, or
@@ -2509,11 +2795,16 @@ public static class PlanToCircuit
             nullKeyIndices = null;
         }
 
+        while (Unwrap(plan, ctx) is { } inlined)
+        {
+            plan = inlined;
+        }
+
         Stream<ZSet<StructuralRow, Z64>> input;
         LinearStage[] chain = [];
         if (plan is FilterPlan or ProjectPlan && !ctx.PlanCache.ContainsKey(plan))
         {
-            var (inputPlan, stages) = CollectLinearStages(plan);
+            var (inputPlan, stages) = CollectLinearStages(plan, ctx);
             input = CompilePlan(builder, inputPlan, ctx);
             chain = stages.ToArray();
         }

@@ -66,64 +66,67 @@ internal static class ExpressionRewriter
     public static HashSet<int> CollectColumnIndices(ResolvedExpression expr)
     {
         var set = new HashSet<int>();
-        Walk(expr, set);
+        VisitColumns(expr, i => set.Add(i));
         return set;
+    }
 
-        static void Walk(ResolvedExpression e, HashSet<int> acc)
+    /// <summary>How many times each column index is referenced, added into <paramref name="counts"/>.</summary>
+    public static void CountColumnReferences(ResolvedExpression expr, Dictionary<int, int> counts) =>
+        VisitColumns(expr, i => counts[i] = counts.GetValueOrDefault(i) + 1);
+
+    // Calls `visit` once per ResolvedColumn occurrence (not correlation refs, which index
+    // into the OUTER schema; the decorrelator walks those via CollectCorrelationIndices).
+    private static void VisitColumns(ResolvedExpression e, Action<int> visit)
+    {
+        switch (e)
         {
-            switch (e)
-            {
-                case ResolvedColumn c:
-                    acc.Add(c.Index);
-                    break;
-                case ResolvedBinary b:
-                    Walk(b.Left, acc);
-                    Walk(b.Right, acc);
-                    break;
-                case ResolvedUnary u:
-                    Walk(u.Operand, acc);
-                    break;
-                case ResolvedIsNull isn:
-                    Walk(isn.Operand, acc);
-                    break;
-                case ResolvedCast cast:
-                    Walk(cast.Operand, acc);
-                    break;
-                case ResolvedFunctionCall fn:
-                    foreach (var a in fn.Arguments)
-                    {
-                        Walk(a, acc);
-                    }
+            case ResolvedColumn c:
+                visit(c.Index);
+                break;
+            case ResolvedBinary b:
+                VisitColumns(b.Left, visit);
+                VisitColumns(b.Right, visit);
+                break;
+            case ResolvedUnary u:
+                VisitColumns(u.Operand, visit);
+                break;
+            case ResolvedIsNull isn:
+                VisitColumns(isn.Operand, visit);
+                break;
+            case ResolvedCast cast:
+                VisitColumns(cast.Operand, visit);
+                break;
+            case ResolvedFunctionCall fn:
+                foreach (var a in fn.Arguments)
+                {
+                    VisitColumns(a, visit);
+                }
 
-                    break;
-                case ResolvedInList il:
-                    Walk(il.Probe, acc);
-                    foreach (var v in il.Values)
-                    {
-                        Walk(v, acc);
-                    }
+                break;
+            case ResolvedInList il:
+                VisitColumns(il.Probe, visit);
+                foreach (var v in il.Values)
+                {
+                    VisitColumns(v, visit);
+                }
 
-                    break;
-                case ResolvedCaseWhen ce:
-                    foreach (var w in ce.Whens)
-                    {
-                        Walk(w.Condition, acc);
-                        Walk(w.Result, acc);
-                    }
+                break;
+            case ResolvedCaseWhen ce:
+                foreach (var w in ce.Whens)
+                {
+                    VisitColumns(w.Condition, visit);
+                    VisitColumns(w.Result, visit);
+                }
 
-                    if (ce.ElseResult is not null)
-                    {
-                        Walk(ce.ElseResult, acc);
-                    }
+                if (ce.ElseResult is not null)
+                {
+                    VisitColumns(ce.ElseResult, visit);
+                }
 
-                    break;
-                case ResolvedCorrelationRef:
-                    // Correlation refs aren't local-column refs — they index
-                    // into the OUTER schema. The decorrelator walks them
-                    // separately via CollectCorrelationIndices.
-                    break;
-                // ResolvedLiteral: no columns.
-            }
+                break;
+            case ResolvedCorrelationRef:
+                break;
+            // ResolvedLiteral: no columns.
         }
     }
 

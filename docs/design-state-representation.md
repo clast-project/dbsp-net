@@ -1129,6 +1129,52 @@ throwaway Z-set per join input. Fusing it needs the same pre-step on the reflect
 `InvokeExchangeIndex`/`InvokeGroupProject` calls (the typed-compiler reflection landmine).
 It is a follow-up, measured by w1profile B/ev on q3/q4/q9/q20.
 
+### 9.11 Lever 3 built: single-use CTE/view inlining + projection composition (−2.4 GiB, time-neutral)
+
+**What.** A CTE referenced exactly once (single-query and program compiles), and in a
+program a reachable non-output view referenced exactly once, compiles **in place** at its
+reference instead of as a separately cached stream (`InlineSingleUseMode`, default on,
+`DBSPNET_INLINE_SINGLE_USE=off`). `Unwrap` makes such a reference transparent to
+`CompilePlanUncached`, the chain walker and `CompileIndexInput`. `CountReferences` /
+`ForEachChild` (exhaustive over plan nodes, like `CollectScans`) count references. Recursive
+CTE self-references are excluded, and a CTE with a stream already registered is never
+inlined; recursive bodies compile in their own context anyway, so that guard is defensive.
+The typed program path (`TypeEligibleProgramViews`) disables view inlining, because its
+consumers read view streams directly. An inlined view's operators carry its consumer's
+profile label. W>1 compiles are untouched.
+
+**Projection composition.** Inlining alone removed the intermediate *Z-sets* but saved only
+0.37 GiB, because `RunStages` still built one row per Map stage. The chain walker now
+composes `outer(inner(x))` into one projection (the optimizer's `SimplifyProject` rule,
+applied across the inlined boundary), so one row is built per chain. Following Feldera's
+`shouldInlineComposition`, it declines when that would evaluate a non-trivial inner
+expression more than once per row (`ExpressionRewriter.CountColumnReferences`).
+
+**Tests.** `InlineSingleUseTests`: inlined ≡ shared ≡ batch oracle for six CTE shapes (nested,
+join input, aggregate input, used twice and so not inlined, join body), on the typed and
+structural paths, over 150 arbitrary ±1 streams each; a recursive CTE; and a program with
+single-use, nested-inlined, shared and output views. Mutations caught: inlining output views
+(1), composing without substitution (1). Dropping the recursive exclusion is an equivalent
+mutant today (see above). Full suite 2484 passed, 1 skipped.
+
+**SF=3 batch 1** (all 16 outputs identical):
+
+| | inlining off | inlining on |
+|---|---|---|
+| allocated | 45.07 GiB | **43.05 GiB (−2.0 GiB; −0.37 of it from inlining alone)** |
+| engine step, 5 alternating runs | 36.4 / 37.6 / 37.6 / 34.0 / 38.9 (mean 36.9) | 39.6 / 39.0 / 35.9 / 35.5 / 34.6 (mean 36.9) |
+| ApplyOps / single-consumer Apply→Apply edges | 271 / 86 | 240 / 55 (producer alloc 6.0 → 0.7 GiB) |
+
+**Time-neutral.** Two-run pairs suggested ±6% either way. Five runs per arm show identical
+means and a ±2.5 s spread, so step time on this host is not resolvable below ~5% without
+more repetitions. The allocation gain is deterministic.
+
+**§9.9–9.11 cumulative** (vs `0707657`): allocation 46.71 → 43.05 GiB (−7.8%); step ~−12%,
+all from index fusion. The census's 10.2 GiB of throwaway producer allocation is down to
+0.7 GiB, and what it held turned out to be mostly mapped *rows*, not Z-set overhead.
+**The single-consumer pointwise-chain lever is exhausted.** What remains is per-row cost
+inside joins, windows and aggregates: the row-representation question proper.
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
