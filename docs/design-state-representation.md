@@ -1175,6 +1175,31 @@ all from index fusion. The census's 10.2 GiB of throwaway producer allocation is
 **The single-consumer pointwise-chain lever is exhausted.** What remains is per-row cost
 inside joins, windows and aggregates: the row-representation question proper.
 
+### 9.12 Typed-path index fusion: sized, not built
+
+`dotnet run -- applycensus <q> [events] [batch]` (in `Q9AllocProbe.cs`) runs one Nexmark query
+on the typed path and lists every single-consumer ApplyOp → ApplyOp edge with its producer's
+B/ev (1M events, `NEXMARK_GEN=feldera`):
+
+| query | projection → key-index edges (producer B/ev) | ingest lift → first chain | query B/ev |
+|---|---|---|---|
+| q4 | 3.3, 44.5, 33.2, 2.8 (≈84) | 101.0 → projection | 1221 |
+| q3 | 0.7, 1.2 | 7.8, 3.2 | 99 |
+| q9 | 3.3 | 101.0 → projection (→ TOP-K) | — |
+| q20 | 101.0 (lift → index), 4.4 | — | — |
+
+As on ivm-bench (§9.10), fusion removes the intermediate Z-set but not the rows, which is
+roughly 40% of a producer's allocation. Projection → index fusion alone is ≈3% of B/ev on q4
+and ≈0 on q3/q9. Folding the **ingest lift** (structural row → emitted struct) into the
+first chain adds about another 40 B/ev on q4/q9/q20, so the combined prize is ~3–7% of B/ev
+on the join queries.
+
+**Not built.** (1) The Feldera head-to-head runs at W=14 and §9.10's fusion is W≤1 only, so
+reaching the comparison needs the pre-step inside `ExchangeIndexOp` (map/filter, then
+partition and index). (2) A new Core operator needs new reflection-bound `Invoke*` helpers in
+`TypedPlanCompiler`, the known landmine. Worth doing only as one lever (lift + chain + index,
+W≥1); it ranks below the per-row cost inside joins/windows/aggregates.
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim

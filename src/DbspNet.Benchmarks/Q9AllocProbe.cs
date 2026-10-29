@@ -118,6 +118,128 @@ internal static class Q9AllocProbe
         }
     }
 
+    /// <summary>
+    /// Apply-chain census for one Nexmark query (typed path): every ApplyOp → ApplyOp edge
+    /// whose producer has exactly one consumer, with both ends' origins (the builder method
+    /// and the compiler method that made each transform) and the producer's B/ev. Sizes the
+    /// typed-path index-fusion prize (docs/design-state-representation.md §9.10).
+    /// `dotnet run -- applycensus [q] [events] [batch]`
+    /// </summary>
+    public static void Census(string queryId, int totalEvents, int batchSize)
+    {
+        var query = NexmarkQueries.All.First(q => q.Id == queryId);
+        var events = Generate(totalEvents);
+        var q = Compile(query.Sql);
+        q.Circuit.ProfileOperators = true;
+        Feed(q, events, query.Tables.ToHashSet(), batchSize);
+
+        var ops = q.Circuit.Operators;
+        var profile = q.Circuit.CollectOperatorProfile().ToDictionary(p => p.Index);
+        var producerOf = new Dictionary<object, int>(ReferenceEqualityComparer.Instance);
+        var consumersOf = new Dictionary<object, List<int>>(ReferenceEqualityComparer.Instance);
+        var reads = new List<object>[ops.Count];
+        for (var i = 0; i < ops.Count; i++)
+        {
+            reads[i] = [];
+            foreach (var (name, stream) in StreamFields(ops[i]))
+            {
+                if (name.Contains("output", StringComparison.OrdinalIgnoreCase) || name == "_out")
+                {
+                    producerOf.TryAdd(stream, i);
+                }
+                else
+                {
+                    reads[i].Add(stream);
+                    if (!consumersOf.TryGetValue(stream, out var l)) consumersOf[stream] = l = [];
+                    l.Add(i);
+                }
+            }
+        }
+
+        double Bev(int i) => profile.TryGetValue(i, out var p) ? p.AllocBytes / (double)events.Count : 0;
+        Console.WriteLine($"=== {queryId}: {ops.Count} operators ===");
+        for (var i = 0; i < ops.Count; i++)
+        {
+            Console.WriteLine($"  op{i,-3} {ops[i].GetType().Name.Split('`')[0],-24} {Bev(i),8:F1} B/ev  {Origin(ops[i])}");
+        }
+
+        Console.WriteLine("  -- single-consumer ApplyOp -> ApplyOp edges --");
+        for (var i = 0; i < ops.Count; i++)
+        {
+            foreach (var s in reads[i])
+            {
+                if (producerOf.TryGetValue(s, out var from) && consumersOf[s].Count == 1
+                    && ops[from].GetType().Name.StartsWith("ApplyOp", StringComparison.Ordinal)
+                    && ops[i].GetType().Name.StartsWith("ApplyOp", StringComparison.Ordinal))
+                {
+                    Console.WriteLine($"    op{from} ({Bev(from):F1} B/ev) -> op{i}");
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<(string Name, object Stream)> StreamFields(object op)
+    {
+        for (var t = op.GetType(); t is not null && t != typeof(object); t = t.BaseType)
+        {
+            foreach (var f in t.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic
+                                          | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                if (f.FieldType.IsGenericType && f.FieldType.GetGenericTypeDefinition() == typeof(DbspNet.Core.Circuit.Stream<>)
+                    && f.GetValue(op) is { } s)
+                {
+                    yield return (f.Name, s);
+                }
+            }
+        }
+    }
+
+    private static string Origin(object op)
+    {
+        if (op.GetType().GetField("_transform", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                ?.GetValue(op) is not Delegate d)
+        {
+            return "";
+        }
+
+        var outer = Enclosing(d.Method);
+        var inner = FindSql(d.Target, 0);
+        return inner is null ? outer : $"{outer} / {inner}";
+
+        static string? FindSql(object? target, int depth)
+        {
+            if (target is null || depth > 4) return null;
+            foreach (var f in target.GetType().GetFields(System.Reflection.BindingFlags.Instance
+                                                         | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public))
+            {
+                var v = f.GetValue(target);
+                if (v is Delegate dd)
+                {
+                    if (dd.Method.DeclaringType?.Namespace?.StartsWith("DbspNet.Sql", StringComparison.Ordinal) == true)
+                        return Enclosing(dd.Method);
+                    if (FindSql(dd.Target, depth + 1) is { } r) return r;
+                }
+                else if (v is not null && v.GetType().Name.Contains("DisplayClass", StringComparison.Ordinal)
+                         && FindSql(v, depth + 1) is { } r2)
+                {
+                    return r2;
+                }
+            }
+
+            return null;
+        }
+
+        static string Enclosing(System.Reflection.MethodInfo m)
+        {
+            var n = m.Name;
+            var a = n.IndexOf('<', StringComparison.Ordinal);
+            var b = n.IndexOf('>', StringComparison.Ordinal);
+            var t = m.DeclaringType;
+            while (t?.DeclaringType is not null && t.Name.StartsWith('<')) t = t.DeclaringType;
+            return $"{t?.Name}.{(a >= 0 && b > a ? n[(a + 1)..b] : n)}";
+        }
+    }
+
     private static void Feed(CompiledQuery q, List<Event> events, HashSet<NexmarkTable> consumed, int batchSize)
     {
         var buffers = consumed.ToDictionary(t => t, _ => new List<(object?[], long)>(batchSize));

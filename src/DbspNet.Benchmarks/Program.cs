@@ -109,6 +109,15 @@ if (args.Length > 0 && args[0] == "parallelview")
 }
 
 // SCRATCH: q9 alloc-mode probe — `dotnet run -- allocmode [query] [events] [batch] [iters]`
+// Apply-chain census on one Nexmark query: `dotnet run -- applycensus [q] [events] [batch]`
+if (args.Length > 0 && args[0] == "applycensus")
+{
+    int A(int i, int fb) => args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out var v) ? v : fb;
+    DbspNet.Benchmarks.Q9AllocProbe.Census(args.Length > 1 ? args[1] : "q4", A(2, 1_000_000), A(3, 10_000));
+    return 0;
+}
+
 if (args.Length > 0 && args[0] == "allocmode")
 {
     int A(int i, int fb) => args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
