@@ -1037,6 +1037,53 @@ being fused into it. Count adjacent Project→Project ApplyOps in the compiled i
 circuit before designing any representation change. If the pattern is common, fusing them is
 a cheap, deterministic allocation win.
 
+### 9.9 Unfused pointwise chains: ~10 GiB of throwaway Z-sets (the §9.8 lead, measured)
+
+Instrument: `tests/DbspNet.Tests/Scratch/IvmApplyChainCensus.cs` (same env vars as
+`IvmBatchProfile`). It runs SF=3 batch 1 and rebuilds the operator graph by reflection (each
+operator's `Stream<>` fields). It labels every ApplyOp with the builder method and the
+`PlanToCircuit` method that made it, and reports **single-consumer ApplyOp → ApplyOp edges**:
+a producer whose whole hashed output Z-set exists only to feed one pointwise consumer.
+
+**Result: 373 ApplyOps (21.2 GiB). 187 single-consumer Apply→Apply edges, whose producers
+allocate 10.2 GiB, ~22% of the batch's 46.7 GiB.** By pattern:
+
+| edge (producer → consumer) | edges | producer alloc |
+|---|---|---|
+| input projection → join's null-key `Filter` | 40 | 3,088 MiB |
+| join's null-key `Filter` → join's key-index `GroupProject` | 64 | 1,496 MiB |
+| linear chain → linear chain (view / CTE boundary) | 17 | 3,753 MiB |
+| projection → aggregate's key-index `GroupProject` | 10 | 1,145 MiB |
+| aggregate output map → linear chain | 4 | 460 MiB |
+| the rest (semi/outer-join plumbing) | 52 | ~270 MiB |
+
+Causes:
+
+1. **Join and aggregate lowering emits its own pointwise operators.** `CompileInnerJoin`
+   builds `Filter(HasNoNullKey)` then `GroupProject(key, row ⇒ row)` on each side, after the
+   input's own projection. That is three passes and two intermediate Z-sets per join input.
+   Operator fusion (`CompileLinearChain`) only merges adjacent *plan* nodes, and these are
+   created inside the join's lowering. The null-key filter is a pure no-op when the key
+   columns are NOT NULL.
+2. **View and CTE references stop the chain.** A referenced view or CTE is compiled once to
+   its own stream, so a projection over it starts a new chain even when the census shows
+   exactly one consumer (`finwire_financial → financials`, `watches_history → watches →
+   fact_watches`, `holdings_history → fact_holdings`).
+
+**Levers, cheapest first** (all compile-time lowering; each is exact):
+
+1. Fuse the null-key filter into the key-index step (one `GroupProject` that drops NULL-keyed
+   rows), and skip the check entirely when every key column is NOT NULL.
+2. Lower the input's linear chain *into* the join's or aggregate's indexing pass: compile the
+   chain to a row function instead of a stream when its only consumer indexes it.
+3. Inline a single-consumer view/CTE reference through `CompileLinearChain` instead of
+   materialising it as a separate stream.
+
+The ceiling is ~10 GiB of allocation, plus one full hash-and-insert pass per removed edge.
+Feldera does the equivalent (its circuit optimizer merges consecutive maps and
+map→map-index). Measure each lever with whole-step + allocation on SF=3, and w1profile B/ev on
+Nexmark (the typed path has its own join lowering: check it for the same pattern).
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
