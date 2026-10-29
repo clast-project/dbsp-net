@@ -2351,56 +2351,14 @@ public static class PlanToCircuit
         LogicalPlan plan,
         CompileContext ctx)
     {
-        // Walk top→down collecting stages; the loop stops at the first
-        // non-linear node, which becomes the chain's compiled input.
-        var stages = new List<LinearStage>();
-        var node = plan;
-        while (true)
-        {
-            if (node is FilterPlan f)
-            {
-                stages.Add(new LinearStage(
-                    LinearStageKind.Filter,
-                    ExpressionCompiler.CompilePredicate(f.Predicate),
-                    null,
-                    null));
-                node = f.Input;
-            }
-            else if (node is ProjectPlan p)
-            {
-                // An identity projection is a pure rename — no runtime stage.
-                if (IsIdentityProjection(p))
-                {
-                    node = p.Input;
-                    continue;
-                }
-
-                var delegates = new Func<IReadOnlyList<object?>, object?>[p.Projections.Count];
-                for (var i = 0; i < delegates.Length; i++)
-                {
-                    delegates[i] = ExpressionCompiler.CompileScalar(p.Projections[i].Expression);
-                }
-
-                stages.Add(new LinearStage(LinearStageKind.Map, null, delegates, p.Schema));
-                node = p.Input;
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        var input = CompilePlan(builder, node, ctx);
+        var (inputPlan, stages) = CollectLinearStages(plan);
+        var input = CompilePlan(builder, inputPlan, ctx);
 
         // No runtime stages (e.g. a chain of identity projections) → pass through.
         if (stages.Count == 0)
         {
             return input;
         }
-
-        // Stages were collected outermost-first; data flows from the input
-        // upward, so apply them in reverse (innermost-first) order.
-        stages.Reverse();
 
         var codec = ctx.Codec;
 
@@ -2425,25 +2383,7 @@ public static class PlanToCircuit
         {
             var chain = stages.ToArray();
             result = builder.MapFilterRows<StructuralRow, StructuralRow, Z64>(input, row =>
-            {
-                IReadOnlyList<object?> current = row;
-                foreach (var stage in chain)
-                {
-                    if (stage.Kind == LinearStageKind.Filter)
-                    {
-                        if (!stage.Predicate!(current))
-                        {
-                            return (false, null!);
-                        }
-                    }
-                    else
-                    {
-                        current = ApplyMap(stage, current, codec);
-                    }
-                }
-
-                return (true, (StructuralRow)current);
-            });
+                RunStages(chain, row, codec) is { } kept ? (true, kept) : (false, null!));
         }
 
         // Partition state survives a filters-only chain unchanged (filters touch
@@ -2470,6 +2410,127 @@ public static class PlanToCircuit
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Walks a maximal run of <see cref="FilterPlan"/> / <see cref="ProjectPlan"/> nodes
+    /// top→down. Returns the first non-linear node (the chain's input) and the runtime
+    /// stages in data-flow order (innermost first). Identity projections are pure renames
+    /// and contribute no stage.
+    /// </summary>
+    private static (LogicalPlan Input, List<LinearStage> Stages) CollectLinearStages(LogicalPlan plan)
+    {
+        var stages = new List<LinearStage>();
+        var node = plan;
+        while (true)
+        {
+            if (node is FilterPlan f)
+            {
+                stages.Add(new LinearStage(
+                    LinearStageKind.Filter,
+                    ExpressionCompiler.CompilePredicate(f.Predicate),
+                    null,
+                    null));
+                node = f.Input;
+            }
+            else if (node is ProjectPlan p)
+            {
+                if (IsIdentityProjection(p))
+                {
+                    node = p.Input;
+                    continue;
+                }
+
+                var delegates = new Func<IReadOnlyList<object?>, object?>[p.Projections.Count];
+                for (var i = 0; i < delegates.Length; i++)
+                {
+                    delegates[i] = ExpressionCompiler.CompileScalar(p.Projections[i].Expression);
+                }
+
+                stages.Add(new LinearStage(LinearStageKind.Map, null, delegates, p.Schema));
+                node = p.Input;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        // Collected outermost-first; data flows from the input upward.
+        stages.Reverse();
+        return (node, stages);
+    }
+
+    /// <summary>Runs <paramref name="chain"/> over one row: the rewritten row, or
+    /// <see langword="null"/> when a filter drops it.</summary>
+    private static StructuralRow? RunStages(
+        LinearStage[] chain, StructuralRow row, IRowCodec<StructuralRow> codec)
+    {
+        IReadOnlyList<object?> current = row;
+        foreach (var stage in chain)
+        {
+            if (stage.Kind == LinearStageKind.Filter)
+            {
+                if (!stage.Predicate!(current))
+                {
+                    return null;
+                }
+            }
+            else
+            {
+                current = ApplyMap(stage, current, codec);
+            }
+        }
+
+        return (StructuralRow)current;
+    }
+
+    /// <summary>
+    /// Compiles a join or aggregate input that is about to be indexed, letting the
+    /// indexing pass absorb the input's pointwise work (docs/design-state-representation.md
+    /// §9.9). Returns the stream to index plus an optional per-row pre-step: the input's own
+    /// Filter/Project chain, then (when <paramref name="nullKeyIndices"/> is given) dropping
+    /// rows with a NULL key column. Indexing with the pre-step fused in is exact: map and
+    /// filter are pure row functions and Z-set addition is associative, so consolidating
+    /// before or after the map gives the same indexed Z-set.
+    /// <para>Call only at W≤1: at W&gt;1 the exchange must see the mapped rows and the
+    /// partition tracking reads the operator layout, so callers keep the separate operators
+    /// there. A chain already compiled for another consumer (in <c>PlanCache</c>) is reused,
+    /// not re-run inline.</para>
+    /// </summary>
+    private static (Stream<ZSet<StructuralRow, Z64>> Input, Func<StructuralRow, StructuralRow?>? Pre)
+        CompileIndexInput(CircuitBuilder builder, LogicalPlan plan, CompileContext ctx, int[]? nullKeyIndices)
+    {
+        System.Diagnostics.Debug.Assert(ctx.Workers <= 1, "index-input fusion is W<=1 only");
+
+        // A NULL check on NOT NULL key columns can never drop a row.
+        if (nullKeyIndices is not null && nullKeyIndices.All(i => !plan.Schema[i].Type.Nullable))
+        {
+            nullKeyIndices = null;
+        }
+
+        Stream<ZSet<StructuralRow, Z64>> input;
+        LinearStage[] chain = [];
+        if (plan is FilterPlan or ProjectPlan && !ctx.PlanCache.ContainsKey(plan))
+        {
+            var (inputPlan, stages) = CollectLinearStages(plan);
+            input = CompilePlan(builder, inputPlan, ctx);
+            chain = stages.ToArray();
+        }
+        else
+        {
+            input = CompilePlan(builder, plan, ctx);
+        }
+
+        var codec = ctx.Codec;
+        Func<StructuralRow, StructuralRow?>? pre = (chain.Length, nullKeyIndices) switch
+        {
+            (0, null) => null,
+            (0, { } idx) => row => HasNoNullKey(row, idx) ? row : null,
+            (_, null) => row => RunStages(chain, row, codec),
+            (_, { } idx) => row => RunStages(chain, row, codec) is { } m && HasNoNullKey(m, idx) ? m : null,
+        };
+        return (input, pre);
     }
 
     private static StructuralRow ApplyMap(
@@ -2530,15 +2591,29 @@ public static class PlanToCircuit
         JoinPlan plan,
         CompileContext ctx)
     {
-        var left = CompilePlan(builder, plan.Left, ctx);
-
         var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
+
+        // At W<=1 each input's pointwise work (its own Filter/Project chain and the
+        // NULL-key check) runs inside the indexing pass instead of as separate operators
+        // that each build a throwaway Z-set (docs/design-state-representation.md §9.9).
+        var fuseIndexing = ctx.Workers <= 1 && IndexFusionMode.Enabled;
+        Stream<ZSet<StructuralRow, Z64>> left;
+        Func<StructuralRow, StructuralRow?>? leftPre = null;
+        if (fuseIndexing)
+        {
+            (left, leftPre) = CompileIndexInput(builder, plan.Left, ctx, plan.AllowNullKeys ? null : leftIndices);
+        }
+        else
+        {
+            left = CompilePlan(builder, plan.Left, ctx);
+        }
 
         // INNER: drop NULL-keyed rows on both sides — the equi-predicate is
         // never true when either key column is NULL. For set-op-synthesised
         // joins (INTERSECT/EXCEPT) this is overridden: NULLs are equal to
-        // each other for deduplication-style matching.
-        var leftFiltered = plan.AllowNullKeys
+        // each other for deduplication-style matching. (Fused into the
+        // indexing pre-step at W<=1.)
+        var leftFiltered = plan.AllowNullKeys || fuseIndexing
             ? left
             : builder.Filter(left, row => HasNoNullKey(row, leftIndices));
 
@@ -2556,6 +2631,18 @@ public static class PlanToCircuit
         StructuralRow LeftKeyOf(StructuralRow row) => ExtractKey(codec, leftKeySchema, row, leftIndices);
         StructuralRow Combine(StructuralRow _, StructuralRow lrow, StructuralRow rrow) =>
             MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount);
+
+        // Exchange-and-index one side; with a fused pre-step (W<=1 only), index straight
+        // from the unmapped input in one pass.
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> IndexSide(
+            Stream<ZSet<StructuralRow, Z64>> side,
+            Func<StructuralRow, StructuralRow?>? pre,
+            Func<StructuralRow, int> part,
+            Func<StructuralRow, StructuralRow> keyOf) =>
+            pre is null
+                ? builder.ExchangeIndex(side, part, keyOf)
+                : builder.MapFilterGroupProject<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                    side, pre, keyOf, static row => row);
 
         var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
 
@@ -2591,14 +2678,24 @@ public static class PlanToCircuit
             var shared = GetOrBuildSharedArrangement(
                 builder, ctx, plan, rightIndices, rightKeySchema,
                 new ArrangementKey(shareSource, string.Join(",", rightIndices)));
-            var leftIndexed = builder.ExchangeIndex(leftFiltered, LeftPart, LeftKeyOf);
+            var leftIndexed = IndexSide(leftFiltered, leftPre, LeftPart, LeftKeyOf);
             joined = EmitSharedRightInnerJoin(
                 builder, ctx, leftIndexed, shared.RightIndexed, shared.Arrangement, Combine, residualFn);
         }
         else
         {
-            var right = CompilePlan(builder, plan.Right, ctx);
-            var rightFiltered = plan.AllowNullKeys
+            Stream<ZSet<StructuralRow, Z64>> right;
+            Func<StructuralRow, StructuralRow?>? rightPre = null;
+            if (fuseIndexing)
+            {
+                (right, rightPre) = CompileIndexInput(builder, plan.Right, ctx, plan.AllowNullKeys ? null : rightIndices);
+            }
+            else
+            {
+                right = CompilePlan(builder, plan.Right, ctx);
+            }
+
+            var rightFiltered = plan.AllowNullKeys || fuseIndexing
                 ? right
                 : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
             int RightPart(StructuralRow row) => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema);
@@ -2636,8 +2733,8 @@ public static class PlanToCircuit
             }
             else
             {
-                leftIndexed = builder.ExchangeIndex(leftFiltered, LeftPart, LeftKeyOf);
-                rightIndexed = builder.ExchangeIndex(rightFiltered, RightPart, RightKeyOf);
+                leftIndexed = IndexSide(leftFiltered, leftPre, LeftPart, LeftKeyOf);
+                rightIndexed = IndexSide(rightFiltered, rightPre, RightPart, RightKeyOf);
             }
 
             var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
@@ -3761,7 +3858,18 @@ public static class PlanToCircuit
         AggregatePlan plan,
         CompileContext ctx)
     {
-        var input = CompilePlan(builder, plan.Input, ctx);
+        // At W<=1 the input's Filter/Project chain runs inside the indexing pass
+        // (docs/design-state-representation.md §9.9).
+        Stream<ZSet<StructuralRow, Z64>> input;
+        Func<StructuralRow, StructuralRow?>? pre = null;
+        if (ctx.Workers <= 1 && IndexFusionMode.Enabled)
+        {
+            (input, pre) = CompileIndexInput(builder, plan.Input, ctx, nullKeyIndices: null);
+        }
+        else
+        {
+            input = CompilePlan(builder, plan.Input, ctx);
+        }
 
         // Group-key extractors. A key is any scalar expression (bare column,
         // CAST(ts AS DATE), a + b, …), compiled once to a delegate run per row —
@@ -3830,7 +3938,10 @@ public static class PlanToCircuit
                 input,
                 row => StablePartitionHash.OfWholeRow(KeyRowOf(row), groupKeySchema),
                 KeyRowOf)
-            : builder.GroupProject(input, KeyRowOf, row => row);
+            : pre is null
+                ? builder.GroupProject(input, KeyRowOf, row => row)
+                : builder.MapFilterGroupProject<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                    input, pre, KeyRowOf, static row => row);
 
         // Snapshot codec for the IndexedZSet trace inside IncrementalAggregateOp.
         // Bootstrap rebuilds aggregator scratch from the trace on Load, so only

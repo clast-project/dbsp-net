@@ -462,6 +462,51 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// <see cref="GroupProject{TKey,TRow,TValue,TWeight}"/> with a fused pointwise pre-step:
+    /// <paramref name="map"/> rewrites each input row, or drops it by returning
+    /// <see langword="null"/>, in the same pass that keys it. The flat Z-set a separate
+    /// map/filter operator would build between the two is never materialised.
+    /// </summary>
+    /// <remarks>
+    /// Equivalent to a map/filter followed by <c>GroupProject</c>: the map is a pure row
+    /// function, and summing two input rows' weights before or after mapping them to the
+    /// same row gives the same indexed Z-set (Z-set addition is associative and
+    /// commutative; the builder consolidates either way).
+    /// </remarks>
+    public static Stream<IndexedZSet<TKey, TValue, TWeight>> MapFilterGroupProject<TKey, TIn, TRow, TValue, TWeight>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TIn, TWeight>> input,
+        Func<TIn, TRow?> map,
+        Func<TRow, TKey> keyOf,
+        Func<TRow, TValue> valueOf)
+        where TKey : notnull
+        where TIn : notnull
+        where TRow : class
+        where TValue : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(map);
+        ArgumentNullException.ThrowIfNull(keyOf);
+        ArgumentNullException.ThrowIfNull(valueOf);
+
+        return builder.Apply(input, z =>
+        {
+            var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+            foreach (var (row, w) in z)
+            {
+                if (map(row) is { } mapped)
+                {
+                    b.Add(keyOf(mapped), valueOf(mapped), w);
+                }
+            }
+
+            return b.Build();
+        });
+    }
+
+    /// <summary>
     /// Incremental inner equi-join. Both inputs must already be indexed on
     /// the shared key. <paramref name="combine"/> produces the output row
     /// from the join key, the left row and the right row.

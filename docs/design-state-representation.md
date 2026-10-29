@@ -1086,6 +1086,42 @@ into one operator when the producer's fan-out is 1, and folds a `Map` after a jo
 join (`JoinFilterMap`). Measure each lever with whole-step + allocation on SF=3, and w1profile B/ev on
 Nexmark (the typed path has its own join lowering: check it for the same pattern).
 
+### 9.10 Levers 1–2 of §9.9 built: index fusion (−12% step)
+
+`CompileIndexInput` (W≤1, structural path) compiles a join's or aggregate's input as a
+stream plus a per-row pre-step: the input's own Filter/Project chain (`CollectLinearStages`
+/ `RunStages`, factored out of `CompileLinearChain`), then the NULL-key check. The check is
+skipped when every key column is NOT NULL. The new Core operator
+`MapFilterGroupProject` runs the pre-step and keys the row in one pass. A chain already in
+`PlanCache` (another consumer compiled it) is reused rather than re-run inline. At W>1
+nothing changes, because the exchange needs the mapped rows and the partition tracking reads
+the operator layout. `IndexFusionMode` (default on, `DBSPNET_INDEX_FUSION=off`) is the A/B
+switch.
+
+**Exactness.** Map and filter are pure row functions and Z-set addition is associative, so
+this holds for **arbitrary signed** streams. `IndexFusionTests` checks fused ≡ unfused (and ≡
+the batch oracle for joins and linear aggregates) over 200 arbitrary ±1 streams per query:
+chains on both join sides, NULLable keys with and without a chain, collapsing projections,
+computed keys, CTEs used once and twice, a three-way join, the shared-arrangement branch,
+and linear, MIN/MAX and COUNT(DISTINCT) aggregates. Mutations caught: no NULL-key check (2),
+maps ignored (2), aggregate indexing the unmapped rows (5). Full suite 2474 passed, 1
+skipped.
+
+**SF=3 batch 1**, alternating arms, all 16 outputs identical:
+
+| | fusion off | fusion on |
+|---|---|---|
+| engine step | 43.6 / 42.1 s | **36.5 / 38.1 s (≈ −12%)** |
+| allocated | 46.71 GiB | **45.07 GiB (−1.64 GiB)** |
+| ApplyOps / single-consumer Apply→Apply edges | 373 / 187 | 271 / 86 |
+
+Allocation falls by less than the 4.2 GiB of producer allocation removed, because the fused
+pass still builds the mapped rows. What goes is the intermediate Z-set: its dictionary and
+one hash-and-insert per row, which is why time moves more than bytes. The aggregate half
+barely registers, because every aggregate chain the census found starts at a view or CTE
+reference. That is lever 3, which is now also the largest remainder (~3 GiB of
+view-boundary chains).
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
