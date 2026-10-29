@@ -48,6 +48,26 @@ internal abstract class TypedSqlAggregator<TIn>
 
     public virtual object? Update(ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after)
         => Compute(after);
+
+    /// <summary>
+    /// Number of result columns this aggregator produces. 1 for every plain
+    /// aggregate; a shared multi-member aggregator
+    /// (<see cref="TypedSharedCountDistinctAggregator{TIn,T}"/>) produces one per
+    /// member, written to the composite's result slots.
+    /// </summary>
+    public virtual int ResultCount => 1;
+
+    /// <summary>Batch counterpart of <see cref="UpdateInto"/>.</summary>
+    public virtual void ComputeInto(IMultiset<TIn, Z64> rows, object?[] results, int[] slots)
+        => results[slots[0]] = Compute(rows);
+
+    /// <summary>
+    /// Advance <paramref name="state"/> by <paramref name="delta"/> and write the
+    /// <see cref="ResultCount"/> results to <c>results[slots[j]]</c>.
+    /// </summary>
+    public virtual void UpdateInto(
+        ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after, object?[] results, int[] slots)
+        => results[slots[0]] = Update(ref state, delta, after);
 }
 
 /// <summary>
@@ -1076,14 +1096,40 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
     where TAgg : notnull
 {
     private readonly TypedSqlAggregator<TIn>[] _aggs;
+    private readonly int[][] _slots;
+    private readonly int _resultCount;
     private readonly Func<object?[], TAgg> _packResults;
 
     public TypedCompositeAggregator(
         TypedSqlAggregator<TIn>[] aggs,
         Func<object?[], TAgg> packResults)
+        : this(aggs, IdentitySlots(aggs.Length), aggs.Length, packResults)
+    {
+    }
+
+    /// <summary>
+    /// Composite over aggregators that may each produce several results:
+    /// aggregator <c>i</c> writes its results to <c>slots[i][0..]</c> of the
+    /// <paramref name="resultCount"/>-wide row handed to
+    /// <paramref name="packResults"/>.
+    /// </summary>
+    public TypedCompositeAggregator(
+        TypedSqlAggregator<TIn>[] aggs,
+        int[][] slots,
+        int resultCount,
+        Func<object?[], TAgg> packResults)
     {
         _aggs = aggs;
+        _slots = slots;
+        _resultCount = resultCount;
         _packResults = packResults;
+    }
+
+    private static int[][] IdentitySlots(int n)
+    {
+        var slots = new int[n][];
+        for (var i = 0; i < n; i++) slots[i] = [i];
+        return slots;
     }
 
     public Optional<TAgg> Compute(IMultiset<TIn, Z64> multiset)
@@ -1093,10 +1139,10 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
             return Optional<TAgg>.None;
         }
 
-        var results = new object?[_aggs.Length];
+        var results = new object?[_resultCount];
         for (var i = 0; i < _aggs.Length; i++)
         {
-            results[i] = _aggs[i].Compute(multiset);
+            _aggs[i].ComputeInto(multiset, results, _slots[i]);
         }
 
         return Optional<TAgg>.Some(_packResults(results));
@@ -1114,11 +1160,11 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
         // for cancelling-weight groups. The gate applies to the
         // output wrapping below.
         var subStates = state as object?[] ?? new object?[_aggs.Length];
-        var results = new object?[_aggs.Length];
+        var results = new object?[_resultCount];
         for (var i = 0; i < _aggs.Length; i++)
         {
             var slot = subStates[i];
-            results[i] = _aggs[i].Update(ref slot, delta, afterMultiset);
+            _aggs[i].UpdateInto(ref slot, delta, afterMultiset, results, _slots[i]);
             subStates[i] = slot;
         }
 
