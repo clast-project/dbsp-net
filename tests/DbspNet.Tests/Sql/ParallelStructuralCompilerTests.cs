@@ -741,15 +741,22 @@ public class ParallelStructuralCompilerTests
     }
 
     [Fact]
-    public void GlobalWindow_RefusesParallel()
+    public void GlobalWindow_GathersToOneWorker()
     {
         // No PARTITION BY ⇒ a single global window ⇒ nothing to shard on; the
-        // compile must refuse so the caller falls back to the serial circuit.
+        // compile gathers the input onto worker 0 and runs the serial operator there
+        // (ParallelGlobalOpsPbtTests checks parallel ≡ serial for these shapes).
         var plan = CompilePlan(
             ["CREATE TABLE t (v BIGINT NOT NULL)"],
             "SELECT SUM(v) OVER () FROM t");
-        Assert.False(PlanToCircuit.TryCompileParallel(plan, 4, out var q));
-        Assert.Null(q);
+        Assert.True(PlanToCircuit.TryCompileParallel(plan, 4, out var q));
+        using (q)
+        {
+            q!.Table("t").Insert(3L);
+            q.Table("t").Insert(4L);
+            q.Step();
+            Assert.Equal(new Z64(2), q.WeightOf(7L));
+        }
     }
 
     [Fact]

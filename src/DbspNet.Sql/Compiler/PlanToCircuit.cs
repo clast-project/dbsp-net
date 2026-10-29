@@ -814,11 +814,11 @@ public static class PlanToCircuit
     /// <summary>
     /// Whether every node in <paramref name="plan"/> is one the exchange-insertion
     /// pass can shard soundly. A key-sensitive node is admissible only when its
-    /// shard key is hashable (<see cref="IsHashableType"/>) and, for windows /
-    /// top-K / rank, a PARTITION BY exists (a global window has no key to shard
-    /// on). Everything not explicitly handled — a broadcast / correlated /
+    /// shard key is hashable (<see cref="IsHashableType"/>); a node with no key at
+    /// all (a global window / top-K / rank, a cross join) gathers onto one worker.
+    /// Everything not explicitly handled — a broadcast / correlated /
     /// scalar-subquery join, a semi-join, a set difference, a recursive CTE, a
-    /// temporal filter, a non-inner join, a global top-K — is refused so the
+    /// temporal filter, a non-inner join — is refused so the
     /// caller falls back to the serial single circuit.
     /// </summary>
     private static bool CanCompileParallel(LogicalPlan plan) => CollectParallelBlockers(plan, blockers: null);
@@ -871,9 +871,11 @@ public static class PlanToCircuit
             return ok;
         }
 
+        // An unpartitioned (global) window / rank / TOP-K gathers onto worker 0
+        // (GatherToWorkerZero), so only a PARTITION BY key has to be hashable.
         bool Partitioned(string what, IReadOnlyList<ResolvedExpression> keys) =>
-            keys.Count == 0 ? Block("unpartitioned " + what)
-            : AllHashable(keys) || Block(what + " with a non-hashable PARTITION BY key");
+            keys.Count == 0
+            || AllHashable(keys) || Block(what + " with a non-hashable PARTITION BY key");
 
         switch (plan)
         {
@@ -901,12 +903,9 @@ public static class PlanToCircuit
                          });
                 if (ok || blockers is not null)
                 {
+                    // A cross join (no equi-key) is admissible: CompileInnerJoin broadcasts
+                    // a provably one-row right side, else gathers both sides to one worker.
                     var (leftIndices, rightIndices) = ExtractEquiKeyIndices(j);
-                    if (leftIndices.Length == 0)
-                    {
-                        ok = Block("cross join (no equi-key to shard on)") && ok;
-                    }
-
                     for (var k = 0; k < leftIndices.Length; k++)
                     {
                         if (!IsHashableType(j.Left.Schema[leftIndices[k]].Type)
@@ -966,6 +965,10 @@ public static class PlanToCircuit
             case WindowOffsetPlan wo:
                 return Then(Partitioned("LAG/LEAD", wo.PartitionKeys), wo.Input);
 
+            case TopKPlan t:
+                // A global ORDER BY … LIMIT gathers onto worker 0 (CompileTopK).
+                return Walk(t.Input);
+
             default:
             {
                 var why = plan switch
@@ -974,7 +977,6 @@ public static class PlanToCircuit
                     ScalarSubqueryJoinPlan => "scalar subquery",
                     CorrelatedScalarSubqueryJoinPlan => "correlated scalar subquery",
                     DifferencePlan => "EXCEPT / set difference",
-                    TopKPlan => "unpartitioned TOP-K (ORDER BY … LIMIT)",
                     RecursiveCtePlan => "recursive CTE",
                     TemporalFilterPlan => "temporal filter (NOW())",
                     _ => plan.GetType().Name,
@@ -2246,9 +2248,49 @@ public static class PlanToCircuit
         CompileContext ctx)
     {
         var input = CompilePlan(builder, plan.Input, ctx);
+
+        // Parallel: a global ORDER BY … LIMIT ranks the whole relation, so gather it
+        // onto worker 0 and run the serial operator there (identity at W<=1).
+        if (ctx.Workers > 1)
+        {
+            input = GatherToWorkerZero(builder, input);
+        }
+
         var comparer = BuildStructuralSortComparer(plan.SortKeys);
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-        return builder.TopK(input, comparer, plan.Offset ?? 0, plan.Limit, codec);
+        return MarkGathered(ctx, Array.Empty<ResolvedExpression>(),
+            builder.TopK(input, comparer, plan.Offset ?? 0, plan.Limit, codec));
+    }
+
+    /// <summary>
+    /// Parallel (W&gt;1) only: route every row of <paramref name="input"/> to worker 0,
+    /// for an operator with no key to shard on (a global rank / window / TOP-K). The
+    /// serial operator downstream then sees the whole relation on worker 0 and an
+    /// empty input — so it emits nothing — on every other worker.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> GatherToWorkerZero(
+        CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input) =>
+        builder.Exchange(input, static _ => 0);
+
+    /// <summary>
+    /// Records that the output of a gathered (unpartitioned) operator lives entirely on
+    /// worker 0: equal rows are trivially co-located (shard-disjoint), and it is
+    /// partitioned by the empty key — every row shares one worker, so any downstream
+    /// key is a superset and a downstream aggregate may elide its shuffle. A
+    /// partitioned operator's output keeps the unpartitioned default.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> MarkGathered(
+        CompileContext ctx,
+        IReadOnlyList<ResolvedExpression> partitionKeys,
+        Stream<ZSet<StructuralRow, Z64>> output)
+    {
+        if (ctx.Workers > 1 && partitionKeys.Count == 0)
+        {
+            ctx.SetPartition(output, new PartitionInfo(ShardDisjoint: true, PartitionKey: Array.Empty<int>()));
+        }
+
+        return output;
     }
 
     private static IComparer<StructuralRow> BuildStructuralSortComparer(IReadOnlyList<SortKey> sortKeys)
@@ -2318,13 +2360,17 @@ public static class PlanToCircuit
 
         // Parallel: co-locate each PARTITION BY group on one worker before the
         // per-partition operator (identity passthrough at W<=1). A global (no
-        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
-        // partition list is non-empty whenever this fires.
+        // PARTITION BY) window has no key to shard on: gather it whole onto
+        // worker 0 (GatherToWorkerZero), where the serial operator runs.
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+        }
+        else if (ctx.Workers > 1)
+        {
+            input = GatherToWorkerZero(builder, input);
         }
 
         // §22 narrow-key path: pass the single ORDER BY extractor so the operator can
@@ -2342,9 +2388,9 @@ public static class PlanToCircuit
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-        return builder.PartitionedTopK<StructuralRow, StructuralRow>(
+        return MarkGathered(ctx, plan.PartitionKeys, builder.PartitionedTopK<StructuralRow, StructuralRow>(
             input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec,
-            orderKey, orderDescending, orderNullsFirst);
+            orderKey, orderDescending, orderNullsFirst));
     }
 
     // ---- Rank-in-output (ROW_NUMBER / RANK / DENSE_RANK as an output column) ----
@@ -2397,20 +2443,24 @@ public static class PlanToCircuit
 
         // Parallel: co-locate each PARTITION BY group on one worker before the
         // per-partition operator (identity passthrough at W<=1). A global (no
-        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
-        // partition list is non-empty whenever this fires.
+        // PARTITION BY) window has no key to shard on: gather it whole onto
+        // worker 0 (GatherToWorkerZero), where the serial operator runs.
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
+        else if (ctx.Workers > 1)
+        {
+            input = GatherToWorkerZero(builder, input);
+        }
 
         // The snapshot codec is over the base (input) rows; the operator recovers
         // the widened output from them on load.
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
-        return builder.PartitionedRank<StructuralRow>(
-            input, PartitionOf, order, sortKeyOnly, plan.Function, null, codec);
+        return MarkGathered(ctx, plan.PartitionKeys, builder.PartitionedRank<StructuralRow>(
+            input, PartitionOf, order, sortKeyOnly, plan.Function, null, codec));
     }
 
     // ---- Window aggregates (agg(x) OVER (PARTITION BY p [ORDER BY o RANGE …])) ----
@@ -2443,13 +2493,17 @@ public static class PlanToCircuit
 
         // Parallel: co-locate each PARTITION BY group on one worker before the
         // per-partition operator (identity passthrough at W<=1). A global (no
-        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
-        // partition list is non-empty whenever this fires.
+        // PARTITION BY) window has no key to shard on: gather it whole onto
+        // worker 0 (GatherToWorkerZero), where the serial operator runs.
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+        }
+        else if (ctx.Workers > 1)
+        {
+            input = GatherToWorkerZero(builder, input);
         }
 
         IComparer<StructuralRow> order;
@@ -2493,7 +2547,7 @@ public static class PlanToCircuit
 
         var frontier = ResolveWindowFrontier(plan, ctx);
 
-        return builder.PartitionedWindowAggregate<StructuralRow>(
+        return MarkGathered(ctx, plan.PartitionKeys, builder.PartitionedWindowAggregate<StructuralRow>(
             input,
             PartitionOf,
             order,
@@ -2504,7 +2558,7 @@ public static class PlanToCircuit
             plan.Aggregates.Count,
             partitionComparer: null,
             snapshotCodec: codec,
-            frontier: frontier);
+            frontier: frontier));
     }
 
     /// <summary>
@@ -2585,13 +2639,17 @@ public static class PlanToCircuit
 
         // Parallel: co-locate each PARTITION BY group on one worker before the
         // per-partition operator (identity passthrough at W<=1). A global (no
-        // PARTITION BY) window is refused upstream by CanCompileParallel, so the
-        // partition list is non-empty whenever this fires.
+        // PARTITION BY) window has no key to shard on: gather it whole onto
+        // worker 0 (GatherToWorkerZero), where the serial operator runs.
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+        }
+        else if (ctx.Workers > 1)
+        {
+            input = GatherToWorkerZero(builder, input);
         }
 
         // Total order: the ORDER BY keys left to right (any comparable type —
@@ -2620,7 +2678,8 @@ public static class PlanToCircuit
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
-        return builder.PartitionedOffset<StructuralRow>(input, PartitionOf, order, specs, null, codec);
+        return MarkGathered(ctx, plan.PartitionKeys,
+            builder.PartitionedOffset<StructuralRow>(input, PartitionOf, order, specs, null, codec));
     }
 
     // ---- Projection ----
@@ -3070,7 +3129,13 @@ public static class PlanToCircuit
             int RightPart(StructuralRow row) => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema);
             StructuralRow RightKeyOf(StructuralRow row) => ExtractKey(codec, rightKeySchema, row, rightIndices);
 
-            var broadcastRight = ShouldBroadcastRight(plan.Right, ctx);
+            // A cross join (no equi-key) has nothing to shard on. When the right side is
+            // provably at most one row (a GROUP-BY-less aggregate — the `CROSS JOIN
+            // global_stats` shape), broadcast it and leave the left on its balanced
+            // partition. Otherwise both sides index under the empty key, whose constant
+            // partition hash sends every row of both to one worker: gather-both.
+            var broadcastRight = ShouldBroadcastRight(plan.Right, ctx)
+                || (ctx.Workers > 1 && leftIndices.Length == 0 && IsAtMostOneRow(plan.Right));
 
             Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed;
             Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> rightIndexed;
@@ -3134,6 +3199,21 @@ public static class PlanToCircuit
 
         return joined;
     }
+
+    /// <summary>
+    /// True when <paramref name="plan"/> provably holds at most one row: a GROUP-BY-less
+    /// aggregate (which emits one row, or none for an empty input), seen through
+    /// Filter / Project / CTE-scan wrappers that cannot add rows. Gates the cross-join
+    /// broadcast above; anything unrecognised is conservatively false.
+    /// </summary>
+    private static bool IsAtMostOneRow(LogicalPlan plan) => plan switch
+    {
+        AggregatePlan a => a.GroupKeys.Count == 0,
+        FilterPlan f => IsAtMostOneRow(f.Input),
+        ProjectPlan p => IsAtMostOneRow(p.Input),
+        CteScanPlan c => IsAtMostOneRow(c.Cte.Plan),
+        _ => false,
+    };
 
     /// <summary>
     /// Returns the shared right arrangement for <paramref name="key"/>, building
