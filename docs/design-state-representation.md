@@ -119,3 +119,25 @@ Sequencing: **A, B, E** are independent and operator-local — run them in
 parallel now. **C/D** need the seam first; I extract it serially (a pure
 refactor, gated by the existing suites and byte-identical B/ev), then C and D
 fan out on it.
+
+## 5. Cross-cutting findings
+
+### 5.1 Our Nexmark generator under-represents strings (found by variant E)
+
+`NexmarkGenerator` emits constant `extra` values (`"b"`/`"a"`/`"p"`) and 4 fixed
+bid URLs. Feldera's generator (`../feldera/crates/nexmark/src/generator/strings.rs`
+`next_extra`, `bids.rs`) pads `extra` with random text toward
+`avg_bid_byte_size` and builds URLs with per-channel ids. Consequences:
+
+- **String-interning wins measured on our data are inflated.** Variant E
+  (`exp/state-E-strings`, `e60bf95`) cut q20 live bytes −44% / objects −88% and
+  q19 −28% / −53%, almost all from columns that are high-cardinality in Feldera's
+  data. Interning stays sound and bounded (it switches itself off on
+  high-cardinality columns), so it is still worth keeping for genuinely
+  low-cardinality columns. But it can't be credited against Feldera until it is
+  re-measured on faithful data.
+- **Every prior DbspNet-vs-Feldera Nexmark ratio ran on lighter rows on our
+  side.** That is not a fair comparison for string-heavy queries (q0, q18–q22).
+- **Action:** make the generator Feldera-faithful (random-length `extra`,
+  channel-id URLs) behind a switch, and re-take the Phase 0 baselines with it,
+  before any variant's wall-clock phase.
