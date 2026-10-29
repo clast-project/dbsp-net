@@ -39,7 +39,8 @@ public class OperatorMetricsTests
         q.Table("t").Insert(2, 5);
         q.Step();
 
-        var agg = Assert.Single(q.CollectStats(), s => s.Name == "IncrementalAggregate");
+        // COUNT/SUM-only GROUP BY compiles to the trace-free linear aggregate (§4G).
+        var agg = Assert.Single(q.CollectStats(), s => s.Name == "LinearAggregate");
         Assert.Equal(2, agg.RetainedRows);     // two groups (k=1, k=2)
         Assert.Equal(2, agg.LastOutputRows);   // two group rows emitted
         Assert.Null(agg.GcFrontier);           // no LATENESS → no GC frontier
@@ -100,6 +101,6 @@ public class OperatorMetricsTests
         Assert.NotEmpty(stats);
         // Indices are the operators' registration positions (ascending, distinct).
         Assert.Equal(stats.Select(s => s.Index).OrderBy(i => i), stats.Select(s => s.Index));
-        Assert.Contains("IncrementalAggregate", stats.Single().ToString());
+        Assert.Contains("LinearAggregate", stats.Single().ToString());
     }
 }

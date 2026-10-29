@@ -28,7 +28,7 @@ namespace DbspNet.Sql.Compiler;
 /// <c>false</c>; callers fall back to
 /// <see cref="PlanToCircuit.Compile(LogicalPlan, ISqlSnapshotCodecs?)"/>.
 /// </summary>
-public static class TypedPlanCompiler
+public static partial class TypedPlanCompiler
 {
     /// <summary>
     /// Diagnostic (tests only, design §23.7): the number of window-aggregate order
@@ -1884,9 +1884,18 @@ public static class TypedPlanCompiler
         // Output: Stream<ZSet<(TKey, TAgg), Z64>>
         var aggSnapshotCodec = BuildAdaptedIndexedCodec(
             ctx.SnapshotCodecs, keySchema, inner.Schema, keyRowType, inner.RowType);
-        var aggregated = EmitAggregate(
-            ctx, keyRowType, inner.RowType, aggRowType, indexed, composite,
-            aggSnapshotCodec);
+        // Trace-free linear aggregate when every call is COUNT/SUM/AVG/COUNT(DISTINCT)
+        // (design-state-representation §4G); the trace-backed operator otherwise.
+        var linear = LinearAggregateMode.Enabled && ctx.Options.TraceFamily != TraceFamily.Spine
+            && SupportsKeyedBlobs(aggSnapshotCodec)
+            ? TryBuildLinearComposite(plan.Aggregates, inner.RowType, aggRowType)
+            : null;
+        var aggregated = linear is not null
+            ? InvokeLinearAggregate(
+                ctx.Builder, keyRowType, inner.RowType, aggRowType, indexed, linear, aggSnapshotCodec)
+            : EmitAggregate(
+                ctx, keyRowType, inner.RowType, aggRowType, indexed, composite,
+                aggSnapshotCodec);
 
         // Flatten (TKey, TAgg) -> TFinal: TFinal columns are
         // [group-key columns..., agg columns...]. We rely on the
