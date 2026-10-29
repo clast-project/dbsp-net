@@ -1089,12 +1089,13 @@ public sealed class Resolver
 
         var basePlan = ResolveWithHiddenOrderColumns(
             innerNoWindow, hiddenAsts, scope, outerSchema, visibleSchema);
+        basePlan = ReuseVisibleColumnsForHidden(basePlan, visibleSchema.Count, hiddenAsts.Count, out var hiddenAt);
         var baseSchema = basePlan.Schema;
 
         var partitionKeys = new List<ResolvedExpression>(win.Over.PartitionBy.Count);
         for (var j = 0; j < win.Over.PartitionBy.Count; j++)
         {
-            var idx = visibleSchema.Count + j;
+            var idx = hiddenAt[j];
             partitionKeys.Add(new ResolvedColumn(idx, baseSchema[idx].Type));
         }
 
@@ -1102,7 +1103,7 @@ public sealed class Resolver
         for (var j = 0; j < win.Over.OrderBy.Count; j++)
         {
             var item = win.Over.OrderBy[j];
-            var idx = visibleSchema.Count + win.Over.PartitionBy.Count + j;
+            var idx = hiddenAt[win.Over.PartitionBy.Count + j];
             var descending = item.Direction == SortDirection.Descending;
             var nullsFirst = item.Nulls switch
             {
@@ -1139,6 +1140,72 @@ public sealed class Resolver
         };
 
         return ResolveSelect(rewritten, scope, outerSchema);
+    }
+
+    /// <summary>
+    /// Drop hidden PARTITION BY / ORDER BY columns that merely copy a column already
+    /// in the row (docs/design-state-representation.md §4A.1). <paramref name="plan"/>
+    /// is the inner select re-resolved with <paramref name="hiddenCount"/> hidden
+    /// trailing columns after <paramref name="visibleCount"/> visible ones. When it is
+    /// a projection and a hidden item is a bare column reference identical to a visible
+    /// item (or to an earlier kept hidden item), that hidden item is removed and its
+    /// key refers to the existing column instead. Computed expressions are kept as
+    /// they are. <paramref name="hiddenAt"/>[j] is where hidden key <c>j</c> now lives.
+    /// The visible prefix is untouched, so the strip projection above the TOP-K and
+    /// every visible result are unchanged; only the TOP-K row narrows.
+    /// </summary>
+    private static LogicalPlan ReuseVisibleColumnsForHidden(
+        LogicalPlan plan, int visibleCount, int hiddenCount, out int[] hiddenAt)
+    {
+        hiddenAt = new int[hiddenCount];
+        for (var j = 0; j < hiddenCount; j++)
+        {
+            hiddenAt[j] = visibleCount + j;
+        }
+
+        if (plan is not ProjectPlan project || project.Projections.Count != visibleCount + hiddenCount)
+        {
+            return plan;
+        }
+
+        var items = new List<ProjectionItem>(project.Projections.Count);
+        var columns = new List<SchemaColumn>(project.Projections.Count);
+        for (var i = 0; i < visibleCount; i++)
+        {
+            items.Add(project.Projections[i]);
+            columns.Add(project.Schema[i]);
+        }
+
+        for (var j = 0; j < hiddenCount; j++)
+        {
+            var hidden = project.Projections[visibleCount + j];
+            var reuse = -1;
+            if (hidden.Expression is ResolvedColumn)
+            {
+                for (var i = 0; i < items.Count; i++)
+                {
+                    if (items[i].Expression.Equals(hidden.Expression))
+                    {
+                        reuse = i;
+                        break;
+                    }
+                }
+            }
+
+            if (reuse >= 0)
+            {
+                hiddenAt[j] = reuse;
+                continue;
+            }
+
+            hiddenAt[j] = items.Count;
+            items.Add(hidden);
+            columns.Add(project.Schema[visibleCount + j]);
+        }
+
+        return items.Count == project.Projections.Count
+            ? plan
+            : new ProjectPlan(project.Input, items, new Schema(columns));
     }
 
     /// <summary>

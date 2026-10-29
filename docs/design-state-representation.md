@@ -188,6 +188,76 @@ lower B/ev everywhere. If it ships, `PartitionedTopKNarrowOp` and the §22 selec
 seam become dead code apart from the legacy arm, and can be retired together with the
 legacy arm once restore compatibility has been dealt with.
 
+### 4A.1 No duplicated partition/order columns (`exp/state-r3-looseends`)
+
+**Built.** The resolver (`TryResolvePartitionedTopK`) used to append every PARTITION
+BY / ORDER BY expression as a hidden trailing column of the window input, even when
+the expression was a bare column already in the select list. That is how q18's TOP-K
+row carried bidder, auction and date_time twice. `ReuseVisibleColumnsForHidden` now
+points such a key at the existing column and drops the copy. It also folds a key
+repeated across PARTITION BY and ORDER BY onto one hidden column. Computed keys
+(`v + 1`) and keys over non-selected columns stay hidden as before. The visible
+prefix, the strip projection above the TOP-K and every result are unchanged. The
+resolver is shared, so the structural and typed paths both get the narrower row.
+
+A second effect is larger than the bytes saved in the row. With no hidden columns
+left, q18/q19's window-input projection and strip projection become identities. The
+optimizer then removes them: the structural q18-shape circuit goes from three
+operators to one, and the typed path loses the same two per-row projections.
+
+**Results** (1M events, batch 10k, W=1, `NEXMARK_GEN=feldera`; both arms built clean
+from the same tree, differing only in the resolver; output rows identical):
+
+| query | live bytes before → after | Δ | B/ev w1profile before → after | B/ev decay (mean of 5) |
+|---|---|---|---|---|
+| q9 | 284,998,848 → **231,742,040** | −18.7% | 1022 → **949** (−7.1%) | 994 → 921 |
+| q18 | 641,558,456 → **594,180,832** | −7.4% | 1070 → **860** (−19.6%) | 1070 → 860 |
+| q19 | 656,960,736 → **619,202,400** | −5.7% | 1081 → **879** (−18.7%) | 1083 → 879 |
+
+The other w1profile rungs are byte-identical.
+
+**Tests.** `PartitionedTopKHiddenColumnTests` has three parts:
+- plan-shape tests: bare selected keys (one of them aliased) are reused, while
+  computed and unselected keys stay hidden and a repeated key shares one column;
+- a differential PBT (600 cases, structural and typed): a query with bare keys must
+  emit, tick for tick, exactly what the same query emits with every key spelled as
+  a computed identity (`c + 0`, `LOWER(h)`). The computed form keeps the old
+  hidden-column shape, which is asserted. The domain covers aliased, reordered and
+  partially-selected select lists, NULLable and VARCHAR keys, multi-key PARTITION
+  BY / ORDER BY, and ROW_NUMBER / RANK / DENSE_RANK.
+
+Three mutations were caught, each after a clean rebuild:
+- reusing the wrong visible column (24 TOP-K tests fail);
+- a stale index for kept hidden columns after a removal (caught only by the new
+  tests);
+- reusing any column regardless of identity (26 fail).
+
+**Snapshot compatibility: old snapshots do not restore, and no alias can fix that.**
+Tested cross-process, writing with the old binary and reading with the new one, on a
+q18-shaped query:
+- **Structural path:** the plan fingerprint changes. The two identity projections
+  are gone, so the operator list and every operator's position differ, and the
+  TOP-K's persisted row is 4 columns instead of 6. `IFingerprintAlias` substitutes
+  one operator's type in place. It cannot express removed operators, shifted
+  indices or a different payload shape. Restoring an old snapshot would need a
+  compile-time compatibility switch that keeps the duplicate columns. That switch
+  has not been built. Old→old and new→new restore fine.
+- **Typed path: pre-existing, and broader than this change.** A typed-path snapshot
+  never restores in another process, *even with the same binary*. The plan
+  fingerprint hashes `Type.FullName` of each operator, and the typed row and key
+  structs are emitted as `TypedRow_<random GUID>` (`TypedRowEmitter.BuildTypeFor`).
+  Each process therefore computes a different fingerprint. In-process round trips,
+  which is what every snapshot test does, pass because the emitter caches the
+  types. So §4A's "pre-arc snapshots fail" risk, and §4G's legacy→linear alias,
+  only ever held in-process on the typed path. Making typed snapshots portable needs
+  a deterministic emitted name (e.g. a hash of the field-type fingerprint) or a
+  fingerprint that hashes schemas instead of CLR names.
+
+**Recommendation: ship.** It is a deterministic memory and allocation win on all
+three queries with identical output. Its compatibility cost is confined to
+structural-path snapshots of windowed TOP-K queries, which (like every
+operator-shape change) need a re-snapshot. Fix the typed fingerprint separately.
+
 ## 4B. Variant B — COUNT(DISTINCT) and MIN/MAX sub-state (`exp/state-B-distinct`)
 
 **Built** (`TypedCompactAggregatorState.cs`, default-on via `CompactAggregatorStateMode`,
