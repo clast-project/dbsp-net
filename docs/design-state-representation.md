@@ -1122,6 +1122,13 @@ barely registers, because every aggregate chain the census found starts at a vie
 reference. That is lever 3, which is now also the largest remainder (~3 GiB of
 view-boundary chains).
 
+**Typed path (Nexmark):** half the pattern. `TypedPlanCompiler`'s join refuses NULLable keys,
+so there is no NULL-key filter. But a projected input (join-column pruning inserts exactly
+these) still reaches `InvokeExchangeIndex` as its own MapRows/MapFilterRows operator: one
+throwaway Z-set per join input. Fusing it needs the same pre-step on the reflection-bound
+`InvokeExchangeIndex`/`InvokeGroupProject` calls (the typed-compiler reflection landmine).
+It is a follow-up, measured by w1profile B/ev on q3/q4/q9/q20.
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
