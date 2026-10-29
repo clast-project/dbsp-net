@@ -432,16 +432,40 @@ public sealed class ProgramRunner
                     $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms ({share,4:F1}%)  alloc {op.AllocBytes / (1024.0 * 1024.0),8:F1} MiB  state={op.RetainedRows,-8} out={op.LastOutputRows,-6} {op.Label}"));
             }
 
-            // DBSPNET_PROFILE_VIEW=<view>: every operator of one view, in circuit order,
-            // so a view's whole chain (not just its top-30 members) can be read.
-            if (Environment.GetEnvironmentVariable("DBSPNET_PROFILE_VIEW") is { Length: > 0 } view)
+            // By VIEW: sums time and allocation across every operator a view owns, so the
+            // costliest views (and how much of each is ApplyOp) can be ranked directly.
+            sb.AppendLine();
+            sb.AppendLine("-- by view (cumulative; top 20) --");
+            var byView = operators
+                .GroupBy(o => o.Label)
+                .Select(g => (
+                    View: g.Key,
+                    Count: g.Count(),
+                    Ms: g.Sum(o => o.CumulativeMs),
+                    Alloc: g.Sum(o => o.AllocBytes),
+                    ApplyMs: g.Where(o => o.Name == "ApplyOp").Sum(o => o.CumulativeMs)))
+                .OrderByDescending(g => g.Ms)
+                .Take(20);
+            foreach (var g in byView)
             {
-                sb.AppendLine();
-                sb.AppendLine("-- all operators of view '" + view + "' (circuit order) --");
-                foreach (var op in operators.Where(o => o.Label == view).OrderBy(o => o.Index))
+                var msShare = stepMs > 0 ? g.Ms / stepMs * 100.0 : 0.0;
+                sb.AppendLine(FormattableString.Invariant(
+                    $"  {g.View,-28} x{g.Count,-4} {g.Ms,8:F1} ms ({msShare,4:F1}%)  alloc {g.Alloc / (1024.0 * 1024.0),8:F1} MiB  of which ApplyOp {g.ApplyMs,8:F1} ms"));
+            }
+
+            // DBSPNET_PROFILE_VIEW=<view>[,<view>...]: every operator of each view, in
+            // circuit order, so a view's whole chain (not just its top-30 members) can be read.
+            if (Environment.GetEnvironmentVariable("DBSPNET_PROFILE_VIEW") is { Length: > 0 } views)
+            {
+                foreach (var view in views.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 {
-                    sb.AppendLine(FormattableString.Invariant(
-                        $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms  alloc {op.AllocBytes / (1024.0 * 1024.0),8:F1} MiB  state={op.RetainedRows,-8} out={op.LastOutputRows,-6}"));
+                    sb.AppendLine();
+                    sb.AppendLine("-- all operators of view '" + view + "' (circuit order) --");
+                    foreach (var op in operators.Where(o => o.Label == view).OrderBy(o => o.Index))
+                    {
+                        sb.AppendLine(FormattableString.Invariant(
+                            $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms  alloc {op.AllocBytes / (1024.0 * 1024.0),8:F1} MiB  state={op.RetainedRows,-8} out={op.LastOutputRows,-6}"));
+                    }
                 }
             }
 
