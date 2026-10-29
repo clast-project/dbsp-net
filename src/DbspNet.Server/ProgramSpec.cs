@@ -47,13 +47,17 @@ public sealed record OutputSpec(string View, string Uri, string? Mode = null);
 /// <summary>Result of a deploy: the compile time (excluded from measured batch duration,
 /// as Feldera excludes its Rust compile), the binding counts, whether per-batch state
 /// persistence is on, and the engine tick restored from a pre-existing checkpoint (0 =
-/// fresh start, the normal benchmark case).</summary>
+/// fresh start, the normal benchmark case). <paramref name="Workers"/> is the replica count
+/// the program runs on (1 = the serial program); <paramref name="SerialFallback"/> says why a
+/// deploy asked for more workers ran serially, and is null otherwise.</summary>
 public sealed record DeployResult(
     double CompileTimeS,
     int InputCount,
     int OutputCount,
     bool Persistent = false,
-    long RestoredTick = 0);
+    long RestoredTick = 0,
+    int Workers = 1,
+    string? SerialFallback = null);
 
 /// <summary>Result of resume: the epoch second the batch timer started.</summary>
 public sealed record ResumeResult(long ResumedAtEpochS);

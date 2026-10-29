@@ -13,13 +13,22 @@ namespace DbspNet.Connectors.Abstractions;
 
 /// <summary>
 /// Drives a whole <see cref="CompiledProgram"/> (a DAG of views maintained as one
-/// circuit) from N input connectors (one per source table, matched by
+/// circuit) — or its data-parallel counterpart, a <see cref="ParallelCompiledProgram"/>
+/// (the same DAG replicated across W workers, inputs sharded, outputs gathered) — from N
+/// input connectors (one per source table, matched by
 /// <see cref="IInputConnector.Name"/>) to M output connectors (one per output view,
 /// matched by <see cref="IOutputConnector.ViewName"/>). Table schemas are <b>declared</b>
 /// by the program (from <c>CREATE TABLE</c>), so each input connector validates its Delta
 /// source against the declared schema. Output is per-batch (truncate): drain all currently
 /// available source versions, then write every output view's full contents once — the
 /// natural model for an ivm-bench batch. See <c>docs/design-connectors.md</c>.
+/// <para>
+/// The two program kinds differ only behind <see cref="RunnerProgram"/> (ingest, step,
+/// output reads); the batch loop, incremental-output bookkeeping and profile are shared.
+/// A parallel program cannot be checkpointed through this runner (<see cref="ICheckpointStore"/>
+/// snapshots a single circuit), so <see cref="CreateAsync(ParallelCompiledProgram, IReadOnlyList{IInputConnector}, IReadOnlyList{IOutputConnector}, CancellationToken)"/>
+/// takes no store.
+/// </para>
 /// </summary>
 public sealed class ProgramRunner
 {
@@ -28,9 +37,9 @@ public sealed class ProgramRunner
     private static readonly bool ProfileEnabled =
         Environment.GetEnvironmentVariable("DBSPNET_PROFILE") is "1" or "true" or "TRUE";
 
-    private readonly CompiledProgram _program;
+    private readonly RunnerProgram _program;
     private readonly List<InputBinding> _inputs;
-    private readonly List<(IOutputConnector Connector, ProgramOutput Output)> _outputs;
+    private readonly List<(IOutputConnector Connector, RunnerOutput Output)> _outputs;
 
     // Incremental-mode outputs: each one's net change since its last write, summed over the
     // ticks in between, and whether it has been written in this process (the first write
@@ -47,12 +56,16 @@ public sealed class ProgramRunner
     private readonly BatchProfile? _profile = ProfileEnabled ? new BatchProfile() : null;
 
     private ProgramRunner(
-        CompiledProgram program,
+        RunnerProgram program,
+        CompiledProgram? serial,
+        ParallelCompiledProgram? parallel,
         List<InputBinding> inputs,
-        List<(IOutputConnector, ProgramOutput)> outputs,
+        List<(IOutputConnector, RunnerOutput)> outputs,
         ICheckpointStore? checkpoint)
     {
         _program = program;
+        Program = serial;
+        ParallelProgram = parallel;
         _inputs = inputs;
         _outputs = outputs;
         foreach (var (connector, _) in outputs)
@@ -65,7 +78,23 @@ public sealed class ProgramRunner
         _checkpoint = checkpoint;
     }
 
-    public CompiledProgram Program => _program;
+    /// <summary>The serial program this runner drives, or <c>null</c> when it drives a
+    /// <see cref="ParallelProgram"/>.</summary>
+    public CompiledProgram? Program { get; }
+
+    /// <summary>The data-parallel program this runner drives, or <c>null</c> when it
+    /// drives a serial <see cref="Program"/>.</summary>
+    public ParallelCompiledProgram? ParallelProgram { get; }
+
+    /// <summary>The worker count W (1 for a serial program).</summary>
+    public int Workers => ParallelProgram?.Workers ?? 1;
+
+    /// <summary>Engine ticks completed so far.</summary>
+    public long TickCount => _program.TickCount;
+
+    /// <summary>Every output view the program materialises — including views computed but
+    /// bound to no connector — with its current distinct-row count.</summary>
+    public IEnumerable<KeyValuePair<string, long>> ViewRowCounts() => _program.ViewRowCounts();
 
     /// <summary>True when this runner was wired with a checkpoint store, so each
     /// <see cref="RunBatchAsync"/> ends with a durable state snapshot.</summary>
@@ -96,13 +125,45 @@ public sealed class ProgramRunner
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
+        var runnerProgram = RunnerProgram.Of(program);
+        var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
+        return new ProgramRunner(runnerProgram, program, null, ins, outs, checkpoint);
+    }
+
+    /// <summary>
+    /// Wire connectors to a data-parallel program: the same binding and validation as the
+    /// serial overload, with each source's versions pushed into a sharded input (split
+    /// across the replicas by whole-row hash) and each output read as the gathered
+    /// (replica-summed) view and per-tick delta. Batch semantics and output modes are
+    /// identical to the serial runner. No checkpoint store: the parallel program's state
+    /// is per-worker (<c>ParallelSnapshot</c>), which <see cref="ICheckpointStore"/> does not
+    /// model.
+    /// </summary>
+    public static async ValueTask<ProgramRunner> CreateAsync(
+        ParallelCompiledProgram program,
+        IReadOnlyList<IInputConnector> inputs,
+        IReadOnlyList<IOutputConnector> outputs,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(program);
+        var runnerProgram = RunnerProgram.Of(program);
+        var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
+        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint: null);
+    }
+
+    private static async ValueTask<(List<InputBinding>, List<(IOutputConnector, RunnerOutput)>)> BindAsync(
+        RunnerProgram program,
+        IReadOnlyList<IInputConnector> inputs,
+        IReadOnlyList<IOutputConnector> outputs,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(inputs);
         ArgumentNullException.ThrowIfNull(outputs);
 
         var inputBindings = new List<InputBinding>(inputs.Count);
         foreach (var connector in inputs)
         {
-            if (!program.Inputs.TryGetValue(connector.Name, out var tableInput))
+            if (!program.TryGetInput(connector.Name, out var tableInput))
             {
                 throw new ArgumentException(
                     $"input connector '{connector.Name}' does not match any program source table");
@@ -113,10 +174,10 @@ public sealed class ProgramRunner
             inputBindings.Add(new InputBinding(connector, tableInput, connector.InitialOffset));
         }
 
-        var outputBindings = new List<(IOutputConnector, ProgramOutput)>(outputs.Count);
+        var outputBindings = new List<(IOutputConnector, RunnerOutput)>(outputs.Count);
         foreach (var connector in outputs)
         {
-            if (!program.Outputs.TryGetValue(connector.ViewName, out var programOutput))
+            if (!program.TryGetOutput(connector.ViewName, out var programOutput))
             {
                 throw new ArgumentException(
                     $"output connector '{connector.ViewName}' does not match any program output view");
@@ -126,7 +187,7 @@ public sealed class ProgramRunner
             outputBindings.Add((connector, programOutput));
         }
 
-        return new ProgramRunner(program, inputBindings, outputBindings, checkpoint);
+        return (inputBindings, outputBindings);
     }
 
     /// <summary>
@@ -143,7 +204,7 @@ public sealed class ProgramRunner
             return 0;
         }
 
-        var state = await _checkpoint.TryRestoreAsync(_program.Circuit, cancellationToken).ConfigureAwait(false);
+        var state = await _checkpoint.TryRestoreAsync(_program.SerialCircuit!, cancellationToken).ConfigureAwait(false);
         if (state is null)
         {
             return 0;
@@ -176,7 +237,7 @@ public sealed class ProgramRunner
         var offsets = _inputs
             .Select(b => new SourceCheckpoint(b.Connector.Name, b.Cursor.Serialize()))
             .ToList();
-        return _checkpoint.SaveAsync(_program.Circuit, offsets, cancellationToken);
+        return _checkpoint.SaveAsync(_program.SerialCircuit!, offsets, cancellationToken);
     }
 
     /// <summary>Ingest every source version currently available (one engine tick per
@@ -250,7 +311,7 @@ public sealed class ProgramRunner
     /// Call after <see cref="DrainAsync"/> to materialise a batch's results.</summary>
     public async ValueTask WriteOutputsAsync(CancellationToken cancellationToken = default)
     {
-        var tick = _program.Circuit.TickCount;
+        var tick = _program.TickCount;
         foreach (var (connector, output) in _outputs)
         {
             if (_incremental.TryGetValue(connector, out var incremental))
@@ -283,7 +344,7 @@ public sealed class ProgramRunner
         {
             if (_incremental.TryGetValue(connector, out var incremental) && incremental.Written)
             {
-                foreach (var (row, weight) in output.View.LastDelta)
+                foreach (var (row, weight) in output.LastDelta)
                 {
                     incremental.Pending.Add(row, weight);
                 }
@@ -292,7 +353,7 @@ public sealed class ProgramRunner
     }
 
     private async ValueTask WriteIncrementalAsync(
-        IOutputConnector connector, ProgramOutput output, IncrementalOutput incremental, long tick,
+        IOutputConnector connector, RunnerOutput output, IncrementalOutput incremental, long tick,
         CancellationToken cancellationToken)
     {
         // The first write in this process carries the whole view (the connector truncates
@@ -326,8 +387,8 @@ public sealed class ProgramRunner
             // Resume→RunBatch prints a clean profile (comparable across batches).
             _profile.Reset();
             _profile.BeginGc();
-            _program.Circuit.ProfileOperators = true;
-            _program.Circuit.ResetOperatorProfile();
+            _program.ProfileOperators = true;
+            _program.ResetOperatorProfile();
         }
 
         var wall0 = Stopwatch.GetTimestamp();
@@ -348,7 +409,7 @@ public sealed class ProgramRunner
         {
             _profile.TotalTicks = Stopwatch.GetTimestamp() - wall0;
             _profile.EngineTicks = ticks;
-            var report = _profile.BuildReport(_program.Circuit.CollectOperatorProfile());
+            var report = _profile.BuildReport(_program.CollectOperatorProfile(), Workers);
             Console.Error.WriteLine(report);
 
             // Optionally persist the report so it survives harness container teardown:
@@ -373,11 +434,11 @@ public sealed class ProgramRunner
         return ticks;
     }
 
-    private sealed class InputBinding(IInputConnector connector, DbspNet.Sql.Compiler.TableInput tableInput, IConnectorOffset cursor)
+    private sealed class InputBinding(IInputConnector connector, RunnerInput tableInput, IConnectorOffset cursor)
     {
         public IInputConnector Connector { get; } = connector;
 
-        public DbspNet.Sql.Compiler.TableInput TableInput { get; } = tableInput;
+        public RunnerInput TableInput { get; } = tableInput;
 
         public IConnectorOffset Cursor { get; set; } = cursor;
     }
@@ -436,7 +497,7 @@ public sealed class ProgramRunner
             return acc;
         }
 
-        public string BuildReport(IReadOnlyList<OperatorProfile> operators)
+        public string BuildReport(IReadOnlyList<OperatorProfile> operators, int workers)
         {
             static double Ms(long ticks) => ticks * MsPerTick;
 
@@ -450,7 +511,13 @@ public sealed class ProgramRunner
             sb.AppendLine(FormattableString.Invariant(
                 $"engine build: {(string.IsNullOrEmpty(commit) ? "(DBSPNET_COMMIT unset)" : commit)}"));
             sb.AppendLine(FormattableString.Invariant(
-                $"batch wall {Ms(TotalTicks):F0} ms over {EngineTicks} engine tick(s)"));
+                $"batch wall {Ms(TotalTicks):F0} ms over {EngineTicks} engine tick(s), workers W={workers}"));
+            if (workers > 1)
+            {
+                // Operator rows are summed over the W replicas: worker time, not wall, so
+                // their shares of "engine step" (a wall time) can exceed 100%.
+                sb.AppendLine("operator times are summed over workers (CPU time, not wall)");
+            }
             var allocGiB = (GC.GetTotalAllocatedBytes() - _allocStart) / (1024.0 * 1024.0 * 1024.0);
             sb.AppendLine(FormattableString.Invariant(
                 $"allocated {allocGiB:F2} GiB   GC gen0/1/2 = {GC.CollectionCount(0) - _gen0Start}/{GC.CollectionCount(1) - _gen1Start}/{GC.CollectionCount(2) - _gen2Start}   ServerGC={System.Runtime.GCSettings.IsServerGC} procs={Environment.ProcessorCount}"));

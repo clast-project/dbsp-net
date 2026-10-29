@@ -486,3 +486,46 @@ race-free, so it stays a plain static.)
 **Still open:** this does not by itself give a parallel `ProgramRunner` (§9.5), and nothing here is
 measured on a real sharded program — the probe is W=1 and synthetic, though the mechanism does not
 depend on W.
+
+### 10.6 BUILT — the parallel `ProgramRunner` and the server's worker setting (2026-10-29)
+
+Closes §10.5's "still open". `ProgramRunner` now drives either program kind through one batch loop.
+The two kinds differ only behind an internal `RunnerProgram` (`src/DbspNet.Connectors.Abstractions/RunnerProgram.cs`):
+inputs (`TableInput` vs `ShardedTableInput`), `Step`, and outputs as *current view + last tick's delta*.
+That is all the runner reads, so a forked runner would have duplicated the drain loop, the
+incremental-output bookkeeping and the profile for no gain.
+
+- **Outputs.** A parallel output's view is `ParallelProgramOutput.CurrentView` (the sum of the W
+  in-circuit integrals, §10.5) and its per-tick delta is `CurrentDelta` (the gathered, replica-summed
+  delta). Incremental mode sums `CurrentDelta` between writes exactly as it sums the serial
+  `IntegratedViewHandle.LastDelta`; truncate mode writes `CurrentView`.
+- **Ingest.** `ArrowExtensions.PushArrow(this ShardedTableInput, …)` runs the same column-major decode
+  as the serial push and hands it to `ShardedTableInput.Push`, which splits it by whole-row hash. The
+  serial path is unchanged (the shared decoder now takes the schema instead of the `TableInput`).
+- **Profile.** `DBSPNET_PROFILE` works for both. A parallel program's operator rows are summed over
+  the replicas (`ParallelCircuit.CollectOperatorProfile`), so they are worker CPU time, not wall.
+- **Server.** `DBSPNET_WORKERS` (default 1, the serial program). With W > 1, `DeployAsync` calls
+  `SqlProgram.TryCompileParallel`; if any reachable view does not shard it runs the serial program
+  and logs every blocking view and construct to stderr (`SqlProgram.ParallelBlockers`, the
+  program-level form of `PlanToCircuit.ParallelBlockers`). `DeployResult.Workers` and
+  `SerialFallback` report the choice.
+- **Checkpointing forces serial.** With a snapshot directory and W > 1 the deploy runs serially
+  (logged). The runner's `ICheckpointStore` snapshots one `RootCircuit` with the source offsets in its
+  manifest; the per-worker `ParallelSnapshot` has no offset-atomic store yet. The ivm-bench
+  deployment sets no snapshot directory, so it is unaffected.
+
+**Correctness.** `ParallelProgramRunnerTests` runs the same random multi-batch insert/delete stream
+through a serial and a W=4 runner, each writing Delta outputs, over a program of inner joins, a
+re-keying aggregate over a join, GROUP BY, DISTINCT, UNION ALL, a partitioned TOP-K, a rank in the
+output and a window aggregate. After every batch the two views are equal and each Delta table read
+back equals its engine's view, in incremental and truncate mode. Verified by mutation: dropping one
+replica's shard from the gathered delta fails every incremental case; dropping one replica's integral
+from the view fails every case; keeping only a batch's last tick fails every incremental case (serial
+and parallel). `DbspNetEngineTests` covers the server: W=4 runs a shardable program in parallel; an
+`EXCEPT` view falls back to serial and names itself; a snapshot directory forces serial. All three
+stay equal to a batch re-computation over three Delta batches.
+
+**For a newly-shardable construct:** nothing in the runner changes. It needs only what every view
+already gets from `TryCompileProgramParallel`: a view whose gathered delta and summed integral equal
+the serial program's. Add it to `ParallelProgramRunnerTests.ProgramSql`, which checks exactly that
+through the runner.

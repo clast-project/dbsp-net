@@ -135,9 +135,55 @@ public sealed class DbspNetEngineTests : IDisposable
     [Fact]
     public async Task Deploy_Resume_Wait_AcrossBatches_MatchesBatch()
     {
-        var companyDir = Path.Combine(_root, "company");
-        var tradeDir = Path.Combine(_root, "trade");
-        var totalsDir = Path.Combine(_root, "out_totals");
+        var deploy = await RunTwoBatches(new DbspNetEngine(), ProgramSql, "serial");
+        Assert.Equal(1, deploy.Workers);
+        Assert.Null(deploy.SerialFallback);
+    }
+
+    /// <summary>With workers > 1 and a program whose every view shards, the engine runs the
+    /// data-parallel program — Delta in, sharded push, gathered incremental Delta out — and the
+    /// sink still equals the batch re-computation after every batch.</summary>
+    [Fact]
+    public async Task Workers4_ShardableProgram_RunsParallel_AndMatchesBatch()
+    {
+        var deploy = await RunTwoBatches(new DbspNetEngine(workers: 4), ProgramSql, "parallel");
+        Assert.Equal(4, deploy.Workers);
+        Assert.Null(deploy.SerialFallback);
+    }
+
+    /// <summary>A program with a view the parallel compile refuses (EXCEPT) falls back to the
+    /// serial program, says which view and construct blocked it, and stays correct.</summary>
+    [Fact]
+    public async Task Workers4_UnshardableProgram_FallsBackToSerial_AndMatchesBatch()
+    {
+        var sql = ProgramSql.Append(
+            "CREATE VIEW traded_only AS SELECT company_id FROM trade EXCEPT SELECT company_id FROM company").ToArray();
+        var deploy = await RunTwoBatches(
+            new DbspNetEngine(workers: 4), sql, "fallback", storedViews: new[] { "traded_only" });
+        Assert.Equal(1, deploy.Workers);
+        Assert.NotNull(deploy.SerialFallback);
+        Assert.Contains("traded_only", deploy.SerialFallback, StringComparison.Ordinal);
+        Assert.Contains("EXCEPT", deploy.SerialFallback, StringComparison.Ordinal);
+    }
+
+    /// <summary>Checkpointing configured with workers > 1 runs serially: only the serial
+    /// program checkpoints through the runner.</summary>
+    [Fact]
+    public async Task Workers4_WithSnapshotDir_RunsSerial()
+    {
+        var deploy = await RunTwoBatches(
+            new DbspNetEngine(workers: 4), ProgramSql, "persistent", snapshotDir: Path.Combine(_root, "snap"));
+        Assert.True(deploy.Persistent);
+        Assert.Equal(1, deploy.Workers);
+        Assert.Contains("checkpoint", deploy.SerialFallback, StringComparison.Ordinal);
+    }
+
+    private async Task<DeployResult> RunTwoBatches(
+        DbspNetEngine engine, string[] sql, string prefix, string[]? storedViews = null, string? snapshotDir = null)
+    {
+        var companyDir = Path.Combine(_root, prefix, "company");
+        var tradeDir = Path.Combine(_root, prefix, "trade");
+        var totalsDir = Path.Combine(_root, prefix, "out_totals");
         Directory.CreateDirectory(totalsDir);
 
         var companyNet = new List<object?[]>();
@@ -148,13 +194,14 @@ public sealed class DbspNetEngineTests : IDisposable
         var trade = await CreateTable(tradeDir, TradeSchema());
         await Append(trade, TradeSchema(), tradeNet, new object?[] { 10, 1, 50 }, new object?[] { 11, 2, 30 });
 
-        var resolved = SqlProgram.Resolve(ProgramSql, OutputViews);
+        var resolved = SqlProgram.Resolve(sql, OutputViews);
 
-        var engine = new DbspNetEngine();
         var spec = new ProgramSpec(
-            ProgramSql,
+            sql,
             new[] { new InputSpec("company", companyDir), new InputSpec("trade", tradeDir) },
-            new[] { new OutputSpec("company_totals", totalsDir) });
+            new[] { new OutputSpec("company_totals", totalsDir) },
+            SnapshotDir: snapshotDir,
+            StoredViews: storedViews);
 
         var deploy = await engine.DeployAsync(spec);
         Assert.Equal(2, deploy.InputCount);
@@ -164,8 +211,7 @@ public sealed class DbspNetEngineTests : IDisposable
         var resume1 = engine.Resume();
         Assert.True(resume1.ResumedAtEpochS > 0);
         var wait1 = await engine.WaitAsync();
-        Assert.Single(wait1.Outputs);
-        Assert.Equal("company_totals", wait1.Outputs[0].View);
+        Assert.Contains(wait1.Outputs, o => o.View == "company_totals");
         Assert.All(wait1.Outputs, o => Assert.Equal("success", o.Status));
         Assert.True((await ReadTotals(totalsDir)).Equals(BatchTotals(resolved, NetOf(companyNet), NetOf(tradeNet))));
 
@@ -178,9 +224,19 @@ public sealed class DbspNetEngineTests : IDisposable
         Assert.True(wait2.Ticks >= 1);
         Assert.True((await ReadTotals(totalsDir)).Equals(BatchTotals(resolved, NetOf(companyNet), NetOf(tradeNet))));
 
+        // Batch 3 (append): another company version, and a trade for a company with none.
+        await Append(company, CompanySchema(), companyNet, new object?[] { 2, 201, 3 }, new object?[] { 3, 300, 1 });
+        await Append(trade, TradeSchema(), tradeNet, new object?[] { 14, 3, 5 }, new object?[] { 15, 4, 7 });
+
+        engine.Resume();
+        await engine.WaitAsync();
+        Assert.True((await ReadTotals(totalsDir)).Equals(BatchTotals(resolved, NetOf(companyNet), NetOf(tradeNet))));
+
         company.Dispose();
         trade.Dispose();
+        return deploy;
     }
+
     /// <summary>
     /// A view declared `+stored: true` with no output connector must still be COMPUTED. ivm-bench
     /// has two (fact_market_history, daily_market_pulse): Feldera computes them and the benchmark

@@ -34,14 +34,34 @@ public sealed class DbspNetEngine
         ? OutputMode.Truncate
         : OutputMode.Incremental;
 
+    // Worker count W. DBSPNET_WORKERS > 1 compiles the program data-parallel across W
+    // replicas when every view shards, and falls back to the serial program (logged) when
+    // one does not. Default 1: the serial program, today's behaviour.
+    private static readonly int WorkersSetting =
+        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_WORKERS"), out var w) && w > 1 ? w : 1;
+
+    private readonly int _workers;
     private readonly object _gate = new();
     private readonly List<IInputConnector> _inputs = new();
     private readonly List<IOutputConnector> _outputs = new();
     private ProgramRunner? _runner;
-    private CompiledProgram? _program;
     private Task<long>? _batch;
     private long _resumedAtEpochS;
     private readonly Stopwatch _batchTimer = new();
+
+    /// <summary>An engine whose worker count comes from <c>DBSPNET_WORKERS</c> (default 1).</summary>
+    public DbspNetEngine()
+        : this(WorkersSetting)
+    {
+    }
+
+    /// <summary>An engine that runs programs across <paramref name="workers"/> replicas when
+    /// they shard (see <see cref="DeployAsync"/>).</summary>
+    public DbspNetEngine(int workers)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
+        _workers = workers;
+    }
 
     /// <summary>Compile the program, wire its Delta connectors, and validate each source
     /// against its declared table schema. Idempotent-replace: a second deploy discards the
@@ -52,6 +72,16 @@ public sealed class DbspNetEngine
     /// codecs and wired to a <see cref="SnapshotCheckpointStore"/>, so every batch ends
     /// durable and a redeploy resumes from the last checkpoint. Restore happens here, in
     /// deploy — outside the measured batch span, like the compile.
+    /// </para>
+    /// <para>
+    /// With more than one worker (<c>DBSPNET_WORKERS</c>), the program is compiled
+    /// data-parallel (<see cref="SqlProgram.TryCompileParallel"/>) and driven by the same
+    /// runner. It falls back to the serial program, and logs why to stderr, when any view the
+    /// outputs reach cannot be sharded, and also when persistence is on: the runner's
+    /// checkpoint store snapshots one serial circuit and the per-worker parallel snapshot has
+    /// no offset-atomic store yet, so a persistent deploy is always serial.
+    /// <see cref="DeployResult.Workers"/> and <see cref="DeployResult.SerialFallback"/> report
+    /// what was chosen.
     /// </para></summary>
     public async Task<DeployResult> DeployAsync(ProgramSpec spec, CancellationToken cancellationToken = default)
     {
@@ -73,10 +103,36 @@ public sealed class DbspNetEngine
         // and Feldera (Calcite) sorts NULLs low by default (last under DESC).
         // The snapshot codecs are registered at construction and touched only by
         // Save/Load — a persistent compile Steps identically to a non-persistent one.
-        var program = SqlProgram.Compile(
-            spec.Program, outputViews,
-            snapshotCodecs: persistent ? ArrowSqlSnapshotCodecs.Instance : null,
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+        ParallelCompiledProgram? parallel = null;
+        string? fallback = null;
+        if (_workers > 1 && persistent)
+        {
+            fallback = "checkpointing is configured, and only the serial program checkpoints";
+        }
+        else if (_workers > 1
+            && !SqlProgram.TryCompileParallel(
+                spec.Program, outputViews, _workers, out parallel,
+                numericStringCoercion: true, nullCollation: NullCollation.Low))
+        {
+            var blockers = SqlProgram.ParallelBlockers(
+                spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+            fallback = "views that do not shard: " + (blockers.Count == 0
+                ? "(none reported)"
+                : string.Join("; ", blockers.Select(b => b.View + " [" + string.Join(", ", b.Blockers) + "]")));
+        }
+
+        if (fallback is not null)
+        {
+            Console.Error.WriteLine(
+                $"dbspnet: DBSPNET_WORKERS={_workers} but running the program SERIALLY — {fallback}");
+        }
+
+        var program = parallel is null
+            ? SqlProgram.Compile(
+                spec.Program, outputViews,
+                snapshotCodecs: persistent ? ArrowSqlSnapshotCodecs.Instance : null,
+                numericStringCoercion: true, nullCollation: NullCollation.Low)
+            : null;
 
         var inputs = spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, i.Uri))
@@ -89,24 +145,40 @@ public sealed class DbspNetEngine
             ? new SnapshotCheckpointStore(new LocalTableFileSystem(snapshotDir!))
             : null;
 
-        var runner = await ProgramRunner.CreateAsync(program, inputs, outputs, checkpoint, cancellationToken)
-            .ConfigureAwait(false);
+        ProgramRunner runner;
+        try
+        {
+            runner = parallel is not null
+                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, cancellationToken).ConfigureAwait(false)
+                : await ProgramRunner.CreateAsync(program!, inputs, outputs, checkpoint, cancellationToken)
+                    .ConfigureAwait(false);
+        }
+        catch
+        {
+            parallel?.Dispose();
+            throw;
+        }
 
         var restoredTick = await runner.RestoreAsync(cancellationToken).ConfigureAwait(false);
 
+        ProgramRunner? previous;
         lock (_gate)
         {
+            previous = _runner;
             _runner = runner;
-            _program = program;
             _inputs.Clear();
             _inputs.AddRange(inputs);
             _outputs.Clear();
             _outputs.AddRange(outputs);
         }
 
+        // A replaced parallel program owns W worker threads.
+        previous?.ParallelProgram?.Dispose();
+
         sw.Stop();
         return new DeployResult(
-            sw.Elapsed.TotalSeconds, inputs.Count, outputs.Count, persistent, restoredTick);
+            sw.Elapsed.TotalSeconds, inputs.Count, outputs.Count, persistent, restoredTick,
+            runner.Workers, fallback);
     }
 
     /// <summary>Start ingesting the current batch (all source versions available now) in
@@ -172,15 +244,14 @@ public sealed class DbspNetEngine
         lock (_gate)
         {
             return new EngineStats(
-                Deployed: _program is not null,
+                Deployed: _runner is not null,
                 BatchRunning: _batch is { IsCompleted: false },
-                TickCount: _program?.Circuit.TickCount ?? 0,
+                TickCount: _runner?.TickCount ?? 0,
                 Outputs: OutputStats());
         }
     }
 
     private List<OutputStat> OutputStats() =>
-        _program is null
-            ? new List<OutputStat>()
-            : _program.Outputs.Select(kv => new OutputStat(kv.Key, kv.Value.CurrentView.Count)).ToList();
+        _runner?.ViewRowCounts().Select(kv => new OutputStat(kv.Key, kv.Value)).ToList()
+            ?? new List<OutputStat>();
 }

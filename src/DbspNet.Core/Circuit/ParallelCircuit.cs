@@ -170,6 +170,60 @@ public sealed class ParallelCircuit : IDisposable
     public long LogicalTime => _replicas[0].LogicalTime;
 
     /// <summary>
+    /// Turn per-operator profiling on or off on every replica (see
+    /// <see cref="RootCircuit.ProfileOperators"/>). Set between steps.
+    /// </summary>
+    public bool ProfileOperators
+    {
+        get => _replicas[0].ProfileOperators;
+        set
+        {
+            foreach (var replica in _replicas)
+            {
+                replica.ProfileOperators = value;
+            }
+        }
+    }
+
+    /// <summary>Zero every replica's per-operator cumulative timers.</summary>
+    public void ResetOperatorProfile()
+    {
+        foreach (var replica in _replicas)
+        {
+            replica.ResetOperatorProfile();
+        }
+    }
+
+    /// <summary>
+    /// The per-operator profile summed across replicas: every replica is built from
+    /// the same closure, so operator <c>i</c> is the same operator on each. Time and
+    /// allocation are the workers' total (CPU-side, not wall), and the state/output
+    /// row counts are the sum of the shards.
+    /// </summary>
+    public IReadOnlyList<OperatorProfile> CollectOperatorProfile()
+    {
+        var sum = _replicas[0].CollectOperatorProfile().ToArray();
+        for (var w = 1; w < _replicas.Length; w++)
+        {
+            var shard = _replicas[w].CollectOperatorProfile();
+            for (var i = 0; i < sum.Length && i < shard.Count; i++)
+            {
+                var s = shard[i];
+                var a = sum[i];
+                sum[i] = a with
+                {
+                    CumulativeMs = a.CumulativeMs + s.CumulativeMs,
+                    AllocBytes = a.AllocBytes + s.AllocBytes,
+                    RetainedRows = a.RetainedRows < 0 ? a.RetainedRows : a.RetainedRows + s.RetainedRows,
+                    LastOutputRows = a.LastOutputRows < 0 ? a.LastOutputRows : a.LastOutputRows + s.LastOutputRows,
+                };
+            }
+        }
+
+        return sum;
+    }
+
+    /// <summary>
     /// Advance every replica's logical clock to <paramref name="microsSinceEpoch"/>
     /// before a <see cref="Step"/>. Fans the value out to all workers (which are
     /// parked, so this is race-free). See <see cref="RootCircuit.AdvanceTime"/>.

@@ -27,7 +27,7 @@ namespace DbspNet.Sql.Compiler;
 /// Rows are positional; NULL is <c>null</c> in the row slot. Equi-join
 /// semantics drop rows whose join-key contains any NULL.
 /// </remarks>
-public static class PlanToCircuit
+public static partial class PlanToCircuit
 {
     public static CompiledQuery Compile(
         LogicalPlan plan,

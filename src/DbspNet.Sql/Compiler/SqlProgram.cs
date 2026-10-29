@@ -61,6 +61,23 @@ public static class SqlProgram
     }
 
     /// <summary>
+    /// Why <see cref="TryCompileParallel"/> would refuse this program: every view reachable
+    /// from <paramref name="outputViews"/> that the parallel compile cannot shard, with each
+    /// blocking construct described in SQL terms. Empty when every reachable view shards.
+    /// For logging a serial fallback; it does not compile anything.
+    /// </summary>
+    public static IReadOnlyList<(string View, IReadOnlyList<string> Blockers)> ParallelBlockers(
+        IReadOnlyList<string> statements,
+        ISet<string> outputViews,
+        CompileOptions? options = null,
+        bool numericStringCoercion = false,
+        NullCollation nullCollation = NullCollation.High)
+    {
+        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
+        return PlanToCircuit.ProgramParallelBlockers(resolved.Views, options);
+    }
+
+    /// <summary>
     /// Resolve (without compiling) — parse each statement against a shared catalog,
     /// registering each view's schema so later views resolve references to it. Exposed so
     /// callers (and tests) can inspect the resolved plans before / instead of compiling.

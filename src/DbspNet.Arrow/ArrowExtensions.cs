@@ -282,7 +282,7 @@ public static class ArrowExtensions
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(batch);
         ValidateWeights(batch, weights);
-        return DecodeCore(input, batch, weights.ToArray(), zeroCopyStrings: false);
+        return DecodeCore(input.Schema, batch, weights.ToArray(), zeroCopyStrings: false);
     }
 
     private static void ValidateWeights(RecordBatch batch, ReadOnlySpan<long> weights)
@@ -295,14 +295,27 @@ public static class ArrowExtensions
         }
     }
 
+    /// <summary>
+    /// Sharded counterpart of <see cref="PushArrow(TableInput, RecordBatch, ReadOnlySpan{long})"/>
+    /// for a parallel program's source table: the same per-column decode, then one push
+    /// that splits the delta across the replicas by whole-row hash. Strings are copied.
+    /// </summary>
+    public static void PushArrow(
+        this ShardedTableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(batch);
+        ValidateWeights(batch, weights);
+        input.Push(DecodeCore(input.Schema, batch, weights.ToArray(), zeroCopyStrings: false));
+    }
+
     private static void PushArrowCore(
         TableInput input, RecordBatch batch, long[]? weights, bool zeroCopyStrings) =>
-        input.Push(DecodeCore(input, batch, weights, zeroCopyStrings));
+        input.Push(DecodeCore(input.Schema, batch, weights, zeroCopyStrings));
 
     private static List<(object?[] Values, long Weight)> DecodeCore(
-        TableInput input, RecordBatch batch, long[]? weights, bool zeroCopyStrings)
+        SqlSchema schema, RecordBatch batch, long[]? weights, bool zeroCopyStrings)
     {
-        var schema = input.Schema;
         var columnCount = schema.Count;
         if (batch.ColumnCount != columnCount)
         {
