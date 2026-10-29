@@ -141,3 +141,25 @@ bid URLs. Feldera's generator (`../feldera/crates/nexmark/src/generator/strings.
 - **Action:** make the generator Feldera-faithful (random-length `extra`,
   channel-id URLs) behind a switch, and re-take the Phase 0 baselines with it,
   before any variant's wall-clock phase.
+
+### 5.2 The aggregate trace dominates aggregate state (found by variant B)
+
+Variant B (`exp/state-B-distinct`, `7db2dec`/`8ba8d46`) compacted the
+COUNT(DISTINCT) and MIN/MAX sub-states: q4 live state −33% (1.48×), q15 1.15×,
+q16 1.24×. q15/q16 moved little because their distinct sub-state was only
+17% / 27% of live bytes. **The rest is `IncrementalAggregateOp`'s input trace**:
+every input row is kept so aggregators can read post-delta weights.
+
+The trace is only *needed* by non-linear aggregates (MIN/MAX, and
+COUNT(DISTINCT) through its value counts). **Linear aggregates (COUNT, SUM, AVG)
+are exact from running weight sums with no trace at all** — DBSP's linear
+aggregation, which Feldera implements as a separate operator. Candidate **G**:
+elide the trace when every aggregate in a group is linear, or keep per-value
+weight counts in place of the trace for COUNT(DISTINCT). B projects q15 → ~5 MB
+(~20×). Costs: restore needs persisted aggregator state, and frontier GC needs a
+substitute for the trace. It is operator-level work, separate from C/D's
+representation of the trace.
+
+B's open risk: MIN/MAX now rescans the group when the current extreme is
+retracted, instead of O(log n) per row. Validate on a retraction-heavy
+(sliding-window) workload before shipping.
