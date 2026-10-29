@@ -169,3 +169,48 @@ representation of the trace.
 B's open risk: MIN/MAX now rescans the group when the current extreme is
 retracted, instead of O(log n) per row. Validate on a retraction-heavy
 (sliding-window) workload before shipping.
+
+## 6. Phase 1 wall-clock (serialized, idle M4 Pro, 10M events, W=1, legacy generator, 2 reps)
+
+Mean ev/s is the harmonic mean over five 2M-event segments; reps agreed within ~5%.
+
+| variant | query | baseline ev/s | variant ev/s | live state @10M |
+|---|---|---|---|---|
+| **A** compact TOP-K (`exp/state-A-topk` f5592aa) | q18 | 561k / 650k | **1,234k / 1,197k (~2.0×)** | 18,512 → 4,089 MB |
+| | q19 | 919k / 909k | **1,434k / 1,523k (~1.6×)** | 8,189 → 4,993 MB |
+| **B** compact agg state (`exp/state-B-distinct` 7db2dec) | q15 | 940k / 946k | **1,315k / 1,294k (+38%)** | 762 → 582 MB |
+| | q16 | 705k / 721k | **955k / 986k (+35%)** | 2,160 → 1,586 MB |
+| **C** FlatHash (`exp/state-C-flathash` 682ce09) | q4 | 1,592k / 1,614k | 1,353k / 1,386k (**−15%**) | 4,501 → 2,782 MB |
+| | q20 | 2,049k / 1,970k | 1,773k / 1,739k (−13%) | 5,192 → 3,414 MB |
+| | q9 | 1,841k / 1,803k | 1,881k / 1,806k (≈) | 3,315 → 2,691 MB |
+| | q3 | 27.4M / 26.7M | 31.3M / 33.0M (+20%) | 100 → 30 MB |
+| **D** Sorted F=16 (`exp/state-D-sorted` f788fe0) | q4 | as above | 1,454k / 1,461k (−9%) | 4,501 → 2,434 MB |
+| | q20 | | 1,817k / 1,709k (−12%) | 5,192 → 3,164 MB |
+| | q9 | | 1,680k / 1,692k (−7%) | 3,315 → 2,632 MB |
+| | q3 | | 20.7M / 22.3M (−21%) | 100 → 25 MB |
+
+(D at F=8 is within noise of F=16 on q4/q9 and worse on q20.)
+
+**Reading.**
+
+1. **A and B are real wins, in both time and memory.** They remove *objects*
+   (A: ~15–20 per partition → ~0 plus strings; B: boxed distinct keys), and
+   throughput follows.
+2. **C and D shrink join/aggregate state 35–48% at 10M, but neither is faster.**
+   Both lose 9–15% on q4/q20. FlatHash also decays *more* within the run (q4
+   1.52M → 1.20M), presumably from chasing in-group links across pages. D is
+   the flattest curve on q4 (1.42–1.51M across all segments) but starts below
+   Flat. The hash-of-hashes container is not what costs time on joins.
+3. **q20's in-step GC pause is unchanged (18–34%) under C and D.** D measured
+   q20's live object count dropping only 9%: what remains is one `byte[]` per
+   string cell. GC pause follows object count, not bytes, and strings now
+   dominate it. **String storage in state (an arena, not interning — see §5.1)
+   is the remaining GC lever for joins.**
+4. q15/q16 keep their decay *shape* under B (the curve is lifted, not
+   flattened). The remaining lever is candidate G (§5.2): a trace-free linear
+   aggregate.
+
+**Decisions proposed:** ship A (after a snapshot-fingerprint alias) and B
+(after a retraction-heavy MIN/MAX check). Keep C/D opt-in only, as a memory
+option, not a speed one. Next builds: a VARCHAR arena in state, then G.
+All of the above to be re-confirmed on `NEXMARK_GEN=feldera`.
