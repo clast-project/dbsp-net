@@ -3951,11 +3951,11 @@ public static class PlanToCircuit
                     ExpressionCompiler.CompileScalar(call.Argument!),
                     call.ResultType);
             case AggregateKind.Min:
-                return new SqlMinMaxAggregator(
+                return StructuralCompactAggregatorStateMode.BuildMinMax(
                     ExpressionCompiler.CompileScalar(call.Argument!),
                     wantMin: true);
             case AggregateKind.Max:
-                return new SqlMinMaxAggregator(
+                return StructuralCompactAggregatorStateMode.BuildMinMax(
                     ExpressionCompiler.CompileScalar(call.Argument!),
                     wantMin: false);
             case AggregateKind.Avg:

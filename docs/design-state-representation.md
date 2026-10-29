@@ -422,6 +422,36 @@ sliding shape (≤ 1.10×, and faster than legacy on three of four) and matches
 rescan-only on append-only. It also keeps q4's −32/−33%. Legacy and
 rescan-only stay selectable.
 
+### 4B.3 Round 3 — the structural path (`exp/state-r3-structural`)
+
+ivm-bench runs the **structural** program path (`SqlProgram.Compile`, default options,
+W=1; `TypeEligibleProgramViews` is off). Census of its 18-output program
+(`dotnet run -- statecensus program.json`):
+
+| variant | structural path today | ivm-bench hits |
+|---|---|---|
+| A compact TOP-K | selected (`StatefulOperators.PartitionedTopK`, `StructuralRow` key) | **0** — every RANK/ROW_NUMBER is rank-in-output (`PartitionedRankOp`, 13 in 6 views) |
+| B compact COUNT(DISTINCT) | typed only (`TypedPlanCompiler.cs:2383`); structural keeps `Dictionary<object,long>` | 5 aggregates in 5 gold views |
+| B2 hybrid MIN/MAX | typed only (`TypedPlanCompiler.cs:2061`) → **ported here** | 5 aggregates (watches, customer_concentration, daily_market_pulse, market_volatility, trade_volume_stats) |
+| G trace-free linear | typed only (`TypedPlanCompiler.cs:1889`) | **0** under the typed rules (every candidate has a NULLable SUM); 3 if NULLable SUM were admitted (fact_cash_balances, broker_performance, customer_concentration) |
+
+**Built:** `SqlMinMaxHybridAggregator` (`StructuralCompactAggregatorState.cs`): (best, count)
+per group; the first loss of the best rescans the post-delta group once into the legacy
+`Dictionary`+`SortedSet` state; demotes when the group empties. Default-on;
+`StructuralCompactAggregatorStateMode.MinMax` / `DBSPNET_STRUCT_MINMAX=legacy` select
+the old state. The batch evaluator keeps the legacy aggregator (it is the oracle).
+
+`dotnet run -- structstate` (deterministic; live bytes after full GC, allocated bytes):
+
+| shape | legacy | hybrid |
+|---|---|---|
+| watches-like (100k groups, 130k rows, MIN+MAX of CASE-filtered TIMESTAMP) | 320,988,672 live / 235,974,624 alloc | **218,082,904 (−32%) / 186,448,528 (−21%)** |
+
+Tests: `StructuralMinMaxHybridTests` (hybrid ≡ legacy every tick incl. negative-weight
+inputs, batch oracle, promotion/demotion unit test). Mutations caught: loss never
+detected, wrong end, no demotion, duplicate holders not counted; "promotion keeps
+non-positive rows" is equivalent (the fold skips them anyway).
+
 ## 4G. Variant G — trace-free linear aggregate (branch `exp/state-G-lineragg`)
 
 **Built.** `LinearAggregateOp<TKey,TValue,TOut>` (Core) over a new

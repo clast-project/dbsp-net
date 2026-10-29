@@ -33,6 +33,18 @@ if (args.Length > 0 && args[0] == "r3par")
     return DbspNet.Benchmarks.ParallelStateBenchmark.Run(args);
 }
 
+// State-variant census of an ivm-bench program spec: `dotnet run -- statecensus program.json`
+if (args.Length > 0 && args[0] == "statecensus")
+{
+    return DbspNet.Benchmarks.StateCensus.Run(args);
+}
+
+// Structural-path state instrument (live bytes / alloc per arm): `dotnet run -- structstate [scale] [shapePrefix]`
+if (args.Length > 0 && args[0] == "structstate")
+{
+    return DbspNet.Benchmarks.StructuralStateBenchmark.Run(args);
+}
+
 // Profiling sub-command: `dotnet run -- profile {typed|structural|handwired} [seconds]`
 if (args.Length > 0 && args[0] == "profile")
 {
