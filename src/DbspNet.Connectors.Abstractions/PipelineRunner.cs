@@ -75,6 +75,12 @@ public sealed class PipelineRunner
 
         var query = compile(catalog);
 
+        if (outputs.Any(o => o.Mode == OutputMode.Incremental))
+        {
+            throw new NotSupportedException(
+                "OutputMode.Incremental is supported by ProgramRunner only; use Truncate or Changelog here.");
+        }
+
         if (outputs.Any(o => o.Mode == OutputMode.Truncate) && !query.HasStoredOutput)
         {
             throw new InvalidOperationException(

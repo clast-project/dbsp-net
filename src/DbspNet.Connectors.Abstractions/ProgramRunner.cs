@@ -4,7 +4,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using DbspNet.Arrow;
+using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.Collections;
 using DbspNet.Sql.Compiler;
 
 namespace DbspNet.Connectors.Abstractions;
@@ -29,6 +31,18 @@ public sealed class ProgramRunner
     private readonly CompiledProgram _program;
     private readonly List<InputBinding> _inputs;
     private readonly List<(IOutputConnector Connector, ProgramOutput Output)> _outputs;
+
+    // Incremental-mode outputs: each one's net change since its last write, summed over the
+    // ticks in between, and whether it has been written in this process (the first write
+    // carries the whole view, onto a sink the connector truncates).
+    private readonly Dictionary<IOutputConnector, IncrementalOutput> _incremental = new(ReferenceEqualityComparer.Instance);
+
+    private sealed class IncrementalOutput
+    {
+        public ZSetBuilder<StructuralRow, Z64> Pending { get; set; } = new();
+
+        public bool Written { get; set; }
+    }
     private readonly ICheckpointStore? _checkpoint;
     private readonly BatchProfile? _profile = ProfileEnabled ? new BatchProfile() : null;
 
@@ -41,6 +55,13 @@ public sealed class ProgramRunner
         _program = program;
         _inputs = inputs;
         _outputs = outputs;
+        foreach (var (connector, _) in outputs)
+        {
+            if (connector.Mode == OutputMode.Incremental)
+            {
+                _incremental[connector] = new IncrementalOutput();
+            }
+        }
         _checkpoint = checkpoint;
     }
 
@@ -214,6 +235,7 @@ public sealed class ProgramRunner
                     _profile.StepTicks += Stopwatch.GetTimestamp() - stepStart;
                 }
 
+                AccumulateIncrementalChanges();
                 ticks++;
                 b.Cursor = batch.Offset;
                 progressed = true;
@@ -231,6 +253,12 @@ public sealed class ProgramRunner
         var tick = _program.Circuit.TickCount;
         foreach (var (connector, output) in _outputs)
         {
+            if (_incremental.TryGetValue(connector, out var incremental))
+            {
+                await WriteIncrementalAsync(connector, output, incremental, tick, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
             if (_profile is null)
             {
                 var arrow = ArrowExtensions.ToArrowView(output.Schema, output.CurrentView);
@@ -247,6 +275,40 @@ public sealed class ProgramRunner
                 _profile.Output(connector.ViewName).Add(matTicks, Stopwatch.GetTimestamp() - w0, rows);
             }
         }
+    }
+
+    private void AccumulateIncrementalChanges()
+    {
+        foreach (var (connector, output) in _outputs)
+        {
+            if (_incremental.TryGetValue(connector, out var incremental) && incremental.Written)
+            {
+                foreach (var (row, weight) in output.View.LastDelta)
+                {
+                    incremental.Pending.Add(row, weight);
+                }
+            }
+        }
+    }
+
+    private async ValueTask WriteIncrementalAsync(
+        IOutputConnector connector, ProgramOutput output, IncrementalOutput incremental, long tick,
+        CancellationToken cancellationToken)
+    {
+        // The first write in this process carries the whole view (the connector truncates
+        // the sink first); later writes carry the net change since the previous one.
+        var m0 = Stopwatch.GetTimestamp();
+        var net = incremental.Written ? incremental.Pending.Build() : output.CurrentView;
+        incremental.Pending = new ZSetBuilder<StructuralRow, Z64>();
+        var changes = ArrowExtensions.ToArrowChanges(output.Schema, net);
+        var matTicks = Stopwatch.GetTimestamp() - m0;
+
+        var w0 = Stopwatch.GetTimestamp();
+        await connector.ApplyChangesAsync(changes.Inserts, changes.InsertKeys, changes.Deletes, tick, cancellationToken)
+            .ConfigureAwait(false);
+        incremental.Written = true;
+        _profile?.Output(connector.ViewName).Add(
+            matTicks, Stopwatch.GetTimestamp() - w0, changes.Inserts.Length + changes.Deletes.Count);
     }
 
     /// <summary>

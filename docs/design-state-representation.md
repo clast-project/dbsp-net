@@ -1264,6 +1264,55 @@ input lift is now fused into the aggregate's index. **W=14 shows no change beyon
 only the smaller chain → exchange part applies there, and those runs are dominated by
 exchange coordination. The Feldera head-to-head (W=14) is therefore unchanged by §9.13.
 
+### 9.14 Incremental Delta output (what Feldera's "truncate" actually does)
+
+**Finding (#89's first complete CI run).** DbspNet's output storage grew one full copy per
+batch (118 → 237 → 355 MB) while Feldera's stayed at 156 MB. Reproduced locally to the byte
+with ivm-bench's own collector: our `Truncate` mode is a Delta `Overwrite` of the whole view
+every batch. Old files are only logically removed, and the collector counts every file on
+disk. Feldera's connector truncates **once at pipeline start** and then writes only each
+batch's changes: appended inserts plus deletion vectors for deletes. So we were also
+rewriting all 16 output views inside every timed batch, including the small incremental ones.
+
+**Built** (engineered-wood from the `external/engineered-wood` submodule, which has
+row-addressed deletes):
+
+- `OutputMode.Incremental` and `IOutputConnector.ApplyChangesAsync`, a default interface
+  method that throws.
+- `ProgramRunner` sums each incremental output's per-tick deltas (`IntegratedViewHandle.LastDelta`)
+  between writes. Its first write in a process carries the whole view, which also covers a
+  restore.
+- `ArrowExtensions.ToArrowChanges` gives inserts expanded by weight with an equality key per
+  copy, plus `(key, count)` deletes.
+- `DeltaOutputConnector` (Incremental) keeps every live copy's address (file, position). Each
+  batch is **one commit**: `StageRowDeletesAsync(ByPath, DeletionVector)` for retractions,
+  plus `WriteDataFilesAsync` + `StageDataFiles` for inserts, whose positions come from the
+  write order. A new table is created with deletion vectors. An existing one is truncated
+  in the first commit (`DeleteAsync(True)`), and is refused if it lacks deletion vectors.
+- The ivm-bench server (`DbspNetEngine`) now defaults to Incremental, the faithful reading
+  of the spec's `"truncate"`. `DBSPNET_OUTPUT_MODE=truncate` restores the full rewrite.
+
+**Tests.** `IncrementalDeltaOutputTests`: sink ≡ view after each of 8 random batches, for a
+GROUP BY with updates, a UNION ALL bag and a duplicate-row passthrough, at ≤ 1 new data
+file per batch; restart truncates and continues; a non-DV table is refused. Mutations
+caught: deletes never staged (4), positions off by one (4), first-write truncate skipped
+(1). Full suite 2499 passed, 1 skipped. (One earlier full-suite run aborted the test host
+once; not reproduced in 4 further runs, including `--blame`.)
+
+**SF=3, batches 1→2→3** (`tests/.../Scratch/IvmMultiBatch.cs`, two runs per mode). All 16
+outputs read back through engineered-wood, deletion vectors applied, are **identical** in
+both modes after batch 3, in row counts and digests:
+
+| | Truncate | Incremental |
+|---|---|---|
+| batch 2 output write | 4,296 / 3,847 ms | **16 / 16 ms** |
+| batch 3 output write | 944 / 1,073 ms | **9 / 9 ms** |
+| batch 1 output write | 1.9 / 1.8 s | 1.7 / 4.7 s |
+| parquet on disk after batch 3 | 351.9 MB | **117.5 MB** |
+
+Batches 2/3's drain is 26–243 ms, so with Incremental output their whole processing time is
+now ~0.05–0.3 s locally (Feldera on CI: 6.5 s / 6.4 s).
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim

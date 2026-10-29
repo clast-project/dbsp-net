@@ -26,6 +26,14 @@ namespace DbspNet.Server;
 /// </summary>
 public sealed class DbspNetEngine
 {
+    // How output tables are written. Incremental (the default) truncates each table once and
+    // then writes only each batch's net change, which is what a "truncate" binding means in
+    // Feldera's Delta connector; DBSPNET_OUTPUT_MODE=truncate rewrites every view each batch.
+    private static readonly OutputMode OutputModeSetting = string.Equals(
+        Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_MODE")?.Trim(), "truncate", StringComparison.OrdinalIgnoreCase)
+        ? OutputMode.Truncate
+        : OutputMode.Incremental;
+
     private readonly object _gate = new();
     private readonly List<IInputConnector> _inputs = new();
     private readonly List<IOutputConnector> _outputs = new();
@@ -74,7 +82,7 @@ public sealed class DbspNetEngine
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, i.Uri))
             .ToList();
         var outputs = spec.Outputs
-            .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, o.Uri, OutputMode.Truncate))
+            .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, o.Uri, OutputModeSetting))
             .ToList();
 
         var checkpoint = persistent

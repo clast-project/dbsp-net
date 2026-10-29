@@ -17,6 +17,13 @@ public enum OutputMode
     /// <summary>Append the tick's delta as insert/delete rows (a changelog). Idempotent
     /// only via a per-tick dedup key at the sink.</summary>
     Changelog,
+
+    /// <summary>Keep the sink equal to the current view, like <see cref="Truncate"/>, but
+    /// write only each batch's net change: rows whose multiplicity fell are deleted where
+    /// they sit, new copies appended (<see cref="IOutputConnector.ApplyChangesAsync"/>). The
+    /// sink is truncated once, at its first write in a process, which then carries the
+    /// whole current view. Feldera's Delta "truncate" mode works the same way.</summary>
+    Incremental,
 }
 
 /// <summary>
@@ -44,4 +51,20 @@ public interface IOutputConnector : IAsyncDisposable
     /// <summary>Append the tick's <paramref name="delta"/> with signed
     /// <paramref name="weights"/> (Changelog mode).</summary>
     ValueTask WriteDeltaAsync(RecordBatch delta, long[] weights, long tick, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Apply a batch's net change to a sink holding the view (Incremental mode).
+    /// <paramref name="inserts"/> has one row per added copy, and
+    /// <paramref name="insertKeys"/>[i] is row i's equality key (equal rows have equal keys).
+    /// <paramref name="deletes"/> names rows to remove by key and copy count. On the
+    /// connector's first call in a process the sink is truncated first, and
+    /// <paramref name="inserts"/> is the whole current view.
+    /// </summary>
+    ValueTask ApplyChangesAsync(
+        RecordBatch inserts,
+        IReadOnlyList<object> insertKeys,
+        IReadOnlyList<(object Key, long Count)> deletes,
+        long tick,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException($"{GetType().Name} does not support OutputMode.Incremental.");
 }

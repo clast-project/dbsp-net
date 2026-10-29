@@ -28,4 +28,7 @@ public sealed class IntegratedViewHandle<TRow>
 
     /// <summary>The full view contents after the most recent step.</summary>
     public ZSet<TRow, Z64> Current => _op.View;
+
+    /// <summary>The change the most recent step applied to the view (its input delta).</summary>
+    public ZSet<TRow, Z64> LastDelta => _op.LastDelta;
 }

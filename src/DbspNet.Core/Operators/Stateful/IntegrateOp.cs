@@ -58,6 +58,9 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     /// valid until the next <see cref="Step"/>.</summary>
     public ZSet<TRow, Z64> View => _view.Current;
 
+    /// <summary>The delta the most recent step integrated.</summary>
+    public ZSet<TRow, Z64> LastDelta => _input.Current;
+
     public string MetricName => "IntegratedView";
 
     public long RetainedRows => _view.Current.Count;

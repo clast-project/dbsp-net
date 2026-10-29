@@ -64,6 +64,59 @@ public static class ArrowExtensions
         return BuildArrow(schema, view, expandByWeight: true);
     }
 
+    /// <summary>
+    /// A net change to an integrated view, shaped for an incremental (Delta-style) sink:
+    /// <c>Inserts</c> carries one row per added copy (a row with weight <c>w &gt; 0</c> is
+    /// emitted <c>w</c> times), <c>InsertKeys</c>[i] is that row's equality key (the
+    /// <see cref="DbspNet.Core.Collections.StructuralRow"/> itself), and <c>Deletes</c> names
+    /// each row whose multiplicity fell, with the number of copies to remove.
+    /// </summary>
+    public static ArrowChanges ToArrowChanges(
+        SqlSchema schema,
+        DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> changes)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(changes);
+        var columnCount = schema.Count;
+        var cols = new List<object?>[columnCount];
+        for (var c = 0; c < columnCount; c++)
+        {
+            cols[c] = new List<object?>(changes.Count);
+        }
+
+        var keys = new List<object>(changes.Count);
+        var deletes = new List<(object Key, long Count)>();
+        foreach (var (row, weight) in changes)
+        {
+            var w = weight.Value;
+            if (w < 0)
+            {
+                deletes.Add((row, -w));
+                continue;
+            }
+
+            for (long k = 0; k < w; k++)
+            {
+                for (var c = 0; c < columnCount; c++)
+                {
+                    cols[c].Add(row[c]);
+                }
+
+                keys.Add(row);
+            }
+        }
+
+        var columns = new object?[columnCount][];
+        for (var c = 0; c < columnCount; c++)
+        {
+            columns[c] = cols[c].ToArray();
+        }
+
+        var ones = new long[keys.Count];
+        System.Array.Fill(ones, 1L);
+        return new ArrowChanges(Assemble(schema, columns, ones, keys.Count).Rows, keys, deletes);
+    }
+
     private static ArrowDelta BuildArrow(
         SqlSchema schema,
         DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> zset,
@@ -304,3 +357,9 @@ public static class ArrowExtensions
 /// inserts, negative are retractions.
 /// </summary>
 public sealed record ArrowDelta(RecordBatch Rows, long[] Weights);
+
+/// <summary>A view's net change for an incremental sink (see <see cref="ArrowExtensions.ToArrowChanges"/>).</summary>
+public sealed record ArrowChanges(
+    RecordBatch Inserts,
+    IReadOnlyList<object> InsertKeys,
+    IReadOnlyList<(object Key, long Count)> Deletes);
