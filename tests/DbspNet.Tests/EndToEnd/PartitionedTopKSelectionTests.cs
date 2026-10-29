@@ -82,8 +82,12 @@ public class PartitionedTopKSelectionTests
 
     private static void WithOverride(PartitionedTopKNarrowing mode, Action body)
     {
+        // The §22 narrow/whole-row choice exists only on the Legacy state arm (the
+        // default compact operator subsumes both), so pin it.
         var prev = PartitionedTopKNarrowingMode.Override;
+        var prevState = PartitionedTopKStateMode.Override;
         PartitionedTopKNarrowingMode.Override = mode;
+        PartitionedTopKStateMode.Override = PartitionedTopKState.Legacy;
         try
         {
             body();
@@ -91,6 +95,7 @@ public class PartitionedTopKSelectionTests
         finally
         {
             PartitionedTopKNarrowingMode.Override = prev;
+            PartitionedTopKStateMode.Override = prevState;
         }
     }
 
