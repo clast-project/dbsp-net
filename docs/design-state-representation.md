@@ -138,9 +138,15 @@ bid URLs. Feldera's generator (`../feldera/crates/nexmark/src/generator/strings.
   re-measured on faithful data.
 - **Every prior DbspNet-vs-Feldera Nexmark ratio ran on lighter rows on our
   side.** That is not a fair comparison for string-heavy queries (q0, q18–q22).
-- **Action:** make the generator Feldera-faithful (random-length `extra`,
-  channel-id URLs) behind a switch, and re-take the Phase 0 baselines with it,
-  before any variant's wall-clock phase.
+- **Done (`4ed465e`, merged to main):** `NEXMARK_GEN=feldera` selects a
+  Feldera-faithful port (hot auction/bidder/seller ratios, 10k channels, padded
+  `extra`, Feldera's price and expiry rules). It matches Feldera's own generator
+  to sampling noise at 1M events (avg string bytes/row 192.0/452.0/119.5 vs
+  192.1/452.2/119.5; distinct (bidder,auction) 291,513 vs 291,295). Legacy stays
+  the default and is byte-identical. `genstats [events] [legacy|feldera]` prints
+  the statistics. On faithful data q18 retains **44% less** (hot keys collapse
+  partitions 917k → 291k), q19/q20 retain more (longer strings), and q16's
+  output grows 15×. **All Phase 0 baselines must be re-taken on this profile.**
 
 ### 5.2 The aggregate trace dominates aggregate state (found by variant B)
 
