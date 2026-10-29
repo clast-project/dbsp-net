@@ -1080,8 +1080,10 @@ Causes:
    materialising it as a separate stream.
 
 The ceiling is ~10 GiB of allocation, plus one full hash-and-insert pass per removed edge.
-Feldera does the equivalent (its circuit optimizer merges consecutive maps and
-map→map-index). Measure each lever with whole-step + allocation on SF=3, and w1profile B/ev on
+Feldera does the equivalent (checked at `78afc9077`): its circuit pass
+`visitors/outer/OptimizeProjections.java` composes `Map → MapIndex` and `MapIndex → MapIndex`
+into one operator when the producer's fan-out is 1, and folds a `Map` after a join into the
+join (`JoinFilterMap`). Measure each lever with whole-step + allocation on SF=3, and w1profile B/ev on
 Nexmark (the typed path has its own join lowering: check it for the same pattern).
 
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
