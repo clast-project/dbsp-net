@@ -9,6 +9,7 @@
 //                     are promoted one per batch
 //   IVM_OUTPUT_MODE   truncate (default) | incremental
 //   IVM_OUT_ROOT      (optional) output Delta root; default = temp. Wiped at start.
+//   IVM_WORKERS       (optional) > 1 runs the data-parallel program on that many workers
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -57,8 +58,16 @@ public class IvmMultiBatch
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
-        var program = SqlProgram.Compile(
-            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+        var workers = int.TryParse(Environment.GetEnvironmentVariable("IVM_WORKERS"), out var w) ? w : 1;
+        ParallelCompiledProgram? parallel = null;
+        if (workers > 1)
+        {
+            Assert.True(
+                SqlProgram.TryCompileParallel(
+                    spec.Program, outputViews, workers, out parallel,
+                    numericStringCoercion: true, nullCollation: NullCollation.Low),
+                "parallel compile refused the program");
+        }
 
         string InUri(string uri)
         {
@@ -74,9 +83,13 @@ public class IvmMultiBatch
         var outputs = spec.Output_Bindings
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
             .ToList();
-        var runner = await ProgramRunner.CreateAsync(program, inputs, outputs);
+        var runner = parallel is not null
+            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs)
+            : await ProgramRunner.CreateAsync(
+                SqlProgram.Compile(spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low),
+                inputs, outputs);
 
-        _out.WriteLine($"output mode: {mode}");
+        _out.WriteLine($"output mode: {mode}, workers: {workers}");
         for (var batch = 1; batch <= 3; batch++)
         {
             if (batch > 1)
@@ -99,6 +112,8 @@ public class IvmMultiBatch
         {
             await o.DisposeAsync();
         }
+
+        parallel?.Dispose();
 
         // Each output's contents as read back through engineered-wood (deletion vectors
         // applied): row count and an order-independent digest, comparable across modes.
