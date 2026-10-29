@@ -1,0 +1,10 @@
+<Project>
+  <!--
+    Submodules under external/ build with their own package versions. Without this file
+    MSBuild would find the repository's Directory.Packages.props and turn central package
+    management on for them, and their inline PackageReference versions would fail (NU1008).
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>
