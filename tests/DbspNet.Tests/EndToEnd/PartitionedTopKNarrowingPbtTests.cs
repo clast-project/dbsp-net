@@ -38,7 +38,7 @@ public class PartitionedTopKNarrowingPbtTests
 
     private static readonly string[] Functions = { "ROW_NUMBER", "RANK", "DENSE_RANK" };
 
-    private sealed record QuerySpec(string Function, int K, bool Descending)
+    internal sealed record QuerySpec(string Function, int K, bool Descending)
     {
         public string Sql =>
             $"SELECT g, v, id FROM (SELECT g, v, id, {Function}() OVER " +
@@ -98,10 +98,13 @@ public class PartitionedTopKNarrowingPbtTests
         // The seam is read at operator construction, so enable it across Compile and
         // keep it for the circuit's lifetime, then restore. Thread-static: this test
         // body runs synchronously on one thread.
+        // The narrow/whole-row seam exists only on the Legacy state arm; pin it.
         var prev = PartitionedTopKNarrowingMode.Override;
+        var prevState = PartitionedTopKStateMode.Override;
         PartitionedTopKNarrowingMode.Override = narrowing
             ? PartitionedTopKNarrowing.ForceNarrow
             : PartitionedTopKNarrowing.ForceWholeRow;
+        PartitionedTopKStateMode.Override = PartitionedTopKState.Legacy;
         try
         {
             var query = IncrementalOracle.CompileQuery(new[] { Ddl }, sql);
@@ -110,6 +113,7 @@ public class PartitionedTopKNarrowingPbtTests
         finally
         {
             PartitionedTopKNarrowingMode.Override = prev;
+            PartitionedTopKStateMode.Override = prevState;
         }
     }
 
@@ -120,7 +124,7 @@ public class PartitionedTopKNarrowingPbtTests
     /// rank cut. The accumulated incremental output telescopes to the final window, so
     /// this is the expected accumulated output.
     /// </summary>
-    private static ZSet<StructuralRow, Z64> BatchTopK(
+    internal static ZSet<StructuralRow, Z64> BatchTopK(
         QuerySpec spec, IReadOnlyList<IReadOnlyList<InputEvent>> ticks)
     {
         // Net multiset of input rows.

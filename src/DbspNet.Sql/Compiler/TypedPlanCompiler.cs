@@ -1435,10 +1435,35 @@ public static class TypedPlanCompiler
             return null;
         }
 
+        // State-representation arc A (docs/design-state-representation.md §4): an
+        // UNBOXED partition key — an emitted key struct built straight from the typed
+        // row — instead of a StructuralRow over boxed values (one object[] + one box per
+        // column + the row object, per partition). Falls back to the boxed key when a
+        // partition expression or its key row is outside the typed surface.
+        Type? partitionKeyType = null;
+        Delegate? typedPartitionKey = null;
+        if (PartitionedTopKStateMode.Current == PartitionedTopKState.Compact && plan.PartitionKeys.Count > 0)
+        {
+            var keyColumns = new SchemaColumn[plan.PartitionKeys.Count];
+            for (var i = 0; i < plan.PartitionKeys.Count; i++)
+            {
+                keyColumns[i] = new SchemaColumn("$pk" + i, plan.PartitionKeys[i].Type);
+            }
+
+            var keySchema = new Schema(keyColumns);
+            if (TypedRowEmitter.EmitRowType(keySchema) is { } keyRowType
+                && BuildExprKeyExtractorDelegate(rowType, keyRowType, keySchema, plan.PartitionKeys) is { } keyOf)
+            {
+                partitionKeyType = keyRowType;
+                typedPartitionKey = keyOf;
+            }
+        }
+
         var snapshotCodec = BuildAdaptedZSetCodec(ctx.SnapshotCodecs, plan.Schema, rowType);
         var output = InvokePartitionedTopK(
             ctx.Builder, rowType, topKInput, sortExtractors, descending, nullsFirst,
-            partitionExtractors, plan.Function, plan.Limit, snapshotCodec, unboxedSortKeys);
+            partitionExtractors, plan.Function, plan.Limit, snapshotCodec, unboxedSortKeys,
+            partitionKeyType, typedPartitionKey);
         return new TypedNode(rowType, inner.Schema, output);
     }
 
@@ -3539,25 +3564,30 @@ public static class TypedPlanCompiler
     private static object InvokePartitionedTopK(
         CircuitBuilder builder, Type rowType, object input, Delegate[] sortExtractors,
         bool[] descending, bool[] nullsFirst, Delegate[] partitionExtractors,
-        RankFunction function, long limit, object? snapshotCodec, Delegate[]? unboxedSortKeys)
+        RankFunction function, long limit, object? snapshotCodec, Delegate[]? unboxedSortKeys,
+        Type? partitionKeyType, Delegate? typedPartitionKey)
     {
         var openMethod = typeof(TypedPlanCompiler)
             .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
             .Single(m => m.Name == nameof(BuildPartitionedTopK) && m.IsGenericMethodDefinition);
-        var closed = openMethod.MakeGenericMethod(rowType);
+        var closed = openMethod.MakeGenericMethod(rowType, partitionKeyType ?? typeof(StructuralRow));
         return closed.Invoke(null, new object?[]
         {
             builder, input, sortExtractors, descending, nullsFirst, partitionExtractors, function, limit,
-            snapshotCodec, unboxedSortKeys,
+            snapshotCodec, unboxedSortKeys, typedPartitionKey,
         })!;
     }
 
-    /// <summary>Generic worker for <see cref="InvokePartitionedTopK"/>.</summary>
-    private static object BuildPartitionedTopK<TRow>(
+    /// <summary>Generic worker for <see cref="InvokePartitionedTopK"/>. <typeparamref name="TKey"/>
+    /// is the emitted partition-key struct when <paramref name="typedPartitionKey"/> is
+    /// given, else <see cref="StructuralRow"/> over the boxed partition columns.</summary>
+    private static object BuildPartitionedTopK<TRow, TKey>(
         CircuitBuilder builder, object input, Delegate[] sortExtractors,
         bool[] descending, bool[] nullsFirst, Delegate[] partitionExtractors,
-        RankFunction function, long limit, object? snapshotCodec, Delegate[]? unboxedSortKeys)
+        RankFunction function, long limit, object? snapshotCodec, Delegate[]? unboxedSortKeys,
+        Delegate? typedPartitionKey)
         where TRow : notnull
+        where TKey : notnull
     {
         var keys = new Func<TRow, object?>[sortExtractors.Length];
         for (var i = 0; i < sortExtractors.Length; i++)
@@ -3638,8 +3668,11 @@ public static class TypedPlanCompiler
 
         var stream = (Stream<ZSet<TRow, Z64>>)input;
         var codec = (IZSetTraceCodec<TRow, Z64>?)snapshotCodec;
-        return builder.PartitionedTopK<TRow, StructuralRow>(
-            stream, PartitionOf, order, sortKeyOnly, function, limit, null, codec,
+        var partitionOf = typedPartitionKey is not null
+            ? (Func<TRow, TKey>)typedPartitionKey
+            : (Func<TRow, TKey>)(object)(Func<TRow, StructuralRow>)PartitionOf;
+        return builder.PartitionedTopK<TRow, TKey>(
+            stream, partitionOf, order, sortKeyOnly, function, limit, null, codec,
             orderKey, orderDescending, orderNullsFirst);
     }
 
@@ -3664,7 +3697,7 @@ public static class TypedPlanCompiler
     /// constructs the strongly-typed partition/order delegates, the numeric
     /// order-value extractor, and the struct-fusing widener, then drives the
     /// row-opaque window-aggregate builder (TKey = StructuralRow over the boxed
-    /// partition columns, as in <see cref="BuildPartitionedTopK{TRow}"/>).</summary>
+    /// partition columns, as in <see cref="BuildPartitionedTopK{TRow,TKey}"/>).</summary>
     private static object BuildPartitionedWindowAggregate<TInRow, TAgg, TOutRow>(
         CircuitBuilder builder, object input, Delegate[] partitionExtractors,
         Delegate? orderExtractor, Delegate? unboxedOrderKey, bool descending, bool nullsFirst,

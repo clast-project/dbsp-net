@@ -326,7 +326,8 @@ public static class Snapshot
         }
 
         var actual = SnapshotManifest.ComputeCircuitFingerprint(circuit);
-        if (manifest.PlanFingerprint != actual)
+        if (manifest.PlanFingerprint != actual
+            && manifest.PlanFingerprint != SnapshotManifest.ComputeCircuitFingerprint(circuit, useAliases: true))
         {
             throw new InvalidDataException(
                 "snapshot plan fingerprint mismatch — the circuit's operator " +

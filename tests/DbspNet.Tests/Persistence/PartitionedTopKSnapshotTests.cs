@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Persistence;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
@@ -80,6 +81,84 @@ public class PartitionedTopKSnapshotTests : IDisposable
         Assert.Equal(1, consumer.WeightOf(1, 80).Value);
         Assert.Equal(0, consumer.WeightOf(1, 90).Value);
         Assert.Equal(0, consumer.WeightOf(2, 50).Value);
+    }
+
+    /// <summary>
+    /// Each state arm restores its own snapshot and the restored circuit keeps tracking an
+    /// uninterrupted (legacy) run across inline (1 row), sorted-array and tree
+    /// (&gt; SmallMax) partitions, including retractions that promote unseen rows. The two
+    /// arms write the same payload; Legacy → Compact restores through the compact operator's
+    /// <c>IFingerprintAlias</c> — the Legacy arm builds exactly the pre-compact operator
+    /// (boxed <c>StructuralRow</c> key), so this is the upgrade path for existing snapshots.
+    /// </summary>
+    [Theory]
+    [InlineData("Compact", "Compact")]
+    [InlineData("Legacy", "Legacy")]
+    [InlineData("Legacy", "Compact")]
+    public async Task RestoreAcrossStateArms_TracksUninterruptedRun(string producerArm, string consumerArm)
+    {
+        var producer = CompileIn(Enum.Parse<PartitionedTopKState>(producerArm));
+        var reference = CompileIn(PartitionedTopKState.Legacy);
+
+        // dept 1: one row (inline); dept 2: 5 rows (array); dept 3: 50 rows (tree).
+        void Before(CompiledQuery q)
+        {
+            q.Table("emp").Insert(1, 7);
+            for (var s = 0; s < 5; s++)
+            {
+                q.Table("emp").Insert(2, 100 + s);
+            }
+
+            for (var s = 0; s < 50; s++)
+            {
+                q.Table("emp").Insert(3, 1000 + s);
+            }
+        }
+
+        Before(producer);
+        Before(reference);
+        producer.Step();
+        reference.Step();
+
+        await Snapshot.WriteAsync(producer.Circuit, _snapshotDir);
+        var consumer = CompileIn(Enum.Parse<PartitionedTopKState>(consumerArm));
+        await Snapshot.ReadAsync(consumer.Circuit, _snapshotDir);
+
+        var after = new Action<CompiledQuery>[]
+        {
+            q => { q.Table("emp").Delete(3, 1049); q.Table("emp").Delete(3, 1048); q.Table("emp").Delete(2, 104); },
+            q => { q.Table("emp").Delete(1, 7); q.Table("emp").Insert(1, 8); q.Table("emp").Insert(3, 5000); },
+            q =>
+            {
+                for (var s = 0; s < 48; s++)
+                {
+                    q.Table("emp").Delete(3, 1000 + s);
+                }
+            },
+        };
+
+        foreach (var tick in after)
+        {
+            tick(consumer);
+            tick(reference);
+            consumer.Step();
+            reference.Step();
+            Assert.Equal(reference.Current, consumer.Current);
+        }
+    }
+
+    private static CompiledQuery CompileIn(PartitionedTopKState arm)
+    {
+        var prev = PartitionedTopKStateMode.Override;
+        PartitionedTopKStateMode.Override = arm;
+        try
+        {
+            return Compile();
+        }
+        finally
+        {
+            PartitionedTopKStateMode.Override = prev;
+        }
     }
 
     [Fact]

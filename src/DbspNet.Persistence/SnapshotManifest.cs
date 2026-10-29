@@ -100,15 +100,18 @@ public sealed record SnapshotManifest(
     /// fingerprint. Generic operators include their type arguments in
     /// <see cref="Type.FullName"/>, so e.g. an aggregate over
     /// <c>(int, decimal, decimal)</c> hashes differently from one over
-    /// <c>(long, decimal, decimal)</c>.
+    /// <c>(long, decimal, decimal)</c>. With <paramref name="useAliases"/>, operators
+    /// implementing <see cref="IFingerprintAlias"/> hash as the type they replaced — the
+    /// fingerprint a snapshot written before that replacement carries.
     /// </summary>
-    internal static string ComputeCircuitFingerprint(RootCircuit circuit)
+    internal static string ComputeCircuitFingerprint(RootCircuit circuit, bool useAliases = false)
     {
         var sb = new StringBuilder();
         for (var i = 0; i < circuit.Operators.Count; i++)
         {
             var op = circuit.Operators[i];
-            sb.Append(i).Append(':').Append(op.GetType().FullName).Append(';');
+            var type = useAliases && op is IFingerprintAlias alias ? alias.FingerprintAliasType : op.GetType();
+            sb.Append(i).Append(':').Append(type.FullName).Append(';');
         }
 
         var bytes = Encoding.UTF8.GetBytes(sb.ToString());

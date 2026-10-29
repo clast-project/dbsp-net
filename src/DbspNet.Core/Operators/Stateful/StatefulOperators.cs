@@ -148,6 +148,24 @@ public static class StatefulOperators
 
         var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
 
+        // State-representation arc, variant A (docs/design-state-representation.md §4):
+        // the compact operator subsumes both legacy representations below (it keeps no
+        // window dictionary, so the §22 narrow key's kill-hash has nothing left to save).
+        if (PartitionedTopKStateMode.Current != PartitionedTopKState.Legacy)
+        {
+            // Snapshots written by the legacy arm restore here: alias the fingerprint
+            // to the operator that arm would have built for this plan.
+            var legacy = orderKey is not null && PartitionedTopKNarrowingMode.ShouldNarrow(limit)
+                ? typeof(PartitionedTopKNarrowOp<TRow, StructuralRow>)
+                : typeof(PartitionedTopKOp<TRow, StructuralRow>);
+            builder.AddRawOperator(new PartitionedTopKCompactOp<TRow, TKey>(
+                input, output, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec)
+            {
+                FingerprintAliasType = legacy,
+            });
+            return output;
+        }
+
         // §22.7 narrow-key path: a per-operator decision. Take it only when a
         // single-column ORDER BY extractor was plumbed through AND the selection gate
         // (limit threshold by default, or a force override for the §22 A/B gates) says

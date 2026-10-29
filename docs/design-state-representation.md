@@ -120,6 +120,74 @@ parallel now. **C/D** need the seam first; I extract it serially (a pure
 refactor, gated by the existing suites and byte-identical B/ev), then C and D
 fan out on it.
 
+## 4. Variant A — compact partitioned TOP-K state (branch `exp/state-A-topk`)
+
+**Built.** `PartitionedTopKCompactOp<TRow,TKey>` replaces both `PartitionedTopKOp` and
+the §22 `PartitionedTopKNarrowOp`. It sits behind `PartitionedTopKStateMode`, which is
+default-on. The `DBSPNET_TOPK_STATE=compact|compactboxedkey|legacy` env var, or the
+thread-static `Override`, selects the arm.
+- **One flat table.** `Dictionary<TKey, Partition>`, where `Partition` is a struct. A
+  partition with one row stores that row **inline**, with no heap object of its own.
+  2..32 rows live in one sorted `Entry[]`. Past 32 rows a partition moves to a
+  `SortedDictionary`, so a hot partition's insert stays O(log n).
+- **No stored window.** The window is a pure function of the state. On a partition's
+  first touch in a tick, the operator computes the old window from the pre-delta state
+  into a reused scratch buffer. After the delta it computes the new window and
+  merge-diffs the two, both sorted by `order`. Scratch buffers are reused, so the only
+  per-tick allocation is the output delta.
+- **Unboxed partition key (typed path).** The key is an emitted key struct built by
+  `BuildExprKeyExtractorDelegate`, replacing the `StructuralRow` of boxes.
+  `BuildPartitionedTopK` is now `<TRow,TKey>`, and its reflected invoke was updated with
+  it. The structural path keeps the `StructuralRow` key but gets the compact container.
+- The snapshot payload is unchanged (one flattened Z-set), and load just replays it.
+
+**Results** (1M events, batch 10k, W=1). Live bytes come from `decay … stream`; B/ev
+comes from `w1profile`. The legacy arm reproduces the branch-point baseline: B/ev is
+byte-identical, and live bytes are within 0.001% for q18/q19 and 0.3% for q9.
+
+| query | live bytes legacy | compact, boxed key | **compact** | ratio | B/ev legacy → boxed key → **compact** |
+|---|---|---|---|---|---|
+| q18 | 1,968,248,608 (2,139 B/row) | 681,988,568 | **473,135,792 (514 B/row)** | **4.16×** | 2106 → 1518 → **1429** (−32%) |
+| q19 | 874,274,896 (950 B/row) | 549,917,720 | **538,989,264 (586 B/row)** | **1.62×** | 1668 → 1351 → **1270** (−24%) |
+| q9 (incl. join state) | 361,170,928 | 286,055,240 | **275,194,880** | 1.31× | 1116 → 1111 → **1030** (−8%) |
+
+On q18 the container lever and the key lever multiply. The container alone gives
+2.89×, and unboxing the key takes that to 4.16×.
+
+**What is left in q18's 514 B/row** (a probe on a synthetic q18): the typed row is a
+104 B struct. Three of its ten fields (bidder, auction, date_time) are duplicated by
+the plan's window-input projection, which is a planner issue, not this operator's.
+Each row also has three string `byte[]`s, which are variant E's territory. The rest is
+`Dictionary` growth slack: capacity runs up to about 1.7× count, and the entry is
+152 B, holding the 16 B key and a 24 B partition trailer. A custom row-keyed
+open-addressing table could save that ~40 B/entry plus some slack, an estimated
+~15% more. It was not built.
+
+**Correctness.** The new `PartitionedTopKCompactPbtTests` check two things:
+- compact ≡ batch oracle, on the §22 tie domain (3000 cases);
+- compact ≡ legacy **every tick**, across structural, typed W=1, typed W=2 and typed
+  boxed-key. This runs on a domain that crosses the inline↔array↔tree boundaries in
+  both directions, with NULLable and VARCHAR multi-column partition keys and NULLable
+  and multi-column ORDER BY (250 cases).
+
+Both of these mutations were caught:
+- dropping the row on array→tree promotion;
+- corrupting the array→inline demotion.
+
+A snapshot restore-then-step test covers all three storage shapes on each arm. The
+full suite passes: 2380 passed, 1 skipped.
+
+**Risk: snapshot compatibility.** The payload is unchanged, but the manifest's plan
+fingerprint hashes operator type names. A snapshot written by a pre-arc binary
+therefore fails the fingerprint check under the new default. Today the only way to
+restore it is `DBSPNET_TOPK_STATE=legacy`, or a fingerprint alias, which has not been
+built. Every operator-type change has this property, the §22 narrow operator included.
+
+**Recommendation: ship.** It is a large deterministic win on all three rows, with
+lower B/ev everywhere. If it ships, `PartitionedTopKNarrowOp` and the §22 selection
+seam become dead code apart from the legacy arm, and can be retired together with the
+legacy arm once restore compatibility has been dealt with.
+
 ## 5. Cross-cutting findings
 
 ### 5.1 Our Nexmark generator under-represents strings (found by variant E)
