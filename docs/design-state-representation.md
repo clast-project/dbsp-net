@@ -247,7 +247,7 @@ deletes. The test ends with a batch recompute. It also runs a 200k-op churn test
 `DistinctValueTable` against a `Dictionary` oracle. Full suite: 2379 passed, 1
 skipped, 0 failed.
 
-### 4B.1 Ship decision — compact MIN/MAX is OFF by default
+### 4B.1 Ship decision — compact MIN/MAX is OFF by default (superseded by §4B.2: the hybrid ships on)
 
 `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps]` keeps a
 source-maintained sliding window over `SELECT g, MIN(v), MAX(v) … GROUP BY g`:
@@ -266,6 +266,80 @@ compaction (the q15/q16 +35–38% of §6) ships **on**; `CompactMinMax` ships
 **off**. Follow-up: a hybrid that starts at (best, count) and promotes a group to
 a sorted structure the first time its extreme is retracted. That keeps q4's
 append-only −33% and costs a sliding window one rescan per group.
+
+### 4B.2 Hybrid MIN/MAX — promote on first retraction (`exp/state-B2-minmax`)
+
+**Built.** The MIN/MAX state is now a three-way switch,
+`CompactAggregatorStateMode.MinMax` (`MinMaxStateKind`): `Legacy` (Dictionary +
+SortedSet), `RescanOnly` (§4B.1) and `Hybrid` (**the default**). A hybrid group
+starts as (best, count). The first tick that retracts its best (or finds it
+inconsistent) does one rescan of the post-delta group into a
+`SortedValueCounts<T>`, and the group keeps that state from then on.
+
+`SortedValueCounts<T>` is a chunked sorted array: a short array of chunks, each
+holding up to 128 inline `(T value, long rows)` entries. An insert or remove is
+a binary search plus a memmove inside one chunk, and MIN/MAX is read off the
+ends. A full chunk splits in half, except that appending past the top or
+prepending below the bottom starts a new chunk. Without that rule, a sliding
+window leaves every chunk half full: the in-situ cost was 41 B/value, and it is
+21 B/value with the rule. A chunk under 32 entries merges with a neighbour when
+the two fit in half a chunk. The bulk build sorts into chunks filled to 3/4
+(with a reused per-thread scratch buffer). Values are keyed by `CompareTo`, so
+the Decimal "equal but not Equals" behaviour is the same as (best, count).
+
+**Demotion:** only when the group empties. Losing the extreme once is the
+evidence that it will be lost again, and a wrong demotion costs another
+O(group) rescan. Restore folds a fresh state from the trace, so a restored group
+starts compact and re-promotes on its next loss. Nothing new is persisted.
+
+**`minmaxslide`** (ms/tick; serialized, other agents' builds paused; one process
+runs all three arms back to back; reps 0/1/2, where rep 0 is legacy's JIT
+warm-up). Live heap is after a compacting GC; the trace is the same in every
+arm.
+
+| shape (groups × window, change/tick) | legacy | rescan-only | **hybrid** | hybrid/legacy (reps 1–2) | live MB L / R / H |
+|---|---|---|---|---|---|
+| 100 × 10k, 10 | 2.18 / 1.49 / 1.54 | 16.7 / 16.2 / 16.2 | **1.44 / 1.25 / 1.22** | 0.80–0.84× | 231 / 37 / 58 |
+| 10 × 100k, 10 | 0.89 / 0.62 / 0.63 | 16.0 / 15.7 / 15.8 | **0.76 / 0.68 / 0.67** | 1.06–1.10× | 223 / 39 / 61 |
+| 1000 × 1k, 1 | 3.67 / 3.17 / 3.22 | 14.8 / 14.1 / 14.1 | **2.08 / 1.68 / 1.66** | 0.52–0.53× | 246 / 42 / 63 |
+| 100 × 10k, 1000 | 68.6 / 63.6 / 64.4 | 55.9 / 53.9 / 53.5 | **50.9 / 49.2 / 49.3** | 0.77× | 284 / 90 / 107 |
+| append 100 × 10k, 10 | 1.66 / 1.07 / 1.09 | 0.89 / 0.85 / 0.86 | **0.87 / 0.85 / 0.85** | = rescan-only | 299 / 76 / 76 |
+| append 1000 × 1k, 1 | 3.00 / 2.26 / 2.27 | 1.36 / 1.37 / 1.35 | **1.35 / 1.35 / 1.37** | = rescan-only | 319 / 86 / 86 |
+
+Two earlier serialized passes agree to within ~10%. Per promoted value, the
+hybrid costs **~21 B** (for example (57.7 − 37.2) MB / 1M values), against
+**~97 B** per value per aggregator for legacy. The one-time promotion shows as
+allocation (10 × 100k: 2310 B/row-change against 924 B for legacy, amortised
+over 300 ticks).
+
+**q4** (1M events, batch 10k; hybrid ≈ rescan-only, so q4 groups essentially
+never promote):
+
+| generator | live bytes legacy → rescan-only → hybrid | B/ev (w1profile) L → R → H |
+|---|---|---|
+| default | 490,412,232 → 331,255,440 → **331,280,896** (−32.4%) | 2222 → 2116 → **2116** |
+| `NEXMARK_GEN=feldera` | 422,394,528 → 282,789,352 → **282,861,560** (−33.0%) | 1978 → 1888 → **1888** |
+
+**Tests.** `CompactAggregatorStateTests` now has these parts:
+
+- a 4-way differential: hybrid, rescan-only, legacy and structural;
+- sliding-window streams that promote groups mid-run (FILTERed and computed
+  MIN/MAX, weight-2 rows, NULLs, emptied groups that demote);
+- a snapshot/restore test taken after promotions, which must continue
+  tick-for-tick like an uninterrupted legacy run;
+- a direct check that append-only never promotes and the first loss does;
+- a churn test of `SortedValueCounts` against a `SortedDictionary` oracle
+  (random, ascending slide and descending slide).
+
+Full suite: 2394 passed, 1 skipped. Mutations caught: promotion disabled,
+bulk-build duplicate counts dropped, wrong end emitted, and a split off-by-one.
+The defensive "remove missed → rebuild" path is unreachable from well-formed
+transition folds, so that mutant is equivalent.
+
+**Decision: ship the hybrid as the default.** It meets the gate on every
+sliding shape (≤ 1.10×, and faster than legacy on three of four) and matches
+rescan-only on append-only. It also keeps q4's −32/−33%. Legacy and
+rescan-only stay selectable.
 
 ## 5. Cross-cutting findings
 

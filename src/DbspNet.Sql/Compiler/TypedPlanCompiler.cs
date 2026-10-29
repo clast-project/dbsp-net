@@ -2049,10 +2049,12 @@ public static class TypedPlanCompiler
         var icmp = typeof(IComparable<>).MakeGenericType(underlyingClr);
         if (!icmp.IsAssignableFrom(underlyingClr)) return null;
 
-        if (CompactAggregatorStateMode.CompactMinMax)
+        var minMaxKind = CompactAggregatorStateMode.MinMax;
+        if (minMaxKind != MinMaxStateKind.Legacy)
         {
-            // (best, count) state that rescans the trace on loss of the best
-            // (design-state-representation §4) — takes a T? extractor either way.
+            // (best, count) state that rescans the trace on loss of the best and,
+            // in the hybrid, promotes the group to a sorted run on that first loss
+            // (design-state-representation §4B) — takes a T? extractor either way.
             var inParam = Expression.Parameter(inputRowType, "in");
             var built = TypedExpressionCompiler.TryBuildInto(call.Argument, inParam);
             var nullableType = typeof(Nullable<>).MakeGenericType(underlyingClr);
@@ -2061,8 +2063,9 @@ public static class TypedPlanCompiler
                 var asNullable = built.Type == nullableType ? built : Expression.Convert(built, nullableType);
                 var nullableExtract = Expression.Lambda(
                     typeof(Func<,>).MakeGenericType(inputRowType, nullableType), asNullable, inParam).Compile();
-            var compact = typeof(TypedSqlMinMaxCompactAggregator<,>).MakeGenericType(inputRowType, underlyingClr);
-                return Activator.CreateInstance(compact, nullableExtract, wantMin);
+                var compact = typeof(TypedSqlMinMaxCompactAggregator<,>).MakeGenericType(inputRowType, underlyingClr);
+                return Activator.CreateInstance(
+                    compact, nullableExtract, wantMin, minMaxKind == MinMaxStateKind.Hybrid);
             }
         }
 

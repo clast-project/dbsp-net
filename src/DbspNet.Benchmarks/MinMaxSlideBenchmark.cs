@@ -12,34 +12,48 @@ namespace DbspNet.Benchmarks;
 /// Adversarial check for the compact MIN/MAX state (state-representation arc,
 /// variant B): a source-maintained sliding window — each tick inserts N new rows
 /// per group and deletes that group's N oldest — so the current MIN is retracted
-/// every tick. The compact state rescans the group on that event; the legacy
-/// state pays O(log n) per row. A/Bs both in one process.
+/// every tick. The rescan-only ("compact") state rescans the group on that event;
+/// the legacy state pays O(log n) per row; the hybrid rescans once per group and
+/// then pays O(log n) in its sorted run (§4B.2). The <c>append</c> shape inserts
+/// only, so the extreme is never retracted. A/Bs all three arms in one process
+/// and reports the live heap per arm (the trace is shared, so differences are
+/// the MIN/MAX state).
 /// </summary>
 internal static class MinMaxSlideBenchmark
 {
     private const string Ddl = "CREATE TABLE t (g BIGINT NOT NULL, v BIGINT NOT NULL)";
     private const string Sql = "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g";
 
-    public static void Run(int groups, int window, int perTick, int ticks, int reps)
+    /// <param name="appendOnly">Inserts only (no deletes): the extreme is never retracted.</param>
+    public static void Run(int groups, int window, int perTick, int ticks, int reps, bool appendOnly = false)
     {
         Console.WriteLine(
-            $"=== MIN/MAX sliding window: groups={groups} window={window} perTick={perTick} ticks={ticks} ===");
+            $"=== MIN/MAX {(appendOnly ? "append-only" : "sliding window")}: groups={groups} window={window} " +
+            $"perTick={perTick} ticks={ticks} ===");
+        var kinds = new[] { MinMaxStateKind.Legacy, MinMaxStateKind.RescanOnly, MinMaxStateKind.Hybrid };
         for (var rep = 0; rep < reps; rep++)
         {
-            foreach (var compact in new[] { false, true })
+            foreach (var kind in kinds)
             {
-                var (ms, bytes) = Measure(compact, groups, window, perTick, ticks);
+                var (ms, bytes, live) = Measure(kind, groups, window, perTick, ticks, appendOnly);
+                var label = kind switch
+                {
+                    MinMaxStateKind.Legacy => "legacy",
+                    MinMaxStateKind.RescanOnly => "compact",
+                    _ => "hybrid",
+                };
                 Console.WriteLine(
-                    $"  rep {rep} {(compact ? "compact" : "legacy "),-8} {ms,9:F1} ms  " +
-                    $"{ms * 1000 / ticks,9:F1} us/tick  {bytes / (double)ticks / groups / perTick,8:F0} B/row-change");
+                    $"  rep {rep} {label,-8} {ms,9:F1} ms  " +
+                    $"{ms * 1000 / ticks,9:F1} us/tick  {bytes / (double)ticks / groups / perTick,8:F0} B/row-change  live {live / 1e6,8:F1} MB");
             }
         }
     }
 
-    private static (double Ms, long Bytes) Measure(bool compact, int groups, int window, int perTick, int ticks)
+    private static (double Ms, long Bytes, long Live) Measure(
+        MinMaxStateKind kind, int groups, int window, int perTick, int ticks, bool appendOnly)
     {
-        var prev = CompactAggregatorStateMode.CompactMinMax;
-        CompactAggregatorStateMode.CompactMinMax = compact;
+        var prev = CompactAggregatorStateMode.MinMax;
+        CompactAggregatorStateMode.MinMax = kind;
         CompiledQuery q;
         try
         {
@@ -50,7 +64,7 @@ internal static class MinMaxSlideBenchmark
         }
         finally
         {
-            CompactAggregatorStateMode.CompactMinMax = prev;
+            CompactAggregatorStateMode.MinMax = prev;
         }
 
         var batch = new List<(object?[], long)>(groups * window);
@@ -79,7 +93,7 @@ internal static class MinMaxSlideBenchmark
                 for (var i = 0; i < perTick; i++)
                 {
                     batch.Add((new object?[] { g, next + i }, 1L));
-                    batch.Add((new object?[] { g, oldest + i }, -1L));
+                    if (!appendOnly) batch.Add((new object?[] { g, oldest + i }, -1L));
                 }
             }
 
@@ -90,6 +104,20 @@ internal static class MinMaxSlideBenchmark
         }
 
         sw.Stop();
-        return (sw.Elapsed.TotalMilliseconds, GC.GetAllocatedBytesForCurrentThread() - a0);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
+
+        // Live heap with the query (trace + per-group MIN/MAX state) still reachable;
+        // the trace is the same in every arm, so arm differences are the state.
+        batch.Clear();
+        batch.TrimExcess();
+        // Compact first: GC.GetTotalMemory counts fragmentation, which the hybrid's
+        // resized chunk arrays leave behind and which roughly doubles its reading.
+        System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+            System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        var info = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+        var live = info.HeapSizeBytes - info.FragmentedBytes;
+        GC.KeepAlive(q);
+        return (sw.Elapsed.TotalMilliseconds, allocated, live);
     }
 }
