@@ -924,11 +924,54 @@ set (16 outputs + the 2 `+stored` views). Two runs per arm, alternating:
 - **All 13 aggregates together are 3.9–4.5 s (6–7%).** Structural G (§9.4 item 1) is worth a few
   percent here, not the ~2.6× its per-row state shrink suggested. **Demoted.**
 
-**Next for ivm-bench:** the per-output-row cost of a fan-out join on the structural path. Build the
+**Next for ivm-bench:** *(resolved by §9.6: the cause was a missing plan rewrite, not the join's per-row cost.)* The per-output-row cost of a fan-out join on the structural path. Build the
 projected row directly in the join's combine (fuse the following Apply into it, as join column
 pruning does for inputs), and check whether the joined row can stay unboxed. Measure with whole-step
 and allocation; this is a row-construction lever, so it belongs with per-row-execution-efficiency,
 not with state representation.
+
+### 9.6 Outer-join column pruning: −37% ivm-bench batch-1 step
+
+**Diagnosis.** `fact_market_history`'s 40M join rows were neither churn nor real output. A
+one-tick-per-round experiment (all 20 sources pushed, one `Step`) left the join's output at
+40,269,098 rows in that single tick, while the view integrates to 664,780 distinct rows.
+The view selects no column of `wrk_company_financials`, so `LEFT JOIN … USING
+(sk_company_id)` only multiplies each row's weight by its company's financials count (~60).
+`PruneJoinInputs` would have narrowed the right side to its key and collapsed those rows
+into one weighted row, but it handled INNER joins only.
+
+**Built.** `PruneJoinInputs` now also prunes LEFT/RIGHT/FULL joins without a residual. An
+outer join with a residual lowers through an anti-join on the whole preserved row, so it is
+left alone. The narrowed join takes its schema from the old join's schema, so the padded
+side stays nullable.
+
+**Semantics.** Narrowing a preserved side is exact. Narrowing a padded side merges rows that
+differ only in dead columns, and their weights sum. A key whose integrated rows have
+cancelling signs then looks unmatched and gets padded. On arbitrary ±1 streams a probe found
+pruned ≠ unpruned in 8–47% of cases, per query shape. It is exact whenever no integrated row
+weight is negative, which holds for every well-formed table. Curt accepted this on
+2026-10-29, the same envelope as §4G.1. `Corner_OuterJoinUnderNegativeRowWeights_*` pins it.
+
+**Results** (SF=3 batch 1, two runs, same harness as §9.5; all 16 outputs identical to main,
+row for row with multiplicities):
+
+| | main | outer-join pruning |
+|---|---|---|
+| engine step | 63.4–64.2 s | **40.0–40.4 s (−37%)** |
+| allocated | 84.5 GiB | **46.7 GiB (−45%)** |
+| batch wall | 67.6–70.2 s | 44.4–44.8 s |
+| `fact_market_history` left join | 20.4 s / 25.8 GiB | 2.05 s / 0.3 GiB |
+| its projection | 6.7 s / 12.4 GiB | 0.45 s / 0.2 GiB |
+
+**Tests** (`JoinColumnPruningTests`, +13 cases): plan shape (fires, padded side stays
+nullable, fan-out narrows to the key, a residual blocks it); pruned ≡ unpruned ≡ batch
+oracle on well-formed streams with NULL keys and an aggregate parent, on both the typed and
+structural paths; the corner. Mutations caught: inner-join schema for outer joins (7
+failures) and dropping the residual guard (2). Full suite: 2457 passed, 1 skipped.
+
+**Lesson.** The view was 45% of the batch, and the profile said "join". The cause was a
+plan rule that stopped at INNER. Check the logical plan for a missing rewrite before
+optimising the operator.
 
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 

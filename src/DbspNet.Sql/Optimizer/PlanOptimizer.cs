@@ -567,7 +567,18 @@ public static class PlanOptimizer
             _ => parent,
         };
 
-        if (input is not JoinPlan { JoinType: JoinType.Inner } join)
+        // Outer joins too, when they carry no residual. An outer join with a residual
+        // lowers through an anti-join on the WHOLE preserved row
+        // (CompileOuterJoinWithResidual), so narrowing it needs its own argument.
+        // Narrowing an outer join's preserved side is exact (the output is linear in it
+        // for a fixed match-presence). Narrowing a NULL-padded side merges rows that
+        // differ only in dead columns, so their weights sum: per-key match-presence is
+        // unchanged unless weights cancel, which needs negative integrated row weights
+        // (never true of a well-formed table). This is what turns a fan-out LEFT JOIN
+        // whose right columns are unused into a weight multiply (ivm-bench
+        // fact_market_history: ~40M join output rows → ~0.7M).
+        if (input is not JoinPlan join
+            || (join.JoinType != JoinType.Inner && join.Residual is not null))
         {
             return parent;
         }
@@ -650,13 +661,19 @@ public static class PlanOptimizer
             ? null
             : ExpressionRewriter.RemapColumnIndices(join.Residual, concatRemap);
 
+        // An outer join's schema marks its padded side nullable, which the narrowed
+        // inputs' schemas don't, so take the kept columns from the join's own schema.
+        var newSchema = join.JoinType == JoinType.Inner
+            ? newLeft.Schema.Concat(newRight.Schema)
+            : join.Schema.SubsetByIndex(KeptColumns(concatRemap));
+
         var newJoin = join with
         {
             Left = newLeft,
             Right = newRight,
             EquiKeys = newEqui,
             Residual = newResidual,
-            Schema = newLeft.Schema.Concat(newRight.Schema),
+            Schema = newSchema,
         };
 
         // Rebuild the parent against the narrowed join, remapping its references into
@@ -704,6 +721,22 @@ public static class PlanOptimizer
         }
 
         return used;
+    }
+
+    // Old concat-space indices that survive narrowing, in their new output order.
+    private static List<int> KeptColumns(int[] concatRemap)
+    {
+        var kept = new List<int>();
+        for (var i = 0; i < concatRemap.Length; i++)
+        {
+            if (concatRemap[i] >= 0)
+            {
+                kept.Add(i);
+            }
+        }
+
+        kept.Sort((a, b) => concatRemap[a].CompareTo(concatRemap[b]));
+        return kept;
     }
 
     private static int[] Identity(int count)

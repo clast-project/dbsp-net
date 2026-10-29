@@ -3,7 +3,7 @@
 namespace DbspNet.Sql.Optimizer;
 
 /// <summary>
-/// Process-wide opt-in for <b>projection pushdown through an INNER join</b> — the
+/// Process-wide opt-in for <b>projection pushdown through a join</b> — the
 /// column-liveness rule <see cref="PlanOptimizer"/> documents as "not yet applied:
 /// general top-down column liveness across joins" (docs/design-row-representation.md
 /// §21 — the term-2 / whole-row-hash lever the §18 aggregate-input narrowing cannot
@@ -28,12 +28,21 @@ namespace DbspNet.Sql.Optimizer;
 /// is bilinear and no aggregator reads the dropped column <i>through</i> the join (the
 /// aggregate's argument columns are kept, being referenced above), so there is no
 /// value-presence hazard. Holds for arbitrary <i>signed</i> Z-sets — this is ordinary
-/// relational projection pushdown, valid by construction.</para>
+/// relational projection pushdown, valid by construction — for INNER joins.</para>
+/// <para><b>Outer joins (no residual) are pruned too, and that half is conditional.</b>
+/// Narrowing a NULL-padded side merges rows whose weights then sum, so a key whose
+/// integrated rows have cancelling signs looks unmatched and its preserved rows get padded.
+/// It is exact whenever no integrated row weight is negative — true of every well-formed
+/// table — the same envelope as G's NULLable SUM, accepted on the same terms
+/// (docs/design-state-representation.md §9.6). Narrowing a preserved side is exact. The prize
+/// is a fan-out outer join whose padded columns are unused: the padded side narrows to its
+/// key and the fan-out becomes a weight multiply (ivm-bench fact_market_history: −37% batch-1
+/// step, −45% allocation).</para>
 /// <para><b>Default ON</b> (§21 gate: q4 −50% W=1 / 2.93–4.19× W=8, q3 preserved, full-±1
 /// PBT proves soundness). Read at <see cref="PlanOptimizer.Optimize"/> time;
 /// <see cref="ThreadStaticAttribute"/> so concurrent compiles cannot observe each other's
 /// value. No plan/compiler signature change (dodges the typed-compiler reflection gotcha).
-/// Scoped to INNER joins in v1. Benchmarks set it <c>false</c> to A/B the full-row baseline;
+/// Benchmarks set it <c>false</c> to A/B the full-row baseline;
 /// the rest of the seam family (<c>NonLinearNarrowingMode</c> / <c>DeltaPoolMode</c>) stays
 /// default-off because those are conditionally sound, this one is not.</para>
 /// </remarks>
@@ -49,9 +58,9 @@ internal static class JoinColumnPruningMode
 
     /// <summary>
     /// When true (the default), <c>PruneJoinInputs</c> inserts narrowing projections on an
-    /// INNER join's inputs, dropping every column no consumer (parent, combine, residual,
-    /// equi-key) reads. Unconditionally sound, so on by default; set false to A/B the
-    /// full-row baseline. Thread-static.
+    /// INNER join's inputs, and an outer join's with no residual, dropping every column no
+    /// consumer (parent, combine, residual, equi-key) reads. Set false to A/B the full-row
+    /// baseline. Thread-static.
     /// </summary>
     internal static bool Enabled
     {

@@ -432,6 +432,19 @@ public sealed class ProgramRunner
                     $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms ({share,4:F1}%)  alloc {op.AllocBytes / (1024.0 * 1024.0),8:F1} MiB  state={op.RetainedRows,-8} out={op.LastOutputRows,-6} {op.Label}"));
             }
 
+            // DBSPNET_PROFILE_VIEW=<view>: every operator of one view, in circuit order,
+            // so a view's whole chain (not just its top-30 members) can be read.
+            if (Environment.GetEnvironmentVariable("DBSPNET_PROFILE_VIEW") is { Length: > 0 } view)
+            {
+                sb.AppendLine();
+                sb.AppendLine("-- all operators of view '" + view + "' (circuit order) --");
+                foreach (var op in operators.Where(o => o.Label == view).OrderBy(o => o.Index))
+                {
+                    sb.AppendLine(FormattableString.Invariant(
+                        $"  [{op.Index,4}] {op.Name,-24} {op.CumulativeMs,8:F1} ms  alloc {op.AllocBytes / (1024.0 * 1024.0),8:F1} MiB  state={op.RetainedRows,-8} out={op.LastOutputRows,-6}"));
+                }
+            }
+
             // By operator KIND: sums time AND allocation across every operator of a
             // kind, so the ApplyOp (map/filter/project) tail's total share of the
             // batch pops out directly — the number the row-rep / columnar arc weighs.
