@@ -367,6 +367,21 @@ internal static class RandomQuery
         // pre-ANSI inner-join spelling.
         Gen.Const("SELECT a.k, a.v, b.v FROM t a, u b WHERE a.k = b.k"));
 
+    /// <summary>
+    /// True when <paramref name="sql"/> aggregates SUM over the NULLable table
+    /// <c>n</c> and the integrated <c>n</c> holds a NEGATIVE row weight. SUM over a
+    /// NULLable argument on the trace-free linear aggregate follows summed-weight
+    /// presence (NULL iff the summed weight of non-NULL rows is 0;
+    /// docs/design-state-representation.md §4G), which equals the batch oracle's
+    /// per-row rule on every Z-set without negative row weights and deliberately
+    /// diverges on the rest (pinned by <c>LinearAggregateTests.Corner_SumNullable*</c>).
+    /// The PBTs assert equivalence only inside that domain.
+    /// </summary>
+    internal static bool OutsideNullableSumDomain(string sql, IEnumerable<InputEvent> events)
+        => sql.Contains("SUM(", StringComparison.Ordinal)
+           && sql.Contains("FROM n ", StringComparison.Ordinal)
+           && IncrementalOracle.NetTable(events, "n").Any(e => e.Value.Value < 0);
+
     // ---- Data generator ----
 
     // A nullable int drawn from [-2, 5]: values < 0 fold to NULL so ~25% of

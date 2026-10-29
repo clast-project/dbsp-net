@@ -103,14 +103,13 @@ public static partial class TypedPlanCompiler
                         typeof(LinearCountAggregator<>).MakeGenericType(inputRowType), presence);
                 }
 
-            // SUM over a NULLable argument stays on the trace-backed operator: its NULL
-            // rule is "no non-NULL row has non-zero weight", a per-row fact that a
-            // weight sum cannot reproduce once the integrated input carries negative
-            // weights (rows {+1 x=4, -1 x=2} sum to weight 0 yet the result is 2).
-            // AVG's NULL rule is already the summed non-NULL weight, so it is linear.
-            case AggregateKind.Sum when call.Argument.Type.Nullable:
-                return null;
-
+            // SUM over a NULLable argument: NULL iff the summed weight of the group's
+            // non-NULL-argument rows is zero ("summed-weight presence", the rule AVG
+            // already uses; every SUM unit tracks that weight as N). The trace-backed
+            // operator's rule is per-row ("no non-NULL row has non-zero weight"); the
+            // two agree whenever no integrated row weight is negative — every
+            // well-formed table — and differ otherwise: rows {+1 x=4, -1 x=2, +1 NULL}
+            // give the trace 2 and this NULL (§4G, Corner_SumNullable* pins it).
             case AggregateKind.Sum when call.ResultType is SqlBigintType:
                 return Linear(typeof(LinearSumLongAggregator<>), typeof(long?));
 

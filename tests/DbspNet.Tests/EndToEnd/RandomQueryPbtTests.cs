@@ -110,6 +110,11 @@ public class RandomQueryPbtTests
         var ctx = new BatchEvalContext(tableStates, new Dictionary<CteRef, ZSet<StructuralRow, Z64>>());
         var batch = BatchPlanEvaluator.Evaluate(plan, ctx);
 
+        if (RandomQuery.OutsideNullableSumDomain(sql, filteredTicks.SelectMany(t => t)))
+        {
+            return true;
+        }
+
         if (!accumulated.Equals(batch))
         {
             var family = compileOptions?.TraceFamily ?? TraceFamily.Flat;

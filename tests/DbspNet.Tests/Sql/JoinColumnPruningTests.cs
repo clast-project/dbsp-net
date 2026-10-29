@@ -84,6 +84,11 @@ public class JoinColumnPruningTests
         var ctx = new BatchEvalContext(tableStates, new Dictionary<CteRef, ZSet<StructuralRow, Z64>>());
         var batch = BatchPlanEvaluator.Evaluate(plan, ctx);
 
+        if (RandomQuery.OutsideNullableSumDomain(sql, allFiltered.SelectMany(t => t)))
+        {
+            return true;
+        }
+
         if (!accumulated.Equals(batch))
         {
             Console.Error.WriteLine($"SQL (pruned): {sql}");

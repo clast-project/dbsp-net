@@ -40,7 +40,10 @@ public sealed class LinearAggregateTests : IDisposable
                  COUNT(DISTINCT v) FILTER (WHERE p >= 6) AS dv_hi,
                  COUNT(DISTINCT s) AS ds,
                  COUNT(DISTINCT v + p) AS dvp,
-                 COUNT(DISTINCT d) AS dd
+                 COUNT(DISTINCT d) AS dd,
+                 SUM(v) AS sv,
+                 SUM(xn) AS sxn,
+                 SUM(dn) AS sdn
           FROM t
           GROUP BY g";
 
@@ -51,7 +54,7 @@ public sealed class LinearAggregateTests : IDisposable
         @"SELECT g, COUNT(*) AS n, COUNT(v) AS nv, COUNT(*) FILTER (WHERE p < 3) AS n_lo,
                  SUM(w) AS sw, SUM(d) AS sd, AVG(dn) AS adn,
                  COUNT(DISTINCT v) AS dv, COUNT(DISTINCT v) FILTER (WHERE p < 3) AS dv_lo,
-                 COUNT(DISTINCT s) AS ds, COUNT(DISTINCT d) AS dd
+                 COUNT(DISTINCT s) AS ds, COUNT(DISTINCT d) AS dd, SUM(v) AS sv, SUM(dn) AS sdn
           FROM t GROUP BY g";
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "dbspnet-lagg-" + Guid.NewGuid().ToString("N"));
@@ -171,10 +174,13 @@ public sealed class LinearAggregateTests : IDisposable
         Assert.Equal("LinearAggregateOp", AggOp(Compile(Query, linear: true)));
         Assert.Equal("IncrementalAggregateOp", AggOp(Compile(Query, linear: false)));
 
-        // Non-linear members, NULLable SUM and the spine family keep the trace.
+        // NULLable SUM (BIGINT, DOUBLE, DECIMAL accumulators) is linear too.
+        Assert.Equal("LinearAggregateOp", AggOp(Compile("SELECT g, SUM(v) FROM t GROUP BY g", true)));
+        Assert.Equal("LinearAggregateOp", AggOp(Compile("SELECT g, SUM(xn) FROM t GROUP BY g", true)));
+        Assert.Equal("LinearAggregateOp", AggOp(Compile("SELECT g, SUM(dn) FROM t GROUP BY g", true)));
+
+        // Non-linear members and the spine family keep the trace.
         Assert.Equal("IncrementalAggregateOp", AggOp(Compile("SELECT g, COUNT(*), MIN(v) FROM t GROUP BY g", true)));
-        Assert.Equal("IncrementalAggregateOp", AggOp(Compile("SELECT g, SUM(v) FROM t GROUP BY g", true)));
-        Assert.Equal("IncrementalAggregateOp", AggOp(Compile("SELECT g, SUM(xn) FROM t GROUP BY g", true)));
         Assert.Equal(
             "SpineIncrementalAggregateOp",
             AggOp(Compile("SELECT g, COUNT(*) FROM t GROUP BY g", true, new CompileOptions { TraceFamily = TraceFamily.Spine })));
@@ -229,7 +235,9 @@ public sealed class LinearAggregateTests : IDisposable
         // weights go negative and groups cancel to weight 0 while non-empty). Every
         // non-DISTINCT linear member is exact here: its state is a linear function of
         // the integrated group, and the op keeps a weight-0 group whose sums have not
-        // cancelled (dropping it would lose them).
+        // cancelled (dropping it would lose them). NULLable SUM is deliberately absent:
+        // its NULL rule follows summed weight, which diverges here (see
+        // Corner_SumNullableUnderNegativeRowWeights_FollowsSummedNonNullWeight).
         const string q =
             @"SELECT g, COUNT(*) AS n, COUNT(v) AS nv, COUNT(*) FILTER (WHERE p < 3) AS n_lo,
                      SUM(w) AS sw, SUM(d) AS sd, AVG(v) AS av, AVG(dn) AS adn, SUM(x) AS sx, AVG(xn) AS axn
@@ -278,6 +286,83 @@ public sealed class LinearAggregateTests : IDisposable
 
         Assert.Equal(["0|2#1"], Delta(queries[0]));
         Assert.Equal(["0|1#1"], Delta(queries[1]));
+    }
+
+    [Fact]
+    public void Corner_SumNullableUnderNegativeRowWeights_FollowsSummedNonNullWeight()
+    {
+        // Documented divergence (§4G, "summed-weight presence"): SUM over a NULLable
+        // argument is NULL iff the summed weight of the group's non-NULL rows is 0.
+        // The trace-backed operator asks instead whether some non-NULL row has
+        // non-zero weight. With rows id=1 (+1, v=4) and id=2 (-1, v=2) the non-NULL
+        // weight sums to 0 although both rows are held; id=3 (v NULL) keeps the group
+        // present. Trace: 4*1 + 2*(-1) = 2. Linear: NULL. Same for every accumulator.
+        const string q = "SELECT g, SUM(v) AS sv, SUM(xn) AS sxn, SUM(dn) AS sdn FROM t GROUP BY g";
+        var queries = new[] { Compile(q, linear: false), Compile(q, linear: true) };
+        Assert.Equal("LinearAggregateOp", AggOp(queries[1]));
+        foreach (var c in queries)
+        {
+            c.Table("t").Insert(0, 1, 4, 0L, 0, null, "0.00", "4.00", 0.0, 4.0);
+            c.Table("t").Delete(0, 2, 2, 0L, 0, null, "0.00", "2.00", 0.0, 2.0);
+            c.Table("t").Insert(0, 3, null, 0L, 0, null, "0.00", null, 0.0, null);
+            c.Step();
+        }
+
+        Assert.Equal(["0|2|" + Format(2.0) + "|200#1"], Delta(queries[0]));
+        Assert.Equal(["0|NULL|NULL|NULL#1"], Delta(queries[1]));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NullableSum_AllNullThenValueThenNull_MatchesTraceBacked(bool restoreBetweenTicks)
+    {
+        // A group of only NULL arguments sums to NULL; it turns non-NULL when a
+        // non-NULL row arrives and back to NULL when that row leaves, while the group
+        // stays present throughout. BIGINT, DOUBLE and DECIMAL accumulators, with an
+        // optional snapshot/restore of the linear op before every tick.
+        const string q = "SELECT g, COUNT(*) AS n, SUM(v) AS sv, SUM(xn) AS sxn, SUM(dn) AS sdn FROM t GROUP BY g";
+        var legacy = Compile(q, linear: false);
+        var linear = Compile(q, linear: true);
+        object?[] null1 = [0, 1, null, 0L, 0, null, "0.00", null, 0.0, null];
+        object?[] null2 = [0, 2, null, 0L, 0, null, "0.00", null, 0.0, null];
+        object?[] val = [0, 3, 7, 0L, 0, null, "0.00", "1.25", 0.0, 0.5];
+        var half = Format(0.5);
+        var script = new (object?[] Row, bool Insert, string Expected)[]
+        {
+            (null1, true, "0|1|NULL|NULL|NULL#1"),
+            (null2, true, "0|1|NULL|NULL|NULL#-1;0|2|NULL|NULL|NULL#1"),
+            (val, true, "0|2|NULL|NULL|NULL#-1;0|3|7|" + half + "|125#1"),
+            (val, false, "0|2|NULL|NULL|NULL#1;0|3|7|" + half + "|125#-1"),
+            (null1, false, "0|1|NULL|NULL|NULL#1;0|2|NULL|NULL|NULL#-1"),
+            (val, true, "0|1|NULL|NULL|NULL#-1;0|2|7|" + half + "|125#1"),
+            (null2, false, "0|1|7|" + half + "|125#1;0|2|7|" + half + "|125#-1"),
+            (val, false, "0|1|7|" + half + "|125#-1"),
+            (null1, true, "0|1|NULL|NULL|NULL#1"),
+        };
+
+        var tick = 0;
+        foreach (var (row, insert, expected) in script)
+        {
+            if (restoreBetweenTicks)
+            {
+                var dir = Path.Combine(_dir, "t" + tick);
+                await Snapshot.WriteAsync(linear.Circuit, dir);
+                linear = Compile(q, linear: true);
+                await Snapshot.ReadAsync(linear.Circuit, dir);
+            }
+
+            tick++;
+            foreach (var c in new[] { legacy, linear })
+            {
+                if (insert) c.Table("t").Insert(row);
+                else c.Table("t").Delete(row);
+                c.Step();
+            }
+
+            Assert.Equal(expected.Split(';'), Delta(legacy));
+            Assert.Equal(Delta(legacy), Delta(linear));
+        }
     }
 
     [Fact]

@@ -351,13 +351,14 @@ one `Dictionary<TKey, struct>`. It has **no input trace**. The typed compiler
 GROUP BY is one of:
 
 - `COUNT(*)`, `COUNT(x)`, or a FILTERed count (`COUNT(CASE WHEN p THEN 1 END)`);
-- `SUM(x)` over a **NOT NULL** argument (BIGINT, DOUBLE or DECIMAL accumulator);
+- `SUM(x)` over any argument, NULLable or not (BIGINT, DOUBLE or DECIMAL accumulator;
+  NULLable since §4G.1);
 - `AVG(x)` over any argument, NULLable or not, DOUBLE or DECIMAL;
 - `COUNT(DISTINCT x)`, FILTERed or not, sharing per-base tables like variant B. The
   base value must be blittable or `Utf8String`.
 
-Anything else keeps `IncrementalAggregateOp`: MIN/MAX, sketches, STDDEV, a SUM over
-a NULLable argument, the spine trace family, or a snapshot codec without keyed
+Anything else keeps `IncrementalAggregateOp`: MIN/MAX, sketches, STDDEV, the spine
+trace family, or a snapshot codec without keyed
 blobs. `LinearAggregateMode` is default-on, uses the inverse thread-static flag, and
 `DBSPNET_LINEAR_AGG=off` turns it off. The structural path is unchanged, so the
 program path and LATENESS still compile to the trace-backed operator.
@@ -378,10 +379,10 @@ outer `AVG(final) GROUP BY category` does. Its inner `MAX(price)` keeps the trac
 - FILTER is evaluated per row.
 - BIGINT SUM uses the same `checked(sum + v*w)` per delta row. DECIMAL sums keep
   the same Int256 accumulator and narrow at output.
-- **SUM over a NULLable argument is excluded on purpose.** Its NULL rule is "no
-  non-NULL row has non-zero weight". That is a per-row fact: rows `{+1 x=4, −1 x=2}`
-  sum to weight 0 but give 2. The existing arbitrary-Z-set PBTs
-  (`RandomQuery*`) caught this.
+- **SUM over a NULLable argument** was excluded at first, because the trace-backed
+  rule is "no non-NULL row has non-zero weight", a per-row fact: rows `{+1 x=4,
+  −1 x=2}` sum to weight 0 but give 2. The arbitrary-Z-set PBTs (`RandomQuery*`)
+  caught this. §4G.1 makes it linear under summed-weight presence.
 - **COUNT(DISTINCT) corner, documented and tested.** G counts values whose
   *summed* weight is positive. The trace-backed operator counts values held by
   *some positive-weight row*. The two agree whenever no integrated row weight is
@@ -450,8 +451,7 @@ Full suite: 2399 passed, 1 skipped.
 **Risks.**
 
 - The COUNT(DISTINCT) negative-weight corner above.
-- A NULLable SUM keeps the trace, so a query with one such SUM loses the whole win.
-  An exact fix would need per-row presence.
+- ~~A NULLable SUM keeps the trace~~ — resolved by §4G.1.
 - Per-group state is an `object[]` of cells, which is fine for few, large groups.
   Many-group linear aggregates (q12-like) have not been measured.
 - Wall-clock has not been measured under contention. The decay ev/s moved up
@@ -461,10 +461,52 @@ Full suite: 2399 passed, 1 skipped.
 Before quoting a throughput number, run a serialized 10M decay on q15/q16 to check
 whether the decay curve flattens. Follow-ups:
 
-1. Make nullable SUM linear if the SQL semantics on negative weights are allowed to
-   follow the summed weight.
+1. ~~Make nullable SUM linear~~ — done, §4G.1.
 2. Give the structural path the same operator.
 3. Fix the `TypedAvgDecimalAggregator` divide-by-zero.
+
+### 4G.1 SUM over a NULLable argument (summed-weight presence, `exp/state-r3-looseends`)
+
+**Rule (user-approved).** SUM over a NULLable argument is NULL iff the summed weight
+of the group's non-NULL-argument rows is 0. That is AVG's rule, and every linear SUM
+unit already tracked that weight (`N`) and persisted it in its keyed blob, so the
+change is only the removal of the compile-time exclusion. Legacy→linear restore
+through the alias folds `trace.arrows`, which rebuilds `N` exactly.
+
+**Divergence.** The rule equals the trace-backed one whenever no integrated row
+weight is negative. Otherwise it differs: `{+1 (id1, v=4), −1 (id2, v=2), +1 (id3,
+v NULL)}` gives the trace 2 and G NULL, for all three accumulators. This is the same
+accepted class of corner as G's COUNT(DISTINCT).
+`Corner_SumNullableUnderNegativeRowWeights_FollowsSummedNonNullWeight` pins it.
+
+**Tests.**
+- The `RandomQuery*` PBTs (incremental, optimized, pooled, pruned) now skip only
+  the cases where the query SUMs over the NULLable table `n` **and** the integrated
+  `n` holds a negative row weight (`RandomQuery.OutsideNullableSumDomain`).
+- `LinearAggregateTests` covers BIGINT, DOUBLE and DECIMAL nullable SUM in the
+  every-tick differential and in both restore directions.
+- A scripted all-NULL → value → NULL group test runs with and without a
+  snapshot/restore before every tick.
+
+Mutations, all caught after a clean rebuild:
+- BIGINT SUM never NULL (10 tests fail, including 4 `RandomQuery*` PBTs);
+- NULL rows counted into `N` (10 fail);
+- DOUBLE SUM never NULL (5 fail);
+- DECIMAL SUM never NULL (6 fail);
+- `N` not persisted (3 restore tests fail).
+
+**Nexmark: nothing newly eligible.** Every Nexmark column is NOT NULL, and the
+compiled aggregate operator types for all queries are identical before and after.
+The only SUM is q17's, and that group also has MIN/MAX.
+
+**Synthetic** (1M rows, batch 10k, 20k groups, ~20% NULL per argument, ~10% deletes;
+`SELECT g, COUNT(*), SUM(v BIGINT), SUM(x DOUBLE), SUM(d DECIMAL) GROUP BY g`; B/ev
+covers push + step):
+
+| arm | operator | live bytes | B/ev |
+|---|---|---|---|
+| off (= behaviour before §4G.1) | IncrementalAggregateOp | 193,686,448 | 2157 |
+| on | LinearAggregateOp | **25,084,480 (7.7×)** | **1817 (−16%)** |
 
 ## 5. Cross-cutting findings
 
