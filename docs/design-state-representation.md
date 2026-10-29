@@ -1016,6 +1016,27 @@ now on a clean profile. Next: price a non-consolidating delta path for linear op
 (map/filter chains between stateful ops) against the `reprbench`/`w1profile` instruments
 before any representation rewrite.
 
+### 9.8 MIN/MAX input narrowing by default: measured, not shipped
+
+Policy (Curt, 2026-10-29): an assumption Feldera makes that *improves performance* should be
+on by default. Feldera narrows aggregate inputs unconditionally (Calcite projects an
+aggregate's input to its keys and arguments), so `NonLinearNarrowingMode` was flipped to
+`Always` and measured. The suite passed once the signed-stream PBTs pinned `Auto`, and a
+corner test pinned the divergence.
+
+SF=3 batch 1 (outputs identical): **`Always` allocated 47.74 GiB vs 46.71 GiB under `Auto`
+(+1 GiB)**, and the step was no faster (39.1 vs 38.5 s). On `watches` the narrowing added a
+*separate* projection ApplyOp (502 MiB) directly after the view's own CASE projection,
+without shrinking the aggregate (1,205.6 MiB, 885,922 state rows, both arms). Nexmark already
+declares every table `append_only`, so `Auto` already narrows there and `Always` changes
+nothing. **Reverted.** It fails the policy's own condition.
+
+**Lead for the per-row arc.** Optimizer-inserted narrowing projections (this rule, and
+join-input pruning) can land as their own ApplyOp next to an existing projection instead of
+being fused into it. Count adjacent Project→Project ApplyOps in the compiled ivm-bench
+circuit before designing any representation change. If the pattern is common, fusing them is
+a cheap, deterministic allocation win.
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
