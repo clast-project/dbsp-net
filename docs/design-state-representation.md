@@ -1242,8 +1242,27 @@ fusion-fires test asserts fewer ApplyOps. Mutations caught: the W>1 step ignorin
 r3par output digests are identical in every cell. The single-circuit gain is twice the
 §9.12 estimate, because the deferred lift removes a full-width Z-set of every input row.
 The parallel compile has no lift (inputs are already typed), so W>1 keeps only the
-chain → exchange part: −5.5% on q4. **Wall-clock not yet measured**, and on this host it
-needs ≥5 alternating runs per arm (§9.11).
+chain → exchange part: −5.5% on q4.
+
+**Wall-clock** (`nexmark 2000000 10000 3 14`, i.e. every query at W=1 and W=14 with each run
+a median of 3; `NEXMARK_GEN=feldera`; 5 alternating runs per arm; idle machine,
+`caffeinate`). Median ev/s, fusion off → on:
+
+| | W=1 (boundary compile: lift fused) | W=14 (parallel compile: chain → exchange) |
+|---|---|---|
+| q4 | 2.20M → 2.55M (**+16%**; ranges 2.08–2.30 vs 2.52–2.82, disjoint) | +0.9% |
+| q12 | 2.80M → 3.97M (**+42%**) | −1.1% |
+| q16 | 2.28M → 2.93M (**+29%**) | −4.1% |
+| q17 | 2.60M → 3.28M (**+26%**) | −0.3% |
+| q3 / q8 / q15 / q20 | +14% / +19% / +21% / +7% | −0.5% / +4.1% / −13.5%* / +0.9% |
+| q0 / q1 / q22 (controls, untouched) | −0.1% / −1.3% / −1.1% | −0.7% / −0.2% / +0.6% |
+
+\*q15's off arm spans 33% at W=14; q2 (also untouched) is bimodal (3.96–4.81M) in both arms
+at W=1 and moved −6% at W=14. Both are noise. **W=1 gains are real** (disjoint ranges on
+every fused query), largest on the single-table aggregates (q12/q15/q16/q17), whose bid
+input lift is now fused into the aggregate's index. **W=14 shows no change beyond noise**:
+only the smaller chain → exchange part applies there, and those runs are dominated by
+exchange coordination. The Feldera head-to-head (W=14) is therefore unchanged by §9.13.
 
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
