@@ -247,7 +247,7 @@ deletes. The test ends with a batch recompute. It also runs a 200k-op churn test
 `DistinctValueTable` against a `Dictionary` oracle. Full suite: 2379 passed, 1
 skipped, 0 failed.
 
-### 4B.1 Ship decision — compact MIN/MAX is OFF by default
+### 4B.1 Ship decision — compact MIN/MAX is OFF by default (superseded by §4B.2: the hybrid ships on)
 
 `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps]` keeps a
 source-maintained sliding window over `SELECT g, MIN(v), MAX(v) … GROUP BY g`:
@@ -266,6 +266,80 @@ compaction (the q15/q16 +35–38% of §6) ships **on**; `CompactMinMax` ships
 **off**. Follow-up: a hybrid that starts at (best, count) and promotes a group to
 a sorted structure the first time its extreme is retracted. That keeps q4's
 append-only −33% and costs a sliding window one rescan per group.
+
+### 4B.2 Hybrid MIN/MAX — promote on first retraction (`exp/state-B2-minmax`)
+
+**Built.** The MIN/MAX state is now a three-way switch,
+`CompactAggregatorStateMode.MinMax` (`MinMaxStateKind`): `Legacy` (Dictionary +
+SortedSet), `RescanOnly` (§4B.1) and `Hybrid` (**the default**). A hybrid group
+starts as (best, count). The first tick that retracts its best (or finds it
+inconsistent) does one rescan of the post-delta group into a
+`SortedValueCounts<T>`, and the group keeps that state from then on.
+
+`SortedValueCounts<T>` is a chunked sorted array: a short array of chunks, each
+holding up to 128 inline `(T value, long rows)` entries. An insert or remove is
+a binary search plus a memmove inside one chunk, and MIN/MAX is read off the
+ends. A full chunk splits in half, except that appending past the top or
+prepending below the bottom starts a new chunk. Without that rule, a sliding
+window leaves every chunk half full: the in-situ cost was 41 B/value, and it is
+21 B/value with the rule. A chunk under 32 entries merges with a neighbour when
+the two fit in half a chunk. The bulk build sorts into chunks filled to 3/4
+(with a reused per-thread scratch buffer). Values are keyed by `CompareTo`, so
+the Decimal "equal but not Equals" behaviour is the same as (best, count).
+
+**Demotion:** only when the group empties. Losing the extreme once is the
+evidence that it will be lost again, and a wrong demotion costs another
+O(group) rescan. Restore folds a fresh state from the trace, so a restored group
+starts compact and re-promotes on its next loss. Nothing new is persisted.
+
+**`minmaxslide`** (ms/tick; serialized, other agents' builds paused; one process
+runs all three arms back to back; reps 0/1/2, where rep 0 is legacy's JIT
+warm-up). Live heap is after a compacting GC; the trace is the same in every
+arm.
+
+| shape (groups × window, change/tick) | legacy | rescan-only | **hybrid** | hybrid/legacy (reps 1–2) | live MB L / R / H |
+|---|---|---|---|---|---|
+| 100 × 10k, 10 | 2.18 / 1.49 / 1.54 | 16.7 / 16.2 / 16.2 | **1.44 / 1.25 / 1.22** | 0.80–0.84× | 231 / 37 / 58 |
+| 10 × 100k, 10 | 0.89 / 0.62 / 0.63 | 16.0 / 15.7 / 15.8 | **0.76 / 0.68 / 0.67** | 1.06–1.10× | 223 / 39 / 61 |
+| 1000 × 1k, 1 | 3.67 / 3.17 / 3.22 | 14.8 / 14.1 / 14.1 | **2.08 / 1.68 / 1.66** | 0.52–0.53× | 246 / 42 / 63 |
+| 100 × 10k, 1000 | 68.6 / 63.6 / 64.4 | 55.9 / 53.9 / 53.5 | **50.9 / 49.2 / 49.3** | 0.77× | 284 / 90 / 107 |
+| append 100 × 10k, 10 | 1.66 / 1.07 / 1.09 | 0.89 / 0.85 / 0.86 | **0.87 / 0.85 / 0.85** | = rescan-only | 299 / 76 / 76 |
+| append 1000 × 1k, 1 | 3.00 / 2.26 / 2.27 | 1.36 / 1.37 / 1.35 | **1.35 / 1.35 / 1.37** | = rescan-only | 319 / 86 / 86 |
+
+Two earlier serialized passes agree to within ~10%. Per promoted value, the
+hybrid costs **~21 B** (for example (57.7 − 37.2) MB / 1M values), against
+**~97 B** per value per aggregator for legacy. The one-time promotion shows as
+allocation (10 × 100k: 2310 B/row-change against 924 B for legacy, amortised
+over 300 ticks).
+
+**q4** (1M events, batch 10k; hybrid ≈ rescan-only, so q4 groups essentially
+never promote):
+
+| generator | live bytes legacy → rescan-only → hybrid | B/ev (w1profile) L → R → H |
+|---|---|---|
+| default | 490,412,232 → 331,255,440 → **331,280,896** (−32.4%) | 2222 → 2116 → **2116** |
+| `NEXMARK_GEN=feldera` | 422,394,528 → 282,789,352 → **282,861,560** (−33.0%) | 1978 → 1888 → **1888** |
+
+**Tests.** `CompactAggregatorStateTests` now has these parts:
+
+- a 4-way differential: hybrid, rescan-only, legacy and structural;
+- sliding-window streams that promote groups mid-run (FILTERed and computed
+  MIN/MAX, weight-2 rows, NULLs, emptied groups that demote);
+- a snapshot/restore test taken after promotions, which must continue
+  tick-for-tick like an uninterrupted legacy run;
+- a direct check that append-only never promotes and the first loss does;
+- a churn test of `SortedValueCounts` against a `SortedDictionary` oracle
+  (random, ascending slide and descending slide).
+
+Full suite: 2394 passed, 1 skipped. Mutations caught: promotion disabled,
+bulk-build duplicate counts dropped, wrong end emitted, and a split off-by-one.
+The defensive "remove missed → rebuild" path is unreachable from well-formed
+transition folds, so that mutant is equivalent.
+
+**Decision: ship the hybrid as the default.** It meets the gate on every
+sliding shape (≤ 1.10×, and faster than legacy on three of four) and matches
+rescan-only on append-only. It also keeps q4's −32/−33%. Legacy and
+rescan-only stay selectable.
 
 ## 4G. Variant G — trace-free linear aggregate (branch `exp/state-G-lineragg`)
 
@@ -486,3 +560,41 @@ Mean ev/s is the harmonic mean over five 2M-event segments; reps agreed within ~
 (after a retraction-heavy MIN/MAX check). Keep C/D opt-in only, as a memory
 option, not a speed one. Next builds: a VARCHAR arena in state, then G.
 All of the above to be re-confirmed on `NEXMARK_GEN=feldera`.
+
+## 7. Round 2 wall-clock (serialized, idle, `caffeinate -i`, 10M events, W=1, `NEXMARK_GEN=feldera`, 2 reps)
+
+Each pair is one build with its variant switch off/on. Mean is the harmonic mean
+of five 2M-event segments.
+
+| variant | query | off: segments (k ev/s) → mean | on: segments → mean | live state |
+|---|---|---|---|---|
+| **G** linear agg | q15 | 2001 1368 979 795 816 → **1,056–1,119k** | 2979 3064 3067 3081 3087 → **2,931–3,055k (~2.8×, flat)** | 846 → 75 MB |
+| | q16 | 902 402 257 183 219 → **285–286k** | 2306 2300 2318 2437 2290 → **2,295–2,329k (~8×, flat)** | 1,809 → 321 MB |
+| **B2** hybrid MIN/MAX | q4 | 2111 2012 2073 1906 1537 → **1,885–1,902k** | 2320 2106 2109 2252 2221 → **2,141–2,198k (+14–16%, flat)** | 3,893 → 2,556 MB |
+| **H** ingest arena | q18 | 1,271–1,371k | 1,347–1,393k | 6,438 → 5,021 MB |
+| | q19 | 1,359–1,488k | 1,397–1,453k | 6,140 → 4,736 MB |
+| | q20 | 1,974–2,104k | 2,123–2,124k | 5,706 → 4,686 MB |
+
+**Reading.**
+
+1. **G removes the decay on q15/q16 outright.** The old operator loses 60–80%
+   of its throughput across the run on Feldera-faithful data; the trace-free
+   operator is flat from the first segment to the last. Shipped `a55b0e4`.
+2. **B2 removes q4's late-run sag** (last segment 1.54–1.57M → 2.08–2.22M) and
+   cuts its state 34%. Shipped with this section.
+3. **H does not pay at W=1.** It removes 82–88% of live objects on q18–q20, and
+   worst-segment pause drops (q19 22% → 11%, q20 18% → 10%), but mean throughput
+   moves −2% to +8%, inside run-to-run spread. With its retention risk (§4H: 1%
+   survival pins 20× the strings), **H is not shipped.** Revisit if a W>1 or
+   memory-bound workload makes object count the limit. At W=1, GC pause is no
+   longer the dominant cost for these queries after A.
+4. **Lesson, superseding §6's "throughput follows object count":** throughput
+   follows *work per row*. A, G and B2 removed per-row work (per-partition
+   containers, the aggregate trace, the duplicated MIN/MAX structure) along with
+   the objects; C, D and H moved bytes or objects without removing work.
+
+**Measurement note.** A first run of this round (without `caffeinate`) showed
+15-minute "stalls" and isolated ~0.54M ev/s segments. A watchdog proved they were
+macOS idle sleep at ~2–3 am: its 5 s `sleep` loop counted 15 s across 14.5
+wall-minutes. The table above is the re-run with sleep prevented. Run every
+unattended timing benchmark under `caffeinate -i`.

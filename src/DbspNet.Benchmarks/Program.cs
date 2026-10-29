@@ -10,6 +10,15 @@ using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
 
+// A/B aid: DBSPNET_MINMAX_STATE=legacy|rescan|hybrid picks the typed MIN/MAX state
+// for queries compiled on this (main) thread (design-state-representation §4B).
+switch (Environment.GetEnvironmentVariable("DBSPNET_MINMAX_STATE"))
+{
+    case "legacy": CompactAggregatorStateMode.MinMax = MinMaxStateKind.Legacy; break;
+    case "rescan": CompactAggregatorStateMode.MinMax = MinMaxStateKind.RescanOnly; break;
+    case "hybrid": CompactAggregatorStateMode.MinMax = MinMaxStateKind.Hybrid; break;
+}
+
 // Profiling sub-command: `dotnet run -- profile {typed|structural|handwired} [seconds]`
 if (args.Length > 0 && args[0] == "profile")
 {
@@ -94,14 +103,15 @@ if (args.Length > 0 && args[0] == "genstats")
     return DbspNet.Benchmarks.Nexmark.NexmarkGenStats.Run(args);
 }
 
-// MIN/MAX sliding-window retraction check: `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps]`
+// MIN/MAX sliding-window retraction check: `dotnet run -- minmaxslide [groups] [window] [perTick] [ticks] [reps] [append]`
 if (args.Length > 0 && args[0] == "minmaxslide")
 {
     int Arg(int i, int fallback) =>
         args.Length > i && int.TryParse(args[i], System.Globalization.NumberStyles.Integer,
             CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
-    DbspNet.Benchmarks.MinMaxSlideBenchmark.Run(Arg(1, 100), Arg(2, 10_000), Arg(3, 10), Arg(4, 500), Arg(5, 2));
+    DbspNet.Benchmarks.MinMaxSlideBenchmark.Run(Arg(1, 100), Arg(2, 10_000), Arg(3, 10), Arg(4, 500), Arg(5, 2),
+        args.Length > 6 && args[6] == "append");
     return 0;
 }
 
