@@ -984,6 +984,38 @@ failures) and dropping the residual guard (2). Full suite: 2457 passed, 1 skippe
 plan rule that stopped at INNER. Check the logical plan for a missing rewrite before
 optimising the operator.
 
+### 9.7 Audit after §9.6: no second plan blunder; the rest is per-row work
+
+Same harness, rebased ivm-bench SQL (`2c10de5`), `e19cb37` per-view rollup. Engine step
+~39.6 s, 46.7 GiB. **No view is above 12% of the step**; the top five are `fact_holdings`,
+`watches`, `trades_history`, `daily_market` and `fact_trade` (~55% together). ApplyOp is still
+about half of step time and allocation across 373 instances. It is spread thin: projections
+between joins, each building new rows and a fresh hashed Z-set.
+
+What the audit found, by allocation (per-operator ms is not trusted under ServerGC, §9.5):
+
+- **Fan-out written into the benchmark SQL, not ours to remove.** `fact_holdings` joins
+  `dim_trade` (×2) and `dim_security` on keys with no temporal predicate, although both are
+  SCD-2 tables. Its 912,231 output rows come from 362,342 holding rows. Feldera runs the
+  same SQL and pays the same multiplication. This is a candidate upstream report, not an
+  engine lever.
+- **SCD temporal joins** (`fact_trade`, `fact_holdings` ⋈ `dim_account`): equi-key plus
+  `BETWEEN` residual, already pushed into the join (no materialised product). Inherent
+  per-candidate work.
+- **`watches`**: a MIN/MAX GROUP BY over CASE projections. Aggregate-input narrowing
+  (`NonLinearNarrowingMode`) does not fire, because ivm-bench's tables are not declared
+  `append_only`, so non-negativity is not provable. Under "Always" it would. That is the
+  same well-formed-input assumption as §4G.1 and §9.6, so it is a **policy decision**, not a
+  bug.
+- Parsing-shaped Applies (`finwire_financial` 1.5 GiB, `dim_trade` 1.5 GiB) are real work that
+  Feldera also does.
+
+**Conclusion.** The remaining batch-1 cost is genuine per-row work: row construction plus a
+consolidating hash per operator per tick. That is the row-representation arc's "Layer A + B",
+now on a clean profile. Next: price a non-consolidating delta path for linear operators
+(map/filter chains between stateful ops) against the `reprbench`/`w1profile` instruments
+before any representation rewrite.
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim
