@@ -817,9 +817,8 @@ public static partial class PlanToCircuit
     /// shard key is hashable (<see cref="IsHashableType"/>); a node with no key at
     /// all (a global window / top-K / rank, a cross join) gathers onto one worker.
     /// Everything not explicitly handled — a broadcast / correlated /
-    /// scalar-subquery join, a semi-join, a set difference, a recursive CTE, a
-    /// temporal filter, a non-inner join — is refused so the
-    /// caller falls back to the serial single circuit.
+    /// scalar-subquery join, a set difference, a recursive CTE, a temporal
+    /// filter — is refused so the caller falls back to the serial single circuit.
     /// </summary>
     private static bool CanCompileParallel(LogicalPlan plan) => CollectParallelBlockers(plan, blockers: null);
 
@@ -893,14 +892,20 @@ public static partial class PlanToCircuit
 
             case JoinPlan j:
             {
-                var ok = j.JoinType == DbspNet.Sql.Parser.Ast.JoinType.Inner
-                         || Block(j.JoinType switch
-                         {
-                             DbspNet.Sql.Parser.Ast.JoinType.LeftOuter => "LEFT OUTER JOIN",
-                             DbspNet.Sql.Parser.Ast.JoinType.RightOuter => "RIGHT OUTER JOIN",
-                             DbspNet.Sql.Parser.Ast.JoinType.FullOuter => "FULL OUTER JOIN",
-                             var other => other + " join",
-                         });
+                // Every join type shards on its equi-key. An outer join with a residual
+                // additionally shuffles each preserved side by its WHOLE row (the
+                // anti-join in UnmatchedPreservedRows), so every preserved column must hash.
+                var ok = j.JoinType switch
+                {
+                    DbspNet.Sql.Parser.Ast.JoinType.Inner => true,
+                    DbspNet.Sql.Parser.Ast.JoinType.LeftOuter
+                        or DbspNet.Sql.Parser.Ast.JoinType.RightOuter
+                        or DbspNet.Sql.Parser.Ast.JoinType.FullOuter =>
+                        j.Residual is null
+                        || PreservedSidesHashable(j)
+                        || Block("outer join with a residual over a non-hashable column type"),
+                    var other => Block(other + " join"),
+                };
                 if (ok || blockers is not null)
                 {
                     // A cross join (no equi-key) is admissible: CompileInnerJoin broadcasts
@@ -918,6 +923,23 @@ public static partial class PlanToCircuit
                 }
 
                 return Then(ok, j.Left, j.Right);
+            }
+
+            // EXISTS / IN / NOT EXISTS / NOT IN: both sides shard on the semi-join key
+            // tuple, whose columns are the EquiKeys' common types.
+            case SemiJoinPlan sj:
+            {
+                var ok = true;
+                foreach (var eq in sj.EquiKeys)
+                {
+                    if (!IsHashableType(eq.Type))
+                    {
+                        ok = Block((sj.IsAnti ? "anti-join" : "semi-join") + " on a non-hashable key type " + eq.Type);
+                        break;
+                    }
+                }
+
+                return Then(ok, sj.Input, sj.Subquery);
             }
 
             case AggregatePlan a:
@@ -973,7 +995,6 @@ public static partial class PlanToCircuit
             {
                 var why = plan switch
                 {
-                    SemiJoinPlan sj => sj.IsAnti ? "anti-join (NOT EXISTS / NOT IN)" : "semi-join (EXISTS / IN)",
                     ScalarSubqueryJoinPlan => "scalar subquery",
                     CorrelatedScalarSubqueryJoinPlan => "correlated scalar subquery",
                     DifferencePlan => "EXCEPT / set difference",
@@ -1054,6 +1075,34 @@ public static partial class PlanToCircuit
         var estimate = CardinalityEstimator.Estimate(
             right, name => ctx.RowCounts.TryGetValue(name, out var n) ? n : (long?)null);
         return estimate <= ctx.Options.BroadcastMaxRows;
+    }
+
+    /// <summary>
+    /// Whether every column of each side an outer join preserves has a stable partition
+    /// hash — the residual lowering (<see cref="CompileOuterJoinWithResidual"/>) shuffles
+    /// those sides by their whole row.
+    /// </summary>
+    private static bool PreservedSidesHashable(JoinPlan j)
+    {
+        static bool AllColumnsHashable(Schema schema)
+        {
+            foreach (var col in schema.Columns)
+            {
+                if (!IsHashableType(col.Type))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return j.JoinType switch
+        {
+            DbspNet.Sql.Parser.Ast.JoinType.LeftOuter => AllColumnsHashable(j.Left.Schema),
+            DbspNet.Sql.Parser.Ast.JoinType.RightOuter => AllColumnsHashable(j.Right.Schema),
+            _ => AllColumnsHashable(j.Left.Schema) && AllColumnsHashable(j.Right.Schema),
+        };
     }
 
     private static bool AllHashable(IReadOnlyList<ResolvedExpression> keys)
@@ -3313,6 +3362,17 @@ public static partial class PlanToCircuit
         var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
         var leftCount = plan.Left.Schema.Count;
         var rightCount = plan.Right.Schema.Count;
+        var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
+        var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
+
+        // Parallel: shuffle the WHOLE preserved side by its equi-key hash, before the
+        // NULL-key split, so the NULL-keyed bypass rows land by key too (a NULL key
+        // hashes to a fixed sentinel). Every output row then sits on the worker its
+        // left key hashes to, which is what lets the output record an honest
+        // left-key partition below. The non-preserved side is shuffled by the same
+        // key inside ExchangeIndex. At W<=1 `Exchange` is the input itself and
+        // `ExchangeIndex` is the GroupProject emitted before, so W=1 is byte-identical.
+        left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
 
         // NULL-keyed left rows can never find a match (NULL = anything is
         // NULL, not TRUE), so they bypass the join and go straight to the
@@ -3321,18 +3381,16 @@ public static partial class PlanToCircuit
         var validKeyLeft = builder.Filter(left, row => HasNoNullKey(row, leftIndices));
         var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
 
-        var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
-        var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
         var joinedSchema = plan.Schema;
         var codec = ctx.Codec;
         var leftIndexed = builder.GroupProject(
             validKeyLeft,
             row => ExtractKey(codec, leftKeySchema, row, leftIndices),
             row => row);
-        var rightIndexed = builder.GroupProject(
+        var rightIndexed = builder.ExchangeIndex(
             validKeyRight,
-            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
-            row => row);
+            row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema),
+            row => ExtractKey(codec, rightKeySchema, row, rightIndices));
 
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
@@ -3354,7 +3412,17 @@ public static partial class PlanToCircuit
             nullKeyLeft,
             row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount));
 
-        return builder.Union(joined, nullKeyPadded);
+        var result = builder.Union(joined, nullKeyPadded);
+
+        // Every output row (matched, padded by the operator, or NULL-key bypass)
+        // carries its left row's key columns at the same indices and sits on the
+        // worker that key hashed to: partitioned by the left equi-key.
+        if (ctx.Workers > 1)
+        {
+            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices));
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -3412,14 +3480,16 @@ public static partial class PlanToCircuit
 
         var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
         var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
-        var leftIndexed = builder.GroupProject(
+        // Parallel: shard both sides by the equi-key, as an INNER join does, so each
+        // matched pair is produced on the worker its key hashes to. GroupProject at W<=1.
+        var leftIndexed = builder.ExchangeIndex(
             validKeyLeft,
-            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
-            row => row);
-        var rightIndexed = builder.GroupProject(
+            row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema),
+            row => ExtractKey(codec, leftKeySchema, row, leftIndices));
+        var rightIndexed = builder.ExchangeIndex(
             validKeyRight,
-            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
-            row => row);
+            row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema),
+            row => ExtractKey(codec, rightKeySchema, row, rightIndices));
 
         // Push the residual INTO the inner join's combine (flat path) instead of
         // materialising the full product and filtering above. matched is the same
@@ -3522,6 +3592,10 @@ public static partial class PlanToCircuit
         // would look unmatched and emit a spurious NULL-pad. Set-ifying first
         // makes every surviving pair weight +1, so the projection below can only
         // sum upward.
+        //
+        // Parallel: this needs no shuffle. Equal matched pairs share a preserved row,
+        // hence an equi-key, and the inner join produced every pair on the worker that
+        // key hashes to, so all copies of a pair are already on one worker.
         var matchedPairs = NonZeroSet(builder, ctx, matched, matchedSchema);
 
         // π_S(matchedPairs), rebuilt in the SIDE's own schema (not a slice of
@@ -3540,6 +3614,17 @@ public static partial class PlanToCircuit
                 return codec.BuildRow(sideSchema, vs);
             });
 
+        // Parallel: from here on the key is the WHOLE preserved row, so shuffle by its
+        // whole-row hash: `projected` before the Distinct (one Distinct must see every
+        // copy of a row) and `side` into the semi-join below, so a preserved row meets
+        // its distinct match on one worker. NULLs hash to a fixed sentinel, consistent
+        // with the NULL = NULL row identity this anti-join needs. Identity / GroupProject
+        // at W<=1. The final Difference subtracts the semi rows from the UNshuffled
+        // `side`; it is linear, so a row and its cancelling semi row may sit on
+        // different workers.
+        int WholeRowPart(StructuralRow row) => StablePartitionHash.OfWholeRow(row, sideSchema);
+        projected = builder.Exchange(projected, WholeRowPart);
+
         // Collapse the per-match multiplicity: a preserved row that matched k
         // rows must be subtracted exactly once, not k times. Weights here are
         // all +1, so plain Distinct is enough.
@@ -3547,8 +3632,8 @@ public static partial class PlanToCircuit
             builder, ctx, projected,
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(sideSchema));
 
-        var sideIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
-            side, row => row, row => row);
+        var sideIndexed = builder.ExchangeIndex<StructuralRow, StructuralRow, Z64>(
+            side, WholeRowPart, static row => row);
         var distinctIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
             distinct, row => row, row => row);
 
@@ -3587,6 +3672,13 @@ public static partial class PlanToCircuit
         var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
         var leftCount = plan.Left.Schema.Count;
         var rightCount = plan.Right.Schema.Count;
+        var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
+        var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
+
+        // Parallel: the mirror of LEFT JOIN. Shuffle the whole preserved (right)
+        // side by its key hash before the NULL-key split, and the probed (left) side
+        // by the same key inside ExchangeIndex. Identity / GroupProject at W<=1.
+        right = builder.Exchange(right, row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema));
 
         // NULL-keyed right rows bypass the join and emit as unmatched.
         // NULL-keyed left rows can never match and are dropped.
@@ -3594,14 +3686,12 @@ public static partial class PlanToCircuit
         var validKeyLeft = builder.Filter(left, row => HasNoNullKey(row, leftIndices));
         var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
 
-        var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
-        var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
         var joinedSchema = plan.Schema;
         var codec = ctx.Codec;
-        var leftIndexed = builder.GroupProject(
+        var leftIndexed = builder.ExchangeIndex(
             validKeyLeft,
-            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
-            row => row);
+            row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema),
+            row => ExtractKey(codec, leftKeySchema, row, leftIndices));
         var rightIndexed = builder.GroupProject(
             validKeyRight,
             row => ExtractKey(codec, rightKeySchema, row, rightIndices),
@@ -3630,7 +3720,22 @@ public static partial class PlanToCircuit
             nullKeyRight,
             row => NullPadLeft(codec, joinedSchema, row, leftCount, rightCount));
 
-        return builder.Union(joined, nullKeyPadded);
+        var result = builder.Union(joined, nullKeyPadded);
+
+        // Every output row carries its right row's key columns (offset past the
+        // left columns) and sits on the worker that key hashed to.
+        if (ctx.Workers > 1)
+        {
+            var outKey = new int[rightIndices.Length];
+            for (var i = 0; i < rightIndices.Length; i++)
+            {
+                outKey[i] = leftCount + rightIndices[i];
+            }
+
+            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: outKey));
+        }
+
+        return result;
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompileFullOuterJoin(
@@ -3666,14 +3771,19 @@ public static partial class PlanToCircuit
         var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
         var joinedSchema = plan.Schema;
         var codec = ctx.Codec;
-        var leftIndexed = builder.GroupProject(
+        // Parallel: shuffle both valid-key sides by the equi-key. The NULL-keyed
+        // bypass rows stay wherever they are; they only ever reach the output union,
+        // which is linear. The output is left unpartitioned: an unmatched right row
+        // has NULL left-key columns yet sits by its right key (and vice versa), so no
+        // column set co-locates every row. GroupProject at W<=1.
+        var leftIndexed = builder.ExchangeIndex(
             validKeyLeft,
-            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
-            row => row);
-        var rightIndexed = builder.GroupProject(
+            row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema),
+            row => ExtractKey(codec, leftKeySchema, row, leftIndices));
+        var rightIndexed = builder.ExchangeIndex(
             validKeyRight,
-            row => ExtractKey(codec, rightKeySchema, row, rightIndices),
-            row => row);
+            row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema),
+            row => ExtractKey(codec, rightKeySchema, row, rightIndices));
 
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
@@ -3978,6 +4088,13 @@ public static partial class PlanToCircuit
                 return codec.BuildRow(keySchema, vs);
             });
 
+        // Parallel: both sides shard on the key tuple's whole-row hash. The narrowed
+        // subquery rows ARE key tuples, so shuffle them before the Distinct (which must
+        // see every copy of a tuple); the outer rows shuffle by their probe tuple inside
+        // ExchangeIndex below. Identity / GroupProject at W<=1.
+        int KeyPart(StructuralRow keyRow) => StablePartitionHash.OfWholeRow(keyRow, keySchema);
+        subqueryProjected = builder.Exchange(subqueryProjected, KeyPart);
+
         var subqueryDistinct = EmitDistinct(
             builder, ctx, subqueryProjected,
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(keySchema));
@@ -3987,19 +4104,19 @@ public static partial class PlanToCircuit
         var outerNonNull = builder.Filter(outer, row => HasNoNullProbe(probeFns, row));
         var subqNonNull = builder.Filter(subqueryDistinct, row => HasNoNullKeyRow(row));
 
-        var outerIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
-            outerNonNull,
-            row =>
+        StructuralRow ProbeKeyOf(StructuralRow row)
+        {
+            var vs = new object?[probeFns.Length];
+            for (var i = 0; i < probeFns.Length; i++)
             {
-                var vs = new object?[probeFns.Length];
-                for (var i = 0; i < probeFns.Length; i++)
-                {
-                    vs[i] = probeFns[i](row);
-                }
+                vs[i] = probeFns[i](row);
+            }
 
-                return codec.BuildRow(keySchema, vs);
-            },
-            row => row);
+            return codec.BuildRow(keySchema, vs);
+        }
+
+        var outerIndexed = builder.ExchangeIndex<StructuralRow, StructuralRow, Z64>(
+            outerNonNull, row => KeyPart(ProbeKeyOf(row)), ProbeKeyOf);
         var subqIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
             subqNonNull,
             row => row,
@@ -4022,11 +4139,39 @@ public static partial class PlanToCircuit
             // did NOT match. NULL-key outer rows were filtered above and
             // never entered the join, so they don't appear in `outer` here
             // either; they're consistently dropped, matching SQL's
-            // WHERE-NULL-drops semantics at the conjunct level.
+            // WHERE-NULL-drops semantics at the conjunct level. Difference is
+            // linear, so at W>1 the unshuffled outerNonNull and the key-sharded
+            // matched rows need not share a worker; the result is unpartitioned.
             return builder.Difference(outerNonNull, matched);
         }
 
+        // A semi-join emits each outer row on the worker its probe tuple hashed to.
+        // When every probe is a bare outer column, that is an honest partition on
+        // those columns (the output schema is the outer schema).
+        if (ctx.Workers > 1 && BareProbeIndices(plan.EquiKeys) is { } probeIndices)
+        {
+            ctx.SetPartition(matched, new PartitionInfo(ShardDisjoint: false, PartitionKey: probeIndices));
+        }
+
         return matched;
+    }
+
+    /// <summary>The outer column index of every semi-join probe, or null if any probe
+    /// is not a bare column reference.</summary>
+    private static int[]? BareProbeIndices(IReadOnlyList<SemiJoinEqui> equiKeys)
+    {
+        var indices = new int[equiKeys.Count];
+        for (var i = 0; i < equiKeys.Count; i++)
+        {
+            if (equiKeys[i].OuterKey is not ResolvedColumn rc)
+            {
+                return null;
+            }
+
+            indices[i] = rc.Index;
+        }
+
+        return indices;
     }
 
     private static bool HasNoNullProbe(

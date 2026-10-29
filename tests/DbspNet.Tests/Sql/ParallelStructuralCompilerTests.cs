@@ -760,15 +760,29 @@ public class ParallelStructuralCompilerTests
     }
 
     [Fact]
-    public void LeftJoin_RefusesParallel()
+    public void OuterJoinResidual_OverRealPreservedColumn_RefusesParallel()
     {
-        var plan = CompilePlan(
-            [
-                "CREATE TABLE l (k INT NOT NULL, a BIGINT NOT NULL)",
-                "CREATE TABLE r (k INT NOT NULL, b BIGINT NOT NULL)",
-            ],
-            "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k");
-        Assert.False(PlanToCircuit.TryCompileParallel(plan, 4, out _));
+        // An equi LEFT JOIN shards (ParallelOuterSemiJoinTests), and so does one with a
+        // residual, but the residual lowering shuffles the preserved side by its WHOLE
+        // row, and REAL has no stable partition hash. A REAL on the non-preserved side
+        // is fine.
+        string[] ddl =
+        [
+            "CREATE TABLE l (k INT NOT NULL, a REAL NOT NULL)",
+            "CREATE TABLE r (k INT NOT NULL, b REAL NOT NULL)",
+        ];
+        Assert.True(PlanToCircuit.TryCompileParallel(
+            CompilePlan(ddl, "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k"), 4, out var plain));
+        plain!.Dispose();
+        Assert.False(PlanToCircuit.TryCompileParallel(
+            CompilePlan(ddl, "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k AND l.a < r.b"), 4, out _));
+        Assert.True(PlanToCircuit.TryCompileParallel(
+            CompilePlan(
+                ["CREATE TABLE l (k INT NOT NULL, a BIGINT NOT NULL)", "CREATE TABLE r (k INT NOT NULL, b REAL NOT NULL)"],
+                "SELECT l.a, r.b FROM l LEFT JOIN r ON l.k = r.k AND l.a < r.b"),
+            4,
+            out var nonPreservedReal));
+        nonPreservedReal!.Dispose();
     }
 
     [Fact]
