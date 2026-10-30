@@ -212,7 +212,7 @@ public sealed class CircuitBuilder
 
         var workers = _parallel.Workers;
         var coordinator = _parallel.NextCoordinator(
-            () => new ExchangeCoordinator<List<KeyValuePair<TKey, TWeight>>>(workers));
+            () => new ExchangeCoordinator<IReadOnlyList<KeyValuePair<TKey, TWeight>>>(workers));
         var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
         _root.AddOperator(new ExchangeOp<TKey, TWeight>(
             input, output, partition, coordinator, _parallel.WorkerId, _parallel.Abort));
@@ -245,7 +245,7 @@ public sealed class CircuitBuilder
 
         var workers = _parallel.Workers;
         var coordinator = _parallel.NextCoordinator(
-            () => new ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>>(workers));
+            () => new ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>>(workers));
         var output = new Stream<ZSet<TRow, TWeight>>(ZSet<TRow, TWeight>.Empty);
         _root.AddOperator(new BroadcastExchangeOp<TRow, TWeight>(
             input, output, coordinator, _parallel.WorkerId, _parallel.Abort));
@@ -285,7 +285,7 @@ public sealed class CircuitBuilder
 
         var workers = _parallel.Workers;
         var coordinator = _parallel.NextCoordinator(
-            () => new ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>>(workers));
+            () => new ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>>(workers));
         var output = new Stream<IndexedZSet<TKey, TRow, TWeight>>(
             IndexedZSet<TKey, TRow, TWeight>.Empty);
         _root.AddOperator(new ExchangeIndexOp<TKey, TRow, TWeight>(
@@ -323,7 +323,7 @@ public sealed class CircuitBuilder
 
         var workers = _parallel.Workers;
         var coordinator = _parallel.NextCoordinator(
-            () => new ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>>(workers));
+            () => new ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>>(workers));
         var output = new Stream<IndexedZSet<TKey, TRow, TWeight>>(
             IndexedZSet<TKey, TRow, TWeight>.Empty);
         _root.AddOperator(new ExchangeIndexStepOp<TKey, TIn, TRow, TWeight>(

@@ -38,15 +38,38 @@ internal static class TraceAccessProfile
     // irrelevant next to what is being measured.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, TraceAccessCounter> Table = new();
 
+    // The operator whose construction created the trace: the first stack frame in an operator
+    // type, for the census to attribute state. Profiling only.
+    private static string OwnerOperator()
+    {
+        foreach (var frame in new System.Diagnostics.StackTrace().GetFrames())
+        {
+            var type = frame.GetMethod()?.DeclaringType;
+            if (type?.Namespace is { } ns && ns.StartsWith("DbspNet.Core.Operators", StringComparison.Ordinal)
+                && !type.Name.Contains("Trace", StringComparison.Ordinal))
+            {
+                var name = type.Name;
+                var tick = name.IndexOf('`', StringComparison.Ordinal);
+                return tick < 0 ? name : name[..tick];
+            }
+        }
+
+        return "?";
+    }
+
     internal static void Mark(
-        object collection, string kind, Func<int> stateKeys, Func<TraceShape>? shape = null)
+        object collection,
+        string kind,
+        Func<int> stateKeys,
+        Func<TraceShape>? shape = null,
+        Func<IEnumerable<object>>? entries = null)
     {
         if (!Enabled)
         {
             return;
         }
 
-        var c = new TraceAccessCounter(kind, stateKeys, shape);
+        var c = new TraceAccessCounter(kind, stateKeys, shape, entries, collection.GetType()) { Owner = OwnerOperator() };
         Table.AddOrUpdate(collection, c);
         lock (Counters)
         {
@@ -83,14 +106,28 @@ internal static class TraceAccessProfile
 
 /// <summary>Per-collection access tallies; see <see cref="TraceAccessProfile"/>.</summary>
 internal sealed class TraceAccessCounter(
-    string kind, Func<int> stateKeys, Func<TraceShape>? shape = null)
+    string kind,
+    Func<int> stateKeys,
+    Func<TraceShape>? shape = null,
+    Func<IEnumerable<object>>? entries = null,
+    Type? collectionType = null)
 {
+    /// <summary>The trace collection's own type (its key / value type arguments).</summary>
+    public Type? CollectionType => collectionType;
+
+    /// <summary>Every top-level object the trace holds right now: each key, and for an indexed
+    /// trace each group's inner values (the survivor census, docs/design-row-arena.md).</summary>
+    public IEnumerable<object> Entries() => entries?.Invoke() ?? [];
+
     /// <summary>An indexed trace's group shape right now; <c>null</c> for a flat trace.</summary>
     public TraceShape? Shape => shape?.Invoke();
 
     private readonly HashSet<object> _touched = new();
 
     public string Kind { get; } = kind;
+
+    /// <summary>The operator type that created the trace (see TraceAccessProfile.OwnerOperator).</summary>
+    public string Owner { get; init; } = "?";
 
     /// <summary>Keys held right now — the denominator of the touch fraction.</summary>
     public int StateKeys => stateKeys();

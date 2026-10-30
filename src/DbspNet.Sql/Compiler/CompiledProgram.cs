@@ -60,4 +60,7 @@ public sealed record ProgramOutput(Schema Schema, IntegratedViewHandle<Structura
     /// <summary>The full current view contents (valid until the next
     /// <see cref="CompiledProgram.Step"/>).</summary>
     public ZSet<StructuralRow, Z64> CurrentView => View.Current;
+
+    /// <summary>The number of rows in <see cref="CurrentView"/>, without forming it.</summary>
+    public long RowCount => View.Count;
 }

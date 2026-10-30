@@ -69,9 +69,71 @@ public class ParallelArrowIngestTests
         }
     }
 
-    // Many duplicate rows (small domains), NULLs, every 10th row weight 0; a retract batch
-    // carries negative weights too.
-    private static (RecordBatch Batch, long[] Weights) Batch(SqlSchema schema, int rows, int seed, bool retract = false)
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public void LargeBatches_WithoutZeroWeights_LoadExactlyTheBatch(int workers)
+    {
+        // No zero weights, so both pushes decode in 4,096-row blocks (docs/design-chunked-deltas.md
+        // §8) rather than whole columns — the serial and parallel paths both use the block
+        // decode, so the reference is built from the batch's own Arrow accessors instead.
+        var outputs = new HashSet<string>(["v_all"], StringComparer.Ordinal);
+        var batches = new[] { Batch(SqlSchema(), 40_000, seed: 4, zeroWeights: false), Batch(SqlSchema(), 20_003, seed: 5, zeroWeights: false) };
+        var expected = new SortedDictionary<string, long>(StringComparer.Ordinal);
+        foreach (var (batch, weights) in batches)
+        {
+            var k = (Int32Array)batch.Column(0);
+            var amount = (Decimal128Array)batch.Column(1);
+            var name = (StringArray)batch.Column(2);
+            var r = (FloatArray)batch.Column(3);
+            for (var i = 0; i < batch.Length; i++)
+            {
+                object?[] cells =
+                [
+                    k.GetValue(i),
+                    amount.IsNull(i) ? null : new Clast.DatabaseDecimal.Values.Decimal128(
+                        System.Runtime.InteropServices.MemoryMarshal.Read<Int128>(amount.GetBytes(i))),
+                    name.IsNull(i) ? null : DbspNet.Sql.TypeSystem.Utf8String.Of(name.GetString(i)),
+                    r.GetValue(i),
+                ];
+                var key = string.Join("|", cells.Select(v => v?.ToString() ?? "<null>"));
+                expected[key] = expected.GetValueOrDefault(key) + weights[i];
+            }
+        }
+
+        foreach (var key in expected.Where(kv => kv.Value == 0).Select(kv => kv.Key).ToList())
+        {
+            expected.Remove(key);
+        }
+
+        var serial = SqlProgram.Compile(Program, outputs);
+        foreach (var (batch, weights) in batches)
+        {
+            serial.Table("t").PushArrow(batch, weights);
+        }
+
+        serial.Step();
+        Assert.Equal(expected, Materialize(serial.Outputs["v_all"].CurrentView));
+
+        Assert.True(SqlProgram.TryCompileParallel(Program, outputs, Math.Max(2, workers), out var parallel));
+        using (parallel)
+        {
+            foreach (var (batch, weights) in batches)
+            {
+                parallel!.Table("t").PushArrow(batch, weights);
+            }
+
+            parallel!.Step();
+            Assert.Equal(expected, Materialize(parallel.Outputs["v_all"].CurrentView));
+        }
+
+        SqlSchema SqlSchema() => SqlProgram.Compile(Program, outputs).Table("t").Schema;
+    }
+
+    // Many duplicate rows (small domains), NULLs, every 10th row weight 0 (unless
+    // zeroWeights is false); a retract batch carries negative weights too.
+    private static (RecordBatch Batch, long[] Weights) Batch(
+        SqlSchema schema, int rows, int seed, bool retract = false, bool zeroWeights = true)
     {
         var rng = new Random(seed);
         var k = new Int32Array.Builder();
@@ -103,7 +165,7 @@ public class ParallelArrowIngestTests
             r.Append(rng.Next(4) * 0.5f);
             weights[i] = (i % 10) switch
             {
-                0 => 0,
+                0 => zeroWeights ? 0 : 1,
                 1 or 2 when retract => -1,
                 3 => 2,
                 _ => 1,

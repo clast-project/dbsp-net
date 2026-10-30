@@ -31,7 +31,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
     private readonly Stream<IndexedZSet<TKey, TRow, TWeight>> _output;
     private readonly Func<TRow, int> _partition;
     private readonly Func<TRow, TKey> _keyOf;
-    private readonly ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>> _coordinator;
+    private readonly ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>> _coordinator;
     private readonly int _worker;
     private readonly int _workers;
     private readonly CancellationToken _abort;
@@ -41,7 +41,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         Stream<IndexedZSet<TKey, TRow, TWeight>> output,
         Func<TRow, int> partition,
         Func<TRow, TKey> keyOf,
-        ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>> coordinator,
+        ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>> coordinator,
         int worker,
         CancellationToken abort)
     {
@@ -65,13 +65,13 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         // the input is a Z-set so its keys are distinct, so a bucket never
         // merges (see ExchangeOp). Buckets are allocated lazily; empty cells
         // publish null.
-        var buckets = new List<KeyValuePair<TRow, TWeight>>?[workers];
+        var buckets = new IReadOnlyList<KeyValuePair<TRow, TWeight>>?[workers];
         long splitRows = 0;
         foreach (var kv in _input.Current)
         {
             // Non-negative modulo: partition() may return a negative hash.
             var j = ((_partition(kv.Key) % workers) + workers) % workers;
-            (buckets[j] ??= new List<KeyValuePair<TRow, TWeight>>()).Add(kv);
+            ExchangeBuckets.Add(ref buckets[j], kv);
             splitRows++;
         }
 
@@ -108,7 +108,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
             var bucket = _coordinator.Read(src, _worker);
             if (bucket is not null)
             {
-                foreach (var (row, weight) in bucket)
+                foreach (var (row, weight) in ExchangeBuckets.Items(bucket))
                 {
                     indexed.Add(_keyOf(row), row, weight);
                     gatherRows++;

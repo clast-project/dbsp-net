@@ -70,7 +70,7 @@ internal abstract class RunnerProgram
         public override void Step() => program.Step();
 
         public override IEnumerable<KeyValuePair<string, long>> ViewRowCounts() =>
-            program.Outputs.Select(kv => KeyValuePair.Create(kv.Key, (long)kv.Value.CurrentView.Count));
+            program.Outputs.Select(kv => KeyValuePair.Create(kv.Key, kv.Value.RowCount));
 
         public override bool ProfileOperators
         {

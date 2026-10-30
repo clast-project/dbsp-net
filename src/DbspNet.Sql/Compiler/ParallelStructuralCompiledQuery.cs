@@ -192,6 +192,11 @@ public sealed class ParallelProgramOutput
     {
         get
         {
+            if (_shards.Count == 1)
+            {
+                return _shards[0].Count;
+            }
+
             var tick = _circuit.TickCount;
             if (_rowCountTick != tick)
             {
@@ -224,7 +229,7 @@ public sealed class ParallelProgramOutput
             var after = 0L;
             foreach (var shard in _shards)
             {
-                after += shard.Current.WeightOf(row).Value;
+                after += shard.WeightOf(row).Value;
             }
 
             if (after != 0)
@@ -326,6 +331,67 @@ public sealed class ShardedTableInput
     /// across the replicas on up to <see cref="ParallelCompiledProgram.Workers"/> threads
     /// rather than on the caller's (the bulk-load ingest path).
     /// </summary>
+    /// <summary>The rows a <see cref="PushColumnBlocks"/> range decodes at once: small enough
+    /// that a block's per-column staging arrays (8 bytes a row) stay off the large-object heap.</summary>
+    internal const int DecodeBlockRows = 4096;
+
+    /// <summary>
+    /// <see cref="PushColumns"/> without whole-batch column buffers: each parallel row range
+    /// asks <paramref name="decode"/> for its rows in blocks of <see cref="DecodeBlockRows"/>
+    /// (<c>decode(from, count)</c> returns one array per column for rows
+    /// <c>[from, from + count)</c>) and builds those rows from the block. A whole-batch boxed
+    /// column is an <c>object?[n]</c> on the large-object heap, card-scanned by every young GC
+    /// until a background gen2 frees it (docs/design-chunked-deltas.md §8). Same rows, same order.
+    /// </summary>
+    public void PushColumnBlocks(int rowCount, long[]? weights, Func<int, int, object?[][]> decode)
+    {
+        ArgumentNullException.ThrowIfNull(decode);
+        if (weights is not null && Array.IndexOf(weights, 0L, 0, rowCount) >= 0)
+        {
+            // Zero weights drop rows, so the built rows are not contiguous source rows; decode
+            // the batch whole, as before.
+            PushColumns(decode(0, rowCount), weights, rowCount);
+            return;
+        }
+
+        var keys = new StructuralRow[rowCount];
+        var zs = new Z64[rowCount];
+        void Build(int from, int to)
+        {
+            for (var block = from; block < to; block += DecodeBlockRows)
+            {
+                var count = Math.Min(DecodeBlockRows, to - block);
+                var columns = decode(block, count);
+                for (var r = 0; r < count; r++)
+                {
+                    var values = new object?[columns.Length];
+                    for (var c = 0; c < values.Length; c++)
+                    {
+                        values[c] = columns[c][r];
+                    }
+
+                    var i = block + r;
+                    keys[i] = _codec.BuildRow(Schema, BoundaryEncoder.Encode(Schema, values));
+                    zs[i] = new Z64(weights is null ? 1 : weights[i]);
+                }
+            }
+        }
+
+        if (_handle.Workers == 1 || rowCount < ShardedInputHandle<StructuralRow, Z64>.ParallelSplitThreshold)
+        {
+            Build(0, rowCount);
+        }
+        else
+        {
+            Parallel.ForEach(
+                System.Collections.Concurrent.Partitioner.Create(0, rowCount, Math.Max(4096, rowCount / (_handle.Workers * 4))),
+                new ParallelOptions { MaxDegreeOfParallelism = _handle.Workers },
+                range => Build(range.Item1, range.Item2));
+        }
+
+        _handle.PushRows(keys, zs, rowCount);
+    }
+
     public void PushColumns(object?[][] columns, long[]? weights, int rowCount)
     {
         ArgumentNullException.ThrowIfNull(columns);

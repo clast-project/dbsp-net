@@ -3969,6 +3969,179 @@ be silently withdrawn by inlining changes, which is exactly how §25.3's bimodal
 that holds under this knob is one you can trust across runtime upgrades.
 
 ---
+## 27. Row-representation arc, phase 0 — the batch-1 GC pause does not follow surviving bytes (MEASURED, gate FAILED for row forms; §27.6 finds the real lever)
+
+Branch `arc/row-repr`. The arc (docs/next-arc-row-representation-prompt.md) aimed to cut the
+bytes that survive ivm-bench batch 1, on the premise (state-representation §9.15) that the
+young-GC pause — ~40% of the parallel step — "follows surviving bytes, about twice over".
+Phase 0 was to size candidate row forms against that before any design. The premise does not
+hold at W=8, so no row form clears the gate. SF=3 batch 1, M4 Pro, Server GC, digests identical
+to main throughout.
+
+### 27.1 What survives (`IVM_HEAP_CENSUS=1`, new)
+
+A reflection walk of everything reachable from the runner after batch 1 (gcdump on .NET 10 is
+lossy at this size): **10.53 GB in 168M objects against 10.59 GB `PromotedBytes`** (99.4%
+coverage). W=8 is the same heap (10.54 GB, same mix).
+
+| kind | objects | bytes | share |
+|---|---|---|---|
+| `object[]` (row cells, ~9 slots avg) | 46.8M | 4.75 GB | 45% |
+| `StructuralRow` | 45.6M | 1.46 GB | 14% |
+| dictionary `Entry[]` / nodes / per-group Z-sets (all kinds) | — | ~2.6 GB | ~25% |
+| numeric boxes (double, long, Timestamp, Date32, int) | 26.9M | 0.64 GB | 6% |
+| `Utf8String` boxes + `byte[]` | 13.6M | 0.50 GB | 5% |
+
+- **Boxes are already shared across rows**: references per distinct box ≈ double 12.7, string
+  20, long 9.3, Timestamp 11.6, int 12. Projections copy cell references, so unboxing saves
+  little; the per-row `object[]` (header + an 8-byte slot per cell) is the cost.
+- **Rows are barely shared across traces** (DBSPNET_TRACE_ACCESS_PROFILE pass): of 32.5M distinct
+  trace entries, 30.9M sit in exactly one trace and 1.6M in two (W=8: 28.9M / 2.6M). The
+  brief's "one row shared by every trace" is not true for batch 1, so a copy-by-value design
+  loses little here; the typed path's +26% (§23.8) has another cause.
+- 13M of the 45.6M rows are held by operator state that is not a marked trace (min/max
+  `SortedDictionary`, TOP-K and window state).
+
+Sized on bytes, an inline-class row (cells as typed fields in the row object, no `object[]`,
+no numeric boxes) would remove ~2.7 GB (~26% of live, ~33% of small-object survivors); a
+handle-free paged row ~48% (synthetic probe below).
+
+### 27.2 Young-GC copying (`IVM_GC_EVENTS=1`, now with promoted bytes and mark timing)
+
+W=1: young GCs copy ~24–27 GB (≈15 GB out of gen0, ≈11 GB out of gen1) for ~8.2 GB of
+small-object state that stays. **>99% of the bytes young GCs mark arrive through the card
+table** (old containers pointing at new rows); stack/handle roots are negligible. The mark phase
+(slowest heap, from per-heap `GCMarkWithType` timestamps) is only **~⅓ of each young pause**
+(e.g. W=8: an 876 ms gen1 GC spends 311 ms marking through cards); the other ⅔ is plan /
+relocate / compact plus suspension, which public events do not split.
+
+### 27.3 The gate measurement — pad every row, measure the pause slope
+
+Temporary seam (not committed): every `StructuralRow` carries a field; with
+`DBSPNET_ROW_PAD=40` it points at a fresh 64-byte array, so every row — trace state and
+deltas alike — gets 64 B and one object bigger. 3 alternating runs per arm:
+
+| | bytes copied by young GCs | young pause |
+|---|---|---|
+| W=1, control | 27.2 GB | 4.49 s |
+| W=1, +64 B/row | 35.2 GB (+29%) | 5.05 s (**+0.56 s, ≈0.07 s/GB**) |
+| W=8, control | 30.8 GB | 6.08 s |
+| W=8, +64 B/row | 39.5 GB (+28%) | 6.08 s (**+0.00 s**) |
+
+At W=8 an extra 8.7 GB of copying and +50% row objects do not move the pause at all; at W=1
+the slope is a quarter of what "pause ∝ surviving bytes" implies. Removing the ~26–30% of row
+bytes that the best candidate could remove is therefore worth **~0.5 s at W=1 and ~0 at W=8**,
+against a gate of ≥ ~1.5 s at W=8. **Gate failed — no row-form design is proposed.** Together
+with the earlier GC-knob results (gen0 budget 1–4 GiB and heap count do not move it either),
+the W=8 pause is invariant to bytes copied, object count and GC count.
+
+### 27.4 Synthetic probe (`RowFormGcProbe`, `ROW_FORM_PROBE=…`)
+
+Grows a heap of census-shaped rows on one thread with interleaved garbage. Full scale (31.2M
+rows, garbage 7×): live boxed 4.81 / inline-class 3.39 / arena 3.35 / arena-strings 3.52 /
+handle-free 2.52 GB; young pause 1.20 / 0.98 / **2.15** / **1.94** / 1.05 s. Byte figures are
+exact; pause figures are not representative — the probe promotes 4–5× more garbage than batch 1
+does and models no large trace dictionaries — but LOH-paged arenas made the pause *worse*
+(gen1 promotion 14–16 GB vs 6), a further strike against candidate 1.
+
+### 27.5 What this leaves open (not pursued without Curt)
+
+The W=8 pause is ~6 s that is not copying-bound. Untested hypotheses, each needing its own
+instrument: (a) relocate/compact pointer fix-up through the card table — proportional to dirty
+cards in the multi-GB trace `Entry[]` arrays on the LOH (5.5 GB of LOH at W=8 vs 2.4 GB at W=1:
+per-worker dictionaries resize separately), not to the rows; an `Entry[]` holding no references
+is never card-scanned, which would favour reference-free trace containers on a *different*
+metric than the one sized here; (b) GC thread stragglers on the 4 efficiency cores; (c)
+suspension — "suspension only" pauses are 0.3 s at W=1, 0.6–0.75 s at W=8. A native trace
+(PerfView/`dotnet-trace` GC phase events, or a GC with `GCLogEnabled`) would split (a)/(b).
+
+### 27.6 Native GC trace — the pause is card scanning of the large trace hash tables
+
+macOS `sample` on the W=8 test host for all of batch 1 (2 ms interval; libcoreclr keeps its
+local symbols, so GC phases resolve), attributed by `scripts/gc-phases.py`. Share of all
+Server-GC-thread samples taken inside a GC (37k samples; sampling inflated the pause 6.3 →
+7.8 s, proportions are what count):
+
+| GC work | share |
+|---|---|
+| **mark through cards of large-object-heap objects** | **25.3%** |
+| **relocate (pointer update) through the same LOH cards** | **22.5%** |
+| relocate references inside survivors | 21.6% |
+| plan | 7.3% |
+| compact (the actual copy) | **5.8%** |
+| mark / relocate through small-object-heap cards | 4.5% |
+| join / wait (heap imbalance) | ~11% |
+| stack roots, handles, suspension | <1% |
+
+So **~48% of the young pause is scanning the dirty cards of LOH arrays, twice per GC**, and
+copying is under 6% — which is why padding rows (§27.3) did not move it. Which LOH objects
+(`IVM_HEAP_CENSUS`, objects ≥ 85,000 B, W=8 after batch 1): only **617 arrays, 0.89 GB, 0.77 GB
+of them holding references** — the big trace dictionaries: flat traces'
+`Entry<StructuralRow,Z64>[]` 0.33 GB, indexed traces' outer `Entry<StructuralRow,ZSet>[]` 0.19 GB,
+window `Entry<Object,List<RowAddress>>[]` 0.10 GB, TOP-K / min-max state 0.13 GB (`Int32[]`
+buckets 0.12 GB are reference-free and never scanned).
+
+Mechanism: a bulk load inserts millions of new (gen0) rows into these old tables at
+hash-random positions, so each insert dirties its own 256-byte card, and a card stays set as long
+as it points at an ephemeral (gen0 *or* gen1) row. Every young GC therefore re-scans most of the
+~3M cards of 0.77 GB of tables, in mark and again in relocate. The cost scales with the size and
+reference density of the big tables × the number of young GCs, not with row bytes — consistent
+with every invariance seen (row padding, gen0 budget, heap count).
+
+**What this points at (not built; for Curt).** The lever is *references from large old
+containers to young rows*, not row size. Ceiling: ~48% of a ~6 s W=8 young pause ≈ **2.9 s**,
+above the ~1.5 s gate. Shapes that remove it: (1) reference-free hash arrays — the table's
+`Entry` holds an `int` row index, the rows (or their references) live in an append-only paged
+array, so new references land densely (32 per card) in the newest pages only and the
+multi-hundred-MB `Entry[]` is never card-scanned; (2) the same split for the indexed traces'
+outer group map. FlatHash (§10.C) appended its slots but kept the row references inside the
+hash structs and was judged on Nexmark W=1 pause; it was never measured on this metric. A
+synthetic probe — big `Dictionary<row,weight>` with random inserts vs. index + paged row array,
+on a growing heap — would size (1) before any engine change.
+
+### 27.7 Sizing the lever synthetically (`TableCardProbe`) — moving references does not help; removing the row object halves the pause
+
+`TABLE_CARD_PROBE=dict|index|index-flat|cells`: 25M rows (9 cells — 8 shared boxes + a unique
+id; 152 B each) grown into 48 tables over 20 ticks on W threads, each tick's delta rebuilt by 3
+dictionary stages with 4 short-lived rows per kept row. Server GC, M4 Pro, young pause per run:
+
+| mode (what the table holds) | W=8 young pause | W=1 young pause | gen1 promoted |
+|---|---|---|---|
+| `dict` — `Dictionary<StructuralRow,long>` (today) | 1.54–1.90 s | 1.40–1.86 s | 1.9–3.0 GB |
+| `index` — reference-free `Entry` + paged row-reference array | 1.66–1.69 s | 1.53–1.63 s | 2.4–2.9 GB |
+| `index-flat` — same, one doubling row array | 1.68–1.70 s | 1.48–1.49 s | 2.4–2.9 GB |
+| *deltas chunked below the LOH threshold (`TABLE_CARD_DELTA_CHUNK=3000`):* | | | |
+| `dict` | 1.64–1.76 s | 1.82–1.86 s | 2.7–3.2 GB |
+| `index` | 1.60–1.61 s | 1.67–1.69 s | 2.2–2.6 GB |
+| **`cells` — row values copied into reference-free `long` pages, no row object kept** | **0.87–0.88 s** | **0.90–1.01 s** | **0.02 GB** |
+
+`cells` also builds 38% faster at W=8 (4.6 → 2.9 s) and halves live state (4.76 → 2.37 GB).
+
+1. **The probe reproduces the real pause's shape**: sampled with `scripts/gc-phases.py`, `dict`
+   spends 41% of in-GC time on LOH cards (real batch 1: 48%).
+2. **Moving the references does not remove the cost.** `index` makes the 0.6 GB hash `Entry[]`
+   reference-free, yet LOH card time stays ~27–41%: the references move to the dense row pages,
+   and the cost is *marking and fixing up each young row reached from an old container*, not
+   finding the reference. Dense vs hash-random placement is worth only ~5–10%. The per-tick delta
+   dictionaries are themselves LOH arrays full of young-row references (3.75 MB each here), and
+   dead ones stay card-scanned until a background gen2 sweeps them — in the engine the LOH peaks
+   at 5.5 GB at W=8 against 0.89 GB live after batch 1, so deltas are a real share of the card
+   time too.
+3. **Removing the row *object* from trace state halves the young pause.** With no old→young
+   references from the traces, gen1 promotion vanishes; what remains (~0.9 s) is the deltas and
+   transient rows. This is the reconciliation with §27.3: padding added bytes and a *leaf* object
+   reached by tracing from a row, which is cheap; the expensive unit is **a young object referenced
+   from an old container**, one per row inserted into a trace.
+
+**Gate, revised.** The lever is "trace state holds no per-row GC objects" — rows stored as
+unboxed values in reference-free pages (the brief's "unboxed" half, but *not* shared by reference
+and with no handle object; candidate 1's handle per row is exactly what costs). If the real
+batch 1 behaves like the probe, the trace-side share of the W=8 young pause (~6 s) is ~50% →
+**~3 s**, above the 1.5 s gate. Caveats before a design: the probe's rows are all longs (real rows
+carry strings → a byte-page string store, and decimals / timestamps); operators read trace rows as
+`StructuralRow`, so a read path that re-materialises rows reintroduces allocation (joins emit
+from trace rows every tick); deltas stay object-based, so their LOH share is untouched.
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,

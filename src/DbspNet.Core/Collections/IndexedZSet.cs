@@ -21,23 +21,44 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private readonly Dictionary<TKey, ZSet<TValue, TWeight>> _groups;
+    // A Dictionary, or a ChunkedMap (the default; DBSPNET_ZSET_MAP=dictionary opts out) (docs/design-chunked-deltas.md).
+    // One field either way, so an indexed Z-set is no bigger than before.
+    private readonly object _groupStore;
 
     internal IndexedZSet(Dictionary<TKey, ZSet<TValue, TWeight>> groups)
     {
-        _groups = groups;
+        _groupStore = groups;
+        if (DeltaSizeProfile.Enabled)
+        {
+            DeltaSizeProfile.Record(groups);
+        }
     }
+
+    internal IndexedZSet(ChunkedMap<TKey, ZSet<TValue, TWeight>> groups)
+    {
+        _groupStore = groups;
+        if (DeltaSizeProfile.Enabled)
+        {
+            DeltaSizeProfile.Record(groups);
+        }
+    }
+
+    private MapView<TKey, ZSet<TValue, TWeight>> Groups => new(_groupStore);
+
+    /// <summary>An empty indexed Z-set to mutate in place (a trace's state), in the configured map.</summary>
+    internal static IndexedZSet<TKey, TValue, TWeight> NewMutable() =>
+        ZSetMapMode.Chunked ? new(new ChunkedMap<TKey, ZSet<TValue, TWeight>>()) : new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
 
     // Registered in a side table only when DBSPNET_TRACE_ACCESS_PROFILE is set and a trace marks
     // this instance as its state (docs/design-incremental-persistence.md §11). No field here: one
     // would cost 8 bytes on every Z-set, which the w1profile B/ev instrument picks up.
     internal void MarkTraceState() =>
-        TraceAccessProfile.Mark(this, "indexed", () => _groups.Count, () =>
+        TraceAccessProfile.Mark(this, "indexed", () => Groups.Count, () =>
         {
             long values = 0, singletons = 0, bytes = 0;
             var groupsBySize = new long[6];
             var valuesBySize = new long[6];
-            foreach (var group in _groups.Values)
+            foreach (var group in Groups.Values)
             {
                 var n = group.Count;
                 values += n;
@@ -52,21 +73,33 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
                 valuesBySize[b] += n;
             }
 
-            return new TraceShape(_groups.Count, values, singletons, bytes, groupsBySize, valuesBySize);
-        });
+            return new TraceShape(Groups.Count, values, singletons, bytes, groupsBySize, valuesBySize);
+        }, CensusEntries);
+
+    private IEnumerable<object> CensusEntries()
+    {
+        foreach (var (key, group) in Groups)
+        {
+            yield return key;
+            foreach (var entry in group.Entries())
+            {
+                yield return entry.Key;
+            }
+        }
+    }
 
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =
         new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
 
-    public int GroupCount => _groups.Count;
+    public int GroupCount => Groups.Count;
 
-    public bool IsEmpty => _groups.Count == 0;
+    public bool IsEmpty => Groups.Count == 0;
 
-    public IEnumerable<TKey> Keys => _groups.Keys;
+    public IEnumerable<TKey> Keys => Groups.Keys;
 
     public ZSet<TValue, TWeight> GroupFor(TKey key)
     {
-        var found = _groups.TryGetValue(key, out var g);
+        var found = Groups.TryGetValue(key, out var g);
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Probe(key, found);
@@ -77,7 +110,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     public bool ContainsKey(TKey key)
     {
-        var found = _groups.ContainsKey(key);
+        var found = Groups.ContainsKey(key);
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Probe(key, found);
@@ -87,25 +120,46 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     }
 
     /// <summary>
-    /// The dictionary's own struct enumerator, returned by value so
+    /// A struct enumerator over the backing map, returned by value so
     /// <c>foreach</c> binds to it by pattern rather than through
     /// <see cref="IEnumerable{T}"/> — see the note on
     /// <see cref="ZSet{TKey,TWeight}.GetEnumerator"/> for the cost this avoids.
     /// </summary>
-    public Dictionary<TKey, ZSet<TValue, TWeight>>.Enumerator GetEnumerator()
+    public Enumerator GetEnumerator()
     {
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Scan();
         }
 
-        return _groups.GetEnumerator();
+        return new Enumerator(Groups.GetEnumerator());
     }
 
     IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
-        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => _groups.GetEnumerator();
+        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => new Enumerator(Groups.GetEnumerator());
 
-    IEnumerator IEnumerable.GetEnumerator() => _groups.GetEnumerator();
+    IEnumerator IEnumerable.GetEnumerator() => new Enumerator(Groups.GetEnumerator());
+
+    /// <summary>Enumerates the groups in either backing map, in the map's order.</summary>
+    public struct Enumerator : IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
+    {
+        private MapView<TKey, ZSet<TValue, TWeight>>.Enumerator _inner;
+
+        internal Enumerator(MapView<TKey, ZSet<TValue, TWeight>>.Enumerator inner)
+        {
+            _inner = inner;
+        }
+
+        public readonly KeyValuePair<TKey, ZSet<TValue, TWeight>> Current => _inner.Current;
+
+        readonly object IEnumerator.Current => Current;
+
+        public bool MoveNext() => _inner.MoveNext();
+
+        public void Dispose() => _inner.Dispose();
+
+        void IEnumerator.Reset() => throw new NotSupportedException();
+    }
 
     public bool Equals(IndexedZSet<TKey, TValue, TWeight>? other)
     {
@@ -119,14 +173,14 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             return true;
         }
 
-        if (_groups.Count != other._groups.Count)
+        if (Groups.Count != other.Groups.Count)
         {
             return false;
         }
 
-        foreach (var (k, g) in _groups)
+        foreach (var (k, g) in Groups)
         {
-            if (!other._groups.TryGetValue(k, out var g2) || !g.Equals(g2))
+            if (!other.Groups.TryGetValue(k, out var g2) || !g.Equals(g2))
             {
                 return false;
             }
@@ -140,7 +194,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public override int GetHashCode()
     {
         var hash = 0;
-        foreach (var (k, g) in _groups)
+        foreach (var (k, g) in Groups)
         {
             hash ^= HashCode.Combine(k, g);
         }
@@ -154,13 +208,13 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public ZSet<(TKey Key, TValue Value), TWeight> Flatten()
     {
         var total = 0L;
-        foreach (var g in _groups.Values)
+        foreach (var g in Groups.Values)
         {
             total += g.Count;
         }
 
         var b = new ZSetBuilder<(TKey, TValue), TWeight>((int)Math.Min(total, int.MaxValue));
-        foreach (var (k, g) in _groups)
+        foreach (var (k, g) in Groups)
         {
             foreach (var (v, w) in g)
             {
@@ -175,7 +229,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     {
         ArgumentNullException.ThrowIfNull(other);
         var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (k, g) in _groups)
+        foreach (var (k, g) in Groups)
         {
             foreach (var (v, w) in g)
             {
@@ -183,7 +237,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
         }
 
-        foreach (var (k, g) in other._groups)
+        foreach (var (k, g) in other.Groups)
         {
             foreach (var (v, w) in g)
             {
@@ -198,7 +252,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     {
         ArgumentNullException.ThrowIfNull(other);
         var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (k, g) in _groups)
+        foreach (var (k, g) in Groups)
         {
             foreach (var (v, w) in g)
             {
@@ -206,7 +260,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
         }
 
-        foreach (var (k, g) in other._groups)
+        foreach (var (k, g) in other.Groups)
         {
             foreach (var (v, w) in g)
             {
@@ -231,24 +285,24 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     internal void MergeInPlace(IndexedZSet<TKey, TValue, TWeight> delta)
     {
         ArgumentNullException.ThrowIfNull(delta);
-        if (delta._groups.Count == 0)
+        if (delta.Groups.Count == 0)
         {
             return;
         }
 
-        foreach (var (key, deltaGroup) in delta._groups)
+        foreach (var (key, deltaGroup) in delta.Groups)
         {
-            if (_groups.TryGetValue(key, out var currentGroup))
+            if (Groups.TryGetValue(key, out var currentGroup))
             {
                 currentGroup.MergeInPlace(deltaGroup);
                 if (currentGroup.IsEmpty)
                 {
-                    _groups.Remove(key);
+                    Groups.Remove(key);
                 }
             }
             else
             {
-                _groups[key] = deltaGroup.Clone();
+                Groups.Set(key, deltaGroup.Clone());
             }
         }
     }
@@ -270,7 +324,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
         ArgumentNullException.ThrowIfNull(monotoneKey);
         List<TKey>? removed = null;
-        foreach (var key in _groups.Keys)
+        foreach (var key in Groups.Keys)
         {
             if (monotoneKey(key) < threshold)
             {
@@ -285,7 +339,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
         foreach (var key in removed)
         {
-            _groups.Remove(key);
+            Groups.Remove(key);
         }
 
         return removed;
@@ -308,15 +362,16 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private Dictionary<TKey, ZSetBuilder<TValue, TWeight>>? _groups;
+    // A Dictionary, or a ChunkedMap (the default; DBSPNET_ZSET_MAP=dictionary opts out); null after Build(). One field.
+    private object? _store;
 
     public IndexedZSetBuilder()
     {
-        _groups = new Dictionary<TKey, ZSetBuilder<TValue, TWeight>>();
+        _store = MapView<TKey, ZSetBuilder<TValue, TWeight>>.NewStore();
     }
 
-    private Dictionary<TKey, ZSetBuilder<TValue, TWeight>> Groups =>
-        _groups ?? throw new InvalidOperationException("IndexedZSetBuilder used after Build().");
+    private MapView<TKey, ZSetBuilder<TValue, TWeight>> Groups =>
+        new(_store ?? throw new InvalidOperationException("IndexedZSetBuilder used after Build()."));
 
     public void Add(TKey key, TValue value, TWeight weight)
     {
@@ -329,7 +384,7 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
         if (!g.TryGetValue(key, out var inner))
         {
             inner = new ZSetBuilder<TValue, TWeight>();
-            g[key] = inner;
+            g.Set(key, inner);
         }
 
         inner.Add(value, weight);
@@ -338,23 +393,26 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
     public IndexedZSet<TKey, TValue, TWeight> Build()
     {
         var raw = Groups;
-        _groups = null;
+        _store = null;
         if (raw.Count == 0)
         {
             return IndexedZSet<TKey, TValue, TWeight>.Empty;
         }
 
-        var final = new Dictionary<TKey, ZSet<TValue, TWeight>>(capacity: raw.Count);
+        var finalStore = MapView<TKey, ZSet<TValue, TWeight>>.NewStore(raw.Count);
+        var final = new MapView<TKey, ZSet<TValue, TWeight>>(finalStore);
         foreach (var (k, builder) in raw)
         {
             var zset = builder.Build();
             if (!zset.IsEmpty)
             {
-                final[k] = zset;
+                final.Set(k, zset);
             }
         }
 
-        return new IndexedZSet<TKey, TValue, TWeight>(final);
+        return finalStore is Dictionary<TKey, ZSet<TValue, TWeight>> d
+            ? new IndexedZSet<TKey, TValue, TWeight>(d)
+            : new IndexedZSet<TKey, TValue, TWeight>((ChunkedMap<TKey, ZSet<TValue, TWeight>>)finalStore);
     }
 }
 
