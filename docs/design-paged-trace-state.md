@@ -405,3 +405,30 @@ Every query but q3 (flat) and q8 at W=8 (0.90, inside its 1.31× spread) moves t
 10,000-event batch makes ~240 KB delta dictionaries, so Nexmark's deltas were on the LOH too. Single
 queries at W=8 swing a lot on this box (spreads up to 2.7×), so read the per-query W=8 cells as
 direction; the W=1 row and both geomeans are the result.
+
+## 14. Re-measured with the chunked map on (2026-10-30)
+
+§12 failed the store while per-tick deltas were on the LOH; the chunked map (docs/design-chunked-deltas.md,
+default on) took them off. Same instrument, chunked default vs chunked + `DBSPNET_TRACE_STORE=paged`,
+ivm-bench SF=3 batch 1, W=8, 5 alternating runs, digests identical in all:
+
+| | chunked | chunked + paged | Δ |
+|---|---|---|---|
+| promoted out of gen1 | 15.05 GB | 11.04 GB | **−4.0 GB** (SE 0.63) |
+| promoted out of gen0 | 20.10 GB | 19.16 GB | −0.94 GB (SE 0.16) |
+| young pause | 5.76 s | 5.36 s | −0.40 s (SE 0.29) — not resolved |
+| drain | 17.99 s | 20.99 s | **+3.0 s** (SE 0.72) |
+| output | 3.73 s | 2.33 s | −1.40 s (SE 0.07) |
+| background gen2s | 1–2 | 4–6 | |
+
+With the delta noise gone the store does what it was built for — 4 GB less promoted out of gen1 —
+but it still loses: drain is 3 s worse. Two costs are visible, not yet separated: (1) **background
+gen2s 1–2 → 4–6** — the 1 MiB pages are LOH allocations (~4 GB in batch 1), which count against the
+gen2 budget; in the paged arm the run with the fewest (4) was also the fastest (18.6 s); (2) the
+**probe-side boxing** of §12 (join allocation 9.6 → 15.9 GiB, join CPU +1.5 s). Output is faster
+because forming a view from pages, with zero-copy strings, is cheaper than enumerating object rows.
+
+If the store is revisited, the first experiment is pages outside the GC heap (`NativeMemory`, the
+alternative to decision (b)), which removes cost (1) and isolates (2); strings then need a
+`MemoryManager` per page for zero-copy reads, and pages a release protocol. Cost (2) goes only with
+unboxed downstream consumers (the columnar arc).
