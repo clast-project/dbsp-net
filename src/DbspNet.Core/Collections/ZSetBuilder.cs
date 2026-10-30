@@ -13,20 +13,25 @@ public sealed class ZSetBuilder<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    // Exactly one of these is set until Build(): the chunked map when DBSPNET_ZSET_MAP=chunked
-    // (docs/design-chunked-deltas.md), else the dictionary.
-    private Dictionary<TKey, TWeight>? _entries;
-    private ChunkedMap<TKey, TWeight>? _chunked;
+    // A Dictionary, or a ChunkedMap when DBSPNET_ZSET_MAP=chunked (docs/design-chunked-deltas.md);
+    // null after Build(). One field either way, so the builder is no bigger than before — a
+    // second field cost w1profile up to 3 B/ev.
+    private object? _store;
+
+    private ChunkedMap<TKey, TWeight>? _chunked =>
+        _store is not null && _store.GetType() == typeof(ChunkedMap<TKey, TWeight>)
+            ? System.Runtime.CompilerServices.Unsafe.As<ChunkedMap<TKey, TWeight>>(_store)
+            : null;
 
     public ZSetBuilder()
     {
         if (ZSetMapMode.Chunked)
         {
-            _chunked = new ChunkedMap<TKey, TWeight>();
+            _store = new ChunkedMap<TKey, TWeight>();
         }
         else
         {
-            _entries = new Dictionary<TKey, TWeight>();
+            _store = new Dictionary<TKey, TWeight>();
         }
     }
 
@@ -43,28 +48,30 @@ public sealed class ZSetBuilder<TKey, TWeight>
     {
         if (ZSetMapMode.Chunked)
         {
-            _chunked = new ChunkedMap<TKey, TWeight>(capacity > 0 ? capacity : 0);
+            _store = new ChunkedMap<TKey, TWeight>(capacity > 0 ? capacity : 0);
         }
         else
         {
-            _entries = new Dictionary<TKey, TWeight>(capacity > 0 ? capacity : 0);
+            _store = new Dictionary<TKey, TWeight>(capacity > 0 ? capacity : 0);
         }
     }
 
     internal ZSetBuilder(Dictionary<TKey, TWeight> entries)
     {
-        _entries = entries;
+        _store = entries;
     }
 
     internal ZSetBuilder(ChunkedMap<TKey, TWeight> entries)
     {
-        _chunked = entries;
+        _store = entries;
     }
 
     public int Count => _chunked?.Count ?? Entries.Count;
 
     private Dictionary<TKey, TWeight> Entries =>
-        _entries ?? throw new InvalidOperationException("ZSetBuilder used after Build().");
+        _store is null
+            ? throw new InvalidOperationException("ZSetBuilder used after Build().")
+            : System.Runtime.CompilerServices.Unsafe.As<Dictionary<TKey, TWeight>>(_store);
 
     /// <summary>
     /// Adds <paramref name="weight"/> to the weight of <paramref name="key"/>.
@@ -131,12 +138,12 @@ public sealed class ZSetBuilder<TKey, TWeight>
     {
         if (_chunked is { } m)
         {
-            _chunked = null; // prevent reuse
+            _store = null; // prevent reuse
             return m.Count == 0 ? ZSet<TKey, TWeight>.Empty : new ZSet<TKey, TWeight>(m);
         }
 
         var d = Entries;
-        _entries = null; // prevent reuse
+        _store = null; // prevent reuse
         if (d.Count == 0)
         {
             return ZSet<TKey, TWeight>.Empty;
