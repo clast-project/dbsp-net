@@ -22,7 +22,7 @@ namespace DbspNet.Tests.Scratch;
 public class TraceLayoutGcProbe
 {
     // (groups, values per group) per census size bucket: 1, 2-4, 5-16, 17-256, 257-4096, >4096.
-    private static readonly (int Groups, int Size)[] Shape =
+    internal static readonly (int Groups, int Size)[] Shape =
     [
         (3_328_848, 1),
         (1_921_009, 3),   // 4.83M values / 1.92M groups ≈ 2.5
