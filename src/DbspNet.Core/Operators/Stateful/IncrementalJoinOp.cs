@@ -52,6 +52,11 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     private readonly Func<TOut, bool>? _residual;
     private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
     private readonly IndexedZSetTrace<TKey, TRight, TWeight> _rightTrace = new();
+
+    // When set, that side's integral lives in the store instead of its trace
+    // (docs/design-paged-trace-state.md, increment 3).
+    private readonly IIndexedTraceStore<TKey, TLeft, TWeight>? _leftStore;
+    private readonly IIndexedTraceStore<TKey, TRight, TWeight>? _rightStore;
     private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
     private readonly IIndexedZSetTraceCodec<TKey, TRight, TWeight>? _rightSnapshotCodec;
     private readonly IFrontier? _frontier;
@@ -68,8 +73,12 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
         IFrontier? frontier = null,
         Func<TKey, long>? monotoneKey = null,
-        Func<TOut, bool>? residual = null)
+        Func<TOut, bool>? residual = null,
+        IIndexedTraceStore<TKey, TLeft, TWeight>? leftStore = null,
+        IIndexedTraceStore<TKey, TRight, TWeight>? rightStore = null)
     {
+        _leftStore = leftStore;
+        _rightStore = rightStore;
         _leftIn = leftIn;
         _rightIn = rightIn;
         _output = output;
@@ -82,7 +91,11 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
     }
 
     /// <summary>Total keys retained across both traces. Exposed for GC-bound tests.</summary>
-    internal int RetainedKeyCount => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
+    internal int RetainedKeyCount => LeftGroups + RightGroups;
+
+    private int LeftGroups => _leftStore?.GroupCount ?? _leftTrace.Current.GroupCount;
+
+    private int RightGroups => _rightStore?.GroupCount ?? _rightTrace.Current.GroupCount;
 
     public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -93,8 +106,10 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
                 "to CircuitBuilder.IncrementalInnerJoin to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        await _leftSnapshotCodec.SaveAsync(writer, LeftTraceFile, _leftTrace.Current, cancellationToken).ConfigureAwait(false);
-        await _rightSnapshotCodec.SaveAsync(writer, RightTraceFile, _rightTrace.Current, cancellationToken).ConfigureAwait(false);
+        await _leftSnapshotCodec.SaveAsync(
+            writer, LeftTraceFile, _leftStore?.Materialize() ?? _leftTrace.Current, cancellationToken).ConfigureAwait(false);
+        await _rightSnapshotCodec.SaveAsync(
+            writer, RightTraceFile, _rightStore?.Materialize() ?? _rightTrace.Current, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -107,12 +122,12 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
 
         var left = await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false);
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _leftTrace.Integrate(left);
+        IntegrateLeft(left);
         var integrateMs = SnapshotRestoreProfile.MsSince(t0);
 
         var right = await _rightSnapshotCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _rightTrace.Integrate(right);
+        IntegrateRight(right);
         if (SnapshotRestoreProfile.Enabled)
         {
             SnapshotRestoreProfile.AddIntegrate(integrateMs + SnapshotRestoreProfile.MsSince(t1));
@@ -132,7 +147,7 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         // term. The left trace stays at L_{t-1} for the second pass and is
         // integrated AFTER. Order matters: do not move the two Integrate
         // calls together.
-        _rightTrace.Integrate(dr);
+        IntegrateRight(dr);
 
         ZSetBuilder<TOut, TWeight> builder;
         if (_pooledBuilder is not null)
@@ -146,15 +161,55 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         }
 
         // dl ⋈ R_t
-        IncrementalJoinCore.JoinInto(dl, _rightTrace.Current, _combine, _residual, builder);
+        if (_rightStore is null)
+        {
+            IncrementalJoinCore.JoinInto(dl, _rightTrace.Current, _combine, _residual, builder);
+        }
+        else
+        {
+            IncrementalJoinCore.JoinInto(dl, _rightStore, _combine, _residual, builder);
+        }
+
         // L_{t-1} ⋈ dr
-        IncrementalJoinCore.JoinInto(_leftTrace.Current, dr, _combine, _residual, builder);
+        if (_leftStore is null)
+        {
+            IncrementalJoinCore.JoinInto(_leftTrace.Current, dr, _combine, _residual, builder);
+        }
+        else
+        {
+            IncrementalJoinCore.JoinInto(_leftStore, dr, _combine, _residual, builder);
+        }
+
         var result = _pooledBuilder is not null ? builder.BuildShared() : builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
 
-        _leftTrace.Integrate(dl);
+        IntegrateLeft(dl);
         CollectGarbage();
+    }
+
+    private void IntegrateLeft(IndexedZSet<TKey, TLeft, TWeight> delta)
+    {
+        if (_leftStore is null)
+        {
+            _leftTrace.Integrate(delta);
+        }
+        else if (!delta.IsEmpty)
+        {
+            _leftStore.Integrate(delta);
+        }
+    }
+
+    private void IntegrateRight(IndexedZSet<TKey, TRight, TWeight> delta)
+    {
+        if (_rightStore is null)
+        {
+            _rightTrace.Integrate(delta);
+        }
+        else if (!delta.IsEmpty)
+        {
+            _rightStore.Integrate(delta);
+        }
     }
 
     // Frontier-driven GC: when the join key is monotone on BOTH sides (so no
@@ -174,13 +229,13 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         }
 
         _lastGcFrontier = frontier;
-        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
-        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += (_leftStore?.DropKeysBelow(frontier, _monotoneKey) ?? _leftTrace.DropKeysBelow(frontier, _monotoneKey)).Count;
+        _gcDropped += (_rightStore?.DropKeysBelow(frontier, _monotoneKey) ?? _rightTrace.DropKeysBelow(frontier, _monotoneKey)).Count;
     }
 
     public string MetricName => "IncrementalInnerJoin";
 
-    public long RetainedRows => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
+    public long RetainedRows => LeftGroups + RightGroups;
 
     public long LastOutputRows => _output.Current.Count;
 

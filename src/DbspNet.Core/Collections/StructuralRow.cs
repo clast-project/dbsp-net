@@ -42,6 +42,17 @@ public class StructuralRow : IEquatable<StructuralRow>, IReadOnlyList<object?>
     }
 
     /// <summary>
+    /// A row over <paramref name="values"/> whose hash is already known — it MUST be what
+    /// <see cref="ComputeHash(object?[])"/> returns for them (a store re-forming a row it kept
+    /// the hash of; docs/design-paged-trace-state.md §4).
+    /// </summary>
+    internal StructuralRow(object?[] values, int hash)
+    {
+        _values = values;
+        _hash = hash;
+    }
+
+    /// <summary>
     /// Subclass constructor: registers a precomputed hash without backing
     /// <c>object?[]</c> storage. Subclasses must override <see cref="Count"/>
     /// and <see cref="this[int]"/> to surface their typed fields.

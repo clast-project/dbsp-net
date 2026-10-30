@@ -86,4 +86,138 @@ internal static class IncrementalJoinCore
             }
         }
     }
+
+    /// <summary>
+    /// <see cref="JoinInto{TKey,TLeft,TRight,TOut,TWeight}(IndexedZSet{TKey,TLeft,TWeight},IndexedZSet{TKey,TRight,TWeight},Func{TKey,TLeft,TRight,TOut},Func{TOut,bool}?,ZSetBuilder{TOut,TWeight})"/>
+    /// with the right side in a store: the same side choice, nesting and order, so the output
+    /// is the same Z-set built in the same order.
+    /// </summary>
+    public static void JoinInto<TKey, TLeft, TRight, TOut, TWeight>(
+        IndexedZSet<TKey, TLeft, TWeight> a,
+        IIndexedTraceStore<TKey, TRight, TWeight> b,
+        Func<TKey, TLeft, TRight, TOut> combine,
+        Func<TOut, bool>? residual,
+        ZSetBuilder<TOut, TWeight> output)
+        where TKey : notnull
+        where TLeft : notnull
+        where TRight : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        if (a.IsEmpty || b.GroupCount == 0)
+        {
+            return;
+        }
+
+        if (a.GroupCount <= b.GroupCount)
+        {
+            foreach (var (key, aGroup) in a)
+            {
+                var g = b.FindGroup(key);
+                if (g < 0 || b.FirstValue(g) < 0)
+                {
+                    continue;
+                }
+
+                foreach (var (av, aw) in aGroup)
+                {
+                    for (var v = b.FirstValue(g); v >= 0; v = b.NextValue(v))
+                    {
+                        Emit(combine(key, av, b.ValueAt(v)), TWeight.Multiply(aw, b.WeightAt(v)), residual, output);
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (var g = b.FirstGroup(); g >= 0; g = b.NextGroup(g))
+            {
+                var key = b.KeyOf(g);
+                var aGroup = a.GroupFor(key);
+                if (aGroup.IsEmpty)
+                {
+                    continue;
+                }
+
+                foreach (var (av, aw) in aGroup)
+                {
+                    for (var v = b.FirstValue(g); v >= 0; v = b.NextValue(v))
+                    {
+                        Emit(combine(key, av, b.ValueAt(v)), TWeight.Multiply(aw, b.WeightAt(v)), residual, output);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>The left side in a store; see the overload with the right side in one.</summary>
+    public static void JoinInto<TKey, TLeft, TRight, TOut, TWeight>(
+        IIndexedTraceStore<TKey, TLeft, TWeight> a,
+        IndexedZSet<TKey, TRight, TWeight> b,
+        Func<TKey, TLeft, TRight, TOut> combine,
+        Func<TOut, bool>? residual,
+        ZSetBuilder<TOut, TWeight> output)
+        where TKey : notnull
+        where TLeft : notnull
+        where TRight : notnull
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        if (a.GroupCount == 0 || b.IsEmpty)
+        {
+            return;
+        }
+
+        if (a.GroupCount <= b.GroupCount)
+        {
+            for (var g = a.FirstGroup(); g >= 0; g = a.NextGroup(g))
+            {
+                var key = a.KeyOf(g);
+                var bGroup = b.GroupFor(key);
+                if (bGroup.IsEmpty)
+                {
+                    continue;
+                }
+
+                for (var v = a.FirstValue(g); v >= 0; v = a.NextValue(v))
+                {
+                    var (av, aw) = (a.ValueAt(v), a.WeightAt(v));
+                    foreach (var (bv, bw) in bGroup)
+                    {
+                        Emit(combine(key, av, bv), TWeight.Multiply(aw, bw), residual, output);
+                    }
+                }
+            }
+        }
+        else
+        {
+            foreach (var (key, bGroup) in b)
+            {
+                var g = a.FindGroup(key);
+                if (g < 0)
+                {
+                    continue;
+                }
+
+                for (var v = a.FirstValue(g); v >= 0; v = a.NextValue(v))
+                {
+                    var (av, aw) = (a.ValueAt(v), a.WeightAt(v));
+                    foreach (var (bv, bw) in bGroup)
+                    {
+                        Emit(combine(key, av, bv), TWeight.Multiply(aw, bw), residual, output);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void Emit<TOut, TWeight>(TOut outRow, TWeight weight, Func<TOut, bool>? residual, ZSetBuilder<TOut, TWeight> output)
+        where TOut : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        if (residual is null || residual(outRow))
+        {
+            output.Add(outRow, weight);
+        }
+    }
 }

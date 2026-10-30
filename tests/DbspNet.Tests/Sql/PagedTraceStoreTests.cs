@@ -224,4 +224,104 @@ public class PagedTraceStoreTests
             Text(),
             random.Next(40) == 0 ? Utf8String.Of("x") : null);   // a value in the NULL column escapes
     }
+
+    private static readonly Schema KeySchema = new(
+    [
+        new SchemaColumn("k", new SqlBigintType(true)),
+        new SchemaColumn("ks", new SqlVarcharType(null, true)),
+    ]);
+
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(2, true)]
+    [InlineData(3, true)]
+    public void Indexed_RandomSignedDeltas_MatchTheIndexedZSet(int seed, bool views)
+    {
+        var random = new Random(seed);
+        var reference = new IndexedZSet<StructuralRow, StructuralRow, Z64>(new Dictionary<StructuralRow, ZSet<StructuralRow, Z64>>());
+        var store = PagedIndexedStore.For(KeySchema, Wide, views);
+        var live = new List<(StructuralRow Key, StructuralRow Value)>();
+
+        for (var tick = 0; tick < 80; tick++)
+        {
+            var builder = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            var n = random.Next(0, tick < 5 ? 300 : 100);
+            for (var i = 0; i < n; i++)
+            {
+                // Few keys so groups grow, shrink, empty out and come back; values often re-used.
+                var (key, value) = live.Count > 0 && random.Next(2) == 0
+                    ? live[random.Next(live.Count)]
+                    : (RandomKey(random), RandomRow(random));
+                var weight = random.Next(3) == 0 ? -random.Next(1, 3) : random.Next(1, 3);
+                builder.Add(Copy(key), Copy(value), new Z64(weight));
+                live.Add((key, value));
+            }
+
+            var delta = builder.Build();
+            reference.MergeInPlace(delta);
+            store.Integrate(delta);
+            AssertSameIndexed(reference, store);
+
+            if (tick % 20 == 19)
+            {
+                // Frontier GC: drop the groups whose first key cell is below a threshold.
+                static long Mono(StructuralRow k) => k[0] is long l ? l : long.MinValue;
+                var threshold = random.Next(0, 6);
+                var expected = reference.RemoveKeysBelow(threshold, Mono);
+                var actual = store.DropKeysBelow(threshold, Mono);
+                Assert.Equal(expected, actual);
+                AssertSameIndexed(reference, store);
+            }
+        }
+    }
+
+    private static StructuralRow RandomKey(Random random) =>
+        new(random.Next(8) == 0 ? null : (long)random.Next(10), random.Next(3) == 0 ? Utf8String.Of("k" + random.Next(2)) : null);
+
+    private static void AssertSameIndexed(IndexedZSet<StructuralRow, StructuralRow, Z64> reference, PagedIndexedStore store)
+    {
+        Assert.Equal(reference.GroupCount, store.GroupCount);
+        var g = store.FirstGroup();
+        foreach (var (key, group) in reference)
+        {
+            Assert.True(g >= 0);
+            Assert.Equal(key, store.KeyOf(g));
+            Assert.Equal(g, store.FindGroup(Copy(key)));
+            var v = store.FirstValue(g);
+            foreach (var (value, weight) in group)
+            {
+                Assert.True(v >= 0);
+                var stored = store.ValueAt(v);
+                Assert.Equal(value.GetHashCode(), stored.GetHashCode());
+                Assert.Equal(value, stored);
+                Assert.Equal(weight, store.WeightAt(v));
+                v = store.NextValue(v);
+            }
+
+            Assert.Equal(-1, v);
+            g = store.NextGroup(g);
+        }
+
+        Assert.Equal(-1, g);
+
+        // The snapshot form: same order, every group and value.
+        var formed = store.Materialize();
+        Assert.Equal(reference.Select(kv => kv.Key), formed.Select(kv => kv.Key));
+        foreach (var ((_, e), (_, a)) in reference.Zip(formed))
+        {
+            AssertSameZSet(e, a);
+        }
+    }
+
+    private static void AssertSameZSet(ZSet<StructuralRow, Z64> expected, ZSet<StructuralRow, Z64> actual)
+    {
+        var e = expected.ToList();
+        var a = actual.ToList();
+        Assert.Equal(e.Count, a.Count);
+        for (var i = 0; i < e.Count; i++)
+        {
+            Assert.Equal(e[i].Value, a[i].Value);
+            Assert.Equal(e[i].Key, a[i].Key);
+        }
+    }
 }

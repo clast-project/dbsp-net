@@ -171,4 +171,63 @@ public class IntegrateSnapshotTests : IDisposable
             }
         }
     }
+
+    [Fact]
+    public async Task PagedJoinStore_WritesTheSameSnapshotBytes()
+    {
+        // Increment 3: an inner join's two traces in the paged store save through the same codecs
+        // in the same group and value order, so every file matches byte for byte.
+        async Task<string> Run(bool paged, string name)
+        {
+            var dir = Path.Combine(_snapshotDir, name);
+            var previous = TraceStoreMode.Paged;
+            TraceStoreMode.Paged = paged;
+            try
+            {
+                var catalog = new Catalog();
+                var resolver = new Resolver(catalog);
+                resolver.Resolve(Parser.ParseStatement("CREATE TABLE l (k INT NOT NULL, a VARCHAR, x DOUBLE)"));
+                resolver.Resolve(Parser.ParseStatement("CREATE TABLE r (k INT NOT NULL, b VARCHAR)"));
+                var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(
+                    "SELECT l.k, a, x, b FROM l JOIN r ON l.k = r.k"))).Query;
+                // ShareArrangements skips the typed fast path (the store is structural-only); with
+                // snapshot codecs present no arrangement is actually shared.
+                var q = PlanToCircuit.Compile(
+                    plan, ArrowSqlSnapshotCodecs.Instance, new CompileOptions { StoredOutput = true, ShareArrangements = true });
+                for (var i = 0; i < 60; i++)
+                {
+                    q.Table("l").Insert(i % 7, "a" + i, i * 0.5);
+                    q.Table("r").Insert(i % 5, "b" + (i % 3));
+                }
+
+                q.Step();
+                for (var i = 0; i < 60; i += 4)
+                {
+                    q.Table("l").Delete(i % 7, "a" + i, i * 0.5);
+                }
+
+                q.Table("r").Delete(1, "b1");
+                q.Table("l").Insert(3, null, -0.0);
+                q.Step();
+                await Snapshot.WriteAsync(q.Circuit, dir);
+                return dir;
+            }
+            finally
+            {
+                TraceStoreMode.Paged = previous;
+            }
+        }
+
+        var boxedDir = await Run(paged: false, "join-boxed");
+        var pagedDir = await Run(paged: true, "join-paged");
+        var files = Directory.GetFiles(boxedDir, "*", SearchOption.AllDirectories)
+            .Select(f => Path.GetRelativePath(boxedDir, f)).Order(StringComparer.Ordinal).ToList();
+        Assert.Contains(files, f => f.EndsWith("left.arrows", StringComparison.Ordinal));
+        Assert.Equal(files, Directory.GetFiles(pagedDir, "*", SearchOption.AllDirectories)
+            .Select(f => Path.GetRelativePath(pagedDir, f)).Order(StringComparer.Ordinal));
+        foreach (var f in files.Where(f => f.EndsWith(".arrows", StringComparison.Ordinal)))
+        {
+            Assert.Equal(File.ReadAllBytes(Path.Combine(boxedDir, f)), File.ReadAllBytes(Path.Combine(pagedDir, f)));
+        }
+    }
 }

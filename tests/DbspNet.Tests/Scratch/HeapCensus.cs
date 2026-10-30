@@ -122,12 +122,20 @@ internal static class HeapCensus
             yield return line;
         }
 
+        foreach (var g in Enumerable.Range(0, counters.Count).GroupBy(i => counters[i].Owner + " " + counters[i].Kind)
+            .OrderByDescending(g => g.Sum(i => perTrace[i].Bytes)))
+        {
+            yield return string.Create(
+                CultureInfo.InvariantCulture,
+                $"CENSUS owner {g.Key} traces={g.Count()} keys={g.Sum(i => (long)counters[i].StateKeys)} entries_first={g.Sum(i => perTrace[i].Entries)} bytes={g.Sum(i => perTrace[i].Bytes)}");
+        }
+
         foreach (var t in Enumerable.Range(0, counters.Count).OrderByDescending(i => perTrace[i].Bytes).Take(25))
         {
             var c = counters[t];
             yield return string.Create(
                 CultureInfo.InvariantCulture,
-                $"CENSUS trace #{t} {c.Kind} keys={c.StateKeys} entries_first={perTrace[t].Entries} bytes={perTrace[t].Bytes} type={Name(c.CollectionType)}");
+                $"CENSUS trace #{t} {c.Owner} {c.Kind} keys={c.StateKeys} entries_first={perTrace[t].Entries} bytes={perTrace[t].Bytes} type={Name(c.CollectionType)}");
         }
     }
 
