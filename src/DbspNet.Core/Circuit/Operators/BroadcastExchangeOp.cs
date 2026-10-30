@@ -31,7 +31,7 @@ internal sealed class BroadcastExchangeOp<TRow, TWeight> : IOperator
 {
     private readonly Stream<ZSet<TRow, TWeight>> _input;
     private readonly Stream<ZSet<TRow, TWeight>> _output;
-    private readonly ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>> _coordinator;
+    private readonly ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>> _coordinator;
     private readonly int _worker;
     private readonly int _workers;
     private readonly CancellationToken _abort;
@@ -39,7 +39,7 @@ internal sealed class BroadcastExchangeOp<TRow, TWeight> : IOperator
     internal BroadcastExchangeOp(
         Stream<ZSet<TRow, TWeight>> input,
         Stream<ZSet<TRow, TWeight>> output,
-        ExchangeCoordinator<List<KeyValuePair<TRow, TWeight>>> coordinator,
+        ExchangeCoordinator<IReadOnlyList<KeyValuePair<TRow, TWeight>>> coordinator,
         int worker,
         CancellationToken abort)
     {
@@ -60,21 +60,23 @@ internal sealed class BroadcastExchangeOp<TRow, TWeight> : IOperator
         // This worker's whole shard becomes one bucket, published to every cell of
         // our grid row so any reader's column sees it. The Z-set's keys are already
         // distinct, so a plain list suffices.
-        var shard = new List<KeyValuePair<TRow, TWeight>>();
+        IReadOnlyList<KeyValuePair<TRow, TWeight>>? shard = ZSetMapMode.Chunked
+            ? new ChunkedList<KeyValuePair<TRow, TWeight>>()
+            : new List<KeyValuePair<TRow, TWeight>>();
         foreach (var kv in _input.Current)
         {
-            shard.Add(kv);
+            ExchangeBuckets.Add(ref shard, kv);
         }
 
         for (var j = 0; j < workers; j++)
         {
-            _coordinator.Publish(_worker, j, shard);
+            _coordinator.Publish(_worker, j, shard!);
         }
 
         if (profile)
         {
             var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-            StepProfiler.RecordSplit(_worker, t1 - t0, shard.Count);
+            StepProfiler.RecordSplit(_worker, t1 - t0, shard!.Count);
             t0 = t1;
         }
 

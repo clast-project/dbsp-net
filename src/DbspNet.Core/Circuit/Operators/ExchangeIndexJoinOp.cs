@@ -79,8 +79,8 @@ internal sealed class ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight> : 
 
     /// <summary>The pair of per-destination buckets one worker sends another in a tick.</summary>
     internal readonly record struct DualBucket(
-        List<KeyValuePair<TLeftRow, TWeight>>? Left,
-        List<KeyValuePair<TRightRow, TWeight>>? Right);
+        IReadOnlyList<KeyValuePair<TLeftRow, TWeight>>? Left,
+        IReadOnlyList<KeyValuePair<TRightRow, TWeight>>? Right);
 
     public void Step()
     {
@@ -91,20 +91,20 @@ internal sealed class ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight> : 
         // Split each side's rows into one append-only bucket per destination. The
         // inputs are Z-sets so their keys are distinct, so a bucket never merges
         // (see ExchangeIndexOp). Buckets are allocated lazily; empty cells stay null.
-        var leftBuckets = new List<KeyValuePair<TLeftRow, TWeight>>?[workers];
-        var rightBuckets = new List<KeyValuePair<TRightRow, TWeight>>?[workers];
+        var leftBuckets = new IReadOnlyList<KeyValuePair<TLeftRow, TWeight>>?[workers];
+        var rightBuckets = new IReadOnlyList<KeyValuePair<TRightRow, TWeight>>?[workers];
         long splitRows = 0;
         foreach (var kv in _leftInput.Current)
         {
             var j = ((_leftPartition(kv.Key) % workers) + workers) % workers;
-            (leftBuckets[j] ??= new List<KeyValuePair<TLeftRow, TWeight>>()).Add(kv);
+            ExchangeBuckets.Add(ref leftBuckets[j], kv);
             splitRows++;
         }
 
         foreach (var kv in _rightInput.Current)
         {
             var j = ((_rightPartition(kv.Key) % workers) + workers) % workers;
-            (rightBuckets[j] ??= new List<KeyValuePair<TRightRow, TWeight>>()).Add(kv);
+            ExchangeBuckets.Add(ref rightBuckets[j], kv);
             splitRows++;
         }
 
@@ -142,7 +142,7 @@ internal sealed class ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight> : 
             var pair = _coordinator.Read(src, _worker);
             if (pair.Left is not null)
             {
-                foreach (var (row, weight) in pair.Left)
+                foreach (var (row, weight) in ExchangeBuckets.Items(pair.Left))
                 {
                     leftIndexed.Add(_leftKeyOf(row), row, weight);
                     gatherRows++;
@@ -151,7 +151,7 @@ internal sealed class ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight> : 
 
             if (pair.Right is not null)
             {
-                foreach (var (row, weight) in pair.Right)
+                foreach (var (row, weight) in ExchangeBuckets.Items(pair.Right))
                 {
                     rightIndexed.Add(_rightKeyOf(row), row, weight);
                     gatherRows++;

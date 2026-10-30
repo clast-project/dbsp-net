@@ -584,3 +584,130 @@ internal readonly struct MapView<TKey, TValue>
         void IEnumerator.Reset() => throw new NotSupportedException();
     }
 }
+
+/// <summary>
+/// An append-only list in chunks that never reach the 85,000-byte large-object threshold — the
+/// exchange operators' per-destination buckets when <c>DBSPNET_ZSET_MAP=chunked</c>
+/// (docs/design-chunked-deltas.md, increment 4). Order is append order.
+/// </summary>
+internal sealed class ChunkedList<T> : IReadOnlyList<T>
+{
+    private const int LohBytes = 85_000;
+    private static readonly int Shift = ComputeShift();
+    private static readonly int ChunkLength = 1 << Shift;
+
+    private T[] _first = new T[4];
+    private T[][]? _chunks;   // non-null once past one chunk; [0] is _first
+    private int _count;
+
+    public int Count => _count;
+
+    public T this[int index] =>
+        _chunks is null ? _first[index] : _chunks[index >> Shift][index & (ChunkLength - 1)];
+
+    /// <summary>The largest single array, in bytes (for tests).</summary>
+    internal long LargestArrayBytes => (long)Math.Min(_chunks is null ? _first.Length : ChunkLength, ChunkLength) * Unsafe.SizeOf<T>();
+
+    public void Add(T item)
+    {
+        if (_chunks is null)
+        {
+            if (_count < _first.Length)
+            {
+                _first[_count++] = item;
+                return;
+            }
+
+            if (_first.Length < ChunkLength)
+            {
+                Array.Resize(ref _first, Math.Min(ChunkLength, _first.Length * 2));
+                _first[_count++] = item;
+                return;
+            }
+
+            _chunks = new T[4][];
+            _chunks[0] = _first;
+        }
+
+        var c = _count >> Shift;
+        if (c == _chunks.Length)
+        {
+            Array.Resize(ref _chunks, _chunks.Length * 2);
+        }
+
+        (_chunks[c] ??= new T[ChunkLength])[_count & (ChunkLength - 1)] = item;
+        _count++;
+    }
+
+    public Enumerator GetEnumerator() => new(this);
+
+    IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+    private static int ComputeShift()
+    {
+        var size = Math.Max(1, Unsafe.SizeOf<T>());
+        var shift = 4;
+        while (((2L << shift) * size) + 32 < LohBytes)
+        {
+            shift++;
+        }
+
+        return shift;
+    }
+
+    /// <summary>Walks one chunk at a time.</summary>
+    public struct Enumerator : IEnumerator<T>
+    {
+        private readonly ChunkedList<T> _list;
+        private T[] _chunk;
+        private int _chunkIndex;
+        private int _offset;
+        private int _limit;
+        private T _current;
+
+        internal Enumerator(ChunkedList<T> list)
+        {
+            _list = list;
+            _chunk = list._first;
+            _chunkIndex = 0;
+            _offset = 0;
+            _limit = Math.Min(list._count, list._first.Length);
+            _current = default!;
+        }
+
+        public readonly T Current => _current;
+
+        readonly object? IEnumerator.Current => _current;
+
+        public bool MoveNext()
+        {
+            while (true)
+            {
+                if (_offset < _limit)
+                {
+                    _current = _chunk[_offset++];
+                    return true;
+                }
+
+                var start = (_chunkIndex + 1) << Shift;
+                if (_list._chunks is null || start >= _list._count)
+                {
+                    return false;
+                }
+
+                _chunkIndex++;
+                _chunk = _list._chunks[_chunkIndex];
+                _offset = 0;
+                _limit = Math.Min(_list._count - start, ChunkLength);
+            }
+        }
+
+        public readonly void Dispose()
+        {
+        }
+
+        void IEnumerator.Reset() => throw new NotSupportedException();
+    }
+}

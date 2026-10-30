@@ -25,7 +25,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
     private readonly Stream<ZSet<TKey, TWeight>> _input;
     private readonly Stream<ZSet<TKey, TWeight>> _output;
     private readonly Func<TKey, int> _partition;
-    private readonly ExchangeCoordinator<List<KeyValuePair<TKey, TWeight>>> _coordinator;
+    private readonly ExchangeCoordinator<IReadOnlyList<KeyValuePair<TKey, TWeight>>> _coordinator;
     private readonly int _worker;
     private readonly int _workers;
     private readonly CancellationToken _abort;
@@ -34,7 +34,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         Stream<ZSet<TKey, TWeight>> input,
         Stream<ZSet<TKey, TWeight>> output,
         Func<TKey, int> partition,
-        ExchangeCoordinator<List<KeyValuePair<TKey, TWeight>>> coordinator,
+        ExchangeCoordinator<IReadOnlyList<KeyValuePair<TKey, TWeight>>> coordinator,
         int worker,
         CancellationToken abort)
     {
@@ -60,13 +60,13 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         // destination publishes null. The key hash is paid once, here, at the
         // gather (vs. the previous build-then-rebuild which hashed every row
         // twice — once per bucket, once at the gather).
-        var buckets = new List<KeyValuePair<TKey, TWeight>>?[workers];
+        var buckets = new IReadOnlyList<KeyValuePair<TKey, TWeight>>?[workers];
         long splitRows = 0;
         foreach (var kv in _input.Current)
         {
             // Non-negative modulo: partition() may return a negative hash.
             var j = ((_partition(kv.Key) % workers) + workers) % workers;
-            (buckets[j] ??= new List<KeyValuePair<TKey, TWeight>>()).Add(kv);
+            ExchangeBuckets.Add(ref buckets[j], kv);
             splitRows++;
         }
 
