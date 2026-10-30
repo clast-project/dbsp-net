@@ -21,7 +21,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    // A Dictionary, or a ChunkedMap when DBSPNET_ZSET_MAP=chunked (docs/design-chunked-deltas.md).
+    // A Dictionary, or a ChunkedMap (the default; DBSPNET_ZSET_MAP=dictionary opts out) (docs/design-chunked-deltas.md).
     // One field either way, so an indexed Z-set is no bigger than before.
     private readonly object _groupStore;
 
@@ -362,7 +362,7 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    // A Dictionary, or a ChunkedMap when DBSPNET_ZSET_MAP=chunked; null after Build(). One field.
+    // A Dictionary, or a ChunkedMap (the default; DBSPNET_ZSET_MAP=dictionary opts out); null after Build(). One field.
     private object? _store;
 
     public IndexedZSetBuilder()

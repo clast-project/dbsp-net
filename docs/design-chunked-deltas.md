@@ -291,3 +291,19 @@ A first run of the same A/B showed drain **+1.76 s** (SE 0.22); it did not repro
 A/B of the input decode alone (old whole-column decode behind a temporary switch, since removed)
 gave drain +0.20 s (SE 0.56) and young pause +0.15 s (SE 0.08) — the block decode is neutral on
 the drain. The input side's value is the LOH residency it removes, not step time.
+
+## 10. Default on (2026-10-30)
+
+`ZSetMapMode.Chunked` is now true unless `DBSPNET_ZSET_MAP=dictionary`; a test pins the default.
+Suite 2643/2643 with the default and with the opt-out. With no environment set: ivm-bench SF=3
+digests identical at W=8 and W=1, and `Entry<StructuralRow,Z64>[]` on the LOH in batch 1 is
+0.02 GB (W=8) / 0.03 GB (W=1), down from 6.0 GB — the remainder is code that still builds a
+`Dictionary` directly (the spine traces, the paged store's snapshot form).
+
+**New fine-tick baseline** (w1profile B/ev, default config): q0 672, q1 789, q2 526, q22 899, q3 66,
+q20 1080, q4 1991, q9 939, q18 1132, q19 1007 — +0.9% to +6.5% over the Dictionary numbers, as
+measured in §7. `docs/w1-profile.md` still records the Dictionary-era table; future B/ev A/Bs
+compare against these.
+
+What the default buys, from §7–§9: ivm-bench batch 1 at W=8 drain −3.1 s and young pause −1.0 s,
+output write −2.1 s; Nexmark +18% (W=1) / +14% (W=8) geomean.

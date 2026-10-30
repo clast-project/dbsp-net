@@ -8,7 +8,7 @@ namespace DbspNet.Core.Circuit.Operators;
 
 /// <summary>
 /// The exchange operators' per-destination buckets: a <see cref="List{T}"/>, or a
-/// <see cref="ChunkedList{T}"/> when <c>DBSPNET_ZSET_MAP=chunked</c> — a bucket of a bulk-load
+/// <see cref="ChunkedList{T}"/> (the default; <c>DBSPNET_ZSET_MAP=dictionary</c> opts out) — a bucket of a bulk-load
 /// delta grows past the large-object threshold as a List (docs/design-chunked-deltas.md,
 /// increment 4). Reads go through <see cref="Items"/>, which enumerates either without boxing.
 /// </summary>

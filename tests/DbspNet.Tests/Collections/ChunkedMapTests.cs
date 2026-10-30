@@ -91,4 +91,13 @@ public class ChunkedMapTests
 
         Assert.False(e.MoveNext());
     }
+
+    [Fact]
+    public void ChunkedIsTheDefault_UnlessOptedOut()
+    {
+        // docs/design-chunked-deltas.md §10: on by default; DBSPNET_ZSET_MAP=dictionary opts out.
+        var optedOut = string.Equals(
+            Environment.GetEnvironmentVariable("DBSPNET_ZSET_MAP")?.Trim(), "dictionary", StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(!optedOut, ZSetMapMode.Chunked);
+    }
 }

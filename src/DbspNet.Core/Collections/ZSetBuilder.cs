@@ -13,7 +13,7 @@ public sealed class ZSetBuilder<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    // A Dictionary, or a ChunkedMap when DBSPNET_ZSET_MAP=chunked (docs/design-chunked-deltas.md);
+    // A Dictionary, or a ChunkedMap (the default; DBSPNET_ZSET_MAP=dictionary opts out) (docs/design-chunked-deltas.md);
     // null after Build(). One field either way, so the builder is no bigger than before — a
     // second field cost w1profile up to 3 B/ev.
     private object? _store;

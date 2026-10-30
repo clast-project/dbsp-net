@@ -8,13 +8,13 @@ namespace DbspNet.Core.Collections;
 
 /// <summary>
 /// Whether Z-sets are backed by <see cref="ChunkedMap{TKey,TValue}"/> instead of
-/// <see cref="Dictionary{TKey,TValue}"/> (docs/design-chunked-deltas.md). Default off;
-/// <c>DBSPNET_ZSET_MAP=chunked</c> selects it for the process.
+/// <see cref="Dictionary{TKey,TValue}"/> (docs/design-chunked-deltas.md). Default on since
+/// 2026-10-30 (§10 there); <c>DBSPNET_ZSET_MAP=dictionary</c> opts the process out.
 /// </summary>
 internal static class ZSetMapMode
 {
-    internal static readonly bool Chunked = string.Equals(
-        Environment.GetEnvironmentVariable("DBSPNET_ZSET_MAP")?.Trim(), "chunked", StringComparison.OrdinalIgnoreCase);
+    internal static readonly bool Chunked = !string.Equals(
+        Environment.GetEnvironmentVariable("DBSPNET_ZSET_MAP")?.Trim(), "dictionary", StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
@@ -587,7 +587,7 @@ internal readonly struct MapView<TKey, TValue>
 
 /// <summary>
 /// An append-only list in chunks that never reach the 85,000-byte large-object threshold — the
-/// exchange operators' per-destination buckets when <c>DBSPNET_ZSET_MAP=chunked</c>
+/// exchange operators' per-destination buckets (the default; <c>DBSPNET_ZSET_MAP=dictionary</c> opts out)
 /// (docs/design-chunked-deltas.md, increment 4). Order is append order.
 /// </summary>
 internal sealed class ChunkedList<T> : IReadOnlyList<T>
