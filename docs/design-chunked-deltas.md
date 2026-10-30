@@ -261,3 +261,33 @@ the drain, but batch 1 spends ~3.7 s in output); (2) large-map lookup still 1.16
 default flip — the seam is still off; (4) the unexplained short test totals (2561, 2599 of 2640,
 both "Passed!", not reproduced in seven reruns — suspected test-host abort hidden by the summary
 grep; abort lines are now checked).
+
+## 9. The Arrow boundary — input decode in blocks, output built from rows (2026-10-30)
+
+Commit `d71c6eb`. **Input:** `ArrowColumns.Extract` gains a row offset; the parallel ingest
+(`ShardedTableInput.PushColumnBlocks`) has each worker row range decode its rows in 4,096-row
+blocks, and the serial `DecodeCore` does the same, so no whole-batch boxed `object?[n]` column is
+allocated (batches with zero-weight rows keep the whole-column decode — rare, and their surviving
+rows are not contiguous). **Output:** `ToArrowChanges` / `ToArrowDelta` / `ToArrowView` build each
+Arrow column straight from the row list through a struct cell source (the per-column
+`List<object?>` + `ToArray()` staging is gone) and reserve builder capacity up front.
+
+**Correctness.** A new ingest test checks the decoded table against values read directly from the
+batch's Arrow accessors (a serial-vs-parallel comparison cannot catch an offset bug both paths
+share); an injected offset bug makes it — and the existing ingest tests — fail. Suite 2642/2642
+off and on. ivm-bench: all 16 digests identical; the written Parquet is identical per view in
+schema and row multiset (pyarrow), with only the `created_by` build stamp differing.
+
+**ivm-bench SF=3 batch 1, W=8, chunked on**, before (`f0f6be7`, built in a worktree) vs after,
+5 alternating runs:
+
+| | before | after | Δ |
+|---|---|---|---|
+| output (materialise + Delta write) | 5.66 s | **3.58 s** | **−2.09 s** (SE 0.78) |
+| drain | 17.07 s | 17.28 s | +0.21 s (SE 0.66) — noise |
+| background gen2s | 3–5 | 1–2 | |
+
+A first run of the same A/B showed drain **+1.76 s** (SE 0.22); it did not reproduce. A same-build
+A/B of the input decode alone (old whole-column decode behind a temporary switch, since removed)
+gave drain +0.20 s (SE 0.56) and young pause +0.15 s (SE 0.08) — the block decode is neutral on
+the drain. The input side's value is the LOH residency it removes, not step time.
