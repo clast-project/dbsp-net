@@ -53,6 +53,10 @@ public sealed class ProgramRunner
         public bool Written { get; set; }
     }
     private readonly ICheckpointStore? _checkpoint;
+
+    // Engine tick of the last checkpoint written or restored; -1 = none. Source cursors only
+    // advance together with a tick (DrainAsync), so an unchanged tick means nothing to save.
+    private long _checkpointedTick = -1;
     private readonly BatchProfile? _profile = ProfileEnabled ? new BatchProfile() : null;
 
     private ProgramRunner(
@@ -217,6 +221,7 @@ public sealed class ProgramRunner
             b.Cursor = b.Connector.ParseOffset(sc.Offset);
         }
 
+        _checkpointedTick = state.Tick;
         return state.Tick;
     }
 
@@ -225,19 +230,23 @@ public sealed class ProgramRunner
     /// commit atomically (the offsets ride in the snapshot manifest), so engine tick
     /// T and the cursors can never diverge. Called automatically at the end of
     /// <see cref="RunBatchAsync"/> when a checkpoint store is wired; exposed for a
-    /// forced checkpoint (e.g. before a clean shutdown).
+    /// forced checkpoint (e.g. before a clean shutdown). Skipped when the engine has not
+    /// ticked since the last checkpoint written or restored: state and cursors are then
+    /// exactly what that checkpoint already holds, and an idle batch would otherwise pay a
+    /// full state rewrite for nothing.
     /// </summary>
-    public ValueTask CheckpointAsync(CancellationToken cancellationToken = default)
+    public async ValueTask CheckpointAsync(CancellationToken cancellationToken = default)
     {
-        if (_checkpoint is null)
+        if (_checkpoint is null || _program.TickCount == _checkpointedTick)
         {
-            return ValueTask.CompletedTask;
+            return;
         }
 
         var offsets = _inputs
             .Select(b => new SourceCheckpoint(b.Connector.Name, b.Cursor.Serialize()))
             .ToList();
-        return _checkpoint.SaveAsync(_program.SerialCircuit!, offsets, cancellationToken);
+        await _checkpoint.SaveAsync(_program.SerialCircuit!, offsets, cancellationToken).ConfigureAwait(false);
+        _checkpointedTick = _program.TickCount;
     }
 
     /// <summary>Ingest every source version currently available (one engine tick per

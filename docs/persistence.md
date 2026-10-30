@@ -262,42 +262,52 @@ answers that from state without mutating it — pinned per aggregate kind by
 `AggregatorEmptyDeltaTests`). Manifest schema bumped to v4: a v3 snapshot has
 no state file, so accepting it would silently re-enter the buggy path.
 
-**Layout and retention.** Each snapshot lives under its own
-`snap-{tick}/` key prefix in the store, with the per-op `op-{i}/`
-contents and the snapshot's `manifest.json`. A top-level
-`{snapshotDir}/current.txt` names the latest snap-T and is the source
-of truth — `Snapshot.Read` reads it to find the loadable snapshot.
-`Snapshot.Write(circuit, dir, retainCount: N)` keeps the N
-most-recent snapshots; older ones are pruned after the new snapshot
-commits. Default `retainCount` is 1 — only the just-written snapshot
-survives, matching the prior overwrite semantics.
-`Snapshot.ListSnapshots(dir)` returns retained ticks in ascending
-order; useful for debugging and for time-travel queries (load an
-older `snap-T` directly by its manifest).
+**Layout and retention.** Each snapshot lives under its own key prefix — `snap-{tick}/`, or
+`snap-{tick}.{gen}/` when a directory for that tick already exists — with the per-op `op-{i}/`
+contents and the snapshot's `manifest.json`. A top-level `{snapshotDir}/current.txt` names the
+committed snapshot and is the source of truth — `Snapshot.Read` reads it to find the loadable
+snapshot. `Snapshot.Write(circuit, dir, retainCount: N)` keeps the current snapshot plus the
+newest N−1 complete ones before it, and deletes everything else after the commit, including
+orphans of crashed writes. `Snapshot.Write`'s own default `retainCount` is 1;
+`SnapshotCheckpointStore` (the connector path) defaults to 2, as Feldera does.
+`Snapshot.ListSnapshots(dir)` returns retained ticks in ascending order.
 
-**Cloud-native commit.** Per-op blobs and the `manifest.json` for a
-new snap-T are written directly to their final keys. The commit
-happens when `current.txt` is atomically updated last — before that,
-the new snapshot is invisible to readers (they're still resolving
-through the prior `current.txt`). This sequencing works on cloud
-object stores (where directory rename doesn't exist) and on the
-local store (which simulates atomic single-blob writes via
-tmp+rename internally). Pruning of older retained snap-T blobs is
-best-effort and runs after the `current.txt` commit. Crash points:
+**Commit protocol (crash-safe since the durable-state arc, increment 0).** A write never touches a
+directory a committed snapshot occupies — a second snapshot at the same tick (an idle batch) goes
+to `snap-{tick}.1`, and so on. The sequence is:
 
-- Mid-Save (operator throws): partial blobs may exist under
-  `snap-T/`, but `current.txt` is never updated, so `Read` and
-  `Exists` see the prior snapshot (or no snapshot). Orphans get
-  pruned eventually as ticks advance and retention catches up.
-- Between blob writes and `current.txt` commit: same — orphan
-  blobs invisible to readers.
-- During `current.txt` rename: atomic — either old or new pointer is
-  visible.
-- During pruning: best-effort. Failures leave orphan blobs but don't
-  break correctness; `Read` still uses `current.txt`.
+1. write every op's files under the fresh prefix;
+2. make them durable (`IDurableTableFileSystem.SyncAsync` — fsync each file and every directory up
+   to the root; on macOS one `F_FULLFSYNC` device flush at the end);
+3. write `manifest.json` and make it durable — so a manifest's presence implies complete, durable
+   op files;
+4. replace `current.txt` atomically and durably in one operation
+   (`WriteAllBytesDurableAsync`: fsync a temp file, rename over the pointer, fsync the directory).
+   This is the commit;
+5. prune.
 
-`Snapshot.Exists(store)` returns true iff `current.txt` exists and
-names a snap-T whose manifest exists.
+A store without `IDurableTableFileSystem` (an object store, `InMemoryTableFileSystem`) is taken to
+make each write durable on return, and its `WriteAllBytesAsync` must be atomic. On the local
+store, `WriteAllBytesAsync` is now write-temp-then-rename, so it is atomic too.
+`DBSPNET_SNAPSHOT_FSYNC=0` (or `Snapshot.Durable = false`) drops steps 2–4's fsyncs for
+measurement; the commit then survives a process crash but not power loss. Measured cost on the
+M4's APFS volume for a 4 GiB, 168-file checkpoint: about 0.07 s per device flush, three per
+checkpoint. Per-file `fsync` there is about free.
+
+The previous protocol had three crash windows, all closed: it rewrote the committed directory in
+place on a same-tick write (a crash mid-rewrite corrupted the only snapshot); it never fsynced; and
+it deleted `current.txt` before renaming the new pointer in, so a crash between the two left no
+pointer and the runner silently restarted from its sources' initial offsets. Pruning also used to
+keep the highest-numbered directories, so an orphan at a later tick could cause the *current*
+snapshot to be deleted. `CrashSafeCheckpointTests` crashes before every mutation of a commit, as a
+process crash and as a power loss (`CrashSimulatingFileSystem` keeps a separate image of what was
+fsynced), and requires restore to land exactly on the old or the new commit, the new one once
+the write has returned. Reverting any one of the four fixes fails it.
+
+`Snapshot.Exists(store)` returns true iff `current.txt` exists and names a snap-T whose manifest
+exists. `Snapshot.PointerExists(store)` is the "was anything ever committed" test:
+`SnapshotCheckpointStore` treats only a missing pointer as a fresh start. A pointer naming an
+unreadable snapshot fails the restore instead of silently re-ingesting from scratch.
 
 **Schema drift detection.** The manifest carries two fingerprints:
 

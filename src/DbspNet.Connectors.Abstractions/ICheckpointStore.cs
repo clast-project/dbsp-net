@@ -47,7 +47,10 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore
     private readonly ITableFileSystem _fs;
     private readonly int _retainCount;
 
-    public SnapshotCheckpointStore(ITableFileSystem fs, int retainCount = 1)
+    /// <param name="fs">Where checkpoints live.</param>
+    /// <param name="retainCount">Committed checkpoints to keep. Default 2 (Feldera keeps two): the
+    /// previous one survives until the next is durable and committed.</param>
+    public SnapshotCheckpointStore(ITableFileSystem fs, int retainCount = 2)
     {
         _fs = fs ?? throw new ArgumentNullException(nameof(fs));
         _retainCount = retainCount;
@@ -71,7 +74,10 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore
     {
         ArgumentNullException.ThrowIfNull(circuit);
 
-        if (!await Snapshot.ExistsAsync(_fs, cancellationToken).ConfigureAwait(false))
+        // Only a missing pointer means "never checkpointed". A pointer naming a snapshot that
+        // cannot be read must fail the restore, not silently restart from the sources' initial
+        // offsets — ReadAsync throws for it.
+        if (!await Snapshot.PointerExistsAsync(_fs, cancellationToken).ConfigureAwait(false))
         {
             return null;
         }

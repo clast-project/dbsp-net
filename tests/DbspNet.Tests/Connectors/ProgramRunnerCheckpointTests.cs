@@ -189,4 +189,53 @@ public class ProgramRunnerCheckpointTests
             Assert.Equal(Materialize(without.Outputs[view]), Materialize(withCodecs.Outputs[view]));
         }
     }
+
+    /// <summary>
+    /// A batch that drains nothing writes no checkpoint: state and cursors are exactly what
+    /// the last one holds. Before, it re-serialised all state into the committed snapshot's
+    /// own directory, so a crash mid-rewrite destroyed the only checkpoint — and paid a full
+    /// state rewrite for nothing.
+    /// </summary>
+    [Fact]
+    public async Task IdleBatch_WritesNoCheckpoint()
+    {
+        var fs = new DbspNet.Tests.Persistence.CrashSimulatingFileSystem();
+        var store = new SnapshotCheckpointStore(fs);
+
+        var p1 = CompilePersistent();
+        var r1 = await RunnerOver(p1, Versions().Take(2).ToList(), store);
+        Assert.Equal(2, await r1.RunBatchAsync());
+        var afterFirst = fs.Mutations;
+
+        Assert.Equal(0, await r1.RunBatchAsync());
+        await r1.CheckpointAsync();
+        Assert.Equal(afterFirst, fs.Mutations);
+
+        // Same after a restart: the restored checkpoint is the last one.
+        var p2 = CompilePersistent();
+        var r2 = await RunnerOver(p2, Versions().Take(2).ToList(), store);
+        Assert.Equal(2, await r2.RestoreAsync());
+        Assert.Equal(0, await r2.RunBatchAsync());
+        Assert.Equal(afterFirst, fs.Mutations);
+    }
+
+    /// <summary>
+    /// A commit pointer naming an unreadable snapshot fails the restore. Only a missing
+    /// pointer means "fresh start"; treating damage as one would silently re-ingest every
+    /// source from its initial offset over empty state.
+    /// </summary>
+    [Fact]
+    public async Task DamagedCheckpoint_FailsRestoreInsteadOfStartingFresh()
+    {
+        var fs = new InMemoryTableFileSystem();
+        var store = new SnapshotCheckpointStore(fs);
+        var r1 = await RunnerOver(CompilePersistent(), Versions().Take(2).ToList(), store);
+        await r1.RunBatchAsync();
+
+        var current = System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
+        await fs.DeleteAsync(current + "/manifest.json");
+
+        var r2 = await RunnerOver(CompilePersistent(), Versions(), store);
+        await Assert.ThrowsAsync<System.IO.FileNotFoundException>(async () => await r2.RestoreAsync());
+    }
 }

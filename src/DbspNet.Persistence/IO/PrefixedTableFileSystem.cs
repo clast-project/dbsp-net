@@ -12,7 +12,12 @@ namespace DbspNet.Persistence.IO;
 /// machinery written against a flat root operate inside a subtree (e.g. one
 /// worker's slice of a parallel snapshot) with no awareness of the prefix.
 /// </summary>
-internal sealed class PrefixedTableFileSystem : ITableFileSystem
+/// <remarks>
+/// Always presents <see cref="IDurableTableFileSystem"/>; over an inner store that is not durable
+/// the sync is a no-op and the durable write is a plain write — exactly what a caller would do
+/// against the inner store directly.
+/// </remarks>
+internal sealed class PrefixedTableFileSystem : IDurableTableFileSystem
 {
     private readonly ITableFileSystem _inner;
     private readonly string _prefix;
@@ -62,4 +67,26 @@ internal sealed class PrefixedTableFileSystem : ITableFileSystem
     public ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
         _inner.WriteAllBytesAsync(_prefix + path, data, cancellationToken);
+
+    public ValueTask SyncAsync(IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default)
+    {
+        if (_inner is not IDurableTableFileSystem durable)
+        {
+            return default;
+        }
+
+        var prefixed = new List<string>(paths.Count);
+        foreach (var p in paths)
+        {
+            prefixed.Add(_prefix + p);
+        }
+
+        return durable.SyncAsync(prefixed, cancellationToken);
+    }
+
+    public ValueTask WriteAllBytesDurableAsync(
+        string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+        _inner is IDurableTableFileSystem durable
+            ? durable.WriteAllBytesDurableAsync(_prefix + path, data, cancellationToken)
+            : _inner.WriteAllBytesAsync(_prefix + path, data, cancellationToken);
 }

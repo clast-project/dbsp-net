@@ -500,7 +500,7 @@ public class IvmRecoveryProbe
                 var h = 17L;
                 for (var i = 0; i < output.Schema.Count; i++)
                 {
-                    h = unchecked((h * 486187739L) + (row[i]?.GetHashCode() ?? 0));
+                    h = unchecked((h * 486187739L) + IvmRestoreProfile.StableCell(row[i]));
                 }
 
                 hash = unchecked(hash + (h * weight.Value));
