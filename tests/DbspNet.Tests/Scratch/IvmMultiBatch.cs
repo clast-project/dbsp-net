@@ -98,10 +98,23 @@ public class IvmMultiBatch
             }
 
             var sw = Stopwatch.StartNew();
-            var ticks = await runner.DrainAsync();
-            var drainMs = sw.Elapsed.TotalMilliseconds;
-            await runner.WriteOutputsAsync();
-            var outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
+            long ticks;
+            double drainMs, outputMs;
+            if (Environment.GetEnvironmentVariable("DBSPNET_PROFILE") is { Length: > 0 })
+            {
+                // Only RunBatchAsync builds the DBSPNET_PROFILE report (stderr / DBSPNET_PROFILE_FILE).
+                ticks = await runner.RunBatchAsync();
+                drainMs = sw.Elapsed.TotalMilliseconds;
+                outputMs = 0;
+            }
+            else
+            {
+                ticks = await runner.DrainAsync();
+                drainMs = sw.Elapsed.TotalMilliseconds;
+                await runner.WriteOutputsAsync();
+                outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
+            }
+
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
