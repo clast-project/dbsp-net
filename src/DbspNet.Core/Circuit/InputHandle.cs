@@ -18,15 +18,23 @@ public sealed class InputHandle<T> : IInputCommit
     private readonly RootCircuit _root;
     private readonly Stream<T> _stream;
     private readonly Func<T, T, T> _merge;
+    private readonly Func<IReadOnlyList<T>, T>? _mergeMany;
     private readonly T _zero;
     private T _pending;
     private bool _hasPending;
 
-    internal InputHandle(RootCircuit root, Stream<T> stream, T zero, Func<T, T, T> merge)
+    // With a many-way merge: every value pushed this tick, merged once at commit. A
+    // pairwise merge per push re-copies the accumulated value each time — quadratic in
+    // the pushes a tick takes (a bulk load pushes a table as many record batches).
+    private List<T>? _queued;
+
+    internal InputHandle(
+        RootCircuit root, Stream<T> stream, T zero, Func<T, T, T> merge, Func<IReadOnlyList<T>, T>? mergeMany = null)
     {
         _root = root;
         _stream = stream;
         _merge = merge;
+        _mergeMany = mergeMany;
         _zero = zero;
         _pending = zero;
     }
@@ -40,6 +48,12 @@ public sealed class InputHandle<T> : IInputCommit
     {
         lock (_root.SyncRoot)
         {
+            if (_mergeMany is not null)
+            {
+                (_queued ??= []).Add(value);
+                return;
+            }
+
             _pending = _hasPending ? _merge(_pending, value) : value;
             _hasPending = true;
         }
@@ -47,6 +61,15 @@ public sealed class InputHandle<T> : IInputCommit
 
     void IInputCommit.Commit()
     {
+        if (_mergeMany is not null)
+        {
+            _stream.SetCurrent(_queued is not { Count: > 0 } queued
+                ? _zero
+                : queued.Count == 1 ? queued[0] : _mergeMany(queued));
+            _queued?.Clear();
+            return;
+        }
+
         _stream.SetCurrent(_hasPending ? _pending : _zero);
         _pending = _zero;
         _hasPending = false;

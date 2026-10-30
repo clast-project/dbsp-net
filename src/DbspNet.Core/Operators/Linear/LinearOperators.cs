@@ -25,7 +25,7 @@ public static class LinearOperators
         where TWeight : struct, IZRing<TWeight>
     {
         ArgumentNullException.ThrowIfNull(builder);
-        return builder.Input(ZSet<TRow, TWeight>.Empty, (a, b) => a + b);
+        return builder.Input(ZSet<TRow, TWeight>.Empty, (a, b) => a + b, SumAll<TRow, TWeight>, name: null);
     }
 
     /// <summary>
@@ -39,7 +39,28 @@ public static class LinearOperators
         where TWeight : struct, IZRing<TWeight>
     {
         ArgumentNullException.ThrowIfNull(builder);
-        return builder.Input(ZSet<TRow, TWeight>.Empty, (a, b) => a + b, name);
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        return builder.Input(ZSet<TRow, TWeight>.Empty, (a, b) => a + b, SumAll<TRow, TWeight>, name);
+    }
+
+    // A tick's queued input pushes, summed in one builder sized to all of them.
+    private static ZSet<TRow, TWeight> SumAll<TRow, TWeight>(IReadOnlyList<ZSet<TRow, TWeight>> parts)
+        where TRow : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        long total = 0;
+        foreach (var part in parts)
+        {
+            total += part.Count;
+        }
+
+        var sum = new ZSetBuilder<TRow, TWeight>((int)Math.Min(total, int.MaxValue));
+        foreach (var part in parts)
+        {
+            sum.AddRange(part);
+        }
+
+        return sum.Build();
     }
 
     /// <summary>

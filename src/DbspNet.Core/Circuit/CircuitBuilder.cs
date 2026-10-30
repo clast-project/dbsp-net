@@ -44,12 +44,27 @@ public sealed class CircuitBuilder
     /// given tick) and a merge function (used when <see cref="InputHandle{T}.Push"/>
     /// is called multiple times between two <see cref="RootCircuit.Step"/> calls).
     /// </summary>
-    public (InputHandle<T> Handle, Stream<T> Stream) Input<T>(T zero, Func<T, T, T> merge)
+    public (InputHandle<T> Handle, Stream<T> Stream) Input<T>(T zero, Func<T, T, T> merge) =>
+        Input(zero, merge, mergeMany: null, name: null);
+
+    /// <summary>
+    /// As <see cref="Input{T}(T, Func{T, T, T})"/>, optionally named, with an optional
+    /// <paramref name="mergeMany"/>: when given, a tick's pushes are queued and merged
+    /// once at commit (equal to folding them with <paramref name="merge"/>).
+    /// </summary>
+    internal (InputHandle<T> Handle, Stream<T> Stream) Input<T>(
+        T zero, Func<T, T, T> merge, Func<IReadOnlyList<T>, T>? mergeMany, string? name)
     {
         ArgumentNullException.ThrowIfNull(merge);
         var stream = new Stream<T>(zero);
-        var handle = new InputHandle<T>(_root, stream, zero, merge);
+        var handle = new InputHandle<T>(_root, stream, zero, merge, mergeMany);
         _root.AddInput(handle);
+        if (name is not null)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(name);
+            _root.RegisterNamedPort(name, handle);
+        }
+
         return (handle, stream);
     }
 

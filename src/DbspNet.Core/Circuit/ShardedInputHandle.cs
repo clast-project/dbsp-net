@@ -76,4 +76,71 @@ public sealed class ShardedInputHandle<TKey, TWeight>
             }
         }
     }
+
+    /// <summary>Below this many rows <see cref="PushRows"/> splits on the calling thread.</summary>
+    public const int ParallelSplitThreshold = 16_384;
+
+    /// <summary>
+    /// Split the rows <c>keys[0..count)</c> (weights alongside) by
+    /// <c>partition(key) % W</c> and queue each shard on its replica — the same
+    /// shards <see cref="Push"/> would queue for those rows built into one Z-set,
+    /// without building it: equal keys share a partition, so each bucket merges its
+    /// own duplicates. Large inputs split across up to <c>W</c> threads: one pass
+    /// over row ranges computes every row's partition, then one thread per replica
+    /// builds that replica's bucket from its rows in input order.
+    /// </summary>
+    public void PushRows(TKey[] keys, TWeight[] weights, int count)
+    {
+        ArgumentNullException.ThrowIfNull(keys);
+        ArgumentNullException.ThrowIfNull(weights);
+        if (count > keys.Length || count > weights.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        var workers = _shards.Length;
+        if (workers == 1 || count < ParallelSplitThreshold)
+        {
+            var b = new ZSetBuilder<TKey, TWeight>(count);
+            for (var i = 0; i < count; i++)
+            {
+                b.Add(keys[i], weights[i]);
+            }
+
+            Push(b.Build());
+            return;
+        }
+
+        var target = new int[count];
+        var options = new ParallelOptions { MaxDegreeOfParallelism = workers };
+        Parallel.ForEach(
+            System.Collections.Concurrent.Partitioner.Create(0, count, Math.Max(4096, count / (workers * 4))),
+            options,
+            range =>
+            {
+                for (var i = range.Item1; i < range.Item2; i++)
+                {
+                    target[i] = ((_partition(keys[i]) % workers) + workers) % workers;
+                }
+            });
+
+        var perBucket = (count / workers) + 1;
+        Parallel.For(0, workers, options, j =>
+        {
+            var b = new ZSetBuilder<TKey, TWeight>(perBucket);
+            for (var i = 0; i < count; i++)
+            {
+                if (target[i] == j)
+                {
+                    b.Add(keys[i], weights[i]);
+                }
+            }
+
+            var shard = b.Build();
+            if (!shard.IsEmpty)
+            {
+                _shards[j].Push(shard);
+            }
+        });
+    }
 }

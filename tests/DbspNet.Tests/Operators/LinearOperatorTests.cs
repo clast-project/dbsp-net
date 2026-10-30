@@ -311,4 +311,36 @@ public class LinearOperatorTests
             return oh!.Current.Equals(z);
         });
     }
+
+    [Fact]
+    public void ZSetInput_ManyPushesInOneTick_DeliverTheirSum()
+    {
+        // A tick's pushes are queued and summed once at commit; the stream must carry
+        // exactly their Z-set sum (cancellations removed), then the empty set on a tick
+        // with no push.
+        Gen.Select(GenZSet.Array[0, 6], Gen.Bool).Sample(t =>
+        {
+            var (parts, named) = t;
+            InputHandle<ZSet<string, Z64>>? ih = null;
+            OutputHandle<ZSet<string, Z64>>? oh = null;
+            var c = RootCircuit.Build(b =>
+            {
+                var (h, s) = named ? b.ZSetInput<string, Z64>("in") : b.ZSetInput<string, Z64>();
+                ih = h;
+                oh = b.Output(s);
+            });
+
+            var expected = ZSet<string, Z64>.Empty;
+            foreach (var part in parts)
+            {
+                ih!.Push(part);
+                expected += part;
+            }
+
+            c.Step();
+            Assert.Equal(expected, oh!.Current);
+            c.Step();
+            Assert.True(oh.Current.IsEmpty);
+        });
+    }
 }

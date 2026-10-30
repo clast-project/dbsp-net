@@ -297,8 +297,10 @@ public static class ArrowExtensions
 
     /// <summary>
     /// Sharded counterpart of <see cref="PushArrow(TableInput, RecordBatch, ReadOnlySpan{long})"/>
-    /// for a parallel program's source table: the same per-column decode, then one push
-    /// that splits the delta across the replicas by whole-row hash. Strings are copied.
+    /// for a parallel program's source table: the same per-column decode (one column per
+    /// thread on a large batch), then <see cref="ShardedTableInput.PushColumns"/>, which
+    /// builds the rows and splits them across the replicas by whole-row hash in parallel.
+    /// Strings are copied.
     /// </summary>
     public static void PushArrow(
         this ShardedTableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
@@ -306,7 +308,31 @@ public static class ArrowExtensions
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(batch);
         ValidateWeights(batch, weights);
-        input.Push(DecodeCore(input.Schema, batch, weights.ToArray(), zeroCopyStrings: false));
+        var schema = input.Schema;
+        if (batch.ColumnCount != schema.Count)
+        {
+            throw new ArgumentException(
+                $"batch arity {batch.ColumnCount} does not match table arity {schema.Count}",
+                nameof(batch));
+        }
+
+        var rowCount = batch.Length;
+        var columns = new object?[schema.Count][];
+        void Extract(int c) =>
+            columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, rowCount, StringDecoding.Transcode);
+        if (rowCount < DbspNet.Core.Circuit.ShardedInputHandle<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64>.ParallelSplitThreshold)
+        {
+            for (var c = 0; c < columns.Length; c++)
+            {
+                Extract(c);
+            }
+        }
+        else
+        {
+            Parallel.For(0, columns.Length, Extract);
+        }
+
+        input.PushColumns(columns, weights.ToArray(), rowCount);
     }
 
     private static void PushArrowCore(
