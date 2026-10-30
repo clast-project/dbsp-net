@@ -42,6 +42,14 @@ snapshot + input WAL, and verified restore. The weakness is *shape and cost*, no
   `ivm-bench-checkpoint-premise-wrong`, `spine-compaction-experiment`, `feldera-source-comparison`,
   `row-repr-arc-kickoff`.
 
+**The sharpest gap: parallel programs cannot checkpoint in deployment.** `ProgramRunner`'s parallel
+`CreateAsync` takes no checkpoint store ("`ICheckpointStore` snapshots a single circuit"), and
+`DbspNetEngine.DeployAsync` therefore *falls back to the serial program* whenever a snapshot dir is
+set ("checkpointing is configured, and only the serial program checkpoints"). So today a durable
+deployment gives up W=12 — batch 1 on CI would go from ~38 s back toward the ~90 s serial number.
+`ParallelSnapshot` exists in Persistence (and parallel restore is shipped), so the missing piece is
+wiring plus a consistent cross-worker checkpoint. This is probably increment 1.
+
 **Code entry points.** `src/DbspNet.Persistence/` (`Snapshot.cs`, `ParallelSnapshot.cs`,
 `WalRecorder.cs`, `ArrowZSetTraceCodec.cs`, `ArrowIndexedZSetTraceCodec.cs`, `SnapshotManifest.cs`,
 `WalManifest.cs`), `src/DbspNet.Connectors.Abstractions/ProgramRunner.cs` (unconditional snapshot at
