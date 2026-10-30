@@ -305,7 +305,7 @@ public static partial class PlanToCircuit
             if (options.StoredOutput)
             {
                 var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-                var integrated = builder.Integrate(queryStream, viewCodec);
+                var integrated = builder.Integrate(queryStream, viewCodec, ViewStore(plan.Schema));
                 queryStream = integrated.Output;
                 view = integrated.View;
             }
@@ -519,7 +519,7 @@ public static partial class PlanToCircuit
                     if (v.IsOutput)
                     {
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
-                        var integrated = builder.Integrate(stream, viewCodec);
+                        var integrated = builder.Integrate(stream, viewCodec, ViewStore(v.Query.Schema));
                         outputs[v.ViewName] = new ProgramOutput(v.Query.Schema, integrated.View);
                     }
                 }
@@ -719,7 +719,7 @@ public static partial class PlanToCircuit
                         // writes, closing the §10.1 restore gap with no driver-side region.
                         // The delta still flows through unchanged for the sharded output.
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
-                        var integrated = builder.Integrate(stream, viewCodec);
+                        var integrated = builder.Integrate(stream, viewCodec, ViewStore(v.Query.Schema));
                         builder.Output(integrated.Output, "view:" + v.ViewName);
 
                         // The build closure runs once per replica, sequentially in worker
@@ -798,6 +798,11 @@ public static partial class PlanToCircuit
     /// the operator's re-shuffle can be elided. Ported verbatim from
     /// <c>TypedPlanCompiler.IsKeySubset</c>.
     /// </summary>
+    // The integrated output view's state: the paged store when DBSPNET_TRACE_STORE=paged
+    // (docs/design-paged-trace-state.md, increment 1), else null — IntegrateOp's own Z-set.
+    private static PagedZSetStore? ViewStore(Schema schema) =>
+        TraceStoreMode.Paged ? PagedZSetStore.For(schema) : null;
+
     private static bool IsKeySubset(int[] sub, int[] super)
     {
         foreach (var c in sub)

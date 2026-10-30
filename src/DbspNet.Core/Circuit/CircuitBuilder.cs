@@ -119,11 +119,22 @@ public sealed class CircuitBuilder
     public (Stream<ZSet<TRow, Z64>> Output, IntegratedViewHandle<TRow> View) Integrate<TRow>(
         Stream<ZSet<TRow, Z64>> input,
         IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        where TRow : notnull =>
+        Integrate(input, snapshotCodec, store: null);
+
+    /// <summary>
+    /// <see cref="Integrate{TRow}(Stream{ZSet{TRow, Z64}}, IZSetTraceCodec{TRow, Z64}?)"/> with the
+    /// integral held in <paramref name="store"/> instead of a Z-set (null keeps the Z-set).
+    /// </summary>
+    internal (Stream<ZSet<TRow, Z64>> Output, IntegratedViewHandle<TRow> View) Integrate<TRow>(
+        Stream<ZSet<TRow, Z64>> input,
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec,
+        IIntegratedViewStore<TRow>? store)
         where TRow : notnull
     {
         ArgumentNullException.ThrowIfNull(input);
         var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
-        var op = new IntegrateOp<TRow>(input, output, snapshotCodec);
+        var op = new IntegrateOp<TRow>(input, output, snapshotCodec, store);
         AddRawOperator(op);
         return (output, new IntegratedViewHandle<TRow>(op));
     }

@@ -29,6 +29,12 @@ public sealed class IntegratedViewHandle<TRow>
     /// <summary>The full view contents after the most recent step.</summary>
     public ZSet<TRow, Z64> Current => _op.View;
 
+    /// <summary>The number of rows in <see cref="Current"/>, without forming it.</summary>
+    public int Count => _op.ViewCount;
+
+    /// <summary>A row's weight in <see cref="Current"/>, without forming it.</summary>
+    public Z64 WeightOf(TRow row) => _op.WeightOf(row);
+
     /// <summary>The change the most recent step applied to the view (its input delta).</summary>
     public ZSet<TRow, Z64> LastDelta => _op.LastDelta;
 }

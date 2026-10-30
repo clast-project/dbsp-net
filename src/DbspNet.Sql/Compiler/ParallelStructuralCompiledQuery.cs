@@ -192,6 +192,11 @@ public sealed class ParallelProgramOutput
     {
         get
         {
+            if (_shards.Count == 1)
+            {
+                return _shards[0].Count;
+            }
+
             var tick = _circuit.TickCount;
             if (_rowCountTick != tick)
             {
@@ -224,7 +229,7 @@ public sealed class ParallelProgramOutput
             var after = 0L;
             foreach (var shard in _shards)
             {
-                after += shard.Current.WeightOf(row).Value;
+                after += shard.WeightOf(row).Value;
             }
 
             if (after != 0)

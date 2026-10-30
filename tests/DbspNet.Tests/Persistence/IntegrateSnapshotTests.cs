@@ -98,4 +98,77 @@ public class IntegrateSnapshotTests : IDisposable
         await Assert.ThrowsAsync<NotSupportedException>(async () =>
             await Snapshot.WriteAsync(query.Circuit, _snapshotDir));
     }
+
+    [Fact]
+    public async Task PagedViewStore_WritesTheSameSnapshotBytes_AndRestoresEitherWay()
+    {
+        // docs/design-paged-trace-state.md §7: the paged store saves through the same codec in
+        // the same row order, so a snapshot from either representation restores into either.
+        async Task<(string Dir, CompiledQuery Query)> Run(bool paged, string name)
+        {
+            var dir = Path.Combine(_snapshotDir, name);
+            var previous = TraceStoreMode.Paged;
+            TraceStoreMode.Paged = paged;
+            try
+            {
+                var q = Compile(ArrowSqlSnapshotCodecs.Instance);
+                for (var i = 0; i < 50; i++)
+                {
+                    q.Table("t").Insert(i, i + 1);
+                }
+
+                q.Step();
+                for (var i = 0; i < 50; i += 3)
+                {
+                    q.Table("t").Delete(i, i + 1);
+                }
+
+                q.Table("t").Insert(100, 7);
+                q.Step();
+                await Snapshot.WriteAsync(q.Circuit, dir);
+                return (dir, q);
+            }
+            finally
+            {
+                TraceStoreMode.Paged = previous;
+            }
+        }
+
+        var (boxedDir, boxed) = await Run(paged: false, "boxed");
+        var (pagedDir, paged) = await Run(paged: true, "paged");
+        Assert.True(boxed.CurrentView.Equals(paged.CurrentView));
+
+        var boxedFiles = Directory.GetFiles(boxedDir, "*", SearchOption.AllDirectories)
+            .Select(f => Path.GetRelativePath(boxedDir, f)).Order(StringComparer.Ordinal).ToList();
+        var pagedFiles = Directory.GetFiles(pagedDir, "*", SearchOption.AllDirectories)
+            .Select(f => Path.GetRelativePath(pagedDir, f)).Order(StringComparer.Ordinal).ToList();
+        Assert.Equal(boxedFiles, pagedFiles);
+        Assert.Contains(boxedFiles, f => f.EndsWith("view.arrows", StringComparison.Ordinal));
+        foreach (var f in boxedFiles.Where(f => f.EndsWith("view.arrows", StringComparison.Ordinal)))
+        {
+            Assert.Equal(File.ReadAllBytes(Path.Combine(boxedDir, f)), File.ReadAllBytes(Path.Combine(pagedDir, f)));
+        }
+
+        foreach (var (dir, intoPaged) in new[] { (boxedDir, true), (pagedDir, false) })
+        {
+            var previous = TraceStoreMode.Paged;
+            TraceStoreMode.Paged = intoPaged;
+            try
+            {
+                var restored = Compile(ArrowSqlSnapshotCodecs.Instance);
+                await Snapshot.ReadAsync(restored.Circuit, dir);
+                restored.Table("t").Delete(1, 2);
+                restored.Step();
+                boxed.Table("t").Delete(1, 2);
+                boxed.Step();
+                Assert.True(restored.CurrentView.Equals(boxed.CurrentView));
+                boxed.Table("t").Insert(1, 2);
+                boxed.Step();
+            }
+            finally
+            {
+                TraceStoreMode.Paged = previous;
+            }
+        }
+    }
 }
