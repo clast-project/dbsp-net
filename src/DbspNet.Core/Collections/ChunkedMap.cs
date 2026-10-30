@@ -106,6 +106,20 @@ internal sealed class ChunkedMap<TKey, TValue> : IEnumerable<KeyValuePair<TKey, 
         }
     }
 
+    public IEnumerable<TValue> Values
+    {
+        get
+        {
+            for (var i = 0; i < _count; i++)
+            {
+                if (EntryAt(i).Next >= -1)
+                {
+                    yield return EntryAt(i).Value;
+                }
+            }
+        }
+    }
+
     public TValue this[TKey key]
     {
         set => Insert(key, value);
@@ -479,6 +493,93 @@ internal sealed class ChunkedMap<TKey, TValue> : IEnumerable<KeyValuePair<TKey, 
         public readonly void Dispose()
         {
         }
+
+        void IEnumerator.Reset() => throw new NotSupportedException();
+    }
+}
+
+/// <summary>
+/// A view over a map store that is either a <see cref="Dictionary{TKey,TValue}"/> or a
+/// <see cref="ChunkedMap{TKey,TValue}"/> — so a type that keeps one <c>object</c> store field (one
+/// field, so it is no bigger than before) can use either through the same calls.
+/// </summary>
+internal readonly struct MapView<TKey, TValue>
+    where TKey : notnull
+{
+    private readonly object _store;
+
+    public MapView(object store)
+    {
+        _store = store;
+    }
+
+    private Dictionary<TKey, TValue>? Dict =>
+        _store.GetType() == typeof(Dictionary<TKey, TValue>) ? Unsafe.As<Dictionary<TKey, TValue>>(_store) : null;
+
+    private ChunkedMap<TKey, TValue> Chunked => Unsafe.As<ChunkedMap<TKey, TValue>>(_store);
+
+    public int Count => Dict is { } d ? d.Count : Chunked.Count;
+
+    public IEnumerable<TKey> Keys => Dict is { } d ? d.Keys : Chunked.Keys;
+
+    public IEnumerable<TValue> Values => Dict is { } d ? d.Values : Chunked.Values;
+
+    // A method, not an indexer: an indexer setter on a struct returned from a property is CS1612.
+    public void Set(TKey key, TValue value)
+    {
+        if (Dict is { } d)
+        {
+            d[key] = value;
+        }
+        else
+        {
+            Chunked[key] = value;
+        }
+    }
+
+    /// <summary>A fresh, empty store of the configured kind.</summary>
+    public static object NewStore(int capacity = 0) =>
+        ZSetMapMode.Chunked ? new ChunkedMap<TKey, TValue>(capacity) : new Dictionary<TKey, TValue>(capacity);
+
+    public bool TryGetValue(TKey key, out TValue value) =>
+        Dict is { } d ? d.TryGetValue(key, out value!) : Chunked.TryGetValue(key, out value);
+
+    public bool ContainsKey(TKey key) => Dict is { } d ? d.ContainsKey(key) : Chunked.ContainsKey(key);
+
+    public bool Remove(TKey key) => Dict is { } d ? d.Remove(key) : Chunked.Remove(key);
+
+    public Enumerator GetEnumerator() => new(_store);
+
+    /// <summary>Either map's struct enumerator.</summary>
+    public struct Enumerator : IEnumerator<KeyValuePair<TKey, TValue>>
+    {
+        private readonly bool _isChunked;
+        private Dictionary<TKey, TValue>.Enumerator _dictionary;
+        private ChunkedMap<TKey, TValue>.Enumerator _chunked;
+
+        internal Enumerator(object store)
+        {
+            if (store.GetType() == typeof(Dictionary<TKey, TValue>))
+            {
+                _isChunked = false;
+                _dictionary = Unsafe.As<Dictionary<TKey, TValue>>(store).GetEnumerator();
+                _chunked = default;
+            }
+            else
+            {
+                _isChunked = true;
+                _dictionary = default;
+                _chunked = Unsafe.As<ChunkedMap<TKey, TValue>>(store).GetEnumerator();
+            }
+        }
+
+        public readonly KeyValuePair<TKey, TValue> Current => _isChunked ? _chunked.Current : _dictionary.Current;
+
+        readonly object IEnumerator.Current => Current;
+
+        public bool MoveNext() => _isChunked ? _chunked.MoveNext() : _dictionary.MoveNext();
+
+        public void Dispose() => _dictionary.Dispose();
 
         void IEnumerator.Reset() => throw new NotSupportedException();
     }

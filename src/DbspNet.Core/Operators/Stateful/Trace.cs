@@ -71,7 +71,7 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight>
 
     private static IndexedZSet<TKey, TValue, TWeight> NewState()
     {
-        var z = new IndexedZSet<TKey, TValue, TWeight>(new Dictionary<TKey, ZSet<TValue, TWeight>>());
+        var z = IndexedZSet<TKey, TValue, TWeight>.NewMutable();
         if (TraceAccessProfile.Enabled)
         {
             z.MarkTraceState();
