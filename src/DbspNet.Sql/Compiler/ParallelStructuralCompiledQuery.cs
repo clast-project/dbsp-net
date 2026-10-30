@@ -108,7 +108,14 @@ public sealed class ParallelCompiledProgram : IDisposable
     /// are integrated in-circuit, per replica (§10.4), so there is no driver-side
     /// per-tick view work here.
     /// </summary>
-    public void Step() => Circuit.Step();
+    public void Step()
+    {
+        Circuit.Step();
+        foreach (var output in Outputs.Values)
+        {
+            output.AfterStep();
+        }
+    }
 
     public void Dispose() => Circuit.Dispose();
 }
@@ -139,6 +146,10 @@ public sealed class ParallelProgramOutput
     private readonly ParallelCircuit _circuit;
     private ZSet<StructuralRow, Z64>? _cached;
     private long _cachedTick = -1;
+    private ZSet<StructuralRow, Z64>? _cachedDelta;
+    private long _cachedDeltaTick = -1;
+    private long _rowCount;
+    private long _rowCountTick = -1;
 
     internal ParallelProgramOutput(
         Schema schema,
@@ -154,8 +165,82 @@ public sealed class ParallelProgramOutput
 
     public Schema Schema { get; }
 
-    /// <summary>This tick's gathered output delta (summed across workers).</summary>
-    public ZSet<StructuralRow, Z64> CurrentDelta => _delta.Current;
+    /// <summary>This tick's gathered output delta (summed across workers; cached per tick).</summary>
+    public ZSet<StructuralRow, Z64> CurrentDelta
+    {
+        get
+        {
+            var tick = _circuit.TickCount;
+            if (_cachedDelta is null || _cachedDeltaTick != tick)
+            {
+                _cachedDelta = _delta.Current;
+                _cachedDeltaTick = tick;
+            }
+
+            return _cachedDelta;
+        }
+    }
+
+    /// <summary>
+    /// The number of distinct rows in <see cref="CurrentView"/>, without forming it on
+    /// every tick. The first read counts the formed view; from then on
+    /// <see cref="ParallelCompiledProgram.Step"/> keeps the count current from each tick's
+    /// delta — O(|delta| · W) lookups in the shard integrals instead of an O(|view|) sum
+    /// per read. A program nobody asks for counts pays nothing.
+    /// </summary>
+    public long RowCount
+    {
+        get
+        {
+            var tick = _circuit.TickCount;
+            if (_rowCountTick != tick)
+            {
+                _rowCount = CurrentView.Count;
+                _rowCountTick = tick;
+            }
+
+            return _rowCount;
+        }
+    }
+
+    /// <summary>
+    /// Advance <see cref="RowCount"/> past the tick just stepped: each row the delta
+    /// touched entered the view if its summed weight is now non-zero and was zero before
+    /// (<c>after - delta</c>), and left it in the opposite case. Skipped until the count is
+    /// first read, and when it is stale (a tick was missed), which leaves the next read to
+    /// recount; at <c>W == 1</c> the read is already O(1).
+    /// </summary>
+    internal void AfterStep()
+    {
+        var tick = _circuit.TickCount;
+        if (_shards.Count == 1 || _rowCountTick < 0 || _rowCountTick != tick - 1)
+        {
+            return;
+        }
+
+        var count = _rowCount;
+        foreach (var (row, delta) in CurrentDelta)
+        {
+            var after = 0L;
+            foreach (var shard in _shards)
+            {
+                after += shard.Current.WeightOf(row).Value;
+            }
+
+            if (after != 0)
+            {
+                count++;
+            }
+
+            if (after - delta.Value != 0)
+            {
+                count--;
+            }
+        }
+
+        _rowCount = count;
+        _rowCountTick = tick;
+    }
 
     /// <summary>The full current view contents (valid until the next
     /// <see cref="ParallelCompiledProgram.Step"/>).</summary>
@@ -231,6 +316,72 @@ public sealed class ShardedTableInput
         }
 
         _handle.Push(b.Build());
+    }
+
+    /// <summary>
+    /// Push <paramref name="rowCount"/> rows given column-major (<c>columns[c][i]</c> is
+    /// row <c>i</c>'s column <c>c</c>, boundary-typed as <see cref="Push"/> takes them),
+    /// with <paramref name="weights"/> (all 1 when null; weight-0 rows are dropped). Same
+    /// result as <see cref="Push"/>, but a large batch builds its rows and splits them
+    /// across the replicas on up to <see cref="ParallelCompiledProgram.Workers"/> threads
+    /// rather than on the caller's (the bulk-load ingest path).
+    /// </summary>
+    public void PushColumns(object?[][] columns, long[]? weights, int rowCount)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        if (columns.Length != Schema.Count)
+        {
+            throw new ArgumentException(
+                $"column count {columns.Length} does not match schema arity {Schema.Count}", nameof(columns));
+        }
+
+        // Source row of every pushed row: all of them unless some weight is zero.
+        int[]? source = null;
+        var count = rowCount;
+        if (weights is not null && Array.IndexOf(weights, 0L, 0, rowCount) >= 0)
+        {
+            source = new int[rowCount];
+            count = 0;
+            for (var i = 0; i < rowCount; i++)
+            {
+                if (weights[i] != 0)
+                {
+                    source[count++] = i;
+                }
+            }
+        }
+
+        var keys = new StructuralRow[count];
+        var zs = new Z64[count];
+        void Build(int from, int to)
+        {
+            for (var k = from; k < to; k++)
+            {
+                var i = source is null ? k : source[k];
+                var values = new object?[columns.Length];
+                for (var c = 0; c < values.Length; c++)
+                {
+                    values[c] = columns[c][i];
+                }
+
+                keys[k] = _codec.BuildRow(Schema, BoundaryEncoder.Encode(Schema, values));
+                zs[k] = new Z64(weights is null ? 1 : weights[i]);
+            }
+        }
+
+        if (_handle.Workers == 1 || count < ShardedInputHandle<StructuralRow, Z64>.ParallelSplitThreshold)
+        {
+            Build(0, count);
+        }
+        else
+        {
+            Parallel.ForEach(
+                System.Collections.Concurrent.Partitioner.Create(0, count, Math.Max(4096, count / (_handle.Workers * 4))),
+                new ParallelOptions { MaxDegreeOfParallelism = _handle.Workers },
+                range => Build(range.Item1, range.Item2));
+        }
+
+        _handle.PushRows(keys, zs, count);
     }
 
     private void PushSingle(object?[] values, long weight)

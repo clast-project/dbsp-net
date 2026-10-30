@@ -100,10 +100,10 @@ internal abstract class RunnerProgram
 
         public override void Step() => program.Step();
 
-        // Forms each view as the sum of its W replica integrals (cached per tick), so this
-        // is O(|view|) per view on a tick whose view nobody has read yet.
+        // Kept current per tick from the deltas once first read (ParallelProgramOutput.RowCount),
+        // not formed from the W replica integrals on every read.
         public override IEnumerable<KeyValuePair<string, long>> ViewRowCounts() =>
-            program.Outputs.Select(kv => KeyValuePair.Create(kv.Key, (long)kv.Value.CurrentView.Count));
+            program.Outputs.Select(kv => KeyValuePair.Create(kv.Key, kv.Value.RowCount));
 
         public override bool ProfileOperators
         {

@@ -212,6 +212,15 @@ public class ParallelOuterSemiJoinTests
                             + $"serial:   {string.Join(", ", expected.OrderBy(kv => kv.Key).Select(kv => $"[{kv.Key}]x{kv.Value}"))}\n"
                             + $"parallel: {string.Join(", ", actual.OrderBy(kv => kv.Key).Select(kv => $"[{kv.Key}]x{kv.Value}"))}");
                     }
+
+                    // The delta-maintained row count, first read at a seed-dependent tick
+                    // (before it the count is untracked), then advanced by every Step.
+                    if (t >= seed % 3)
+                    {
+                        Assert.True(
+                            s.CurrentView.Count == p.RowCount,
+                            $"view {name}, W={workers}, seed={seed}, tick {t}: RowCount {p.RowCount} != {s.CurrentView.Count}");
+                    }
                 }
             }
         }
