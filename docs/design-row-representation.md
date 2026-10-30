@@ -3969,7 +3969,7 @@ be silently withdrawn by inlining changes, which is exactly how §25.3's bimodal
 that holds under this knob is one you can trust across runtime upgrades.
 
 ---
-## 27. Row-representation arc, phase 0 — the batch-1 GC pause does not follow surviving bytes (MEASURED, gate FAILED, STOP)
+## 27. Row-representation arc, phase 0 — the batch-1 GC pause does not follow surviving bytes (MEASURED, gate FAILED for row forms; §27.6 finds the real lever)
 
 Branch `arc/row-repr`. The arc (docs/next-arc-row-representation-prompt.md) aimed to cut the
 bytes that survive ivm-bench batch 1, on the premise (state-representation §9.15) that the
@@ -4054,6 +4054,50 @@ is never card-scanned, which would favour reference-free trace containers on a *
 metric than the one sized here; (b) GC thread stragglers on the 4 efficiency cores; (c)
 suspension — "suspension only" pauses are 0.3 s at W=1, 0.6–0.75 s at W=8. A native trace
 (PerfView/`dotnet-trace` GC phase events, or a GC with `GCLogEnabled`) would split (a)/(b).
+
+### 27.6 Native GC trace — the pause is card scanning of the large trace hash tables
+
+macOS `sample` on the W=8 test host for all of batch 1 (2 ms interval; libcoreclr keeps its
+local symbols, so GC phases resolve), attributed by `scripts/gc-phases.py`. Share of all
+Server-GC-thread samples taken inside a GC (37k samples; sampling inflated the pause 6.3 →
+7.8 s, proportions are what count):
+
+| GC work | share |
+|---|---|
+| **mark through cards of large-object-heap objects** | **25.3%** |
+| **relocate (pointer update) through the same LOH cards** | **22.5%** |
+| relocate references inside survivors | 21.6% |
+| plan | 7.3% |
+| compact (the actual copy) | **5.8%** |
+| mark / relocate through small-object-heap cards | 4.5% |
+| join / wait (heap imbalance) | ~11% |
+| stack roots, handles, suspension | <1% |
+
+So **~48% of the young pause is scanning the dirty cards of LOH arrays, twice per GC**, and
+copying is under 6% — which is why padding rows (§27.3) did not move it. Which LOH objects
+(`IVM_HEAP_CENSUS`, objects ≥ 85,000 B, W=8 after batch 1): only **617 arrays, 0.89 GB, 0.77 GB
+of them holding references** — the big trace dictionaries: flat traces'
+`Entry<StructuralRow,Z64>[]` 0.33 GB, indexed traces' outer `Entry<StructuralRow,ZSet>[]` 0.19 GB,
+window `Entry<Object,List<RowAddress>>[]` 0.10 GB, TOP-K / min-max state 0.13 GB (`Int32[]`
+buckets 0.12 GB are reference-free and never scanned).
+
+Mechanism: a bulk load inserts millions of new (gen0) rows into these old tables at
+hash-random positions, so each insert dirties its own 256-byte card, and a card stays set as long
+as it points at an ephemeral (gen0 *or* gen1) row. Every young GC therefore re-scans most of the
+~3M cards of 0.77 GB of tables, in mark and again in relocate. The cost scales with the size and
+reference density of the big tables × the number of young GCs, not with row bytes — consistent
+with every invariance seen (row padding, gen0 budget, heap count).
+
+**What this points at (not built; for Curt).** The lever is *references from large old
+containers to young rows*, not row size. Ceiling: ~48% of a ~6 s W=8 young pause ≈ **2.9 s**,
+above the ~1.5 s gate. Shapes that remove it: (1) reference-free hash arrays — the table's
+`Entry` holds an `int` row index, the rows (or their references) live in an append-only paged
+array, so new references land densely (32 per card) in the newest pages only and the
+multi-hundred-MB `Entry[]` is never card-scanned; (2) the same split for the indexed traces'
+outer group map. FlatHash (§10.C) appended its slots but kept the row references inside the
+hash structs and was judged on Nexmark W=1 pause; it was never measured on this metric. A
+synthetic probe — big `Dictionary<row,weight>` with random inserts vs. index + paged row array,
+on a growing heap — would size (1) before any engine change.
 
 ## Appendix — sources
 

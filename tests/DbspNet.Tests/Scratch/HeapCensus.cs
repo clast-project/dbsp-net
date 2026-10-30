@@ -38,6 +38,18 @@ internal static class HeapCensus
         {
             yield return line;
         }
+
+        // Large-object-heap objects (>= 85,000 bytes): a young GC scans their dirty cards in both
+        // mark and relocate, so what matters is which of them hold references.
+        yield return string.Create(
+            CultureInfo.InvariantCulture,
+            $"CENSUS loh objects={w.Loh.Values.Sum(v => v.Objects)} bytes={w.Loh.Values.Sum(v => v.Bytes)} with_refs={w.Loh.Where(kv => HasRefs(kv.Key.GetElementType() ?? kv.Key)).Sum(kv => kv.Value.Bytes)}");
+        foreach (var (t, v) in w.Loh.OrderByDescending(kv => kv.Value.Bytes).Take(top))
+        {
+            yield return string.Create(
+                CultureInfo.InvariantCulture,
+                $"CENSUS loh type {Name(t),-60} objects={v.Objects,8} bytes={v.Bytes,14} refs={HasRefs(t.GetElementType() ?? t)}");
+        }
     }
 
     /// <summary>The rows the traces hold: sharing factor, bytes by type, bytes by trace.</summary>
@@ -202,6 +214,8 @@ internal static class HeapCensus
 
         public long TotalObjects { get; private set; }
 
+        public Dictionary<Type, (long Objects, long Bytes)> Loh { get; } = new();
+
         public void Visit(object root, int owner)
         {
             Push(root);
@@ -308,6 +322,12 @@ internal static class HeapCensus
             TotalObjects++;
             _byType.TryGetValue(t, out var e);
             _byType[t] = (e.Objects + 1, e.Bytes + size, e.InRefs);
+            if (size >= 85_000)
+            {
+                Loh.TryGetValue(t, out var l);
+                Loh[t] = (l.Objects + 1, l.Bytes + size);
+            }
+
             if (!Skip(t))
             {
                 _stack.Push(x);
