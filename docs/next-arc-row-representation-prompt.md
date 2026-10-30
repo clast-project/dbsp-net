@@ -96,7 +96,7 @@ smallest increment that the gate instruments can see. Propose, then wait for Cur
 - `TraceLayoutGcProbe` (`TRACE_LAYOUT_PROBE=rows|indexed|flat|rows-paged|flat-paged`).
 
 **Measurement rules (learned the hard way):** always `DOTNET_gcServer=1` (the server is
-`Sdk.Web`; workstation GC made W=8 look 1.3×); run under `caffeinate -i`; serialize runs
+`Sdk.Web`; workstation GC made W=8 look 1.3×); system sleep is off (`pmset sleep 0`) — if a run shows a lone slow segment, check `pmset -g`; serialize runs
 (never two measurements at once); wall-clock needs ≥5 alternating runs per arm (±15% noise) —
 prefer deterministic measures (live bytes, allocation, B/ev); this Mac has 4 efficiency
 cores, so W=12 locally is slower than W=8 and says nothing about the CI box.
