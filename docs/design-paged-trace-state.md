@@ -376,3 +376,32 @@ is overwhelmingly the per-tick deltas. Next decisions: whether a process-wide ru
 acceptable to ship (runtimeconfig `System.GC.LOHThreshold`; needs a threshold sweep — the 128 MB
 point is arbitrary — and Nexmark/other benchmarks under it), or whether to engineer delta
 containers that stay under 85,000 B per array (chunked Z-sets), which the setting now prices.
+
+### 13.1 Threshold sweep and Nexmark (2026-10-30)
+
+**Sweep**, ivm-bench SF=3 batch 1, W=8, 5 alternating runs per arm, digests identical in all:
+
+| `GCLOHThreshold` | drain | young pause | background gen2s | peak heap after a GC |
+|---|---|---|---|---|
+| default (85,000 B) | 18.37 s (sd 0.78) | 6.44 s | 7–10 | 19.5 GB |
+| 1 MB | 17.94 s | 5.71 s | 5–6 | 18.3 GB |
+| 4 MB | 20.13 s (sd 1.25) | 5.49 s | 1–2 | 15.0 GB |
+| **16 MB** | **15.73 s** (sd 0.49) | **5.26 s** | **0** | **14.9 GB** |
+| 128 MB | 15.73 s | 5.41 s | 0 | 15.0 GB |
+
+16 MB takes the whole gain; 128 MB adds nothing. Peak heap *falls* ~4.6 GB (dead LOH arrays no
+longer pile up waiting for a background gen2). 4 MB is the odd point — better pause, worse drain;
+one or two background gen2s still run there, timing unexplained — a reason not to sit at the edge.
+
+**Nexmark** (`nexmark 1000000 10000 3 8`, the benchmark's own Server GC config, default 85,000 B vs
+16 MB, 3 alternating processes per arm, median of the three per-process medians, events/s ratio):
+
+| | q0 | q1 | q2 | q3 | q4 | q9 | q5 | q7 | q8 | q12 | q15 | q16 | q17 | q18 | q19 | q20 | q22 | geomean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| W=1 | 1.08 | 1.19 | 1.09 | 0.99 | 1.07 | 1.09 | 1.18 | 1.15 | 1.01 | 1.07 | 1.10 | 1.12 | 1.11 | 1.11 | 1.13 | 1.20 | 1.06 | **1.10** |
+| W=8 | 1.21 | 1.13 | 1.02 | 0.99 | 1.06 | 1.21 | 2.58 | — | 0.90 | 1.07 | 1.18 | 1.20 | 1.50 | 1.37 | 1.09 | 1.08 | 1.25 | **1.20** |
+
+Every query but q3 (flat) and q8 at W=8 (0.90, inside its 1.31× spread) moves the same way. A
+10,000-event batch makes ~240 KB delta dictionaries, so Nexmark's deltas were on the LOH too. Single
+queries at W=8 swing a lot on this box (spreads up to 2.7×), so read the per-query W=8 cells as
+direction; the W=1 row and both geomeans are the result.
