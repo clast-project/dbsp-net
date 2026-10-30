@@ -13,6 +13,12 @@
 //   IVM_TYPE_VIEWS    (optional) 1 = serial program tries the typed fast path per view
 //   IVM_PAUSE_DIR     (optional) after batch 1, write <dir>/pid and wait for <dir>/go — so a
 //                     heap dump (dotnet-gcdump collect -p <pid>) sees batch 1's retained state
+//   IVM_SNAPSHOT_DIR  (optional) checkpoint after every batch through SnapshotCheckpointStore
+//                     (serial or, with IVM_WORKERS, the one-commit parallel snapshot), timed as
+//                     checkpoint_ms; then restore the last one into a fresh program, timed as
+//                     restore_ms, and check its view row counts. Wiped at start. Compiles with
+//                     snapshot codecs, which turn off shared arrangements, so compare drain_ms
+//                     only against another run with this set.
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -59,18 +65,34 @@ public class IvmMultiBatch
 
         RewindPendingCommits(stagingRoot);
 
+        var snapshotDir = Environment.GetEnvironmentVariable("IVM_SNAPSHOT_DIR");
+        var codecs = string.IsNullOrEmpty(snapshotDir) ? null : DbspNet.Persistence.ArrowSqlSnapshotCodecs.Instance;
+        SnapshotCheckpointStore? store = null;
+        if (codecs is not null)
+        {
+            if (Directory.Exists(snapshotDir))
+            {
+                Directory.Delete(snapshotDir, recursive: true);
+            }
+
+            Directory.CreateDirectory(snapshotDir!);
+            store = new SnapshotCheckpointStore(new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!));
+        }
+
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         var workers = int.TryParse(Environment.GetEnvironmentVariable("IVM_WORKERS"), out var w) ? w : 1;
-        ParallelCompiledProgram? parallel = null;
-        if (workers > 1)
+        ParallelCompiledProgram? CompileParallel()
         {
             Assert.True(
                 SqlProgram.TryCompileParallel(
-                    spec.Program, outputViews, workers, out parallel,
+                    spec.Program, outputViews, workers, out var compiled, codecs,
                     numericStringCoercion: true, nullCollation: NullCollation.Low),
                 "parallel compile refused the program");
+            return compiled;
         }
+
+        var parallel = workers > 1 ? CompileParallel() : null;
 
         string InUri(string uri)
         {
@@ -80,9 +102,10 @@ public class IvmMultiBatch
                 : Path.Combine(dataRoot, rel);
         }
 
-        var inputs = spec.Inputs
+        List<IInputConnector> Inputs() => spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))
             .ToList();
+        var inputs = Inputs();
         var outputs = spec.Output_Bindings
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
             .ToList();
@@ -90,10 +113,8 @@ public class IvmMultiBatch
         using var gcEvents = Environment.GetEnvironmentVariable("IVM_GC_EVENTS") == "1" ? new GcPauseListener() : null;
 
         var runner = parallel is not null
-            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs)
-            : await ProgramRunner.CreateAsync(
-                CompileSerial(),
-                inputs, outputs);
+            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, store)
+            : await ProgramRunner.CreateAsync(CompileSerial(), inputs, outputs, store);
 
         // IVM_TYPE_VIEWS=1 (serial only): each view tries the typed fast path, structural
         // fallback elsewhere (design-row-representation §23). That path disables single-use
@@ -102,7 +123,7 @@ public class IvmMultiBatch
         {
             var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") == "1";
             var compiled = SqlProgram.Compile(
-                spec.Program, outputViews, options: new CompileOptions { TypeEligibleProgramViews = typeViews },
+                spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews },
                 numericStringCoercion: true, nullCollation: NullCollation.Low);
             if (typeViews)
             {
@@ -222,6 +243,20 @@ public class IvmMultiBatch
                 }
             }
 
+            // The checkpoint the server would write at the end of this batch (RunBatchAsync under
+            // DBSPNET_PROFILE has already written it, so this is then a no-op).
+            double checkpointMs = 0;
+            double snapshotMb = 0;
+            if (store is not null)
+            {
+                var k0 = Stopwatch.GetTimestamp();
+                await runner.CheckpointAsync();
+                checkpointMs = Stopwatch.GetElapsedTime(k0).TotalMilliseconds;
+                var current = File.ReadAllText(Path.Combine(snapshotDir!, "current.txt")).Trim();
+                snapshotMb = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
+                    .Sum(f => new FileInfo(f).Length) / (1024.0 * 1024.0);
+            }
+
             // What the server's /wait reports after every batch.
             var c0 = Stopwatch.GetTimestamp();
             var viewRows = runner.ViewRowCounts().Sum(kv => kv.Value);
@@ -229,7 +264,35 @@ public class IvmMultiBatch
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1}"));
+                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1}")
+                + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1}")));
+        }
+
+        if (store is not null)
+        {
+            // Restart: drop the producer, then restore its last checkpoint into a fresh program at
+            // the same W (the deploy path's RestoreAsync), and check every view came back.
+            var expected = runner.ViewRowCounts().OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+            var producerTick = runner.TickCount;
+            parallel?.Dispose();
+            parallel = null;
+            runner = null!;
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+
+            using var restoredParallel = workers > 1 ? CompileParallel() : null;
+            var restored = restoredParallel is not null
+                ? await ProgramRunner.CreateAsync(restoredParallel, Inputs(), [], store)
+                : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), [], store);
+            var r0 = Stopwatch.GetTimestamp();
+            var restoredTick = await restored.RestoreAsync();
+            var restoreMs = Stopwatch.GetElapsedTime(r0).TotalMilliseconds;
+            var actual = restored.ViewRowCounts().OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+            var match = restoredTick == producerTick && expected.SequenceEqual(actual);
+            _out.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"RESTORE workers={workers} tick={restoredTick} restore_ms={restoreMs:F0} view_rows_match={match}"));
+            Assert.True(match, "restored view row counts differ from the producer's");
         }
 
         foreach (var o in outputs)
