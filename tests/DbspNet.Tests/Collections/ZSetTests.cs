@@ -198,4 +198,76 @@ public class ZSetTests
         var b = ZSet.FromEntries(new[] { ("y", new Z64(2)), ("x", new Z64(1)) });
         Assert.Equal(a.ToString(), b.ToString());
     }
+
+    // A key and a weight, the weight possibly zero (a Singleton of zero is empty).
+    private static readonly Gen<(string Key, Z64 Weight)> GenEntry =
+        Gen.Select(Gen.OneOfConst("a", "b", "c", "d"), GenWeight);
+
+    [Fact]
+    public void InlineGroups_MergeAndReadLikeADictionary()
+    {
+        // A group born inline (Singleton, or Clone of a one-entry set — how an indexed
+        // trace stores a new key) then merged with arbitrary deltas must behave exactly
+        // like a dictionary-backed set built from the same entries, in every operation.
+        Gen.Select(GenEntry, GenZSet.Array[0, 6], Gen.Bool).Sample(t =>
+        {
+            var (first, deltas, viaClone) = t;
+            // Singleton of a zero weight is the shared Empty, never merged into in place.
+            var group = viaClone || first.Weight.Value == 0
+                ? ZSet.FromEntries(new[] { first }).Clone()
+                : ZSet.Singleton(first.Key, first.Weight);
+            var reference = new Dictionary<string, long>();
+            void Fold(string k, long w)
+            {
+                var v = reference.GetValueOrDefault(k) + w;
+                if (v == 0) reference.Remove(k);
+                else reference[k] = v;
+            }
+
+            Fold(first.Key, first.Weight.Value);
+            AssertSame(reference, group);
+            foreach (var delta in deltas)
+            {
+                group.MergeInPlace(delta);
+                foreach (var (k, w) in delta)
+                {
+                    Fold(k, w.Value);
+                }
+
+                AssertSame(reference, group);
+            }
+
+            var dictionaryBacked = ZSet.FromEntries(reference.Select(kv => (kv.Key, new Z64(kv.Value))));
+            Assert.True(group.Equals(dictionaryBacked) && dictionaryBacked.Equals(group));
+            Assert.Equal(dictionaryBacked.GetHashCode(), group.GetHashCode());
+            Assert.Equal(dictionaryBacked.ToString(), group.ToString());
+            foreach (var other in deltas)
+            {
+                Assert.Equal(dictionaryBacked + other, group + other);
+                Assert.Equal(other + dictionaryBacked, other + group);
+                Assert.Equal(dictionaryBacked - other, group - other);
+            }
+
+            Assert.Equal(-dictionaryBacked, -group);
+            Assert.Equal(dictionaryBacked.Clone(), group.Clone());
+            var removed = group.RemoveKeysBelow(1, k => k[0] - 'a');
+            Assert.Equal(reference.ContainsKey("a") ? 1 : 0, removed);
+            Assert.False(group.Contains("a"));
+        });
+    }
+
+    private static void AssertSame(Dictionary<string, long> reference, ZSet<string, Z64> set)
+    {
+        Assert.Equal(reference.Count, set.Count);
+        Assert.Equal(reference.Count == 0, set.IsEmpty);
+        Assert.Equal(reference.Values.Sum(), set.SumWeights().Value);
+        Assert.Equal(reference.OrderBy(kv => kv.Key), set.Select(kv => KeyValuePair.Create(kv.Key, kv.Value.Value)).OrderBy(kv => kv.Key));
+        foreach (var k in new[] { "a", "b", "c", "d" })
+        {
+            Assert.Equal(reference.GetValueOrDefault(k), set.WeightOf(k).Value);
+            Assert.Equal(reference.ContainsKey(k), set.Contains(k));
+        }
+
+        Assert.Equal(reference.Keys.OrderBy(k => k), set.Keys.OrderBy(k => k));
+    }
 }

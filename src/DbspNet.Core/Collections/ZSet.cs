@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections;
+using System.Runtime.CompilerServices;
 using DbspNet.Core.Algebra;
 
 namespace DbspNet.Core.Collections;
@@ -15,25 +16,56 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
-    private readonly Dictionary<TKey, TWeight> _entries;
+    // A Dictionary, or an InlineEntry holding at most one entry (a zero Weight means empty,
+    // per the zero-is-absent invariant). Inline exists for the per-key groups of indexed
+    // traces, most of which hold one row: a one-entry dictionary costs the group four
+    // objects (Z-set, dictionary, buckets, entries) where inline costs two, and a bulk load
+    // retains millions of them. One field either way, so a dictionary-backed Z-set (every
+    // delta) is no bigger than before; telling them apart is an exact type check against a
+    // sealed class.
+    private object _store;
+
+    private sealed class InlineEntry(TKey key, TWeight weight)
+    {
+        public TKey Key = key;
+        public TWeight Weight = weight;
+    }
 
     // Ctor takes ownership; callers must not retain a reference to the dict.
     internal ZSet(Dictionary<TKey, TWeight> entries)
     {
-        _entries = entries;
+        _store = entries;
     }
+
+    private ZSet(TKey key, TWeight weight)
+    {
+        _store = new InlineEntry(key, weight);
+    }
+
+    /// <summary>The backing dictionary, or null when inline.</summary>
+    private Dictionary<TKey, TWeight>? Dict =>
+        _store is InlineEntry ? null : Unsafe.As<Dictionary<TKey, TWeight>>(_store);
+
+    // The inline entry's fields; valid only while Dict is null.
+    private ref TKey OneKey => ref Unsafe.As<InlineEntry>(_store).Key;
+
+    private ref TWeight OneWeight => ref Unsafe.As<InlineEntry>(_store).Weight;
 
     // Registered in a side table only when DBSPNET_TRACE_ACCESS_PROFILE is set and a trace marks
     // this instance as its state (docs/design-incremental-persistence.md §11). No field here: one
     // would cost 8 bytes on every Z-set, which the w1profile B/ev instrument picks up.
     internal void MarkTraceState() =>
-        TraceAccessProfile.Mark(this, "flat", () => _entries.Count);
+        TraceAccessProfile.Mark(this, "flat", () => Count);
 
     public static ZSet<TKey, TWeight> Empty { get; } = new(new Dictionary<TKey, TWeight>());
 
-    public int Count => _entries.Count;
+    /// <summary>A one-entry Z-set held inline (no dictionary); empty for a zero weight.</summary>
+    internal static ZSet<TKey, TWeight> Inline(TKey key, TWeight weight) =>
+        TWeight.IsZero(weight) ? new(default!, TWeight.Zero) : new(key, weight);
 
-    public bool IsEmpty => _entries.Count == 0;
+    public int Count => Dict?.Count ?? (TWeight.IsZero(OneWeight) ? 0 : 1);
+
+    public bool IsEmpty => Dict is { } d ? d.Count == 0 : TWeight.IsZero(OneWeight);
 
     /// <summary>
     /// Sum of every entry's weight. Z-set-linear alternative to
@@ -50,7 +82,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public TWeight SumWeights()
     {
         var sum = TWeight.Zero;
-        foreach (var (_, w) in _entries)
+        foreach (var (_, w) in Entries())
         {
             sum = TWeight.Add(sum, w);
         }
@@ -63,7 +95,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// </summary>
     public TWeight WeightOf(TKey key)
     {
-        var found = _entries.TryGetValue(key, out var w);
+        var found = TryGetWeight(key, out var w);
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Probe(key, found);
@@ -74,7 +106,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
 
     public bool Contains(TKey key)
     {
-        var found = _entries.ContainsKey(key);
+        var found = TryGetWeight(key, out _);
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Probe(key, found);
@@ -83,13 +115,47 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         return found;
     }
 
-    public IEnumerable<TKey> Keys => _entries.Keys;
+    public IEnumerable<TKey> Keys =>
+        Dict is { } d ? d.Keys : TWeight.IsZero(OneWeight) ? Array.Empty<TKey>() : [OneKey];
+
+    private bool TryGetWeight(TKey key, out TWeight weight)
+    {
+        if (Dict is { } d)
+        {
+            return d.TryGetValue(key, out weight);
+        }
+
+        if (!TWeight.IsZero(OneWeight) && EqualityComparer<TKey>.Default.Equals(OneKey, key))
+        {
+            weight = OneWeight;
+            return true;
+        }
+
+        weight = TWeight.Zero;
+        return false;
+    }
+
+    private ZSetBuilder<TKey, TWeight> ToBuilder(int extra)
+    {
+        if (Dict is { } d)
+        {
+            return ZSetBuilder.From(d);
+        }
+
+        var b = new ZSetBuilder<TKey, TWeight>(1 + extra);
+        if (!TWeight.IsZero(OneWeight))
+        {
+            b.Add(OneKey, OneWeight);
+        }
+
+        return b;
+    }
 
     public ZSet<TKey, TWeight> Plus(ZSet<TKey, TWeight> other)
     {
         ArgumentNullException.ThrowIfNull(other);
-        var b = ZSetBuilder.From(_entries);
-        foreach (var (k, w) in other._entries)
+        var b = ToBuilder(other.Count);
+        foreach (var (k, w) in other.Entries())
         {
             b.Add(k, w);
         }
@@ -100,8 +166,8 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public ZSet<TKey, TWeight> Minus(ZSet<TKey, TWeight> other)
     {
         ArgumentNullException.ThrowIfNull(other);
-        var b = ZSetBuilder.From(_entries);
-        foreach (var (k, w) in other._entries)
+        var b = ToBuilder(other.Count);
+        foreach (var (k, w) in other.Entries())
         {
             b.Add(k, TWeight.Negate(w));
         }
@@ -111,8 +177,8 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
 
     public ZSet<TKey, TWeight> Negate()
     {
-        var d = new Dictionary<TKey, TWeight>(capacity: _entries.Count);
-        foreach (var (k, w) in _entries)
+        var d = new Dictionary<TKey, TWeight>(capacity: Count);
+        foreach (var (k, w) in Entries())
         {
             d[k] = TWeight.Negate(w);
         }
@@ -127,8 +193,8 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             return Empty;
         }
 
-        var d = new Dictionary<TKey, TWeight>(capacity: _entries.Count);
-        foreach (var (k, w) in _entries)
+        var d = new Dictionary<TKey, TWeight>(capacity: Count);
+        foreach (var (k, w) in Entries())
         {
             var product = TWeight.Multiply(w, scalar);
             if (!TWeight.IsZero(product))
@@ -144,7 +210,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     {
         ArgumentNullException.ThrowIfNull(predicate);
         var d = new Dictionary<TKey, TWeight>();
-        foreach (var (k, w) in _entries)
+        foreach (var (k, w) in Entries())
         {
             if (predicate(k))
             {
@@ -162,8 +228,8 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         // Output has at most one entry per input row (fewer only if rows collide
         // under f), so the input count is a tight upper bound — pre-size to it to
         // avoid resize churn on the common 1:1 projection (§16.7).
-        var b = new ZSetBuilder<TKey2, TWeight>(_entries.Count);
-        foreach (var (k, w) in _entries)
+        var b = new ZSetBuilder<TKey2, TWeight>(Count);
+        foreach (var (k, w) in Entries())
         {
             b.Add(f(k), w);
         }
@@ -172,38 +238,89 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     }
 
     /// <summary>
-    /// Folds <paramref name="delta"/> into this Z-set's backing dictionary
-    /// in place, preserving the zero-is-absent invariant. Used by
-    /// <c>ZSetTrace</c>; callers must not retain any reference to this
-    /// instance across a merge. Runs in <c>O(|delta|)</c>.
+    /// Folds <paramref name="delta"/> into this Z-set in place, preserving the
+    /// zero-is-absent invariant. Used by <c>ZSetTrace</c> and indexed-trace groups;
+    /// callers must not retain any reference to this instance across a merge. Runs in
+    /// <c>O(|delta|)</c>. An inline Z-set stays inline while the result has at most one
+    /// key, and moves to a dictionary when a second key arrives.
     /// </summary>
     internal void MergeInPlace(ZSet<TKey, TWeight> delta)
     {
         ArgumentNullException.ThrowIfNull(delta);
-        if (delta._entries.Count == 0)
+        if (delta.IsEmpty)
         {
             return;
         }
 
-        foreach (var (k, dw) in delta._entries)
+        if (Dict is null)
         {
-            if (_entries.TryGetValue(k, out var current))
+            if (delta.Count == 1)
+            {
+                var (k, dw) = delta.Single();
+                if (TWeight.IsZero(OneWeight))
+                {
+                    OneKey = k;
+                    OneWeight = dw;
+                    return;
+                }
+
+                if (EqualityComparer<TKey>.Default.Equals(OneKey, k))
+                {
+                    OneWeight = TWeight.Add(OneWeight, dw);
+                    if (TWeight.IsZero(OneWeight))
+                    {
+                        OneKey = default!;
+                    }
+
+                    return;
+                }
+            }
+
+            var promoted = new Dictionary<TKey, TWeight>(1 + delta.Count);
+            if (!TWeight.IsZero(OneWeight))
+            {
+                promoted[OneKey] = OneWeight;
+            }
+
+            _store = promoted;
+        }
+
+        var entries = Dict!;
+        foreach (var (k, dw) in delta.Entries())
+        {
+            if (entries.TryGetValue(k, out var current))
             {
                 var sum = TWeight.Add(current, dw);
                 if (TWeight.IsZero(sum))
                 {
-                    _entries.Remove(k);
+                    entries.Remove(k);
                 }
                 else
                 {
-                    _entries[k] = sum;
+                    entries[k] = sum;
                 }
             }
             else
             {
-                _entries[k] = dw;
+                entries[k] = dw;
             }
         }
+    }
+
+    // The only entry of a one-entry Z-set.
+    private KeyValuePair<TKey, TWeight> Single()
+    {
+        if (Dict is not { } d)
+        {
+            return new(OneKey, OneWeight);
+        }
+
+        foreach (var kv in d)
+        {
+            return kv;
+        }
+
+        throw new InvalidOperationException("empty Z-set");
     }
 
     /// <summary>
@@ -223,8 +340,21 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         }
 
         ArgumentNullException.ThrowIfNull(monotoneKey);
+        var entries = Dict;
+        if (entries is null)
+        {
+            if (TWeight.IsZero(OneWeight) || monotoneKey(OneKey) >= threshold)
+            {
+                return 0;
+            }
+
+            OneKey = default!;
+            OneWeight = TWeight.Zero;
+            return 1;
+        }
+
         List<TKey>? removed = null;
-        foreach (var key in _entries.Keys)
+        foreach (var key in entries.Keys)
         {
             if (monotoneKey(key) < threshold)
             {
@@ -239,24 +369,31 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
 
         foreach (var key in removed)
         {
-            _entries.Remove(key);
+            entries.Remove(key);
         }
 
         return removed.Count;
     }
 
     /// <summary>
-    /// Returns a shallow copy with its own backing dictionary. Used by
-    /// in-place merges on <c>IndexedZSet</c> to avoid aliasing the caller's
-    /// inner Z-sets.
+    /// Returns a shallow copy with its own storage. Used by in-place merges on
+    /// <c>IndexedZSet</c> to avoid aliasing the caller's inner Z-sets — which makes it
+    /// where a trace's new group is born, so a one-entry copy is made inline.
     /// </summary>
     internal ZSet<TKey, TWeight> Clone()
     {
-        return new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>(_entries));
+        var entries = Dict;
+        if (entries is null || entries.Count == 1)
+        {
+            var (k, w) = IsEmpty ? new KeyValuePair<TKey, TWeight>(default!, TWeight.Zero) : Single();
+            return Inline(k, w);
+        }
+
+        return new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>(entries));
     }
 
     /// <summary>
-    /// The dictionary's own struct enumerator, returned by value so
+    /// A struct enumerator over either representation, returned by value so
     /// <c>foreach</c> binds to it by pattern rather than through
     /// <see cref="IEnumerable{T}"/>.
     /// </summary>
@@ -271,25 +408,78 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// per enumeration, which is 3.0% of total on the tiny shape but only
     /// 0.003% on the wide one — the dominant allocation is the fresh output
     /// dictionary, not this. So this buys back dispatch, not the Layer-A
-    /// allocation floor. Exposing the concrete enumerator is deliberate: this
-    /// type is the dictionary-backed multiset, and the abstraction that lets a
-    /// sorted run stand in its place is <see cref="IMultiset{TKey,TWeight}"/>,
-    /// not this method.
+    /// allocation floor. The abstraction that lets a sorted run stand in this
+    /// type's place is <see cref="IMultiset{TKey,TWeight}"/>, not this method.
     /// </remarks>
-    public Dictionary<TKey, TWeight>.Enumerator GetEnumerator()
+    public Enumerator GetEnumerator()
     {
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Scan();
         }
 
-        return _entries.GetEnumerator();
+        return new Enumerator(this);
     }
 
-    IEnumerator<KeyValuePair<TKey, TWeight>> IEnumerable<KeyValuePair<TKey, TWeight>>.GetEnumerator() =>
-        _entries.GetEnumerator();
+    // Enumeration for this type's own methods: not counted as a trace scan.
+    private Enumerator Entries() => new(this);
 
-    IEnumerator IEnumerable.GetEnumerator() => _entries.GetEnumerator();
+    IEnumerator<KeyValuePair<TKey, TWeight>> IEnumerable<KeyValuePair<TKey, TWeight>>.GetEnumerator() =>
+        new Enumerator(this);
+
+    IEnumerator IEnumerable.GetEnumerator() => new Enumerator(this);
+
+    /// <summary>Enumerates a <see cref="ZSet{TKey,TWeight}"/> in either representation.</summary>
+    public struct Enumerator : IEnumerator<KeyValuePair<TKey, TWeight>>
+    {
+        private readonly ZSet<TKey, TWeight>? _inline;
+        private Dictionary<TKey, TWeight>.Enumerator _dictionary;
+        private bool _done;
+
+        internal Enumerator(ZSet<TKey, TWeight> set)
+        {
+            if (set.Dict is { } d)
+            {
+                _inline = null;
+                _dictionary = d.GetEnumerator();
+                _done = false;
+            }
+            else
+            {
+                _inline = set;
+                _dictionary = default;
+                _done = TWeight.IsZero(set.OneWeight);
+            }
+        }
+
+        public readonly KeyValuePair<TKey, TWeight> Current =>
+            _inline is null ? _dictionary.Current : new(_inline.OneKey, _inline.OneWeight);
+
+        readonly object IEnumerator.Current => Current;
+
+        public bool MoveNext()
+        {
+            if (_inline is null)
+            {
+                return _dictionary.MoveNext();
+            }
+
+            if (_done)
+            {
+                return false;
+            }
+
+            _done = true;
+            return true;
+        }
+
+        // Lets a method of ZSet foreach over Entries() directly.
+        public readonly Enumerator GetEnumerator() => this;
+
+        public void Dispose() => _dictionary.Dispose();
+
+        void IEnumerator.Reset() => throw new NotSupportedException();
+    }
 
     public static ZSet<TKey, TWeight> operator +(ZSet<TKey, TWeight> a, ZSet<TKey, TWeight> b) => a.Plus(b);
 
@@ -309,14 +499,14 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             return true;
         }
 
-        if (_entries.Count != other._entries.Count)
+        if (Count != other.Count)
         {
             return false;
         }
 
-        foreach (var (k, w) in _entries)
+        foreach (var (k, w) in Entries())
         {
-            if (!other._entries.TryGetValue(k, out var w2) || !w.Equals(w2))
+            if (!other.TryGetWeight(k, out var w2) || !w.Equals(w2))
             {
                 return false;
             }
@@ -332,7 +522,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         // Order-independent hash: XOR per-entry hashes. Acceptable since
         // this type is rarely used as a dictionary key.
         var hash = 0;
-        foreach (var (k, w) in _entries)
+        foreach (var (k, w) in Entries())
         {
             hash ^= HashCode.Combine(k, w);
         }
@@ -342,13 +532,13 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
 
     public override string ToString()
     {
-        if (_entries.Count == 0)
+        if (IsEmpty)
         {
             return "{}";
         }
 
-        var parts = new List<string>(_entries.Count);
-        foreach (var (k, w) in _entries)
+        var parts = new List<string>(Count);
+        foreach (var (k, w) in Entries())
         {
             parts.Add($"{k} => {w}");
         }
@@ -377,7 +567,7 @@ public static class ZSet
             return ZSet<TKey, TWeight>.Empty;
         }
 
-        return new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight> { [key] = weight });
+        return ZSet<TKey, TWeight>.Inline(key, weight);
     }
 
     public static ZSet<TKey, TWeight> FromEntries<TKey, TWeight>(IEnumerable<KeyValuePair<TKey, TWeight>> entries)

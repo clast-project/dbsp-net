@@ -126,6 +126,19 @@ public class IvmMultiBatch
                 }
             }
 
+            if (batch == 1 && Environment.GetEnvironmentVariable("IVM_MEASURE_LIVE") == "1")
+            {
+                // Live bytes after a full compacting GC: batch 1's retained state, exactly.
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                // PromotedBytes of that full blocking GC is what survived it; GetTotalMemory under
+                // Server GC also counts free space in regions and varies run to run.
+                var info = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+                _out.WriteLine(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"LIVE promoted={info.PromotedBytes} heap={info.HeapSizeBytes} fragmented={info.FragmentedBytes}"));
+            }
+
             if (batch == 1 && DbspNet.Core.Collections.TraceAccessProfile.Enabled)
             {
                 // Indexed-trace group shape after the bulk load (DBSPNET_TRACE_ACCESS_PROFILE=1).
