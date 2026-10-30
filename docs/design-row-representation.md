@@ -4099,6 +4099,49 @@ hash structs and was judged on Nexmark W=1 pause; it was never measured on this 
 synthetic probe — big `Dictionary<row,weight>` with random inserts vs. index + paged row array,
 on a growing heap — would size (1) before any engine change.
 
+### 27.7 Sizing the lever synthetically (`TableCardProbe`) — moving references does not help; removing the row object halves the pause
+
+`TABLE_CARD_PROBE=dict|index|index-flat|cells`: 25M rows (9 cells — 8 shared boxes + a unique
+id; 152 B each) grown into 48 tables over 20 ticks on W threads, each tick's delta rebuilt by 3
+dictionary stages with 4 short-lived rows per kept row. Server GC, M4 Pro, young pause per run:
+
+| mode (what the table holds) | W=8 young pause | W=1 young pause | gen1 promoted |
+|---|---|---|---|
+| `dict` — `Dictionary<StructuralRow,long>` (today) | 1.54–1.90 s | 1.40–1.86 s | 1.9–3.0 GB |
+| `index` — reference-free `Entry` + paged row-reference array | 1.66–1.69 s | 1.53–1.63 s | 2.4–2.9 GB |
+| `index-flat` — same, one doubling row array | 1.68–1.70 s | 1.48–1.49 s | 2.4–2.9 GB |
+| *deltas chunked below the LOH threshold (`TABLE_CARD_DELTA_CHUNK=3000`):* | | | |
+| `dict` | 1.64–1.76 s | 1.82–1.86 s | 2.7–3.2 GB |
+| `index` | 1.60–1.61 s | 1.67–1.69 s | 2.2–2.6 GB |
+| **`cells` — row values copied into reference-free `long` pages, no row object kept** | **0.87–0.88 s** | **0.90–1.01 s** | **0.02 GB** |
+
+`cells` also builds 38% faster at W=8 (4.6 → 2.9 s) and halves live state (4.76 → 2.37 GB).
+
+1. **The probe reproduces the real pause's shape**: sampled with `scripts/gc-phases.py`, `dict`
+   spends 41% of in-GC time on LOH cards (real batch 1: 48%).
+2. **Moving the references does not remove the cost.** `index` makes the 0.6 GB hash `Entry[]`
+   reference-free, yet LOH card time stays ~27–41%: the references move to the dense row pages,
+   and the cost is *marking and fixing up each young row reached from an old container*, not
+   finding the reference. Dense vs hash-random placement is worth only ~5–10%. The per-tick delta
+   dictionaries are themselves LOH arrays full of young-row references (3.75 MB each here), and
+   dead ones stay card-scanned until a background gen2 sweeps them — in the engine the LOH peaks
+   at 5.5 GB at W=8 against 0.89 GB live after batch 1, so deltas are a real share of the card
+   time too.
+3. **Removing the row *object* from trace state halves the young pause.** With no old→young
+   references from the traces, gen1 promotion vanishes; what remains (~0.9 s) is the deltas and
+   transient rows. This is the reconciliation with §27.3: padding added bytes and a *leaf* object
+   reached by tracing from a row, which is cheap; the expensive unit is **a young object referenced
+   from an old container**, one per row inserted into a trace.
+
+**Gate, revised.** The lever is "trace state holds no per-row GC objects" — rows stored as
+unboxed values in reference-free pages (the brief's "unboxed" half, but *not* shared by reference
+and with no handle object; candidate 1's handle per row is exactly what costs). If the real
+batch 1 behaves like the probe, the trace-side share of the W=8 young pause (~6 s) is ~50% →
+**~3 s**, above the 1.5 s gate. Caveats before a design: the probe's rows are all longs (real rows
+carry strings → a byte-page string store, and decimals / timestamps); operators read trace rows as
+`StructuralRow`, so a read path that re-materialises rows reintroduces allocation (joins emit
+from trace rows every tick); deltas stay object-based, so their LOH share is untouched.
+
 ## Appendix — sources
 
 DbspNet: `ZSet.cs`, `IndexedZSet.cs`, `IncrementalJoinOp.cs`,

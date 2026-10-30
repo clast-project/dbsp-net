@@ -718,7 +718,7 @@ public class RowFormGcProbe
     // Runtime GC events (keyword 0x1): pause per GC kind from suspend-begin to restart-end (copied
     // from IvmMultiBatch's IVM_GC_EVENTS listener), plus bytes promoted out of gen0 and gen1 by the
     // young GCs (GCHeapStats TotalPromotedSize0/1 — the copying the pause pays for).
-    private sealed class GcEventListener : EventListener
+    internal sealed class GcEventListener : EventListener
     {
         private readonly object _gate = new();
         private readonly Dictionary<string, (int Count, double Ms)> _byKind = new(StringComparer.Ordinal);
