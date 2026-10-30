@@ -353,6 +353,18 @@ public class IvmMultiBatch
         private string? _kind;
         private double _p0, _p1, _g0, _g1, _g2, _loh;
 
+        // GCMarkWithType: bytes each heap marked from each root kind this GC (3 = older
+        // generations via the card table). Summed, and the busiest heap, per kind.
+        private readonly Dictionary<int, (double Sum, double Max)> _mark = new();
+
+        // Mark-phase time per heap: each GCMarkWithType fires as that heap finishes the phase, so
+        // the gap since the heap's previous mark event (or GCStart) is the phase's duration.
+        private readonly Dictionary<int, DateTime> _heapLast = new();
+        private readonly Dictionary<int, (double SumMs, double MaxMs)> _markMs = new();
+        private DateTime _gcStart;
+        private static readonly string[] MarkKinds =
+            ["stack", "finalizeQ", "handles", "cards", "sizedref", "overflow", "dephandles", "newFQ", "steal", "bgcsaved"];
+
         private static double Field(System.Diagnostics.Tracing.EventWrittenEventArgs e, string name) =>
             Convert.ToDouble(e.Payload![e.PayloadNames!.IndexOf(name)], CultureInfo.InvariantCulture);
 
@@ -377,6 +389,19 @@ public class IvmMultiBatch
                         var depth = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Depth")], CultureInfo.InvariantCulture);
                         var type = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Type")], CultureInfo.InvariantCulture);
                         _kind = "gen" + depth + (type == 1 ? " background" : type == 2 ? " foreground" : " blocking");
+                        _gcStart = e.TimeStamp;
+                        break;
+                    case "GCMarkWithType":
+                        var mk = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Type")], CultureInfo.InvariantCulture);
+                        var mb = Field(e, "Bytes");
+                        var (ms0, mx0) = _mark.GetValueOrDefault(mk);
+                        _mark[mk] = (ms0 + mb, Math.Max(mx0, mb));
+                        var heap = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("HeapNum")], CultureInfo.InvariantCulture);
+                        var since = _heapLast.TryGetValue(heap, out var last) ? last : _gcStart;
+                        var phaseMs = (e.TimeStamp - since).TotalMilliseconds;
+                        _heapLast[heap] = e.TimeStamp;
+                        var (ts0, tx0) = _markMs.GetValueOrDefault(mk);
+                        _markMs[mk] = (ts0 + phaseMs, Math.Max(tx0, phaseMs));
                         break;
                     case "GCHeapStats_V2":
                         // Bytes this GC promoted out of gen0 / gen1: the copying a young pause pays for.
@@ -400,13 +425,19 @@ public class IvmMultiBatch
                                 _promotedByKind[kind] = (p0 + _p0, p1 + _p1);
                                 _perGc.Add(string.Create(
                                     CultureInfo.InvariantCulture,
-                                    $"GC {kind} {pause:F0} ms promoted0={_p0 / 1e9:F2} promoted1={_p1 / 1e9:F2} GB | gen0={_g0 / 1e9:F2} gen1={_g1 / 1e9:F2} gen2={_g2 / 1e9:F2} loh={_loh / 1e9:F2} GB"));
+                                    $"GC {kind} {pause:F0} ms promoted0={_p0 / 1e9:F2} promoted1={_p1 / 1e9:F2} GB | gen0={_g0 / 1e9:F2} gen1={_g1 / 1e9:F2} gen2={_g2 / 1e9:F2} loh={_loh / 1e9:F2} GB | marked ")
+                                    + string.Join(" ", _mark.OrderBy(kv => kv.Key).Select(kv => string.Create(
+                                        CultureInfo.InvariantCulture,
+                                        $"{(kv.Key < MarkKinds.Length ? MarkKinds[kv.Key] : kv.Key.ToString(CultureInfo.InvariantCulture))}={kv.Value.Sum / 1e9:F2}GB/{_markMs.GetValueOrDefault(kv.Key).MaxMs:F0}ms"))));
                             }
                         }
 
                         _suspend = default;
                         _kind = null;
                         _p0 = _p1 = _g0 = _g1 = _g2 = _loh = 0;
+                        _mark.Clear();
+                        _markMs.Clear();
+                        _heapLast.Clear();
                         break;
                 }
             }
