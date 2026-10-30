@@ -224,3 +224,63 @@ real engine does not behave like `TableCardProbe`), stop before increment 3 and 
     where the prize is?
 (d) Is the probe-side boxing cost on Nexmark joins (increment 3) acceptable if ivm-bench wins, and
     what B/ev regression would you accept?
+
+Decided 2026-10-30: (a) compile-time `SqlType`, (b) managed LOH pages, (c) increment 1 first.
+(d) open — needed before increment 3 is kept, not before it is built.
+
+## 11. Increment 1 — built and measured (2026-10-30)
+
+Commits `574fbaf`, `aa45e16`. `PagedZSetStore` (src/DbspNet.Sql/Compiler/PagedTraceStore.cs)
+holds each `IntegrateOp`'s integral behind `DBSPNET_TRACE_STORE=paged`; `IntegrateOp` takes an
+`IIntegratedViewStore<TRow>` (Core) and forms `View` on demand, once per step. View counts and
+weights (`IntegratedViewHandle.Count` / `WeightOf`, `ProgramOutput.RowCount`) no longer form it.
+
+Built as §2–§4 say, with two details settled in code:
+- **Every non-string kind is one codec**: `Decimal128`, the temporal structs and the primitives
+  are unmanaged and `IEquatable<T>`, so a cell is its raw bytes (decodes bit-for-bit) and compares
+  with `IEquatable<T>.Equals` — what `T.Equals(object)` does for a same-typed probe.
+- **Slots are allocated like `Dictionary` entries** (LIFO free list, else append; `Clear` frees in
+  enumeration order like `MergeInPlace(Negate())`), so the formed view enumerates in the same order
+  and snapshot files are byte-identical.
+- The bucket index must mix the hash first (Fibonacci). Masking the low bits made `fact_holdings`
+  take 13.5 s to integrate at W=8 (Dictionary: 0.26 s); the cause in those rows' hashes is not
+  pinned down.
+
+**Correctness.** Differential tests against `ZSet` (random signed deltas over every kind, NaN
+payloads, ±0.0, NULL patterns, off-kind and wrong-arity rows that escape, string compaction,
+the load reset); snapshot bytes identical across representations, and cross-restore both ways;
+full suite 2628/2628 with the store off and with `DBSPNET_TRACE_STORE=paged`; ivm-bench SF=3 all
+16 view digests identical at W=8 in every paired run. Default off: w1profile B/ev identical on all
+ten Nexmark queries against `9935319`.
+
+**ivm-bench SF=3 batch 1, W=8, Server GC.** Census at drain end (`IVM_MEASURE_AT=drain` — after
+the output write the formed views would be counted too):
+
+| | boxed | paged | Δ |
+|---|---|---|---|
+| `StructuralRow` objects | 44.59M | 41.01M | **−3.59M** (= the view rows) |
+| all objects | 160.1M | 149.8M | −10.3M |
+| LOH arrays holding references | 221 MB (133) | 102 MB (68) | −119 MB |
+| live bytes (`PromotedBytes`) | 10.16 GB | 10.27 GB | +0.11 GB (pages 0.79 GB; shared strings now copied) |
+
+Drain-only GC (`GCPAUSE-DRAIN`), 5 alternating runs per arm:
+
+| | boxed | paged | Δ |
+|---|---|---|---|
+| young pause | 6.50 s (sd 0.36) | 6.26 s (sd 0.36) | −0.24 s, SE ≈ 0.23 — not resolved |
+| promoted out of gen0 / gen1 | 15.77 / 13.84 GB | 15.53 / 13.50 GB | −0.24 / −0.34 GB |
+| drain | 18.4 s (sd 1.0) | 18.1 s (sd 0.9) | noise |
+| `IntegratedView` CPU (summed over workers, 1 run) | 0.45 s | 1.17 s | +0.7 s (≈ +90 ms per worker) |
+
+**Reading.** The census moved exactly as designed. The pause moved by the amount §9 predicted
+(−0.2–0.4 s for 8% of the state rows), but that is at the noise floor of 5 runs, and promotion
+moved less than in proportion (−2.5% gen1 for −8% of rows). So the stop rule is neither clearly
+met nor clearly failed: increment 1 is too small to resolve against this instrument. Increment 3
+moves ~8× more rows; its keep-gate (≥ 1.5 s pause) is ~6 SE, which this instrument can resolve.
+
+**Open costs found.** (1) Forming the view is now O(|view|) of new objects per read; at W>1 each
+shard's formed view is cached in its `IntegrateOp` *and* summed into `ParallelProgramOutput`'s
+cache, so formed copies are held twice until the next step. A streaming enumeration for the
+output writer would remove both. (2) Integrate CPU is ~2.6× the Dictionary's (per-cell virtual
+codec calls, boxed `row[i]` reads, first-page growth by copy) — small next to the step, not yet
+optimised.
