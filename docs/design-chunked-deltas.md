@@ -141,3 +141,62 @@ map lands, judged by what is left on `IVM_LOH_ALLOC`.
 (b) If it lands, also ship `System.GC.LOHThreshold` as belt and braces for the hosts we own
     (server, benchmarks), or rely on the structure alone?
 (c) Start with increment 1 + 2 (flat Z-sets, ~80% of the LOH entry bytes) as one measured step?
+
+## 7. Increments 1 + 2 — built and measured (2026-10-30)
+
+Commits `c981a0f`, `dc7d5b3`. `ChunkedMap<TKey,TValue>` (src/DbspNet.Core/Collections/ChunkedMap.cs);
+`ZSet`, `ZSetBuilder` and the flat `ZSetTrace` take it when `DBSPNET_ZSET_MAP=chunked`. Indexed
+Z-sets' outer maps are still `Dictionary` (increment 3); their inner per-group Z-sets are chunked.
+
+**Correctness.** Differential test against `Dictionary` — random add/set/remove/clear sequences
+up to ~25K live keys and a 1M-key fill, contents and enumeration order after every block, and the
+compacting copy — passes; every array of a 1M-entry map is under 85,000 B. Suite 2640/2640 with the
+seam off and on. ivm-bench SF=3: all 16 digests identical at W=8 in every run.
+
+**Default off is byte-identical** on w1profile B/ev (all ten queries, against `9935319`) — after a
+fix: a second field on `ZSetBuilder` had cost q20/q4/q9 +1–3 B/ev; the builder now keeps one
+`object` store field, as `ZSet` does. With the seam **on**, B/ev rises 0.7–6.5% (q3 62 → 66, q9
++4.7%): power-of-two capacities and the 0.5 load factor below.
+
+**Micro-benchmark** (StructuralRow keys, chunked ÷ Dictionary time, median of 9):
+
+| entries | add | lookup | enumerate |
+|---|---|---|---|
+| 1K | 0.59 | 0.76 | 1.00 |
+| 100K | 0.74 | **1.30** | 0.96 |
+| 1M | 0.71 | **1.16** | 1.01 |
+
+The §5 gate (≤ 5% slower everywhere) is **missed for lookup in large maps**. Unchecked two-level
+access, a chunk-at-a-time enumerator and a 0.5 load factor brought it down from 1.4–1.8×;
+single-array buckets made no difference, so the bucket index is not the cause. The rest is not
+explained. Small maps — the fine-tick case — are faster than `Dictionary` on every operation.
+
+**ivm-bench SF=3 batch 1, W=8**, 5 alternating runs, drain only:
+
+| | Dictionary | ChunkedMap | Δ |
+|---|---|---|---|
+| young pause | 6.57 s (sd 0.14) | **5.69 s** (sd 0.19) | **−0.87 s** (SE 0.11) |
+| drain, mean | 19.03 s (sd 0.40) | 17.60 s (sd 1.71) | −1.44 s (SE 0.78) |
+| drain, median | 19.15 s | 16.49 s | −2.66 s (four runs at 16.5 s, one at 20.3 s) |
+| background gen2s | 7–9 | 5 | |
+
+`Entry<StructuralRow,Z64>[]` (6.0 GB) is gone from the LOH. The keep-gate (≥ half of the 16 MB
+setting's −2.6 s drain) is met on the mean, noisily. What stays on the LOH (one `IVM_LOH_ALLOC` run):
+`KeyValuePair<StructuralRow,Z64>[]` 1.28 GB, `object[]` 0.75 GB, indexed outer maps
+`Entry<StructuralRow,ZSet<…>>[]` 0.51 GB, `Entry<StructuralRow,ZSetBuilder<…>>[]` 0.41 GB — which is
+why 5 background gen2s remain where the 16 MB setting had none.
+
+**Nexmark** (`nexmark 1000000 10000 3 8`, 3 alternating processes per arm, median ratio, events/s):
+
+| | q0 | q1 | q2 | q3 | q4 | q9 | q5 | q7 | q8 | q12 | q15 | q16 | q17 | q18 | q19 | q20 | q22 | geomean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| W=1 | 1.09 | 1.37 | 1.11 | 1.03 | 1.22 | 1.18 | 1.33 | 1.17 | 1.07 | 1.07 | 1.21 | 1.18 | 1.22 | 1.20 | 1.19 | 1.27 | 1.17 | **1.18** |
+| W=8 | 1.28 | 1.33 | 1.12 | 1.03 | 1.19 | 1.13 | 3.00 | — | 1.00 | 1.28 | 1.09 | 1.10 | 1.00 | 1.09 | 1.02 | 0.91 | 1.09 | **1.18** |
+
+Better than the 16 MB setting at W=1 (+10%), close to it at W=8 (+20%). Only q20 at W=8 is below
+1.0 (0.91, inside its 1.27× spread). Nexmark's 10,000-event batches make ~240 KB maps, so it gains
+both from staying off the LOH and from add being cheaper than `Dictionary`'s at those sizes.
+
+**Next:** increment 3 (indexed Z-sets' outer map + `IndexedZSetBuilder`) and increment 4 (the
+`KeyValuePair[]` / `object[]` producers — not yet located), each measured the same way; then the
+default flip.
