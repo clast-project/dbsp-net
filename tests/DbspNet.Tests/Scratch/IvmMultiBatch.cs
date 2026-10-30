@@ -220,6 +220,10 @@ public class IvmMultiBatch
             {
                 await Task.Delay(2000); // runtime events arrive asynchronously
                 _out.WriteLine("GCPAUSE " + gcEvents.Report());
+                foreach (var line in gcEvents.PerGc())
+                {
+                    _out.WriteLine(line);
+                }
             }
 
             // What the server's /wait reports after every batch.
@@ -343,8 +347,14 @@ public class IvmMultiBatch
     {
         private readonly object _gate = new();
         private readonly Dictionary<string, (int Count, double Ms)> _byKind = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, (double P0, double P1)> _promotedByKind = new(StringComparer.Ordinal);
+        private readonly List<string> _perGc = new();
         private DateTime _suspend;
         private string? _kind;
+        private double _p0, _p1, _g0, _g1, _g2, _loh;
+
+        private static double Field(System.Diagnostics.Tracing.EventWrittenEventArgs e, string name) =>
+            Convert.ToDouble(e.Payload![e.PayloadNames!.IndexOf(name)], CultureInfo.InvariantCulture);
 
         protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
         {
@@ -368,18 +378,46 @@ public class IvmMultiBatch
                         var type = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Type")], CultureInfo.InvariantCulture);
                         _kind = "gen" + depth + (type == 1 ? " background" : type == 2 ? " foreground" : " blocking");
                         break;
+                    case "GCHeapStats_V2":
+                        // Bytes this GC promoted out of gen0 / gen1: the copying a young pause pays for.
+                        _p0 = Field(e, "TotalPromotedSize0");
+                        _p1 = Field(e, "TotalPromotedSize1");
+                        _g0 = Field(e, "GenerationSize0");
+                        _g1 = Field(e, "GenerationSize1");
+                        _g2 = Field(e, "GenerationSize2");
+                        _loh = Field(e, "GenerationSize3");
+                        break;
                     case "GCRestartEEEnd_V1":
                         if (_suspend != default)
                         {
                             var kind = _kind ?? "no GC (suspension only)";
                             var (n, ms) = _byKind.GetValueOrDefault(kind);
-                            _byKind[kind] = (n + 1, ms + (e.TimeStamp - _suspend).TotalMilliseconds);
+                            var pause = (e.TimeStamp - _suspend).TotalMilliseconds;
+                            _byKind[kind] = (n + 1, ms + pause);
+                            if (_kind is not null)
+                            {
+                                var (p0, p1) = _promotedByKind.GetValueOrDefault(kind);
+                                _promotedByKind[kind] = (p0 + _p0, p1 + _p1);
+                                _perGc.Add(string.Create(
+                                    CultureInfo.InvariantCulture,
+                                    $"GC {kind} {pause:F0} ms promoted0={_p0 / 1e9:F2} promoted1={_p1 / 1e9:F2} GB | gen0={_g0 / 1e9:F2} gen1={_g1 / 1e9:F2} gen2={_g2 / 1e9:F2} loh={_loh / 1e9:F2} GB"));
+                            }
                         }
 
                         _suspend = default;
                         _kind = null;
+                        _p0 = _p1 = _g0 = _g1 = _g2 = _loh = 0;
                         break;
                 }
+            }
+        }
+
+        /// <summary>One line per GC (IVM_GC_EVENTS=1): pause, promoted bytes, generation sizes.</summary>
+        public string[] PerGc()
+        {
+            lock (_gate)
+            {
+                return _perGc.ToArray();
             }
         }
 
@@ -388,7 +426,10 @@ public class IvmMultiBatch
             lock (_gate)
             {
                 return string.Join("; ", _byKind.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv =>
-                    string.Create(CultureInfo.InvariantCulture, $"{kv.Key}: {kv.Value.Count} GCs {kv.Value.Ms:F0} ms")))
+                    string.Create(CultureInfo.InvariantCulture, $"{kv.Key}: {kv.Value.Count} GCs {kv.Value.Ms:F0} ms")
+                    + (_promotedByKind.TryGetValue(kv.Key, out var p)
+                        ? string.Create(CultureInfo.InvariantCulture, $" (promoted {p.P0 / 1e9:F2}/{p.P1 / 1e9:F2} GB)")
+                        : "")))
                     + string.Create(CultureInfo.InvariantCulture, $"; total {_byKind.Values.Sum(v => v.Ms):F0} ms");
             }
         }
