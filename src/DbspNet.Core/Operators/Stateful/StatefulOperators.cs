@@ -578,40 +578,6 @@ public static class StatefulOperators
     }
 
     /// <summary>
-    /// <see cref="IncrementalInnerJoin{TKey,TLeft,TRight,TOut,TWeight}"/> with either trace held
-    /// in a store (null keeps the in-memory trace). Named apart from the public overload, which
-    /// TypedPlanCompiler finds by name through reflection. A store may hand <paramref name="combine"/>
-    /// views onto its slots, so <paramref name="combine"/> must read their cells and keep none
-    /// of its arguments.
-    /// </summary>
-    internal static Stream<ZSet<TOut, TWeight>> IncrementalInnerJoinWithStores<TKey, TLeft, TRight, TOut, TWeight>(
-        this CircuitBuilder builder,
-        Stream<IndexedZSet<TKey, TLeft, TWeight>> left,
-        Stream<IndexedZSet<TKey, TRight, TWeight>> right,
-        Func<TKey, TLeft, TRight, TOut> combine,
-        IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec,
-        IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec,
-        IFrontier? frontier,
-        Func<TKey, long>? monotoneKey,
-        Func<TOut, bool>? residual,
-        IIndexedTraceStore<TKey, TLeft, TWeight>? leftStore,
-        IIndexedTraceStore<TKey, TRight, TWeight>? rightStore)
-        where TKey : notnull
-        where TLeft : notnull
-        where TRight : notnull
-        where TOut : notnull
-        where TWeight : struct, IZRing<TWeight>
-    {
-        ArgumentNullException.ThrowIfNull(builder);
-        var output = new Stream<ZSet<TOut, TWeight>>(ZSet<TOut, TWeight>.Empty);
-        builder.AddRawOperator(
-            new IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight>(
-                left, right, output, combine, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey, residual,
-                leftStore, rightStore));
-        return output;
-    }
-
-    /// <summary>
     /// Build a <b>shared</b> indexed arrangement over an already-indexed Z-set
     /// delta stream: one <see cref="ArrangeOp{TKey,TValue,TWeight}"/> integrates
     /// the stream into a single trace whose post-tick integral many downstream

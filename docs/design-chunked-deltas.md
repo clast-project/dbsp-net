@@ -298,7 +298,8 @@ the drain. The input side's value is the LOH residency it removes, not step time
 Suite 2643/2643 with the default and with the opt-out. With no environment set: ivm-bench SF=3
 digests identical at W=8 and W=1, and `Entry<StructuralRow,Z64>[]` on the LOH in batch 1 is
 0.02 GB (W=8) / 0.03 GB (W=1), down from 6.0 GB — the remainder is code that still builds a
-`Dictionary` directly (the spine traces, the paged store's snapshot form).
+`Dictionary` directly (the spine traces; the paged store's snapshot form too, until the store was
+removed — docs/design-paged-trace-state.md §16).
 
 **New fine-tick baseline** (w1profile B/ev, default config): q0 672, q1 789, q2 526, q22 899, q3 66,
 q20 1080, q4 1991, q9 939, q18 1132, q19 1007 — +0.9% to +6.5% over the Dictionary numbers, as

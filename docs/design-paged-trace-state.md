@@ -1,4 +1,10 @@
-# Paged trace state — trace rows as values in reference-free pages (DESIGN, proposed)
+# Paged trace state — trace rows as values in reference-free pages (DESIGN; built, measured, NOT KEPT — code removed)
+
+> **Status (2026-10-30):** increments 1 and 3 were built and measured (§11–§15) and the store lost
+> every time — first because the batch-1 pause was per-tick delta LOH cards, not trace state (§12);
+> then, with deltas fixed by the chunked map, because the store's own work outweighs the promotion it
+> saves (§14–§15). The code was removed before `arc/row-repr` merged; it is in the branch history
+> (`574fbaf`, `2d36bf6`, `c916fd2`). See §16 for what would have to change to revisit it.
 
 Branch `arc/row-repr`. Phase 1 of the row-representation arc
 (docs/next-arc-row-representation-prompt.md). The measurements this rests on are
@@ -431,7 +437,8 @@ because forming a view from pages, with zero-copy strings, is cheaper than enume
 If the store is revisited, the first experiment is pages outside the GC heap (`NativeMemory`, the
 alternative to decision (b)), which removes cost (1) and isolates (2); strings then need a
 `MemoryManager` per page for zero-copy reads, and pages a release protocol. Cost (2) goes only with
-unboxed downstream consumers (the columnar arc).
+unboxed downstream consumers — a columnar engine, which docs/design-columnar-batch1.md §8–§9 closed in
+2026-07 as designed-and-measured-not-built.
 
 ## 15. Native pages — the experiment (2026-10-30)
 
@@ -454,5 +461,18 @@ Native pages recover 1.47 s of drain against managed pages (SE 0.55) and bring b
 to the default's 2 — the gen2-budget cost of §14 was real. But the store is still **+1.73 s** slower
 than without it (SE 0.54), and the young pause does not move beyond noise (−0.19 s, SE 0.15). What is
 left is the store's own work: boxing on every cell a join reads, cell decode and compare, copying
-values in at integrate. That cost only goes with unboxed downstream consumers — the columnar arc —
-so the store has no path to a win on its own. **Verdict: not kept.**
+values in at integrate. That cost only goes with unboxed downstream consumers — a columnar engine, which
+docs/design-columnar-batch1.md §8–§9 already closed as not worth building (no bounded first increment,
+~5–10% wall ceiling) — so the store has no path to a win on its own. **Verdict: not kept.**
+
+## 16. Removed (2026-10-30)
+
+The store, its Core seams (`IIntegratedViewStore`, `IIndexedTraceStore`, the store arms of
+`IntegrateOp` / `IncrementalJoinOp` / `IncrementalJoinCore`) and its tests were deleted before the
+merge; `DBSPNET_TRACE_STORE` and `DBSPNET_TRACE_STORE_PAGES` no longer exist. Kept from this work:
+view row counts and weights without forming the view (`IntegratedViewHandle.Count` / `WeightOf`,
+`ProgramOutput.RowCount`), the census's owner attribution, and the drain-only GC / LOH instruments.
+
+**Revisit only if** a change removes the probe-side boxing — downstream operators reading cells
+unboxed — *and* the pages live outside the GC budget with a safe release protocol. On the measured
+evidence, nothing short of both makes the trade positive.

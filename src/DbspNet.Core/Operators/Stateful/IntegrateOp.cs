@@ -41,16 +41,10 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     private readonly ZSetTrace<TRow, Z64> _view = new();
     private readonly IZSetTraceCodec<TRow, Z64>? _snapshotCodec;
 
-    // When set, the integral lives here instead of in _view, and View is formed on demand
-    // (once per step) from it.
-    private readonly IIntegratedViewStore<TRow>? _store;
-    private ZSet<TRow, Z64>? _materialized;
-
     public IntegrateOp(
         Stream<ZSet<TRow, Z64>> input,
         Stream<ZSet<TRow, Z64>> output,
-        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null,
-        IIntegratedViewStore<TRow>? store = null)
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -58,25 +52,24 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         _input = input;
         _output = output;
         _snapshotCodec = snapshotCodec;
-        _store = store;
     }
 
     /// <summary>The full current view contents — every delta folded in so far —
     /// valid until the next <see cref="Step"/>.</summary>
-    public ZSet<TRow, Z64> View => _store is null ? _view.Current : _materialized ??= _store.Materialize();
+    public ZSet<TRow, Z64> View => _view.Current;
 
-    /// <summary>The number of rows in <see cref="View"/>, without forming it.</summary>
-    public int ViewCount => _store?.Count ?? _view.Current.Count;
+    /// <summary>The number of rows in <see cref="View"/>.</summary>
+    public int ViewCount => _view.Current.Count;
 
-    /// <summary>A row's weight in <see cref="View"/>, without forming it.</summary>
-    public Z64 WeightOf(TRow row) => _store is null ? _view.Current.WeightOf(row) : _store.WeightOf(row);
+    /// <summary>A row's weight in <see cref="View"/>.</summary>
+    public Z64 WeightOf(TRow row) => _view.Current.WeightOf(row);
 
     /// <summary>The delta the most recent step integrated.</summary>
     public ZSet<TRow, Z64> LastDelta => _input.Current;
 
     public string MetricName => "IntegratedView";
 
-    public long RetainedRows => ViewCount;
+    public long RetainedRows => _view.Current.Count;
 
     public long LastOutputRows => _output.Current.Count;
 
@@ -87,16 +80,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     public void Step()
     {
         var delta = _input.Current;
-        if (_store is null)
-        {
-            _view.Integrate(delta);  // O(|delta|): fold the tick's delta into the view.
-        }
-        else if (!delta.IsEmpty)
-        {
-            _store.Integrate(delta);
-            _materialized = null;
-        }
-
+        _view.Integrate(delta);      // O(|delta|): fold the tick's delta into the view.
         _output.SetCurrent(delta);   // the delta flows through unchanged.
     }
 
@@ -109,7 +93,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
                 "CircuitBuilder.Integrate to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "view.arrows", View, cancellationToken);
+        return _snapshotCodec.SaveAsync(writer, "view.arrows", _view.Current, cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -124,18 +108,8 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         // Reset the (in-place-mutated) view to the persisted contents. Integrating
         // into a freshly-cleared trace re-establishes exactly the saved multiset.
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (_store is null)
-        {
-            _view.Current.MergeInPlace(_view.Current.Negate());
-            _view.Integrate(loaded);
-        }
-        else
-        {
-            _store.Clear();
-            _store.Integrate(loaded);
-            _materialized = null;
-        }
-
+        _view.Current.MergeInPlace(_view.Current.Negate());
+        _view.Integrate(loaded);
         if (SnapshotRestoreProfile.Enabled)
         {
             SnapshotRestoreProfile.AddIntegrate(SnapshotRestoreProfile.MsSince(t0));

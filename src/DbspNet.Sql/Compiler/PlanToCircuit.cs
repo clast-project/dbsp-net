@@ -305,7 +305,7 @@ public static partial class PlanToCircuit
             if (options.StoredOutput)
             {
                 var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-                var integrated = builder.Integrate(queryStream, viewCodec, ViewStore(plan.Schema));
+                var integrated = builder.Integrate(queryStream, viewCodec);
                 queryStream = integrated.Output;
                 view = integrated.View;
             }
@@ -519,7 +519,7 @@ public static partial class PlanToCircuit
                     if (v.IsOutput)
                     {
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
-                        var integrated = builder.Integrate(stream, viewCodec, ViewStore(v.Query.Schema));
+                        var integrated = builder.Integrate(stream, viewCodec);
                         outputs[v.ViewName] = new ProgramOutput(v.Query.Schema, integrated.View);
                     }
                 }
@@ -719,7 +719,7 @@ public static partial class PlanToCircuit
                         // writes, closing the §10.1 restore gap with no driver-side region.
                         // The delta still flows through unchanged for the sharded output.
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
-                        var integrated = builder.Integrate(stream, viewCodec, ViewStore(v.Query.Schema));
+                        var integrated = builder.Integrate(stream, viewCodec);
                         builder.Output(integrated.Output, "view:" + v.ViewName);
 
                         // The build closure runs once per replica, sequentially in worker
@@ -798,11 +798,6 @@ public static partial class PlanToCircuit
     /// the operator's re-shuffle can be elided. Ported verbatim from
     /// <c>TypedPlanCompiler.IsKeySubset</c>.
     /// </summary>
-    // The integrated output view's state: the paged store when DBSPNET_TRACE_STORE=paged
-    // (docs/design-paged-trace-state.md, increment 1), else null — IntegrateOp's own Z-set.
-    private static PagedZSetStore? ViewStore(Schema schema) =>
-        TraceStoreMode.Paged ? PagedZSetStore.For(schema) : null;
-
     private static bool IsKeySubset(int[] sub, int[] super)
     {
         foreach (var c in sub)
@@ -1377,8 +1372,7 @@ public static partial class PlanToCircuit
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier = null,
         Func<StructuralRow, long>? monotoneKey = null,
-        Func<StructuralRow, bool>? residual = null,
-        JoinTraceSchemas? storeSchemas = null)
+        Func<StructuralRow, bool>? residual = null)
     {
         // The residual (a non-equi ON conjunct spanning both sides, e.g. a
         // temporal-SCD `ts BETWEEN lo AND hi`) is pushed INTO the flat join's
@@ -1398,23 +1392,9 @@ public static partial class PlanToCircuit
             return residual is null ? spineJoined : builder.Filter(spineJoined, row => residual(row));
         }
 
-        if (storeSchemas is { } schemas && TraceStoreMode.Paged)
-        {
-            // docs/design-paged-trace-state.md increment 3: both traces as values in pages. The
-            // caller passes schemas only when combine copies cells out of its arguments and keeps
-            // none of them, so the stores can hand it in-place views.
-            return builder.IncrementalInnerJoinWithStores(
-                left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual,
-                PagedIndexedStore.For(schemas.LeftKey, schemas.Left, views: true),
-                PagedIndexedStore.For(schemas.RightKey, schemas.Right, views: true));
-        }
-
         return builder.IncrementalInnerJoin(
             left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual);
     }
-
-    /// <summary>The key and value schemas of an inner join's two traces, for the paged store.</summary>
-    private sealed record JoinTraceSchemas(Schema LeftKey, Schema Left, Schema RightKey, Schema Right);
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitLeftJoin(
         CircuitBuilder builder,
@@ -3244,8 +3224,7 @@ public static partial class PlanToCircuit
             var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
             joined = EmitInnerJoin(
                 builder, ctx, leftIndexed, rightIndexed, Combine,
-                leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn,
-                new JoinTraceSchemas(leftKeySchema, plan.Left.Schema, rightKeySchema, plan.Right.Schema));
+                leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn);
 
             // A broadcast join leaves the fact side on its incoming partition (not
             // the join key), so the output is partitioned as the left was — inherit
@@ -3527,8 +3506,7 @@ public static partial class PlanToCircuit
             (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema),
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema),
-            residual: row => residualScalar(row) is true,
-            storeSchemas: new JoinTraceSchemas(leftKeySchema, plan.Left.Schema, rightKeySchema, plan.Right.Schema));
+            residual: row => residualScalar(row) is true);
 
         var parts = new List<Stream<ZSet<StructuralRow, Z64>>> { matched };
 
