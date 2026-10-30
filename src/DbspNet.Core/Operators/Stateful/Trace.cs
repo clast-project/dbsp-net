@@ -25,7 +25,7 @@ internal sealed class ZSetTrace<TKey, TWeight>
 
     private static ZSet<TKey, TWeight> NewState()
     {
-        var z = new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>());
+        var z = ZSet<TKey, TWeight>.NewMutable();
         if (TraceAccessProfile.Enabled)
         {
             z.MarkTraceState();

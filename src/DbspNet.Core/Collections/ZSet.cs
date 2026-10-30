@@ -41,10 +41,24 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         }
     }
 
+    // Ctor takes ownership; the chunked twin of the Dictionary ctor (docs/design-chunked-deltas.md).
+    internal ZSet(ChunkedMap<TKey, TWeight> entries)
+    {
+        _store = entries;
+        if (DeltaSizeProfile.Enabled)
+        {
+            DeltaSizeProfile.Record(entries);
+        }
+    }
+
     private ZSet(TKey key, TWeight weight)
     {
         _store = new InlineEntry(key, weight);
     }
+
+    /// <summary>An empty Z-set to mutate in place (a trace's state), in the configured map.</summary>
+    internal static ZSet<TKey, TWeight> NewMutable() =>
+        ZSetMapMode.Chunked ? new(new ChunkedMap<TKey, TWeight>()) : new(new Dictionary<TKey, TWeight>());
 
     /// <summary>
     /// Approximate heap bytes of this Z-set's own objects (itself and its storage, not the keys):
@@ -54,6 +68,11 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     internal long ContainerBytes()
     {
         const long Self = 24;
+        if (Chunked is { } c)
+        {
+            return Self + 64 + c.ArrayBytes;
+        }
+
         if (Dict is not { } d)
         {
             return Self + 16 + (2 * IntPtr.Size);
@@ -64,9 +83,15 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         return Self + 80 + (24 + (4 * capacity)) + (24 + (entry * capacity));
     }
 
-    /// <summary>The backing dictionary, or null when inline.</summary>
+    /// <summary>The backing dictionary, or null when inline or chunked.</summary>
     private Dictionary<TKey, TWeight>? Dict =>
-        _store is InlineEntry ? null : Unsafe.As<Dictionary<TKey, TWeight>>(_store);
+        _store.GetType() == typeof(Dictionary<TKey, TWeight>) ? Unsafe.As<Dictionary<TKey, TWeight>>(_store) : null;
+
+    /// <summary>The backing chunked map, or null (docs/design-chunked-deltas.md).</summary>
+    private ChunkedMap<TKey, TWeight>? Chunked =>
+        _store.GetType() == typeof(ChunkedMap<TKey, TWeight>) ? Unsafe.As<ChunkedMap<TKey, TWeight>>(_store) : null;
+
+    private bool IsInline => _store.GetType() == typeof(InlineEntry);
 
     // The inline entry's fields; valid only while Dict is null.
     private ref TKey OneKey => ref Unsafe.As<InlineEntry>(_store).Key;
@@ -93,9 +118,9 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     internal static ZSet<TKey, TWeight> Inline(TKey key, TWeight weight) =>
         TWeight.IsZero(weight) ? new(default!, TWeight.Zero) : new(key, weight);
 
-    public int Count => Dict?.Count ?? (TWeight.IsZero(OneWeight) ? 0 : 1);
+    public int Count => Dict?.Count ?? Chunked?.Count ?? (TWeight.IsZero(OneWeight) ? 0 : 1);
 
-    public bool IsEmpty => Dict is { } d ? d.Count == 0 : TWeight.IsZero(OneWeight);
+    public bool IsEmpty => Dict is { } d ? d.Count == 0 : Chunked is { } c ? c.Count == 0 : TWeight.IsZero(OneWeight);
 
     /// <summary>
     /// Sum of every entry's weight. Z-set-linear alternative to
@@ -146,13 +171,18 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     }
 
     public IEnumerable<TKey> Keys =>
-        Dict is { } d ? d.Keys : TWeight.IsZero(OneWeight) ? Array.Empty<TKey>() : [OneKey];
+        Dict is { } d ? d.Keys : Chunked is { } c ? c.Keys : TWeight.IsZero(OneWeight) ? Array.Empty<TKey>() : [OneKey];
 
     private bool TryGetWeight(TKey key, out TWeight weight)
     {
         if (Dict is { } d)
         {
             return d.TryGetValue(key, out weight);
+        }
+
+        if (Chunked is { } c)
+        {
+            return c.TryGetValue(key, out weight);
         }
 
         if (!TWeight.IsZero(OneWeight) && EqualityComparer<TKey>.Default.Equals(OneKey, key))
@@ -170,6 +200,11 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         if (Dict is { } d)
         {
             return ZSetBuilder.From(d);
+        }
+
+        if (Chunked is { } c)
+        {
+            return new ZSetBuilder<TKey, TWeight>(ChunkedMap<TKey, TWeight>.CopyOf(c));
         }
 
         var b = new ZSetBuilder<TKey, TWeight>(1 + extra);
@@ -207,6 +242,17 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
 
     public ZSet<TKey, TWeight> Negate()
     {
+        if (ZSetMapMode.Chunked)
+        {
+            var m = new ChunkedMap<TKey, TWeight>(Count);
+            foreach (var (k, w) in Entries())
+            {
+                m[k] = TWeight.Negate(w);
+            }
+
+            return new ZSet<TKey, TWeight>(m);
+        }
+
         var d = new Dictionary<TKey, TWeight>(capacity: Count);
         foreach (var (k, w) in Entries())
         {
@@ -221,6 +267,21 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         if (TWeight.IsZero(scalar))
         {
             return Empty;
+        }
+
+        if (ZSetMapMode.Chunked)
+        {
+            var m = new ChunkedMap<TKey, TWeight>(Count);
+            foreach (var (k, w) in Entries())
+            {
+                var product = TWeight.Multiply(w, scalar);
+                if (!TWeight.IsZero(product))
+                {
+                    m[k] = product;
+                }
+            }
+
+            return new ZSet<TKey, TWeight>(m);
         }
 
         var d = new Dictionary<TKey, TWeight>(capacity: Count);
@@ -239,6 +300,20 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public ZSet<TKey, TWeight> Filter(Func<TKey, bool> predicate)
     {
         ArgumentNullException.ThrowIfNull(predicate);
+        if (ZSetMapMode.Chunked)
+        {
+            var m = new ChunkedMap<TKey, TWeight>();
+            foreach (var (k, w) in Entries())
+            {
+                if (predicate(k))
+                {
+                    m[k] = w;
+                }
+            }
+
+            return new ZSet<TKey, TWeight>(m);
+        }
+
         var d = new Dictionary<TKey, TWeight>();
         foreach (var (k, w) in Entries())
         {
@@ -282,7 +357,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             return;
         }
 
-        if (Dict is null)
+        if (IsInline)
         {
             if (delta.Count == 1)
             {
@@ -306,13 +381,51 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
                 }
             }
 
-            var promoted = new Dictionary<TKey, TWeight>(1 + delta.Count);
-            if (!TWeight.IsZero(OneWeight))
+            if (ZSetMapMode.Chunked)
             {
-                promoted[OneKey] = OneWeight;
+                var chunkedPromoted = new ChunkedMap<TKey, TWeight>(1 + delta.Count);
+                if (!TWeight.IsZero(OneWeight))
+                {
+                    chunkedPromoted[OneKey] = OneWeight;
+                }
+
+                _store = chunkedPromoted;
+            }
+            else
+            {
+                var promoted = new Dictionary<TKey, TWeight>(1 + delta.Count);
+                if (!TWeight.IsZero(OneWeight))
+                {
+                    promoted[OneKey] = OneWeight;
+                }
+
+                _store = promoted;
+            }
+        }
+
+        if (Chunked is { } map)
+        {
+            foreach (var (k, dw) in delta.Entries())
+            {
+                if (map.TryGetValue(k, out var current))
+                {
+                    var sum = TWeight.Add(current, dw);
+                    if (TWeight.IsZero(sum))
+                    {
+                        map.Remove(k);
+                    }
+                    else
+                    {
+                        map[k] = sum;
+                    }
+                }
+                else
+                {
+                    map[k] = dw;
+                }
             }
 
-            _store = promoted;
+            return;
         }
 
         var entries = Dict!;
@@ -340,6 +453,16 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     // The only entry of a one-entry Z-set.
     private KeyValuePair<TKey, TWeight> Single()
     {
+        if (Chunked is { } c)
+        {
+            foreach (var kv in c)
+            {
+                return kv;
+            }
+
+            throw new InvalidOperationException("empty Z-set");
+        }
+
         if (Dict is not { } d)
         {
             return new(OneKey, OneWeight);
@@ -370,6 +493,25 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         }
 
         ArgumentNullException.ThrowIfNull(monotoneKey);
+        if (Chunked is { } map)
+        {
+            List<TKey>? dropped = null;
+            foreach (var key in map.Keys)
+            {
+                if (monotoneKey(key) < threshold)
+                {
+                    (dropped ??= new List<TKey>()).Add(key);
+                }
+            }
+
+            foreach (var key in dropped ?? [])
+            {
+                map.Remove(key);
+            }
+
+            return dropped?.Count ?? 0;
+        }
+
         var entries = Dict;
         if (entries is null)
         {
@@ -412,14 +554,15 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// </summary>
     internal ZSet<TKey, TWeight> Clone()
     {
-        var entries = Dict;
-        if (entries is null || entries.Count == 1)
+        if (IsInline || Count == 1)
         {
             var (k, w) = IsEmpty ? new KeyValuePair<TKey, TWeight>(default!, TWeight.Zero) : Single();
             return Inline(k, w);
         }
 
-        return new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>(entries));
+        return Chunked is { } c
+            ? new ZSet<TKey, TWeight>(ChunkedMap<TKey, TWeight>.CopyOf(c))
+            : new ZSet<TKey, TWeight>(new Dictionary<TKey, TWeight>(Dict!));
     }
 
     /// <summary>
@@ -463,7 +606,9 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public struct Enumerator : IEnumerator<KeyValuePair<TKey, TWeight>>
     {
         private readonly ZSet<TKey, TWeight>? _inline;
+        private readonly bool _isChunked;
         private Dictionary<TKey, TWeight>.Enumerator _dictionary;
+        private ChunkedMap<TKey, TWeight>.Enumerator _chunked;
         private bool _done;
 
         internal Enumerator(ZSet<TKey, TWeight> set)
@@ -471,19 +616,33 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             if (set.Dict is { } d)
             {
                 _inline = null;
+                _isChunked = false;
                 _dictionary = d.GetEnumerator();
+                _chunked = default;
+                _done = false;
+            }
+            else if (set.Chunked is { } c)
+            {
+                _inline = null;
+                _isChunked = true;
+                _dictionary = default;
+                _chunked = c.GetEnumerator();
                 _done = false;
             }
             else
             {
                 _inline = set;
+                _isChunked = false;
                 _dictionary = default;
+                _chunked = default;
                 _done = TWeight.IsZero(set.OneWeight);
             }
         }
 
         public readonly KeyValuePair<TKey, TWeight> Current =>
-            _inline is null ? _dictionary.Current : new(_inline.OneKey, _inline.OneWeight);
+            _inline is not null ? new(_inline.OneKey, _inline.OneWeight)
+            : _isChunked ? _chunked.Current
+            : _dictionary.Current;
 
         readonly object IEnumerator.Current => Current;
 
@@ -491,7 +650,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         {
             if (_inline is null)
             {
-                return _dictionary.MoveNext();
+                return _isChunked ? _chunked.MoveNext() : _dictionary.MoveNext();
             }
 
             if (_done)

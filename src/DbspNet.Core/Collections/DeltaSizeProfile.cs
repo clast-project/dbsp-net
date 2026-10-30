@@ -47,7 +47,24 @@ internal static class DeltaSizeProfile
         var capacity = dictionary.EnsureCapacity(0);
         var entryBytes = (8 + Unsafe.SizeOf<TKey>() + Unsafe.SizeOf<TValue>() + 7) / 8 * 8;
         var entries = (long)capacity * entryBytes;
-        var buckets = (long)capacity * sizeof(int);
+        Add(rows, entries, (long)capacity * sizeof(int), entries);
+    }
+
+    /// <summary>A chunked map is bucketed by its largest single array — what decides whether
+    /// any of it lands on the large-object heap.</summary>
+    internal static void Record<TKey, TValue>(ChunkedMap<TKey, TValue> map)
+        where TKey : notnull
+    {
+        if (map.Count == 0)
+        {
+            return;
+        }
+
+        Add(map.Count, map.ArrayBytes, 0, map.LargestArrayBytes);
+    }
+
+    private static void Add(long rows, long entries, long buckets, long largest)
+    {
         var name = _current ?? "(outside step)";
         lock (Gate)
         {
@@ -57,7 +74,7 @@ internal static class DeltaSizeProfile
                 ByOperator[name] = t;
             }
 
-            t.Add(rows, entries, buckets);
+            t.Add(rows, entries, buckets, largest);
         }
     }
 
@@ -86,7 +103,7 @@ internal static class DeltaSizeProfile
         }
 
         var labels = new[] { "<85K", "85K-1M", "1M-4M", "4M-16M", ">16M" };
-        yield return "DELTASIZE entry-array bytes bucket: count / rows / entry bytes / bucket bytes";
+        yield return "DELTASIZE largest-array bucket: count / rows / entry bytes / bucket bytes";
         for (var b = 0; b < labels.Length; b++)
         {
             yield return string.Create(
@@ -123,10 +140,10 @@ internal static class DeltaSizeProfile
 
         public long LohEntries => Entries.Skip(1).Sum();
 
-        public void Add(long rows, long entries, long buckets)
+        public void Add(long rows, long entries, long buckets, long largest)
         {
             var b = 0;
-            while (b < Edges.Length && entries >= Edges[b])
+            while (b < Edges.Length && largest >= Edges[b])
             {
                 b++;
             }

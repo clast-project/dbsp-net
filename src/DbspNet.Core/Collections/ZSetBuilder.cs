@@ -13,11 +13,21 @@ public sealed class ZSetBuilder<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
+    // Exactly one of these is set until Build(): the chunked map when DBSPNET_ZSET_MAP=chunked
+    // (docs/design-chunked-deltas.md), else the dictionary.
     private Dictionary<TKey, TWeight>? _entries;
+    private ChunkedMap<TKey, TWeight>? _chunked;
 
     public ZSetBuilder()
     {
-        _entries = new Dictionary<TKey, TWeight>();
+        if (ZSetMapMode.Chunked)
+        {
+            _chunked = new ChunkedMap<TKey, TWeight>();
+        }
+        else
+        {
+            _entries = new Dictionary<TKey, TWeight>();
+        }
     }
 
     /// <summary>
@@ -31,7 +41,14 @@ public sealed class ZSetBuilder<TKey, TWeight>
     /// </summary>
     public ZSetBuilder(int capacity)
     {
-        _entries = new Dictionary<TKey, TWeight>(capacity > 0 ? capacity : 0);
+        if (ZSetMapMode.Chunked)
+        {
+            _chunked = new ChunkedMap<TKey, TWeight>(capacity > 0 ? capacity : 0);
+        }
+        else
+        {
+            _entries = new Dictionary<TKey, TWeight>(capacity > 0 ? capacity : 0);
+        }
     }
 
     internal ZSetBuilder(Dictionary<TKey, TWeight> entries)
@@ -39,7 +56,12 @@ public sealed class ZSetBuilder<TKey, TWeight>
         _entries = entries;
     }
 
-    public int Count => Entries.Count;
+    internal ZSetBuilder(ChunkedMap<TKey, TWeight> entries)
+    {
+        _chunked = entries;
+    }
+
+    public int Count => _chunked?.Count ?? Entries.Count;
 
     private Dictionary<TKey, TWeight> Entries =>
         _entries ?? throw new InvalidOperationException("ZSetBuilder used after Build().");
@@ -52,6 +74,28 @@ public sealed class ZSetBuilder<TKey, TWeight>
     {
         if (TWeight.IsZero(weight))
         {
+            return;
+        }
+
+        if (_chunked is { } m)
+        {
+            if (m.TryGetValue(key, out var had))
+            {
+                var total = TWeight.Add(had, weight);
+                if (TWeight.IsZero(total))
+                {
+                    m.Remove(key);
+                }
+                else
+                {
+                    m[key] = total;
+                }
+            }
+            else
+            {
+                m[key] = weight;
+            }
+
             return;
         }
 
@@ -85,6 +129,12 @@ public sealed class ZSetBuilder<TKey, TWeight>
 
     public ZSet<TKey, TWeight> Build()
     {
+        if (_chunked is { } m)
+        {
+            _chunked = null; // prevent reuse
+            return m.Count == 0 ? ZSet<TKey, TWeight>.Empty : new ZSet<TKey, TWeight>(m);
+        }
+
         var d = Entries;
         _entries = null; // prevent reuse
         if (d.Count == 0)
@@ -103,7 +153,17 @@ public sealed class ZSetBuilder<TKey, TWeight>
     /// <see cref="BuildShared"/> output is dead (no <c>z⁻¹</c> or external consumer
     /// retains it across ticks); for the owning-handoff path use <see cref="Build"/>.
     /// </summary>
-    public void Reset() => Entries.Clear();
+    public void Reset()
+    {
+        if (_chunked is { } m)
+        {
+            m.Clear();
+        }
+        else
+        {
+            Entries.Clear();
+        }
+    }
 
     /// <summary>
     /// Wraps the backing dictionary in a Z-set <b>without</b> transferring ownership
@@ -112,7 +172,7 @@ public sealed class ZSetBuilder<TKey, TWeight>
     /// is invalidated by the next <see cref="Reset"/>; the caller guarantees it is
     /// dead by then (the §20 dead-after-tick / no-<c>z⁻¹</c> edge constraint).
     /// </summary>
-    public ZSet<TKey, TWeight> BuildShared() => new(Entries);
+    public ZSet<TKey, TWeight> BuildShared() => _chunked is { } m ? new(m) : new(Entries);
 }
 
 internal static class ZSetBuilder
