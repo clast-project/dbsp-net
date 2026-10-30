@@ -243,7 +243,21 @@ W=8 is slightly below increment 2's 1.18 (q19 0.90, q4 0.96). Single W=8 cells o
 up to ~2.7× across processes, so this is not attributed to increment 4 without more runs; a W=8
 A/B of increment 4 alone (exchange buckets on vs off) would settle it.
 
-**Open:** (1) the `object[]` producer; (2) large-map lookup still 1.16–1.30× Dictionary (§7); (3) the
+**The `object[]` producer, located** (`dotnet-trace` with GC verbose events attached to the test
+host, the process held after batch 1 by `IVM_PAUSE_DIR` so the trace ends cleanly; AllocationTick
+stacks totalled by a throwaway TraceEvent analyzer). Of the 0.75 GB of LOH `object[]`:
+~66% is `ArrowExtensions.ToArrowChanges` — the incremental **output** writer
+(`ProgramRunner.WriteIncrementalAsync`), which copies every cell into a `List<object?>` per column
+and `ToArray()`s it again before building Arrow arrays; ~25% is `ArrowColumns.Extract*` in
+`PushArrow` — the **input** decode, a boxed `object?[n]` per Arrow column before rows are assembled.
+Both are boxed column staging buffers at the Arrow boundary, not engine state. The remaining LOH
+`byte[]`/`int[]` is also output-side and reference-free (Arrow buffer builders growing, MemoryStream,
+the Parquet encoder). So inside the drain the only reference-holding LOH producer left is the input
+decode (~0.2 GB); the output writer runs after the drain, outside every drain-only number above.
+
+**Open:** (1) the Arrow-boundary staging buffers — input decode row-major (no per-column boxed
+arrays; inside the drain) and the output writer appending rows straight into Arrow builders (after
+the drain, but batch 1 spends ~3.7 s in output); (2) large-map lookup still 1.16–1.30× Dictionary (§7); (3) the
 default flip — the seam is still off; (4) the unexplained short test totals (2561, 2599 of 2640,
 both "Passed!", not reproduced in seven reruns — suspected test-host abort hidden by the summary
 grep; abort lines are now checked).
