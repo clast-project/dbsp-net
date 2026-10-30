@@ -409,7 +409,8 @@ public sealed class ProgramRunner
         {
             _profile.TotalTicks = Stopwatch.GetTimestamp() - wall0;
             _profile.EngineTicks = ticks;
-            var report = _profile.BuildReport(_program.CollectOperatorProfile(), Workers);
+            var report = _profile.BuildReport(
+                _program.CollectOperatorProfile(), Workers, _program.CollectOperatorProfilePerWorker());
             Console.Error.WriteLine(report);
 
             // Optionally persist the report so it survives harness container teardown:
@@ -463,6 +464,7 @@ public sealed class ProgramRunner
         private int _gen0Start;
         private int _gen1Start;
         private int _gen2Start;
+        private TimeSpan _pauseStart;
 
         public void Reset()
         {
@@ -480,6 +482,7 @@ public sealed class ProgramRunner
             _gen0Start = GC.CollectionCount(0);
             _gen1Start = GC.CollectionCount(1);
             _gen2Start = GC.CollectionCount(2);
+            _pauseStart = GC.GetTotalPauseDuration();
         }
 
         public PhaseAcc Source(string name) => Get(_sources, name);
@@ -497,7 +500,10 @@ public sealed class ProgramRunner
             return acc;
         }
 
-        public string BuildReport(IReadOnlyList<OperatorProfile> operators, int workers)
+        public string BuildReport(
+            IReadOnlyList<OperatorProfile> operators,
+            int workers,
+            IReadOnlyList<IReadOnlyList<OperatorProfile>>? perWorker = null)
         {
             static double Ms(long ticks) => ticks * MsPerTick;
 
@@ -520,7 +526,14 @@ public sealed class ProgramRunner
             }
             var allocGiB = (GC.GetTotalAllocatedBytes() - _allocStart) / (1024.0 * 1024.0 * 1024.0);
             sb.AppendLine(FormattableString.Invariant(
-                $"allocated {allocGiB:F2} GiB   GC gen0/1/2 = {GC.CollectionCount(0) - _gen0Start}/{GC.CollectionCount(1) - _gen1Start}/{GC.CollectionCount(2) - _gen2Start}   ServerGC={System.Runtime.GCSettings.IsServerGC} procs={Environment.ProcessorCount}"));
+                $"allocated {allocGiB:F2} GiB   GC gen0/1/2 = {GC.CollectionCount(0) - _gen0Start}/{GC.CollectionCount(1) - _gen1Start}/{GC.CollectionCount(2) - _gen2Start}   ServerGC={System.Runtime.GCSettings.IsServerGC} procs={Environment.ProcessorCount}   GC pause {(GC.GetTotalPauseDuration() - _pauseStart).TotalMilliseconds:F0} ms"));
+
+            // How big the retained state is, per row: the live heap (as of the last GC) over
+            // every row that stateful operators hold (traces, aggregates, windows, views).
+            var retained = operators.Where(o => o.RetainedRows > 0).Sum(o => o.RetainedRows);
+            var heapGiB = GC.GetGCMemoryInfo().HeapSizeBytes / (1024.0 * 1024.0 * 1024.0);
+            sb.AppendLine(FormattableString.Invariant(
+                $"retained state rows {retained:N0}   GC heap {heapGiB:F2} GiB   ≈ {(retained > 0 ? heapGiB * 1024 * 1024 * 1024 / retained : 0):F0} B/retained row"));
 
             var readMs = _sources.Values.Sum(v => Ms(v.ReadTicks));
             var pushMs = _sources.Values.Sum(v => Ms(v.PushTicks));
@@ -616,8 +629,63 @@ public sealed class ProgramRunner
                     $"  {g.Kind,-26} x{g.Count,-4} {g.Ms,8:F1} ms ({msShare,4:F1}%)  alloc {g.Alloc / (1024.0 * 1024.0),9:F1} MiB ({allocShare,4:F1}%)"));
             }
 
+            if (perWorker is { Count: > 1 })
+            {
+                AppendWorkerBalance(sb, perWorker);
+            }
+
             sb.AppendLine("===== END BATCH PROFILE =====");
             return sb.ToString();
+        }
+
+        // Where a parallel batch's step time sits per worker. An exchange's time includes
+        // its barrier wait, so a worker with short busy time and long exchange time spent
+        // the difference waiting on a straggler; the straggler's work is the critical path.
+        private static void AppendWorkerBalance(StringBuilder sb, IReadOnlyList<IReadOnlyList<OperatorProfile>> perWorker)
+        {
+            static bool IsExchange(OperatorProfile o) => o.Name.Contains("Exchange", StringComparison.Ordinal);
+
+            sb.AppendLine();
+            sb.AppendLine("-- per worker (busy = non-exchange operators; exchange includes barrier wait) --");
+            for (var w = 0; w < perWorker.Count; w++)
+            {
+                var busy = perWorker[w].Where(o => !IsExchange(o)).Sum(o => o.CumulativeMs);
+                var exchange = perWorker[w].Where(IsExchange).Sum(o => o.CumulativeMs);
+                sb.AppendLine(FormattableString.Invariant($"  worker {w,2}  busy {busy,9:F0} ms  exchange {exchange,9:F0} ms"));
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("-- most imbalanced non-exchange operators (by max-worker minus mean ms; top 20) --");
+            var ops = perWorker[0].Count;
+            var rows = new List<(OperatorProfile Op, double Max, double Mean, int At)>();
+            for (var i = 0; i < ops; i++)
+            {
+                if (IsExchange(perWorker[0][i]))
+                {
+                    continue;
+                }
+
+                double max = 0, sum = 0;
+                var at = 0;
+                for (var w = 0; w < perWorker.Count; w++)
+                {
+                    var ms = i < perWorker[w].Count ? perWorker[w][i].CumulativeMs : 0;
+                    sum += ms;
+                    if (ms > max)
+                    {
+                        max = ms;
+                        at = w;
+                    }
+                }
+
+                rows.Add((perWorker[0][i], max, sum / perWorker.Count, at));
+            }
+
+            foreach (var (op, max, mean, at) in rows.OrderByDescending(r => r.Max - r.Mean).Take(20))
+            {
+                sb.AppendLine(FormattableString.Invariant(
+                    $"  [{op.Index,4}] {op.Name,-24} max {max,8:F1} ms (worker {at,2})  mean {mean,8:F1} ms  {op.Label}"));
+            }
         }
 
         private static void AppendPhase(StringBuilder sb, string label, double ms, long totalTicks)

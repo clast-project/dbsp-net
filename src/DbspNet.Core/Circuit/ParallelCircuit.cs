@@ -200,6 +200,14 @@ public sealed class ParallelCircuit : IDisposable
     /// allocation are the workers' total (CPU-side, not wall), and the state/output
     /// row counts are the sum of the shards.
     /// </summary>
+    /// <summary>
+    /// Each replica's own <see cref="RootCircuit.CollectOperatorProfile"/>, worker by worker
+    /// (the same operator at the same index in every list) — for finding the worker an
+    /// operator's time concentrates on, which <see cref="CollectOperatorProfile"/>'s sum hides.
+    /// </summary>
+    public IReadOnlyList<IReadOnlyList<OperatorProfile>> CollectOperatorProfilePerWorker() =>
+        _replicas.Select(r => r.CollectOperatorProfile()).ToArray();
+
     public IReadOnlyList<OperatorProfile> CollectOperatorProfile()
     {
         var sum = _replicas[0].CollectOperatorProfile().ToArray();

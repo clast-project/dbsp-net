@@ -42,6 +42,9 @@ internal abstract class RunnerProgram
 
     public abstract IReadOnlyList<OperatorProfile> CollectOperatorProfile();
 
+    /// <summary>Per-worker operator profiles of a parallel program; <c>null</c> when serial.</summary>
+    public virtual IReadOnlyList<IReadOnlyList<OperatorProfile>>? CollectOperatorProfilePerWorker() => null;
+
     public static RunnerProgram Of(CompiledProgram program) => new Serial(program);
 
     public static RunnerProgram Of(ParallelCompiledProgram program) => new Parallel(program);
@@ -114,6 +117,9 @@ internal abstract class RunnerProgram
 
         public override IReadOnlyList<OperatorProfile> CollectOperatorProfile() =>
             program.Circuit.CollectOperatorProfile();
+
+        public override IReadOnlyList<IReadOnlyList<OperatorProfile>> CollectOperatorProfilePerWorker() =>
+            program.Circuit.CollectOperatorProfilePerWorker();
     }
 
     private sealed class SerialInput(TableInput table) : RunnerInput

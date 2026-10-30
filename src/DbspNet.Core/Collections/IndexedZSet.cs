@@ -32,7 +32,20 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     // this instance as its state (docs/design-incremental-persistence.md §11). No field here: one
     // would cost 8 bytes on every Z-set, which the w1profile B/ev instrument picks up.
     internal void MarkTraceState() =>
-        TraceAccessProfile.Mark(this, "indexed", () => _groups.Count);
+        TraceAccessProfile.Mark(this, "indexed", () => _groups.Count, () =>
+        {
+            long values = 0, singletons = 0;
+            foreach (var group in _groups.Values)
+            {
+                values += group.Count;
+                if (group.Count == 1)
+                {
+                    singletons++;
+                }
+            }
+
+            return (_groups.Count, values, singletons);
+        });
 
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =
         new(new Dictionary<TKey, ZSet<TValue, TWeight>>());

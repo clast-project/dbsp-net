@@ -10,6 +10,8 @@
 //   IVM_OUTPUT_MODE   truncate (default) | incremental
 //   IVM_OUT_ROOT      (optional) output Delta root; default = temp. Wiped at start.
 //   IVM_WORKERS       (optional) > 1 runs the data-parallel program on that many workers
+//   IVM_PAUSE_DIR     (optional) after batch 1, write <dir>/pid and wait for <dir>/go — so a
+//                     heap dump (dotnet-gcdump collect -p <pid>) sees batch 1's retained state
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -113,6 +115,40 @@ public class IvmMultiBatch
                 drainMs = sw.Elapsed.TotalMilliseconds;
                 await runner.WriteOutputsAsync();
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
+            }
+
+            if (batch == 1 && Environment.GetEnvironmentVariable("IVM_PAUSE_DIR") is { Length: > 0 } pauseDir)
+            {
+                File.WriteAllText(Path.Combine(pauseDir, "pid"), Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+                while (!File.Exists(Path.Combine(pauseDir, "go")))
+                {
+                    await Task.Delay(500);
+                }
+            }
+
+            if (batch == 1 && DbspNet.Core.Collections.TraceAccessProfile.Enabled)
+            {
+                // Indexed-trace group shape after the bulk load (DBSPNET_TRACE_ACCESS_PROFILE=1).
+                long traces = 0, groups = 0, values = 0, singletons = 0, flatTraces = 0, flatRows = 0;
+                foreach (var c in DbspNet.Core.Collections.TraceAccessProfile.Snapshot())
+                {
+                    if (c.Shape is { } sh)
+                    {
+                        traces++;
+                        groups += sh.Groups;
+                        values += sh.Values;
+                        singletons += sh.Singletons;
+                    }
+                    else
+                    {
+                        flatTraces++;
+                        flatRows += c.StateKeys;
+                    }
+                }
+
+                _out.WriteLine(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"SHAPE indexed traces={traces} groups={groups} values={values} singleton_groups={singletons} | flat traces={flatTraces} rows={flatRows}"));
             }
 
             // What the server's /wait reports after every batch.

@@ -38,14 +38,15 @@ internal static class TraceAccessProfile
     // irrelevant next to what is being measured.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, TraceAccessCounter> Table = new();
 
-    internal static void Mark(object collection, string kind, Func<int> stateKeys)
+    internal static void Mark(
+        object collection, string kind, Func<int> stateKeys, Func<(long Groups, long Values, long Singletons)>? shape = null)
     {
         if (!Enabled)
         {
             return;
         }
 
-        var c = new TraceAccessCounter(kind, stateKeys);
+        var c = new TraceAccessCounter(kind, stateKeys, shape);
         Table.AddOrUpdate(collection, c);
         lock (Counters)
         {
@@ -81,8 +82,13 @@ internal static class TraceAccessProfile
 }
 
 /// <summary>Per-collection access tallies; see <see cref="TraceAccessProfile"/>.</summary>
-internal sealed class TraceAccessCounter(string kind, Func<int> stateKeys)
+internal sealed class TraceAccessCounter(
+    string kind, Func<int> stateKeys, Func<(long Groups, long Values, long Singletons)>? shape = null)
 {
+    /// <summary>An indexed trace's group shape right now: groups, inner values across them, and
+    /// groups holding exactly one value. <c>null</c> for a flat trace.</summary>
+    public (long Groups, long Values, long Singletons)? Shape => shape?.Invoke();
+
     private readonly HashSet<object> _touched = new();
 
     public string Kind { get; } = kind;
