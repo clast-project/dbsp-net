@@ -161,6 +161,26 @@ public class IvmMultiBatch
                     $"LIVE promoted={info.PromotedBytes} heap={info.HeapSizeBytes} fragmented={info.FragmentedBytes}"));
             }
 
+            if (batch == 1 && Environment.GetEnvironmentVariable("IVM_HEAP_CENSUS") == "1")
+            {
+                // What survives the bulk load, by kind, and how shared the trace rows are.
+                var censusSw = Stopwatch.StartNew();
+                foreach (var line in HeapCensus.Reachable(runner))
+                {
+                    _out.WriteLine(line);
+                }
+
+                if (DbspNet.Core.Collections.TraceAccessProfile.Enabled)
+                {
+                    foreach (var line in HeapCensus.Traces(DbspNet.Core.Collections.TraceAccessProfile.Snapshot()))
+                    {
+                        _out.WriteLine(line);
+                    }
+                }
+
+                _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"CENSUS took {censusSw.Elapsed.TotalSeconds:F0} s"));
+            }
+
             if (batch == 1 && DbspNet.Core.Collections.TraceAccessProfile.Enabled)
             {
                 // Indexed-trace group shape after the bulk load (DBSPNET_TRACE_ACCESS_PROFILE=1).

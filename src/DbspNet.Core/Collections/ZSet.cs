@@ -73,7 +73,15 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     // this instance as its state (docs/design-incremental-persistence.md §11). No field here: one
     // would cost 8 bytes on every Z-set, which the w1profile B/ev instrument picks up.
     internal void MarkTraceState() =>
-        TraceAccessProfile.Mark(this, "flat", () => Count);
+        TraceAccessProfile.Mark(this, "flat", () => Count, entries: CensusEntries);
+
+    private IEnumerable<object> CensusEntries()
+    {
+        foreach (var entry in Entries())
+        {
+            yield return entry.Key;
+        }
+    }
 
     public static ZSet<TKey, TWeight> Empty { get; } = new(new Dictionary<TKey, TWeight>());
 
@@ -440,7 +448,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     }
 
     // Enumeration for this type's own methods: not counted as a trace scan.
-    private Enumerator Entries() => new(this);
+    internal Enumerator Entries() => new(this);
 
     IEnumerator<KeyValuePair<TKey, TWeight>> IEnumerable<KeyValuePair<TKey, TWeight>>.GetEnumerator() =>
         new Enumerator(this);

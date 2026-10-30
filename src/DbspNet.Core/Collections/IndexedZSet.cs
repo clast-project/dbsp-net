@@ -53,7 +53,19 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
 
             return new TraceShape(_groups.Count, values, singletons, bytes, groupsBySize, valuesBySize);
-        });
+        }, CensusEntries);
+
+    private IEnumerable<object> CensusEntries()
+    {
+        foreach (var (key, group) in _groups)
+        {
+            yield return key;
+            foreach (var entry in group.Entries())
+            {
+                yield return entry.Key;
+            }
+        }
+    }
 
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =
         new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
