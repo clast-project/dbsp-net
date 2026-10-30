@@ -3569,6 +3569,28 @@ is columnar territory). The same "unbox the key, keep the operator generic over 
 pattern generalizes to the other row-opaque stateful operators (join/aggregate/TOP-K partition &
 order keys) — measure-first there too.
 
+### 23.8 — Re-measured on retained bytes (2026-10-30): still negative, and it *grows* surviving state
+
+Batch 1's limit is now GC pause, which is all young-generation copying of surviving state
+(design-state-representation §9.15), so the question became whether unboxed typed rows shrink
+what survives. `IvmMultiBatch IVM_TYPE_VIEWS=1` (serial only). The typed program path turns
+single-use view inlining off, so the control is structural with
+`DBSPNET_INLINE_SINGLE_USE=off`. SF=3 batch 1, W=1, Server GC, M4 Pro, outputs byte-identical:
+
+| | structural (default) | structural, no inlining | typed (19/50 views), no inlining | typed vs control |
+|---|---|---|---|---|
+| live after batch 1 (`PromotedBytes`) | 10.60 GB | 10.60 GB | **13.39 GB** | **+26 %** |
+| allocated | 41.45 GiB | 43.47 GiB | 66.65 GiB | +53 % |
+| GC pause | 5.0 s | 4.8 s | 5.8 s | +20 % |
+| engine step | 34.1 s | 33.9 s | 52.1 s | +54 % |
+
+Typing *adds* 2.8 GB of surviving state. A structural row is one `object[]` shared by
+reference by every trace that holds it; a typed row is a struct copied by value into each
+trace and builder slot, and the wide rows of the typed views (trades, watches, daily_market)
+sit in several traces each. That outweighs the boxes it saves. §23.7's key fix shrank the
+allocation penalty (+82 % → +53 %) but the decision stands: typed rows lose on ivm-bench for
+both allocation and retained bytes. (Inlining itself: −2.0 GiB allocated, time-neutral.)
+
 ---
 
 ## 24. Next arc — scoping the remaining ivm-bench batch-1 gap (3.5×, design-only)

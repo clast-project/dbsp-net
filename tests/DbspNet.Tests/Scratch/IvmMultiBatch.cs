@@ -10,6 +10,7 @@
 //   IVM_OUTPUT_MODE   truncate (default) | incremental
 //   IVM_OUT_ROOT      (optional) output Delta root; default = temp. Wiped at start.
 //   IVM_WORKERS       (optional) > 1 runs the data-parallel program on that many workers
+//   IVM_TYPE_VIEWS    (optional) 1 = serial program tries the typed fast path per view
 //   IVM_PAUSE_DIR     (optional) after batch 1, write <dir>/pid and wait for <dir>/go — so a
 //                     heap dump (dotnet-gcdump collect -p <pid>) sees batch 1's retained state
 using System.Diagnostics;
@@ -91,8 +92,26 @@ public class IvmMultiBatch
         var runner = parallel is not null
             ? await ProgramRunner.CreateAsync(parallel, inputs, outputs)
             : await ProgramRunner.CreateAsync(
-                SqlProgram.Compile(spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low),
+                CompileSerial(),
                 inputs, outputs);
+
+        // IVM_TYPE_VIEWS=1 (serial only): each view tries the typed fast path, structural
+        // fallback elsewhere (design-row-representation §23). That path disables single-use
+        // inlining, so compare it against DBSPNET_INLINE_SINGLE_USE=off, not the default.
+        CompiledProgram CompileSerial()
+        {
+            var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") == "1";
+            var compiled = SqlProgram.Compile(
+                spec.Program, outputViews, options: new CompileOptions { TypeEligibleProgramViews = typeViews },
+                numericStringCoercion: true, nullCollation: NullCollation.Low);
+            if (typeViews)
+            {
+                var (typed, fellBack) = PlanToCircuit.LastProgramTypedTally;
+                _out.WriteLine($"TYPED {typed.Count} views typed, {fellBack.Count} fell back; typed: " + string.Join(", ", typed));
+            }
+
+            return compiled;
+        }
 
         _out.WriteLine($"output mode: {mode}, workers: {workers}");
         for (var batch = 1; batch <= 3; batch++)
