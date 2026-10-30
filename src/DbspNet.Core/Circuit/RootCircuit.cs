@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful;
 
 namespace DbspNet.Core.Circuit;
@@ -289,7 +290,17 @@ public sealed class RootCircuit
             // leakage between successive ops).
             var a0 = GC.GetAllocatedBytesForCurrentThread();
             var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (DeltaSizeProfile.Enabled)
+            {
+                DeltaSizeProfile.Current = _operators[i] is IIntrospectable named ? named.MetricName : _operators[i].GetType().Name;
+            }
+
             _operators[i].Step();
+            if (DeltaSizeProfile.Enabled)
+            {
+                DeltaSizeProfile.Current = null;
+            }
+
             _opCumTicks[i] += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
             _opCumAlloc[i] += GC.GetAllocatedBytesForCurrentThread() - a0;
         }

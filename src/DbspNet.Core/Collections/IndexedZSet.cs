@@ -26,6 +26,10 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     internal IndexedZSet(Dictionary<TKey, ZSet<TValue, TWeight>> groups)
     {
         _groups = groups;
+        if (DeltaSizeProfile.Enabled)
+        {
+            DeltaSizeProfile.Record(groups);
+        }
     }
 
     // Registered in a side table only when DBSPNET_TRACE_ACCESS_PROFILE is set and a trace marks

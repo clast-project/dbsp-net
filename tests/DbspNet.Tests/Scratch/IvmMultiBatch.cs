@@ -198,6 +198,15 @@ public class IvmMultiBatch
                 _out.WriteLine("SHAPE values by size [1, 2-4, 5-16, 17-256, 257-4096, >4096] = " + string.Join(" ", valuesBySize));
             }
 
+            if (batch == 1 && DbspNet.Core.Collections.DeltaSizeProfile.Enabled)
+            {
+                // DBSPNET_DELTA_SIZE_PROFILE=1 (with DBSPNET_PROFILE=1 for attribution).
+                foreach (var line in DbspNet.Core.Collections.DeltaSizeProfile.Report())
+                {
+                    _out.WriteLine(line);
+                }
+            }
+
             if (batch == 1 && gcEvents is not null)
             {
                 await Task.Delay(2000); // runtime events arrive asynchronously

@@ -35,6 +35,10 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     internal ZSet(Dictionary<TKey, TWeight> entries)
     {
         _store = entries;
+        if (DeltaSizeProfile.Enabled)
+        {
+            DeltaSizeProfile.Record(entries);
+        }
     }
 
     private ZSet(TKey key, TWeight weight)

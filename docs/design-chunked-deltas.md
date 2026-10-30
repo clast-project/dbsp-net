@@ -1,0 +1,143 @@
+# Chunked Z-set maps — delta containers that stay off the large-object heap (DESIGN, proposed)
+
+Branch `arc/row-repr`. Follows docs/design-paged-trace-state.md §12–§13: the batch-1 young-GC
+cost that §27.6 traced to large-object-heap (LOH) cards is the **per-tick delta Z-sets**, not
+trace state. Raising `GCLOHThreshold` to 16 MB — so those arrays are born young and die young — cut
+ivm-bench SF=3 batch 1 at W=8 from 18.37 s to 15.73 s of drain (young pause 6.44 → 5.26 s, zero
+background gen2s, peak heap −4.6 GB) and lifted Nexmark by a geomean +10% at W=1 and +20% at W=8.
+That setting is process-wide; DbspNet is a library. This design gets the same effect in the data
+structure.
+
+## 1. What the deltas look like (measured)
+
+`DBSPNET_DELTA_SIZE_PROFILE=1` (with `DBSPNET_PROFILE=1` for attribution) records every
+dictionary-backed Z-set and indexed Z-set as it is formed — rows, and entry/bucket bytes from the
+dictionary's capacity — by the operator stepping. ivm-bench SF=3 batch 1, W=8:
+
+| entry-array size | Z-sets | rows | entry bytes |
+|---|---|---|---|
+| < 85 KB | 11,748,137 | 48.2M | 1.74 GB |
+| 85 KB – 1 MB | 1,386 | 13.6M | 0.40 GB |
+| 1 – 4 MB | 778 | 64.6M | 1.94 GB |
+| 4 – 16 MB | 176 | 34.9M | 1.19 GB |
+| > 16 MB | 7 | 6.3M | 0.22 GB (largest 33.5 MB, 982,180 rows) |
+
+- **A few big deltas, not many medium ones.** 2,347 of 11.75M Z-sets cross the threshold, but they
+  carry 71% of the rows.
+- **Growth copies are a third of the LOH traffic.** Their final arrays total 3.75 GB; the runtime's
+  AllocationTick tally (§12) saw 6.0 GB of `Entry<StructuralRow,Z64>[]` on the LOH — the rest is,
+  most likely, the intermediate arrays a dictionary leaves behind each time it doubles (not
+  recorded by this instrument, which sees only the final dictionary).
+- **Producers** (LOH entry bytes): `ApplyOp` (fused filter/project) 1.84 GB; inner join output
+  0.63; `ExchangeIndexOp` 0.29 and `ExchangeOp` 0.20; outside any operator step (input push,
+  gather) 0.35; window/aggregate outputs ~0.35. All are built through `ZSetBuilder` /
+  `IndexedZSetBuilder` or a `ZSet` operation — the structure lives in Collections, not in operators.
+- The 11.7M small ones are mostly the inner per-group Z-sets of indexed deltas (exchange-index
+  1.78M–6.09M per operator kind). They are on the small-object heap already; the design must not
+  make them slower or bigger.
+
+## 2. The structure: `ChunkedMap<TKey, TValue>`
+
+The `Dictionary<TKey,TValue>` algorithm — separate chaining through an entry array, a bucket
+index, a LIFO free list — with its two arrays split into chunks that never reach 85,000 bytes.
+
+```
+ChunkedMap<TKey, TValue>
+  entries : Entry[][]   Entry { int hash; int next; TKey key; TValue value }
+                        chunk 0 starts small and doubles (copying) up to EntryChunk entries;
+                        after that, fixed chunks of EntryChunk, appended — never copied again
+  buckets : int[][]     power-of-two total, chunks of BucketChunk ints; slot = Fibonacci(hash)
+  count, freeList, freeCount                      — exactly Dictionary's bookkeeping
+EntryChunk = 2048 for 24-byte entries (48 KB) — computed per instantiation as
+             largest power of two with EntryChunk × sizeof(Entry) < 85,000
+BucketChunk = 16,384 ints (64 KB)
+```
+
+- **Order is Dictionary's, by construction.** A new entry goes to the free-list head if there is
+  one, else to position `count`; `Remove` pushes onto the free list; resizing never moves an entry.
+  So any sequence of operations enumerates in the order a `Dictionary` would — the property the
+  paged store kept (§11 there), which keeps join/aggregate emission order, downstream floating-point
+  sums, view digests and snapshot files byte-identical.
+- **Small maps are a Dictionary in all but name.** Below `EntryChunk` there is one entry chunk and
+  one bucket chunk, grown by doubling — the same allocation pattern as today (power-of-two instead
+  of prime capacities, so sizes differ slightly).
+- **Large maps never copy entries.** Growth past `EntryChunk` appends a chunk; only the bucket
+  index is rebuilt on resize (reading the stored hash, as `Dictionary` does). The growth copies that
+  are a third of today's LOH traffic disappear, as well as the LOH residency.
+- **Every array is small, so every array is born young.** A delta dies within its tick, so a young
+  GC that sees it either finds it dead (free) or copies a few 48 KB chunks once. No chunk is on the
+  LOH, none is card-scanned while dead, and none counts toward the gen2 budget that drives the
+  background gen2s.
+- **Hashing and equality** go through `EqualityComparer<TKey>.Default` as `Dictionary` does; for
+  `StructuralRow` that is the cached hash and the existing `Equals` — no new hash implementation.
+- **Indexing cost.** One shift and mask per access to pick the chunk. Expected to be within noise
+  of `Dictionary` (which pays a `FastMod`); the micro-benchmark gate in §5 checks it.
+
+### Why not the alternatives
+
+- **Pool deltas across ticks** (`DeltaPoolMode`, §20): removes allocation, not the cost — a pooled
+  map lives in gen2 and is refilled with references to young rows each tick, the old→young pattern
+  that made traces expensive.
+- **Sorted batches, Feldera-style**: still large arrays unless chunked, and sorting `StructuralRow`s
+  costs comparisons the hash path does not pay. A different redesign.
+- **Large-only switch-over** (keep `Dictionary` below the threshold, migrate above): exact order
+  after migration needs `Dictionary`'s free-list positions, which it does not expose. One structure
+  everywhere is simpler and is exact.
+
+## 3. Where it goes
+
+`ZSet<TKey,TWeight>._store` is already polymorphic (a `Dictionary` or an `InlineEntry`); it becomes
+a `ChunkedMap` or an `InlineEntry`. Work, by surface:
+
+| surface | change |
+|---|---|
+| `ZSet`, `ZSetBuilder`, `IndexedZSet`, `IndexedZSetBuilder` (~22 `Dictionary` references) | swap the backing map; reproduce each `Dictionary` operation exactly — including the copy constructor's *compacting* copy used by `Clone`, and `new Dictionary(capacity)` |
+| `ZSet.Enumerator` | wraps the map's struct enumerator instead of `Dictionary`'s |
+| `IndexedZSet.GetEnumerator` | returns `Dictionary<…>.Enumerator` publicly today → its own struct enumerator; every `foreach` keeps compiling |
+| internal `ZSet(Dictionary)` / `IndexedZSet(Dictionary)` constructors | used by Trace.cs, the two spine traces, the paged store and the census/profile hooks; they take the map instead |
+| `TraceAccessProfile`, `HeapCensus`, `DeltaSizeProfile` | read the map's sizes |
+
+Trace state uses the same types, so it is chunked too. For long-lived state that is neutral: an
+old→young reference costs a card whether its array is on the LOH or in gen2 small-object pages, and
+§12 measured trace containers as a small share.
+
+Behind `DBSPNET_ZSET_MAP=chunked` while it is measured; default `Dictionary`. The seam is a
+static readonly flag read at map creation, as `DeltaPoolMode` does.
+
+**Not covered here, seen in §12's LOH tally:** `KeyValuePair<StructuralRow,Z64>[]` (1.28 GB) and
+`object[]` (0.75 GB) on the LOH — other producers (exchange sharding buffers and similar, to be
+located with the AllocationTick stack or the size profile extended to them). A follow-up once the
+map lands, judged by what is left on `IVM_LOH_ALLOC`.
+
+## 4. Increments
+
+1. **`ChunkedMap` alone**, with a differential test against `Dictionary`: random operation
+   sequences (add, set, remove, re-add, clear-by-removal, capacity hints, copy) checking contents
+   *and enumeration order* after every step, across the chunk boundary; plus a micro-benchmark
+   (insert/lookup/enumerate at 10, 1K, 100K, 1M entries) against `Dictionary`.
+2. **Flat Z-sets** (`ZSet`, `ZSetBuilder`) behind the seam — the bulk of the LOH bytes.
+3. **Indexed Z-sets** (`IndexedZSet`, `IndexedZSetBuilder`, outer map and enumerator).
+4. Whatever `IVM_LOH_ALLOC` still shows (the `KeyValuePair[]` / `object[]` producers).
+
+## 5. Gates and instruments
+
+- **Correctness:** suite green with the seam off and on; ivm-bench SF=3 view digests identical at
+  W=1 and W=8; snapshot files byte-identical (same order by construction).
+- **It did what it says:** `IVM_LOH_ALLOC=1` shows no `Entry<…>[]` on the LOH;
+  `DBSPNET_DELTA_SIZE_PROFILE` largest chunk < 85 KB.
+- **Batch 1 (the prize):** drain-only young pause and drain time, ≥ 5 alternating runs per arm at
+  W=8. Target: the 16 MB-threshold result (−2.6 s drain). **Keep if it reaches at least half of
+  that without the runtime setting**; then also measure it combined with the setting (anything left
+  for the knob is the follow-up's size).
+- **Nexmark:** throughput at W=1 and W=8, alternating processes; geomean not worse, and compared
+  with the +10% / +20% the setting gave.
+- **Fine-tick cost:** w1profile B/ev will *change* (power-of-two capacities, different growth), so
+  it is reported, not required identical; the micro-benchmark gate is ≤ 5% slower than `Dictionary`
+  at every size.
+
+## 6. Decisions for Curt
+
+(a) One structure everywhere (proposed) or large-only with a migration step?
+(b) If it lands, also ship `System.GC.LOHThreshold` as belt and braces for the hosts we own
+    (server, benchmarks), or rely on the structure alone?
+(c) Start with increment 1 + 2 (flat Z-sets, ~80% of the LOH entry bytes) as one measured step?
