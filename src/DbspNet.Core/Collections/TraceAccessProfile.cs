@@ -39,7 +39,7 @@ internal static class TraceAccessProfile
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, TraceAccessCounter> Table = new();
 
     internal static void Mark(
-        object collection, string kind, Func<int> stateKeys, Func<(long Groups, long Values, long Singletons)>? shape = null)
+        object collection, string kind, Func<int> stateKeys, Func<TraceShape>? shape = null)
     {
         if (!Enabled)
         {
@@ -83,11 +83,10 @@ internal static class TraceAccessProfile
 
 /// <summary>Per-collection access tallies; see <see cref="TraceAccessProfile"/>.</summary>
 internal sealed class TraceAccessCounter(
-    string kind, Func<int> stateKeys, Func<(long Groups, long Values, long Singletons)>? shape = null)
+    string kind, Func<int> stateKeys, Func<TraceShape>? shape = null)
 {
-    /// <summary>An indexed trace's group shape right now: groups, inner values across them, and
-    /// groups holding exactly one value. <c>null</c> for a flat trace.</summary>
-    public (long Groups, long Values, long Singletons)? Shape => shape?.Invoke();
+    /// <summary>An indexed trace's group shape right now; <c>null</c> for a flat trace.</summary>
+    public TraceShape? Shape => shape?.Invoke();
 
     private readonly HashSet<object> _touched = new();
 
@@ -125,4 +124,24 @@ internal sealed class TraceAccessCounter(
         Scans = 0;
         _touched.Clear();
     }
+}
+
+/// <summary>
+/// An indexed trace's group shape (DBSPNET_TRACE_ACCESS_PROFILE census): groups, inner values,
+/// single-value groups, the bytes of the per-group containers (the inner Z-set and its storage;
+/// the outer dictionary and the rows themselves excluded), and groups / values by group size
+/// in buckets 1, 2–4, 5–16, 17–256, 257–4096, &gt;4096.
+/// </summary>
+internal sealed record TraceShape(
+    long Groups, long Values, long Singletons, long ContainerBytes, long[] GroupsBySize, long[] ValuesBySize)
+{
+    public static int Bucket(int size) => size switch
+    {
+        <= 1 => 0,
+        <= 4 => 1,
+        <= 16 => 2,
+        <= 256 => 3,
+        <= 4096 => 4,
+        _ => 5,
+    };
 }

@@ -34,17 +34,25 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     internal void MarkTraceState() =>
         TraceAccessProfile.Mark(this, "indexed", () => _groups.Count, () =>
         {
-            long values = 0, singletons = 0;
+            long values = 0, singletons = 0, bytes = 0;
+            var groupsBySize = new long[6];
+            var valuesBySize = new long[6];
             foreach (var group in _groups.Values)
             {
-                values += group.Count;
-                if (group.Count == 1)
+                var n = group.Count;
+                values += n;
+                if (n == 1)
                 {
                     singletons++;
                 }
+
+                bytes += group.ContainerBytes();
+                var b = TraceShape.Bucket(n);
+                groupsBySize[b]++;
+                valuesBySize[b] += n;
             }
 
-            return (_groups.Count, values, singletons);
+            return new TraceShape(_groups.Count, values, singletons, bytes, groupsBySize, valuesBySize);
         });
 
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =

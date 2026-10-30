@@ -42,6 +42,24 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         _store = new InlineEntry(key, weight);
     }
 
+    /// <summary>
+    /// Approximate heap bytes of this Z-set's own objects (itself and its storage, not the keys):
+    /// for the trace-shape census. 64-bit layout: object header 16 B; Dictionary ~80 B plus a
+    /// bucket int per slot and an entry (hash, next, key, value) per slot.
+    /// </summary>
+    internal long ContainerBytes()
+    {
+        const long Self = 24;
+        if (Dict is not { } d)
+        {
+            return Self + 16 + (2 * IntPtr.Size);
+        }
+
+        long capacity = d.EnsureCapacity(0);
+        var entry = 8 + Unsafe.SizeOf<TKey>() + Unsafe.SizeOf<TWeight>();
+        return Self + 80 + (24 + (4 * capacity)) + (24 + (entry * capacity));
+    }
+
     /// <summary>The backing dictionary, or null when inline.</summary>
     private Dictionary<TKey, TWeight>? Dict =>
         _store is InlineEntry ? null : Unsafe.As<Dictionary<TKey, TWeight>>(_store);

@@ -1326,6 +1326,74 @@ The incremental batches went from 3.44 / 2.95 s (truncate output, previous run) 
 0.13 / 0.09 s. Storage is flat. Batch 1 is unchanged: equal CPU, but Feldera uses ~11 cores
 and the DbspNet server one circuit. **Next lever: run the ivm-bench program in parallel.**
 
+### 9.15 Parallel batch 1, and why the flattened trace stays unbuilt
+
+**Parallel.** Every ivm-bench view now compiles to the parallel structural program (outer /
+semi / anti joins, global operators gathered to worker 0, cross-join broadcast, REAL /
+INTERVAL partition hashing), and ivm-bench runs `DBSPNET_WORKERS=12` (Feldera's `workers: 12`).
+SF=3 outputs at W=4/8/12 are byte-identical to serial. Running it found a silent serial bug —
+correlated semi-join outer keys were not cast to the common type, so DATE = TIMESTAMP never
+matched (`5f0f0a4`). CI (run 40980861676, pin `5a6e550`):
+
+| batch | Feldera | DbspNet serial (§9.14) | DbspNet W=12 |
+|---|---|---|---|
+| 1 | 27.2 s | 90.8 s | **44.4 s** (376 vs 284 CPU-s) |
+| 2 | 3.50 s | 0.13 s | 0.36 s |
+| 3 | 3.70 s | 0.09 s | 0.35 s |
+
+Batches 2/3 needed delta-maintained row counts (`/wait` had formed every view from its W
+shards) and a tick's input pushes merged once instead of pairwise (quadratic; serial too).
+They are still ~3× serial on CI and not locally — unexplained.
+
+**Where batch 1's parallel time goes** (local, Server GC — always profile with
+`DOTNET_gcServer=1`; workstation GC serialises gen0 and made W=8 look 1.3×):
+
+- No serial bottleneck: at W=12 every worker spends ~15.4 s in the step (8.5–11 s busy, the
+  rest exchange + barrier wait); worker 0, which runs the gathered global operators, is not
+  the straggler. (`DBSPNET_PROFILE` now prints per-worker busy/exchange and the most
+  imbalanced operators.)
+- **GC pause is the Amdahl term**: 4.5 s serial, 6.3–6.9 s at W=8/12 (~40% of the step).
+  GC knobs (gen0 budget 1–4 GiB, non-concurrent, 8 heaps) do not move it; sharing boxes for
+  decoded small ints / dates / bools cut allocation 0.25% (reverted).
+- **The pause is all young-generation copying.** From the runtime's GC events
+  (`IVM_GC_EVENTS=1`): W=1 — gen0 10 GCs 2.20 s, gen1 5 GCs 2.15 s, gen2 4 *background*
+  GCs 6 ms; W=8 — gen0 2.32 s, gen1 3.62 s, gen2 13 ms. There is no blocking full GC. A bulk
+  load keeps nearly everything it allocates, so each young GC copies the new state up a
+  generation: pause follows surviving bytes, about twice over.
+
+**Retained state after batch 1** (`IVM_MEASURE_LIVE=1`: `PromotedBytes` of a forced full
+blocking GC — `GC.GetTotalMemory` under Server GC swung 12.7–21.5 GB on unchanged code):
+10.6 GB. Trace census (`DBSPNET_TRACE_ACCESS_PROFILE=1`): 115 indexed traces, 5.40M groups,
+24.9M values; groups by size 1 / 2–4 / 5–16 / 17–256 / 257–4096 / >4096 =
+3.33M / 1.92M / 109k / 28k / 14k / 15, holding 3.3M / 4.8M / 0.7M / 2.6M / **10.5M / 3.0M**
+values. Per-group containers (inner Z-set and its storage) = **1.19 GB, 11%** of live; the
+rows are most of the rest.
+
+**Shipped from this:** a one-entry Z-set is held inline (`3be707e`; Z-set storage is the
+dictionary or a sealed one-entry object in one field — a generic key field instead taxed
+every struct-keyed delta, q4 +26 B/ev). Live 11.21 → 10.59 GB; w1profile q4 −32, q9 −26,
+q20 −7, q3 −4 B/ev, others identical. Wall effect below noise.
+
+**The flattened trace — measured, not built.** It was built once already (§10.C, FlatHash):
+state −35–48% on Nexmark but joins 9–15% *slower* and in-step GC pause unchanged (§6). For
+ivm-bench batch 1 the ceiling is now bounded from both sides:
+
+- What it removes is the 11% of surviving bytes in per-group containers. Paged into
+  large-object-heap pages those would not be copied by young GCs at all, so the bound is
+  ~11% of the pause: **~0.5–0.7 s at W=8, ~3% of batch wall**, before any probe-cost loss.
+  More than half the values sit in ~14k groups of 257+ rows, which a flat layout must still
+  index by value — little container saving there.
+- A synthetic full-scale probe (`TraceLayoutGcProbe`, the census shape in three layouts) shows
+  why a static-heap measure misleads: a forced full GC pauses 0.25 s with the rows alone in
+  16K pages, 0.8–1.2 s for today's trace, 0.4 s for a paged flat trace — but 3.0 s for the
+  rows in one 25M-element array, and 2.3–3.0 s for an unpaged flat trace. Server GC marks a
+  huge reference array on one thread; any flat layout must be paged. Real batch-1 pauses are
+  not full GCs, though, so this −60% does not transfer.
+
+**Decision: do not build the flattened trace for batch 1.** The lever the data points at is
+the rows: ~80% of surviving bytes, copied about twice per bulk load — the unboxed / columnar
+row representation, whose cost docs/design-columnar-batch1.md §7–§9 measured.
+
 ## 10. Appendix — unshipped variants (write-ups archived from their branches)
 
 These sections lived only on their experiment branches. They are copied here verbatim

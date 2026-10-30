@@ -85,6 +85,9 @@ public class IvmMultiBatch
         var outputs = spec.Output_Bindings
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
             .ToList();
+        // IVM_GC_EVENTS=1: every GC pause during batch 1 (suspend → restart), by generation.
+        using var gcEvents = Environment.GetEnvironmentVariable("IVM_GC_EVENTS") == "1" ? new GcPauseListener() : null;
+
         var runner = parallel is not null
             ? await ProgramRunner.CreateAsync(parallel, inputs, outputs)
             : await ProgramRunner.CreateAsync(
@@ -142,7 +145,9 @@ public class IvmMultiBatch
             if (batch == 1 && DbspNet.Core.Collections.TraceAccessProfile.Enabled)
             {
                 // Indexed-trace group shape after the bulk load (DBSPNET_TRACE_ACCESS_PROFILE=1).
-                long traces = 0, groups = 0, values = 0, singletons = 0, flatTraces = 0, flatRows = 0;
+                long traces = 0, groups = 0, values = 0, singletons = 0, containerBytes = 0, flatTraces = 0, flatRows = 0;
+                var groupsBySize = new long[6];
+                var valuesBySize = new long[6];
                 foreach (var c in DbspNet.Core.Collections.TraceAccessProfile.Snapshot())
                 {
                     if (c.Shape is { } sh)
@@ -151,6 +156,12 @@ public class IvmMultiBatch
                         groups += sh.Groups;
                         values += sh.Values;
                         singletons += sh.Singletons;
+                        containerBytes += sh.ContainerBytes;
+                        for (var i = 0; i < 6; i++)
+                        {
+                            groupsBySize[i] += sh.GroupsBySize[i];
+                            valuesBySize[i] += sh.ValuesBySize[i];
+                        }
                     }
                     else
                     {
@@ -161,7 +172,15 @@ public class IvmMultiBatch
 
                 _out.WriteLine(string.Create(
                     CultureInfo.InvariantCulture,
-                    $"SHAPE indexed traces={traces} groups={groups} values={values} singleton_groups={singletons} | flat traces={flatTraces} rows={flatRows}"));
+                    $"SHAPE indexed traces={traces} groups={groups} values={values} singleton_groups={singletons} container_bytes={containerBytes} | flat traces={flatTraces} rows={flatRows}"));
+                _out.WriteLine("SHAPE groups by size [1, 2-4, 5-16, 17-256, 257-4096, >4096] = " + string.Join(" ", groupsBySize));
+                _out.WriteLine("SHAPE values by size [1, 2-4, 5-16, 17-256, 257-4096, >4096] = " + string.Join(" ", valuesBySize));
+            }
+
+            if (batch == 1 && gcEvents is not null)
+            {
+                await Task.Delay(2000); // runtime events arrive asynchronously
+                _out.WriteLine("GCPAUSE " + gcEvents.Report());
             }
 
             // What the server's /wait reports after every batch.
@@ -278,4 +297,61 @@ public class IvmMultiBatch
     private sealed record InputBinding(string Table, string Uri, string Mode);
 
     private sealed record OutputBinding(string View, string Uri, string Mode);
+
+    // Pairs each GC's suspend-begin with its restart-end (the pause the application sees) and
+    // charges it to that GC's generation and kind, from the runtime's own GC events.
+    private sealed class GcPauseListener : System.Diagnostics.Tracing.EventListener
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, (int Count, double Ms)> _byKind = new(StringComparer.Ordinal);
+        private DateTime _suspend;
+        private string? _kind;
+
+        protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+        {
+            if (source.Name == "Microsoft-Windows-DotNETRuntime")
+            {
+                EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Informational, (System.Diagnostics.Tracing.EventKeywords)0x1);
+            }
+        }
+
+        protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+        {
+            lock (_gate)
+            {
+                switch (e.EventName)
+                {
+                    case "GCSuspendEEBegin_V1":
+                        _suspend = e.TimeStamp;
+                        break;
+                    case "GCStart_V2":
+                        var depth = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Depth")], CultureInfo.InvariantCulture);
+                        var type = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Type")], CultureInfo.InvariantCulture);
+                        _kind = "gen" + depth + (type == 1 ? " background" : type == 2 ? " foreground" : " blocking");
+                        break;
+                    case "GCRestartEEEnd_V1":
+                        if (_suspend != default)
+                        {
+                            var kind = _kind ?? "no GC (suspension only)";
+                            var (n, ms) = _byKind.GetValueOrDefault(kind);
+                            _byKind[kind] = (n + 1, ms + (e.TimeStamp - _suspend).TotalMilliseconds);
+                        }
+
+                        _suspend = default;
+                        _kind = null;
+                        break;
+                }
+            }
+        }
+
+        public string Report()
+        {
+            lock (_gate)
+            {
+                return string.Join("; ", _byKind.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv =>
+                    string.Create(CultureInfo.InvariantCulture, $"{kv.Key}: {kv.Value.Count} GCs {kv.Value.Ms:F0} ms")))
+                    + string.Create(CultureInfo.InvariantCulture, $"; total {_byKind.Values.Sum(v => v.Ms):F0} ms");
+            }
+        }
+    }
 }
