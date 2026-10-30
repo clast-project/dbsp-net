@@ -200,3 +200,50 @@ both from staying off the LOH and from add being cheaper than `Dictionary`'s at 
 **Next:** increment 3 (indexed Z-sets' outer map + `IndexedZSetBuilder`) and increment 4 (the
 `KeyValuePair[]` / `object[]` producers — not yet located), each measured the same way; then the
 default flip.
+
+## 8. Increments 3 + 4 — built and measured (2026-10-30)
+
+Commits `8de9260` (indexed Z-sets: `IndexedZSet` / `IndexedZSetBuilder` keep one `object` store
+field read through `MapView`, a struct over either map; `IndexedZSet.GetEnumerator` returns its own
+struct enumerator) and `145d7cf` (exchange buckets: the five exchange operators publish
+`IReadOnlyList` buckets — `List<T>` with the seam off, unchanged; `ChunkedList<T>` with it on — and
+gather through `ExchangeBuckets.Items`, an unboxed struct enumeration of either).
+
+**Correctness.** Suite 2640/2640 off and on; ivm-bench all 16 digests identical in every run below.
+Default off is still byte-identical on w1profile B/ev (all ten queries vs `9935319`); on, B/ev is as
+after increment 2 (+0.9–6.5%; W=1 creates no exchange operators).
+
+**LOH after all four increments** (`IVM_LOH_ALLOC=1`, one run, W=8): gone — `Entry<Row,Z64>[]`
+6.0 GB, `KeyValuePair<Row,Z64>[]` 1.28 GB, indexed outer maps 0.51 GB, builder maps 0.41 GB. Left:
+`byte[]` 1.48 GB (reference-free: never card-scanned), `object[]` 0.75 GB (**producer not
+located** — no allocation site in the engine, Arrow or connector code matches by inspection, and
+in-process AllocationTick events carry no stacks), `int[]` 0.31 GB (reference-free), the Delta output
+connector's `Entry<object, List<RowAddress>>[]` 0.20 GB, and small non-Z-set operator-state maps.
+
+**ivm-bench SF=3 batch 1, W=8**, 5 alternating runs, drain only:
+
+| | Dictionary | ChunkedMap (1–4) | Δ |
+|---|---|---|---|
+| drain | 19.97 s (median 19.40, sd 1.20) | **16.89 s** (median 16.29, sd 1.14) | **−3.08 s** (SE 0.74) |
+| young pause | 6.55 s (sd 0.42) | **5.53 s** (sd 0.17) | **−1.02 s** (SE 0.20) |
+| background gen2s | 7–9 | 2–5 | |
+
+The keep-gate (≥ 1.3 s drain without the runtime setting) is met with margin. (This session's
+baseline ran slower than earlier ones — 19.97 s vs ~18.4–19.0 s — so compare within the table, not
+against §13.1 of the paged-store doc.)
+
+**Nexmark** (3 alternating processes per arm, median ratio, events/s), W=1 / W=8:
+
+q0 1.08/1.05 · q1 1.35/1.38 · q2 1.12/1.10 · q3 1.02/1.06 · q4 1.24/0.96 · q9 1.18/1.03 ·
+q5 1.42/2.42 · q7 1.14/— · q8 0.99/1.03 · q12 1.11/1.11 · q15 1.21/1.32 · q16 1.19/1.06 ·
+q17 1.22/0.99 · q18 1.27/1.28 · q19 1.20/0.90 · q20 1.21/0.99 · q22 1.11/1.12 —
+**geomean 1.18 (W=1), 1.14 (W=8)**.
+
+W=8 is slightly below increment 2's 1.18 (q19 0.90, q4 0.96). Single W=8 cells on this box spread
+up to ~2.7× across processes, so this is not attributed to increment 4 without more runs; a W=8
+A/B of increment 4 alone (exchange buckets on vs off) would settle it.
+
+**Open:** (1) the `object[]` producer; (2) large-map lookup still 1.16–1.30× Dictionary (§7); (3) the
+default flip — the seam is still off; (4) the unexplained short test totals (2561, 2599 of 2640,
+both "Passed!", not reproduced in seven reruns — suspected test-host abort hidden by the summary
+grep; abort lines are now checked).
