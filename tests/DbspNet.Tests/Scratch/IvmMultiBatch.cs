@@ -115,10 +115,14 @@ public class IvmMultiBatch
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
             }
 
+            // What the server's /wait reports after every batch.
+            var c0 = Stopwatch.GetTimestamp();
+            var viewRows = runner.ViewRowCounts().Sum(kv => kv.Value);
+            var countsMs = Stopwatch.GetElapsedTime(c0).TotalMilliseconds;
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} parquet_mb={bytes / 1e6:F1}"));
+                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1}"));
         }
 
         foreach (var o in outputs)
