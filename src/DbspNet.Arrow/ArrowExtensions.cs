@@ -77,13 +77,8 @@ public static class ArrowExtensions
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(changes);
-        var columnCount = schema.Count;
-        var cols = new List<object?>[columnCount];
-        for (var c = 0; c < columnCount; c++)
-        {
-            cols[c] = new List<object?>(changes.Count);
-        }
-
+        // The inserted rows are kept anyway (they are InsertKeys), so the Arrow columns are built
+        // straight from them — no boxed per-column staging copy (docs/design-chunked-deltas.md §8).
         var keys = new List<object>(changes.Count);
         var deletes = new List<(object Key, long Count)>();
         foreach (var (row, weight) in changes)
@@ -97,24 +92,13 @@ public static class ArrowExtensions
 
             for (long k = 0; k < w; k++)
             {
-                for (var c = 0; c < columnCount; c++)
-                {
-                    cols[c].Add(row[c]);
-                }
-
                 keys.Add(row);
             }
         }
 
-        var columns = new object?[columnCount][];
-        for (var c = 0; c < columnCount; c++)
-        {
-            columns[c] = cols[c].ToArray();
-        }
-
         var ones = new long[keys.Count];
         System.Array.Fill(ones, 1L);
-        return new ArrowChanges(Assemble(schema, columns, ones, keys.Count).Rows, keys, deletes);
+        return new ArrowChanges(AssembleRows(schema, keys, ones).Rows, keys, deletes);
     }
 
     private static ArrowDelta BuildArrow(
@@ -128,37 +112,20 @@ public static class ArrowExtensions
         {
             // Delta path: one Arrow row per distinct Z-set row, carrying its signed weight.
             var rowCount = zset.Count;
-            var perColumn = new object?[columnCount][];
-            for (var c = 0; c < columnCount; c++)
-            {
-                perColumn[c] = new object?[rowCount];
-            }
-
+            var rows = new List<object>(rowCount);
             var weights = new long[rowCount];
-            var rowIndex = 0;
             foreach (var (row, weight) in zset)
             {
-                for (var c = 0; c < columnCount; c++)
-                {
-                    perColumn[c][rowIndex] = row[c];
-                }
-
-                weights[rowIndex] = weight.Value;
-                rowIndex++;
+                weights[rows.Count] = weight.Value;
+                rows.Add(row);
             }
 
-            return Assemble(schema, perColumn, weights, rowCount);
+            return AssembleRows(schema, rows, weights);
         }
 
         // View path: emit each row w times (its view multiplicity). A materialized view
         // never carries a non-positive accumulated weight, so those are dropped.
-        var cols = new List<object?>[columnCount];
-        for (var c = 0; c < columnCount; c++)
-        {
-            cols[c] = new List<object?>(zset.Count);
-        }
-
-        long total = 0;
+        var expanded = new List<object>(zset.Count);
         foreach (var (row, weight) in zset)
         {
             var w = weight.Value;
@@ -169,25 +136,26 @@ public static class ArrowExtensions
 
             for (long k = 0; k < w; k++)
             {
-                for (var c = 0; c < columnCount; c++)
-                {
-                    cols[c].Add(row[c]);
-                }
+                expanded.Add(row);
             }
-
-            total += w;
         }
 
-        var expandedCount = checked((int)total);
-        var expandedColumns = new object?[columnCount][];
-        for (var c = 0; c < columnCount; c++)
-        {
-            expandedColumns[c] = cols[c].ToArray();
-        }
-
-        var ones = new long[expandedCount];
+        var ones = new long[expanded.Count];
         System.Array.Fill(ones, 1L);
-        return Assemble(schema, expandedColumns, ones, expandedCount);
+        return AssembleRows(schema, expanded, ones);
+    }
+
+    // Each Arrow column built straight from the rows.
+    private static ArrowDelta AssembleRows(SqlSchema schema, IReadOnlyList<object> rows, long[] weights)
+    {
+        var arrays = new IArrowArray[schema.Count];
+        for (var c = 0; c < schema.Count; c++)
+        {
+            arrays[c] = ArrowColumns.Build(schema[c].Type, rows, c);
+        }
+
+        var arrowSchema = ArrowSchemaBridge.ToArrow(schema);
+        return new ArrowDelta(new RecordBatch(arrowSchema, arrays, rows.Count), weights);
     }
 
     private static ArrowDelta Assemble(SqlSchema schema, object?[][] perColumn, long[] weights, int rowCount)
@@ -316,23 +284,20 @@ public static class ArrowExtensions
                 nameof(batch));
         }
 
-        var rowCount = batch.Length;
-        var columns = new object?[schema.Count][];
-        void Extract(int c) =>
-            columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, rowCount, StringDecoding.Transcode);
-        if (rowCount < DbspNet.Core.Circuit.ShardedInputHandle<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64>.ParallelSplitThreshold)
+        // Decoded in row blocks inside the parallel row build, not as whole-batch boxed columns:
+        // a whole column is an object?[rowCount] on the large-object heap (design-chunked-deltas §8).
+        object?[][] Decode(int from, int count)
         {
+            var columns = new object?[schema.Count][];
             for (var c = 0; c < columns.Length; c++)
             {
-                Extract(c);
+                columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, from, count, StringDecoding.Transcode);
             }
-        }
-        else
-        {
-            Parallel.For(0, columns.Length, Extract);
+
+            return columns;
         }
 
-        input.PushColumns(columns, weights.ToArray(), rowCount);
+        input.PushColumnBlocks(batch.Length, weights.ToArray(), Decode);
     }
 
     private static void PushArrowCore(
@@ -352,37 +317,40 @@ public static class ArrowExtensions
 
         var rowCount = batch.Length;
 
-        // Phase 1: per-column extraction. Each column walks its Arrow
-        // array in a single typed loop. Per-cell virtual dispatch through
-        // an abstract reader is gone.
-        var perColumn = new object?[columnCount][];
-        for (var c = 0; c < columnCount; c++)
-        {
-            perColumn[c] = ArrowColumns.Extract(
-                batch.Column(c), schema[c].Type, rowCount,
-                zeroCopyStrings ? StringDecoding.Alias : StringDecoding.Transcode);
-        }
-
-        // Phase 2: assemble row-major deltas from the column-major buffers.
-        // This is unavoidable while StructuralRow stores object?[] internally
-        // — typed-row support would let us skip the per-row allocation.
         var deltas = new List<(object?[] Values, long Weight)>(rowCount);
         var hasWeights = weights is not null;
-        for (var i = 0; i < rowCount; i++)
-        {
-            var weight = hasWeights ? weights![i] : 1L;
-            if (weight == 0)
-            {
-                continue;
-            }
+        var perColumn = new object?[columnCount][];
+        var strings = zeroCopyStrings ? StringDecoding.Alias : StringDecoding.Transcode;
 
-            var row = new object?[columnCount];
+        // Per block of rows: each column walks its Arrow array in one typed loop (no per-cell
+        // virtual dispatch), then the block's rows are assembled row-major. Blocks keep the boxed
+        // column buffers off the large-object heap (docs/design-chunked-deltas.md §8).
+        const int BlockRows = 4096;
+        for (var block = 0; block < rowCount; block += BlockRows)
+        {
+            var count = Math.Min(BlockRows, rowCount - block);
             for (var c = 0; c < columnCount; c++)
             {
-                row[c] = perColumn[c][i];
+                perColumn[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, block, count, strings);
             }
 
-            deltas.Add((row, weight));
+            for (var r = 0; r < count; r++)
+            {
+                var i = block + r;
+                var weight = hasWeights ? weights![i] : 1L;
+                if (weight == 0)
+                {
+                    continue;
+                }
+
+                var row = new object?[columnCount];
+                for (var c = 0; c < columnCount; c++)
+                {
+                    row[c] = perColumn[c][r];
+                }
+
+                deltas.Add((row, weight));
+            }
         }
 
         return deltas;

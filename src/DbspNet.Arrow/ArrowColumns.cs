@@ -40,141 +40,149 @@ internal static class ArrowColumns
 
     public static object?[] Extract(
         IArrowArray array, SqlType type, int rowCount,
+        StringDecoding strings = StringDecoding.Transcode) =>
+        Extract(array, type, 0, rowCount, strings);
+
+    /// <summary>Rows <c>[from, from + rowCount)</c> of <paramref name="array"/>, so a caller can
+    /// decode a large batch in blocks whose staging arrays stay off the large-object heap
+    /// (docs/design-chunked-deltas.md §8).</summary>
+    public static object?[] Extract(
+        IArrowArray array, SqlType type, int from, int rowCount,
         StringDecoding strings = StringDecoding.Transcode) => type switch
     {
         // INTEGER binds against any narrow signed int (FromArrowType widens Int8/Int16/Int32
         // → INTEGER), so the source array can be any of the three widths; widen to int here.
         SqlIntegerType => array switch
         {
-            Int32Array a32 => ExtractInt32(a32, rowCount),
-            Int16Array a16 => ExtractInt16(a16, rowCount),
-            Int8Array a8 => ExtractInt8(a8, rowCount),
+            Int32Array a32 => ExtractInt32(a32, from, rowCount),
+            Int16Array a16 => ExtractInt16(a16, from, rowCount),
+            Int8Array a8 => ExtractInt8(a8, from, rowCount),
             _ => throw new NotSupportedException(
                 $"INTEGER source column is {array.GetType().Name}; expected Int8/Int16/Int32Array"),
         },
-        SqlBigintType => ExtractInt64((Int64Array)array, rowCount),
-        SqlRealType => ExtractFloat((FloatArray)array, rowCount),
-        SqlDoubleType => ExtractDouble((DoubleArray)array, rowCount),
-        SqlBooleanType => ExtractBool((BooleanArray)array, rowCount),
+        SqlBigintType => ExtractInt64((Int64Array)array, from, rowCount),
+        SqlRealType => ExtractFloat((FloatArray)array, from, rowCount),
+        SqlDoubleType => ExtractDouble((DoubleArray)array, from, rowCount),
+        SqlBooleanType => ExtractBool((BooleanArray)array, from, rowCount),
         SqlVarcharType => strings switch
         {
-            StringDecoding.Alias => ExtractStringAlias((StringArray)array, rowCount),
-            StringDecoding.Arena => ExtractStringArena((StringArray)array, rowCount),
-            _ => ExtractString((StringArray)array, rowCount),
+            StringDecoding.Alias => ExtractStringAlias((StringArray)array, from, rowCount),
+            StringDecoding.Arena => ExtractStringArena((StringArray)array, from, rowCount),
+            _ => ExtractString((StringArray)array, from, rowCount),
         },
-        SqlDateType => ExtractDate((Date32Array)array, rowCount),
-        SqlTimeType => ExtractTime((Time64Array)array, rowCount),
+        SqlDateType => ExtractDate((Date32Array)array, from, rowCount),
+        SqlTimeType => ExtractTime((Time64Array)array, from, rowCount),
         // A Delta table's log schema can report TIMESTAMP while the physical Parquet stores
         // the legacy INT96 encoding, which engineered-wood surfaces as raw FixedSizeBinary(12)
         // rather than converting it. Decode INT96 here (driven by the declared type) so the
         // source's data conforms to the schema it advertises.
         SqlTimestampType => array is Apache.Arrow.Arrays.FixedSizeBinaryArray int96
-            ? ExtractTimestampInt96(int96, rowCount)
-            : ExtractTimestamp((TimestampArray)array, rowCount),
+            ? ExtractTimestampInt96(int96, from, rowCount)
+            : ExtractTimestamp((TimestampArray)array, from, rowCount),
         // A DECIMAL binds against the Delta log's canonical Decimal128, but the Parquet
         // physical can pack small precisions into INT32/INT64, which engineered-wood surfaces
         // as Decimal32/Decimal64Array. The mantissa is the same scaled integer at every width;
         // widen it to Int128.
         SqlDecimalType => array switch
         {
-            Decimal128Array d128 => ExtractDecimal(d128, rowCount),
-            Decimal64Array d64 => ExtractDecimal64(d64, rowCount),
-            Decimal32Array d32 => ExtractDecimal32(d32, rowCount),
+            Decimal128Array d128 => ExtractDecimal(d128, from, rowCount),
+            Decimal64Array d64 => ExtractDecimal64(d64, from, rowCount),
+            Decimal32Array d32 => ExtractDecimal32(d32, from, rowCount),
             _ => throw new NotSupportedException(
                 $"DECIMAL source column is {array.GetType().Name}; expected Decimal32/64/128Array"),
         },
         _ => throw new NotSupportedException($"no Arrow extractor for {type.Display}"),
     };
 
-    private static object?[] ExtractInt32(Int32Array a, int n)
+    private static object?[] ExtractInt32(Int32Array a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)values[i];
+            result[i] = a.IsNull(from + i) ? null : (object)values[from + i];
         }
 
         return result;
     }
 
-    private static object?[] ExtractInt16(Int16Array a, int n)
+    private static object?[] ExtractInt16(Int16Array a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)(int)values[i];
+            result[i] = a.IsNull(from + i) ? null : (object)(int)values[from + i];
         }
 
         return result;
     }
 
-    private static object?[] ExtractInt8(Int8Array a, int n)
+    private static object?[] ExtractInt8(Int8Array a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)(int)values[i];
+            result[i] = a.IsNull(from + i) ? null : (object)(int)values[from + i];
         }
 
         return result;
     }
 
-    private static object?[] ExtractInt64(Int64Array a, int n)
+    private static object?[] ExtractInt64(Int64Array a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)values[i];
+            result[i] = a.IsNull(from + i) ? null : (object)values[from + i];
         }
 
         return result;
     }
 
-    private static object?[] ExtractFloat(FloatArray a, int n)
+    private static object?[] ExtractFloat(FloatArray a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)values[i];
+            result[i] = a.IsNull(from + i) ? null : (object)values[from + i];
         }
 
         return result;
     }
 
-    private static object?[] ExtractDouble(DoubleArray a, int n)
+    private static object?[] ExtractDouble(DoubleArray a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)values[i];
+            result[i] = a.IsNull(from + i) ? null : (object)values[from + i];
         }
 
         return result;
     }
 
-    private static object?[] ExtractBool(BooleanArray a, int n)
+    private static object?[] ExtractBool(BooleanArray a, int from, int n)
     {
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object?)a.GetValue(i);
+            result[i] = a.IsNull(from + i) ? null : (object?)a.GetValue(from + i);
         }
 
         return result;
     }
 
-    private static object?[] ExtractString(StringArray a, int n)
+    private static object?[] ExtractString(StringArray a, int from, int n)
     {
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)Utf8String.Of(a.GetString(i));
+            result[i] = a.IsNull(from + i) ? null : (object)Utf8String.Of(a.GetString(from + i));
         }
 
         return result;
@@ -191,21 +199,21 @@ internal static class ArrowColumns
     /// owner reference even if the batch is disposed; for native-backed
     /// buffers, dispose-after-Push would dangle.
     /// </summary>
-    private static object?[] ExtractStringAlias(StringArray a, int n)
+    private static object?[] ExtractStringAlias(StringArray a, int from, int n)
     {
         var memory = a.ValueBuffer.Memory;
         var offsets = a.ValueOffsets;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            if (a.IsNull(i))
+            if (a.IsNull(from + i))
             {
                 result[i] = null;
                 continue;
             }
 
-            var start = offsets[i];
-            var end = offsets[i + 1];
+            var start = offsets[from + i];
+            var end = offsets[from + i + 1];
             result[i] = Utf8String.FromBytes(memory.Slice(start, end - start));
         }
 
@@ -216,7 +224,7 @@ internal static class ArrowColumns
     /// Copies the column's UTF-8 bytes once into a single managed arena and slices each row's
     /// <see cref="Utf8String"/> out of it: one allocation per column instead of two per cell, and no
     /// UTF-8 → UTF-16 → UTF-8 round trip (which <see cref="ExtractString"/> pays via
-    /// <c>Utf8String.Of(a.GetString(i))</c>).
+    /// <c>Utf8String.Of(a.GetString(from + i))</c>).
     /// </summary>
     /// <remarks>
     /// <para>The middle ground between <see cref="ExtractString"/> and
@@ -231,7 +239,7 @@ internal static class ArrowColumns
     /// choice where a small fraction of a batch is retained (an ingest path that filters), because
     /// one surviving row would pin every string in the batch.</para>
     /// </remarks>
-    private static object?[] ExtractStringArena(StringArray a, int n)
+    private static object?[] ExtractStringArena(StringArray a, int from, int n)
     {
         var result = new object?[n];
         if (n == 0)
@@ -240,56 +248,56 @@ internal static class ArrowColumns
         }
 
         var offsets = a.ValueOffsets;
-        var first = offsets[0];
-        var arena = new byte[offsets[n] - first];
+        var first = offsets[from];
+        var arena = new byte[offsets[from + n] - first];
         a.ValueBuffer.Memory.Span.Slice(first, arena.Length).CopyTo(arena);
 
         for (var i = 0; i < n; i++)
         {
-            if (a.IsNull(i))
+            if (a.IsNull(from + i))
             {
                 result[i] = null;
                 continue;
             }
 
             result[i] = Utf8String.FromBytes(
-                new ReadOnlyMemory<byte>(arena, offsets[i] - first, offsets[i + 1] - offsets[i]));
+                new ReadOnlyMemory<byte>(arena, offsets[from + i] - first, offsets[from + i + 1] - offsets[from + i]));
         }
 
         return result;
     }
 
-    private static object?[] ExtractDate(Date32Array a, int n)
+    private static object?[] ExtractDate(Date32Array a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)new Date32(values[i]);
+            result[i] = a.IsNull(from + i) ? null : (object)new Date32(values[from + i]);
         }
 
         return result;
     }
 
-    private static object?[] ExtractTime(Time64Array a, int n)
+    private static object?[] ExtractTime(Time64Array a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)new Time64(values[i]);
+            result[i] = a.IsNull(from + i) ? null : (object)new Time64(values[from + i]);
         }
 
         return result;
     }
 
-    private static object?[] ExtractTimestamp(TimestampArray a, int n)
+    private static object?[] ExtractTimestamp(TimestampArray a, int from, int n)
     {
         var values = a.Values;
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            result[i] = a.IsNull(i) ? null : (object)new Timestamp(values[i]);
+            result[i] = a.IsNull(from + i) ? null : (object)new Timestamp(values[from + i]);
         }
 
         return result;
@@ -299,7 +307,7 @@ internal static class ArrowColumns
     // int32 Julian day. Convert to the µs-since-Unix-epoch DbspNet Timestamp. (Interpreted as
     // an instant / UTC, matching how arrow-rs and pyarrow read INT96 — self-consistent with
     // how the data was written.)
-    private static object?[] ExtractTimestampInt96(Apache.Arrow.Arrays.FixedSizeBinaryArray a, int n)
+    private static object?[] ExtractTimestampInt96(Apache.Arrow.Arrays.FixedSizeBinaryArray a, int from, int n)
     {
         const long julianUnixEpochDay = 2440588L; // Julian day number of 1970-01-01
         const long microsPerDay = 86_400_000_000L;
@@ -314,13 +322,13 @@ internal static class ArrowColumns
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            if (a.IsNull(i))
+            if (a.IsNull(from + i))
             {
                 result[i] = null;
                 continue;
             }
 
-            var bytes = a.GetBytes(i);
+            var bytes = a.GetBytes(from + i);
             var nanosOfDay = BinaryPrimitives.ReadInt64LittleEndian(bytes);
             var julianDay = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(8));
             var micros = ((julianDay - julianUnixEpochDay) * microsPerDay) + (nanosOfDay / 1000L);
@@ -330,40 +338,40 @@ internal static class ArrowColumns
         return result;
     }
 
-    private static object?[] ExtractDecimal64(Decimal64Array a, int n)
+    private static object?[] ExtractDecimal64(Decimal64Array a, int from, int n)
     {
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
             // 8-byte little-endian signed mantissa; sign-extend to Int128 (same scaled value).
-            result[i] = a.IsNull(i)
+            result[i] = a.IsNull(from + i)
                 ? null
-                : new Decimal128((Int128)BinaryPrimitives.ReadInt64LittleEndian(a.GetBytes(i)));
+                : new Decimal128((Int128)BinaryPrimitives.ReadInt64LittleEndian(a.GetBytes(from + i)));
         }
 
         return result;
     }
 
-    private static object?[] ExtractDecimal32(Decimal32Array a, int n)
+    private static object?[] ExtractDecimal32(Decimal32Array a, int from, int n)
     {
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
             // 4-byte little-endian signed mantissa; sign-extend to Int128.
-            result[i] = a.IsNull(i)
+            result[i] = a.IsNull(from + i)
                 ? null
-                : new Decimal128((Int128)BinaryPrimitives.ReadInt32LittleEndian(a.GetBytes(i)));
+                : new Decimal128((Int128)BinaryPrimitives.ReadInt32LittleEndian(a.GetBytes(from + i)));
         }
 
         return result;
     }
 
-    private static object?[] ExtractDecimal(Decimal128Array a, int n)
+    private static object?[] ExtractDecimal(Decimal128Array a, int from, int n)
     {
         var result = new object?[n];
         for (var i = 0; i < n; i++)
         {
-            if (a.IsNull(i))
+            if (a.IsNull(from + i))
             {
                 result[i] = null;
                 continue;
@@ -375,7 +383,7 @@ internal static class ArrowColumns
             // platform (x64, ARM64), so the bit pattern matches with no
             // shuffling. The previous BinaryPrimitives + Int128 ctor path
             // produced the same value with extra arithmetic.
-            result[i] = new Decimal128(MemoryMarshal.Read<Int128>(a.GetBytes(i)));
+            result[i] = new Decimal128(MemoryMarshal.Read<Int128>(a.GetBytes(from + i)));
         }
 
         return result;
@@ -383,7 +391,17 @@ internal static class ArrowColumns
 
     // ---- Build: DbspNet typed object?[] → Arrow column ----
 
-    public static IArrowArray Build(SqlType type, object?[] values) => type switch
+    public static IArrowArray Build(SqlType type, object?[] values) => Build(type, new ArrayCells(values));
+
+    /// <summary>Column <paramref name="column"/> of <paramref name="rows"/> (each a
+    /// <c>StructuralRow</c>), built straight from the rows — no boxed per-column staging array,
+    /// which for a large output is an <c>object?[]</c> on the large-object heap
+    /// (docs/design-chunked-deltas.md §8).</summary>
+    public static IArrowArray Build(SqlType type, IReadOnlyList<object> rows, int column) =>
+        Build(type, new RowCells(rows, column));
+
+    private static IArrowArray Build<TCells>(SqlType type, TCells values)
+        where TCells : struct, ICells => type switch
     {
         SqlIntegerType => BuildInt32(values),
         SqlBigintType => BuildInt64(values),
@@ -398,10 +416,12 @@ internal static class ArrowColumns
         _ => throw new NotSupportedException($"no Arrow builder for {type.Display}"),
     };
 
-    private static IArrowArray BuildInt32(object?[] vs)
+    private static IArrowArray BuildInt32<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new Int32Array.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -416,10 +436,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildInt64(object?[] vs)
+    private static IArrowArray BuildInt64<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new Int64Array.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -434,10 +456,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildFloat(object?[] vs)
+    private static IArrowArray BuildFloat<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new FloatArray.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -452,10 +476,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildDouble(object?[] vs)
+    private static IArrowArray BuildDouble<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new DoubleArray.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -470,10 +496,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildBool(object?[] vs)
+    private static IArrowArray BuildBool<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new BooleanArray.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -488,10 +516,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildString(object?[] vs)
+    private static IArrowArray BuildString<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new StringArray.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -509,10 +539,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildDate(object?[] vs)
+    private static IArrowArray BuildDate<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new Date32Array.Builder();
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -527,10 +559,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildTime(object?[] vs)
+    private static IArrowArray BuildTime<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new Time64Array.Builder(new Time64Type(TimeUnit.Microsecond));
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -545,10 +579,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildTimestamp(object?[] vs)
+    private static IArrowArray BuildTimestamp<TCells>(TCells vs)
+        where TCells : struct, ICells
     {
         var b = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, (string?)null));
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -565,10 +601,12 @@ internal static class ArrowColumns
         return b.Build();
     }
 
-    private static IArrowArray BuildDecimal(object?[] vs, int precision, int scale)
+    private static IArrowArray BuildDecimal<TCells>(TCells vs, int precision, int scale)
+        where TCells : struct, ICells
     {
         var b = new Decimal128Array.Builder(new Decimal128Type(precision, scale));
-        for (var i = 0; i < vs.Length; i++)
+        b.Reserve(vs.Count);
+        for (var i = 0; i < vs.Count; i++)
         {
             if (vs[i] is null)
             {
@@ -588,5 +626,28 @@ internal static class ArrowColumns
         }
 
         return b.Build();
+    }
+
+    /// <summary>Where a builder reads its column's cells from; a struct, so each builder is
+    /// specialised per source with no per-cell delegate or interface call.</summary>
+    private interface ICells
+    {
+        int Count { get; }
+
+        object? this[int i] { get; }
+    }
+
+    private readonly struct ArrayCells(object?[] values) : ICells
+    {
+        public int Count => values.Length;
+
+        public object? this[int i] => values[i];
+    }
+
+    private readonly struct RowCells(IReadOnlyList<object> rows, int column) : ICells
+    {
+        public int Count => rows.Count;
+
+        public object? this[int i] => ((DbspNet.Core.Collections.StructuralRow)rows[i])[column];
     }
 }
