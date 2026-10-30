@@ -122,6 +122,8 @@ public class IvmMultiBatch
             }
 
             var sw = Stopwatch.StartNew();
+            DateTime? drainEndUtc = null;
+            var measureAtDrain = Environment.GetEnvironmentVariable("IVM_MEASURE_AT") == "drain";
             long ticks;
             double drainMs, outputMs;
             if (Environment.GetEnvironmentVariable("DBSPNET_PROFILE") is { Length: > 0 })
@@ -135,6 +137,14 @@ public class IvmMultiBatch
             {
                 ticks = await runner.DrainAsync();
                 drainMs = sw.Elapsed.TotalMilliseconds;
+                drainEndUtc = DateTime.UtcNow;
+                if (measureAtDrain)
+                {
+                    // IVM_MEASURE_AT=drain: before the output write forms any view, so the
+                    // census sees operator state only.
+                    MeasureLive(batch, runner);
+                }
+
                 await runner.WriteOutputsAsync();
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
             }
@@ -148,37 +158,9 @@ public class IvmMultiBatch
                 }
             }
 
-            if (batch == 1 && Environment.GetEnvironmentVariable("IVM_MEASURE_LIVE") == "1")
+            if (!measureAtDrain)
             {
-                // Live bytes after a full compacting GC: batch 1's retained state, exactly.
-                System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
-                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
-                // PromotedBytes of that full blocking GC is what survived it; GetTotalMemory under
-                // Server GC also counts free space in regions and varies run to run.
-                var info = GC.GetGCMemoryInfo(GCKind.FullBlocking);
-                _out.WriteLine(string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"LIVE promoted={info.PromotedBytes} heap={info.HeapSizeBytes} fragmented={info.FragmentedBytes}"));
-            }
-
-            if (batch == 1 && Environment.GetEnvironmentVariable("IVM_HEAP_CENSUS") == "1")
-            {
-                // What survives the bulk load, by kind, and how shared the trace rows are.
-                var censusSw = Stopwatch.StartNew();
-                foreach (var line in HeapCensus.Reachable(runner))
-                {
-                    _out.WriteLine(line);
-                }
-
-                if (DbspNet.Core.Collections.TraceAccessProfile.Enabled)
-                {
-                    foreach (var line in HeapCensus.Traces(DbspNet.Core.Collections.TraceAccessProfile.Snapshot()))
-                    {
-                        _out.WriteLine(line);
-                    }
-                }
-
-                _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"CENSUS took {censusSw.Elapsed.TotalSeconds:F0} s"));
+                MeasureLive(batch, runner);
             }
 
             if (batch == 1 && DbspNet.Core.Collections.TraceAccessProfile.Enabled)
@@ -220,6 +202,7 @@ public class IvmMultiBatch
             {
                 await Task.Delay(2000); // runtime events arrive asynchronously
                 _out.WriteLine("GCPAUSE " + gcEvents.Report());
+                _out.WriteLine("GCPAUSE-DRAIN " + gcEvents.Report(drainEndUtc));
                 foreach (var line in gcEvents.PerGc())
                 {
                     _out.WriteLine(line);
@@ -343,11 +326,47 @@ public class IvmMultiBatch
 
     // Pairs each GC's suspend-begin with its restart-end (the pause the application sees) and
     // charges it to that GC's generation and kind, from the runtime's own GC events.
+    // IVM_MEASURE_LIVE / IVM_HEAP_CENSUS after batch 1: retained bytes and what holds them.
+    private void MeasureLive(int batch, object runner)
+    {
+        if (batch == 1 && Environment.GetEnvironmentVariable("IVM_MEASURE_LIVE") == "1")
+        {
+            // Live bytes after a full compacting GC: batch 1's retained state, exactly.
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            // PromotedBytes of that full blocking GC is what survived it; GetTotalMemory under
+            // Server GC also counts free space in regions and varies run to run.
+            var info = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+            _out.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"LIVE promoted={info.PromotedBytes} heap={info.HeapSizeBytes} fragmented={info.FragmentedBytes}"));
+        }
+
+        if (batch == 1 && Environment.GetEnvironmentVariable("IVM_HEAP_CENSUS") == "1")
+        {
+            // What survives the bulk load, by kind, and how shared the trace rows are.
+            var censusSw = Stopwatch.StartNew();
+            foreach (var line in HeapCensus.Reachable(runner))
+            {
+                _out.WriteLine(line);
+            }
+
+            if (DbspNet.Core.Collections.TraceAccessProfile.Enabled)
+            {
+                foreach (var line in HeapCensus.Traces(DbspNet.Core.Collections.TraceAccessProfile.Snapshot()))
+                {
+                    _out.WriteLine(line);
+                }
+            }
+
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"CENSUS took {censusSw.Elapsed.TotalSeconds:F0} s"));
+        }
+    }
+
     private sealed class GcPauseListener : System.Diagnostics.Tracing.EventListener
     {
         private readonly object _gate = new();
-        private readonly Dictionary<string, (int Count, double Ms)> _byKind = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, (double P0, double P1)> _promotedByKind = new(StringComparer.Ordinal);
+        private readonly List<(string Kind, double Ms, double P0, double P1, DateTime At)> _pauses = new();
         private readonly List<string> _perGc = new();
         private DateTime _suspend;
         private string? _kind;
@@ -416,13 +435,10 @@ public class IvmMultiBatch
                         if (_suspend != default)
                         {
                             var kind = _kind ?? "no GC (suspension only)";
-                            var (n, ms) = _byKind.GetValueOrDefault(kind);
                             var pause = (e.TimeStamp - _suspend).TotalMilliseconds;
-                            _byKind[kind] = (n + 1, ms + pause);
+                            _pauses.Add((kind, pause, _p0, _p1, _suspend.ToUniversalTime()));
                             if (_kind is not null)
                             {
-                                var (p0, p1) = _promotedByKind.GetValueOrDefault(kind);
-                                _promotedByKind[kind] = (p0 + _p0, p1 + _p1);
                                 _perGc.Add(string.Create(
                                     CultureInfo.InvariantCulture,
                                     $"GC {kind} {pause:F0} ms promoted0={_p0 / 1e9:F2} promoted1={_p1 / 1e9:F2} GB | gen0={_g0 / 1e9:F2} gen1={_g1 / 1e9:F2} gen2={_g2 / 1e9:F2} loh={_loh / 1e9:F2} GB | marked ")
@@ -452,16 +468,19 @@ public class IvmMultiBatch
             }
         }
 
-        public string Report()
+        /// <summary>Pauses by kind, those that began before <paramref name="until"/> (UTC) when given.</summary>
+        public string Report(DateTime? until = null)
         {
             lock (_gate)
             {
-                return string.Join("; ", _byKind.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv =>
-                    string.Create(CultureInfo.InvariantCulture, $"{kv.Key}: {kv.Value.Count} GCs {kv.Value.Ms:F0} ms")
-                    + (_promotedByKind.TryGetValue(kv.Key, out var p)
-                        ? string.Create(CultureInfo.InvariantCulture, $" (promoted {p.P0 / 1e9:F2}/{p.P1 / 1e9:F2} GB)")
+                var pauses = _pauses.Where(p => until is null || p.At < until).ToList();
+                return string.Join("; ", pauses.GroupBy(p => p.Kind).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g =>
+                    string.Create(CultureInfo.InvariantCulture, $"{g.Key}: {g.Count()} GCs {g.Sum(p => p.Ms):F0} ms")
+                    + (g.Key.StartsWith("gen", StringComparison.Ordinal)
+                        ? string.Create(CultureInfo.InvariantCulture, $" (promoted {g.Sum(p => p.P0) / 1e9:F2}/{g.Sum(p => p.P1) / 1e9:F2} GB)")
                         : "")))
-                    + string.Create(CultureInfo.InvariantCulture, $"; total {_byKind.Values.Sum(v => v.Ms):F0} ms");
+                    + string.Create(CultureInfo.InvariantCulture, $"; total {pauses.Sum(p => p.Ms):F0} ms")
+                    + string.Create(CultureInfo.InvariantCulture, $"; young {pauses.Where(p => !p.Kind.Contains("background", StringComparison.Ordinal)).Sum(p => p.Ms):F0} ms promoted {pauses.Sum(p => p.P0) / 1e9:F2}/{pauses.Sum(p => p.P1) / 1e9:F2} GB");
             }
         }
     }

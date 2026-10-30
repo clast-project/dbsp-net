@@ -73,6 +73,7 @@ internal sealed class PagedZSetStore : IIntegratedViewStore<StructuralRow>
     private PagedStrings _strings = new();
     private Dictionary<int, StructuralRow>? _escaped;
     private int[] _buckets = new int[16];   // slot + 1; 0 = empty
+    private int _bucketShift = 32 - 4;
     private int _highWater;
     private int _freeHead = -1;
     private int _count;
@@ -145,7 +146,7 @@ internal sealed class PagedZSetStore : IIntegratedViewStore<StructuralRow>
     {
         ArgumentNullException.ThrowIfNull(row);
         var hash = row.GetHashCode();
-        for (var slot = _buckets[hash & (_buckets.Length - 1)] - 1; slot >= 0; slot = Next(slot))
+        for (var slot = _buckets[Bucket(hash, _bucketShift)] - 1; slot >= 0; slot = Next(slot))
         {
             if (Hash(slot) == hash && Matches(slot, row))
             {
@@ -193,7 +194,7 @@ internal sealed class PagedZSetStore : IIntegratedViewStore<StructuralRow>
         }
 
         var hash = row.GetHashCode();
-        var bucket = hash & (_buckets.Length - 1);
+        var bucket = Bucket(hash, _bucketShift);
         var previous = -1;
         for (var slot = _buckets[bucket] - 1; slot >= 0; slot = Next(slot))
         {
@@ -371,7 +372,7 @@ internal sealed class PagedZSetStore : IIntegratedViewStore<StructuralRow>
 
     private void Unlink(int slot)
     {
-        var bucket = Hash(slot) & (_buckets.Length - 1);
+        var bucket = Bucket(Hash(slot), _bucketShift);
         var previous = -1;
         for (var s = _buckets[bucket] - 1; s >= 0; s = Next(s))
         {
@@ -401,19 +402,26 @@ internal sealed class PagedZSetStore : IIntegratedViewStore<StructuralRow>
 
     private void Rehash(int size)
     {
+        var shift = 32 - System.Numerics.BitOperations.Log2((uint)size);
         var buckets = new int[size];
         for (var slot = 0; slot < _highWater; slot++)
         {
             if (Weight(slot) != 0)
             {
-                var bucket = Hash(slot) & (size - 1);
+                var bucket = Bucket(Hash(slot), shift);
                 BinaryPrimitives.WriteInt32LittleEndian(Record(slot)[NextOffset..], buckets[bucket] - 1);
                 buckets[bucket] = slot + 1;
             }
         }
 
         _buckets = buckets;
+        _bucketShift = shift;
     }
+
+    // Fibonacci hashing: the top bits of hash × 2^32/φ. Masking the low bits directly chained
+    // badly on ivm-bench's fact_holdings view at W=8 (13.5 s to integrate vs 0.26 s for the
+    // Dictionary, which reduces modulo a prime); why those rows' low bits cluster is not pinned down.
+    private static int Bucket(int hash, int shift) => (int)(((uint)hash * 0x9E3779B9u) >> shift);
 
     private void CompactStrings()
     {
