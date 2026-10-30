@@ -87,10 +87,38 @@ public static class Snapshot
                 nameof(retainCount), retainCount, "retainCount must be at least 1");
         }
 
-        var tick = circuit.TickCount;
-        var existing = await ListSnapshotDirsAsync(fs, cancellationToken).ConfigureAwait(false);
+        var (tick, generation) = await NextSnapDirAsync(fs, circuit.TickCount, cancellationToken).ConfigureAwait(false);
+        var snapName = SnapDirName(tick, generation);
+        var durable = DurableStore(fs);
+
+        var count = await WriteDirAsync(circuit, fs, snapName, metadata, durable, cancellationToken).ConfigureAwait(false);
+
+        // Commit. After this, the new snapshot is the latest; before, the
+        // pointer still names the prior snapshot (or doesn't exist).
+        await WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
+
+        await PruneAsync(fs, (tick, generation), retainCount, ManifestFile, cancellationToken).ConfigureAwait(false);
+
+        return count;
+    }
+
+    /// <summary>The name of the per-circuit manifest inside a snapshot directory.</summary>
+    internal const string ManifestFile = "manifest.json";
+
+    /// <summary>The store's durability capability, or null when <see cref="Durable"/> is off or the
+    /// store makes every write durable on return.</summary>
+    internal static IDurableTableFileSystem? DurableStore(ITableFileSystem fs) =>
+        Durable ? fs as IDurableTableFileSystem : null;
+
+    /// <summary>
+    /// A snapshot directory nothing names yet for <paramref name="tick"/>: <c>snap-{tick}</c>, or the
+    /// next generation after any directory (committed or orphaned) already at that tick.
+    /// </summary>
+    internal static async ValueTask<(long Tick, int Gen)> NextSnapDirAsync(
+        ITableFileSystem fs, long tick, CancellationToken cancellationToken)
+    {
         var generation = 0;
-        foreach (var (t, g) in existing)
+        foreach (var (t, g) in await ListSnapshotDirsAsync(fs, cancellationToken).ConfigureAwait(false))
         {
             if (t == tick)
             {
@@ -98,9 +126,24 @@ public static class Snapshot
             }
         }
 
-        var snapName = SnapDirName(tick, generation);
-        var durable = Durable ? fs as IDurableTableFileSystem : null;
+        return (tick, generation);
+    }
 
+    /// <summary>
+    /// Write one circuit's operator files and its manifest under <paramref name="dir"/>. With
+    /// <paramref name="durable"/>, the op files are durable before the manifest is written and the
+    /// manifest is durable on return, so manifest presence implies complete op files. Without it,
+    /// nothing is synced (a caller that commits several circuits at once syncs them together).
+    /// Returns the number of operators written.
+    /// </summary>
+    internal static async ValueTask<int> WriteDirAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        string dir,
+        IReadOnlyDictionary<string, string>? metadata,
+        IDurableTableFileSystem? durable,
+        CancellationToken cancellationToken)
+    {
         // Per-op files go under a directory nothing else names (see the class remarks). If a Save
         // throws partway through, the partial files are orphans, invisible to readers because
         // current.txt hasn't moved, and the next successful write's prune removes them.
@@ -112,20 +155,14 @@ public static class Snapshot
                 continue;
             }
 
-            var ctx = new TableFileSystemSnapshotContext(fs, snapName + "/op-" + i);
+            var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
             await s.SaveAsync(ctx, cancellationToken).ConfigureAwait(false);
             snapshotted.Add(i);
         }
 
         if (durable is not null)
         {
-            var written = new List<string>();
-            await foreach (var entry in fs.ListAsync(snapName + "/", cancellationToken).ConfigureAwait(false))
-            {
-                written.Add(entry.Path);
-            }
-
-            await durable.SyncAsync(written, cancellationToken).ConfigureAwait(false);
+            await SyncTreeAsync(fs, durable, dir + "/", cancellationToken).ConfigureAwait(false);
         }
 
         var manifest = new SnapshotManifest(
@@ -137,20 +174,27 @@ public static class Snapshot
             snapshotted,
             circuit.LogicalTime,
             metadata);
-        var manifestKey = snapName + "/manifest.json";
+        var manifestKey = dir + "/" + ManifestFile;
         await manifest.WriteAsync(fs, manifestKey, cancellationToken).ConfigureAwait(false);
         if (durable is not null)
         {
             await durable.SyncAsync([manifestKey], cancellationToken).ConfigureAwait(false);
         }
 
-        // Commit. After this, the new snapshot is the latest; before, the
-        // pointer still names the prior snapshot (or doesn't exist).
-        await WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
-
-        await PruneAsync(fs, (tick, generation), retainCount, cancellationToken).ConfigureAwait(false);
-
         return snapshotted.Count;
+    }
+
+    /// <summary>Make every file under <paramref name="prefix"/> durable, in one sync.</summary>
+    internal static async ValueTask SyncTreeAsync(
+        ITableFileSystem fs, IDurableTableFileSystem durable, string prefix, CancellationToken cancellationToken)
+    {
+        var written = new List<string>();
+        await foreach (var entry in fs.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
+        {
+            written.Add(entry.Path);
+        }
+
+        await durable.SyncAsync(written, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -242,7 +286,7 @@ public static class Snapshot
     }
 
     // Every snap-T / snap-T.G directory present, ordered by (tick, generation) — commit order.
-    private static async ValueTask<List<(long Tick, int Gen)>> ListSnapshotDirsAsync(
+    internal static async ValueTask<List<(long Tick, int Gen)>> ListSnapshotDirsAsync(
         ITableFileSystem fs, CancellationToken cancellationToken)
     {
         var dirs = new HashSet<(long, int)>();
@@ -375,11 +419,34 @@ public static class Snapshot
                 "no snapshot: current.txt missing or empty", CurrentKey);
         }
 
-        var manifestKey = current + "/manifest.json";
+        if (!await fs.ExistsAsync(current + "/" + ManifestFile, cancellationToken).ConfigureAwait(false)
+            && await fs.ExistsAsync(current + "/" + ParallelSnapshot.ParallelManifestFile, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            var p = await ParallelSnapshotManifest
+                .ReadAsync(fs, current + "/" + ParallelSnapshot.ParallelManifestFile, cancellationToken)
+                .ConfigureAwait(false);
+            throw new InvalidDataException(
+                $"snapshot '{current}' was written by a parallel program with {p.Workers} workers; " +
+                "restore it with ParallelSnapshot into a circuit with that worker count.");
+        }
+
+        var manifest = await ReadManifestAsync(circuit, fs, current, cancellationToken).ConfigureAwait(false);
+        return await LoadDirAsync(circuit, fs, current, manifest, parallelism, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Read the manifest under <paramref name="dir"/> and check it against <paramref name="circuit"/>
+    /// (schema version, plan and schema fingerprints, operator count), restoring nothing.
+    /// </summary>
+    internal static async ValueTask<SnapshotManifest> ReadManifestAsync(
+        RootCircuit circuit, ITableFileSystem fs, string dir, CancellationToken cancellationToken)
+    {
+        var manifestKey = dir + "/" + ManifestFile;
         if (!await fs.ExistsAsync(manifestKey, cancellationToken).ConfigureAwait(false))
         {
             throw new FileNotFoundException(
-                $"snapshot '{current}' is missing its manifest at '{manifestKey}' " +
+                $"snapshot '{dir}' is missing its manifest at '{manifestKey}' " +
                 "(possibly pruned or corrupted)",
                 manifestKey);
         }
@@ -421,6 +488,21 @@ public static class Snapshot
                 $"match circuit's operator count {circuit.Operators.Count}");
         }
 
+        return manifest;
+    }
+
+    /// <summary>
+    /// Restore <paramref name="circuit"/> from the operator files under <paramref name="dir"/>, as
+    /// described by its already-validated <paramref name="manifest"/>. Returns the operators restored.
+    /// </summary>
+    internal static async ValueTask<int> LoadDirAsync(
+        RootCircuit circuit,
+        ITableFileSystem fs,
+        string dir,
+        SnapshotManifest manifest,
+        int parallelism,
+        CancellationToken cancellationToken)
+    {
         // Restore the tick counter and the logical clock *before* loading
         // operators: a temporal-filter operator recomputes its emitted window
         // against the clock during LoadAsync, so the clock must already hold its
@@ -433,7 +515,7 @@ public static class Snapshot
 
         if (parallelism > 1 && !ProfileLoad && manifest.SnapshottedIndices.Count > 1)
         {
-            await RestoreConcurrentlyAsync(circuit, fs, current, manifest, parallelism, cancellationToken)
+            await RestoreConcurrentlyAsync(circuit, fs, dir, manifest, parallelism, cancellationToken)
                 .ConfigureAwait(false);
             return manifest.SnapshottedIndices.Count;
         }
@@ -447,7 +529,7 @@ public static class Snapshot
             foreach (var i in manifest.SnapshottedIndices)
             {
                 var s = Snapshottable(circuit, i);
-                var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+                var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
                 if (profile is null)
                 {
                     await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
@@ -570,7 +652,7 @@ public static class Snapshot
         return manifest.Metadata ?? new Dictionary<string, string>();
     }
 
-    private static string SnapDirName(long tick, int generation) =>
+    internal static string SnapDirName(long tick, int generation) =>
         generation == 0
             ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"snap-{tick}")
             : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"snap-{tick}.{generation}");
@@ -605,7 +687,7 @@ public static class Snapshot
                 && generation > 0);
     }
 
-    private static async ValueTask<string?> TryReadCurrentPointerAsync(
+    internal static async ValueTask<string?> TryReadCurrentPointerAsync(
         ITableFileSystem fs, CancellationToken cancellationToken)
     {
         if (!await fs.ExistsAsync(CurrentKey, cancellationToken).ConfigureAwait(false))
@@ -618,7 +700,7 @@ public static class Snapshot
         return string.IsNullOrEmpty(contents) ? null : contents;
     }
 
-    private static ValueTask WriteCurrentPointerAsync(
+    internal static ValueTask WriteCurrentPointerAsync(
         ITableFileSystem fs, IDurableTableFileSystem? durable, string snapName, CancellationToken cancellationToken)
     {
         // A single atomic replace: there is never a moment with no pointer (the earlier
@@ -629,8 +711,18 @@ public static class Snapshot
             : fs.WriteAllBytesAsync(CurrentKey, bytes, cancellationToken);
     }
 
-    private static async ValueTask PruneAsync(
-        ITableFileSystem fs, (long Tick, int Gen) current, int retainCount, CancellationToken cancellationToken)
+    /// <summary>
+    /// Keep <paramref name="current"/> plus the newest <paramref name="retainCount"/> - 1 complete
+    /// snapshots before it, and delete every other snapshot directory. A directory is complete when
+    /// its <paramref name="completeMarker"/> (the last file the commit writes before the pointer)
+    /// exists.
+    /// </summary>
+    internal static async ValueTask PruneAsync(
+        ITableFileSystem fs,
+        (long Tick, int Gen) current,
+        int retainCount,
+        string completeMarker,
+        CancellationToken cancellationToken)
     {
         var dirs = await ListSnapshotDirsAsync(fs, cancellationToken).ConfigureAwait(false);
         var keep = new HashSet<(long, int)> { current };
@@ -642,7 +734,7 @@ public static class Snapshot
         {
             var d = dirs[i];
             if (d.CompareTo(current) < 0
-                && await fs.ExistsAsync(SnapDirName(d.Tick, d.Gen) + "/manifest.json", cancellationToken)
+                && await fs.ExistsAsync(SnapDirName(d.Tick, d.Gen) + "/" + completeMarker, cancellationToken)
                     .ConfigureAwait(false))
             {
                 keep.Add(d);

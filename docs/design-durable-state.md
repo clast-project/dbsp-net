@@ -84,12 +84,48 @@ be real I/O time, but the data has to reach the disk anyway.
 not atomic across workers (Increment 1). `WalRecorder` segments are still not fsynced; that becomes
 relevant with A2 (Increment 2).
 
+## 1b. Increment 1 — parallel checkpoint (DONE, 2026-10-30)
+
+A persistent deploy no longer falls back to serial: `DBSPNET_WORKERS=12` with a snapshot directory
+runs the parallel program and checkpoints all 12 workers as one commit. Protocol in
+`docs/persistence.md` ("Parallel programs").
+
+| before | after |
+|---|---|
+| a `current.txt` and a prune per worker; `parallel.json` a root marker no one cross-checked | one `current.txt` naming `snap-T[.G]/`, which holds `worker-{w}/` subtrees and `parallel.json`; the pointer write is the single commit |
+| restore never compared worker ticks | every worker manifest's tick is checked against `parallel.json` before any state loads |
+| no metadata, so no offsets | `parallel.json` carries metadata; `SnapshotCheckpointStore` implements `IParallelCheckpointStore` |
+| parallel `ProgramRunner.CreateAsync` took no store | it takes an `IParallelCheckpointStore`; `RunnerProgram` dispatches save/restore by program kind |
+| `DbspNetEngine` ran serial whenever persistence was on | runs parallel; **W is pinned by the checkpoint** (`RecordedWorkersAsync`), overriding `DBSPNET_WORKERS` with a log line, as Feldera does |
+| per-worker fsync would have cost 2 device flushes × W | one sync over the whole directory, then `parallel.json`, then the pointer: three device flushes per checkpoint whatever W is |
+
+`Snapshot` was split into internal steps (`WriteDirAsync`, `ReadManifestAsync`, `LoadDirAsync`,
+`NextSnapDirAsync`, `PruneAsync` with a completeness marker) that both paths share. The serial
+commit's behaviour is unchanged.
+
+**Verification.** `ParallelCrashSafeCheckpointTests` runs the increment-0 matrix (every mutation,
+process crash and power loss, flat and spine, later tick and same tick) over W=3 concurrent
+workers, and requires all workers to restore at one commit point. Two reverts each fail all four
+matrix cases: dropping the directory sync, and moving the pointer write before `parallel.json`.
+Also new: a worker at the wrong tick is refused before anything loads; serial and parallel
+snapshots refuse each other, naming W; metadata commits with the workers.
+`WideProgram_RestoreThenContinue_MatchesUninterrupted` (W=2/4, flat and spine) closes the
+coverage gap from brief (c): partitioned top-K, RANK, window SUM, LAG, a join re-keyed by an
+aggregate, and a LATENESS aggregate, each restored and then continued for 4 ticks against an
+uninterrupted run. `LatenessOperator`'s per-worker `maxSeen` is persisted per replica, so restore
+reproduces it. Whether a per-shard frontier is the right semantics is a separate question from
+persistence. Runner: `ParallelRunner_RestoreAfterBatch_…` (W=2/4) matches an uninterrupted serial
+run and writes nothing on an idle batch. Engine: a W=4 persistent deploy runs parallel, and a
+redeploy asking for W=2 resumes at 4. A serial checkpoint redeployed with W=4 stays serial. Both
+match a from-scratch run. Full suite: 2658 pass.
+
+**Not measured yet:** end-to-end checkpoint and restore wall time at W=12 on SF=3. Concurrent
+worker writes should beat the serial save, which is sequential per operator. That needs a Docker
+run, so it is Curt's to run.
+
 ## 2. Plan from here
 
-1. **Increment 1 — parallel checkpoint.** Each worker writes its part and one top-level manifest
-   commits the tick, W and the offsets; prune only after that commit; restore verifies worker
-   ticks. Wire it into the parallel `ProgramRunner.CreateAsync` and drop `DbspNetEngine`'s serial
-   fallback. W is pinned by the checkpoint, as in Feldera.
+1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
 2. **Increment 2 — A2 checkpoint policy.** A durable input WAL every batch, with offsets in each
    record, and a snapshot every N batches or T seconds.
 3. **Phases 1–3 of the kickoff:** scenario and targets, the deciding measurements (spine vs flat at

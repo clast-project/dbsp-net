@@ -25,9 +25,8 @@ namespace DbspNet.Connectors.Abstractions;
 /// <para>
 /// The two program kinds differ only behind <see cref="RunnerProgram"/> (ingest, step,
 /// output reads); the batch loop, incremental-output bookkeeping and profile are shared.
-/// A parallel program cannot be checkpointed through this runner (<see cref="ICheckpointStore"/>
-/// snapshots a single circuit), so <see cref="CreateAsync(ParallelCompiledProgram, IReadOnlyList{IInputConnector}, IReadOnlyList{IOutputConnector}, CancellationToken)"/>
-/// takes no store.
+/// Either kind checkpoints: a serial program through an <see cref="ICheckpointStore"/>, a parallel
+/// one through an <see cref="IParallelCheckpointStore"/>, which commits all W workers together.
 /// </para>
 /// </summary>
 public sealed class ProgramRunner
@@ -52,7 +51,8 @@ public sealed class ProgramRunner
 
         public bool Written { get; set; }
     }
-    private readonly ICheckpointStore? _checkpoint;
+    // An ICheckpointStore (serial) or IParallelCheckpointStore (parallel); RunnerProgram dispatches.
+    private readonly object? _checkpoint;
 
     // Engine tick of the last checkpoint written or restored; -1 = none. Source cursors only
     // advance together with a tick (DrainAsync), so an unchanged tick means nothing to save.
@@ -65,7 +65,7 @@ public sealed class ProgramRunner
         ParallelCompiledProgram? parallel,
         List<InputBinding> inputs,
         List<(IOutputConnector, RunnerOutput)> outputs,
-        ICheckpointStore? checkpoint)
+        object? checkpoint)
     {
         _program = program;
         Program = serial;
@@ -139,20 +139,21 @@ public sealed class ProgramRunner
     /// serial overload, with each source's versions pushed into a sharded input (split
     /// across the replicas by whole-row hash) and each output read as the gathered
     /// (replica-summed) view and per-tick delta. Batch semantics and output modes are
-    /// identical to the serial runner. No checkpoint store: the parallel program's state
-    /// is per-worker (<c>ParallelSnapshot</c>), which <see cref="ICheckpointStore"/> does not
-    /// model.
+    /// identical to the serial runner. With <paramref name="checkpoint"/>, each batch ends with
+    /// one checkpoint of all W workers and the cursors, committed together; the program must
+    /// have been compiled with snapshot codecs, and a restore needs the same W.
     /// </summary>
     public static async ValueTask<ProgramRunner> CreateAsync(
         ParallelCompiledProgram program,
         IReadOnlyList<IInputConnector> inputs,
         IReadOnlyList<IOutputConnector> outputs,
+        IParallelCheckpointStore? checkpoint = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
         var runnerProgram = RunnerProgram.Of(program);
         var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
-        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint: null);
+        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint);
     }
 
     private static async ValueTask<(List<InputBinding>, List<(IOutputConnector, RunnerOutput)>)> BindAsync(
@@ -208,7 +209,7 @@ public sealed class ProgramRunner
             return 0;
         }
 
-        var state = await _checkpoint.TryRestoreAsync(_program.SerialCircuit!, cancellationToken).ConfigureAwait(false);
+        var state = await _program.TryRestoreCheckpointAsync(_checkpoint, cancellationToken).ConfigureAwait(false);
         if (state is null)
         {
             return 0;
@@ -245,7 +246,7 @@ public sealed class ProgramRunner
         var offsets = _inputs
             .Select(b => new SourceCheckpoint(b.Connector.Name, b.Cursor.Serialize()))
             .ToList();
-        await _checkpoint.SaveAsync(_program.SerialCircuit!, offsets, cancellationToken).ConfigureAwait(false);
+        await _program.SaveCheckpointAsync(_checkpoint, offsets, cancellationToken).ConfigureAwait(false);
         _checkpointedTick = _program.TickCount;
     }
 

@@ -166,16 +166,83 @@ public sealed class DbspNetEngineTests : IDisposable
         Assert.Contains("EXCEPT", deploy.SerialFallback, StringComparison.Ordinal);
     }
 
-    /// <summary>Checkpointing configured with workers > 1 runs serially: only the serial
-    /// program checkpoints through the runner.</summary>
+    /// <summary>
+    /// Checkpointing with workers > 1 runs the parallel program, and a redeploy resumes it. The
+    /// redeploy asks for a different worker count and gets the checkpoint's (a checkpoint pins W),
+    /// and after one more batch its sink equals a from-scratch run over the same sources.
+    /// </summary>
     [Fact]
-    public async Task Workers4_WithSnapshotDir_RunsSerial()
+    public async Task Workers4_WithSnapshotDir_RunsParallel_AndARedeployResumesAtTheRecordedWorkerCount()
     {
-        var deploy = await RunTwoBatches(
-            new DbspNetEngine(workers: 4), ProgramSql, "persistent", snapshotDir: Path.Combine(_root, "snap"));
+        var snapshotDir = Path.Combine(_root, "snap");
+        var deploy = await RunTwoBatches(new DbspNetEngine(workers: 4), ProgramSql, "persistent", snapshotDir: snapshotDir);
         Assert.True(deploy.Persistent);
+        Assert.Equal(4, deploy.Workers);
+        Assert.Null(deploy.SerialFallback);
+
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 2), "persistent", snapshotDir);
+        Assert.Equal(4, resumed.Workers);
+        Assert.True(resumed.RestoredTick > 0);
+        await AssertMatchesFromScratch("persistent");
+    }
+
+    /// <summary>A serial checkpoint stays serial when the redeploy asks for workers.</summary>
+    [Fact]
+    public async Task SerialCheckpoint_RedeployWithWorkers_StaysSerial()
+    {
+        var snapshotDir = Path.Combine(_root, "snap1");
+        var deploy = await RunTwoBatches(new DbspNetEngine(), ProgramSql, "persistent1", snapshotDir: snapshotDir);
         Assert.Equal(1, deploy.Workers);
-        Assert.Contains("checkpoint", deploy.SerialFallback, StringComparison.Ordinal);
+
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 4), "persistent1", snapshotDir);
+        Assert.Equal(1, resumed.Workers);
+        Assert.True(resumed.RestoredTick > 0);
+        await AssertMatchesFromScratch("persistent1");
+    }
+
+    private ProgramSpec SpecFor(string prefix, string totalsDir, string? snapshotDir) => new(
+        ProgramSql,
+        new[]
+        {
+            new InputSpec("company", Path.Combine(_root, prefix, "company")),
+            new InputSpec("trade", Path.Combine(_root, prefix, "trade")),
+        },
+        new[] { new OutputSpec("company_totals", totalsDir) },
+        SnapshotDir: snapshotDir);
+
+    // One more version on each source, then a new engine deployed over the same sources, sink and
+    // checkpoint, and one batch run on it.
+    private async Task<DeployResult> AppendThenRedeploy(DbspNetEngine engine, string prefix, string snapshotDir)
+    {
+        foreach (var (name, schema, row) in new[]
+                 {
+                     ("company", CompanySchema(), new object?[] { 4, 400, 1 }),
+                     ("trade", TradeSchema(), new object?[] { 16, 1, 9 }),
+                 })
+        {
+            using var table = await DeltaTable.OpenAsync(
+                new LocalTableFileSystem(Path.Combine(_root, prefix, name)), cancellationToken: CancellationToken.None);
+            await Append(table, schema, new List<object?[]>(), row);
+        }
+
+        var deploy = await engine.DeployAsync(SpecFor(prefix, Path.Combine(_root, prefix, "out_totals"), snapshotDir));
+        engine.Resume();
+        await engine.WaitAsync();
+        return deploy;
+    }
+
+    private async Task AssertMatchesFromScratch(string prefix)
+    {
+        var scratchDir = Path.Combine(_root, prefix, "out_scratch");
+        Directory.CreateDirectory(scratchDir);
+        var scratch = new DbspNetEngine();
+        await scratch.DeployAsync(SpecFor(prefix, scratchDir, snapshotDir: null));
+        scratch.Resume();
+        await scratch.WaitAsync();
+
+        var expected = await ReadTotals(scratchDir);
+        Assert.True(expected.Count > 0);
+        Assert.True((await ReadTotals(Path.Combine(_root, prefix, "out_totals"))).Equals(expected));
     }
 
     private async Task<DeployResult> RunTwoBatches(

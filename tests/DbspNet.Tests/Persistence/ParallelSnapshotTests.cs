@@ -153,7 +153,7 @@ public class ParallelSnapshotTests
     }
 
     [Fact]
-    public async Task Snapshot_LaysOutPerWorkerSubtrees_AndMarkerLast()
+    public async Task Snapshot_LaysOutPerWorkerSubtrees_UnderOnePointer()
     {
         const int workers = 4;
         var plan = CompilePlan(GroupByDdl, GroupByQuery);
@@ -164,15 +164,18 @@ public class ParallelSnapshotTests
         producer.Step();
         await ParallelSnapshot.WriteAsync(producer.Circuit, fs);
 
-        // One marker plus a self-contained single-circuit snapshot per worker.
-        Assert.True(await fs.ExistsAsync("parallel.json"));
+        // One pointer, naming one directory: the commit marker plus a manifest per worker, and no
+        // per-worker pointer (one per worker is what let workers commit at different ticks).
+        var dir = System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
+        Assert.Equal($"snap-{producer.Circuit.TickCount}", dir);
+        Assert.True(await fs.ExistsAsync(dir + "/parallel.json"));
         for (var w = 0; w < workers; w++)
         {
-            Assert.True(await fs.ExistsAsync($"worker-{w}/current.txt"),
-                $"worker {w} should have its own snapshot pointer");
+            Assert.True(await fs.ExistsAsync($"{dir}/worker-{w}/manifest.json"), $"worker {w} manifest missing");
+            Assert.False(await fs.ExistsAsync($"worker-{w}/current.txt"));
         }
 
-        var manifest = await ParallelSnapshotManifest.ReadAsync(fs, "parallel.json");
+        var manifest = await ParallelSnapshotManifest.ReadAsync(fs, dir + "/parallel.json");
         Assert.Equal(workers, manifest.Workers);
         Assert.Equal(producer.Circuit.TickCount, manifest.Tick);
     }

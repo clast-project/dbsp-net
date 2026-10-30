@@ -304,6 +304,28 @@ process crash and as a power loss (`CrashSimulatingFileSystem` keeps a separate 
 fsynced), and requires restore to land exactly on the old or the new commit, the new one once
 the write has returned. Reverting any one of the four fixes fails it.
 
+**Parallel programs (durable-state increment 1).** `ParallelSnapshot` uses the same pointer and
+directory naming with one commit for all `W` workers. `snap-{tick}[.{gen}]/` holds a
+`worker-{w}/` subtree per replica, each with its op files and its own `manifest.json`, plus a
+`parallel.json` (W, tick, metadata such as connector offsets). The workers write concurrently;
+then one sync covers every file under the directory, `parallel.json` is written and synced, and
+`current.txt` is replaced. That last write is the one commit point. Prune counts a directory as
+complete only if its `parallel.json` exists. Restore checks every worker's manifest tick against
+`parallel.json` before it loads any state.
+
+The old layout gave each worker its own `current.txt` and its own prune, and kept `parallel.json`
+at the root as a marker nobody cross-checked, so a crash mid-write restored a mix of ticks without
+any error. That layout is no longer read; a store in it fails with a message saying so.
+`ParallelCrashSafeCheckpointTests` runs the serial crash matrix over three concurrent workers.
+
+A checkpoint pins the worker count, as in Feldera, because the hash partition is part of the
+state. `ParallelSnapshot.RecordedWorkersAsync` reports it: W, 1 for a serial snapshot, or none.
+`DbspNetEngine.DeployAsync` uses the recorded W over `DBSPNET_WORKERS` and logs the override.
+Serial and parallel restores refuse each other's snapshots and name the worker count.
+`SnapshotCheckpointStore` implements both `ICheckpointStore` and `IParallelCheckpointStore`, and
+the parallel `ProgramRunner.CreateAsync` overload takes the latter. A persistent deploy with
+`DBSPNET_WORKERS > 1` therefore runs parallel instead of falling back to serial.
+
 `Snapshot.Exists(store)` returns true iff `current.txt` exists and names a snap-T whose manifest
 exists. `Snapshot.PointerExists(store)` is the "was anything ever committed" test:
 `SnapshotCheckpointStore` treats only a missing pointer as a fresh start. A pointer naming an

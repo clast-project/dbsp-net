@@ -77,9 +77,13 @@ public sealed class DbspNetEngine
     /// With more than one worker (<c>DBSPNET_WORKERS</c>), the program is compiled
     /// data-parallel (<see cref="SqlProgram.TryCompileParallel"/>) and driven by the same
     /// runner. It falls back to the serial program, and logs why to stderr, when any view the
-    /// outputs reach cannot be sharded, and also when persistence is on: the runner's
-    /// checkpoint store snapshots one serial circuit and the per-worker parallel snapshot has
-    /// no offset-atomic store yet, so a persistent deploy is always serial.
+    /// outputs reach cannot be sharded. A persistent parallel deploy checkpoints all W workers
+    /// as one commit (<see cref="ParallelSnapshot"/>).
+    /// </para>
+    /// <para>
+    /// A checkpoint pins the worker count, as in Feldera: the hash partition is part of the
+    /// persisted state. When the snapshot directory already holds a checkpoint written with a
+    /// different W, the deploy uses that W (and logs it) rather than the configured one.
     /// <see cref="DeployResult.Workers"/> and <see cref="DeployResult.SerialFallback"/> report
     /// what was chosen.
     /// </para></summary>
@@ -103,15 +107,28 @@ public sealed class DbspNetEngine
         // and Feldera (Calcite) sorts NULLs low by default (last under DESC).
         // The snapshot codecs are registered at construction and touched only by
         // Save/Load — a persistent compile Steps identically to a non-persistent one.
+        var checkpoint = persistent
+            ? new SnapshotCheckpointStore(new LocalTableFileSystem(snapshotDir!))
+            : null;
+
+        var workers = _workers;
+        if (checkpoint is not null
+            && await checkpoint.RecordedWorkersAsync(cancellationToken).ConfigureAwait(false) is { } recorded
+            && recorded != workers)
+        {
+            Console.Error.WriteLine(
+                $"dbspnet: the checkpoint in {snapshotDir} was written with {recorded} worker(s); " +
+                $"running with {recorded}, not the configured {workers} (a checkpoint pins the worker count)");
+            workers = recorded;
+        }
+
+        var snapshotCodecs = persistent ? ArrowSqlSnapshotCodecs.Instance : null;
         ParallelCompiledProgram? parallel = null;
         string? fallback = null;
-        if (_workers > 1 && persistent)
-        {
-            fallback = "checkpointing is configured, and only the serial program checkpoints";
-        }
-        else if (_workers > 1
+        if (workers > 1
             && !SqlProgram.TryCompileParallel(
-                spec.Program, outputViews, _workers, out parallel,
+                spec.Program, outputViews, workers, out parallel,
+                snapshotCodecs: snapshotCodecs,
                 numericStringCoercion: true, nullCollation: NullCollation.Low))
         {
             var blockers = SqlProgram.ParallelBlockers(
@@ -124,13 +141,13 @@ public sealed class DbspNetEngine
         if (fallback is not null)
         {
             Console.Error.WriteLine(
-                $"dbspnet: DBSPNET_WORKERS={_workers} but running the program SERIALLY — {fallback}");
+                $"dbspnet: {workers} workers requested but running the program SERIALLY — {fallback}");
         }
 
         var program = parallel is null
             ? SqlProgram.Compile(
                 spec.Program, outputViews,
-                snapshotCodecs: persistent ? ArrowSqlSnapshotCodecs.Instance : null,
+                snapshotCodecs: snapshotCodecs,
                 numericStringCoercion: true, nullCollation: NullCollation.Low)
             : null;
 
@@ -141,15 +158,12 @@ public sealed class DbspNetEngine
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, o.Uri, OutputModeSetting))
             .ToList();
 
-        var checkpoint = persistent
-            ? new SnapshotCheckpointStore(new LocalTableFileSystem(snapshotDir!))
-            : null;
-
         ProgramRunner runner;
         try
         {
             runner = parallel is not null
-                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, cancellationToken).ConfigureAwait(false)
+                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, checkpoint, cancellationToken)
+                    .ConfigureAwait(false)
                 : await ProgramRunner.CreateAsync(program!, inputs, outputs, checkpoint, cancellationToken)
                     .ConfigureAwait(false);
         }

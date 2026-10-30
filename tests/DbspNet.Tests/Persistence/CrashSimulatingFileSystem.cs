@@ -27,12 +27,17 @@ internal sealed class SimulatedCrashException : Exception
 /// is counted; when the count reaches <see cref="CrashAt"/> that mutation and every later one
 /// throws <see cref="SimulatedCrashException"/>, so a test can enumerate every crash point of a
 /// commit by setting <c>CrashAt = Mutations + k</c> for k = 0, 1, ….</para>
+/// <para>Thread-safe, for the parallel snapshot's concurrent worker writes. With concurrent
+/// writers, which files exist at crash point k depends on the interleaving; the total count does
+/// not.</para>
 /// </remarks>
 internal sealed class CrashSimulatingFileSystem : IDurableTableFileSystem
 {
     private readonly InMemoryTableFileSystem _live;
     private readonly Dictionary<string, byte[]> _durable;
+    private readonly object _gate = new();
     private bool _crashed;
+    private long _mutations;
 
     public CrashSimulatingFileSystem()
         : this(new InMemoryTableFileSystem(), new Dictionary<string, byte[]>(StringComparer.Ordinal))
@@ -46,7 +51,16 @@ internal sealed class CrashSimulatingFileSystem : IDurableTableFileSystem
     }
 
     /// <summary>Mutations performed so far.</summary>
-    public long Mutations { get; private set; }
+    public long Mutations
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _mutations;
+            }
+        }
+    }
 
     /// <summary>Index of the mutation that crashes; <see cref="long.MaxValue"/> = never.</summary>
     public long CrashAt { get; set; } = long.MaxValue;
@@ -77,13 +91,16 @@ internal sealed class CrashSimulatingFileSystem : IDurableTableFileSystem
 
     private void Mutate()
     {
-        if (_crashed || Mutations == CrashAt)
+        lock (_gate)
         {
-            _crashed = true;
-            throw new SimulatedCrashException();
-        }
+            if (_crashed || _mutations == CrashAt)
+            {
+                _crashed = true;
+                throw new SimulatedCrashException();
+            }
 
-        Mutations++;
+            _mutations++;
+        }
     }
 
     public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default) =>
@@ -128,13 +145,19 @@ internal sealed class CrashSimulatingFileSystem : IDurableTableFileSystem
         Mutate();
         foreach (var path in paths)
         {
-            if (await _live.ExistsAsync(path, cancellationToken))
+            var bytes = await _live.ExistsAsync(path, cancellationToken)
+                ? await _live.ReadAllBytesAsync(path, cancellationToken)
+                : null;
+            lock (_gate)
             {
-                _durable[path] = await _live.ReadAllBytesAsync(path, cancellationToken);
-            }
-            else
-            {
-                _durable.Remove(path);
+                if (bytes is not null)
+                {
+                    _durable[path] = bytes;
+                }
+                else
+                {
+                    _durable.Remove(path);
+                }
             }
         }
     }
@@ -144,7 +167,10 @@ internal sealed class CrashSimulatingFileSystem : IDurableTableFileSystem
     {
         Mutate();
         await _live.WriteAllBytesAsync(path, data, cancellationToken);
-        _durable[path] = data.ToArray();
+        lock (_gate)
+        {
+            _durable[path] = data.ToArray();
+        }
     }
 
     private sealed class CountingFile(CrashSimulatingFileSystem owner, ISequentialFile inner) : ISequentialFile
