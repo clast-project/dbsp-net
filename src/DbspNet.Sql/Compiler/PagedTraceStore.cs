@@ -61,7 +61,7 @@ internal sealed class PagedRows
     private readonly int _recordBytes;
     private readonly int _rowsPerPage;
     private readonly int _fullPageBytes;
-    private readonly List<byte[]> _pages = [];
+    private readonly List<StorePage> _pages = [];
     private PagedStrings _strings = new();
     private Dictionary<int, StructuralRow>? _escaped;
 
@@ -128,20 +128,18 @@ internal sealed class PagedRows
         if (page == _pages.Count)
         {
             // Small first page, so a tiny trace does not hold a megabyte; full pages after.
-            _pages.Add(new byte[page == 0 ? Math.Min(_fullPageBytes, FirstPageRows * _recordBytes) : _fullPageBytes]);
+            _pages.Add(StorePage.Allocate(page == 0 ? Math.Min(_fullPageBytes, FirstPageRows * _recordBytes) : _fullPageBytes));
         }
         else if (_pages[page].Length < needed)
         {
-            var grown = _pages[page];
-            Array.Resize(ref grown, Math.Min(_fullPageBytes, Math.Max(needed, grown.Length * 2)));
-            _pages[page] = grown;
+            _pages[page] = _pages[page].Grow(Math.Min(_fullPageBytes, Math.Max(needed, _pages[page].Length * 2)));
         }
 
         return fresh;
     }
 
     public Span<byte> Record(int slot) =>
-        _pages[slot / _rowsPerPage].AsSpan(slot % _rowsPerPage * _recordBytes, _recordBytes);
+        _pages[slot / _rowsPerPage].Span(slot % _rowsPerPage * _recordBytes, _recordBytes);
 
     public int ReadInt32(int slot, int offset) => BinaryPrimitives.ReadInt32LittleEndian(Record(slot)[offset..]);
 
@@ -1151,7 +1149,7 @@ internal sealed class PagedStrings
 {
     private const int PageBytes = 1 << 20;
     private const int FirstPageBytes = 4096;
-    private readonly List<byte[]> _pages = [];
+    private readonly List<StorePage> _pages = [];
     private int _current = -1;
     private int _offset;
 
@@ -1183,7 +1181,7 @@ internal sealed class PagedStrings
         Live += bytes.Length;
         if (bytes.Length > PageBytes / 4)
         {
-            _pages.Add(bytes.ToArray());   // its own page; the current page stays current
+            _pages.Add(StorePage.Of(bytes));   // its own page; the current page stays current
             return (_pages.Count - 1, 0);
         }
 
@@ -1192,32 +1190,126 @@ internal sealed class PagedStrings
             var page = _current < 0 ? null : _pages[_current];
             if (page is not null && page.Length < PageBytes && _offset + bytes.Length <= PageBytes)
             {
-                Array.Resize(ref page, Math.Min(PageBytes, Math.Max(_offset + bytes.Length, page.Length * 2)));
-                _pages[_current] = page;
+                _pages[_current] = page.Grow(Math.Min(PageBytes, Math.Max(_offset + bytes.Length, page.Length * 2)));
             }
             else
             {
-                _pages.Add(new byte[_current < 0 ? Math.Max(FirstPageBytes, bytes.Length) : PageBytes]);
+                _pages.Add(StorePage.Allocate(_current < 0 ? Math.Max(FirstPageBytes, bytes.Length) : PageBytes));
                 _current = _pages.Count - 1;
                 _offset = 0;
             }
         }
 
-        bytes.CopyTo(_pages[_current].AsSpan(_offset));
+        bytes.CopyTo(_pages[_current].Span(_offset, bytes.Length));
         var at = (_current, _offset);
         _offset += bytes.Length;
         return at;
     }
 
     public ReadOnlySpan<byte> Slice(int page, int offset, int length) =>
-        length == 0 ? default : _pages[page].AsSpan(offset, length);
+        length == 0 ? default : _pages[page].Span(offset, length);
 
     public ReadOnlyMemory<byte> Memory(int page, int offset, int length) =>
-        length == 0 ? default : _pages[page].AsMemory(offset, length);
+        length == 0 ? default : _pages[page].Memory(offset, length);
 
     public void Release(int length)
     {
         Live -= length;
         Dead += length;
     }
+}
+
+/// <summary>
+/// One page of a paged store: a managed <c>byte[]</c> (on the LOH at 1 MiB), or — with
+/// <c>DBSPNET_TRACE_STORE_PAGES=native</c>, an experiment (docs/design-paged-trace-state.md §15) —
+/// unmanaged memory the GC neither scans nor counts toward its gen2 budget.
+/// </summary>
+internal abstract class StorePage
+{
+    private static readonly bool Native = string.Equals(
+        Environment.GetEnvironmentVariable("DBSPNET_TRACE_STORE_PAGES")?.Trim(), "native", StringComparison.OrdinalIgnoreCase);
+
+    public abstract int Length { get; }
+
+    public static StorePage Allocate(int length) => Native ? new NativeStorePageRef(new NativeStorePage(length)) : new ManagedStorePage(new byte[length]);
+
+    public abstract Span<byte> Span(int offset, int length);
+
+    public abstract ReadOnlyMemory<byte> Memory(int offset, int length);
+
+    /// <summary>A page of <paramref name="length"/> bytes holding this page's contents.</summary>
+    public StorePage Grow(int length)
+    {
+        var grown = Allocate(length);
+        Span(0, Length).CopyTo(grown.Span(0, Length));
+        return grown;
+    }
+
+    /// <summary>A page holding a copy of <paramref name="bytes"/>.</summary>
+    public static StorePage Of(ReadOnlySpan<byte> bytes)
+    {
+        var page = Allocate(bytes.Length);
+        bytes.CopyTo(page.Span(0, bytes.Length));
+        return page;
+    }
+}
+
+internal sealed class ManagedStorePage(byte[] bytes) : StorePage
+{
+    public override int Length => bytes.Length;
+
+    public override Span<byte> Span(int offset, int length) => bytes.AsSpan(offset, length);
+
+    public override ReadOnlyMemory<byte> Memory(int offset, int length) => bytes.AsMemory(offset, length);
+}
+
+/// <summary>
+/// Unmanaged page memory, its own <see cref="System.Buffers.MemoryManager{T}"/> so strings can be
+/// handed out zero-copy. EXPERIMENT ONLY: the memory is <b>never freed</b>. A finalizer would be
+/// unsafe (CA2015: a <c>Span</c> taken from the page can outlive the last reference to the manager),
+/// and a correct release protocol is the open design cost; for a measurement inside one process
+/// whose stores live to its end, leaking is exact enough. No <c>GC.AddMemoryPressure</c>: keeping
+/// the pages out of the GC's budget is what is being measured.
+/// </summary>
+internal sealed class NativeStorePage : System.Buffers.MemoryManager<byte>
+{
+    private readonly IntPtr _address;
+    private readonly int _length;
+
+    public NativeStorePage(int length)
+    {
+        _length = length;
+        _address = Marshal.AllocHGlobal(Math.Max(1, length));
+        AsSpanAt(0, length).Clear();
+    }
+
+    public int Length => _length;
+
+    public override Span<byte> GetSpan() => AsSpanAt(0, _length);
+
+    public override System.Buffers.MemoryHandle Pin(int elementIndex = 0) =>
+        throw new NotSupportedException("native store pages are not pinned through Memory");
+
+    public override void Unpin()
+    {
+    }
+
+    internal Span<byte> AsSpanAt(int offset, int length) =>
+        MemoryMarshal.CreateSpan(ref Unsafe.AddByteOffset(ref Unsafe.NullRef<byte>(), _address + offset), length);
+
+    internal ReadOnlyMemory<byte> MemoryAt(int offset, int length) => Memory.Slice(offset, length);
+
+    protected override void Dispose(bool disposing)
+    {
+    }
+}
+
+// The StorePage face of a native page (MemoryManager already has a base class).
+internal sealed class NativeStorePageRef(NativeStorePage page) : StorePage
+{
+    public override int Length => page.Length;
+
+    public override Span<byte> Span(int offset, int length) => page.AsSpanAt(offset, length);
+
+    public override ReadOnlyMemory<byte> Memory(int offset, int length) => page.MemoryAt(offset, length);
 }

@@ -432,3 +432,27 @@ If the store is revisited, the first experiment is pages outside the GC heap (`N
 alternative to decision (b)), which removes cost (1) and isolates (2); strings then need a
 `MemoryManager` per page for zero-copy reads, and pages a release protocol. Cost (2) goes only with
 unboxed downstream consumers (the columnar arc).
+
+## 15. Native pages — the experiment (2026-10-30)
+
+`DBSPNET_TRACE_STORE_PAGES=native` (with `DBSPNET_TRACE_STORE=paged`): record and string pages come
+from `Marshal.AllocHGlobal`, invisible to the GC's budget; each page is its own `MemoryManager<byte>`
+so strings stay zero-copy. **Experiment only — pages are never freed**: a finalizer is unsafe (CA2015,
+a `Span` can outlive the last reference to the manager), and a real release protocol is the
+unsolved cost. Suite 2643/2643 with both on.
+
+ivm-bench SF=3 batch 1, W=8, chunked map on in every arm, 5 alternating rounds, digests identical:
+
+| | chunked | + paged, managed | + paged, native |
+|---|---|---|---|
+| drain | 17.16 s (sd 1.15) | 20.36 s (sd 1.17) | 18.90 s (sd 0.39) |
+| young pause | 5.73 s | 5.69 s | 5.54 s |
+| promoted gen1 | 14.18 GB | 12.44 GB | 13.14 GB |
+| background gen2s | 2 | 4–6 | 2–3 |
+
+Native pages recover 1.47 s of drain against managed pages (SE 0.55) and bring background gen2s back
+to the default's 2 — the gen2-budget cost of §14 was real. But the store is still **+1.73 s** slower
+than without it (SE 0.54), and the young pause does not move beyond noise (−0.19 s, SE 0.15). What is
+left is the store's own work: boxing on every cell a join reads, cell decode and compare, copying
+values in at integrate. That cost only goes with unboxed downstream consumers — the columnar arc —
+so the store has no path to a win on its own. **Verdict: not kept.**
