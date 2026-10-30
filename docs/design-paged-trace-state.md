@@ -284,3 +284,66 @@ cache, so formed copies are held twice until the next step. A streaming enumerat
 output writer would remove both. (2) Integrate CPU is ~2.6× the Dictionary's (per-cell virtual
 codec calls, boxed `row[i]` reads, first-page growth by copy) — small next to the step, not yet
 optimised.
+
+## 12. Increment 3 — built, measured, gate FAILED; the LOH card cost is deltas, not traces (2026-10-30)
+
+Commit `2d36bf6`. `PagedIndexedStore` holds both traces of `IncrementalJoinOp` at the two join
+sites whose combine copies cells (main inner join, residual join): key and value records in
+`PagedRows` (the flat store now shares it), `int[]` key→group and (group, value)→slot indexes, and
+per-group lists that mirror the inner Z-sets' `Dictionary` order (append; a retraction leaves a
+tombstone that the group's next insert reuses, LIFO). Combine gets `PagedRowView`s (a handle;
+cells boxed on read); string cells decode zero-copy from the append-only pages. Semi-joins return
+their argument, so they stay on the in-memory trace. Ownership census first (`TraceAccessProfile`
+now records the constructing operator): inner joins own 21.6M of 31.5M trace entries (3.3 GB),
+aggregates 5.0M, integrated views 3.6M, left joins 0.7M, distinct 0.6M.
+
+**Correctness.** Differential test against `IndexedZSet` (groups, values, weights, enumeration
+order, drop-below, the formed snapshot); a join snapshot byte-identical across representations
+(the test forces the structural compile — a single query otherwise takes the typed path and never
+reaches the store, which a probe caught); suite 2632/2632 off and on; ivm-bench all 16 digests
+identical at W=8 in every paired run.
+
+**Census at drain end, W=8** (increments 1 + 3 on):
+
+| | boxed | paged |
+|---|---|---|
+| objects | 160.1M | **109.7M** |
+| `StructuralRow` | 44.6M | **20.2M** |
+| live LOH arrays holding references | ~538 MB | ~140 MB |
+| live bytes | 10.16 GB | 10.47 GB (pages 4.19 GB) |
+| `Utf8String` / `Double` boxes | 6.8M / 10.5M | 14.6M / 16.3M (join output rows now carry fresh boxes, kept downstream) |
+
+**GC, drain only, 5 alternating runs:** young pause 6.21 s (sd 0.37) → **6.12 s** (sd 0.27);
+promoted gen0 15.92 → 17.30 GB, gen1 13.50 → 12.06 GB; drain 18.9 → 18.8 s. Inner-join allocation
+9.6 → 15.9 GiB, join CPU +1.5 s summed (one profiled run). **The keep-gate (≥ 1.5 s of pause) fails
+by more than an order of magnitude.** Per §9's stop rule, nothing further is built on this design.
+
+**Why: the native trace and an LOH allocation tally.** `sample` + gc-phases.py on the paged arm:
+mark through LOH cards 24.7% of in-GC time (boxed 25.3%), relocate through LOH cards 17.2%
+(22.5%), survivors 23.2% (21.6%). Halving the live trace containers barely touched LOH card work.
+`IVM_LOH_ALLOC=1` (runtime AllocationTick, LOH only) shows what does the LOH allocating in batch 1:
+
+| LOH bytes allocated, batch 1, W=8 | boxed | paged |
+|---|---|---|
+| `Entry<StructuralRow,Z64>[]` — flat Z-set dictionaries | **6.00 GB** | **5.78 GB** |
+| `KeyValuePair<StructuralRow,Z64>[]` | 1.28 GB | 1.28 GB |
+| `object[]` | 0.75 GB | 0.75 GB |
+| `Entry<StructuralRow,ZSet<…>>[]` — indexed groups | 0.51 GB | 0.25 GB |
+| `Entry<StructuralRow,ZSetBuilder<…>>[]` | 0.41 GB | 0.41 GB |
+| `byte[]` | 1.48 GB | 6.36 GB (pages) |
+
+Only ~0.2 GB of the flat dictionaries is alive at drain end, so ~96% of that 6 GB is per-tick
+**delta** Z-sets: each large enough for the LOH, each holding references to young rows, each
+card-scanned by every young GC until a background gen2 frees it. That is the §27.7 side
+observation ("per-tick delta Dictionaries are LOH arrays too") — and it, not trace state, is
+where the 48% of young-GC time goes. `TableCardProbe`'s `cells` arm halved the pause because,
+with `DELTA_CHUNK` set, its deltas were already off the LOH; the real engine's are not.
+
+**What this leaves.** The paged store is correct and stays behind `DBSPNET_TRACE_STORE=paged`
+(default off, byte-identical), but it is not the lever, and its probe-side boxing is a pure cost.
+The lever the evidence now points at is **delta containers off the LOH** — §10 risk 5, never
+designed here: per-tick Z-sets/builders whose backing arrays stay under 85,000 B (chunked, or
+pooled across ticks so they age into gen2 once instead of being re-allocated on the LOH each
+tick). Before designing it: the instrument is `IVM_LOH_ALLOC=1` plus gc-phases.py; a cheap test is
+an arm that caps the delta builders' pre-size so no delta dictionary reaches the LOH, measured on
+LOH-card share and drain-only young pause.

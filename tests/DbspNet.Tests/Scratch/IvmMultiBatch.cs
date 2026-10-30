@@ -203,6 +203,10 @@ public class IvmMultiBatch
                 await Task.Delay(2000); // runtime events arrive asynchronously
                 _out.WriteLine("GCPAUSE " + gcEvents.Report());
                 _out.WriteLine("GCPAUSE-DRAIN " + gcEvents.Report(drainEndUtc));
+                foreach (var line in gcEvents.LohAllocations())
+                {
+                    _out.WriteLine(line);
+                }
                 foreach (var line in gcEvents.PerGc())
                 {
                     _out.WriteLine(line);
@@ -367,6 +371,18 @@ public class IvmMultiBatch
     {
         private readonly object _gate = new();
         private readonly List<(string Kind, double Ms, double P0, double P1, DateTime At)> _pauses = new();
+        private readonly Dictionary<string, double> _lohAlloc = new(StringComparer.Ordinal);
+
+        /// <summary>LOH bytes allocated by type (sampled; IVM_LOH_ALLOC=1).</summary>
+        public string[] LohAllocations()
+        {
+            lock (_gate)
+            {
+                return _lohAlloc.OrderByDescending(kv => kv.Value).Take(15)
+                    .Select(kv => string.Create(CultureInfo.InvariantCulture, $"LOHALLOC {kv.Value / 1e9,8:F2} GB  {kv.Key}"))
+                    .ToArray();
+            }
+        }
         private readonly List<string> _perGc = new();
         private DateTime _suspend;
         private string? _kind;
@@ -391,7 +407,14 @@ public class IvmMultiBatch
         {
             if (source.Name == "Microsoft-Windows-DotNETRuntime")
             {
-                EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Informational, (System.Diagnostics.Tracing.EventKeywords)0x1);
+                // IVM_LOH_ALLOC=1: Verbose adds GCAllocationTick (one event per ~100 KB allocated),
+                // tallied below by type for the large-object heap.
+                EnableEvents(
+                    source,
+                    Environment.GetEnvironmentVariable("IVM_LOH_ALLOC") == "1"
+                        ? System.Diagnostics.Tracing.EventLevel.Verbose
+                        : System.Diagnostics.Tracing.EventLevel.Informational,
+                    (System.Diagnostics.Tracing.EventKeywords)0x1);
             }
         }
 
@@ -401,6 +424,14 @@ public class IvmMultiBatch
             {
                 switch (e.EventName)
                 {
+                    case "GCAllocationTick_V4" or "GCAllocationTick_V3":
+                        if (Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("AllocationKind")], CultureInfo.InvariantCulture) == 1)
+                        {
+                            var typeName = e.Payload![e.PayloadNames!.IndexOf("TypeName")] as string ?? "?";
+                            _lohAlloc[typeName] = _lohAlloc.GetValueOrDefault(typeName) + Field(e, "AllocationAmount64");
+                        }
+
+                        break;
                     case "GCSuspendEEBegin_V1":
                         _suspend = e.TimeStamp;
                         break;
