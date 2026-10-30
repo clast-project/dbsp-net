@@ -1,5 +1,8 @@
 # Starting prompt — next arc: columnar / arena inner-multiset representation
 
+> **Superseded (2026-10-30) by `docs/next-arc-row-representation-prompt.md`**, which starts
+> from the parallel program and batch 1's measured GC-pause composition.
+
 > Ready-to-use kickoff prompt for the columnar end-state arc (§17 #3 of
 > `docs/design-row-representation.md`). Written so a fresh session starts at the real
 > decision — *where is term-2 still large after the §18 narrowing, and does a reused
