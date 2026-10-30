@@ -347,3 +347,32 @@ pooled across ticks so they age into gen2 once instead of being re-allocated on 
 tick). Before designing it: the instrument is `IVM_LOH_ALLOC=1` plus gc-phases.py; a cheap test is
 an arm that caps the delta builders' pre-size so no delta dictionary reaches the LOH, measured on
 LOH-card share and drain-only young pause.
+
+## 13. The delta test — LOH residency is the lever (2026-10-30)
+
+Two arms against the baseline, ivm-bench SF=3 batch 1, W=8, Server GC, all digests identical.
+
+- **Capping the delta builders' pre-size** (3000 entries; temporary seam, reverted) does nothing:
+  drain 18.0 s, young pause 6.40 s (baseline 18.2 / 6.37, one run each), and LOH allocation of
+  flat Z-set dictionaries *rises* 6.0 → 7.4 GB — a big delta still outgrows 85,000 B, and its
+  resize steps leave more dead LOH arrays. Pre-size is not the lever; delta size is.
+- **`DOTNET_GCLOHThreshold=0x8000000` (128 MB)** — no code change; arrays below it are allocated
+  young and die young instead of sitting on the LOH, card-scanned, until a background gen2.
+  5 alternating runs per arm:
+
+| | baseline | LOH threshold 128 MB | Δ |
+|---|---|---|---|
+| drain | 18.56 s (sd 1.42) | **15.82 s** (sd 0.29) | **−2.74 s** (SE 0.65) |
+| young pause | 6.53 s (sd 0.61) | **5.41 s** (sd 0.12) | **−1.12 s** (SE 0.28) |
+| background gen2s | 6–9 | 0 | |
+| promoted gen0 / gen1 | 15.8 / 13.9 GB | 20.0 / 14.9 GB | more copied, shorter pauses |
+
+The drain gain exceeds the pause gain (no background gen2s competing for cores, and run-to-run
+variance collapses 5×). Combined with the paged store (one run) it is worse — 17.3 s / 5.67 s —
+because 1 MiB pages are then young objects that get copied; the store's design assumed the LOH.
+
+This also moves trace containers off the LOH, but §12 showed those are a small share; the effect
+is overwhelmingly the per-tick deltas. Next decisions: whether a process-wide runtime setting is
+acceptable to ship (runtimeconfig `System.GC.LOHThreshold`; needs a threshold sweep — the 128 MB
+point is arbitrary — and Nexmark/other benchmarks under it), or whether to engineer delta
+containers that stay under 85,000 B per array (chunked Z-sets), which the setting now prices.
