@@ -128,6 +128,26 @@ run, so it is Curt's to run.
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
 2. **Increment 2 — A2 checkpoint policy.** A durable input WAL every batch, with offsets in each
    record, and a snapshot every N batches or T seconds.
-3. **Phases 1–3 of the kickoff:** scenario and targets, the deciding measurements (spine vs flat at
+3. **Increment 3 — re-shard at restore (change W between parallel worker counts).** Today W is
+   pinned by the checkpoint, as in Feldera (`controller.rs`: "Can't change number of workers or
+   hosts yet"; their runtime rebalancer in `operator/dynamic/balance/` already moves integrated
+   state between workers). Plan: when the requested W differs from the recorded one, each new worker
+   reads every old worker's slice and keeps the entries with `hash(key) % W_new` = its index,
+   rebuilding its maps from them. The partition function, the checkpoint format and same-W restore
+   are unchanged, so normal running and checkpoints cost nothing extra; only a W-changing restore
+   pays one rehash per entry plus the cross-worker read (unmeasured). Fixed virtual partitions
+   (Flink key groups) were considered and not chosen: they only pay off if changing W must be
+   cheap and frequent, and they cap W. Work:
+   - audit every operator for per-worker (not per-key) state and give each a merge rule;
+     `LatenessOperator.maxSeen` takes the minimum (conservative: delays GC, never wrong);
+   - verification: checkpoint at W_old, restore at W_new, continue, compare against an
+     uninterrupted run, over the `WideProgram` operator set, both directions (e.g. 4→12, 12→4,
+     3→2), flat and spine; plus a crash during a re-sharding restore leaves the old checkpoint
+     restorable;
+   - `DbspNetEngine` adopts the configured W instead of the recorded one, with a log line.
+
+   Out of scope: serial ↔ parallel. The two programs have different operators and restore matches
+   operators by position, so that waits on the operator-identity decision.
+4. **Phases 1–3 of the kickoff:** scenario and targets, the deciding measurements (spine vs flat at
    W=8/12 with chunked maps, delta-run bytes per tick, the restore fraction a run-manifest layout
    avoids), then the choice among options 1–3.
