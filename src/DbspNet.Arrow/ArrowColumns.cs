@@ -28,6 +28,11 @@ public enum StringDecoding
     /// (what the IPC reader produces) a disposed batch leaves the values dangling.</summary>
     Alias,
 
+    /// <summary>Copy each cell's bytes into its own exact-size array: one allocation per cell, no
+    /// transcode, and each cell owns its bytes, so retention is the same as
+    /// <see cref="Transcode"/>'s.</summary>
+    Copy,
+
     /// <summary>Copy the column's bytes once into a managed arena and slice out of it: one
     /// allocation per column, no transcode, ordinary GC ownership. Every surviving row pins the
     /// whole arena, so use it where rows live and die together.</summary>
@@ -68,6 +73,7 @@ internal static class ArrowColumns
         {
             StringDecoding.Alias => ExtractStringAlias((StringArray)array, from, rowCount),
             StringDecoding.Arena => ExtractStringArena((StringArray)array, from, rowCount),
+            StringDecoding.Copy => ExtractStringCopy((StringArray)array, from, rowCount),
             _ => ExtractString((StringArray)array, from, rowCount),
         },
         SqlDateType => ExtractDate((Date32Array)array, from, rowCount),
@@ -262,6 +268,28 @@ internal static class ArrowColumns
 
             result[i] = Utf8String.FromBytes(
                 new ReadOnlyMemory<byte>(arena, offsets[from + i] - first, offsets[from + i + 1] - offsets[from + i]));
+        }
+
+        return result;
+    }
+
+    /// <summary>Each cell's UTF-8 bytes copied into an exact-size array: <see cref="ExtractString"/>
+    /// without the UTF-8 → UTF-16 → UTF-8 round trip and its intermediate <c>string</c>.</summary>
+    private static object?[] ExtractStringCopy(StringArray a, int from, int n)
+    {
+        var bytes = a.ValueBuffer.Memory.Span;
+        var offsets = a.ValueOffsets;
+        var result = new object?[n];
+        for (var i = 0; i < n; i++)
+        {
+            if (a.IsNull(from + i))
+            {
+                result[i] = null;
+                continue;
+            }
+
+            var start = offsets[from + i];
+            result[i] = Utf8String.FromBytes(bytes[start..offsets[from + i + 1]].ToArray());
         }
 
         return result;

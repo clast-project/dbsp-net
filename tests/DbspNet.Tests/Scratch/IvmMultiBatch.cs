@@ -121,6 +121,8 @@ public class IvmMultiBatch
                 PromotePendingCommits(stagingRoot, batch - 1);
             }
 
+            var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
+            double drainAllocGib = 0;
             var sw = Stopwatch.StartNew();
             DateTime? drainEndUtc = null;
             var measureAtDrain = Environment.GetEnvironmentVariable("IVM_MEASURE_AT") == "drain";
@@ -137,6 +139,7 @@ public class IvmMultiBatch
             {
                 ticks = await runner.DrainAsync();
                 drainMs = sw.Elapsed.TotalMilliseconds;
+                drainAllocGib = (GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (double)(1L << 30);
                 drainEndUtc = DateTime.UtcNow;
                 if (measureAtDrain)
                 {
@@ -229,7 +232,7 @@ public class IvmMultiBatch
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1}"));
+                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2}"));
         }
 
         foreach (var o in outputs)

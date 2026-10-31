@@ -21,6 +21,17 @@ namespace DbspNet.Arrow;
 /// </remarks>
 public static class ArrowExtensions
 {
+    // EXPERIMENT (docs/design-connectors.md, G5): how the copying ingest paths decode VARCHAR.
+    // DBSPNET_INGEST_STRINGS=copy|arena selects the candidate; default stays Transcode until the
+    // ivm-bench measurement decides. Alias is not offered: ingest buffers may be native-backed.
+    private static readonly StringDecoding IngestStrings =
+        Environment.GetEnvironmentVariable("DBSPNET_INGEST_STRINGS") switch
+        {
+            "copy" => StringDecoding.Copy,
+            "arena" => StringDecoding.Arena,
+            _ => StringDecoding.Transcode,
+        };
+
     /// <summary>
     /// Materialise the query's current output Z-set as an Arrow batch plus a
     /// parallel weights array. <c>weights[i]</c> is the multiplicity of
@@ -291,7 +302,7 @@ public static class ArrowExtensions
             var columns = new object?[schema.Count][];
             for (var c = 0; c < columns.Length; c++)
             {
-                columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, from, count, StringDecoding.Transcode);
+                columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, from, count, IngestStrings);
             }
 
             return columns;
@@ -320,7 +331,7 @@ public static class ArrowExtensions
         var deltas = new List<(object?[] Values, long Weight)>(rowCount);
         var hasWeights = weights is not null;
         var perColumn = new object?[columnCount][];
-        var strings = zeroCopyStrings ? StringDecoding.Alias : StringDecoding.Transcode;
+        var strings = zeroCopyStrings ? StringDecoding.Alias : IngestStrings;
 
         // Per block of rows: each column walks its Arrow array in one typed loop (no per-cell
         // virtual dispatch), then the block's rows are assembled row-major. Blocks keep the boxed

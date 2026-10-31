@@ -16,6 +16,7 @@
          ArrowIpcExtensions writes; sharing the AppendWeightField /
          WeightFieldName constants avoids drift. -->
     <InternalsVisibleTo Include="DbspNet.Persistence" />
+    <InternalsVisibleTo Include="DbspNet.Tests" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" />
