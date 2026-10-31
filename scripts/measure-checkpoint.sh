@@ -8,8 +8,8 @@
 #   RUNS=3 ARMS="12 12:nofsync" scripts/measure-checkpoint.sh
 #
 # An arm is a worker count, optionally ":nofsync" (DBSPNET_SNAPSHOT_FSYNC=0) to price the fsyncs
-# and/or ":gcbatch" (DBSPNET_CHECKPOINT_GC=batch: no background GC during checkpoint/restore, the
-# default since 2026-10-31 — arms without it now run with DBSPNET_CHECKPOINT_GC=default)
+# and/or ":gcdefault" (DBSPNET_CHECKPOINT_GC=default: background GC stays on during checkpoint and
+# restore, as before 2026-10-31; every other arm runs the shipped no-background-GC default)
 # and/or ":journal" (IVM_CHECKPOINT_POLICY=none: tick journal per batch, no snapshot).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
@@ -40,8 +40,10 @@ for run in $(seq 1 "$RUNS"); do
     workers="${arm%%:*}"
     fsync=1
     [[ "$arm" == *:nofsync* ]] && fsync=0
-    gcmode=default
-    [[ "$arm" == *:gcbatch* ]] && gcmode=batch
+    # GC during checkpoint/restore: the shipped default (no background GC) unless ":gcdefault"
+    # asks for the runtime's default; ":gcbatch" is kept as an explicit spelling of the default.
+    gcmode=batch
+    [[ "$arm" == *:gcdefault* ]] && gcmode=default
     # ":journal" = the A2 policy with no time trigger: every batch commits a tick-journal entry
     # only, and the restore replays the journal from tick 0. Without it, a snapshot every batch.
     policy=""
