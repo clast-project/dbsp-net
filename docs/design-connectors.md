@@ -81,6 +81,10 @@ version). This is the key simplification DBSP + Delta buy us.
   snapshot restores; it never sets the tick directly. No change needed if connectors
   checkpoint *through* `Snapshot` (via G3).
 
+- **G5 — UTF-8 as the text contract (DRAFT 2026-10-31).** The engine stores VARCHAR as
+  UTF-8, but most input paths make it transcode: the default Arrow ingest decodes every
+  cell to a .NET `string` and re-encodes it. See [UTF-8 as the input contract](#utf-8-as-the-input-contract-draft-2026-10-31).
+
 ---
 
 ## Architecture
@@ -370,6 +374,122 @@ the chosen one-tick-per-version default.
    contents; truncate sink == view; incremental resume across drains).
 4. **Mini end-to-end**, then wire the real ivm-bench harness (input/output adapters +
    the drain signal) — the last mile to a measured run.
+
+## UTF-8 as the input contract (DRAFT 2026-10-31)
+
+### Why
+
+UTF-8 is the text encoding of everything this engine reads and writes — Arrow `Utf8`/`LargeUtf8`,
+Parquet `BYTE_ARRAY (UTF8)`, Delta, JSON, Kafka payloads, the Postgres wire protocol in practice —
+and it is what the engine stores: a VARCHAR value is a `Utf8String` (UTF-8 bytes) in every
+operator, trace and snapshot. A source and a sink that *share* some other encoding are rare enough
+that the engine should not be shaped around them. Feldera is the same: its SQL strings are Rust
+`str`, UTF-8 by type invariant.
+
+Any boundary that hands the engine .NET `string`s therefore pays to encode, and one that hands it
+UTF-8 by way of a `string` pays twice. Measured (2026-10-31):
+
+- **Nexmark harness** (`w1profile`, 1M events): pushing `Utf8String` cells instead of `string`s
+  takes **~281 B/event off every query** and **11–39% off ns/event** (q0 −31%, q20 −39%, q4 −17%).
+  Every earlier Nexmark-vs-Feldera ratio charged us for this; Feldera's generator never pays it.
+  (`NEXMARK_STRINGS=utf8` is now the generator default, `018919b`.)
+- **Flat-state probe** (docs/design-flat-state-probe.md §3.4, q20 10M): the engine runs **19–22%
+  faster** on UTF-8 input; its GC pause at W=1 falls 764 → 155 ms.
+
+### Where the engine transcodes today
+
+| Entry point | String cells arrive as | What happens per VARCHAR cell |
+|---|---|---|
+| `TableInput.Push` / `Insert` / `Delete`, `TypedTableInput.Push` (`object?[]` rows) | `string` or `Utf8String` | `string` → `Utf8String.Of` (encode + allocate); `Utf8String` passes through untouched (`BoundaryEncoder`) |
+| `PushArrow(batch[, weights])` — the connectors' path (`PipelineRunner`) | Arrow `Utf8` | **`StringDecoding.Transcode`: UTF-8 → `string` → UTF-8, two allocations, two transcodes** |
+| `ShardedTableInput.PushArrow` — parallel programs (`ProgramRunner` via `RunnerProgram`, so ivm-bench at W>1) | Arrow `Utf8` | **`Transcode`** |
+| `DecodeArrowDeltas` — decode off the engine thread, push later | Arrow `Utf8` | **`Transcode`** |
+| `PushArrowZeroCopy` | Arrow `Utf8` | `Alias`: the cell is a slice of the batch's buffer |
+| Snapshot restore | Arrow IPC | `Arena`: one copy per column block (b83c593) |
+| Output: `ToArrowDelta` / `ToArrowView` | — | appends the UTF-8 bytes directly — already right |
+
+So the production ingest path — every connector, and ivm-bench — is the worst row in the table.
+
+### The contract
+
+1. **VARCHAR crosses every engine boundary as UTF-8.** `Utf8String` (or an Arrow `Utf8` column) is
+   the native form. A .NET `string` stays accepted on the `object?[]` path as a convenience for
+   callers that hold one (tests, small embedders): it is encoded exactly once, at the boundary,
+   which is today's behaviour — the change there is documentation, not code.
+2. **Transcoding a non-UTF-8 source is the connector's job**, never the engine's: a CSV reader with
+   a Latin-1 option converts to UTF-8 before it builds a batch.
+3. **Ownership: by default the engine owns what it keeps.** A retained row must never keep an
+   input buffer alive or dangle when the caller frees it. The three ways to get bytes in, in the
+   order an API should offer them:
+
+   | Mode | Cost per VARCHAR cell | Retention | Use |
+   |---|---|---|---|
+   | **`Copy` (new; the default)** | one exact-size `byte[]`, a memcpy, no transcode | each cell owns its bytes — identical to today's `Transcode` | every ingest path |
+   | `Arena` | one copy per column block | a surviving row pins its block's arena | restore, bulk loads where rows live and die together |
+   | `Alias` | none | a surviving row pins (or, if native-backed, dangles on) the caller's buffer | callers that hand the engine the buffer for good |
+
+   `Copy` is `Transcode` with the round trip removed: the same allocation count minus one, the
+   same retention, so it can replace `Transcode` as the default with no behavioural risk.
+   `Arena` stays the restore mode; it is wrong for ingest that filters, where one surviving row
+   pins every string of its block (the chunk-retention finding of
+   design-state-representation §10.H). `Alias` stays opt-in.
+4. **Validity: validate at ingest by default.** Nothing validates UTF-8 today, and several
+   operators assume it (`LENGTH` counts code points, `UPPER`/`LOWER`, `LIKE`, the regex functions).
+   Feldera cannot hold invalid UTF-8 at all (Rust `str`), so per the adopt-Feldera-assumptions
+   policy the default is to reject an invalid cell with an error naming table and column.
+   `System.Text.Unicode.Utf8.IsValid` is vectorised, so the check should cost little next to the
+   copy; it gets an opt-out for sources that guarantee validity (our own Arrow builders) and is
+   measured in increment 1 before it ships.
+
+### API shape
+
+```csharp
+public enum StringDecoding { Copy, Arena, Alias, Transcode /* kept for A/B only */ }
+
+// Arrow ingest: one optional parameter, default Copy. PushArrowZeroCopy becomes
+// PushArrow(..., StringDecoding.Alias) and is marked [Obsolete].
+public static void PushArrow(this TableInput input, RecordBatch batch,
+    ReadOnlySpan<long> weights, StringDecoding strings = StringDecoding.Copy);
+public static void PushArrow(this ShardedTableInput input, RecordBatch batch,
+    ReadOnlySpan<long> weights, StringDecoding strings = StringDecoding.Copy);
+public static List<(object?[] Values, long Weight)> DecodeArrowDeltas(this TableInput input,
+    RecordBatch batch, ReadOnlySpan<long> weights, StringDecoding strings = StringDecoding.Copy);
+
+// object?[] path: unchanged signature; documented as "VARCHAR cells are Utf8String
+// (passed through) or string (encoded once)".
+public void Push(IEnumerable<(object?[] Values, long Weight)> deltas);
+```
+
+`IInputConnector` needs no change — it already yields Arrow batches; `PipelineRunner` and
+`ProgramRunner` pick up the new default by not passing the parameter. Output is unchanged:
+`ToArrowDelta`/`ToArrowView` already write bytes, and `Current`/`EnumerateView` already return
+`Utf8String` cells.
+
+### Beyond this design
+
+The flat-state probe (docs/design-flat-state-probe.md) points at the longer road: state that owns
+its strings in compacting arenas would copy each value once into state and allocate no per-cell
+object at all. That is a state-representation change, not an API one; `Copy` is the right default
+until then and does not get in its way.
+
+### Increments
+
+1. **`StringDecoding.Copy` + default flip** on the three Arrow ingest paths, with the UTF-8
+   validation behind its opt-out. Gate: ivm-bench SF=3 batch-1 drain and allocation at W=12,
+   ≥5 alternating runs per arm, outputs identical; the validation cost reported separately.
+2. **Harness inputs**: Nexmark done (`018919b`); move the fraud generator and any other
+   `string`-emitting benchmark input to `Utf8String`, with a flag to reproduce old runs.
+3. **Docs + deprecation**: the `object?[]` contract in `TableInput`'s XML docs; `PushArrowZeroCopy`
+   `[Obsolete]` in favour of the parameter.
+
+### Open questions
+
+- **Validation scope.** Validate in `Copy` only (where we touch the bytes anyway), or in every mode?
+  (Lean: every mode, opt-out per call — an `Alias` caller is the likeliest to have skipped it.)
+- **`LargeUtf8` / `Utf8View`.** Arrow's 64-bit-offset and view string types should ingest the same
+  way; check what the readers we use (engineered-wood, Arrow IPC) produce before increment 1.
+- **Is `Transcode` worth keeping at all** once `Copy` lands? (Lean: keep one release as the A/B arm,
+  then delete.)
 
 ## Change-site summary
 
