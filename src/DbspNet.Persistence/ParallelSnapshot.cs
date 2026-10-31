@@ -63,6 +63,7 @@ public static class ParallelSnapshot
         int retainCount = 1,
         CancellationToken cancellationToken = default)
     {
+        using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
         if (retainCount < 1)
@@ -191,6 +192,7 @@ public static class ParallelSnapshot
         ITableFileSystem fs,
         CancellationToken cancellationToken = default)
     {
+        using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
 

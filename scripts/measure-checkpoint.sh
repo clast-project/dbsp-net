@@ -7,7 +7,8 @@
 #   scripts/measure-checkpoint.sh                 # 5 runs each of W=1 and W=12
 #   RUNS=3 ARMS="12 12:nofsync" scripts/measure-checkpoint.sh
 #
-# An arm is a worker count, optionally ":nofsync" (DBSPNET_SNAPSHOT_FSYNC=0) to price the fsyncs.
+# An arm is a worker count, optionally ":nofsync" (DBSPNET_SNAPSHOT_FSYNC=0) to price the fsyncs
+# and/or ":gcbatch" (DBSPNET_CHECKPOINT_GC=batch: no background GC during checkpoint/restore).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
 set -euo pipefail
@@ -36,10 +37,13 @@ for run in $(seq 1 "$RUNS"); do
   for arm in $ARMS; do
     workers="${arm%%:*}"
     fsync=1
-    [[ "$arm" == *:nofsync ]] && fsync=0
+    [[ "$arm" == *:nofsync* ]] && fsync=0
+    gcmode=default
+    [[ "$arm" == *:gcbatch* ]] && gcmode=batch
     echo "## run $run arm $arm" | tee -a "$RESULTS"
     DOTNET_gcServer=1 \
     DBSPNET_SNAPSHOT_FSYNC="$fsync" \
+    DBSPNET_CHECKPOINT_GC="$gcmode" \
     IVM_DATA_ROOT="$DATA" \
     IVM_SPEC="$SPEC" \
     IVM_STAGING_ROOT="$DATA/staging-multi" \

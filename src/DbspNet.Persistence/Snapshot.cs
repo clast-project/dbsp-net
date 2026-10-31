@@ -79,6 +79,7 @@ public static class Snapshot
         int retainCount = 1,
         CancellationToken cancellationToken = default)
     {
+        using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
         if (retainCount < 1)
@@ -419,6 +420,7 @@ public static class Snapshot
         int parallelism,
         CancellationToken cancellationToken = default)
     {
+        using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
         if (parallelism < 1)
