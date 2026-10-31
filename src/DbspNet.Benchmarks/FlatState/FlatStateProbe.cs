@@ -25,6 +25,14 @@ internal static class FlatStateProbe
     private const int RetractEvery = 10;
     private const int WarmupEvents = 300_000;
 
+    /// <summary><c>FLATSTATE_INPUT=utf8</c>: string cells arrive as UTF-8, as a connector delivers
+    /// them — each tick's strings packed into one buffer (Arrow-style) before the timer starts, every
+    /// cell a <see cref="Utf8String"/> slice of it. The managed arm then decodes each cell to a
+    /// <c>string</c>, the flat arms copy the bytes into a UTF-8 arena, and the engine keeps the
+    /// slices. Default (<c>string</c>): cells are the generator's managed strings.</summary>
+    private static readonly bool Utf8Input =
+        string.Equals(Environment.GetEnvironmentVariable("FLATSTATE_INPUT"), "utf8", StringComparison.OrdinalIgnoreCase);
+
     public static int Run(string[] args)
     {
         string Arg(int i, string fallback) => args.Length > i ? args[i] : fallback;
@@ -55,7 +63,7 @@ internal static class FlatStateProbe
         var native = NativeAccount.Bytes;
         var r = new List<string>
         {
-            $"arm={arm}", $"W={workers}", $"events={events}", $"retract={(retract ? 1 : 0)}", $"batch={batch}",
+            $"arm={arm}", $"input={(Utf8Input ? "utf8" : "string")}", $"W={workers}", $"events={events}", $"retract={(retract ? 1 : 0)}", $"batch={batch}",
             $"ns_ev={m.TimedNs / events:F1}", $"timed_ms={m.TimedNs / 1e6:F0}", $"cpu_ms={m.CpuMs:F0}",
             $"process_cpu_ms={Environment.CpuUsage.TotalTime.TotalMilliseconds:F0}",
             $"alloc_B_ev={m.AllocBytes / (double)events:F1}", $"pause_ms={m.PauseMs:F0}",
@@ -144,6 +152,11 @@ internal static class FlatStateProbe
                 ring.Enqueue(tickBids);
             }
 
+            if (Utf8Input)
+            {
+                ToUtf8(bids, auctions);
+            }
+
             var pause0 = GC.GetTotalPauseDuration();
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
             var g0 = GC.CollectionCount(0);
@@ -178,6 +191,47 @@ internal static class FlatStateProbe
         }
 
         return m;
+    }
+
+    /// <summary>Rewrite the tick's rows with every string cell a slice of one UTF-8 buffer.</summary>
+    private static void ToUtf8(List<(object?[] Row, long W)> bids, List<(object?[] Row, long W)> auctions)
+    {
+        var bytes = 0;
+        foreach (var list in (ReadOnlySpan<List<(object?[] Row, long W)>>)[bids, auctions])
+        {
+            foreach (var (r, _) in list)
+            {
+                foreach (var c in r)
+                {
+                    if (c is string str)
+                    {
+                        bytes += System.Text.Encoding.UTF8.GetByteCount(str);
+                    }
+                }
+            }
+        }
+
+        var buffer = new byte[bytes];
+        var at = 0;
+        foreach (var list in (ReadOnlySpan<List<(object?[] Row, long W)>>)[bids, auctions])
+        {
+            for (var i = 0; i < list.Count; i++)
+            {
+                var (r, w) = list[i];
+                var copy = (object?[])r.Clone();
+                for (var c = 0; c < copy.Length; c++)
+                {
+                    if (copy[c] is string str)
+                    {
+                        var n = System.Text.Encoding.UTF8.GetBytes(str, buffer.AsSpan(at));
+                        copy[c] = Utf8String.FromBytes(buffer.AsMemory(at, n));
+                        at += n;
+                    }
+                }
+
+                list[i] = (copy, w);
+            }
+        }
     }
 
     private static long LiveManagedBytes()
@@ -236,12 +290,19 @@ internal static class FlatStateProbe
                 case "managed":
                     Round("restore", ManagedQ20Worker.Restore);
                     break;
+                case "poh" when Utf8Input:
+                    Round("restore", FlatQ20Worker<PohPages, byte>.Restore);
+                    break;
                 case "poh":
-                    Round("restore", FlatQ20Worker<PohPages>.Restore);
+                    Round("restore", FlatQ20Worker<PohPages, char>.Restore);
+                    break;
+                case "native" when Utf8Input:
+                    Round("restore", FlatQ20Worker<NativePages, byte>.Restore);
+                    Round("mmap", FlatQ20Worker<NativePages, byte>.RestoreMapped);
                     break;
                 default:
-                    Round("restore", FlatQ20Worker<NativePages>.Restore);
-                    Round("mmap", FlatQ20Worker<NativePages>.RestoreMapped);
+                    Round("restore", FlatQ20Worker<NativePages, char>.Restore);
+                    Round("mmap", FlatQ20Worker<NativePages, char>.RestoreMapped);
                     break;
             }
 
@@ -257,8 +318,10 @@ internal static class FlatStateProbe
     {
         "engine" => new EngineArm(workers, retract),
         "managed" => new ArmWorkers(workers, () => new ManagedQ20Worker()),
-        "poh" => new ArmWorkers(workers, () => new FlatQ20Worker<PohPages>()),
-        "native" => new ArmWorkers(workers, () => new FlatQ20Worker<NativePages>()),
+        "poh" when Utf8Input => new ArmWorkers(workers, () => new FlatQ20Worker<PohPages, byte>()),
+        "poh" => new ArmWorkers(workers, () => new FlatQ20Worker<PohPages, char>()),
+        "native" when Utf8Input => new ArmWorkers(workers, () => new FlatQ20Worker<NativePages, byte>()),
+        "native" => new ArmWorkers(workers, () => new FlatQ20Worker<NativePages, char>()),
         _ => throw new ArgumentException($"unknown arm '{arm}' (engine|managed|poh|native)"),
     };
 

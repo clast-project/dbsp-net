@@ -149,31 +149,32 @@ internal sealed unsafe class PagedColumn<T, TP> : IDisposable
     }
 }
 
-/// <summary>UTF-16 strings appended into paged char storage. A string never straddles a page.
+/// <summary>Strings — UTF-16 chars or UTF-8 bytes — appended into paged storage. A string never straddles a page.
 /// Freed strings only count as garbage; the owner compacts when garbage passes half.</summary>
-internal sealed unsafe class CharArena<TP> : IDisposable
+internal sealed unsafe class StrArena<TC, TP> : IDisposable
+    where TC : unmanaged
     where TP : struct, IPageSource
 {
-    private PagedColumn<char, TP> _chars = new();
+    private PagedColumn<TC, TP> _chars = new();
 
     public long Used { get; set; }
 
     public long Garbage { get; set; }
 
-    public PagedColumn<char, TP> Chars => _chars;
+    public PagedColumn<TC, TP> Chars => _chars;
 
     public bool NeedsCompaction => Used > (4L << 20) && Garbage * 2 > Used;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public long Append(ReadOnlySpan<char> s)
+    public long Append(ReadOnlySpan<TC> s)
     {
-        var page = PagedColumn<char, TP>.PageElems;
+        var page = PagedColumn<TC, TP>.PageElems;
         if (s.Length > page)
         {
-            throw new InvalidOperationException($"string of {s.Length} chars exceeds a page");
+            throw new InvalidOperationException($"string of {s.Length} elements exceeds a page");
         }
 
-        var off = Used & PagedColumn<char, TP>.Mask;
+        var off = Used & PagedColumn<TC, TP>.Mask;
         if (off + s.Length > page)
         {
             Garbage += page - off;
@@ -181,14 +182,14 @@ internal sealed unsafe class CharArena<TP> : IDisposable
         }
 
         _chars.Ensure(Used + s.Length);
-        s.CopyTo(new Span<char>(_chars.At(Used), s.Length));
+        s.CopyTo(new Span<TC>(_chars.At(Used), s.Length));
         var start = Used;
         Used += s.Length;
         return start;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ReadOnlySpan<char> Get(long start, int length) => new(_chars.At(start), length);
+    public ReadOnlySpan<TC> Get(long start, int length) => new(_chars.At(start), length);
 
     /// <summary>Forget the contents but keep the pages (an output batch reused every tick).</summary>
     public void Reset()
@@ -240,6 +241,14 @@ internal static class FlatHash
 
         return Mix(h ^ (ulong)s.Length);
     }
+
+    /// <summary>Either string representation, by element type (the JIT keeps one branch).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ulong Str<TC>(ReadOnlySpan<TC> s)
+        where TC : unmanaged =>
+        typeof(TC) == typeof(char)
+            ? Str(MemoryMarshal.Cast<TC, char>(s))
+            : Str(MemoryMarshal.Cast<TC, byte>(s));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ulong Combine(ulong h, ulong c) => (h ^ c) * 0x9E3779B97F4A7C15UL + 0x632BE59BD9B4E019UL;
@@ -373,8 +382,9 @@ internal sealed class ColumnPages(Func<int> pages, Func<int, nint> page, nuint p
 /// <para>Record layout: weight (8) · longs (8·NL) · string starts (8·NS) · string lengths
 /// (4·NS) · prev (4) · next (4) · row hash (4), rounded up to 8 bytes.</para>
 /// </remarks>
-internal sealed unsafe class FlatTable<TP> : IDisposable
+internal sealed unsafe class FlatTable<TP, TC> : IDisposable
     where TP : struct, IPageSource
+    where TC : unmanaged, IEquatable<TC>
 {
     private const int Empty = -1;
     private const int NoKey = -2;
@@ -413,7 +423,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         }
     }
 
-    public CharArena<TP> Arena { get; private set; } = new();
+    public StrArena<TC, TP> Arena { get; private set; } = new();
 
     public int High { get; private set; }
 
@@ -463,12 +473,12 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
     public static long Long(byte* r, int c) => ((long*)(r + 8))[c];
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ReadOnlySpan<char> Str(byte* r, int c) => Arena.Get(((long*)(r + _offS))[c], ((int*)(r + _offN))[c]);
+    public ReadOnlySpan<TC> Str(byte* r, int c) => Arena.Get(((long*)(r + _offS))[c], ((int*)(r + _offN))[c]);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int NextOf(byte* r) => *(int*)(r + _offX);
 
-    public ulong RowHash(ReadOnlySpan<long> l, string[] s)
+    public ulong RowHash(ReadOnlySpan<long> l, ReadOnlyMemory<TC>[] s)
     {
         var h = FlatHash.Seed;
         for (var i = 0; i < NL; i++)
@@ -478,7 +488,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
 
         for (var i = 0; i < NS; i++)
         {
-            h = FlatHash.Combine(h, FlatHash.Str(s[i]));
+            h = FlatHash.Combine(h, FlatHash.Str(s[i].Span));
         }
 
         return h;
@@ -523,7 +533,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
     }
 
     /// <summary>Add <paramref name="w"/> copies of the row; a weight reaching zero frees it.</summary>
-    public void Upsert(ReadOnlySpan<long> l, string[] s, long w)
+    public void Upsert(ReadOnlySpan<long> l, ReadOnlyMemory<TC>[] s, long w)
     {
         var h = (int)RowHash(l, s);
         ref var k = ref KeySlot(l[0]);
@@ -619,7 +629,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
             return;
         }
 
-        var fresh = new CharArena<TP>();
+        var fresh = new StrArena<TC, TP>();
         for (var slot = 0; slot < High; slot++)
         {
             var r = Rec(slot);
@@ -665,7 +675,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         _kt.Dispose();
     }
 
-    private bool Equal(byte* r, ReadOnlySpan<long> l, string[] s)
+    private bool Equal(byte* r, ReadOnlySpan<long> l, ReadOnlyMemory<TC>[] s)
     {
         for (var c = 0; c < NL; c++)
         {
@@ -677,7 +687,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
 
         for (var c = 0; c < NS; c++)
         {
-            if (!Str(r, c).SequenceEqual(s[c]))
+            if (!Str(r, c).SequenceEqual(s[c].Span))
             {
                 return false;
             }
@@ -704,7 +714,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         return slot;
     }
 
-    private int Insert(ReadOnlySpan<long> l, string[] s, long w, int h, ref KeyEntry k)
+    private int Insert(ReadOnlySpan<long> l, ReadOnlyMemory<TC>[] s, long w, int h, ref KeyEntry k)
     {
         var slot = AllocSlot();
         var rec = Rec(slot);
@@ -716,7 +726,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
 
         for (var c = 0; c < NS; c++)
         {
-            ((long*)(rec + _offS))[c] = Arena.Append(s[c]);
+            ((long*)(rec + _offS))[c] = Arena.Append(s[c].Span);
             ((int*)(rec + _offN))[c] = s[c].Length;
         }
 

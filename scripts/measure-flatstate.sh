@@ -5,6 +5,7 @@
 #
 #   scripts/measure-flatstate.sh                       # 5 rounds of the full matrix
 #   RUNS=1 SIZES=1000000 scripts/measure-flatstate.sh  # a quick pass
+#   SIZES=10000000 RETRACT=1 INPUTS="string utf8" scripts/measure-flatstate.sh
 #
 # Arms: engine (q20 through SQL, typed path), managed (objects + Dictionary), poh (flat pages on
 # the pinned-object heap), native (flat pages in NativeMemory). The flat and managed arms also
@@ -19,6 +20,7 @@ ARMS="${ARMS:-engine managed poh native}"
 WORKERS="${WORKERS:-1 8}"
 SIZES="${SIZES:-1000000 10000000}"
 RETRACT="${RETRACT:-0 1}"
+INPUTS="${INPUTS:-string}"   # string | utf8 (FLATSTATE_INPUT): how string cells arrive
 DOTNET="${DOTNET:-$HOME/.dotnet/dotnet}"
 export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
 
@@ -36,12 +38,14 @@ for run in $(seq 1 "$RUNS"); do
   for size in $SIZES; do
     for retract in $RETRACT; do
       for w in $WORKERS; do
+        for input in $INPUTS; do
         for arm in $ARMS; do
           ckpt="$WORK/ckpt"
           [[ "$arm" == engine ]] && ckpt=""
-          line=$(DOTNET_gcServer=1 DOTNET_GCDynamicAdaptationMode=0 \
+          line=$(FLATSTATE_INPUT="$input" DOTNET_gcServer=1 DOTNET_GCDynamicAdaptationMode=0 \
             "$BIN" flatstate "$arm" "$w" "$size" "$retract" 10000 5 $ckpt 2>&1 | grep -E '^RESULT|Exception' || true)
           echo "run=$run $line" | tee -a "$RESULTS"
+        done
         done
       done
     done

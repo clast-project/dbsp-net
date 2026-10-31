@@ -39,16 +39,67 @@ internal static class Q20Cells
 
     public static void Bid(object?[] r, Span<long> l, string[] s)
     {
+        ReadBidLongs(r, l);
+        s[0] = Decode(r[3]);
+        s[1] = Decode(r[4]);
+        s[2] = Decode(r[6]);
+    }
+
+    public static void Auction(object?[] r, Span<long> l, string[] s)
+    {
+        ReadAuctionLongs(r, l);
+        s[0] = Decode(r[1]);
+        s[1] = Decode(r[2]);
+        s[2] = Decode(r[9]);
+    }
+
+    /// <summary>The flat arms' view of a row: string cells as memory of <typeparamref name="TC"/>,
+    /// never copied here (the table copies what it keeps).</summary>
+    public static void Bid<TC>(object?[] r, Span<long> l, ReadOnlyMemory<TC>[] s)
+        where TC : unmanaged
+    {
+        ReadBidLongs(r, l);
+        s[0] = Cell<TC>(r[3]);
+        s[1] = Cell<TC>(r[4]);
+        s[2] = Cell<TC>(r[6]);
+    }
+
+    public static void Auction<TC>(object?[] r, Span<long> l, ReadOnlyMemory<TC>[] s)
+        where TC : unmanaged
+    {
+        ReadAuctionLongs(r, l);
+        s[0] = Cell<TC>(r[1]);
+        s[1] = Cell<TC>(r[2]);
+        s[2] = Cell<TC>(r[9]);
+    }
+
+    /// <summary>A string cell as a managed string: shared as-is, or decoded from UTF-8 input
+    /// (which allocates — the cost a connector delivering bytes would impose).</summary>
+    private static string Decode(object? o) =>
+        o as string ?? System.Text.Encoding.UTF8.GetString(((Utf8String)o!).Span);
+
+    private static ReadOnlyMemory<TC> Cell<TC>(object? o)
+        where TC : unmanaged
+    {
+        if (typeof(TC) == typeof(char))
+        {
+            var m = ((string)o!).AsMemory();
+            return Unsafe.As<ReadOnlyMemory<char>, ReadOnlyMemory<TC>>(ref m);
+        }
+
+        var u = ((Utf8String)o!).Memory;
+        return Unsafe.As<ReadOnlyMemory<byte>, ReadOnlyMemory<TC>>(ref u);
+    }
+
+    private static void ReadBidLongs(object?[] r, Span<long> l)
+    {
         l[0] = (long)r[0]!;
         l[1] = (long)r[1]!;
         l[2] = (long)r[2]!;
         l[3] = ((Timestamp)r[5]!).Microseconds;
-        s[0] = (string)r[3]!;
-        s[1] = (string)r[4]!;
-        s[2] = (string)r[6]!;
     }
 
-    public static void Auction(object?[] r, Span<long> l, string[] s)
+    private static void ReadAuctionLongs(object?[] r, Span<long> l)
     {
         l[0] = (long)r[0]!;
         l[1] = (long)r[3]!;
@@ -57,20 +108,18 @@ internal static class Q20Cells
         l[4] = ((Timestamp)r[6]!).Microseconds;
         l[5] = (long)r[7]!;
         l[6] = (long)r[8]!;
-        s[0] = (string)r[1]!;
-        s[1] = (string)r[2]!;
-        s[2] = (string)r[9]!;
     }
 
     public static bool InFilter(object?[] auction) => (long)auction[8]! == 10;
 
     /// <summary>The q20 output row's hash, cells in SELECT order. Every arm and the engine sink
     /// hash through this, so their checksums are comparable.</summary>
-    public static ulong OutHash(
-        long auction, long bidder, long price, ReadOnlySpan<char> channel, ReadOnlySpan<char> url,
-        long bidTime, ReadOnlySpan<char> bidExtra, ReadOnlySpan<char> itemName, ReadOnlySpan<char> description,
+    public static ulong OutHash<TC>(
+        long auction, long bidder, long price, ReadOnlySpan<TC> channel, ReadOnlySpan<TC> url,
+        long bidTime, ReadOnlySpan<TC> bidExtra, ReadOnlySpan<TC> itemName, ReadOnlySpan<TC> description,
         long initialBid, long reserve, long auctionTime, long expires, long seller, long category,
-        ReadOnlySpan<char> auctionExtra)
+        ReadOnlySpan<TC> auctionExtra)
+        where TC : unmanaged
     {
         var h = FlatHash.Seed;
         h = FlatHash.Combine(h, FlatHash.Long(auction));
@@ -309,7 +358,7 @@ internal sealed class ManagedQ20Worker : IQ20Worker
         long rows = 0;
         foreach (var (b, a, w) in _out)
         {
-            sum += (ulong)w * Q20Cells.OutHash(
+            sum += (ulong)w * Q20Cells.OutHash<char>(
                 b.Auction, b.Bidder, b.Price, b.Channel, b.Url, b.DateTime, b.Extra, a.ItemName, a.Description,
                 a.InitialBid, a.Reserve, a.DateTime, a.Expires, a.Seller, a.Category, a.Extra);
             rows += w;
@@ -503,14 +552,15 @@ internal sealed class ManagedQ20Worker : IQ20Worker
 /// <summary>Output records: weight (8) · 10 longs (auction, bidder, price, bidTime, initialBid,
 /// reserve, auctionTime, expires, seller, category) · 6 string starts (channel, url, bidExtra,
 /// itemName, description, auctionExtra) · 6 string lengths.</summary>
-internal sealed unsafe class FlatOutBatch<TP> : IDisposable
+internal sealed unsafe class FlatOutBatch<TP, TC> : IDisposable
     where TP : struct, IPageSource
+    where TC : unmanaged
 {
     private const int OffS = 8 + (8 * 10);
     private const int OffN = OffS + (8 * 6);
     private readonly RecordPages<TP> _rec = new(OffN + (4 * 6));
 
-    public CharArena<TP> Arena { get; } = new();
+    public StrArena<TC, TP> Arena { get; } = new();
 
     public int Count { get; private set; }
 
@@ -540,14 +590,14 @@ internal sealed unsafe class FlatOutBatch<TP> : IDisposable
     public static ref long Long(byte* r, int c) => ref ((long*)(r + 8))[c];
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void SetStr(byte* r, int c, ReadOnlySpan<char> s)
+    public void SetStr(byte* r, int c, ReadOnlySpan<TC> s)
     {
         ((long*)(r + OffS))[c] = Arena.Append(s);
         ((int*)(r + OffN))[c] = s.Length;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ReadOnlySpan<char> Str(byte* r, int c) => Arena.Get(((long*)(r + OffS))[c], ((int*)(r + OffN))[c]);
+    public ReadOnlySpan<TC> Str(byte* r, int c) => Arena.Get(((long*)(r + OffS))[c], ((int*)(r + OffN))[c]);
 
     public void Dispose()
     {
@@ -556,26 +606,27 @@ internal sealed unsafe class FlatOutBatch<TP> : IDisposable
     }
 }
 
-internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
+internal sealed unsafe class FlatQ20Worker<TP, TC> : IQ20Worker
     where TP : struct, IPageSource
+    where TC : unmanaged, IEquatable<TC>
 {
     private const long Magic = 0x3032_5154_414C_46; // "FLATQ20"
     private const int HeaderBytes = 16 << 10;
 
-    private readonly FlatOutBatch<TP> _out = new();
+    private readonly FlatOutBatch<TP, TC> _out = new();
     private readonly long[] _l = new long[8];
-    private readonly string[] _s = new string[3];
-    private readonly FlatTable<TP> _bids;
-    private readonly FlatTable<TP> _auctions;
+    private readonly ReadOnlyMemory<TC>[] _s = new ReadOnlyMemory<TC>[3];
+    private readonly FlatTable<TP, TC> _bids;
+    private readonly FlatTable<TP, TC> _auctions;
     private MemoryMappedFile? _map;
     private MemoryMappedViewAccessor? _view;
 
     public FlatQ20Worker()
-        : this(new FlatTable<TP>(Q20Cells.BidLongs, Q20Cells.BidStrs), new FlatTable<TP>(Q20Cells.AuctionLongs, Q20Cells.AuctionStrs))
+        : this(new FlatTable<TP, TC>(Q20Cells.BidLongs, Q20Cells.BidStrs), new FlatTable<TP, TC>(Q20Cells.AuctionLongs, Q20Cells.AuctionStrs))
     {
     }
 
-    private FlatQ20Worker(FlatTable<TP> bids, FlatTable<TP> auctions)
+    private FlatQ20Worker(FlatTable<TP, TC> bids, FlatTable<TP, TC> auctions)
     {
         _bids = bids;
         _auctions = auctions;
@@ -594,7 +645,7 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
             for (var slot = a.ChainHead(_l[0]); slot >= 0;)
             {
                 var ar = a.Rec(slot);
-                var o = _out.Add(w * FlatTable<TP>.Weight(ar));
+                var o = _out.Add(w * FlatTable<TP, TC>.Weight(ar));
                 WriteBid(o, _l, _s);
                 WriteAuction(o, a, ar);
                 slot = a.NextOf(ar);
@@ -614,7 +665,7 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
             for (var slot = b.ChainHead(_l[0]); slot >= 0;)
             {
                 var br = b.Rec(slot);
-                var o = _out.Add(FlatTable<TP>.Weight(br) * w);
+                var o = _out.Add(FlatTable<TP, TC>.Weight(br) * w);
                 WriteBid(o, b, br);
                 WriteAuction(o, _l, _s);
                 slot = b.NextOf(br);
@@ -634,10 +685,10 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
             var r = o.Rec(i);
             var w = *(long*)r;
             sum += (ulong)w * Q20Cells.OutHash(
-                FlatOutBatch<TP>.Long(r, 0), FlatOutBatch<TP>.Long(r, 1), FlatOutBatch<TP>.Long(r, 2),
-                o.Str(r, 0), o.Str(r, 1), FlatOutBatch<TP>.Long(r, 3), o.Str(r, 2), o.Str(r, 3), o.Str(r, 4),
-                FlatOutBatch<TP>.Long(r, 4), FlatOutBatch<TP>.Long(r, 5), FlatOutBatch<TP>.Long(r, 6),
-                FlatOutBatch<TP>.Long(r, 7), FlatOutBatch<TP>.Long(r, 8), FlatOutBatch<TP>.Long(r, 9), o.Str(r, 5));
+                FlatOutBatch<TP, TC>.Long(r, 0), FlatOutBatch<TP, TC>.Long(r, 1), FlatOutBatch<TP, TC>.Long(r, 2),
+                o.Str(r, 0), o.Str(r, 1), FlatOutBatch<TP, TC>.Long(r, 3), o.Str(r, 2), o.Str(r, 3), o.Str(r, 4),
+                FlatOutBatch<TP, TC>.Long(r, 4), FlatOutBatch<TP, TC>.Long(r, 5), FlatOutBatch<TP, TC>.Long(r, 6),
+                FlatOutBatch<TP, TC>.Long(r, 7), FlatOutBatch<TP, TC>.Long(r, 8), FlatOutBatch<TP, TC>.Long(r, 9), o.Str(r, 5));
             rows += w;
         }
 
@@ -706,11 +757,11 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
     }
 
     /// <summary>Restore by reading every page into freshly allocated pages.</summary>
-    public static FlatQ20Worker<TP> Restore(string path) => Restore(path, mapped: false);
+    public static FlatQ20Worker<TP, TC> Restore(string path) => Restore(path, mapped: false);
 
     /// <summary>Restore by mapping the checkpoint copy-on-write and pointing the tables at it:
     /// nothing is read until a page is touched.</summary>
-    public static FlatQ20Worker<TP> RestoreMapped(string path) => Restore(path, mapped: true);
+    public static FlatQ20Worker<TP, TC> RestoreMapped(string path) => Restore(path, mapped: true);
 
     public void Dispose()
     {
@@ -725,7 +776,7 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         }
     }
 
-    private static FlatQ20Worker<TP> Restore(string path, bool mapped)
+    private static FlatQ20Worker<TP, TC> Restore(string path, bool mapped)
     {
         var header = new long[HeaderBytes / sizeof(long)];
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 0))
@@ -738,15 +789,15 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
             throw new InvalidDataException("not a flat q20 checkpoint");
         }
 
-        var bids = new FlatTable<TP>(Q20Cells.BidLongs, Q20Cells.BidStrs, empty: false);
-        var auctions = new FlatTable<TP>(Q20Cells.AuctionLongs, Q20Cells.AuctionStrs, empty: false);
-        var worker = new FlatQ20Worker<TP>(bids, auctions);
+        var bids = new FlatTable<TP, TC>(Q20Cells.BidLongs, Q20Cells.BidStrs, empty: false);
+        var auctions = new FlatTable<TP, TC>(Q20Cells.AuctionLongs, Q20Cells.AuctionStrs, empty: false);
+        var worker = new FlatQ20Worker<TP, TC>(bids, auctions);
         var h = 1;
         var counts = new List<int>();
         foreach (var t in new[] { bids, auctions })
         {
-            t.LoadScalars(header.AsSpan(h, FlatTable<TP>.ScalarCount));
-            h += FlatTable<TP>.ScalarCount;
+            t.LoadScalars(header.AsSpan(h, FlatTable<TP, TC>.ScalarCount));
+            h += FlatTable<TP, TC>.ScalarCount;
             foreach (var unused in t.Columns())
             {
                 counts.Add((int)header[h++]);
@@ -808,23 +859,23 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         return worker;
     }
 
-    private void WriteBid(byte* o, long[] l, string[] s)
+    private void WriteBid(byte* o, long[] l, ReadOnlyMemory<TC>[] s)
     {
         for (var c = 0; c < Q20Cells.BidLongs; c++)
         {
-            FlatOutBatch<TP>.Long(o, c) = l[c];
+            FlatOutBatch<TP, TC>.Long(o, c) = l[c];
         }
 
-        _out.SetStr(o, 0, s[0]);
-        _out.SetStr(o, 1, s[1]);
-        _out.SetStr(o, 2, s[2]);
+        _out.SetStr(o, 0, s[0].Span);
+        _out.SetStr(o, 1, s[1].Span);
+        _out.SetStr(o, 2, s[2].Span);
     }
 
-    private void WriteBid(byte* o, FlatTable<TP> b, byte* br)
+    private void WriteBid(byte* o, FlatTable<TP, TC> b, byte* br)
     {
         for (var c = 0; c < Q20Cells.BidLongs; c++)
         {
-            FlatOutBatch<TP>.Long(o, c) = FlatTable<TP>.Long(br, c);
+            FlatOutBatch<TP, TC>.Long(o, c) = FlatTable<TP, TC>.Long(br, c);
         }
 
         _out.SetStr(o, 0, b.Str(br, 0));
@@ -832,23 +883,23 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         _out.SetStr(o, 2, b.Str(br, 2));
     }
 
-    private void WriteAuction(byte* o, long[] l, string[] s)
+    private void WriteAuction(byte* o, long[] l, ReadOnlyMemory<TC>[] s)
     {
         for (var c = 1; c < Q20Cells.AuctionLongs; c++)
         {
-            FlatOutBatch<TP>.Long(o, 3 + c) = l[c];
+            FlatOutBatch<TP, TC>.Long(o, 3 + c) = l[c];
         }
 
-        _out.SetStr(o, 3, s[0]);
-        _out.SetStr(o, 4, s[1]);
-        _out.SetStr(o, 5, s[2]);
+        _out.SetStr(o, 3, s[0].Span);
+        _out.SetStr(o, 4, s[1].Span);
+        _out.SetStr(o, 5, s[2].Span);
     }
 
-    private void WriteAuction(byte* o, FlatTable<TP> a, byte* ar)
+    private void WriteAuction(byte* o, FlatTable<TP, TC> a, byte* ar)
     {
         for (var c = 1; c < Q20Cells.AuctionLongs; c++)
         {
-            FlatOutBatch<TP>.Long(o, 3 + c) = FlatTable<TP>.Long(ar, c);
+            FlatOutBatch<TP, TC>.Long(o, 3 + c) = FlatTable<TP, TC>.Long(ar, c);
         }
 
         _out.SetStr(o, 3, a.Str(ar, 0));
