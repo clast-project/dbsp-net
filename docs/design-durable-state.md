@@ -260,6 +260,33 @@ ivm-bench, whose batches arrive well under 60 s apart, a run writes journal file
 Feldera writes no checkpoints there — and a restart replays from tick 0. `CheckpointAsync` still
 forces a snapshot (e.g. before a planned shutdown).
 
+**Built (c5bc996) and measured (2026-10-31).** `TickJournal` (Persistence), `CheckpointPolicy` and
+`ProgramRunner.CommitBatchAsync`/journal replay (Connectors.Abstractions), the engine default and
+`DBSPNET_CHECKPOINT_INTERVAL_SECS`. `CheckpointJournalTests` covers recovery from journal alone and
+from snapshot + journal (serial, W=2, W=3), truncation, stale files, a source that lost a journaled
+version, and a journal left by a run under the other policy; with replay disabled, the five
+recovery tests fail. A snapshot pins W; a journal-only state replays at any W, serial or parallel
+(`DbspNetEngineTests`, 1→4, 4→2, 4→1) — the journal names sources and offsets, never operators.
+
+ivm-bench SF=3, W=12, `ARMS="12 12:journal" scripts/measure-checkpoint.sh`, 5 alternating runs
+per arm, medians [ranges], all 10 restores matched (`docs/checkpoint-journal-results-20261031.txt`):
+
+| | snapshot every batch | journal every batch, no snapshot |
+|---|--:|--:|
+| commit after batch 1 | 4.99 s [4.82–5.16] | **11 ms** [10–11] |
+| commit after batch 2 | 3.24 s [2.98–3.38] | **5 ms** [5–6] |
+| commit after batch 3 | 4.14 s [4.00–4.46] | **6 ms** [5–6] |
+| restore (all 38 ticks) | **5.66 s** [5.34–5.83] | 12.09 s [11.92–16.86] |
+| batch-1 drain (control) | 17.12 s | 16.25 s (one run 25.3 s) |
+
+A batch's commit drops by ~500–1000×: three batches cost 12.4 s of snapshots or 22 ms of journal.
+Recovery from the journal alone replays everything since tick 0 — 12.1 s here, faster than the
+original batch-1 drain because replay writes no outputs — against 5.7 s to load a snapshot. Under
+the 60 s default the replay is bounded by roughly one interval of input; a run that wants a short
+restart sets a shorter interval and pays a snapshot that often. (A first run of this measurement,
+kept out of the doc, ran the snapshot arm with the pre-fix checkpoint GC because the script still
+forced `DBSPNET_CHECKPOINT_GC=default`; fixed in 3d2d399.)
+
 **Not in this increment:** a clean-shutdown hook in the server (none exists to call), data journals
 for non-replayable sources, exactly-once output (needs the journal plus idempotent sinks keyed by
 tick), and buffer pooling in the save path.
@@ -267,8 +294,7 @@ tick), and buffer pooling in the save path.
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
-2. **Increment 2 — A2 checkpoint policy.** A durable input WAL every batch, with offsets in each
-   record, and a snapshot every N batches or T seconds.
+2. ~~Increment 2 — A2 checkpoint policy.~~ Done, §1c.
 3. **Increment 3 — re-shard at restore (change W between parallel worker counts).** Today W is
    pinned by the checkpoint, as in Feldera (`controller.rs`: "Can't change number of workers or
    hosts yet"; their runtime rebalancer in `operator/dynamic/balance/` already moves integrated
