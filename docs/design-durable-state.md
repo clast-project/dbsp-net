@@ -291,7 +291,7 @@ forced `DBSPNET_CHECKPOINT_GC=default`; fixed in 3d2d399.)
 for non-replayable sources, exactly-once output (needs the journal plus idempotent sinks keyed by
 tick), and buffer pooling in the save path.
 
-## 1d. Increment 3 — re-shard a snapshot to a different W (DESIGN 2026-10-31, awaiting go-ahead)
+## 1d. Increment 3 — re-shard a snapshot to a different W (BUILT 2026-10-31)
 
 **Scope.** Restore a parallel snapshot written at W_old ≥ 2 into a program at W_new ≥ 2. Serial ↔
 parallel stays out (different operator graphs; positional identity). A journal-only state already
@@ -358,6 +358,41 @@ any placement sums to the same view. **`Replicated`** writes worker 0's copy to 
   restorable at W_old.
 - ivm-bench SF=3: 12 → 8 and 8 → 12 rewrite time and restored view row counts.
 
+### Built (cdf88de, c9b4240) and measured
+
+Curt approved all three decisions (file-level rewrite, spine refused in v1, the engine re-shards
+automatically). Built as designed — `ReshardSpec`/`ReshardRecorder` (Sql), `ParallelReshard`
+(Persistence), `SnapshotCheckpointStore.ReshardAsync`, `DbspNetEngine` — with two additions the
+audit forced:
+- `PartitionInfo` now records the **key schema** an exchange hashed with and whether an empty
+  partition key means **gathered** (worker 0) or hashed (the empty key's constant worker); the two
+  were indistinguishable, and the elided aggregate's placement needs both.
+- The "elided" path is only reachable aggregate-over-aggregate on the program path: join-then-
+  aggregate always has a projection between them, so its exchange stays (the existing
+  `JoinThenGroupByJoinKey_ElidesExchange` test asserts elision only in a comment). Counting
+  exchange operators confirmed which shape elides; `ParallelReshardTests` uses that one.
+
+**Tests** (`ParallelReshardTests`): every stateful operator of a program with every operator kind
+has a placement; 2→3, 3→2, 4→12, 12→4, 5→2 match an uninterrupted serial run and keep matching
+for 5 more ticks; a wrong placement is rejected with nothing committed; spine is refused; a crash
+at every mutation of the rewrite (process crash and power loss) leaves a snapshot that restores
+at the old W before the commit and the new W after it. Mutating the elided-aggregate or
+residual-join placement makes the self-check fail at that operator. (With few keys and small W a
+wrong hash can coincide with the right one, so the self-check is probabilistic on tiny data.)
+
+**ivm-bench SF=3** (`ARMS="12:to=8 8:to=12" scripts/measure-checkpoint.sh`, 5 runs each,
+medians [ranges], all 10 restores matched; `docs/reshard-results-20261031.txt`):
+
+| | re-shard (rewrite) | restore after it |
+|---|--:|--:|
+| 12 → 8 | 6.74 s [6.63–7.22] | 5.26 s [5.20–5.37] |
+| 8 → 12 | 6.99 s [6.48–7.42] | 5.37 s [5.09–5.38] |
+
+The first version took 144 s (12→8) and 72 s (8→12): a directory listing per operator per old
+worker walked the whole 4.6 GiB snapshot tree each time (90% of samples in `getdirentries`). One
+listing grouped by (worker, op) took it to 16.5 s; rewriting operators concurrently at the
+restore's degree to ~7 s. Changing W therefore costs about one extra restore's worth of time.
+
 ### Decisions for Curt
 - **File-level rewrite** (above) rather than a new load path in every operator (which would also
   decode the data W_new times).
@@ -368,7 +403,7 @@ any placement sums to the same view. **`Replicated`** writes worker 0's copy to 
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
 2. ~~Increment 2 — A2 checkpoint policy.~~ Done, §1c.
-3. **Increment 3 — re-shard at restore (change W between parallel worker counts).** Today W is
+3. ~~Increment 3 — re-shard at restore~~ Done, §1d. (Original plan follows.) **Increment 3 — re-shard at restore (change W between parallel worker counts).** Today W is
    pinned by the checkpoint, as in Feldera (`controller.rs`: "Can't change number of workers or
    hosts yet"; their runtime rebalancer in `operator/dynamic/balance/` already moves integrated
    state between workers). Plan: when the requested W differs from the recorded one, each new worker
