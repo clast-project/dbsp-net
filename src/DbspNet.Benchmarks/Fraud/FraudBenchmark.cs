@@ -25,6 +25,13 @@ internal static class FraudBenchmark
     private const long Day = 86_400_000_000L; // micros per day.
     private const long BaseTimeMicros = 1_700_000_000_000_000L;
 
+    // VARCHAR cells are UTF-8 (Utf8String), as a connector delivers them and as the engine stores
+    // them (docs/design-connectors.md, G5). FRAUD_STRINGS=string hands out .NET strings instead,
+    // which the engine re-encodes on push — runs before 2026-10-31. Only `customers` has string
+    // columns, and it is pushed outside every timed region, so this does not move the numbers.
+    private static readonly bool StringCells =
+        string.Equals(Environment.GetEnvironmentVariable("FRAUD_STRINGS"), "string", StringComparison.OrdinalIgnoreCase);
+
     // internal (not private) so the plan-level research instruments —
     // CalciteRuleCensus — can compile this workload's plan.
     internal static readonly string[] Ddl =
@@ -368,7 +375,11 @@ internal static class FraudBenchmark
         var rows = new List<(object?[], long)>(count);
         for (var i = 0; i < count; i++)
         {
-            rows.Add((new object?[] { (long)i, "cust-" + i, (10000 + (i % 90000)).ToString() }, 1L));
+            var name = "cust-" + i;
+            var zip = (10000 + (i % 90000)).ToString(CultureInfo.InvariantCulture);
+            rows.Add((StringCells
+                ? new object?[] { (long)i, name, zip }
+                : new object?[] { (long)i, Utf8String.Of(name), Utf8String.Of(zip) }, 1L));
         }
 
         return rows;
