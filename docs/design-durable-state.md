@@ -213,6 +213,57 @@ mode off, is unchanged. The deeper fix — pooling the save path's large buffers
 cut the 11.3 GiB allocated per checkpoint — is still open, and is likely shaped by Increment 2's
 format changes.
 
+## 1c. Increment 2 — A2 checkpoint policy (design 2026-10-31)
+
+**What changes.** Today `ProgramRunner` snapshots the whole state at the end of every batch: an
+O(state) rewrite (4.6 GiB on ivm-bench SF=3) per batch, however little the batch changed. A2
+splits the per-batch commit from the snapshot:
+
+- **Every batch: a durable tick journal.** One small file per batch, `journal/{first:D20}-{last:D20}.json`,
+  written atomically and durably (`IDurableTableFileSystem.WriteAllBytesDurableAsync`: a reader or a
+  restart sees the whole file or none). It records, per engine tick, the source the tick consumed
+  and that source's cursor after it — Feldera's per-step resume tokens (`Resume::Seek`, phase0-a
+  §2.5). Offsets only, no row data: every connector we have can re-read a version (Delta CDF by
+  version, Parquet bounded), the replayable case of design-connectors.md. A source that cannot
+  re-read would need its data journaled (the existing `WalRecorder`, A1) — out of scope.
+- **Every N batches or T seconds: a snapshot**, exactly as today (all W workers, offsets in the
+  manifest, one pointer). After its pointer is durable, journal files wholly at or below its tick
+  are deleted (Feldera truncates its journal after the pointer moves, phase0-a §2.2 step 7).
+- **Default policy: journal every batch, snapshot every 60 s** — Feldera's
+  `checkpoint_interval_secs` default (`feldera-types/src/config.rs`), clamped to 1–3600 s as
+  Feldera does. `DBSPNET_CHECKPOINT_INTERVAL_SECS` overrides it in `DbspNetEngine`; `batch` restores
+  the old snapshot-every-batch behaviour. A runner created without a policy keeps the old
+  behaviour, so existing callers are unchanged.
+
+**Recovery.** Restore the snapshot the pointer names (tick T₀, cursors C₀), or start from tick 0
+and the sources' initial offsets when there is none — the empty circuit is a valid base, so no
+initial snapshot is needed. Then replay the journal's ticks after T₀ **exactly**: for each, ask
+that source for its next version from the current cursor, check that the version it returns ends
+at the journaled offset (a mismatch fails the restore loudly: the source is not replaying
+deterministically), push, step, and check the tick number. Then resume normally.
+
+Why replay the journal rather than just let the normal drain re-read from C₀? The drain interleaves
+sources by whatever versions are available *now*, so after a crash it would group and order ticks
+differently from the original run. The final integrated state would agree, but time-dependent
+operators (temporal filters, lateness GC) and the per-tick output deltas need the same tick
+sequence. Replaying the journal reproduces it; the drain then continues from the journal's last
+cursors.
+
+**Outputs.** Unchanged: outputs are written before the batch commits (journal or snapshot), so a
+crash re-processes at most the uncommitted batch — at-least-once. After a restart the first write
+of each incremental output carries the whole view onto a truncated sink, as today; replayed ticks
+emit nothing.
+
+**The trade.** A batch's commit drops from a full snapshot (5–16 s on SF=3) to one small fsynced
+file; recovery grows by the replay of everything since the last snapshot (re-read + re-step). On
+ivm-bench, whose batches arrive well under 60 s apart, a run writes journal files only — as
+Feldera writes no checkpoints there — and a restart replays from tick 0. `CheckpointAsync` still
+forces a snapshot (e.g. before a planned shutdown).
+
+**Not in this increment:** a clean-shutdown hook in the server (none exists to call), data journals
+for non-replayable sources, exactly-once output (needs the journal plus idempotent sinks keyed by
+tick), and buffer pooling in the save path.
+
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
