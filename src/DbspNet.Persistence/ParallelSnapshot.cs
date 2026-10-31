@@ -79,12 +79,17 @@ public static class ParallelSnapshot
 
         // Disjoint subtrees, disjoint replica state. No per-worker sync: the commit marker is
         // parallel.json, so one sync over the whole directory before it is enough, and costs one
-        // device flush instead of two per worker.
+        // device flush instead of two per worker. Each worker goes on the pool so the writes run
+        // concurrently whether or not the file system's calls yield (see ReadAsync: they often don't).
         var tasks = new Task<int>[replicas.Count];
         for (var w = 0; w < replicas.Count; w++)
         {
-            tasks[w] = Snapshot.WriteDirAsync(
-                replicas[w], fs, WorkerDir(snapName, w), metadata: null, durable: null, cancellationToken).AsTask();
+            var replica = replicas[w];
+            var dir = WorkerDir(snapName, w);
+            tasks[w] = Task.Run(
+                async () => await Snapshot.WriteDirAsync(
+                    replica, fs, dir, metadata: null, durable: null, cancellationToken).ConfigureAwait(false),
+                cancellationToken);
         }
 
         var counts = await Task.WhenAll(tasks).ConfigureAwait(false);
@@ -257,12 +262,21 @@ public static class ParallelSnapshot
         // decides how many operator files decode at once, and that is what bounds peak memory
         // (docs/design-incremental-persistence.md §11.4). Each replica also holds only 1/W of the
         // state, so there is less per-replica work to spread.
+        // Each worker goes on the pool, as in WriteAsync. The local file system completes
+        // synchronously, so when a worker's share is 1 (LoadDirAsync's sequential walk), calling it
+        // directly in this loop restored the workers one after another: 19.0 s at W=12 on
+        // ivm-bench SF=3, against 8.7 s serial (docs/design-durable-state.md §1b).
         var perReplica = Math.Max(1, Snapshot.DefaultRestoreParallelism / replicas.Count);
         var tasks = new Task<int>[replicas.Count];
         for (var w = 0; w < replicas.Count; w++)
         {
-            tasks[w] = Snapshot.LoadDirAsync(
-                replicas[w], fs, WorkerDir(current, w), workerManifests[w], perReplica, cancellationToken).AsTask();
+            var replica = replicas[w];
+            var dir = WorkerDir(current, w);
+            var workerManifest = workerManifests[w];
+            tasks[w] = Task.Run(
+                async () => await Snapshot.LoadDirAsync(
+                    replica, fs, dir, workerManifest, perReplica, cancellationToken).ConfigureAwait(false),
+                cancellationToken);
         }
 
         var counts = await Task.WhenAll(tasks).ConfigureAwait(false);

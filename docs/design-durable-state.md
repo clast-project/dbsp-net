@@ -135,9 +135,35 @@ All 10 restores matched the uninterrupted view row counts. The checkpointing com
 arrangements, so the step times compare only with other checkpointing runs. The snapshot is the
 same size at both W, so the earlier 4.05 GiB reference came from a different configuration.
 
-Two findings: **parallel restore is 2.2× slower than serial**, with a very tight range, so the
-effect is real. And the W=12 checkpoint after batch 1 is twice as slow as the later ones, which
-write the same amount of state. Neither is explained yet; both need a profile before any fix.
+Two findings: **parallel restore was 2.2× slower than serial**, with a very tight range, so the
+effect was real. And the W=12 checkpoint after batch 1 is twice as slow as the later ones, which
+write the same amount of state; that one is still unexplained.
+
+**Parallel restore fixed: the workers were restoring one after another.**
+`LocalTableFileSystem`'s reads complete synchronously, so `ParallelSnapshot.ReadAsync` calling each
+worker's `LoadDirAsync` in a plain loop ran worker 0's whole restore, then worker 1's, and so on.
+The serial path did not have the problem because `Parallel.ForEachAsync` puts work on the pool,
+and neither did small W: a worker whose share of the default degree (7 here) is 2 or more also
+takes that branch. Only a share of 1, i.e. W above half the degree, walked sequentially, which is
+why the W=2..4 tests never saw it. `ParallelSnapshotConcurrencyTests` now pins it without timing:
+each worker's first operator-file access over a synchronous file system blocks until every worker
+has arrived (read at W=9, write at W=3), and both tests fail with the fix reverted.
+The tell was CPU, not work: the W=12 restore did the same work as serial (54.7 s CPU against 57.1 s,
+fewer bytes allocated) but kept 3.2 cores busy against 6.5. `IvmParallelRestoreProfile` (scratch)
+restores an existing checkpoint under variants; every truly concurrent variant restored in 5–6 s
+against 15–17 s for the shipped loop. The fix puts each worker on `Task.Run`, in the restore and,
+for the same reason, in the write. Re-measured with the script (5 alternating runs per arm, medians):
+
+| | W=1 | W=12 before | W=12 after |
+|---|--:|--:|--:|
+| restore | 8.1 s (7.8–8.8) | 19.0 s | **7.2 s** (7.0–7.3) |
+| checkpoint after batch 1 / 2 / 3 | 16.1 / 13.0 / 10.3 s | 11.5 / 5.4 / 5.3 s | 11.6 / 5.5 / 5.4 s |
+
+Restore at W=12 is 2.6× faster than before and now slightly faster than serial; all 10 restores
+matched. The checkpoint did not move, so the write was not serialised in the same way; the
+`Task.Run` there is kept only so that concurrency does not depend on the file system. The
+restore-only harness's 5–6 s against 7.2 s end to end is probably the producer's heap still
+being torn down in the end-to-end run; unmeasured.
 Every checkpoint still rewrites all ~4.6 GiB, even after a 9-tick batch that changed almost
 nothing.
 
