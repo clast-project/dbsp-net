@@ -7,6 +7,7 @@ using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Benchmarks;
 
@@ -34,6 +35,9 @@ namespace DbspNet.Benchmarks;
 /// </remarks>
 internal static class ParallelScalingBenchmark
 {
+    private static readonly bool StringCells =
+        string.Equals(Environment.GetEnvironmentVariable("PARALLEL_STRINGS"), "string", StringComparison.OrdinalIgnoreCase);
+
     public static void Run(StringBuilder output, int? maxWorkersOverride = null)
     {
         var maxWorkers = Math.Min(maxWorkersOverride ?? Environment.ProcessorCount, Environment.ProcessorCount);
@@ -104,11 +108,16 @@ internal static class ParallelScalingBenchmark
             },
             workerCounts);
 
-        // VARCHAR project (exchange-free): the boundary encode/decode (string ↔
-        // Utf8String) dominates, so this is where parallel ingest/egest pays most.
+        // VARCHAR project (exchange-free): wide string rows through split and gather. Cells
+        // arrive as UTF-8 (Utf8String), as a connector delivers them and the engine stores them,
+        // so ingest no longer encodes (docs/design-connectors.md, G5). PARALLEL_STRINGS=string
+        // pushes .NET strings instead — the pre-2026-10-31 shape, where the string → Utf8String
+        // encode dominated Split.
         RunShape(
             output,
-            title: "VARCHAR project (exchange-free) — string encode/decode dominates",
+            title: StringCells
+                ? "VARCHAR project (exchange-free) — string encode/decode dominates"
+                : "VARCHAR project (exchange-free) — UTF-8 string rows",
             ddl: ["CREATE TABLE docs (id INT NOT NULL, label VARCHAR NOT NULL, note VARCHAR NOT NULL)"],
             sql: "SELECT id, label, note FROM docs WHERE id >= 0",
             n: 1_000_000,
@@ -118,7 +127,11 @@ internal static class ParallelScalingBenchmark
                 var delta = new List<(object?[] Values, long Weight)>(n);
                 for (var i = 0; i < n; i++)
                 {
-                    delta.Add((new object?[] { i, $"label-{rng.Next(0, 100_000)}", $"note-{i}-payload" }, 1L));
+                    var label = $"label-{rng.Next(0, 100_000)}";
+                    var note = $"note-{i}-payload";
+                    delta.Add((StringCells
+                        ? new object?[] { i, label, note }
+                        : new object?[] { i, Utf8String.Of(label), Utf8String.Of(note) }, 1L));
                 }
 
                 return ("docs", delta);
@@ -135,8 +148,9 @@ internal static class ParallelScalingBenchmark
             "the formerly serial ingest/egest are no longer the wall-clock floor. Ingest " +
             "encodes and shards on the worker threads; egest, on the exchange-free shapes " +
             "whose shards are key-disjoint, decodes per-worker and concatenates with no " +
-            "serial combine. The VARCHAR shape, where the string encode/decode dominates, " +
-            "is where both wins show most. The GROUP BY *Gather* stays flat by design: its " +
+            "serial combine. The VARCHAR shape carries the widest rows, so it is where both " +
+            "wins show most (with `PARALLEL_STRINGS=string` its Split also pays the " +
+            "string → UTF-8 encode the engine does for .NET-string input). The GROUP BY *Gather* stays flat by design: its " +
             "aggregate output is not disjoint (it falls back to the serial Z-set sum) but " +
             "is tiny, so it never gates wall-clock. Allocation-heavy parallel ingest/egest " +
             "needs Server GC to scale — workstation GC stops every worker on each " +

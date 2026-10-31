@@ -266,12 +266,22 @@ internal static class WindowMonoBenchmark
 
     private static long TxnStep(int total) => (90 * Day) / Math.Max(1, total);
 
+    // VARCHAR cells as UTF-8, like the fraud benchmark this copies (FRAUD_STRINGS=string for
+    // .NET strings, runs before 2026-10-31). customers is pushed before the timer, so the numbers
+    // don't move.
+    private static readonly bool StringCells =
+        string.Equals(Environment.GetEnvironmentVariable("FRAUD_STRINGS"), "string", StringComparison.OrdinalIgnoreCase);
+
     private static List<(object?[], long)> BuildCustomers(int count)
     {
         var rows = new List<(object?[], long)>(count);
         for (var i = 0; i < count; i++)
         {
-            rows.Add((new object?[] { (long)i, "cust-" + i, (10000 + (i % 90000)).ToString() }, 1L));
+            var name = "cust-" + i;
+            var zip = (10000 + (i % 90000)).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            rows.Add((StringCells
+                ? new object?[] { (long)i, name, zip }
+                : new object?[] { (long)i, Utf8String.Of(name), Utf8String.Of(zip) }, 1L));
         }
 
         return rows;
