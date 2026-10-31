@@ -167,6 +167,35 @@ being torn down in the end-to-end run; unmeasured.
 Every checkpoint still rewrites all ~4.6 GiB, even after a 9-tick batch that changed almost
 nothing.
 
+**The slow first checkpoint is background-GC waiting (2026-10-30, single runs, diagnosis only).**
+`IVM_CHECKPOINT_PROFILE=1` in `IvmMultiBatch` times every operator save and the GC around each
+checkpoint; `IVM_CHECKPOINT_REPEAT=1` writes a second checkpoint straight after batch 1's.
+
+- The W=12 first checkpoint is mostly waiting: 31 s CPU over 11.6 s wall (2.7 cores) with every
+  worker slow, against 20 s over 2.7–5.4 s for the repeat.
+- Memory pressure is ruled out: free RAM stayed at 20–27 GiB of 64 and the OS logged no
+  compressions, pageouts or swapouts during it.
+- A ~3 s stall lands once per gen-2 GC. At W=12 six concurrent saves of different operator types
+  all stalled 2.93–2.97 s together; at W=1 one operator per checkpoint took ~3 s against its usual
+  0.07–0.45 s. The runtime's GC pause total stayed at 7–117 ms, because these are background GCs:
+  threads that allocate on the large-object heap wait for a background GC, and the Arrow
+  serialisation allocates there (11.3 GiB per 4.6 GiB checkpoint).
+- The first checkpoint runs three gen-2 GCs (batch 1 leaves the budget spent); later ones one.
+- With `DOTNET_gcConcurrent=0` the stalls are gone and the gen-2s show up as ~1 s blocking pauses
+  instead (`gc_pause_ms` 650–2200):
+
+| one run each | background GC (default) | `gcConcurrent=0` |
+|---|--:|--:|
+| W=12 checkpoint batch 1 / again / 2 / 3 | 11.6 / 5.4 / 5.5 / 3.2 s | 4.6 / 3.3 / 4.0 / 3.7 s |
+| W=1 checkpoint batch 1 / again / 2 / 3 | 16.0 / 12.9 / 10.3 / 13.1 s | 10.1 / 8.3 / 8.9 / 8.6 s |
+| W=12 / W=1 restore | 7.5 / 11.4 s | 5.5 / 7.5 s |
+
+Not fixed. Options, cheapest first: switch to `GCLatencyMode.Batch` (no background GC) only for
+the duration of a checkpoint or restore, when no step runs; turn concurrent GC off for the server
+outright (needs the step's batch-1 drain and pause latency re-measured); or remove the coupling at
+its source by pooling the save path's large buffers, which also cuts the 11.3 GiB allocated per
+checkpoint. Each needs the 5-runs-per-arm measurement before it ships.
+
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.

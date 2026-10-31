@@ -156,7 +156,14 @@ public static class Snapshot
             }
 
             var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
+            var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             await s.SaveAsync(ctx, cancellationToken).ConfigureAwait(false);
+            if (ProfileSave)
+            {
+                SaveProfile.Enqueue((dir, i, circuit.Operators[i].GetType().Name,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+            }
+
             snapshotted.Add(i);
         }
 
@@ -348,6 +355,14 @@ public static class Snapshot
     /// default and free when off.
     /// </remarks>
     public static bool ProfileLoad { get; set; }
+
+    /// <summary>Diagnostic: while set, every operator save in a write appends (directory, operator
+    /// index, operator type, ms) to <see cref="SaveProfile"/>. Safe across a parallel snapshot's
+    /// concurrent workers; the reader drains the queue. Off by default and free when off.</summary>
+    internal static bool ProfileSave { get; set; }
+
+    internal static readonly System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
+        SaveProfile = new();
 
     /// <summary>
     /// Degree of concurrency <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
