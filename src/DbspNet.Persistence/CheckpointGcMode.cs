@@ -19,12 +19,14 @@ namespace DbspNet.Persistence;
 /// reads, a runner decoding its next batch ahead — sees blocking full collections for that time.
 /// Scopes nest (a reference count), so overlapping checkpoints restore the caller's mode only when
 /// the last one ends.</para>
-/// <para>EXPERIMENT seam: on only with <c>DBSPNET_CHECKPOINT_GC=batch</c> until measured.</para>
+/// <para>On by default since 2026-10-31: ivm-bench SF=3, 5 runs per arm, first checkpoint
+/// W=12 11.5 → 5.1 s, W=1 15.5 → 9.4 s; restore W=12 7.2 → 5.5 s, W=1 10.9 → 7.1 s; drain
+/// unchanged (design-durable-state §1b). <c>DBSPNET_CHECKPOINT_GC=default</c> opts out.</para>
 /// </remarks>
 internal static class CheckpointGcMode
 {
     internal static readonly bool Enabled =
-        Environment.GetEnvironmentVariable("DBSPNET_CHECKPOINT_GC") == "batch";
+        Environment.GetEnvironmentVariable("DBSPNET_CHECKPOINT_GC") != "default";
 
     private static readonly object Gate = new();
     private static int _depth;

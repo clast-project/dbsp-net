@@ -8,7 +8,8 @@
 #   RUNS=3 ARMS="12 12:nofsync" scripts/measure-checkpoint.sh
 #
 # An arm is a worker count, optionally ":nofsync" (DBSPNET_SNAPSHOT_FSYNC=0) to price the fsyncs
-# and/or ":gcbatch" (DBSPNET_CHECKPOINT_GC=batch: no background GC during checkpoint/restore).
+# and/or ":gcbatch" (DBSPNET_CHECKPOINT_GC=batch: no background GC during checkpoint/restore, the
+# default since 2026-10-31 — arms without it now run with DBSPNET_CHECKPOINT_GC=default).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
 set -euo pipefail

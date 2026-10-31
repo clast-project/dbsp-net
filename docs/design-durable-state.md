@@ -190,11 +190,28 @@ checkpoint; `IVM_CHECKPOINT_REPEAT=1` writes a second checkpoint straight after 
 | W=1 checkpoint batch 1 / again / 2 / 3 | 16.0 / 12.9 / 10.3 / 13.1 s | 10.1 / 8.3 / 8.9 / 8.6 s |
 | W=12 / W=1 restore | 7.5 / 11.4 s | 5.5 / 7.5 s |
 
-Not fixed. Options, cheapest first: switch to `GCLatencyMode.Batch` (no background GC) only for
-the duration of a checkpoint or restore, when no step runs; turn concurrent GC off for the server
-outright (needs the step's batch-1 drain and pause latency re-measured); or remove the coupling at
-its source by pooling the save path's large buffers, which also cuts the 11.3 GiB allocated per
-checkpoint. Each needs the 5-runs-per-arm measurement before it ships.
+**Fixed (2026-10-31): no background GC during a checkpoint or restore.** `CheckpointGcMode` sets
+`GCLatencyMode.Batch` for the duration of `Snapshot`/`ParallelSnapshot` `WriteAsync`/`ReadAsync`
+(ref-counted, restoring the caller's mode), default on; `DBSPNET_CHECKPOINT_GC=default` opts out.
+No step runs inside either (both runners await them between ticks); anything else running
+concurrently in the process sees blocking gen-2s for that time. Measured with
+`ARMS="1 1:gcbatch 12 12:gcbatch" scripts/measure-checkpoint.sh` — 5 alternating runs per arm,
+medians [ranges], all 20 restores matched (`docs/checkpoint-gcbatch-results-20261031.txt`):
+
+| | W=1 | W=1, Batch | W=12 | W=12, Batch |
+|---|--:|--:|--:|--:|
+| checkpoint after batch 1 | 15.5 s [13.1–18.2] | **9.4 s** [9.2–10.3] | 11.5 s [11.5–11.6] | **5.1 s** [4.9–5.4] |
+| checkpoint after batch 2 | 13.1 s [12.5–13.3] | **8.5 s** [7.9–8.7] | 2.7 s [2.7–5.7] | 3.0 s [2.8–3.2] |
+| checkpoint after batch 3 | 10.4 s [10.1–13.0] | **8.6 s** [8.0–9.0] | 4.4 s [4.3–5.7] | 4.0 s [3.5–4.3] |
+| restore | 10.9 s [10.8–12.5] | **7.1 s** [6.9–7.2] | 7.2 s [7.2–7.4] | **5.5 s** [5.3–5.8] |
+| batch-1 drain (control) | 34.4 s | 34.1 s | 17.1 s | 17.3 s |
+
+The first W=12 checkpoint is 2.3× faster and every W=1 checkpoint 1.2–1.6×; restore is 24–35%
+faster at both. Later W=12 checkpoints were already short and move within noise (batch 2's median
+is 0.3 s higher but its range is tighter, 2.8–3.2 against 2.7–5.7). The drain, which runs with the
+mode off, is unchanged. The deeper fix — pooling the save path's large buffers, which would also
+cut the 11.3 GiB allocated per checkpoint — is still open, and is likely shaped by Increment 2's
+format changes.
 
 ## 2. Plan from here
 
