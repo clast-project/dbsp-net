@@ -474,6 +474,107 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (DESIGN 2026-10-31, awaiting go-ahead)
+
+**Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
+operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
+snapshot, as today).
+
+### Constraints from the measurements and the access-pattern inventory
+
+- A batch changes ~0.15% of state; a resumed run reads ~0.0125% of it; restore is ~95% rebuilding
+  objects and maps (§1e). So: write deltas, and fault state in only where it is read.
+- **Reads are delta-key-driven** for joins, aggregates, distinct and integrate: `GroupFor`,
+  `ContainsKey`, `WeightOf`, and an existence check in every `MergeInPlace`. The partitioned
+  TOP-K / rank / window / LAG ops read **whole partitions**, keyed by the partitions a delta touches.
+  Global `TopKOp` walks an ordered prefix of all its state every tick.
+- **Full-state reads to remove or bound:** the first GC pass after restore (`_lastGcFrontier` is not
+  persisted); the join's "iterate the smaller side" rule, which may enumerate a whole trace; the
+  first output write after restore (both output modes enumerate every view); `ViewRowCounts` needs
+  O(1) counts.
+- **Steady-state step time must not move.** The hot path stays in-memory hash maps; nothing cold
+  is consulted for a key once it is resident.
+- GC: cold bytes live in files; what stays resident (Bloom filters, block indexes) is reference-free
+  arrays. Blocks are read into pooled buffers and decoded only for the keys asked for.
+
+### The layout
+
+**Cold runs.** An immutable run file per trace per checkpoint, holding an **additive** Z-set delta
+(base run = the state at the first checkpoint; each later run = the change since the previous one).
+Entries are ordered by the key's stable hash (`StructuralRowHash`, deterministic across processes)
+and grouped into blocks (~128 KiB; an indexed trace never splits a key's group across blocks). Each
+block is an Arrow record batch in the operator's existing codec schema. A footer holds the block
+index (first hash per block), a Bloom filter over keys, entry/group counts, and min/max monotone
+key per block (for lateness GC). Point probe = Bloom → binary search the index → read and decode
+one block. Hash order needs no comparer and serves every probe these operators make; nothing on this
+path needs key-ordered traversal of a trace.
+
+**Hot tier and fault-in, inside the collections.** `ZSet` / `IndexedZSet` get an optional cold
+backing: a miss in the hot map consults the cold runs once — summing the key's entries across runs —
+and inserts the result into the hot map; a *resolved-keys* set (present or tombstoned) keeps a key
+from being read from cold twice. Every operator that probes through `GroupFor` / `ContainsKey` /
+`WeightOf` / `MergeInPlace` therefore becomes lazy without changing its code. Enumeration of a
+collection that still has cold state either streams the merge of hot + cold without promoting
+(for output and counting) or, where an operator truly needs all of it (global `TopKOp`), promotes
+everything — eager, as today. Counts (`Count`, `GroupCount`) are persisted per run and maintained
+exactly through integration (which resolves each delta key, so a key's crossing of zero is known).
+
+**Operators that keep state outside a trace.**
+- Partitioned TOP-K / rank / window / LAG: persist by partition (key = partition row, values = rows)
+  instead of one flat row Z-set, and fault a whole partition into its `SortedDictionary` (and, for
+  rank / LAG / window, recompute that partition's window) on first touch.
+- Aggregates: `_stateCache` / `_aggCache` fault in per group from the `aggstate` keyed blobs, which
+  move into the same run format.
+- Global `TopKOp` (one gathered partition, read in order every tick): stays eager.
+
+**Checkpoint.** Each trace keeps a pending delta (the sum of what it integrated since the last
+checkpoint — ~0.15% of state per batch on ivm-bench). A checkpoint writes one delta run per trace,
+fsyncs it, and writes a manifest naming every run the state is the sum of; the pointer swap commits
+it as today. Run files are shared by consecutive checkpoints; a mark-and-sweep over the retained
+manifests deletes the rest after the pointer moves. **Compaction** merges a trace's runs (streaming,
+hash-ordered, summing weights, dropping zeros) when they pile up, off the step thread — the files are
+immutable — and the next checkpoint references the merged run.
+
+**Restore.** Read the manifest, open each run's footer (index + Bloom + counts): O(#runs) small
+reads, no decoding. Persist `_lastGcFrontier` so the first tick does no full GC pass; GC drops
+whole blocks/runs below the frontier by their min/max monotone key and resolves the rest lazily.
+The join's smaller-side rule treats a trace with cold state as large (iterate the delta, probe the
+trace). The first output write after restore streams each view from hot + cold without promoting;
+removing it entirely needs sink alignment (the sink's committed tick == the restored tick), a later
+step.
+
+**Parallel and re-shard.** Runs are per worker. `ParallelReshard` learns to read runs and write base
+runs at the new W; the placement specs (§1d) are unchanged.
+
+### Increments (each default-off behind `DBSPNET_STATE_LAYOUT=runs`, byte-identical when off)
+
+1. **Run file format** — writer and reader: hash-ordered blocks, block index, Bloom, counts,
+   monotone ranges; point probe and sequential scan. Property tests against `ZSet` / `IndexedZSet`
+   (random contents, collisions, empty, huge groups); microbenchmark: probe latency, scan
+   throughput vs today's decode.
+2. **Snapshots in run format, restore still eager** — swap the on-disk format only. Byte-identical
+   outputs; write and restore times vs today on SF=3.
+3. **Incremental checkpoints** — pending deltas, delta runs, manifest of runs, mark-and-sweep GC,
+   compaction policy; the crash matrix (`CrashSimulatingFileSystem`) over checkpoint, compaction and
+   GC. Measure checkpoint cost on SF=3 against the delta size.
+4. **Lazy restore for traces** — cold backing + fault-in in `ZSet` / `IndexedZSet`, persisted counts
+   and GC frontier, the join side rule, per-group aggregate state. Property tests: random
+   interleavings of integrate / probe / checkpoint / restore against an eager oracle; digest-verified
+   ivm-bench recovery.
+5. **Lazy partitioned operators** — persist by partition, fault in partitions.
+6. **Outputs after restore** — streaming first write; then sink alignment to skip it.
+7. **Re-shard over runs; compaction off the step thread** if increment 3 left it inline.
+
+### Proposed targets (to confirm)
+
+On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
+- **Checkpoint:** proportional to the change — under 0.5 s for a batch-2/3-sized change (today
+  3–5 s).
+- **Restore to ready:** under 1 s, independent of state size (today ~6 s), digest-verified.
+- **First batch after restore:** within 2× of the same batch without a restart.
+- **Steady-state step:** no regression beyond noise (batch-1 drain, 5 runs per arm, layout on vs off).
+- **Memory:** resident state after restore ≈ only what was touched; Bloom + index overhead stated.
+
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
