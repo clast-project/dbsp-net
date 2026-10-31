@@ -379,8 +379,8 @@ the chosen one-tick-per-version default.
 
 > **Status:** `StringDecoding.Copy` is the ingest default on all three Arrow paths, each of which
 > takes an optional `StringDecoding? strings` (null = Copy); `PushArrowZeroCopy` is `[Obsolete]` in
-> favour of `strings: StringDecoding.Alias`. Not yet done: UTF-8 validation (contract item 4) and
-> moving the remaining benchmark generators to `Utf8String` (increment 2).
+> favour of `strings: StringDecoding.Alias`. Benchmark generators emit `Utf8String` (increment 2).
+> UTF-8 validation measured and left opt-in: malformed bytes cannot corrupt state (item 4).
 
 ### Why
 
@@ -438,13 +438,32 @@ So the production ingest path — every connector, and ivm-bench — is the wors
    `Arena` stays the restore mode; it is wrong for ingest that filters, where one surviving row
    pins every string of its block (the chunk-retention finding of
    design-state-representation §10.H). `Alias` stays opt-in.
-4. **Validity: validate at ingest by default.** Nothing validates UTF-8 today, and several
-   operators assume it (`LENGTH` counts code points, `UPPER`/`LOWER`, `LIKE`, the regex functions).
-   Feldera cannot hold invalid UTF-8 at all (Rust `str`), so per the adopt-Feldera-assumptions
-   policy the default is to reject an invalid cell with an error naming table and column.
-   `System.Text.Unicode.Utf8.IsValid` is vectorised, so the check should cost little next to the
-   copy; it gets an opt-out for sources that guarantee validity (our own Arrow builders) and is
-   measured in increment 1 before it ships.
+4. **Validity: garbage in, garbage out — validation is opt-in.** Nothing validates UTF-8 at
+   ingest, and measured (2026-10-31) nothing needs to:
+   - **Nothing in the engine corrupts state on malformed bytes** — once one bug was fixed
+     (`f354a4a`): restoring an aggregate's per-key blobs decoded the keys through a .NET string,
+     so malformed bytes came back as U+FFFD, a restored key stopped matching its own bytes (a later
+     retraction could not cancel) and distinct malformed keys merged. `tests/…/InvalidUtf8Tests`
+     now pins the rest: 19 string functions run on 8 malformed sequences on both compile paths
+     without throwing; `CAST(s AS BIGINT)` fails exactly as it does for `'abc'`; GROUP BY,
+     DISTINCT, joins, TOP-K and COUNT(DISTINCT) retract malformed values exactly and never merge
+     two of them; a snapshot restore keeps the bytes; Arrow ingest (every mode but legacy
+     Transcode) and output preserve them.
+   - **Garbage out is limited to decoders**: LIKE / SIMILAR TO / REGEXP_* match against the
+     value decoded to a .NET string, so they see U+FFFD — deterministic, output-only.
+   - **The check is cheap but not free.** `ArrowColumns.EnsureValidUtf8` (one vectorised
+     `Utf8.IsValid` over a block's bytes plus a code-point-boundary check at each cell start,
+     which catches cells valid only when joined) costs 0.6–17 ns/cell: +6–12% of the `Copy`
+     decode on short ASCII, +58% on 150-byte ASCII, +135% on mixed non-ASCII (1M-cell
+     microbenchmark, `Scratch/Utf8ValidationCost`). On ivm-bench batch 1 at W=12 it is
+     **unmeasurable**: drain 15.45 s validating vs 15.76 s not (5 runs each, ranges overlap),
+     identical allocation and output, and no invalid cell in the TPC-DI data
+     (`docs/ingest-validate-results-20261031.txt`).
+
+   Feldera cannot hold invalid UTF-8 (Rust `str`), so the adopt-Feldera-assumptions policy would
+   default to rejecting it; Curt's call (2026-10-31) is garbage in, garbage out, since malformed
+   bytes cannot corrupt state. Validation stays available as an opt-in for a connector that wants to
+   reject bad input at the edge (`DBSPNET_INGEST_VALIDATE=1` today, a connector option later).
 
 ### API shape
 
@@ -522,8 +541,8 @@ that risk, but at ~1% of ivm-bench allocation it is not worth building for this 
 
 ### Open questions
 
-- **Validation scope.** Validate in `Copy` only (where we touch the bytes anyway), or in every mode?
-  (Lean: every mode, opt-out per call — an `Alias` caller is the likeliest to have skipped it.)
+- **Validation as a connector option.** If a connector wants to reject malformed input, expose
+  `EnsureValidUtf8` per connector rather than the process-wide env seam.
 - **`LargeUtf8` / `Utf8View`.** Arrow's 64-bit-offset and view string types should ingest the same
   way; check what the readers we use (engineered-wood, Arrow IPC) produce before increment 1.
 - **Is `Transcode` worth keeping at all** once `Copy` lands? (Lean: keep one release as the A/B arm,

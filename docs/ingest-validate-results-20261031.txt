@@ -1,0 +1,51 @@
+# f0368e3 Sat Oct 31 10:02:50 PDT 2026 W=12
+## run 1 arm copy
+LIVE promoted=10363594856 heap=10369067624 fragmented=5471760
+RESULT batch=1 ticks=20 drain_ms=15511 output_ms=5640 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=91 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=103 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 1 arm copy:validate
+LIVE promoted=10365180320 heap=10370229808 fragmented=5048480
+RESULT batch=1 ticks=20 drain_ms=15394 output_ms=5796 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=86 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=97 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 2 arm copy
+LIVE promoted=10361992648 heap=10366783224 fragmented=4789568
+RESULT batch=1 ticks=20 drain_ms=15906 output_ms=5849 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=76 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=95 output_ms=11 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 2 arm copy:validate
+LIVE promoted=10362305808 heap=10393214376 fragmented=30907560
+RESULT batch=1 ticks=20 drain_ms=15445 output_ms=5630 counts_ms=17 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=102 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=82 output_ms=9 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 3 arm copy
+LIVE promoted=10359636920 heap=10364484072 fragmented=4846144
+RESULT batch=1 ticks=20 drain_ms=15760 output_ms=5853 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92
+RESULT batch=2 ticks=9 drain_ms=86 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=97 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 3 arm copy:validate
+LIVE promoted=10361703112 heap=10367339800 fragmented=5635680
+RESULT batch=1 ticks=20 drain_ms=16069 output_ms=5814 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92
+RESULT batch=2 ticks=9 drain_ms=91 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=97 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 4 arm copy
+LIVE promoted=10362919544 heap=10367769056 fragmented=4848504
+RESULT batch=1 ticks=20 drain_ms=15734 output_ms=5814 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=105 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=86 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 4 arm copy:validate
+LIVE promoted=10363351136 heap=10404340376 fragmented=40988232
+RESULT batch=1 ticks=20 drain_ms=15200 output_ms=5542 counts_ms=19 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=85 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=103 output_ms=12 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 5 arm copy
+LIVE promoted=10364058296 heap=10380830216 fragmented=16770912
+RESULT batch=1 ticks=20 drain_ms=16013 output_ms=2918 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=91 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=96 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 5 arm copy:validate
+LIVE promoted=10361215568 heap=10366948320 fragmented=5731744
+RESULT batch=1 ticks=20 drain_ms=15613 output_ms=5862 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92
+RESULT batch=2 ticks=9 drain_ms=85 output_ms=18 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=91 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
