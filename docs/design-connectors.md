@@ -482,6 +482,39 @@ until then and does not get in its way.
 3. **Docs + deprecation**: the `object?[]` contract in `TableInput`'s XML docs; `PushArrowZeroCopy`
    `[Obsolete]` in favour of the parameter.
 
+### Measured: Transcode vs Copy vs Arena on ivm-bench (2026-10-31)
+
+`DBSPNET_INGEST_STRINGS=transcode|copy|arena` (`57cf4f8`) on the three Arrow ingest paths;
+`scripts/measure-ingest-strings.sh`, ivm-bench SF=3, W=12, 5 alternating runs per arm, one at a
+time. Live heap is the bytes surviving a full compacting GC right after batch 1's drain, before any
+output view forms. Raw: `docs/ingest-strings-results-20261031.txt`.
+
+| arm | batch-1 drain, median [range] | batch-1 allocation | live after batch 1 |
+|---|--:|--:|--:|
+| Transcode (today) | 16.75 s [15.14–17.83] | 43.29 GiB | 9.65 GB |
+| Copy | 15.77 s [15.63–16.30] | 42.93 GiB | 9.65 GB |
+| Arena | 15.58 s [15.45–16.27] | 42.75 GiB | **9.51 GB** |
+
+Output row counts are identical in every run of every arm, batches 1–3.
+
+- **On ivm-bench, string ingest is a small term.** Removing the round trip saves 0.36 GiB (Copy)
+  and 0.54 GiB (Arena) of 43 GiB — about 1%. Batch 1's allocation is engine-internal churn, as the
+  flat-state probe found for q20. (The Nexmark harness gained far more, 11–39%, because its rows are
+  narrow and string-heavy relative to the work done on them.)
+- **Drain is ~1 s faster for both** (6–7% at the medians), but Transcode's runs spread over 2.7 s
+  and overlap the others, so read it as "probably a little faster, certainly not slower".
+- **Arena pins nothing measurable here — it keeps *less* live** (−0.14 GB): almost every ingested
+  row survives into state, so the per-cell `byte[]` headers Copy pays outweigh the dead bytes an
+  arena block holds.
+
+**Recommendation.** Make **Copy** the ingest default: it is never worse than Transcode, and its
+retention is exactly today's. Offer **Arena** as an opt-in for bulk loads where nearly everything
+survives — ivm-bench's initial load is one, and wins slightly on every measure. Arena is not a safe
+*default*: on a long-running stream behind a selective filter, one surviving row per block pins the
+whole block, so memory would grow with the input rather than with the state. Copy-on-retain (alias
+for the tick, copy where an operator keeps a row) is the design that gets Arena's allocation without
+that risk, but at ~1% of ivm-bench allocation it is not worth building for this workload.
+
 ### Open questions
 
 - **Validation scope.** Validate in `Copy` only (where we touch the bytes anyway), or in every mode?

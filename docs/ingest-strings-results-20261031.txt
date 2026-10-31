@@ -1,0 +1,76 @@
+# 57cf4f8 Sat Oct 31 08:46:05 PDT 2026 W=12
+## run 1 arm transcode
+LIVE promoted=10361330160 heap=10370145920 fragmented=8814752
+RESULT batch=1 ticks=20 drain_ms=17354 output_ms=5490 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=43.29
+RESULT batch=2 ticks=9 drain_ms=89 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=92 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 1 arm copy
+LIVE promoted=10357545568 heap=10366087616 fragmented=8541040
+RESULT batch=1 ticks=20 drain_ms=16299 output_ms=5594 counts_ms=14 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92
+RESULT batch=2 ticks=9 drain_ms=96 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=93 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 1 arm arena
+LIVE promoted=10210754672 heap=10212205232 fragmented=1449552
+RESULT batch=1 ticks=20 drain_ms=15452 output_ms=5577 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.75
+RESULT batch=2 ticks=9 drain_ms=100 output_ms=18 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=92 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 2 arm transcode
+LIVE promoted=10364015304 heap=10372738064 fragmented=8721752
+RESULT batch=1 ticks=20 drain_ms=16745 output_ms=5816 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=43.29
+RESULT batch=2 ticks=9 drain_ms=88 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=83 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 2 arm copy
+LIVE promoted=10359854440 heap=10375693664 fragmented=15838216
+RESULT batch=1 ticks=20 drain_ms=15708 output_ms=5568 counts_ms=17 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=102 output_ms=18 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=106 output_ms=11 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 2 arm arena
+LIVE promoted=10214979816 heap=10226874792 fragmented=11893968
+RESULT batch=1 ticks=20 drain_ms=15634 output_ms=3887 counts_ms=14 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.75
+RESULT batch=2 ticks=9 drain_ms=92 output_ms=18 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=95 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 3 arm transcode
+LIVE promoted=10363656864 heap=10373280712 fragmented=9622840
+RESULT batch=1 ticks=20 drain_ms=15138 output_ms=5516 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=43.29
+RESULT batch=2 ticks=9 drain_ms=91 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=99 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 3 arm copy
+LIVE promoted=10359839464 heap=10368936208 fragmented=9095736
+RESULT batch=1 ticks=20 drain_ms=15769 output_ms=5444 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=84 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=79 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 3 arm arena
+LIVE promoted=10213633488 heap=10222177616 fragmented=8543120
+RESULT batch=1 ticks=20 drain_ms=16270 output_ms=3648 counts_ms=14 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.75
+RESULT batch=2 ticks=9 drain_ms=90 output_ms=18 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=96 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 4 arm transcode
+LIVE promoted=10360729232 heap=10369293344 fragmented=8563104
+RESULT batch=1 ticks=20 drain_ms=17825 output_ms=5608 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=43.29
+RESULT batch=2 ticks=9 drain_ms=88 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=90 output_ms=11 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 4 arm copy
+LIVE promoted=10361770232 heap=10377629104 fragmented=15857864
+RESULT batch=1 ticks=20 drain_ms=15626 output_ms=5641 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=89 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=93 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 4 arm arena
+LIVE promoted=10210833584 heap=10226782008 fragmented=15947416
+RESULT batch=1 ticks=20 drain_ms=15564 output_ms=5423 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.75
+RESULT batch=2 ticks=9 drain_ms=99 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=94 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 5 arm transcode
+LIVE promoted=10360041608 heap=10368097736 fragmented=8055120
+RESULT batch=1 ticks=20 drain_ms=16720 output_ms=5937 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=43.29
+RESULT batch=2 ticks=9 drain_ms=104 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=94 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 5 arm copy
+LIVE promoted=10362601128 heap=10365904352 fragmented=3302216
+RESULT batch=1 ticks=20 drain_ms=15897 output_ms=5620 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93
+RESULT batch=2 ticks=9 drain_ms=84 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=98 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
+## run 5 arm arena
+LIVE promoted=10214241072 heap=10227374736 fragmented=13132656
+RESULT batch=1 ticks=20 drain_ms=15581 output_ms=5624 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.75
+RESULT batch=2 ticks=9 drain_ms=79 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=120.2 drain_alloc_gib=0.05
+RESULT batch=3 ticks=9 drain_ms=92 output_ms=10 counts_ms=0 view_rows=3585648 parquet_mb=120.3 drain_alloc_gib=0.06
