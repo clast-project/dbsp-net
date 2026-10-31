@@ -21,6 +21,7 @@
 //                     only against another run with this set.
 //   IVM_RESTORE_WORKERS  (with IVM_SNAPSHOT_DIR, parallel) restore at this W instead: re-shard the
 //                     last snapshot first (reshard_ms on the RESTORE line)
+//   IVM_TRACE_FAMILY  (optional) spine = spine traces for every keyed stateful operator; default flat
 //   IVM_CHECKPOINT_POLICY  (with IVM_SNAPSHOT_DIR) a CheckpointPolicy.Parse setting: unset = a
 //                     snapshot every batch; "none" = journal only; N = journal + snapshot every N s
 //   IVM_CHECKPOINT_PROFILE=1  (with IVM_SNAPSHOT_DIR) per checkpoint: wall, CPU, allocation and GC
@@ -45,6 +46,13 @@ public class IvmMultiBatch
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
     private readonly ITestOutputHelper _out;
+
+    // IVM_TRACE_FAMILY=spine compiles every keyed stateful operator onto spine traces (design-durable-state
+    // Phase 2: spine vs flat); default flat.
+    private static readonly TraceFamily TraceFamily =
+        string.Equals(Environment.GetEnvironmentVariable("IVM_TRACE_FAMILY"), "spine", StringComparison.OrdinalIgnoreCase)
+            ? TraceFamily.Spine
+            : TraceFamily.Flat;
 
     public IvmMultiBatch(ITestOutputHelper output) => _out = output;
 
@@ -98,6 +106,7 @@ public class IvmMultiBatch
             Assert.True(
                 SqlProgram.TryCompileParallel(
                     spec.Program, outputViews, at ?? workers, out var compiled, codecs,
+                    new CompileOptions { TraceFamily = TraceFamily },
                     numericStringCoercion: true, nullCollation: NullCollation.Low),
                 "parallel compile refused the program");
             return compiled;
@@ -137,7 +146,7 @@ public class IvmMultiBatch
         {
             var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") == "1";
             var compiled = SqlProgram.Compile(
-                spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews },
+                spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews, TraceFamily = TraceFamily },
                 numericStringCoercion: true, nullCollation: NullCollation.Low);
             if (typeViews)
             {
