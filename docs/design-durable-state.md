@@ -119,9 +119,27 @@ run and writes nothing on an idle batch. Engine: a W=4 persistent deploy runs pa
 redeploy asking for W=2 resumes at 4. A serial checkpoint redeployed with W=4 stays serial. Both
 match a from-scratch run. Full suite: 2658 pass.
 
-**Not measured yet:** end-to-end checkpoint and restore wall time at W=12 on SF=3. Concurrent
-worker writes should beat the serial save, which is sequential per operator.
-`scripts/measure-checkpoint.sh` measures it locally, with no Docker; one W=12 smoke run so far.
+**Measured (2026-10-30, 6963d1e, M4 Mac mini, SF=3, `scripts/measure-checkpoint.sh`, 5 alternating
+runs per arm, `DOTNET_gcServer=1`, fsync on).** Medians, with the range across the 5 runs:
+
+| | W=1 | W=12 | W=12 vs W=1 |
+|---|--:|--:|--:|
+| batch 1 step (drain) | 34.2 s (32.6–34.6) | 17.5 s (15.3–17.8) | 1.96× faster |
+| checkpoint after batch 1 | 13.2 s (13.0–15.8) | 11.5 s (11.3–11.6) | 1.15× faster |
+| checkpoint after batch 2 | 12.9 s (10.1–13.3) | 5.4 s (2.6–5.4) | 2.4× faster |
+| checkpoint after batch 3 | 10.2 s (10.1–13.0) | 5.3 s (4.5–5.4) | 1.9× faster |
+| snapshot size | 4.58 GiB | 4.59 GiB | same |
+| restore | 8.7 s (7.7–11.0) | 19.0 s (18.7–19.4) | **2.2× slower** |
+
+All 10 restores matched the uninterrupted view row counts. The checkpointing compile disables shared
+arrangements, so the step times compare only with other checkpointing runs. The snapshot is the
+same size at both W, so the earlier 4.05 GiB reference came from a different configuration.
+
+Two findings: **parallel restore is 2.2× slower than serial**, with a very tight range, so the
+effect is real. And the W=12 checkpoint after batch 1 is twice as slow as the later ones, which
+write the same amount of state. Neither is explained yet; both need a profile before any fix.
+Every checkpoint still rewrites all ~4.6 GiB, even after a 9-tick batch that changed almost
+nothing.
 
 ## 2. Plan from here
 
