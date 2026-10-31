@@ -81,6 +81,11 @@ public static class ParallelReshard
             }
         }
 
+        // One listing of the whole snapshot, grouped by (worker, op): a listing per operator walks
+        // the whole tree on the local file system, which made the rewrite quadratic (70-145 s on
+        // ivm-bench SF=3, nearly all of it in getdirentries).
+        var persisted = await ListPersistedAsync(fs, current, cancellationToken).ConfigureAwait(false);
+
         var indices = workerManifests[0].SnapshottedIndices;
         var specs = new List<(int Index, ReshardSpec Spec)>(indices.Count);
         foreach (var i in indices)
@@ -96,20 +101,25 @@ public static class ParallelReshard
                 throw new NotSupportedException($"operator {i} ({spec.OperatorType}): {why}");
             }
 
-            await CheckFilesCoveredAsync(fs, current, oldW, i, spec, cancellationToken).ConfigureAwait(false);
+            CheckFilesCovered(persisted, oldW, i, spec);
             specs.Add((i, spec));
         }
 
         var (tick, generation) = await Snapshot.NextSnapDirAsync(fs, manifest.Tick, cancellationToken).ConfigureAwait(false);
         var snapName = Snapshot.SnapDirName(tick, generation);
 
-        foreach (var (i, spec) in specs)
-        {
-            foreach (var file in spec.Files)
+        // Operators own disjoint directories, so they rewrite concurrently — at the restore's
+        // degree, which also bounds how many operators' state is decoded at once.
+        await Parallel.ForEachAsync(
+            specs,
+            new ParallelOptions { MaxDegreeOfParallelism = Snapshot.DefaultRestoreParallelism, CancellationToken = cancellationToken },
+            async (entry, ct) =>
             {
-                await RewriteFileAsync(fs, current, snapName, oldW, newW, i, file, cancellationToken).ConfigureAwait(false);
-            }
-        }
+                foreach (var file in entry.Spec.Files)
+                {
+                    await RewriteFileAsync(fs, current, snapName, oldW, newW, entry.Index, file, ct).ConfigureAwait(false);
+                }
+            }).ConfigureAwait(false);
 
         // The worker manifests are identical across workers (same plan, tick, operators).
         var manifestBytes = await fs.ReadAllBytesAsync(WorkerDir(current, 0) + "/" + Snapshot.ManifestFile, cancellationToken)
@@ -147,18 +157,52 @@ public static class ParallelReshard
 
     private static int Bucket(int hash, int workers) => ((hash % workers) + workers) % workers;
 
+    // Every file under the snapshot, by (worker, op): "{snap}/worker-{w}/op-{i}/{name}".
+    private static async ValueTask<Dictionary<(int Worker, int Op), List<string>>> ListPersistedAsync(
+        ITableFileSystem fs, string current, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<(int, int), List<string>>();
+        var prefix = current + "/";
+        await foreach (var f in fs.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
+        {
+            var rel = f.Path.StartsWith(prefix, StringComparison.Ordinal) ? f.Path[prefix.Length..] : f.Path;
+            var parts = rel.Split('/');
+            if (parts.Length != 3
+                || !parts[0].StartsWith("worker-", StringComparison.Ordinal)
+                || !parts[1].StartsWith("op-", StringComparison.Ordinal)
+                || !int.TryParse(parts[0].AsSpan(7), System.Globalization.CultureInfo.InvariantCulture, out var w)
+                || !int.TryParse(parts[1].AsSpan(3), System.Globalization.CultureInfo.InvariantCulture, out var op))
+            {
+                continue;
+            }
+
+            if (!result.TryGetValue((w, op), out var names))
+            {
+                names = [];
+                result[(w, op)] = names;
+            }
+
+            names.Add(parts[2]);
+        }
+
+        return result;
+    }
+
     // Every file the operator wrote must be one its spec names, or the rewrite would silently
     // drop it.
-    private static async ValueTask CheckFilesCoveredAsync(
-        ITableFileSystem fs, string current, int oldW, int op, ReshardSpec spec, CancellationToken cancellationToken)
+    private static void CheckFilesCovered(
+        Dictionary<(int Worker, int Op), List<string>> persisted, int oldW, int op, ReshardSpec spec)
     {
         var named = spec.Files.Select(f => f.Name).ToHashSet(StringComparer.Ordinal);
         for (var w = 0; w < oldW; w++)
         {
-            var prefix = OpDir(current, w, op) + "/";
-            await foreach (var f in fs.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
+            if (!persisted.TryGetValue((w, op), out var names))
             {
-                var name = f.Path.StartsWith(prefix, StringComparison.Ordinal) ? f.Path[prefix.Length..] : f.Path;
+                continue;
+            }
+
+            foreach (var name in names)
+            {
                 if (!named.Contains(name))
                 {
                     throw new InvalidOperationException(
