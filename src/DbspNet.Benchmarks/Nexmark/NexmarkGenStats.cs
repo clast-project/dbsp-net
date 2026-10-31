@@ -71,7 +71,7 @@ internal static class NexmarkGenStats
             sb.Append('\n');
             sha.AppendData(Encoding.UTF8.GetBytes(sb.ToString()));
 
-            var extra = (string)e.Row[^1]!;
+            var extra = e.Row[^1]!.ToString()!;
             extraBytes[t] += extra.Length;
             switch (e.Table)
             {
@@ -80,8 +80,8 @@ internal static class NexmarkGenStats
                     var auction = (long)e.Row[0]!;
                     var bidder = (long)e.Row[1]!;
                     priceSum += (long)e.Row[2]!;
-                    channels.Add((string)e.Row[3]!);
-                    urls.Add((string)e.Row[4]!);
+                    channels.Add(e.Row[3]!.ToString()!);
+                    urls.Add(e.Row[4]!.ToString()!);
                     extras.Add(extra);
                     pairs.Add((bidder, auction));
                     bidAuctions.Add(auction);
@@ -111,7 +111,7 @@ internal static class NexmarkGenStats
 
                 case NexmarkTable.Person:
                 {
-                    var st = (string)e.Row[5]!;
+                    var st = e.Row[5]!.ToString()!;
                     states[st] = states.GetValueOrDefault(st) + 1;
                     break;
                 }

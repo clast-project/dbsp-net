@@ -107,6 +107,28 @@ internal static class NexmarkGenerator
             ? GeneratorProfile.Feldera
             : GeneratorProfile.Legacy;
 
+    /// <summary>How VARCHAR cells arrive.</summary>
+    public enum StringCells
+    {
+        /// <summary>UTF-8 <see cref="Utf8String"/> values — what a connector delivers and what the
+        /// engine stores, so pushing them costs no re-encode (the default).</summary>
+        Utf8,
+
+        /// <summary>Managed <see cref="string"/>s, re-encoded by the engine's input boundary on every
+        /// push. Reproduces runs before 2026-10-31, which timed that conversion; Feldera's generator
+        /// builds Rust (UTF-8) strings and never pays it.</summary>
+        String,
+    }
+
+    /// <summary>
+    /// Process-wide default cell form: <c>NEXMARK_STRINGS=string</c> selects
+    /// <see cref="StringCells.String"/>; anything else (or unset) is <see cref="StringCells.Utf8"/>.
+    /// </summary>
+    public static StringCells DefaultStringCells { get; } =
+        string.Equals(Environment.GetEnvironmentVariable("NEXMARK_STRINGS"), "string", StringComparison.OrdinalIgnoreCase)
+            ? StringCells.String
+            : StringCells.Utf8;
+
     /// <summary>
     /// Generate <paramref name="count"/> events in event-id order using
     /// <see cref="DefaultProfile"/>. The same seed always yields the same stream.
@@ -131,7 +153,33 @@ internal static class NexmarkGenerator
 
     /// <summary>Lazily yield <paramref name="count"/> events with an explicit profile.</summary>
     public static IEnumerable<Event> Stream(int count, int seed, GeneratorProfile profile) =>
-        profile == GeneratorProfile.Feldera ? FelderaStream(count, seed) : LegacyStream(count, seed);
+        Stream(count, seed, profile, DefaultStringCells);
+
+    /// <summary>Lazily yield <paramref name="count"/> events with an explicit profile and cell form.</summary>
+    public static IEnumerable<Event> Stream(int count, int seed, GeneratorProfile profile, StringCells cells)
+    {
+        var events = profile == GeneratorProfile.Feldera ? FelderaStream(count, seed) : LegacyStream(count, seed);
+        return cells == StringCells.Utf8 ? ToUtf8(events) : events;
+    }
+
+    /// <summary>Each string cell becomes its own <see cref="Utf8String"/> (no buffer shared between
+    /// cells, so retained-state byte counts stay honest, as with the fresh strings below).</summary>
+    private static IEnumerable<Event> ToUtf8(IEnumerable<Event> events)
+    {
+        foreach (var e in events)
+        {
+            var row = e.Row;
+            for (var i = 0; i < row.Length; i++)
+            {
+                if (row[i] is string s)
+                {
+                    row[i] = Utf8String.Of(s);
+                }
+            }
+
+            yield return e;
+        }
+    }
 
     private static IEnumerable<Event> LegacyStream(int count, int seed)
     {

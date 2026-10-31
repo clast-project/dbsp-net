@@ -36,6 +36,10 @@
 #   * Neither side times circuit construction. DbspNet's push also pays a boundary
 #     encode (object[] -> typed row) that Feldera's native-struct append skips, so
 #     if anything DbspNet's ingest is mildly penalized, not flattered.
+#   * String cells arrive as UTF-8 (NEXMARK_STRINGS=utf8, the default since
+#     2026-10-31), as Feldera's generator builds them. Runs before that pushed
+#     managed strings and timed DbspNet re-encoding every VARCHAR cell (~20% of
+#     q20's engine time); NEXMARK_STRINGS=string reproduces them.
 #   * Small --events still understates Feldera a little (per-query DBSP setup is
 #     amortized over the stream); raise --events for a steadier read.
 #
@@ -106,7 +110,7 @@ echo
 
 # ---- 1. DbspNet ----------------------------------------------------------------
 echo "-- DbspNet (dotnet, W=1 and W=$CORES) ----------------------------------------"
-NEXMARK_GEN="$NEXMARK_GEN" dotnet run -c Release --project "$REPO/src/DbspNet.Benchmarks" -- \
+NEXMARK_GEN="$NEXMARK_GEN" NEXMARK_STRINGS="${NEXMARK_STRINGS:-utf8}" dotnet run -c Release --project "$REPO/src/DbspNet.Benchmarks" -- \
   nexmark "$EVENTS" "$BATCH" "$RUNS" "$CORES" | tee "$DBSP_OUT"
 echo
 
