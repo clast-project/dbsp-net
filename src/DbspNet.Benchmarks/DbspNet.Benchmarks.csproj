@@ -6,6 +6,8 @@
          strings) is noise for ASCII-only numeric report text. -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CA1305</NoWarn>
+    <!-- The flat-state probe (FlatState/) works on raw page pointers. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- Data-parallel ingest/egest encode/decode allocates heavily on every
          worker thread; workstation GC stops all of them on each collection and
          serializes the very work we parallelized. Server GC gives per-core heaps
