@@ -19,6 +19,8 @@
 //                     restore_ms, and check its view row counts. Wiped at start. Compiles with
 //                     snapshot codecs, which turn off shared arrangements, so compare drain_ms
 //                     only against another run with this set.
+//   IVM_RESTORE_WORKERS  (with IVM_SNAPSHOT_DIR, parallel) restore at this W instead: re-shard the
+//                     last snapshot first (reshard_ms on the RESTORE line)
 //   IVM_CHECKPOINT_POLICY  (with IVM_SNAPSHOT_DIR) a CheckpointPolicy.Parse setting: unset = a
 //                     snapshot every batch; "none" = journal only; N = journal + snapshot every N s
 //   IVM_CHECKPOINT_PROFILE=1  (with IVM_SNAPSHOT_DIR) per checkpoint: wall, CPU, allocation and GC
@@ -91,11 +93,11 @@ public class IvmMultiBatch
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         var workers = int.TryParse(Environment.GetEnvironmentVariable("IVM_WORKERS"), out var w) ? w : 1;
-        ParallelCompiledProgram? CompileParallel()
+        ParallelCompiledProgram? CompileParallel(int? at = null)
         {
             Assert.True(
                 SqlProgram.TryCompileParallel(
-                    spec.Program, outputViews, workers, out var compiled, codecs,
+                    spec.Program, outputViews, at ?? workers, out var compiled, codecs,
                     numericStringCoercion: true, nullCollation: NullCollation.Low),
                 "parallel compile refused the program");
             return compiled;
@@ -328,10 +330,19 @@ public class IvmMultiBatch
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             GC.WaitForPendingFinalizers();
 
-            using var restoredParallel = workers > 1 ? CompileParallel() : null;
+            var restoreWorkers = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTORE_WORKERS"), out var rw) ? rw : workers;
+            using var restoredParallel = restoreWorkers > 1 ? CompileParallel(restoreWorkers) : null;
             var restored = restoredParallel is not null
                 ? await ProgramRunner.CreateAsync(restoredParallel, Inputs(), [], store, policy)
                 : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), [], store, policy);
+            double reshardMs = 0;
+            if (restoreWorkers != workers)
+            {
+                var rs0 = Stopwatch.GetTimestamp();
+                await store.ReshardAsync(restoredParallel!);
+                reshardMs = Stopwatch.GetElapsedTime(rs0).TotalMilliseconds;
+            }
+
             var r0 = Stopwatch.GetTimestamp();
             var restoredTick = await restored.RestoreAsync();
             var restoreMs = Stopwatch.GetElapsedTime(r0).TotalMilliseconds;
@@ -339,7 +350,7 @@ public class IvmMultiBatch
             var match = restoredTick == producerTick && expected.SequenceEqual(actual);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESTORE workers={workers} tick={restoredTick} restore_ms={restoreMs:F0} view_rows_match={match}"));
+                $"RESTORE workers={workers} restore_workers={restoreWorkers} reshard_ms={reshardMs:F0} tick={restoredTick} restore_ms={restoreMs:F0} view_rows_match={match}"));
             Assert.True(match, "restored view row counts differ from the producer's");
         }
 

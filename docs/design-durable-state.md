@@ -291,11 +291,119 @@ forced `DBSPNET_CHECKPOINT_GC=default`; fixed in 3d2d399.)
 for non-replayable sources, exactly-once output (needs the journal plus idempotent sinks keyed by
 tick), and buffer pooling in the save path.
 
+## 1d. Increment 3 — re-shard a snapshot to a different W (BUILT 2026-10-31)
+
+**Scope.** Restore a parallel snapshot written at W_old ≥ 2 into a program at W_new ≥ 2. Serial ↔
+parallel stays out (different operator graphs; positional identity). A journal-only state already
+replays at any W (§1c), so this is only about snapshots.
+
+### The audit (structural parallel path, `PlanToCircuit.TryCompileProgramParallel`)
+
+Inputs are sharded by `OfWholeRow(row) % W`; every exchange places by its own partition function
+(`((h % W) + W) % W`). For each stateful operator the parallel compile can build:
+
+| Operator (site) | Persists | Worker of an entry, as a function of the persisted entry |
+|---|---|---|
+| `IntegrateOp`, each output view | view rows | **none needed — linear**: a view row is legitimately split across replicas today (anti-join, residual outer join, projections, UNION ALL), and every consumer reads the replica **sum** |
+| `DistinctOp` (DISTINCT) | rows | `OWR(row, d.Schema)` |
+| `IncrementalAggregateOp` (GROUP BY), exchange kept | key = group key row, value = input row; `aggstate` blobs by key | `OWR(key, groupKeySchema)` |
+| ″, exchange **elided** (input already partitioned on a subset of the group columns) | same | the **upstream** hash over the subset columns of the stored **value** row, in upstream order/schema; worker 0 if upstream was gathered |
+| `IncrementalJoinOp` / `LeftJoin` / `FullJoin` (hash) | left + right traces keyed by the equi-key | `OWR(key, keySchema)` — proven equal to the exchange's `OfRow(row, indices, keySchema)`; left and right agree |
+| `IncrementalJoinOp`, **broadcast** join | left trace, right trace | right: **replicated** (identical copy on every worker); left: **linear** given a full right everywhere |
+| residual outer join: 2× `DistinctOp` over matched rows | joined rows | `OfRow(row, leftIndices, leftKeySchema)` on the stored joined row (not `OWR(row)`) |
+| residual outer join: `DistinctOp` over side rows; semi `IncrementalJoinOp` on row identity | rows / keys = side rows | `OWR(row, sideSchema)` |
+| SemiJoin (EXISTS/IN/anti): `DistinctOp` over key tuples; `IncrementalJoinOp` | key rows | `OWR(key, semiKeySchema)` |
+| `PartitionedTopK*`, `PartitionedRank`, `PartitionedWindowAggregate`, `PartitionedOffset` | input rows | `OWR(PartitionOf(row), $pk schema)`; **worker 0** when unpartitioned (gathered) |
+| `TopKOp` (global ORDER BY … LIMIT) | all input rows | **worker 0** |
+| global aggregate / hash cross join (empty key) | — | `OWR(empty)` = a constant worker (not 0), which the `OWR(key)` rule already reproduces |
+
+Unreachable on this path (refused or never built): `LatenessOperator`, `TemporalFilterOp`, the
+fixpoints, shared arrangements, `LinearAggregateOp`, `DelayOp`. No per-worker scalar state is
+reachable; tick and logical time are equal on every worker. Spine variants persist per-batch files
+with the same keys (`TraceFamily = Spine`, not the default).
+
+### Design: rewrite the snapshot, then restore normally
+
+1. **The compiler states each operator's placement.** At each build site above, the parallel compile
+   records a `ReshardSpec` for the operator (by its position in the replica circuit): which of its
+   files are traces / keyed blobs, their codecs' schemas, and one of
+   `Hash(entry → int)` (the function from the table), `Worker0`, `Replicated`, or `Any` (linear).
+   An operator without a spec makes re-sharding refuse, loudly — a new stateful operator cannot be
+   resharded by accident.
+2. **`ParallelReshard.RewriteAsync(fs, program, W_new)`** decodes each old worker's file of each
+   operator **once** through the spec's codec, sends every entry to its new worker, and writes a new
+   snapshot generation at the same tick with W_new workers, the same offsets metadata and manifests,
+   then commits it with the usual durable pointer swap. Then the ordinary `ParallelSnapshot.ReadAsync`
+   restores it. Operators' own load code is untouched. Cost ≈ one restore + one checkpoint of
+   decode/encode (~10 s on ivm-bench SF=3), paid only when W changes.
+3. **Self-check on the way.** For `Hash` specs, every entry read from old worker w must satisfy
+   `hash % W_old == w` (`Worker0`: only on worker 0; `Replicated`: identical row counts on every
+   worker). A mismatch means the spec is wrong for that operator, and the rewrite aborts before
+   anything is committed. This turns a silent misplacement — wrong results ticks later — into an
+   error on the old data, where the true placement is known.
+4. **Crash safety for free:** the old snapshot stays current until the new pointer commits.
+5. **`DbspNetEngine`** compiles at the configured W; when the snapshot's W differs (both ≥ 2) it
+   rewrites, logs one line, and restores. Today it adopts the snapshot's W instead.
+
+**Placement of linear state (`Any`).** Entries keep a deterministic spread (`OWR(row) % W_new`);
+any placement sums to the same view. **`Replicated`** writes worker 0's copy to every new worker.
+
+### Verification
+- For every operator kind in the table, a program that builds it: checkpoint at W_old, reshard to
+  W_new, run more batches, and compare against an uninterrupted serial run — 4→12, 12→4, 3→2, 2→3.
+  Includes the special cases: elided-exchange aggregate after a join, broadcast cross join with a
+  one-row side, residual outer join, anti-join, global TOP-K, global aggregate.
+- The self-check rejects a deliberately wrong spec.
+- A crash at any point of the rewrite (`CrashSimulatingFileSystem`) leaves the old snapshot
+  restorable at W_old.
+- ivm-bench SF=3: 12 → 8 and 8 → 12 rewrite time and restored view row counts.
+
+### Built (cdf88de, c9b4240) and measured
+
+Curt approved all three decisions (file-level rewrite, spine refused in v1, the engine re-shards
+automatically). Built as designed — `ReshardSpec`/`ReshardRecorder` (Sql), `ParallelReshard`
+(Persistence), `SnapshotCheckpointStore.ReshardAsync`, `DbspNetEngine` — with two additions the
+audit forced:
+- `PartitionInfo` now records the **key schema** an exchange hashed with and whether an empty
+  partition key means **gathered** (worker 0) or hashed (the empty key's constant worker); the two
+  were indistinguishable, and the elided aggregate's placement needs both.
+- The "elided" path is only reachable aggregate-over-aggregate on the program path: join-then-
+  aggregate always has a projection between them, so its exchange stays (the existing
+  `JoinThenGroupByJoinKey_ElidesExchange` test asserts elision only in a comment). Counting
+  exchange operators confirmed which shape elides; `ParallelReshardTests` uses that one.
+
+**Tests** (`ParallelReshardTests`): every stateful operator of a program with every operator kind
+has a placement; 2→3, 3→2, 4→12, 12→4, 5→2 match an uninterrupted serial run and keep matching
+for 5 more ticks; a wrong placement is rejected with nothing committed; spine is refused; a crash
+at every mutation of the rewrite (process crash and power loss) leaves a snapshot that restores
+at the old W before the commit and the new W after it. Mutating the elided-aggregate or
+residual-join placement makes the self-check fail at that operator. (With few keys and small W a
+wrong hash can coincide with the right one, so the self-check is probabilistic on tiny data.)
+
+**ivm-bench SF=3** (`ARMS="12:to=8 8:to=12" scripts/measure-checkpoint.sh`, 5 runs each,
+medians [ranges], all 10 restores matched; `docs/reshard-results-20261031.txt`):
+
+| | re-shard (rewrite) | restore after it |
+|---|--:|--:|
+| 12 → 8 | 6.74 s [6.63–7.22] | 5.26 s [5.20–5.37] |
+| 8 → 12 | 6.99 s [6.48–7.42] | 5.37 s [5.09–5.38] |
+
+The first version took 144 s (12→8) and 72 s (8→12): a directory listing per operator per old
+worker walked the whole 4.6 GiB snapshot tree each time (90% of samples in `getdirentries`). One
+listing grouped by (worker, op) took it to 16.5 s; rewriting operators concurrently at the
+restore's degree to ~7 s. Changing W therefore costs about one extra restore's worth of time.
+
+### Decisions for Curt
+- **File-level rewrite** (above) rather than a new load path in every operator (which would also
+  decode the data W_new times).
+- **Spine:** refuse in v1 with a clear error (not the default family); add later if needed.
+- **The engine reshards automatically** when the configured W differs, instead of pinning W.
+
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.
 2. ~~Increment 2 — A2 checkpoint policy.~~ Done, §1c.
-3. **Increment 3 — re-shard at restore (change W between parallel worker counts).** Today W is
+3. ~~Increment 3 — re-shard at restore~~ Done, §1d. (Original plan follows.) **Increment 3 — re-shard at restore (change W between parallel worker counts).** Today W is
    pinned by the checkpoint, as in Feldera (`controller.rs`: "Can't change number of workers or
    hosts yet"; their runtime rebalancer in `operator/dynamic/balance/` already moves integrated
    state between workers). Plan: when the requested W differs from the recorded one, each new worker
