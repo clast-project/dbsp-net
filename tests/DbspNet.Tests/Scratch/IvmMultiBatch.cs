@@ -21,6 +21,9 @@
 //                     only against another run with this set.
 //   IVM_RESTORE_WORKERS  (with IVM_SNAPSHOT_DIR, parallel) restore at this W instead: re-shard the
 //                     last snapshot first (reshard_ms on the RESTORE line)
+//   IVM_SNAPSHOT_RETAIN  (optional) snapshots to keep (default 2)
+//   IVM_CHECKPOINT_DELTA=1  (with IVM_SNAPSHOT_DIR, parallel) diff consecutive retained snapshots
+//                     (CheckpointDeltaProbe): DELTA / DELTAKIND lines
 //   IVM_TRACE_FAMILY  (optional) spine = spine traces for every keyed stateful operator; default flat
 //   IVM_CHECKPOINT_POLICY  (with IVM_SNAPSHOT_DIR) a CheckpointPolicy.Parse setting: unset = a
 //                     snapshot every batch; "none" = journal only; N = journal + snapshot every N s
@@ -95,7 +98,9 @@ public class IvmMultiBatch
             }
 
             Directory.CreateDirectory(snapshotDir!);
-            store = new SnapshotCheckpointStore(new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!));
+            // IVM_SNAPSHOT_RETAIN keeps more than the default 2 snapshots (IvmCheckpointDelta diffs them).
+            var retain = int.TryParse(Environment.GetEnvironmentVariable("IVM_SNAPSHOT_RETAIN"), out var r) ? r : 2;
+            store = new SnapshotCheckpointStore(new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!), retain);
         }
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
@@ -325,6 +330,16 @@ public class IvmMultiBatch
                 CultureInfo.InvariantCulture,
                 $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2}")
                 + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1}")));
+        }
+
+        if (store is not null && parallel is not null && Environment.GetEnvironmentVariable("IVM_CHECKPOINT_DELTA") == "1")
+        {
+            // Phase 2: bytes an incremental checkpoint would write between retained snapshots.
+            var deltaFs = new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!);
+            foreach (var line in await CheckpointDeltaProbe.MeasureAsync(deltaFs, parallel))
+            {
+                _out.WriteLine(line);
+            }
         }
 
         if (store is not null)

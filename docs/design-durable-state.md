@@ -399,6 +399,81 @@ restore's degree to ~7 s. Changing W therefore costs about one extra restore's w
 - **Spine:** refuse in v1 with a clear error (not the default family); add later if needed.
 - **The engine reshards automatically** when the configured W differs, instead of pinning W.
 
+## 1e. Phase 2 — the deciding numbers (MEASURED 2026-10-31)
+
+Branch `arc/durable-phase2`. All on ivm-bench SF=3 (multi-batch staging: batch 1 = 20 ticks of bulk
+load, batches 2 and 3 = 9 small ticks each), `DOTNET_gcServer=1`, after Increments 0–3 and the
+checkpoint GC fix.
+
+### (a) Spine vs flat at W=8 (`ARMS="8 8:spine" scripts/measure-checkpoint.sh`, 5 alternating runs, medians [ranges])
+
+| | flat | spine |
+|---|--:|--:|
+| batch-1 drain | 16.70 s [15.64–16.97] | 18.64 s [17.29–19.52] (+11.6%, ranges disjoint) |
+| batch-1 drain allocation | 42.69 GiB | 44.56 GiB (+4.4%) |
+| batches 2 / 3 drain | 0.03 / 0.04 s | 0.04 / 0.04 s |
+| checkpoint after batch 1 / 2 / 3 | 4.91 / 3.15 / 4.31 s | 5.88 / 3.99 / 3.71 s |
+| snapshot size | 4.70 GB | 4.86 GB |
+| restore | 6.04 s [5.62–6.23] | 6.45 s [6.12–6.74] |
+
+All 10 restores matched. **Spine costs ~12% of batch-1 drain on ivm-bench at W=8**, far from the
+1.4–2.5× measured on Nexmark at W=24 before the chunked map. Its checkpoint is no cheaper today:
+the spine snapshot still re-serialises every batch (`GetBatches` copies), so the immutable-batch
+structure buys nothing yet. Raw: `docs/spine-vs-flat-w8-20261031.txt`.
+
+### (b) How much does a batch change the state? (`CheckpointDeltaProbe`, `IVM_CHECKPOINT_DELTA=1`, W=8, flat)
+
+For each pair of consecutive snapshots, per worker and per operator file: decode both with the
+operator's codec, take the Z-set difference, encode it with the same codec. This is what a
+batch-granular manifest-of-delta-runs checkpoint would write (per-tick runs cannot cancel within a
+batch, so they would write at least this much).
+
+| | full snapshot | changed | ratio | entries changed / total |
+|---|--:|--:|--:|--:|
+| batch 1 → 2 | 4,698 MiB | **6.73 MiB** | 0.143% | 13,520 / 35.7 M |
+| batch 2 → 3 | 4,699 MiB | **7.03 MiB** | 0.150% | 15,802 / 35.7 M |
+
+Much of the 7 MiB is per-file overhead (an Arrow schema and footer per operator file per worker):
+the partitioned window aggregate writes 1.84 MiB for 73 changed entries. The largest single file,
+a join's left trace (2.1 GB), changes by 0.04%. Raw: `docs/checkpoint-delta-20261031.txt`.
+
+### (c) What restore spends its time on, and how much of the restored state is used
+
+`IvmRestoreProfile`, serial, sequential restore with the stage profile (2 runs; the stages are
+exact, the totals noisy: 26.1 s and 17.1 s, against ~6–8 s for the parallel restore):
+
+| stage | share of restore |
+|---|--:|
+| read (file I/O) | 3.4–5.5% |
+| decode (Arrow IPC) | ~1% |
+| extract (box columns) | 13–19% |
+| materialize (row objects) | 30–49% |
+| index (hash into Z-sets) | ~10% |
+| integrate (into traces) | 4–5% |
+| rebuild (operator state) | 19–28% |
+
+Replay of batches 2–3 after restoring batch 1 (`IVM_RESTORE_MODE=replay`, verified):
+**1,208 distinct keys probed of 9,671,750 restored (0.0125%)**; full scans touched 2 keys. The
+earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
+
+### What the numbers say about options 1–3
+
+- **Checkpoint cost is ~700× larger than the change it records.** A checkpoint rewrites 4.7 GB
+  to record ~7 MiB of change. Any option that writes deltas (all three, once built) turns a
+  3–5 s snapshot into milliseconds plus fsync. With the A2 journal the per-batch commit is already
+  5–11 ms; what incremental snapshots remove is the 3–5 s paid every snapshot interval, which is
+  what bounds recovery replay.
+- **Restore is ~95% reconstruction, and the resumed run uses 0.01% of it.** Option 1 (delta runs on
+  disk, eager restore) avoids none of that — it would even add a merge of runs at load. Only a
+  lazy layout (options 2 and 3) removes it; with a 0.0125% touch rate the reachable floor is
+  near O(#files).
+- **Spine is not ruled out by step cost** on this workload (+12% at W=8), but it is not a shortcut
+  either: its snapshot and restore are not yet incremental or lazy, so option 3 still needs the
+  run-manifest and lazy-load work options 1 and 2 need.
+
+Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
+scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
+
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.

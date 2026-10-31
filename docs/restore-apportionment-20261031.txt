@@ -1,0 +1,74 @@
+/Users/curthagenlocher/src/dbsp-net/tests/DbspNet.Tests/bin/Release/net10.0/DbspNet.Tests.dll
+Standard Output Messages:
+mode profile, family Flat, batches 3, snapshot /Users/curthagenlocher/restore-prof/snap
+== restore #1: 26146 ms, 38836 MiB allocated, degree 1, tick 20, verified ==
+202 files, 35,372,053 rows, 4645.0 MiB on disk
+stage                        ms     % of restore   % of stages
+read (file I/O)             891        3.4%        3.4%
+decode (Arrow IPC)          271        1.0%        1.0%
+extract (box cols)         3351       12.8%       12.9%
+materialize (rows)        12746       48.8%       49.2%
+index (hash->ZSet)         2643       10.1%       10.2%
+integrate (->trace)         905        3.5%        3.5%
+rebuild (op state)         5084       19.4%       19.6%
+(of extract: VARCHAR)      1470        5.6%   over 1955 of 4247 columns
+[sum of stages]           25891       99.0%
+[unattributed]              255        1.0%
+per row: 732 ns of attributed restore over 35,372,053 rows
+by operator kind (151 ops, 26139 ms):
+IncrementalJoinOp`5                           15112 ms ( 57.8%) x45
+PartitionedWindowAggregateOp`4                 4591 ms ( 17.6%) x30
+IncrementalAggregateOp`3                       3624 ms ( 13.9%) x13
+PartitionedOffsetOp`3                          1494 ms (  5.7%) x8
+IntegrateOp`1                                   745 ms (  2.9%) x18
+IncrementalLeftJoinOp`5                         284 ms (  1.1%) x6
+DistinctOp`2                                    207 ms (  0.8%) x18
+PartitionedRankOp`3                              82 ms (  0.3%) x13
+== restore #2: 17096 ms, 38674 MiB allocated, degree 1, tick 20, verified ==
+202 files, 35,372,053 rows, 4645.0 MiB on disk
+stage                        ms     % of restore   % of stages
+read (file I/O)             938        5.5%        5.6%
+decode (Arrow IPC)          220        1.3%        1.3%
+extract (box cols)         3233       18.9%       19.2%
+materialize (rows)         5203       30.4%       30.8%
+index (hash->ZSet)         1661        9.7%        9.8%
+integrate (->trace)         847        5.0%        5.0%
+rebuild (op state)         4777       27.9%       28.3%
+(of extract: VARCHAR)       875        5.1%   over 1955 of 4247 columns
+[sum of stages]           16879       98.7%
+[unattributed]              217        1.3%
+per row: 477 ns of attributed restore over 35,372,053 rows
+by operator kind (151 ops, 17095 ms):
+IncrementalJoinOp`5                            8047 ms ( 47.1%) x45
+PartitionedWindowAggregateOp`4                 3901 ms ( 22.8%) x30
+IncrementalAggregateOp`3                       2118 ms ( 12.4%) x13
+PartitionedOffsetOp`3                          1447 ms (  8.5%) x8
+IntegrateOp`1                                  1181 ms (  6.9%) x18
+DistinctOp`2                                    175 ms (  1.0%) x18
+IncrementalLeftJoinOp`5                         162 ms (  0.9%) x6
+PartitionedRankOp`3                              65 ms (  0.4%) x13
+/Users/curthagenlocher/src/dbsp-net/tests/DbspNet.Tests/bin/Release/net10.0/DbspNet.Tests.dll
+Passed DbspNet.Tests.Scratch.IvmRestoreProfile.ProfileRestore [11 s]
+Standard Output Messages:
+mode replay, family Flat, batches 3, snapshot /Users/curthagenlocher/restore-prof/snap
+restore 7271 ms, tick 20, verified
+replay of batches 2..3: 150 ms -> tick 38, verified
+-- what the resumed ticks touched (143 non-empty trace collections) --
+restored keys                      9,671,750
+distinct keys probed                   1,208  (0.0125% of restored)
+probes (incl. repeats)                 1,601
+full scans of a trace                      4  over 2 collections
+keys in scanned collections                2  (0.0% of restored — laziness cannot skip these)
+largest collections:
+flat     keys    982,197  probed        0 ( 0.000%)  scans    0
+flat     keys    912,231  probed        0 ( 0.000%)  scans    0
+indexed  keys    885,979  probed       75 ( 0.008%)  scans    0
+flat     keys    664,809  probed        0 ( 0.000%)  scans    0
+flat     keys    390,995  probed       17 ( 0.004%)  scans    0
+indexed  keys    390,978  probed        0 ( 0.000%)  scans    0
+indexed  keys    390,978  probed        9 ( 0.002%)  scans    0
+indexed  keys    390,978  probed        9 ( 0.002%)  scans    0
+indexed  keys    390,978  probed        9 ( 0.002%)  scans    0
+indexed  keys    390,978  probed        8 ( 0.002%)  scans    0
+indexed  keys    390,978  probed        8 ( 0.002%)  scans    0
+indexed  keys    390,978  probed        8 ( 0.002%)  scans    0
