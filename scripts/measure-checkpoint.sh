@@ -9,7 +9,8 @@
 #
 # An arm is a worker count, optionally ":nofsync" (DBSPNET_SNAPSHOT_FSYNC=0) to price the fsyncs
 # and/or ":gcbatch" (DBSPNET_CHECKPOINT_GC=batch: no background GC during checkpoint/restore, the
-# default since 2026-10-31 — arms without it now run with DBSPNET_CHECKPOINT_GC=default).
+# default since 2026-10-31 — arms without it now run with DBSPNET_CHECKPOINT_GC=default)
+# and/or ":journal" (IVM_CHECKPOINT_POLICY=none: tick journal per batch, no snapshot).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
 set -euo pipefail
@@ -41,10 +42,15 @@ for run in $(seq 1 "$RUNS"); do
     [[ "$arm" == *:nofsync* ]] && fsync=0
     gcmode=default
     [[ "$arm" == *:gcbatch* ]] && gcmode=batch
+    # ":journal" = the A2 policy with no time trigger: every batch commits a tick-journal entry
+    # only, and the restore replays the journal from tick 0. Without it, a snapshot every batch.
+    policy=""
+    [[ "$arm" == *:journal* ]] && policy=none
     echo "## run $run arm $arm" | tee -a "$RESULTS"
     DOTNET_gcServer=1 \
     DBSPNET_SNAPSHOT_FSYNC="$fsync" \
     DBSPNET_CHECKPOINT_GC="$gcmode" \
+    IVM_CHECKPOINT_POLICY="$policy" \
     IVM_DATA_ROOT="$DATA" \
     IVM_SPEC="$SPEC" \
     IVM_STAGING_ROOT="$DATA/staging-multi" \

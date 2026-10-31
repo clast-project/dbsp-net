@@ -19,6 +19,8 @@
 //                     restore_ms, and check its view row counts. Wiped at start. Compiles with
 //                     snapshot codecs, which turn off shared arrangements, so compare drain_ms
 //                     only against another run with this set.
+//   IVM_CHECKPOINT_POLICY  (with IVM_SNAPSHOT_DIR) a CheckpointPolicy.Parse setting: unset = a
+//                     snapshot every batch; "none" = journal only; N = journal + snapshot every N s
 //   IVM_CHECKPOINT_PROFILE=1  (with IVM_SNAPSHOT_DIR) per checkpoint: wall, CPU, allocation and GC
 //                     deltas, and the operator save times summed by type (CKPT/CKPTOP lines)
 //   IVM_CHECKPOINT_REPEAT=1   after batch 1's checkpoint, write a second one straight away (same
@@ -73,6 +75,8 @@ public class IvmMultiBatch
         var snapshotDir = Environment.GetEnvironmentVariable("IVM_SNAPSHOT_DIR");
         var codecs = string.IsNullOrEmpty(snapshotDir) ? null : DbspNet.Persistence.ArrowSqlSnapshotCodecs.Instance;
         SnapshotCheckpointStore? store = null;
+        var policySetting = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_POLICY");
+        CheckpointPolicy? policy = string.IsNullOrEmpty(policySetting) ? null : CheckpointPolicy.Parse(policySetting);
         if (codecs is not null)
         {
             if (Directory.Exists(snapshotDir))
@@ -119,8 +123,8 @@ public class IvmMultiBatch
 
         var serial = parallel is null ? CompileSerial() : null;
         var runner = parallel is not null
-            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, store)
-            : await ProgramRunner.CreateAsync(serial!, inputs, outputs, store);
+            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, store, policy)
+            : await ProgramRunner.CreateAsync(serial!, inputs, outputs, store, policy);
         var checkpointProfile = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") == "1";
         DbspNet.Persistence.Snapshot.ProfileSave = checkpointProfile;
 
@@ -263,7 +267,17 @@ public class IvmMultiBatch
                     GC.WaitForPendingFinalizers();
                 }
 
-                checkpointMs = await ProfileCheckpoint($"batch{batch}", async () => await runner.CheckpointAsync());
+                checkpointMs = await ProfileCheckpoint($"batch{batch}", async () =>
+                {
+                    if (policy is null)
+                    {
+                        await runner.CheckpointAsync();
+                    }
+                    else
+                    {
+                        await runner.CommitBatchAsync();
+                    }
+                });
                 if (batch == 1 && Environment.GetEnvironmentVariable("IVM_CHECKPOINT_REPEAT") == "1")
                 {
                     var fs = new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!);
@@ -279,9 +293,13 @@ public class IvmMultiBatch
                         }
                     });
                 }
-                var current = File.ReadAllText(Path.Combine(snapshotDir!, "current.txt")).Trim();
-                snapshotMb = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
-                    .Sum(f => new FileInfo(f).Length) / (1024.0 * 1024.0);
+                var pointer = Path.Combine(snapshotDir!, "current.txt");
+                if (File.Exists(pointer))
+                {
+                    var current = File.ReadAllText(pointer).Trim();
+                    snapshotMb = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
+                        .Sum(f => new FileInfo(f).Length) / (1024.0 * 1024.0);
+                }
             }
 
             // What the server's /wait reports after every batch.
@@ -309,8 +327,8 @@ public class IvmMultiBatch
 
             using var restoredParallel = workers > 1 ? CompileParallel() : null;
             var restored = restoredParallel is not null
-                ? await ProgramRunner.CreateAsync(restoredParallel, Inputs(), [], store)
-                : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), [], store);
+                ? await ProgramRunner.CreateAsync(restoredParallel, Inputs(), [], store, policy)
+                : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), [], store, policy);
             var r0 = Stopwatch.GetTimestamp();
             var restoredTick = await restored.RestoreAsync();
             var restoreMs = Stopwatch.GetElapsedTime(r0).TotalMilliseconds;

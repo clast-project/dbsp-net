@@ -41,6 +41,7 @@ public sealed class DbspNetEngine
         int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_WORKERS"), out var w) && w > 1 ? w : 1;
 
     private readonly int _workers;
+    private readonly CheckpointPolicy? _checkpointPolicy;
     private readonly object _gate = new();
     private readonly List<IInputConnector> _inputs = new();
     private readonly List<IOutputConnector> _outputs = new();
@@ -56,11 +57,14 @@ public sealed class DbspNetEngine
     }
 
     /// <summary>An engine that runs programs across <paramref name="workers"/> replicas when
-    /// they shard (see <see cref="DeployAsync"/>).</summary>
-    public DbspNetEngine(int workers)
+    /// they shard (see <see cref="DeployAsync"/>). A persistent deploy commits batches by
+    /// <paramref name="checkpointPolicy"/>, or by <c>DBSPNET_CHECKPOINT_INTERVAL_SECS</c> when it is
+    /// null.</summary>
+    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
         _workers = workers;
+        _checkpointPolicy = checkpointPolicy;
     }
 
     /// <summary>Compile the program, wire its Delta connectors, and validate each source
@@ -70,8 +74,11 @@ public sealed class DbspNetEngine
     /// When a snapshot directory is configured (<see cref="ProgramSpec.SnapshotDir"/> or
     /// <c>DBSPNET_SNAPSHOT_DIR</c>), the program is compiled with filesystem snapshot
     /// codecs and wired to a <see cref="SnapshotCheckpointStore"/>, so every batch ends
-    /// durable and a redeploy resumes from the last checkpoint. Restore happens here, in
-    /// deploy — outside the measured batch span, like the compile.
+    /// durable and a redeploy resumes from the last checkpoint. Each batch commits a tick-journal
+    /// entry and a full snapshot is taken every 60 s (<c>DBSPNET_CHECKPOINT_INTERVAL_SECS</c>; see
+    /// <see cref="CheckpointPolicy.Parse"/>); a redeploy restores the last snapshot and replays the
+    /// journal after it. Restore happens here, in deploy — outside the measured batch span, like
+    /// the compile.
     /// </para>
     /// <para>
     /// With more than one worker (<c>DBSPNET_WORKERS</c>), the program is compiled
@@ -81,8 +88,9 @@ public sealed class DbspNetEngine
     /// as one commit (<see cref="ParallelSnapshot"/>).
     /// </para>
     /// <para>
-    /// A checkpoint pins the worker count, as in Feldera: the hash partition is part of the
-    /// persisted state. When the snapshot directory already holds a checkpoint written with a
+    /// A snapshot pins the worker count, as in Feldera: the hash partition is part of the
+    /// persisted state. Before the first snapshot the state is the tick journal alone, which
+    /// replays at any worker count, so the configured W is used. When the snapshot directory already holds a checkpoint written with a
     /// different W, the deploy uses that W (and logs it) rather than the configured one.
     /// <see cref="DeployResult.Workers"/> and <see cref="DeployResult.SerialFallback"/> report
     /// what was chosen.
@@ -109,6 +117,13 @@ public sealed class DbspNetEngine
         // Save/Load — a persistent compile Steps identically to a non-persistent one.
         var checkpoint = persistent
             ? new SnapshotCheckpointStore(new LocalTableFileSystem(snapshotDir!))
+            : null;
+
+        // A2 (docs/design-durable-state.md §1c): each batch commits a small tick-journal entry, and
+        // a full snapshot is taken every 60 s (Feldera's default checkpoint_interval_secs).
+        // DBSPNET_CHECKPOINT_INTERVAL_SECS sets the interval, or "batch" for a snapshot per batch.
+        var policy = persistent
+            ? _checkpointPolicy ?? CheckpointPolicy.Parse(Environment.GetEnvironmentVariable("DBSPNET_CHECKPOINT_INTERVAL_SECS"))
             : null;
 
         var workers = _workers;
@@ -162,9 +177,9 @@ public sealed class DbspNetEngine
         try
         {
             runner = parallel is not null
-                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, checkpoint, cancellationToken)
+                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, checkpoint, policy, cancellationToken)
                     .ConfigureAwait(false)
-                : await ProgramRunner.CreateAsync(program!, inputs, outputs, checkpoint, cancellationToken)
+                : await ProgramRunner.CreateAsync(program!, inputs, outputs, checkpoint, policy, cancellationToken)
                     .ConfigureAwait(false);
         }
         catch

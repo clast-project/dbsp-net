@@ -60,7 +60,14 @@ public interface IParallelCheckpointStore
 /// <see cref="RecordedWorkersAsync"/> reports it.
 /// </para>
 /// </summary>
-public sealed class SnapshotCheckpointStore : ICheckpointStore, IParallelCheckpointStore
+/// <summary>A checkpoint store that also keeps the A2 tick journal (docs/design-durable-state.md
+/// §1c) beside its snapshots, in the same store.</summary>
+public interface ICheckpointJournalStore
+{
+    TickJournal Journal { get; }
+}
+
+public sealed class SnapshotCheckpointStore : ICheckpointStore, IParallelCheckpointStore, ICheckpointJournalStore
 {
     /// <summary>Manifest-metadata key under which the offsets JSON is stored.</summary>
     public const string OffsetsMetadataKey = "connector.offsets";
@@ -75,7 +82,11 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore, IParallelCheckpo
     {
         _fs = fs ?? throw new ArgumentNullException(nameof(fs));
         _retainCount = retainCount;
+        Journal = new TickJournal(fs);
     }
+
+    /// <summary>The tick journal kept beside the snapshots.</summary>
+    public TickJournal Journal { get; }
 
     /// <summary>The worker count of the current checkpoint (1 for a serial program), or
     /// <c>null</c> when none has been written.</summary>

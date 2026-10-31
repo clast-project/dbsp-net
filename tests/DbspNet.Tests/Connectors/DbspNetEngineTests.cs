@@ -10,6 +10,7 @@ using Apache.Arrow;
 using DbspNet.Arrow;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Connectors.Abstractions;
 using DbspNet.Server;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Plan;
@@ -168,36 +169,62 @@ public sealed class DbspNetEngineTests : IDisposable
 
     /// <summary>
     /// Checkpointing with workers > 1 runs the parallel program, and a redeploy resumes it. The
-    /// redeploy asks for a different worker count and gets the checkpoint's (a checkpoint pins W),
+    /// redeploy asks for a different worker count and gets the snapshot's (a snapshot pins W),
     /// and after one more batch its sink equals a from-scratch run over the same sources.
     /// </summary>
     [Fact]
     public async Task Workers4_WithSnapshotDir_RunsParallel_AndARedeployResumesAtTheRecordedWorkerCount()
     {
         var snapshotDir = Path.Combine(_root, "snap");
-        var deploy = await RunTwoBatches(new DbspNetEngine(workers: 4), ProgramSql, "persistent", snapshotDir: snapshotDir);
+        var deploy = await RunTwoBatches(
+            new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch), ProgramSql, "persistent", snapshotDir: snapshotDir);
         Assert.True(deploy.Persistent);
         Assert.Equal(4, deploy.Workers);
         Assert.Null(deploy.SerialFallback);
 
-        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 2), "persistent", snapshotDir);
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 2, CheckpointPolicy.EveryBatch), "persistent", snapshotDir);
         Assert.Equal(4, resumed.Workers);
         Assert.True(resumed.RestoredTick > 0);
         await AssertMatchesFromScratch("persistent");
     }
 
-    /// <summary>A serial checkpoint stays serial when the redeploy asks for workers.</summary>
+    /// <summary>A serial snapshot stays serial when the redeploy asks for workers.</summary>
     [Fact]
     public async Task SerialCheckpoint_RedeployWithWorkers_StaysSerial()
     {
         var snapshotDir = Path.Combine(_root, "snap1");
-        var deploy = await RunTwoBatches(new DbspNetEngine(), ProgramSql, "persistent1", snapshotDir: snapshotDir);
+        var deploy = await RunTwoBatches(
+            new DbspNetEngine(1, CheckpointPolicy.EveryBatch), ProgramSql, "persistent1", snapshotDir: snapshotDir);
         Assert.Equal(1, deploy.Workers);
 
-        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 4), "persistent1", snapshotDir);
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch), "persistent1", snapshotDir);
         Assert.Equal(1, resumed.Workers);
         Assert.True(resumed.RestoredTick > 0);
         await AssertMatchesFromScratch("persistent1");
+    }
+
+    /// <summary>
+    /// The default policy (journal every batch, snapshot every 60 s) writes no snapshot in a run
+    /// this short, so the persisted state is the tick journal alone: a redeploy replays it at the
+    /// configured worker count, whatever W wrote it, and still matches a from-scratch run.
+    /// </summary>
+    [Theory]
+    [InlineData(1, 4)]
+    [InlineData(4, 2)]
+    [InlineData(4, 1)]
+    public async Task DefaultPolicy_JournalOnly_RedeployReplaysAtTheConfiguredWorkerCount(int before, int after)
+    {
+        var prefix = $"journal{before}{after}";
+        var snapshotDir = Path.Combine(_root, "snap-" + prefix);
+        var deploy = await RunTwoBatches(new DbspNetEngine(before), ProgramSql, prefix, snapshotDir: snapshotDir);
+        Assert.Equal(before, deploy.Workers);
+        Assert.False(File.Exists(Path.Combine(snapshotDir, "current.txt")));
+        Assert.NotEmpty(Directory.EnumerateFiles(Path.Combine(snapshotDir, "journal")));
+
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(after), prefix, snapshotDir);
+        Assert.Equal(after, resumed.Workers);
+        Assert.True(resumed.RestoredTick > 0);
+        await AssertMatchesFromScratch(prefix);
     }
 
     private ProgramSpec SpecFor(string prefix, string totalsDir, string? snapshotDir) => new(
