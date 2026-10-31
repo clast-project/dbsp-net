@@ -20,7 +20,8 @@ namespace DbspNet.Arrow;
 public enum StringDecoding
 {
     /// <summary>Decode to a .NET string and re-encode to UTF-8 — two allocations and two
-    /// transcodes per cell. The default, and safe for any retention pattern.</summary>
+    /// transcodes per cell. The pre-2026-10-31 ingest default, kept as an A/B arm; prefer
+    /// <see cref="Copy"/>, which has the same retention without the round trip.</summary>
     Transcode,
 
     /// <summary>Alias the Arrow buffer with no copy. Requires the caller to keep the
@@ -29,8 +30,8 @@ public enum StringDecoding
     Alias,
 
     /// <summary>Copy each cell's bytes into its own exact-size array: one allocation per cell, no
-    /// transcode, and each cell owns its bytes, so retention is the same as
-    /// <see cref="Transcode"/>'s.</summary>
+    /// transcode, and each cell owns its bytes, so no retained row pins the source batch. The
+    /// ingest default (docs/design-connectors.md, G5).</summary>
     Copy,
 
     /// <summary>Copy the column's bytes once into a managed arena and slice out of it: one

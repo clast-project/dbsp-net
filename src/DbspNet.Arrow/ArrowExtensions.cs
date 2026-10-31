@@ -13,23 +13,26 @@ namespace DbspNet.Arrow;
 /// <see cref="TableInput"/>, expanding rows by their (signed) weight.
 /// </summary>
 /// <remarks>
-/// Conversion is column-major: each column is walked in a single tight
-/// typed loop with type-dispatch hoisted out of the per-row inner loop.
-/// Strings still copy through .NET <see cref="string"/> (zero-copy via
-/// <c>Utf8String.FromBytes(arrowBuffer)</c> is a follow-up that needs
-/// lifetime discipline from the caller).
+/// <para>Conversion is column-major: each column is walked in a single tight
+/// typed loop with type-dispatch hoisted out of the per-row inner loop.</para>
+/// <para>VARCHAR stays UTF-8 end to end (docs/design-connectors.md, G5). Ingest takes a
+/// <see cref="StringDecoding"/>; the default, <see cref="StringDecoding.Copy"/>, copies each
+/// cell's bytes into an array it owns, so the batch may be disposed after the call and no retained
+/// row pins it. <see cref="StringDecoding.Arena"/> suits bulk loads where nearly every row
+/// survives; <see cref="StringDecoding.Alias"/> hands the batch's buffers to the engine.</para>
 /// </remarks>
 public static class ArrowExtensions
 {
-    // EXPERIMENT (docs/design-connectors.md, G5): how the copying ingest paths decode VARCHAR.
-    // DBSPNET_INGEST_STRINGS=copy|arena selects the candidate; default stays Transcode until the
-    // ivm-bench measurement decides. Alias is not offered: ingest buffers may be native-backed.
-    private static readonly StringDecoding IngestStrings =
+    // What a caller that passes no StringDecoding gets: Copy, chosen on ivm-bench
+    // (docs/design-connectors.md, G5 "Measured"). DBSPNET_INGEST_STRINGS=transcode|arena
+    // overrides it process-wide for A/B runs only (scripts/measure-ingest-strings.sh); Alias is
+    // never a process default, since ingest buffers may be native-backed.
+    private static readonly StringDecoding DefaultIngestStrings =
         Environment.GetEnvironmentVariable("DBSPNET_INGEST_STRINGS") switch
         {
-            "copy" => StringDecoding.Copy,
+            "transcode" => StringDecoding.Transcode,
             "arena" => StringDecoding.Arena,
-            _ => StringDecoding.Transcode,
+            _ => StringDecoding.Copy,
         };
 
     /// <summary>
@@ -183,68 +186,50 @@ public static class ArrowExtensions
 
     /// <summary>
     /// Push every row of an Arrow <see cref="RecordBatch"/> as an insert
-    /// (weight +1) into the table. String columns are copied — the batch's
+    /// (weight +1) into the table. With the default string decoding the batch's
     /// buffers may be disposed after this call returns.
     /// </summary>
-    public static void PushArrow(this TableInput input, RecordBatch batch)
+    /// <param name="strings">How VARCHAR cells take their bytes; <c>null</c> means
+    /// <see cref="StringDecoding.Copy"/>.</param>
+    public static void PushArrow(this TableInput input, RecordBatch batch, StringDecoding? strings = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(batch);
-        PushArrowCore(input, batch, weights: null, zeroCopyStrings: false);
+        PushArrowCore(input, batch, weights: null, strings ?? DefaultIngestStrings);
     }
 
     /// <summary>
     /// Push an Arrow batch with explicit per-row weights. <c>weights[i]</c>
     /// is the signed multiplicity of row <c>i</c>: positive for inserts,
     /// negative for retractions, zero to skip. Lets a single batch carry a
-    /// mixed-direction Z-set delta (e.g., when replaying a stream). Strings
-    /// are copied — the batch's buffers may be disposed after this call.
+    /// mixed-direction Z-set delta (e.g., when replaying a stream). With the default
+    /// string decoding the batch's buffers may be disposed after this call.
     /// </summary>
+    /// <param name="strings">How VARCHAR cells take their bytes; <c>null</c> means
+    /// <see cref="StringDecoding.Copy"/>. <see cref="StringDecoding.Alias"/> makes the engine
+    /// keep slices of the batch's buffers: the caller must then not dispose a native-backed
+    /// batch while the engine holds rows from it.</param>
     public static void PushArrow(
-        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
+        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights, StringDecoding? strings = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(batch);
         ValidateWeights(batch, weights);
-        PushArrowCore(input, batch, weights.ToArray(), zeroCopyStrings: false);
+        PushArrowCore(input, batch, weights.ToArray(), strings ?? DefaultIngestStrings);
     }
 
-    /// <summary>
-    /// Zero-copy variant of <see cref="PushArrow(TableInput, RecordBatch)"/>:
-    /// string columns alias the Arrow <c>ValueBuffer</c> via
-    /// <see cref="Utf8String.FromBytes"/> instead of decoding + re-encoding.
-    /// Eliminates per-cell allocation for VARCHAR data on ingest.
-    /// </summary>
-    /// <remarks>
-    /// <para><b>Lifetime contract.</b> Aliased strings carry a
-    /// <see cref="ReadOnlyMemory{Byte}"/> reference to the batch's buffer.
-    /// The buffer must remain valid for as long as the engine retains data
-    /// from this push — in DBSP, state-bearing operators hold rows
-    /// indefinitely, so <em>do not dispose the <see cref="RecordBatch"/>
-    /// while the engine still holds rows from it</em>.</para>
-    /// <para>For managed-array-backed Arrow buffers (the typical in-process
-    /// builder path), the GC keeps the bytes alive via the
-    /// <see cref="ReadOnlyMemory{Byte}"/> owner reference even if the batch
-    /// itself is disposed. For native-memory buffers (e.g., from an IPC
-    /// stream with a custom allocator), disposing frees the bytes — be
-    /// conservative and keep the batch alive.</para>
-    /// </remarks>
-    public static void PushArrowZeroCopy(this TableInput input, RecordBatch batch)
-    {
-        ArgumentNullException.ThrowIfNull(input);
-        ArgumentNullException.ThrowIfNull(batch);
-        PushArrowCore(input, batch, weights: null, zeroCopyStrings: true);
-    }
+    /// <summary>Zero-copy push: <see cref="PushArrow(TableInput, RecordBatch, StringDecoding?)"/>
+    /// with <see cref="StringDecoding.Alias"/>.</summary>
+    [Obsolete("Use PushArrow(batch, strings: StringDecoding.Alias).")]
+    public static void PushArrowZeroCopy(this TableInput input, RecordBatch batch) =>
+        input.PushArrow(batch, StringDecoding.Alias);
 
-    /// <inheritdoc cref="PushArrowZeroCopy(TableInput, RecordBatch)"/>
+    /// <summary>Zero-copy push: <see cref="PushArrow(TableInput, RecordBatch, ReadOnlySpan{long}, StringDecoding?)"/>
+    /// with <see cref="StringDecoding.Alias"/>.</summary>
+    [Obsolete("Use PushArrow(batch, weights, StringDecoding.Alias).")]
     public static void PushArrowZeroCopy(
-        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
-    {
-        ArgumentNullException.ThrowIfNull(input);
-        ArgumentNullException.ThrowIfNull(batch);
-        ValidateWeights(batch, weights);
-        PushArrowCore(input, batch, weights.ToArray(), zeroCopyStrings: true);
-    }
+        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights) =>
+        input.PushArrow(batch, weights, StringDecoding.Alias);
 
     /// <summary>
     /// Decode an Arrow batch into row-major <c>(values, weight)</c> deltas <b>without
@@ -253,15 +238,17 @@ public static class ArrowExtensions
     /// to decode the next version while the engine processes the current one, then pushes
     /// the result via <see cref="TableInput.Push"/> on the engine thread (two versions
     /// must never merge into one tick). Reads only the table's schema — safe to call
-    /// off-thread. Strings are copied (no zero-copy aliasing).
+    /// off-thread.
     /// </summary>
+    /// <param name="strings">How VARCHAR cells take their bytes; <c>null</c> means
+    /// <see cref="StringDecoding.Copy"/>.</param>
     public static List<(object?[] Values, long Weight)> DecodeArrowDeltas(
-        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
+        this TableInput input, RecordBatch batch, ReadOnlySpan<long> weights, StringDecoding? strings = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(batch);
         ValidateWeights(batch, weights);
-        return DecodeCore(input.Schema, batch, weights.ToArray(), zeroCopyStrings: false);
+        return DecodeCore(input.Schema, batch, weights.ToArray(), strings ?? DefaultIngestStrings);
     }
 
     private static void ValidateWeights(RecordBatch batch, ReadOnlySpan<long> weights)
@@ -279,15 +266,17 @@ public static class ArrowExtensions
     /// for a parallel program's source table: the same per-column decode (one column per
     /// thread on a large batch), then <see cref="ShardedTableInput.PushColumns"/>, which
     /// builds the rows and splits them across the replicas by whole-row hash in parallel.
-    /// Strings are copied.
     /// </summary>
+    /// <param name="strings">How VARCHAR cells take their bytes; <c>null</c> means
+    /// <see cref="StringDecoding.Copy"/>.</param>
     public static void PushArrow(
-        this ShardedTableInput input, RecordBatch batch, ReadOnlySpan<long> weights)
+        this ShardedTableInput input, RecordBatch batch, ReadOnlySpan<long> weights, StringDecoding? strings = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(batch);
         ValidateWeights(batch, weights);
         var schema = input.Schema;
+        var decoding = strings ?? DefaultIngestStrings;
         if (batch.ColumnCount != schema.Count)
         {
             throw new ArgumentException(
@@ -302,7 +291,7 @@ public static class ArrowExtensions
             var columns = new object?[schema.Count][];
             for (var c = 0; c < columns.Length; c++)
             {
-                columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, from, count, IngestStrings);
+                columns[c] = ArrowColumns.Extract(batch.Column(c), schema[c].Type, from, count, decoding);
             }
 
             return columns;
@@ -312,11 +301,11 @@ public static class ArrowExtensions
     }
 
     private static void PushArrowCore(
-        TableInput input, RecordBatch batch, long[]? weights, bool zeroCopyStrings) =>
-        input.Push(DecodeCore(input.Schema, batch, weights, zeroCopyStrings));
+        TableInput input, RecordBatch batch, long[]? weights, StringDecoding strings) =>
+        input.Push(DecodeCore(input.Schema, batch, weights, strings));
 
     private static List<(object?[] Values, long Weight)> DecodeCore(
-        SqlSchema schema, RecordBatch batch, long[]? weights, bool zeroCopyStrings)
+        SqlSchema schema, RecordBatch batch, long[]? weights, StringDecoding strings)
     {
         var columnCount = schema.Count;
         if (batch.ColumnCount != columnCount)
@@ -331,7 +320,6 @@ public static class ArrowExtensions
         var deltas = new List<(object?[] Values, long Weight)>(rowCount);
         var hasWeights = weights is not null;
         var perColumn = new object?[columnCount][];
-        var strings = zeroCopyStrings ? StringDecoding.Alias : IngestStrings;
 
         // Per block of rows: each column walks its Arrow array in one typed loop (no per-cell
         // virtual dispatch), then the block's rows are assembled row-major. Blocks keep the boxed

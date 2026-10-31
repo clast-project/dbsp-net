@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# VARCHAR ingest decoding on ivm-bench SF=3 (docs/design-connectors.md, G5): Transcode (today)
-# vs Copy (a byte[] per cell) vs Arena (one copy per column block). Runs IvmMultiBatch per arm,
+# VARCHAR ingest decoding on ivm-bench SF=3 (docs/design-connectors.md, G5): Transcode (the
+# pre-2026-10-31 default) vs Copy (a byte[] per cell; the default since) vs Arena (one copy per
+# column block). DBSPNET_INGEST_STRINGS overrides the default process-wide. Runs IvmMultiBatch per arm,
 # alternating, one run at a time, and records per batch the drain time and allocation, plus the
 # live heap after batch 1's drain (IVM_MEASURE_AT=drain, so output views don't pollute it).
 #

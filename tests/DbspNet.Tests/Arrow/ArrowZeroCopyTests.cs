@@ -47,7 +47,7 @@ public class ArrowZeroCopyTests
             nameBuilder.Build(),
         }, length: 3);
 
-        q.Table("t").PushArrowZeroCopy(batch);
+        q.Table("t").PushArrow(batch, StringDecoding.Alias);
         q.Step();
 
         var delta = q.ToArrowDelta();
@@ -83,7 +83,7 @@ public class ArrowZeroCopyTests
         sb.Append("café").Append("⚡").Append("🎉");
         var batch = new RecordBatch(arrowSchema, new IArrowArray[] { sb.Build() }, 3);
 
-        q.Table("t").PushArrowZeroCopy(batch);
+        q.Table("t").PushArrow(batch, StringDecoding.Alias);
         q.Step();
 
         var delta = q.ToArrowDelta();
@@ -113,7 +113,7 @@ public class ArrowZeroCopyTests
         var initBuilder = new StringArray.Builder();
         initBuilder.Append("alice").Append("bob");
         var initBatch = new RecordBatch(setupSchema, new IArrowArray[] { initBuilder.Build() }, 2);
-        q.Table("t").PushArrowZeroCopy(initBatch);
+        q.Table("t").PushArrow(initBatch, StringDecoding.Alias);
         q.Step();
         Assert.Equal(2, q.Current.Count);
 
@@ -122,7 +122,7 @@ public class ArrowZeroCopyTests
         deltaBuilder.Append("alice").Append("charlie");
         var deltaBatch = new RecordBatch(setupSchema, new IArrowArray[] { deltaBuilder.Build() }, 2);
         long[] weights = { -1, 1 };
-        q.Table("t").PushArrowZeroCopy(deltaBatch, weights);
+        q.Table("t").PushArrow(deltaBatch, weights, StringDecoding.Alias);
         q.Step();
 
         // Reading the delta confirms both ops applied.
@@ -164,7 +164,7 @@ public class ArrowZeroCopyTests
         var batch = new RecordBatch(schema, new IArrowArray[] { sb.Build() }, 3);
 
         q1.Table("t").PushArrow(batch);          // copy
-        q2.Table("t").PushArrowZeroCopy(batch);  // alias
+        q2.Table("t").PushArrow(batch, StringDecoding.Alias);  // alias
         q1.Step();
         q2.Step();
 

@@ -81,9 +81,9 @@ version). This is the key simplification DBSP + Delta buy us.
   snapshot restores; it never sets the tick directly. No change needed if connectors
   checkpoint *through* `Snapshot` (via G3).
 
-- **G5 — UTF-8 as the text contract (DRAFT 2026-10-31).** The engine stores VARCHAR as
-  UTF-8, but most input paths make it transcode: the default Arrow ingest decodes every
-  cell to a .NET `string` and re-encodes it. See [UTF-8 as the input contract](#utf-8-as-the-input-contract-draft-2026-10-31).
+- **G5 — UTF-8 as the text contract (2026-10-31; Copy default SHIPPED, validation open).**
+  The engine stores VARCHAR as UTF-8, but the Arrow ingest paths decoded every cell to a .NET
+  `string` and re-encoded it; they now copy the bytes. See [UTF-8 as the input contract](#utf-8-as-the-input-contract-draft-2026-10-31).
 
 ---
 
@@ -377,6 +377,11 @@ the chosen one-tick-per-version default.
 
 ## UTF-8 as the input contract (DRAFT 2026-10-31)
 
+> **Status:** `StringDecoding.Copy` is the ingest default on all three Arrow paths, each of which
+> takes an optional `StringDecoding? strings` (null = Copy); `PushArrowZeroCopy` is `[Obsolete]` in
+> favour of `strings: StringDecoding.Alias`. Not yet done: UTF-8 validation (contract item 4) and
+> moving the remaining benchmark generators to `Utf8String` (increment 2).
+
 ### Why
 
 UTF-8 is the text encoding of everything this engine reads and writes — Arrow `Utf8`/`LargeUtf8`,
@@ -396,7 +401,7 @@ UTF-8 by way of a `string` pays twice. Measured (2026-10-31):
 - **Flat-state probe** (docs/design-flat-state-probe.md §3.4, q20 10M): the engine runs **19–22%
   faster** on UTF-8 input; its GC pause at W=1 falls 764 → 155 ms.
 
-### Where the engine transcodes today
+### Where the engine transcoded (as of 2026-10-31, before the default changed)
 
 | Entry point | String cells arrive as | What happens per VARCHAR cell |
 |---|---|---|
