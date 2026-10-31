@@ -88,9 +88,10 @@ public sealed class DbspNetEngine
     /// as one commit (<see cref="ParallelSnapshot"/>).
     /// </para>
     /// <para>
-    /// A snapshot pins the worker count, as in Feldera: the hash partition is part of the
-    /// persisted state. Before the first snapshot the state is the tick journal alone, which
-    /// replays at any worker count, so the configured W is used. When the snapshot directory already holds a checkpoint written with a
+    /// A snapshot written by a parallel program at another parallel worker count is re-sharded to
+    /// the configured W before the restore (<see cref="ParallelReshard"/>), and logged. Between a
+    /// serial and a parallel program a snapshot still pins the worker count, as in Feldera. Before
+    /// the first snapshot the state is the tick journal alone, which replays at any worker count. When the snapshot directory already holds a checkpoint written with a
     /// different W, the deploy uses that W (and logs it) rather than the configured one.
     /// <see cref="DeployResult.Workers"/> and <see cref="DeployResult.SerialFallback"/> report
     /// what was chosen.
@@ -126,15 +127,27 @@ public sealed class DbspNetEngine
             ? _checkpointPolicy ?? CheckpointPolicy.Parse(Environment.GetEnvironmentVariable("DBSPNET_CHECKPOINT_INTERVAL_SECS"))
             : null;
 
+        // A parallel snapshot at another parallel W is re-sharded to the configured W before the
+        // restore (docs/design-durable-state.md §1d). Serial <-> parallel is not supported: the two
+        // programs have different operators, so a snapshot from one pins the other.
         var workers = _workers;
+        int? reshardFrom = null;
         if (checkpoint is not null
             && await checkpoint.RecordedWorkersAsync(cancellationToken).ConfigureAwait(false) is { } recorded
             && recorded != workers)
         {
-            Console.Error.WriteLine(
-                $"dbspnet: the checkpoint in {snapshotDir} was written with {recorded} worker(s); " +
-                $"running with {recorded}, not the configured {workers} (a checkpoint pins the worker count)");
-            workers = recorded;
+            if (recorded > 1 && workers > 1)
+            {
+                reshardFrom = recorded;
+            }
+            else
+            {
+                Console.Error.WriteLine(
+                    $"dbspnet: the checkpoint in {snapshotDir} was written with {recorded} worker(s); " +
+                    $"running with {recorded}, not the configured {workers} (a snapshot cannot move between a " +
+                    "serial and a parallel program)");
+                workers = recorded;
+            }
         }
 
         var snapshotCodecs = persistent ? ArrowSqlSnapshotCodecs.Instance : null;
@@ -186,6 +199,15 @@ public sealed class DbspNetEngine
         {
             parallel?.Dispose();
             throw;
+        }
+
+        if (reshardFrom is { } from && parallel is not null)
+        {
+            var rs = Stopwatch.StartNew();
+            await checkpoint!.ReshardAsync(parallel, cancellationToken).ConfigureAwait(false);
+            Console.Error.WriteLine(
+                $"dbspnet: re-sharded the checkpoint in {snapshotDir} from {from} to {parallel.Workers} workers " +
+                $"in {rs.Elapsed.TotalSeconds:F1} s");
         }
 
         var restoredTick = await runner.RestoreAsync(cancellationToken).ConfigureAwait(false);

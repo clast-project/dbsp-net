@@ -85,12 +85,22 @@ public sealed class ParallelCompiledProgram : IDisposable
     internal ParallelCompiledProgram(
         ParallelCircuit circuit,
         IReadOnlyDictionary<string, ShardedTableInput> inputs,
-        IReadOnlyDictionary<string, ParallelProgramOutput> outputs)
+        IReadOnlyDictionary<string, ParallelProgramOutput> outputs,
+        IReadOnlyDictionary<int, ReshardSpec>? reshardSpecs = null)
     {
         Circuit = circuit;
         Inputs = inputs;
         Outputs = outputs;
+        ReshardSpecs = reshardSpecs ?? new Dictionary<int, ReshardSpec>();
     }
+
+    /// <summary>
+    /// For each stateful operator, by its index in a replica circuit: the files it persists and
+    /// where their entries live, as the compiler stated when it built it. What
+    /// <c>ParallelReshard</c> uses to move a snapshot to another worker count
+    /// (docs/design-durable-state.md §1d). An index missing here cannot be re-sharded.
+    /// </summary>
+    public IReadOnlyDictionary<int, ReshardSpec> ReshardSpecs { get; }
 
     public ParallelCircuit Circuit { get; }
 

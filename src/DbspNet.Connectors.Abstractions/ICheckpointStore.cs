@@ -4,6 +4,7 @@ using System.Text.Json;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.IO;
 using DbspNet.Persistence;
+using DbspNet.Sql.Compiler;
 
 namespace DbspNet.Connectors.Abstractions;
 
@@ -92,6 +93,12 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore, IParallelCheckpo
     /// <c>null</c> when none has been written.</summary>
     public ValueTask<int?> RecordedWorkersAsync(CancellationToken cancellationToken = default) =>
         ParallelSnapshot.RecordedWorkersAsync(_fs, cancellationToken);
+
+    /// <summary>Re-shard the committed parallel snapshot to <paramref name="program"/>'s worker
+    /// count, committing the result (<see cref="ParallelReshard"/>). Returns the old W, or null
+    /// when nothing needed moving.</summary>
+    public ValueTask<int?> ReshardAsync(ParallelCompiledProgram program, CancellationToken cancellationToken = default) =>
+        ParallelReshard.RewriteAsync(_fs, program, _retainCount, cancellationToken);
 
     public async ValueTask SaveAsync(
         RootCircuit circuit, IReadOnlyList<SourceCheckpoint> offsets, CancellationToken cancellationToken)

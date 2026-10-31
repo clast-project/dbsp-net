@@ -30,6 +30,11 @@ public sealed class CircuitBuilder
     /// </summary>
     internal DbspNet.Core.Operators.Stateful.IFrontier LogicalClock => _root.Clock;
 
+    /// <summary>Operators registered so far (for compilers that annotate what they just built).</summary>
+    internal int OperatorCount => _root.Operators.Count;
+
+    internal IOperator OperatorAt(int index) => _root.Operators[index];
+
     /// <summary>Label attributed to every operator registered while set — the SQL
     /// compiler sets it to the view being compiled so a profile can name each
     /// operator's view. See <see cref="RootCircuit.CurrentBuildLabel"/>.</summary>

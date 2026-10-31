@@ -169,11 +169,12 @@ public sealed class DbspNetEngineTests : IDisposable
 
     /// <summary>
     /// Checkpointing with workers > 1 runs the parallel program, and a redeploy resumes it. The
-    /// redeploy asks for a different worker count and gets the snapshot's (a snapshot pins W),
-    /// and after one more batch its sink equals a from-scratch run over the same sources.
+    /// redeploy asks for a different parallel worker count and gets it: the snapshot is re-sharded
+    /// from 4 to 2 workers (docs/design-durable-state.md §1d), and after one more batch the sink
+    /// equals a from-scratch run over the same sources.
     /// </summary>
     [Fact]
-    public async Task Workers4_WithSnapshotDir_RunsParallel_AndARedeployResumesAtTheRecordedWorkerCount()
+    public async Task Workers4_WithSnapshotDir_RunsParallel_AndARedeployAtAnotherWReshards()
     {
         var snapshotDir = Path.Combine(_root, "snap");
         var deploy = await RunTwoBatches(
@@ -183,7 +184,7 @@ public sealed class DbspNetEngineTests : IDisposable
         Assert.Null(deploy.SerialFallback);
 
         var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 2, CheckpointPolicy.EveryBatch), "persistent", snapshotDir);
-        Assert.Equal(4, resumed.Workers);
+        Assert.Equal(2, resumed.Workers);
         Assert.True(resumed.RestoredTick > 0);
         await AssertMatchesFromScratch("persistent");
     }

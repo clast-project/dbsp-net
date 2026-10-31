@@ -670,10 +670,15 @@ public static partial class PlanToCircuit
         var prevStagingCapacity = SpineStagingConfig.Capacity;
         SpineStagingConfig.Capacity = options.TraceFamily == TraceFamily.Spine ? options.SpineStagingCapacity : 0;
         ParallelCircuit circuit;
+        var reshard = new ReshardRecorder();
+        var replica = 0;
         try
         {
             circuit = ParallelCircuit.Build(workers, builder =>
             {
+                // The closure runs once per replica, in worker order; record placements while
+                // building replica 0 only.
+                reshard.Active = replica++ == 0;
                 var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
                 var schemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
 
@@ -693,7 +698,10 @@ public static partial class PlanToCircuit
                     // per-worker snapshot subtree expects.
                     var ctx = new CompileContext(
                         streams, schemas, codec, snapshotCodecs, options, monotonicity,
-                        emptyFrontiers, emptyShareable, workers, rowCounts);
+                        emptyFrontiers, emptyShareable, workers, rowCounts)
+                    {
+                        Reshard = reshard,
+                    };
                     // The scan streams (this program's tables) are whole-row-hashed
                     // inputs → shard-disjoint. A view-scan resolves to that view's
                     // already-built stream, whose partition state was recorded when
@@ -719,7 +727,11 @@ public static partial class PlanToCircuit
                         // writes, closing the §10.1 restore gap with no driver-side region.
                         // The delta still flows through unchanged for the sharded output.
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
+                        var mark = ReshardRecorder.Mark(builder);
                         var integrated = builder.Integrate(stream, viewCodec);
+                        // Linear: a view row may be split across workers, and every consumer
+                        // reads the sum over workers.
+                        reshard.Record(builder, mark, Z("view.arrows", ReshardPlacement.Anywhere, viewCodec));
                         builder.Output(integrated.Output, "view:" + v.ViewName);
 
                         // The build closure runs once per replica, sequentially in worker
@@ -757,9 +769,27 @@ public static partial class PlanToCircuit
             outputs[name] = new ParallelProgramOutput(schema, handle, viewShards[name], circuit);
         }
 
-        compiled = new ParallelCompiledProgram(circuit, inputs, outputs);
+        compiled = new ParallelCompiledProgram(circuit, inputs, outputs, reshard.Specs);
         return true;
     }
+
+    /// <summary>Build one stateful operator and record, for re-sharding (§1d), the files it persists
+    /// and where their entries live. A no-op outside the parallel program compile.</summary>
+    private static T Recorded<T>(CircuitBuilder builder, CompileContext ctx, Func<T> build, params ReshardFile?[] files)
+    {
+        var mark = ReshardRecorder.Mark(builder);
+        var built = build();
+        ctx.Reshard?.Record(builder, mark, files);
+        return built;
+    }
+
+    // Reshard file entries; null without a codec (nothing is persisted then) or a placement.
+    private static ZSetReshardFile? Z(string name, ReshardPlacement? placement, IZSetTraceCodec<StructuralRow, Z64>? codec) =>
+        codec is null || placement is null ? null : new ZSetReshardFile(name, placement, codec);
+
+    private static IndexedReshardFile? IZ(
+        string name, ReshardPlacement? placement, IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? codec) =>
+        codec is null || placement is null ? null : new IndexedReshardFile(name, placement, codec);
 
     /// <summary>
     /// Diagnostic (measurement only): the typed vs fell-back program-view split
@@ -789,7 +819,13 @@ public static partial class PlanToCircuit
     /// <c>null</c> means "not usefully partitioned". Used to elide a redundant
     /// aggregate exchange via <see cref="IsKeySubset"/>.
     /// </param>
-    private readonly record struct PartitionInfo(bool ShardDisjoint, int[]? PartitionKey);
+    /// <param name="KeySchema">The schema the exchange hashed <paramref name="PartitionKey"/>'s
+    /// columns with (<c>StablePartitionHash.OfRow(row, PartitionKey, KeySchema)</c>), so a
+    /// re-shard can reproduce the placement exactly; null when not recorded.</param>
+    /// <param name="Gathered">Every row is on worker 0 (an empty <paramref name="PartitionKey"/>
+    /// from a gather), as opposed to an empty key hashed to its constant worker.</param>
+    private readonly record struct PartitionInfo(
+        bool ShardDisjoint, int[]? PartitionKey, Schema? KeySchema = null, bool Gathered = false);
 
     /// <summary>
     /// True when every column in <paramref name="sub"/> also appears in
@@ -798,6 +834,36 @@ public static partial class PlanToCircuit
     /// the operator's re-shuffle can be elided. Ported verbatim from
     /// <c>TypedPlanCompiler.IsKeySubset</c>.
     /// </summary>
+    /// <summary>
+    /// Where an aggregate's groups live when it elided its exchange because the input was
+    /// already partitioned on a subset of its (bare-column) group key: the upstream exchange's
+    /// own hash, recomputed from the stored group-key row (docs/design-durable-state.md §1d).
+    /// Null — the re-shard then refuses — when the upstream did not record its key schema.
+    /// </summary>
+    private static ReshardPlacement? ElidedAggregatePlacement(PartitionInfo upstream, int[] groupIndices)
+    {
+        var pk = upstream.PartitionKey!;
+        if (upstream.Gathered)
+        {
+            return ReshardPlacement.OnWorker0;
+        }
+
+        if (upstream.KeySchema is not { } keySchema)
+        {
+            return null;
+        }
+
+        // The group-key row holds the input columns in GROUP BY order; find each partition
+        // column in it, keeping the partition key's own order (the hash is order-sensitive).
+        var positions = new int[pk.Length];
+        for (var i = 0; i < pk.Length; i++)
+        {
+            positions[i] = Array.IndexOf(groupIndices, pk[i]);
+        }
+
+        return new ReshardPlacement.Hash(key => StablePartitionHash.OfRow(key, positions, keySchema));
+    }
+
     private static bool IsKeySubset(int[] sub, int[] super)
     {
         foreach (var c in sub)
@@ -1166,6 +1232,13 @@ public static partial class PlanToCircuit
         public IReadOnlyDictionary<string, long>? RowCounts { get; }
 
         /// <summary>
+        /// Set by the parallel program compile: every stateful build site records where its
+        /// operator's persisted entries live, so a snapshot can be re-sharded to another W
+        /// (docs/design-durable-state.md §1d). Null elsewhere.
+        /// </summary>
+        public ReshardRecorder? Reshard { get; set; }
+
+        /// <summary>
         /// Replica count W when this compile targets a <see cref="ParallelCircuit"/>;
         /// 1 for a plain single circuit. When &gt; 1 the key-sensitive operators
         /// (join / aggregate / distinct / partitioned window / partitioned top-K)
@@ -1353,13 +1426,17 @@ public static partial class PlanToCircuit
         Stream<ZSet<StructuralRow, Z64>> input,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
         IFrontier? frontier = null,
-        Func<StructuralRow, long>? monotoneKey = null)
+        Func<StructuralRow, long>? monotoneKey = null,
+        ReshardPlacement? reshard = null)
     {
-        return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineDistinct(
-                input, ctx.Options.Compaction, snapshotCodec, StructuralRowComparer.Instance,
-                frontier: frontier, monotoneKey: monotoneKey)
-            : builder.Distinct(input, snapshotCodec, frontier, monotoneKey);
+        return Recorded(
+            builder, ctx,
+            () => ctx.Options.TraceFamily == TraceFamily.Spine
+                ? builder.SpineDistinct(
+                    input, ctx.Options.Compaction, snapshotCodec, StructuralRowComparer.Instance,
+                    frontier: frontier, monotoneKey: monotoneKey)
+                : builder.Distinct(input, snapshotCodec, frontier, monotoneKey),
+            Z("trace.arrows", reshard, snapshotCodec));
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoin(
@@ -1372,7 +1449,28 @@ public static partial class PlanToCircuit
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier = null,
         Func<StructuralRow, long>? monotoneKey = null,
-        Func<StructuralRow, bool>? residual = null)
+        Func<StructuralRow, bool>? residual = null,
+        ReshardPlacement? leftReshard = null,
+        ReshardPlacement? rightReshard = null)
+    {
+        return Recorded(
+            builder, ctx,
+            () => EmitInnerJoinCore(builder, ctx, left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual),
+            IZ("left.arrows", leftReshard, leftCodec),
+            IZ("right.arrows", rightReshard, rightCodec));
+    }
+
+    private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoinCore(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> combine,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey,
+        Func<StructuralRow, bool>? residual)
     {
         // The residual (a non-equi ON conjunct spanning both sides, e.g. a
         // temporal-SCD `ts BETWEEN lo AND hi`) is pushed INTO the flat join's
@@ -1406,19 +1504,25 @@ public static partial class PlanToCircuit
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier = null,
-        Func<StructuralRow, long>? monotoneKey = null)
+        Func<StructuralRow, long>? monotoneKey = null,
+        ReshardPlacement? leftReshard = null,
+        ReshardPlacement? rightReshard = null)
     {
-        return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineIncrementalLeftJoin(
-                left, right, joinCombine, nullPadCombine, leftCodec, rightCodec,
-                ctx.Options.Compaction,
-                keyComparer: StructuralRowComparer.Instance,
-                leftValueComparer: StructuralRowComparer.Instance,
-                rightValueComparer: StructuralRowComparer.Instance,
-                frontier: frontier,
-                monotoneKey: monotoneKey)
-            : builder.IncrementalLeftJoin(
-                left, right, joinCombine, nullPadCombine, leftCodec, rightCodec, frontier, monotoneKey);
+        return Recorded(
+            builder, ctx,
+            () => ctx.Options.TraceFamily == TraceFamily.Spine
+                ? builder.SpineIncrementalLeftJoin(
+                    left, right, joinCombine, nullPadCombine, leftCodec, rightCodec,
+                    ctx.Options.Compaction,
+                    keyComparer: StructuralRowComparer.Instance,
+                    leftValueComparer: StructuralRowComparer.Instance,
+                    rightValueComparer: StructuralRowComparer.Instance,
+                    frontier: frontier,
+                    monotoneKey: monotoneKey)
+                : builder.IncrementalLeftJoin(
+                    left, right, joinCombine, nullPadCombine, leftCodec, rightCodec, frontier, monotoneKey),
+            IZ("left.arrows", leftReshard, leftCodec),
+            IZ("right.arrows", rightReshard, rightCodec));
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitFullJoin(
@@ -1432,20 +1536,26 @@ public static partial class PlanToCircuit
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier = null,
-        Func<StructuralRow, long>? monotoneKey = null)
+        Func<StructuralRow, long>? monotoneKey = null,
+        ReshardPlacement? leftReshard = null,
+        ReshardPlacement? rightReshard = null)
     {
-        return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineIncrementalFullJoin(
-                left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftCodec, rightCodec,
-                ctx.Options.Compaction,
-                keyComparer: StructuralRowComparer.Instance,
-                leftValueComparer: StructuralRowComparer.Instance,
-                rightValueComparer: StructuralRowComparer.Instance,
-                frontier: frontier,
-                monotoneKey: monotoneKey)
-            : builder.IncrementalFullJoin(
-                left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine,
-                leftCodec, rightCodec, frontier, monotoneKey);
+        return Recorded(
+            builder, ctx,
+            () => ctx.Options.TraceFamily == TraceFamily.Spine
+                ? builder.SpineIncrementalFullJoin(
+                    left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftCodec, rightCodec,
+                    ctx.Options.Compaction,
+                    keyComparer: StructuralRowComparer.Instance,
+                    leftValueComparer: StructuralRowComparer.Instance,
+                    rightValueComparer: StructuralRowComparer.Instance,
+                    frontier: frontier,
+                    monotoneKey: monotoneKey)
+                : builder.IncrementalFullJoin(
+                    left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine,
+                    leftCodec, rightCodec, frontier, monotoneKey),
+            IZ("left.arrows", leftReshard, leftCodec),
+            IZ("right.arrows", rightReshard, rightCodec));
     }
 
     private static Stream<ZSet<(StructuralRow Key, StructuralRow Value), Z64>> EmitAggregate(
@@ -1455,17 +1565,26 @@ public static partial class PlanToCircuit
         IAggregator<StructuralRow, StructuralRow> aggregator,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec,
         IFrontier? frontier = null,
-        Func<StructuralRow, long>? monotoneKey = null)
+        Func<StructuralRow, long>? monotoneKey = null,
+        ReshardPlacement? reshard = null)
     {
-        return ctx.Options.TraceFamily == TraceFamily.Spine
-            ? builder.SpineIncrementalAggregate(
-                input, aggregator, snapshotCodec,
-                ctx.Options.Compaction,
-                keyComparer: StructuralRowComparer.Instance,
-                valueComparer: StructuralRowComparer.Instance,
-                frontier: frontier,
-                monotoneKey: monotoneKey)
-            : builder.IncrementalAggregate(input, aggregator, snapshotCodec, frontier, monotoneKey);
+        // The keyed state blobs (aggstate.arrows) are keyed by the group key, like the trace.
+        var blobs = snapshotCodec is { SupportsKeyedBlobs: true } && reshard is not null
+            ? new KeyedBlobsReshardFile("aggstate.arrows", reshard, snapshotCodec)
+            : null;
+        return Recorded(
+            builder, ctx,
+            () => ctx.Options.TraceFamily == TraceFamily.Spine
+                ? builder.SpineIncrementalAggregate(
+                    input, aggregator, snapshotCodec,
+                    ctx.Options.Compaction,
+                    keyComparer: StructuralRowComparer.Instance,
+                    valueComparer: StructuralRowComparer.Instance,
+                    frontier: frontier,
+                    monotoneKey: monotoneKey)
+                : builder.IncrementalAggregate(input, aggregator, snapshotCodec, frontier, monotoneKey),
+            IZ("trace.arrows", reshard, snapshotCodec),
+            blobs);
     }
 
     /// <summary>
@@ -2215,7 +2334,8 @@ public static partial class PlanToCircuit
 
                     return EmitDistinct(
                         builder, ctx, distinctInput, distinctCodec,
-                        gcFrontier, gcMonotoneKey);
+                        gcFrontier, gcMonotoneKey,
+                        reshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(d.Schema) : null);
                 }
 
             case DifferencePlan diff:
@@ -2308,7 +2428,9 @@ public static partial class PlanToCircuit
         var comparer = BuildStructuralSortComparer(plan.SortKeys);
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
         return MarkGathered(ctx, Array.Empty<ResolvedExpression>(),
-            builder.TopK(input, comparer, plan.Offset ?? 0, plan.Limit, codec));
+            Recorded(
+                builder, ctx, () => builder.TopK(input, comparer, plan.Offset ?? 0, plan.Limit, codec),
+                Z("trace.arrows", ctx.Workers > 1 ? ReshardPlacement.OnWorker0 : null, codec)));
     }
 
     /// <summary>
@@ -2336,7 +2458,7 @@ public static partial class PlanToCircuit
     {
         if (ctx.Workers > 1 && partitionKeys.Count == 0)
         {
-            ctx.SetPartition(output, new PartitionInfo(ShardDisjoint: true, PartitionKey: Array.Empty<int>()));
+            ctx.SetPartition(output, new PartitionInfo(ShardDisjoint: true, PartitionKey: Array.Empty<int>(), Gathered: true));
         }
 
         return output;
@@ -2411,15 +2533,19 @@ public static partial class PlanToCircuit
         // per-partition operator (identity passthrough at W<=1). A global (no
         // PARTITION BY) window has no key to shard on: gather it whole onto
         // worker 0 (GatherToWorkerZero), where the serial operator runs.
+        // Where each persisted row lives, for re-sharding (§1d): the exchange's own function.
+        ReshardPlacement? reshardPlace = null;
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+            reshardPlace = new ReshardPlacement.Hash(row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
         else if (ctx.Workers > 1)
         {
             input = GatherToWorkerZero(builder, input);
+            reshardPlace = ReshardPlacement.OnWorker0;
         }
 
         // §22 narrow-key path: pass the single ORDER BY extractor so the operator can
@@ -2437,9 +2563,9 @@ public static partial class PlanToCircuit
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-        return MarkGathered(ctx, plan.PartitionKeys, builder.PartitionedTopK<StructuralRow, StructuralRow>(
+        return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedTopK<StructuralRow, StructuralRow>(
             input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec,
-            orderKey, orderDescending, orderNullsFirst));
+            orderKey, orderDescending, orderNullsFirst), Z("trace.arrows", reshardPlace, codec)));
     }
 
     // ---- Rank-in-output (ROW_NUMBER / RANK / DENSE_RANK as an output column) ----
@@ -2494,22 +2620,26 @@ public static partial class PlanToCircuit
         // per-partition operator (identity passthrough at W<=1). A global (no
         // PARTITION BY) window has no key to shard on: gather it whole onto
         // worker 0 (GatherToWorkerZero), where the serial operator runs.
+        // Where each persisted row lives, for re-sharding (§1d): the exchange's own function.
+        ReshardPlacement? reshardPlace = null;
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+            reshardPlace = new ReshardPlacement.Hash(row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
         else if (ctx.Workers > 1)
         {
             input = GatherToWorkerZero(builder, input);
+            reshardPlace = ReshardPlacement.OnWorker0;
         }
 
         // The snapshot codec is over the base (input) rows; the operator recovers
         // the widened output from them on load.
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
-        return MarkGathered(ctx, plan.PartitionKeys, builder.PartitionedRank<StructuralRow>(
-            input, PartitionOf, order, sortKeyOnly, plan.Function, null, codec));
+        return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedRank<StructuralRow>(
+            input, PartitionOf, order, sortKeyOnly, plan.Function, null, codec), Z("trace.arrows", reshardPlace, codec)));
     }
 
     // ---- Window aggregates (agg(x) OVER (PARTITION BY p [ORDER BY o RANGE …])) ----
@@ -2544,15 +2674,19 @@ public static partial class PlanToCircuit
         // per-partition operator (identity passthrough at W<=1). A global (no
         // PARTITION BY) window has no key to shard on: gather it whole onto
         // worker 0 (GatherToWorkerZero), where the serial operator runs.
+        // Where each persisted row lives, for re-sharding (§1d): the exchange's own function.
+        ReshardPlacement? reshardPlace = null;
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+            reshardPlace = new ReshardPlacement.Hash(row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
         else if (ctx.Workers > 1)
         {
             input = GatherToWorkerZero(builder, input);
+            reshardPlace = ReshardPlacement.OnWorker0;
         }
 
         IComparer<StructuralRow> order;
@@ -2596,7 +2730,7 @@ public static partial class PlanToCircuit
 
         var frontier = ResolveWindowFrontier(plan, ctx);
 
-        return MarkGathered(ctx, plan.PartitionKeys, builder.PartitionedWindowAggregate<StructuralRow>(
+        return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedWindowAggregate<StructuralRow>(
             input,
             PartitionOf,
             order,
@@ -2607,7 +2741,7 @@ public static partial class PlanToCircuit
             plan.Aggregates.Count,
             partitionComparer: null,
             snapshotCodec: codec,
-            frontier: frontier));
+            frontier: frontier), Z("trace.arrows", reshardPlace, codec)));
     }
 
     /// <summary>
@@ -2690,15 +2824,19 @@ public static partial class PlanToCircuit
         // per-partition operator (identity passthrough at W<=1). A global (no
         // PARTITION BY) window has no key to shard on: gather it whole onto
         // worker 0 (GatherToWorkerZero), where the serial operator runs.
+        // Where each persisted row lives, for re-sharding (§1d): the exchange's own function.
+        ReshardPlacement? reshardPlace = null;
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
             input = builder.Exchange(
                 input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+            reshardPlace = new ReshardPlacement.Hash(row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
         else if (ctx.Workers > 1)
         {
             input = GatherToWorkerZero(builder, input);
+            reshardPlace = ReshardPlacement.OnWorker0;
         }
 
         // Total order: the ORDER BY keys left to right (any comparable type —
@@ -2728,7 +2866,7 @@ public static partial class PlanToCircuit
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
         return MarkGathered(ctx, plan.PartitionKeys,
-            builder.PartitionedOffset<StructuralRow>(input, PartitionOf, order, specs, null, codec));
+            Recorded(builder, ctx, () => builder.PartitionedOffset<StructuralRow>(input, PartitionOf, order, specs, null, codec), Z("trace.arrows", reshardPlace, codec)));
     }
 
     // ---- Projection ----
@@ -3222,9 +3360,16 @@ public static partial class PlanToCircuit
 
             var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
             var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
+            // Re-sharding (§1d): a hash join keeps both traces on OfWholeRow(key) — the same
+            // hash the exchanges compute from the row's key columns. A broadcast join holds a
+            // full right copy on every worker, and its left is linear given that copy.
             joined = EmitInnerJoin(
                 builder, ctx, leftIndexed, rightIndexed, Combine,
-                leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn);
+                leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn,
+                leftReshard: ctx.Workers <= 1 ? null
+                    : broadcastRight ? ReshardPlacement.Anywhere : ReshardPlacement.WholeRow(leftKeySchema),
+                rightReshard: ctx.Workers <= 1 ? null
+                    : broadcastRight ? ReshardPlacement.OnEveryWorker : ReshardPlacement.WholeRow(rightKeySchema));
 
             // A broadcast join leaves the fact side on its incoming partition (not
             // the join key), so the output is partitioned as the left was — inherit
@@ -3233,8 +3378,8 @@ public static partial class PlanToCircuit
             if (ctx.Workers > 1)
             {
                 ctx.SetPartition(joined, broadcastRight
-                    ? new PartitionInfo(ShardDisjoint: false, PartitionKey: ctx.GetPartition(left).PartitionKey)
-                    : new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices));
+                    ? ctx.GetPartition(left) with { ShardDisjoint = false }
+                    : new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
             }
 
             return joined;
@@ -3243,7 +3388,7 @@ public static partial class PlanToCircuit
         // Shared-arrangement (CSE) join output: hash-partitioned by the join key.
         if (ctx.Workers > 1)
         {
-            ctx.SetPartition(joined, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices));
+            ctx.SetPartition(joined, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
         }
 
         return joined;
@@ -3404,7 +3549,9 @@ public static partial class PlanToCircuit
             rightIndexed,
             joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
-            leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
+            leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
+            leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null);
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
@@ -3419,7 +3566,7 @@ public static partial class PlanToCircuit
         // worker that key hashed to: partitioned by the left equi-key.
         if (ctx.Workers > 1)
         {
-            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices));
+            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
         }
 
         return result;
@@ -3506,7 +3653,15 @@ public static partial class PlanToCircuit
             (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema),
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema),
-            residual: row => residualScalar(row) is true);
+            residual: row => residualScalar(row) is true,
+            leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null);
+
+        // Matched rows sit on the worker their (left = right) equi-key hashes to; the left
+        // columns lead the joined row.
+        var matchedPlace = ctx.Workers > 1
+            ? new ReshardPlacement.Hash(row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema))
+            : null;
 
         var parts = new List<Stream<ZSet<StructuralRow, Z64>>> { matched };
 
@@ -3514,7 +3669,7 @@ public static partial class PlanToCircuit
             or DbspNet.Sql.Parser.Ast.JoinType.FullOuter)
         {
             var unmatchedLeft = UnmatchedPreservedRows(
-                builder, ctx, left, matched, joinedSchema, plan.Left.Schema, offsetInCombined: 0);
+                builder, ctx, left, matched, joinedSchema, plan.Left.Schema, offsetInCombined: 0, matchedPlace);
             parts.Add(builder.MapRows(
                 unmatchedLeft,
                 row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount)));
@@ -3524,7 +3679,7 @@ public static partial class PlanToCircuit
             or DbspNet.Sql.Parser.Ast.JoinType.FullOuter)
         {
             var unmatchedRight = UnmatchedPreservedRows(
-                builder, ctx, right, matched, joinedSchema, plan.Right.Schema, offsetInCombined: leftCount);
+                builder, ctx, right, matched, joinedSchema, plan.Right.Schema, offsetInCombined: leftCount, matchedPlace);
             parts.Add(builder.MapRows(
                 unmatchedRight,
                 row => NullPadLeft(codec, joinedSchema, row, leftCount, rightCount)));
@@ -3558,14 +3713,17 @@ public static partial class PlanToCircuit
         CircuitBuilder builder,
         CompileContext ctx,
         Stream<ZSet<StructuralRow, Z64>> input,
-        Schema schema)
+        Schema schema,
+        ReshardPlacement? reshard)
     {
         var positive = EmitDistinct(
             builder, ctx, input,
-            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema));
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema),
+            reshard: reshard);
         var negative = EmitDistinct(
             builder, ctx, builder.Negate(input),
-            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema));
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema),
+            reshard: reshard);
         return builder.Union(positive, negative);
     }
 
@@ -3581,7 +3739,8 @@ public static partial class PlanToCircuit
         Stream<ZSet<StructuralRow, Z64>> matched,
         Schema matchedSchema,
         Schema sideSchema,
-        int offsetInCombined)
+        int offsetInCombined,
+        ReshardPlacement? matchedPlace)
     {
         var codec = ctx.Codec;
         var width = sideSchema.Count;
@@ -3596,7 +3755,7 @@ public static partial class PlanToCircuit
         // Parallel: this needs no shuffle. Equal matched pairs share a preserved row,
         // hence an equi-key, and the inner join produced every pair on the worker that
         // key hashes to, so all copies of a pair are already on one worker.
-        var matchedPairs = NonZeroSet(builder, ctx, matched, matchedSchema);
+        var matchedPairs = NonZeroSet(builder, ctx, matched, matchedSchema, matchedPlace);
 
         // π_S(matchedPairs), rebuilt in the SIDE's own schema (not a slice of
         // the join's, whose nullability differs) so the rows compare equal to
@@ -3628,9 +3787,11 @@ public static partial class PlanToCircuit
         // Collapse the per-match multiplicity: a preserved row that matched k
         // rows must be subtracted exactly once, not k times. Weights here are
         // all +1, so plain Distinct is enough.
+        var sidePlace = ctx.Workers > 1 ? ReshardPlacement.WholeRow(sideSchema) : null;
         var distinct = EmitDistinct(
             builder, ctx, projected,
-            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(sideSchema));
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(sideSchema),
+            reshard: sidePlace);
 
         var sideIndexed = builder.ExchangeIndex<StructuralRow, StructuralRow, Z64>(
             side, WholeRowPart, static row => row);
@@ -3646,7 +3807,9 @@ public static partial class PlanToCircuit
             distinctIndexed,
             (_, sideRow, _) => sideRow,
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema),
-            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema));
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema),
+            leftReshard: sidePlace,
+            rightReshard: sidePlace);
 
         return builder.Difference(side, semi);
     }
@@ -3714,7 +3877,9 @@ public static partial class PlanToCircuit
             leftIndexed,
             joinCombine: (_, rrow, lrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             nullPadCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
-            preservedCodec, probedCodec, gcFrontier, gcMonotoneKey);
+            preservedCodec, probedCodec, gcFrontier, gcMonotoneKey,
+            leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null);
 
         var nullKeyPadded = builder.MapRows(
             nullKeyRight,
@@ -3732,7 +3897,7 @@ public static partial class PlanToCircuit
                 outKey[i] = leftCount + rightIndices[i];
             }
 
-            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: outKey));
+            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: outKey, KeySchema: rightKeySchema));
         }
 
         return result;
@@ -3796,7 +3961,9 @@ public static partial class PlanToCircuit
             joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             nullPadRightCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
             nullPadLeftCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
-            leftCodec, rightCodec, gcFrontier, gcMonotoneKey);
+            leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
+            leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null);
 
         var nullKeyLeftPadded = builder.MapRows(
             nullKeyLeft,
@@ -4095,9 +4262,11 @@ public static partial class PlanToCircuit
         int KeyPart(StructuralRow keyRow) => StablePartitionHash.OfWholeRow(keyRow, keySchema);
         subqueryProjected = builder.Exchange(subqueryProjected, KeyPart);
 
+        var keyPlace = ctx.Workers > 1 ? ReshardPlacement.WholeRow(keySchema) : null;
         var subqueryDistinct = EmitDistinct(
             builder, ctx, subqueryProjected,
-            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(keySchema));
+            snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(keySchema),
+            reshard: keyPlace);
 
         // Filter NULL probes (NULL = anything is NULL, never TRUE in WHERE)
         // and NULL inner-key tuples (same reason).
@@ -4131,7 +4300,9 @@ public static partial class PlanToCircuit
             outerIndexed,
             subqIndexed,
             (_, outerRow, _) => outerRow,
-            leftJoinCodec, rightJoinCodec);
+            leftJoinCodec, rightJoinCodec,
+            leftReshard: keyPlace,
+            rightReshard: keyPlace);
 
         if (plan.IsAnti)
         {
@@ -4150,7 +4321,7 @@ public static partial class PlanToCircuit
         // those columns (the output schema is the outer schema).
         if (ctx.Workers > 1 && BareProbeIndices(plan.EquiKeys) is { } probeIndices)
         {
-            ctx.SetPartition(matched, new PartitionInfo(ShardDisjoint: false, PartitionKey: probeIndices));
+            ctx.SetPartition(matched, new PartitionInfo(ShardDisjoint: false, PartitionKey: probeIndices, KeySchema: keySchema));
         }
 
         return matched;
@@ -4547,7 +4718,11 @@ public static partial class PlanToCircuit
         // frontier. The group-key row stores keys in GROUP BY order, so the
         // monotone column sits at its group-key index.
         var (gcFrontier, gcMonotoneKey) = ResolveGroupKeyFrontier(plan, ctx);
-        var aggregated = EmitAggregate(builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey);
+        var aggregated = EmitAggregate(
+            builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey,
+            reshard: ctx.Workers <= 1 ? null
+                : needsExchange ? ReshardPlacement.WholeRow(groupKeySchema)
+                : ElidedAggregatePlacement(ctx.GetPartition(input), bareGroupIndices!));
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;
@@ -4579,7 +4754,7 @@ public static partial class PlanToCircuit
         // iota(groupCount) — record it for a downstream aggregate to elide on.
         if (ctx.Workers > 1)
         {
-            ctx.SetPartition(mapped, new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount)));
+            ctx.SetPartition(mapped, new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount), KeySchema: groupKeySchema));
         }
 
         return mapped;
