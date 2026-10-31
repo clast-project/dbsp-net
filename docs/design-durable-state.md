@@ -120,8 +120,8 @@ redeploy asking for W=2 resumes at 4. A serial checkpoint redeployed with W=4 st
 match a from-scratch run. Full suite: 2658 pass.
 
 **Not measured yet:** end-to-end checkpoint and restore wall time at W=12 on SF=3. Concurrent
-worker writes should beat the serial save, which is sequential per operator. That needs a Docker
-run, so it is Curt's to run.
+worker writes should beat the serial save, which is sequential per operator.
+`scripts/measure-checkpoint.sh` measures it locally, with no Docker; one W=12 smoke run so far.
 
 ## 2. Plan from here
 
