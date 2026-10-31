@@ -446,7 +446,10 @@ internal sealed class ArrowIndexedZSetTraceCodec
             var keyColumns = new object?[keyCount][];
             for (var c = 0; c < keyCount; c++)
             {
-                keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, rowCount);
+                // ShippingStrings like every other restore path: Transcode (the old default here)
+                // round-trips through a .NET string, which rewrites malformed UTF-8 to U+FFFD, so a
+                // restored key would stop matching its own bytes (InvalidUtf8Tests).
+                keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, rowCount, ShippingStrings);
             }
 
             var blobs = (BinaryArray)batch.Column(keyCount);

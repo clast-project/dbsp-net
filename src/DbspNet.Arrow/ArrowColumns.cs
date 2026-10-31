@@ -46,7 +46,7 @@ internal static class ArrowColumns
 
     public static object?[] Extract(
         IArrowArray array, SqlType type, int rowCount,
-        StringDecoding strings = StringDecoding.Transcode) =>
+        StringDecoding strings = StringDecoding.Copy) =>
         Extract(array, type, 0, rowCount, strings);
 
     /// <summary>Rows <c>[from, from + rowCount)</c> of <paramref name="array"/>, so a caller can
@@ -54,7 +54,7 @@ internal static class ArrowColumns
     /// (docs/design-chunked-deltas.md §8).</summary>
     public static object?[] Extract(
         IArrowArray array, SqlType type, int from, int rowCount,
-        StringDecoding strings = StringDecoding.Transcode) => type switch
+        StringDecoding strings = StringDecoding.Copy) => type switch
     {
         // INTEGER binds against any narrow signed int (FromArrowType widens Int8/Int16/Int32
         // → INTEGER), so the source array can be any of the three widths; widen to int here.
