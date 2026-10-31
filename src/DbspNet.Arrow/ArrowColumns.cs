@@ -42,6 +42,43 @@ public enum StringDecoding
 
 internal static class ArrowColumns
 {
+    // EXPERIMENT (docs/design-connectors.md, G5 item 4): DBSPNET_INGEST_VALIDATE=1 checks that
+    // every VARCHAR cell decoded by Copy / Arena / Alias is valid UTF-8, to price the check.
+    internal static readonly bool ValidateUtf8 =
+        Environment.GetEnvironmentVariable("DBSPNET_INGEST_VALIDATE") == "1";
+
+    /// <summary>
+    /// Throws <see cref="InvalidDataException"/> unless rows <c>[from, from + n)</c> of
+    /// <paramref name="a"/> are each valid UTF-8. One vectorised pass over the rows' contiguous
+    /// bytes, then a check that every cell starts on a code-point boundary (not a continuation
+    /// byte): a valid concatenation cut only at boundaries is valid in every piece.
+    /// </summary>
+    internal static void EnsureValidUtf8(StringArray a, int from, int n)
+    {
+        if (n == 0)
+        {
+            return;
+        }
+
+        var offsets = a.ValueOffsets;
+        var bytes = a.ValueBuffer.Span;
+        var first = offsets[from];
+        var end = offsets[from + n];
+        if (!System.Text.Unicode.Utf8.IsValid(bytes[first..end]))
+        {
+            throw new InvalidDataException("VARCHAR column holds bytes that are not valid UTF-8");
+        }
+
+        for (var i = 1; i < n; i++)
+        {
+            var start = offsets[from + i];
+            if (start < end && (bytes[start] & 0xC0) == 0x80)
+            {
+                throw new InvalidDataException("VARCHAR column holds a cell that is not valid UTF-8");
+            }
+        }
+    }
+
     // ---- Extraction: Arrow column → DbspNet typed object?[] ----
 
     public static object?[] Extract(
@@ -208,6 +245,11 @@ internal static class ArrowColumns
     /// </summary>
     private static object?[] ExtractStringAlias(StringArray a, int from, int n)
     {
+        if (ValidateUtf8)
+        {
+            EnsureValidUtf8(a, from, n);
+        }
+
         var memory = a.ValueBuffer.Memory;
         var offsets = a.ValueOffsets;
         var result = new object?[n];
@@ -248,6 +290,11 @@ internal static class ArrowColumns
     /// </remarks>
     private static object?[] ExtractStringArena(StringArray a, int from, int n)
     {
+        if (ValidateUtf8)
+        {
+            EnsureValidUtf8(a, from, n);
+        }
+
         var result = new object?[n];
         if (n == 0)
         {
@@ -278,6 +325,11 @@ internal static class ArrowColumns
     /// without the UTF-8 → UTF-16 → UTF-8 round trip and its intermediate <c>string</c>.</summary>
     private static object?[] ExtractStringCopy(StringArray a, int from, int n)
     {
+        if (ValidateUtf8)
+        {
+            EnsureValidUtf8(a, from, n);
+        }
+
         var bytes = a.ValueBuffer.Memory.Span;
         var offsets = a.ValueOffsets;
         var result = new object?[n];

@@ -59,4 +59,44 @@ public class StringDecodingTests
         Assert.NotSame(sa.Array, sb.Array);
         Assert.Equal(a.ByteLength, sa.Array!.Length);
     }
+
+    private static StringArray FromBytes(params byte[][] cells)
+    {
+        var b = new StringArray.Builder();
+        foreach (var c in cells)
+        {
+            b.Append(c.AsSpan());
+        }
+
+        return b.Build();
+    }
+
+    [Fact]
+    public void EnsureValidUtf8_AcceptsValidText()
+    {
+        var a = Build();
+        ArrowColumns.EnsureValidUtf8(a, 0, a.Length);
+        ArrowColumns.EnsureValidUtf8(a, 3, a.Length - 3);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x80 })]
+    [InlineData(new byte[] { 0x61, 0xC3 })]
+    [InlineData(new byte[] { 0xC0, 0xAF })]
+    [InlineData(new byte[] { 0xED, 0xA0, 0x80 })]
+    [InlineData(new byte[] { 0xFF })]
+    public void EnsureValidUtf8_RejectsAMalformedCell(byte[] bad)
+    {
+        var a = FromBytes("ok"u8.ToArray(), bad, "ok"u8.ToArray());
+        Assert.Throws<InvalidDataException>(() => ArrowColumns.EnsureValidUtf8(a, 0, 3));
+    }
+
+    [Fact]
+    public void EnsureValidUtf8_RejectsCellsThatAreOnlyValidWhenJoined()
+    {
+        // 0xC3 0xA9 is "é": the column's bytes are valid, but neither cell is.
+        var a = FromBytes("x"u8.ToArray(), [0xC3], [0xA9]);
+        Assert.Throws<InvalidDataException>(() => ArrowColumns.EnsureValidUtf8(a, 0, 3));
+        Assert.Throws<InvalidDataException>(() => ArrowColumns.EnsureValidUtf8(a, 2, 1));
+    }
 }

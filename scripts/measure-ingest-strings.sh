@@ -7,6 +7,9 @@
 #
 #   scripts/measure-ingest-strings.sh                    # 5 rounds, W=12
 #   RUNS=1 ARMS="copy" scripts/measure-ingest-strings.sh
+#   ARMS="copy copy:validate" scripts/measure-ingest-strings.sh   # price UTF-8 validation
+#
+# An arm is a decoding, optionally ":validate" (DBSPNET_INGEST_VALIDATE=1).
 #
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta incl. staging-multi/. No Docker.
 set -euo pipefail
@@ -34,8 +37,11 @@ echo "# $(git -C "$REPO" rev-parse --short HEAD) $(date) W=$WORKERS" | tee "$RES
 for run in $(seq 1 "$RUNS"); do
   for arm in $ARMS; do
     echo "## run $run arm $arm" | tee -a "$RESULTS"
+    validate=0
+    [[ "$arm" == *:validate ]] && validate=1
     DOTNET_gcServer=1 \
-    DBSPNET_INGEST_STRINGS="$arm" \
+    DBSPNET_INGEST_STRINGS="${arm%%:*}" \
+    DBSPNET_INGEST_VALIDATE="$validate" \
     IVM_MEASURE_AT=drain \
     IVM_MEASURE_LIVE=1 \
     IVM_DATA_ROOT="$DATA" \
