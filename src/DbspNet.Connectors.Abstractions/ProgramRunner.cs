@@ -7,6 +7,7 @@ using DbspNet.Arrow;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
+using DbspNet.Persistence;
 using DbspNet.Sql.Compiler;
 
 namespace DbspNet.Connectors.Abstractions;
@@ -25,9 +26,8 @@ namespace DbspNet.Connectors.Abstractions;
 /// <para>
 /// The two program kinds differ only behind <see cref="RunnerProgram"/> (ingest, step,
 /// output reads); the batch loop, incremental-output bookkeeping and profile are shared.
-/// A parallel program cannot be checkpointed through this runner (<see cref="ICheckpointStore"/>
-/// snapshots a single circuit), so <see cref="CreateAsync(ParallelCompiledProgram, IReadOnlyList{IInputConnector}, IReadOnlyList{IOutputConnector}, CancellationToken)"/>
-/// takes no store.
+/// Either kind checkpoints: a serial program through an <see cref="ICheckpointStore"/>, a parallel
+/// one through an <see cref="IParallelCheckpointStore"/>, which commits all W workers together.
 /// </para>
 /// </summary>
 public sealed class ProgramRunner
@@ -52,7 +52,21 @@ public sealed class ProgramRunner
 
         public bool Written { get; set; }
     }
-    private readonly ICheckpointStore? _checkpoint;
+    // An ICheckpointStore (serial) or IParallelCheckpointStore (parallel); RunnerProgram dispatches.
+    private readonly object? _checkpoint;
+
+    // Engine tick of the last checkpoint written or restored; -1 = none. Source cursors only
+    // advance together with a tick (DrainAsync), so an unchanged tick means nothing to save.
+    private long _checkpointedTick = -1;
+
+    // A2 (docs/design-durable-state.md §1c): when the policy journals, each batch's ticks are
+    // appended to the store's tick journal and a snapshot is taken only when the policy says so.
+    // The journal is replayed on restore whenever the store has one, whatever the policy.
+    private readonly CheckpointPolicy _policy;
+    private readonly TickJournal? _journal;
+    private readonly List<JournalTick> _pendingTicks = [];
+    private int _batchesSinceSnapshot;
+    private readonly Stopwatch _sinceSnapshot = new();
     private readonly BatchProfile? _profile = ProfileEnabled ? new BatchProfile() : null;
 
     private ProgramRunner(
@@ -61,7 +75,8 @@ public sealed class ProgramRunner
         ParallelCompiledProgram? parallel,
         List<InputBinding> inputs,
         List<(IOutputConnector, RunnerOutput)> outputs,
-        ICheckpointStore? checkpoint)
+        object? checkpoint,
+        CheckpointPolicy? policy)
     {
         _program = program;
         Program = serial;
@@ -76,7 +91,19 @@ public sealed class ProgramRunner
             }
         }
         _checkpoint = checkpoint;
+        _policy = policy ?? CheckpointPolicy.EveryBatch;
+        _journal = (checkpoint as ICheckpointJournalStore)?.Journal;
+        if (checkpoint is not null && _policy.Journal && _journal is null)
+        {
+            throw new ArgumentException("the checkpoint policy journals every batch, but the checkpoint store keeps no journal", nameof(policy));
+        }
+
+        _sinceSnapshot.Start();
     }
+
+    /// <summary>When each batch is made durable; <see cref="CheckpointPolicy.EveryBatch"/> unless
+    /// the runner was created with another policy.</summary>
+    public CheckpointPolicy Policy => _policy;
 
     /// <summary>The serial program this runner drives, or <c>null</c> when it drives a
     /// <see cref="ParallelProgram"/>.</summary>
@@ -122,12 +149,13 @@ public sealed class ProgramRunner
         IReadOnlyList<IInputConnector> inputs,
         IReadOnlyList<IOutputConnector> outputs,
         ICheckpointStore? checkpoint = null,
+        CheckpointPolicy? policy = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
         var runnerProgram = RunnerProgram.Of(program);
         var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
-        return new ProgramRunner(runnerProgram, program, null, ins, outs, checkpoint);
+        return new ProgramRunner(runnerProgram, program, null, ins, outs, checkpoint, policy);
     }
 
     /// <summary>
@@ -135,20 +163,22 @@ public sealed class ProgramRunner
     /// serial overload, with each source's versions pushed into a sharded input (split
     /// across the replicas by whole-row hash) and each output read as the gathered
     /// (replica-summed) view and per-tick delta. Batch semantics and output modes are
-    /// identical to the serial runner. No checkpoint store: the parallel program's state
-    /// is per-worker (<c>ParallelSnapshot</c>), which <see cref="ICheckpointStore"/> does not
-    /// model.
+    /// identical to the serial runner. With <paramref name="checkpoint"/>, each batch ends with
+    /// one checkpoint of all W workers and the cursors, committed together; the program must
+    /// have been compiled with snapshot codecs, and a restore needs the same W.
     /// </summary>
     public static async ValueTask<ProgramRunner> CreateAsync(
         ParallelCompiledProgram program,
         IReadOnlyList<IInputConnector> inputs,
         IReadOnlyList<IOutputConnector> outputs,
+        IParallelCheckpointStore? checkpoint = null,
+        CheckpointPolicy? policy = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
         var runnerProgram = RunnerProgram.Of(program);
         var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
-        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint: null);
+        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint, policy);
     }
 
     private static async ValueTask<(List<InputBinding>, List<(IOutputConnector, RunnerOutput)>)> BindAsync(
@@ -204,20 +234,67 @@ public sealed class ProgramRunner
             return 0;
         }
 
-        var state = await _checkpoint.TryRestoreAsync(_program.SerialCircuit!, cancellationToken).ConfigureAwait(false);
-        if (state is null)
+        var state = await _program.TryRestoreCheckpointAsync(_checkpoint, cancellationToken).ConfigureAwait(false);
+        if (state is not null)
         {
-            return 0;
+            foreach (var sc in state.Offsets)
+            {
+                var b = Binding(sc.SourceName, "checkpoint");
+                b.Cursor = b.Connector.ParseOffset(sc.Offset);
+            }
+
+            _checkpointedTick = state.Tick;
         }
 
-        foreach (var sc in state.Offsets)
+        // Replay the journal after the snapshot — or after tick 0 and the sources' initial
+        // offsets when there is no snapshot: the empty circuit is a valid base.
+        if (_journal is not null)
         {
-            var b = _inputs.FirstOrDefault(x => string.Equals(x.Connector.Name, sc.SourceName, StringComparison.Ordinal))
-                ?? throw new InvalidDataException($"checkpoint names unknown source '{sc.SourceName}'");
-            b.Cursor = b.Connector.ParseOffset(sc.Offset);
+            var ticks = await _journal.ReadAfterAsync(state?.Tick ?? 0, cancellationToken).ConfigureAwait(false);
+            await ReplayAsync(ticks, cancellationToken).ConfigureAwait(false);
         }
 
-        return state.Tick;
+        _batchesSinceSnapshot = 0;
+        _sinceSnapshot.Restart();
+        return _program.TickCount;
+    }
+
+    private InputBinding Binding(string source, string what) =>
+        _inputs.FirstOrDefault(x => string.Equals(x.Connector.Name, source, StringComparison.Ordinal))
+        ?? throw new InvalidDataException($"{what} names unknown source '{source}'");
+
+    // Re-run the journaled ticks exactly: each one reads the next version of the source it read
+    // the first time, which must end at the journaled offset, and must land on the same tick.
+    // Replayed ticks feed no output: after a restart each output's first write is its whole view.
+    private async ValueTask ReplayAsync(IReadOnlyList<JournalTick> ticks, CancellationToken cancellationToken)
+    {
+        foreach (var t in ticks)
+        {
+            var b = Binding(t.Source, "the tick journal");
+            var batch = await b.Connector.NextAsync(b.Cursor, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException(
+                    $"source '{t.Source}' has no version after {b.Cursor.Serialize()}, but the journal records tick {t.Tick} reading one");
+            var offset = batch.Offset.Serialize();
+            if (!string.Equals(offset, t.Offset, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"replaying tick {t.Tick}: source '{t.Source}' returned a version ending at {offset}, but the journal recorded {t.Offset}");
+            }
+
+            await foreach (var vb in batch.Content.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                b.TableInput.PushArrow(vb.Batch, vb.Weights);
+            }
+
+            _program.Step();
+            if (_program.TickCount != t.Tick)
+            {
+                throw new InvalidDataException(
+                    $"replay reached tick {_program.TickCount} where the journal recorded tick {t.Tick}");
+            }
+
+            b.Cursor = batch.Offset;
+        }
     }
 
     /// <summary>
@@ -225,19 +302,67 @@ public sealed class ProgramRunner
     /// commit atomically (the offsets ride in the snapshot manifest), so engine tick
     /// T and the cursors can never diverge. Called automatically at the end of
     /// <see cref="RunBatchAsync"/> when a checkpoint store is wired; exposed for a
-    /// forced checkpoint (e.g. before a clean shutdown).
+    /// forced checkpoint (e.g. before a clean shutdown). Skipped when the engine has not
+    /// ticked since the last checkpoint written or restored: state and cursors are then
+    /// exactly what that checkpoint already holds, and an idle batch would otherwise pay a
+    /// full state rewrite for nothing.
     /// </summary>
-    public ValueTask CheckpointAsync(CancellationToken cancellationToken = default)
+    public async ValueTask CheckpointAsync(CancellationToken cancellationToken = default)
     {
-        if (_checkpoint is null)
+        if (_checkpoint is null || _program.TickCount == _checkpointedTick)
         {
-            return ValueTask.CompletedTask;
+            return;
         }
 
         var offsets = _inputs
             .Select(b => new SourceCheckpoint(b.Connector.Name, b.Cursor.Serialize()))
             .ToList();
-        return _checkpoint.SaveAsync(_program.SerialCircuit!, offsets, cancellationToken);
+        await _program.SaveCheckpointAsync(_checkpoint, offsets, cancellationToken).ConfigureAwait(false);
+        _checkpointedTick = _program.TickCount;
+
+        // The snapshot covers every tick so far, journaled or not; drop what it supersedes.
+        _pendingTicks.Clear();
+        _batchesSinceSnapshot = 0;
+        _sinceSnapshot.Restart();
+        if (_journal is not null)
+        {
+            await _journal.TruncateThroughAsync(_checkpointedTick, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Make the batch drained so far durable according to <see cref="Policy"/>: a snapshot
+    /// (<see cref="CheckpointPolicy.EveryBatch"/>), or a tick-journal entry followed by a snapshot
+    /// only when the policy's interval or batch count is reached. <see cref="RunBatchAsync"/> calls
+    /// it after writing outputs; a caller driving <see cref="DrainAsync"/> and
+    /// <see cref="WriteOutputsAsync"/> itself calls it in the same place. A no-op without a store.
+    /// </summary>
+    public async ValueTask CommitBatchAsync(CancellationToken cancellationToken = default)
+    {
+        if (_checkpoint is null)
+        {
+            return;
+        }
+
+        if (!_policy.Journal)
+        {
+            await CheckpointAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (_pendingTicks.Count > 0)
+        {
+            await _journal!.AppendAsync(_pendingTicks, cancellationToken).ConfigureAwait(false);
+            _pendingTicks.Clear();
+            _batchesSinceSnapshot++;
+        }
+
+        var due = (_policy.SnapshotEveryBatches is { } n && _batchesSinceSnapshot >= n)
+                  || (_policy.SnapshotInterval is { } t && _sinceSnapshot.Elapsed >= t);
+        if (due)
+        {
+            await CheckpointAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>Ingest every source version currently available (one engine tick per
@@ -299,6 +424,11 @@ public sealed class ProgramRunner
                 AccumulateIncrementalChanges();
                 ticks++;
                 b.Cursor = batch.Offset;
+                if (_policy.Journal && _checkpoint is not null)
+                {
+                    _pendingTicks.Add(new JournalTick(_program.TickCount, b.Connector.Name, batch.Offset.Serialize()));
+                }
+
                 progressed = true;
             }
         }
@@ -398,7 +528,7 @@ public sealed class ProgramRunner
         if (_checkpoint is not null)
         {
             var c0 = _profile is null ? 0 : Stopwatch.GetTimestamp();
-            await CheckpointAsync(cancellationToken).ConfigureAwait(false);
+            await CommitBatchAsync(cancellationToken).ConfigureAwait(false);
             if (_profile is not null)
             {
                 _profile.CheckpointTicks = Stopwatch.GetTimestamp() - c0;

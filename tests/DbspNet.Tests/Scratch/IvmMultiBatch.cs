@@ -13,6 +13,19 @@
 //   IVM_TYPE_VIEWS    (optional) 1 = serial program tries the typed fast path per view
 //   IVM_PAUSE_DIR     (optional) after batch 1, write <dir>/pid and wait for <dir>/go — so a
 //                     heap dump (dotnet-gcdump collect -p <pid>) sees batch 1's retained state
+//   IVM_SNAPSHOT_DIR  (optional) checkpoint after every batch through SnapshotCheckpointStore
+//                     (serial or, with IVM_WORKERS, the one-commit parallel snapshot), timed as
+//                     checkpoint_ms; then restore the last one into a fresh program, timed as
+//                     restore_ms, and check its view row counts. Wiped at start. Compiles with
+//                     snapshot codecs, which turn off shared arrangements, so compare drain_ms
+//                     only against another run with this set.
+//   IVM_CHECKPOINT_POLICY  (with IVM_SNAPSHOT_DIR) a CheckpointPolicy.Parse setting: unset = a
+//                     snapshot every batch; "none" = journal only; N = journal + snapshot every N s
+//   IVM_CHECKPOINT_PROFILE=1  (with IVM_SNAPSHOT_DIR) per checkpoint: wall, CPU, allocation and GC
+//                     deltas, and the operator save times summed by type (CKPT/CKPTOP lines)
+//   IVM_CHECKPOINT_REPEAT=1   after batch 1's checkpoint, write a second one straight away (same
+//                     tick, so a fresh generation directory) and profile it the same way
+//   IVM_CHECKPOINT_PREGC=1    force a full compacting GC (untimed) before every checkpoint
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -59,18 +72,36 @@ public class IvmMultiBatch
 
         RewindPendingCommits(stagingRoot);
 
+        var snapshotDir = Environment.GetEnvironmentVariable("IVM_SNAPSHOT_DIR");
+        var codecs = string.IsNullOrEmpty(snapshotDir) ? null : DbspNet.Persistence.ArrowSqlSnapshotCodecs.Instance;
+        SnapshotCheckpointStore? store = null;
+        var policySetting = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_POLICY");
+        CheckpointPolicy? policy = string.IsNullOrEmpty(policySetting) ? null : CheckpointPolicy.Parse(policySetting);
+        if (codecs is not null)
+        {
+            if (Directory.Exists(snapshotDir))
+            {
+                Directory.Delete(snapshotDir, recursive: true);
+            }
+
+            Directory.CreateDirectory(snapshotDir!);
+            store = new SnapshotCheckpointStore(new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!));
+        }
+
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         var workers = int.TryParse(Environment.GetEnvironmentVariable("IVM_WORKERS"), out var w) ? w : 1;
-        ParallelCompiledProgram? parallel = null;
-        if (workers > 1)
+        ParallelCompiledProgram? CompileParallel()
         {
             Assert.True(
                 SqlProgram.TryCompileParallel(
-                    spec.Program, outputViews, workers, out parallel,
+                    spec.Program, outputViews, workers, out var compiled, codecs,
                     numericStringCoercion: true, nullCollation: NullCollation.Low),
                 "parallel compile refused the program");
+            return compiled;
         }
+
+        var parallel = workers > 1 ? CompileParallel() : null;
 
         string InUri(string uri)
         {
@@ -80,20 +111,22 @@ public class IvmMultiBatch
                 : Path.Combine(dataRoot, rel);
         }
 
-        var inputs = spec.Inputs
+        List<IInputConnector> Inputs() => spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))
             .ToList();
+        var inputs = Inputs();
         var outputs = spec.Output_Bindings
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
             .ToList();
         // IVM_GC_EVENTS=1: every GC pause during batch 1 (suspend → restart), by generation.
         using var gcEvents = Environment.GetEnvironmentVariable("IVM_GC_EVENTS") == "1" ? new GcPauseListener() : null;
 
+        var serial = parallel is null ? CompileSerial() : null;
         var runner = parallel is not null
-            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs)
-            : await ProgramRunner.CreateAsync(
-                CompileSerial(),
-                inputs, outputs);
+            ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, store, policy)
+            : await ProgramRunner.CreateAsync(serial!, inputs, outputs, store, policy);
+        var checkpointProfile = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") == "1";
+        DbspNet.Persistence.Snapshot.ProfileSave = checkpointProfile;
 
         // IVM_TYPE_VIEWS=1 (serial only): each view tries the typed fast path, structural
         // fallback elsewhere (design-row-representation §23). That path disables single-use
@@ -102,7 +135,7 @@ public class IvmMultiBatch
         {
             var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") == "1";
             var compiled = SqlProgram.Compile(
-                spec.Program, outputViews, options: new CompileOptions { TypeEligibleProgramViews = typeViews },
+                spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews },
                 numericStringCoercion: true, nullCollation: NullCollation.Low);
             if (typeViews)
             {
@@ -225,6 +258,53 @@ public class IvmMultiBatch
                 }
             }
 
+            // The checkpoint the server would write at the end of this batch (RunBatchAsync under
+            // DBSPNET_PROFILE has already written it, so this is then a no-op).
+            double checkpointMs = 0;
+            double snapshotMb = 0;
+            if (store is not null)
+            {
+                if (Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PREGC") == "1")
+                {
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    GC.WaitForPendingFinalizers();
+                }
+
+                checkpointMs = await ProfileCheckpoint($"batch{batch}", async () =>
+                {
+                    if (policy is null)
+                    {
+                        await runner.CheckpointAsync();
+                    }
+                    else
+                    {
+                        await runner.CommitBatchAsync();
+                    }
+                });
+                if (batch == 1 && Environment.GetEnvironmentVariable("IVM_CHECKPOINT_REPEAT") == "1")
+                {
+                    var fs = new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!);
+                    await ProfileCheckpoint("batch1-again", async () =>
+                    {
+                        if (parallel is not null)
+                        {
+                            await DbspNet.Persistence.ParallelSnapshot.WriteAsync(parallel.Circuit, fs, retainCount: 2);
+                        }
+                        else
+                        {
+                            await DbspNet.Persistence.Snapshot.WriteAsync(serial!.Circuit, fs, retainCount: 2);
+                        }
+                    });
+                }
+                var pointer = Path.Combine(snapshotDir!, "current.txt");
+                if (File.Exists(pointer))
+                {
+                    var current = File.ReadAllText(pointer).Trim();
+                    snapshotMb = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
+                        .Sum(f => new FileInfo(f).Length) / (1024.0 * 1024.0);
+                }
+            }
+
             // What the server's /wait reports after every batch.
             var c0 = Stopwatch.GetTimestamp();
             var viewRows = runner.ViewRowCounts().Sum(kv => kv.Value);
@@ -232,7 +312,35 @@ public class IvmMultiBatch
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2}"));
+                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2}")
+                + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1}")));
+        }
+
+        if (store is not null)
+        {
+            // Restart: drop the producer, then restore its last checkpoint into a fresh program at
+            // the same W (the deploy path's RestoreAsync), and check every view came back.
+            var expected = runner.ViewRowCounts().OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+            var producerTick = runner.TickCount;
+            parallel?.Dispose();
+            parallel = null;
+            runner = null!;
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+
+            using var restoredParallel = workers > 1 ? CompileParallel() : null;
+            var restored = restoredParallel is not null
+                ? await ProgramRunner.CreateAsync(restoredParallel, Inputs(), [], store, policy)
+                : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), [], store, policy);
+            var r0 = Stopwatch.GetTimestamp();
+            var restoredTick = await restored.RestoreAsync();
+            var restoreMs = Stopwatch.GetElapsedTime(r0).TotalMilliseconds;
+            var actual = restored.ViewRowCounts().OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+            var match = restoredTick == producerTick && expected.SequenceEqual(actual);
+            _out.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"RESTORE workers={workers} tick={restoredTick} restore_ms={restoreMs:F0} view_rows_match={match}"));
+            Assert.True(match, "restored view row counts differ from the producer's");
         }
 
         foreach (var o in outputs)
@@ -268,6 +376,61 @@ public class IvmMultiBatch
             table.Dispose();
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"VIEW {o.View} rows={rows} digest={digest:x16}"));
         }
+    }
+
+    private async Task<double> ProfileCheckpoint(string label, Func<Task> checkpoint)
+    {
+        var g0 = GC.CollectionCount(0);
+        var g1 = GC.CollectionCount(1);
+        var g2 = GC.CollectionCount(2);
+        var pause0 = GC.GetTotalPauseDuration();
+        var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
+        var cpu0 = Process.GetCurrentProcess().TotalProcessorTime;
+        while (DbspNet.Persistence.Snapshot.SaveProfile.TryDequeue(out _))
+        {
+        }
+
+        var info0 = GC.GetGCMemoryInfo();
+        var ws0 = Process.GetCurrentProcess().WorkingSet64;
+        var start = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var t0 = Stopwatch.GetTimestamp();
+        await checkpoint();
+        var wall = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+        if (DbspNet.Persistence.Snapshot.ProfileSave)
+        {
+            var proc = Process.GetCurrentProcess();
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"CKPTMEM {label} start_unix_ms={start} end_unix_ms={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()} " +
+                $"heap_gib={info0.HeapSizeBytes / (double)(1L << 30):F1} committed_gib={info0.TotalCommittedBytes / (double)(1L << 30):F1} " +
+                $"fragmented_gib={info0.FragmentedBytes / (double)(1L << 30):F1} load_gib={info0.MemoryLoadBytes / (double)(1L << 30):F1} " +
+                $"high_load_gib={info0.HighMemoryLoadThresholdBytes / (double)(1L << 30):F1} ws_before_gib={ws0 / (double)(1L << 30):F1} " +
+                $"ws_after_gib={proc.WorkingSet64 / (double)(1L << 30):F1} peak_ws_gib={proc.PeakWorkingSet64 / (double)(1L << 30):F1}"));
+        }
+
+        if (!DbspNet.Persistence.Snapshot.ProfileSave)
+        {
+            return wall;
+        }
+
+        var cpu = (Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds;
+        var ops = new List<(string Dir, int Index, string Op, double Ms)>();
+        while (DbspNet.Persistence.Snapshot.SaveProfile.TryDequeue(out var e))
+        {
+            ops.Add(e);
+        }
+
+        var perWorker = ops.GroupBy(o => o.Dir).Select(g => g.Sum(o => o.Ms)).ToList();
+        _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+            $"CKPT {label} wall_ms={wall:F0} cpu_ms={cpu:F0} alloc_gib={(GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (double)(1L << 30):F2} " +
+            $"gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gc0={GC.CollectionCount(0) - g0} gc1={GC.CollectionCount(1) - g1} gc2={GC.CollectionCount(2) - g2} " +
+            $"save_sum_ms={ops.Sum(o => o.Ms):F0} worker_max_ms={(perWorker.Count == 0 ? 0 : perWorker.Max()):F0} worker_min_ms={(perWorker.Count == 0 ? 0 : perWorker.Min()):F0}"));
+        foreach (var g in ops.GroupBy(o => o.Op).OrderByDescending(g => g.Sum(o => o.Ms)).Take(8))
+        {
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"CKPTOP {label} {g.Key} n={g.Count()} sum_ms={g.Sum(o => o.Ms):F0} max_ms={g.Max(o => o.Ms):F0}"));
+        }
+
+        return wall;
     }
 
     private static string Cell(Apache.Arrow.IArrowArray array, int i)

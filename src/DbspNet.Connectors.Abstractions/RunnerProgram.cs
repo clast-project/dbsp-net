@@ -22,9 +22,15 @@ internal abstract class RunnerProgram
 {
     public abstract long TickCount { get; }
 
-    /// <summary>The serial circuit, for checkpointing; <c>null</c> for a parallel program
-    /// (the checkpoint store snapshots a single <see cref="RootCircuit"/>).</summary>
-    public abstract RootCircuit? SerialCircuit { get; }
+    /// <summary>Checkpoint the program's state and <paramref name="offsets"/> into
+    /// <paramref name="store"/> (an <see cref="ICheckpointStore"/> or an
+    /// <see cref="IParallelCheckpointStore"/>, matching the program kind; the runner's typed
+    /// constructors guarantee it).</summary>
+    public abstract ValueTask SaveCheckpointAsync(
+        object store, IReadOnlyList<SourceCheckpoint> offsets, CancellationToken cancellationToken);
+
+    /// <summary>Restore the program from <paramref name="store"/>; <c>null</c> on a fresh start.</summary>
+    public abstract ValueTask<CheckpointState?> TryRestoreCheckpointAsync(object store, CancellationToken cancellationToken);
 
     public abstract bool TryGetInput(string table, out RunnerInput input);
 
@@ -53,7 +59,12 @@ internal abstract class RunnerProgram
     {
         public override long TickCount => program.Circuit.TickCount;
 
-        public override RootCircuit SerialCircuit => program.Circuit;
+        public override ValueTask SaveCheckpointAsync(
+            object store, IReadOnlyList<SourceCheckpoint> offsets, CancellationToken cancellationToken) =>
+            ((ICheckpointStore)store).SaveAsync(program.Circuit, offsets, cancellationToken);
+
+        public override ValueTask<CheckpointState?> TryRestoreCheckpointAsync(object store, CancellationToken cancellationToken) =>
+            ((ICheckpointStore)store).TryRestoreAsync(program.Circuit, cancellationToken);
 
         public override bool TryGetInput(string table, out RunnerInput input)
         {
@@ -87,7 +98,12 @@ internal abstract class RunnerProgram
     {
         public override long TickCount => program.Circuit.TickCount;
 
-        public override RootCircuit? SerialCircuit => null;
+        public override ValueTask SaveCheckpointAsync(
+            object store, IReadOnlyList<SourceCheckpoint> offsets, CancellationToken cancellationToken) =>
+            ((IParallelCheckpointStore)store).SaveAsync(program.Circuit, offsets, cancellationToken);
+
+        public override ValueTask<CheckpointState?> TryRestoreCheckpointAsync(object store, CancellationToken cancellationToken) =>
+            ((IParallelCheckpointStore)store).TryRestoreAsync(program.Circuit, cancellationToken);
 
         public override bool TryGetInput(string table, out RunnerInput input)
         {

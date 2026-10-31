@@ -459,8 +459,8 @@ public class IvmRestoreProfile
     // string, which is fine inside one run (IvmRecoveryProbe records and verifies in the same
     // process) but silently reports every string-bearing view as "differs" when the digest is
     // written by the record run and read by a later one. Everything here depends only on the
-    // value.
-    private static long StableCell(object? value) => value switch
+    // value. Shared with IvmRecoveryProbe so no digest in this project hashes with GetHashCode.
+    internal static long StableCell(object? value) => value switch
     {
         null => 0,
         string s => StableHash.Of(s),

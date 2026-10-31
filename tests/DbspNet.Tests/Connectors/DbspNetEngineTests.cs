@@ -10,6 +10,7 @@ using Apache.Arrow;
 using DbspNet.Arrow;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Connectors.Abstractions;
 using DbspNet.Server;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Plan;
@@ -166,16 +167,109 @@ public sealed class DbspNetEngineTests : IDisposable
         Assert.Contains("EXCEPT", deploy.SerialFallback, StringComparison.Ordinal);
     }
 
-    /// <summary>Checkpointing configured with workers > 1 runs serially: only the serial
-    /// program checkpoints through the runner.</summary>
+    /// <summary>
+    /// Checkpointing with workers > 1 runs the parallel program, and a redeploy resumes it. The
+    /// redeploy asks for a different worker count and gets the snapshot's (a snapshot pins W),
+    /// and after one more batch its sink equals a from-scratch run over the same sources.
+    /// </summary>
     [Fact]
-    public async Task Workers4_WithSnapshotDir_RunsSerial()
+    public async Task Workers4_WithSnapshotDir_RunsParallel_AndARedeployResumesAtTheRecordedWorkerCount()
     {
+        var snapshotDir = Path.Combine(_root, "snap");
         var deploy = await RunTwoBatches(
-            new DbspNetEngine(workers: 4), ProgramSql, "persistent", snapshotDir: Path.Combine(_root, "snap"));
+            new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch), ProgramSql, "persistent", snapshotDir: snapshotDir);
         Assert.True(deploy.Persistent);
+        Assert.Equal(4, deploy.Workers);
+        Assert.Null(deploy.SerialFallback);
+
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 2, CheckpointPolicy.EveryBatch), "persistent", snapshotDir);
+        Assert.Equal(4, resumed.Workers);
+        Assert.True(resumed.RestoredTick > 0);
+        await AssertMatchesFromScratch("persistent");
+    }
+
+    /// <summary>A serial snapshot stays serial when the redeploy asks for workers.</summary>
+    [Fact]
+    public async Task SerialCheckpoint_RedeployWithWorkers_StaysSerial()
+    {
+        var snapshotDir = Path.Combine(_root, "snap1");
+        var deploy = await RunTwoBatches(
+            new DbspNetEngine(1, CheckpointPolicy.EveryBatch), ProgramSql, "persistent1", snapshotDir: snapshotDir);
         Assert.Equal(1, deploy.Workers);
-        Assert.Contains("checkpoint", deploy.SerialFallback, StringComparison.Ordinal);
+
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch), "persistent1", snapshotDir);
+        Assert.Equal(1, resumed.Workers);
+        Assert.True(resumed.RestoredTick > 0);
+        await AssertMatchesFromScratch("persistent1");
+    }
+
+    /// <summary>
+    /// The default policy (journal every batch, snapshot every 60 s) writes no snapshot in a run
+    /// this short, so the persisted state is the tick journal alone: a redeploy replays it at the
+    /// configured worker count, whatever W wrote it, and still matches a from-scratch run.
+    /// </summary>
+    [Theory]
+    [InlineData(1, 4)]
+    [InlineData(4, 2)]
+    [InlineData(4, 1)]
+    public async Task DefaultPolicy_JournalOnly_RedeployReplaysAtTheConfiguredWorkerCount(int before, int after)
+    {
+        var prefix = $"journal{before}{after}";
+        var snapshotDir = Path.Combine(_root, "snap-" + prefix);
+        var deploy = await RunTwoBatches(new DbspNetEngine(before), ProgramSql, prefix, snapshotDir: snapshotDir);
+        Assert.Equal(before, deploy.Workers);
+        Assert.False(File.Exists(Path.Combine(snapshotDir, "current.txt")));
+        Assert.NotEmpty(Directory.EnumerateFiles(Path.Combine(snapshotDir, "journal")));
+
+        var resumed = await AppendThenRedeploy(new DbspNetEngine(after), prefix, snapshotDir);
+        Assert.Equal(after, resumed.Workers);
+        Assert.True(resumed.RestoredTick > 0);
+        await AssertMatchesFromScratch(prefix);
+    }
+
+    private ProgramSpec SpecFor(string prefix, string totalsDir, string? snapshotDir) => new(
+        ProgramSql,
+        new[]
+        {
+            new InputSpec("company", Path.Combine(_root, prefix, "company")),
+            new InputSpec("trade", Path.Combine(_root, prefix, "trade")),
+        },
+        new[] { new OutputSpec("company_totals", totalsDir) },
+        SnapshotDir: snapshotDir);
+
+    // One more version on each source, then a new engine deployed over the same sources, sink and
+    // checkpoint, and one batch run on it.
+    private async Task<DeployResult> AppendThenRedeploy(DbspNetEngine engine, string prefix, string snapshotDir)
+    {
+        foreach (var (name, schema, row) in new[]
+                 {
+                     ("company", CompanySchema(), new object?[] { 4, 400, 1 }),
+                     ("trade", TradeSchema(), new object?[] { 16, 1, 9 }),
+                 })
+        {
+            using var table = await DeltaTable.OpenAsync(
+                new LocalTableFileSystem(Path.Combine(_root, prefix, name)), cancellationToken: CancellationToken.None);
+            await Append(table, schema, new List<object?[]>(), row);
+        }
+
+        var deploy = await engine.DeployAsync(SpecFor(prefix, Path.Combine(_root, prefix, "out_totals"), snapshotDir));
+        engine.Resume();
+        await engine.WaitAsync();
+        return deploy;
+    }
+
+    private async Task AssertMatchesFromScratch(string prefix)
+    {
+        var scratchDir = Path.Combine(_root, prefix, "out_scratch");
+        Directory.CreateDirectory(scratchDir);
+        var scratch = new DbspNetEngine();
+        await scratch.DeployAsync(SpecFor(prefix, scratchDir, snapshotDir: null));
+        scratch.Resume();
+        await scratch.WaitAsync();
+
+        var expected = await ReadTotals(scratchDir);
+        Assert.True(expected.Count > 0);
+        Assert.True((await ReadTotals(Path.Combine(_root, prefix, "out_totals"))).Equals(expected));
     }
 
     private async Task<DeployResult> RunTwoBatches(

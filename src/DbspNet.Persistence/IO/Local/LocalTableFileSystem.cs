@@ -10,7 +10,11 @@ namespace DbspNet.Persistence.IO.Local;
 /// Uses <see cref="LocalRandomAccessFile"/> and <see cref="LocalSequentialFile"/>
 /// for file handle operations.
 /// </summary>
-public sealed class LocalTableFileSystem : ITableFileSystem
+/// <remarks>
+/// Writes land in the OS page cache; <see cref="SyncAsync"/> and
+/// <see cref="WriteAllBytesDurableAsync"/> make them survive power loss.
+/// </remarks>
+public sealed class LocalTableFileSystem : IDurableTableFileSystem
 {
     private readonly string _rootPath;
     private readonly BufferAllocator? _allocator;
@@ -150,8 +154,110 @@ public sealed class LocalTableFileSystem : ITableFileSystem
         if (directory is not null)
             Directory.CreateDirectory(directory);
 
-        File.WriteAllBytes(fullPath, data.Span.ToArray());
+        // Write-then-rename so a reader (or a crash) sees the old contents or the new ones,
+        // never a truncated file.
+        var tmp = TempSibling(fullPath);
+        try
+        {
+            File.WriteAllBytes(tmp, data.Span);
+            File.Move(tmp, fullPath, overwrite: true);
+        }
+        catch
+        {
+            TryDelete(tmp);
+            throw;
+        }
+
         return default;
+    }
+
+    /// <inheritdoc/>
+    public ValueTask SyncAsync(IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        var directories = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var path in paths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fullPath = ResolvePath(path);
+            LocalDurability.SyncFile(fullPath);
+
+            // Every directory from the file's parent up to the root may be new, and each one's
+            // entry lives in its own parent; the root's parent covers a freshly created root.
+            var dir = Path.GetDirectoryName(fullPath);
+            while (dir is not null && directories.Add(dir) && dir.Length > _rootPath.Length)
+            {
+                dir = Path.GetDirectoryName(dir);
+            }
+        }
+
+        if (directories.Count == 0)
+        {
+            return default;
+        }
+
+        var rootParent = Path.GetDirectoryName(_rootPath);
+        if (rootParent is not null)
+        {
+            directories.Add(rootParent);
+        }
+
+        foreach (var dir in directories)
+        {
+            if (Directory.Exists(dir))
+            {
+                LocalDurability.SyncDirectory(dir);
+            }
+        }
+
+        LocalDurability.Barrier(_rootPath);
+        return default;
+    }
+
+    /// <inheritdoc/>
+    public ValueTask WriteAllBytesDurableAsync(
+        string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        string fullPath = ResolvePath(path);
+        string directory = Path.GetDirectoryName(fullPath) ?? _rootPath;
+        Directory.CreateDirectory(directory);
+
+        // The temp file's bytes must be durable BEFORE the rename publishes it, or a power loss can
+        // leave the new name pointing at an empty file. The rename is durable once its directory is.
+        var tmp = TempSibling(fullPath);
+        try
+        {
+            File.WriteAllBytes(tmp, data.Span);
+            LocalDurability.SyncFile(tmp);
+            File.Move(tmp, fullPath, overwrite: true);
+        }
+        catch
+        {
+            TryDelete(tmp);
+            throw;
+        }
+
+        LocalDurability.SyncDirectory(directory);
+        LocalDurability.Barrier(directory);
+        return default;
+    }
+
+    private static string TempSibling(string fullPath) =>
+        fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private string ResolvePath(string relativePath) =>

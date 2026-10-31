@@ -55,12 +55,18 @@ public class ProgramRunnerCheckpointTests
     private static CompiledProgram CompilePersistent() =>
         SqlProgram.Compile(ProgramSql, OutputViews, ArrowSqlSnapshotCodecs.Instance);
 
-    private static Dictionary<string, long> Materialize(ProgramOutput output)
+    private static Dictionary<string, long> Materialize(ProgramOutput output) =>
+        Materialize(output.CurrentView, output.Schema.Count);
+
+    private static Dictionary<string, long> Materialize(ParallelProgramOutput output) =>
+        Materialize(output.CurrentView, output.Schema.Count);
+
+    private static Dictionary<string, long> Materialize(ZSet<StructuralRow, Z64> view, int columns)
     {
         var map = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var kv in output.CurrentView)
+        foreach (var kv in view)
         {
-            var cells = new string[output.Schema.Count];
+            var cells = new string[columns];
             for (var i = 0; i < cells.Length; i++)
             {
                 cells[i] = kv.Key[i]?.ToString() ?? "<null>";
@@ -132,6 +138,68 @@ public class ProgramRunnerCheckpointTests
         Assert.Equal(reference.Circuit.TickCount, p2.Circuit.TickCount);
     }
 
+    private static ParallelCompiledProgram CompileParallelPersistent(int workers)
+    {
+        Assert.True(SqlProgram.TryCompileParallel(
+            ProgramSql, OutputViews, workers, out var p, ArrowSqlSnapshotCodecs.Instance));
+        return p!;
+    }
+
+    private static async ValueTask<ProgramRunner> ParallelRunnerOver(
+        ParallelCompiledProgram program,
+        IReadOnlyList<IReadOnlyList<(object?[] Row, long Weight)>> versions,
+        IParallelCheckpointStore checkpoint)
+    {
+        var input = new FakeInputConnector("t", TwoInts(), versions);
+        var outputs = OutputViews
+            .Select(v => (IOutputConnector)new FakeOutputConnector(v, OutputMode.Truncate))
+            .ToList();
+        return await ProgramRunner.CreateAsync(program, [input], outputs, checkpoint);
+    }
+
+    /// <summary>
+    /// The parallel runner checkpoints too: all W workers and the cursor commit together, and a
+    /// restarted parallel engine resumes exactly where the checkpoint left off — equal to an
+    /// uninterrupted serial run. An idle batch writes nothing, as on the serial path.
+    /// </summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    public async Task ParallelRunner_RestoreAfterBatch_ResumesWithoutReplayingOrSkipping(int workers)
+    {
+        var all = Versions();
+        var fs = new DbspNet.Tests.Persistence.CrashSimulatingFileSystem();
+        var store = new SnapshotCheckpointStore(fs);
+
+        using (var p1 = CompileParallelPersistent(workers))
+        {
+            var r1 = await ParallelRunnerOver(p1, all.Take(2).ToList(), store);
+            Assert.True(r1.HasCheckpoint);
+            Assert.Equal(2, await r1.RunBatchAsync());
+            var afterFirst = fs.Mutations;
+            Assert.Equal(0, await r1.RunBatchAsync());
+            Assert.Equal(afterFirst, fs.Mutations);
+        }
+
+        Assert.Equal(workers, await store.RecordedWorkersAsync());
+
+        using var p2 = CompileParallelPersistent(workers);
+        var r2 = await ParallelRunnerOver(p2, all, store);
+        Assert.Equal(2, await r2.RestoreAsync());
+        Assert.Equal(2, await r2.RunBatchAsync());
+
+        var reference = CompilePersistent();
+        var rr = await RunnerOver(reference, all, checkpoint: null);
+        Assert.Equal(4, await rr.RunBatchAsync());
+
+        foreach (var view in OutputViews)
+        {
+            Assert.Equal(Materialize(reference.Outputs[view]), Materialize(p2.Outputs[view]));
+        }
+
+        Assert.Equal(reference.Circuit.TickCount, p2.Circuit.TickCount);
+    }
+
     /// <summary>The second batch checkpoints too — each <c>RunBatchAsync</c> ends
     /// durable, so a restart after batch N resumes at batch N+1.</summary>
     [Fact]
@@ -188,5 +256,54 @@ public class ProgramRunnerCheckpointTests
         {
             Assert.Equal(Materialize(without.Outputs[view]), Materialize(withCodecs.Outputs[view]));
         }
+    }
+
+    /// <summary>
+    /// A batch that drains nothing writes no checkpoint: state and cursors are exactly what
+    /// the last one holds. Before, it re-serialised all state into the committed snapshot's
+    /// own directory, so a crash mid-rewrite destroyed the only checkpoint — and paid a full
+    /// state rewrite for nothing.
+    /// </summary>
+    [Fact]
+    public async Task IdleBatch_WritesNoCheckpoint()
+    {
+        var fs = new DbspNet.Tests.Persistence.CrashSimulatingFileSystem();
+        var store = new SnapshotCheckpointStore(fs);
+
+        var p1 = CompilePersistent();
+        var r1 = await RunnerOver(p1, Versions().Take(2).ToList(), store);
+        Assert.Equal(2, await r1.RunBatchAsync());
+        var afterFirst = fs.Mutations;
+
+        Assert.Equal(0, await r1.RunBatchAsync());
+        await r1.CheckpointAsync();
+        Assert.Equal(afterFirst, fs.Mutations);
+
+        // Same after a restart: the restored checkpoint is the last one.
+        var p2 = CompilePersistent();
+        var r2 = await RunnerOver(p2, Versions().Take(2).ToList(), store);
+        Assert.Equal(2, await r2.RestoreAsync());
+        Assert.Equal(0, await r2.RunBatchAsync());
+        Assert.Equal(afterFirst, fs.Mutations);
+    }
+
+    /// <summary>
+    /// A commit pointer naming an unreadable snapshot fails the restore. Only a missing
+    /// pointer means "fresh start"; treating damage as one would silently re-ingest every
+    /// source from its initial offset over empty state.
+    /// </summary>
+    [Fact]
+    public async Task DamagedCheckpoint_FailsRestoreInsteadOfStartingFresh()
+    {
+        var fs = new InMemoryTableFileSystem();
+        var store = new SnapshotCheckpointStore(fs);
+        var r1 = await RunnerOver(CompilePersistent(), Versions().Take(2).ToList(), store);
+        await r1.RunBatchAsync();
+
+        var current = System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
+        await fs.DeleteAsync(current + "/manifest.json");
+
+        var r2 = await RunnerOver(CompilePersistent(), Versions(), store);
+        await Assert.ThrowsAsync<System.IO.FileNotFoundException>(async () => await r2.RestoreAsync());
     }
 }

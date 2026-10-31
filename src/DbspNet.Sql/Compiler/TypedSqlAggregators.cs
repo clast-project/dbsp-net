@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Buffers;
 using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
@@ -68,6 +69,32 @@ internal abstract class TypedSqlAggregator<TIn>
     public virtual void UpdateInto(
         ref object? state, ZSet<TIn, Z64> delta, IMultiset<TIn, Z64> after, object?[] results, int[] slots)
         => results[slots[0]] = Update(ref state, delta, after);
+
+    /// <summary>
+    /// Typed counterpart of <see cref="IAggregator{TValue,TOut}.CanPersistState"/>: true only for the
+    /// order-sensitive <c>double</c> accumulators, whose bulk re-fold on restore can differ in the last
+    /// bits from the per-tick fold that built the live state (docs/design-incremental-persistence.md
+    /// §7.2/§8). Everything exact re-derives by folding.
+    /// </summary>
+    public virtual bool CanPersistState => false;
+
+    /// <summary>Serialise one group's state. Only called when <see cref="CanPersistState"/> is true.</summary>
+    public virtual void WriteState(IBufferWriter<byte> writer, object? state)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not persist state; check CanPersistState first.");
+
+    /// <summary>Replace the folded <paramref name="state"/> with the blob written by <see cref="WriteState"/>.</summary>
+    public virtual void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not persist state; check CanPersistState first.");
+
+    private protected static void WriteDoubleLong(IBufferWriter<byte> writer, double d, long n)
+    {
+        var span = writer.GetSpan(16);
+        BitConverter.TryWriteBytes(span[..8], d);
+        BitConverter.TryWriteBytes(span.Slice(8, 8), n);
+        writer.Advance(16);
+    }
 }
 
 /// <summary>
@@ -180,6 +207,18 @@ internal sealed class TypedSumDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
         state = s;
         return s;
     }
+
+    public override bool CanPersistState => true;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var span = writer.GetSpan(8);
+        BitConverter.TryWriteBytes(span[..8], state is double d ? d : 0.0);
+        writer.Advance(8);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+        => state = BitConverter.ToDouble(blob[..8]);
 }
 
 /// <summary>
@@ -327,6 +366,17 @@ internal sealed class TypedAvgDoubleAggregator<TIn> : TypedSqlAggregator<TIn>
         state = s;
         return s.Sum / s.Count;
     }
+
+    public override bool CanPersistState => true;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var s = state as AvgState ?? new AvgState();
+        WriteDoubleLong(writer, s.Sum, s.Count);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+        => state = new AvgState { Sum = BitConverter.ToDouble(blob[..8]), Count = BitConverter.ToInt64(blob.Slice(8, 8)) };
 }
 
 // ---- Nullable-arg variants (Phase N4) ----
@@ -485,6 +535,21 @@ internal sealed class TypedSumDoubleNullableAggregator<TIn> : TypedSqlAggregator
         state = s;
         return s.DistinctNonNullRows > 0 ? (object)s.Sum : null;
     }
+
+    public override bool CanPersistState => true;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var s = state as SumState ?? new SumState();
+        WriteDoubleLong(writer, s.Sum, s.DistinctNonNullRows);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+        => state = new SumState
+        {
+            Sum = BitConverter.ToDouble(blob[..8]),
+            DistinctNonNullRows = BitConverter.ToInt64(blob.Slice(8, 8)),
+        };
 }
 
 /// <summary><c>SUM</c>-of-non-null with <see cref="Decimal128"/> running total and nullable-arg extraction.</summary>
@@ -590,6 +655,21 @@ internal sealed class TypedAvgDoubleNullableAggregator<TIn> : TypedSqlAggregator
         state = s;
         return s.NonNullCount == 0 ? null : (object)(s.Sum / s.NonNullCount);
     }
+
+    public override bool CanPersistState => true;
+
+    public override void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        var s = state as AvgState ?? new AvgState();
+        WriteDoubleLong(writer, s.Sum, s.NonNullCount);
+    }
+
+    public override void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+        => state = new AvgState
+        {
+            Sum = BitConverter.ToDouble(blob[..8]),
+            NonNullCount = BitConverter.ToInt64(blob.Slice(8, 8)),
+        };
 }
 
 /// <summary><c>AVG</c>-of-non-null over a DECIMAL column with nullable-arg extraction.</summary>
@@ -1177,5 +1257,88 @@ internal sealed class TypedCompositeAggregator<TIn, TAgg> : IAggregator<TIn, TAg
         }
 
         return Optional<TAgg>.Some(_packResults(results));
+    }
+
+    /// <summary>
+    /// True when <b>any</b> sub-aggregate persists state — the same per-slot rule as the structural
+    /// <see cref="CompositeAggregator"/>, so a mixed <c>AVG(x), MIN(y)</c> group persists the AVG slot
+    /// and re-derives MIN by folding.
+    /// </summary>
+    public bool CanPersistState
+    {
+        get
+        {
+            foreach (var a in _aggs)
+            {
+                if (a.CanPersistState)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    // Framing matches CompositeAggregator: per sub-aggregate, in declaration order,
+    // [byte present][int32 length][length bytes]; present = 0 carries no payload.
+    public void WriteState(IBufferWriter<byte> writer, object? state)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        var slots = state as object?[];
+
+        var scratch = new ArrayBufferWriter<byte>();
+        for (var i = 0; i < _aggs.Length; i++)
+        {
+            var slot = slots is not null && i < slots.Length ? slots[i] : null;
+            if (!_aggs[i].CanPersistState || slot is null)
+            {
+                var absent = writer.GetSpan(1);
+                absent[0] = 0;
+                writer.Advance(1);
+                continue;
+            }
+
+            scratch.Clear();
+            _aggs[i].WriteState(scratch, slot);
+            var payload = scratch.WrittenSpan;
+
+            var header = writer.GetSpan(5);
+            header[0] = 1;
+            BitConverter.TryWriteBytes(header.Slice(1, 4), payload.Length);
+            writer.Advance(5);
+            writer.Write(payload);
+        }
+    }
+
+    public void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
+    {
+        // The caller has already folded the restored group into every slot, so an
+        // absent entry keeps that folded value.
+        var slots = state as object?[] ?? new object?[_aggs.Length];
+        var cursor = 0;
+        for (var i = 0; i < _aggs.Length; i++)
+        {
+            if (cursor >= blob.Length)
+            {
+                break;
+            }
+
+            var present = blob[cursor];
+            cursor += 1;
+            if (present == 0)
+            {
+                continue;
+            }
+
+            var length = BitConverter.ToInt32(blob.Slice(cursor, 4));
+            cursor += 4;
+            var slot = slots[i];
+            _aggs[i].MergePersistedState(ref slot, blob.Slice(cursor, length));
+            slots[i] = slot;
+            cursor += length;
+        }
+
+        state = slots;
     }
 }
