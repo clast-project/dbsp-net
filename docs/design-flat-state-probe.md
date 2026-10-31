@@ -129,6 +129,40 @@ Dictionaries, whatever the memory model.
 - Managed-arm checkpoint here is a plain `BinaryWriter`; the engine's Arrow snapshot was not
   measured in this probe (design-durable-state §1b has it for ivm-bench: 4.6 GB, 11.3 GiB allocated).
 
+### 3.4 String input as UTF-8 bytes (`FLATSTATE_INPUT=utf8`, 10M events, retractions on)
+
+§3.1 fed every arm the generator's managed `string`s, which the managed arm keeps by reference for
+free. A connector delivers bytes instead, so this run packs each tick's strings into one UTF-8
+buffer before the timer (Arrow-style; every cell a `Utf8String` slice). The managed arm decodes each
+cell to a `string`; the flat arms copy bytes into a UTF-8 arena (the store is generic over
+`char`/`byte`); the engine keeps the slices (its boundary encoder passes `Utf8String` through). Both
+modes were re-measured together on `1ccac66`, 5 runs each, all checksums and restores agreeing
+(raw: `docs/flat-state-probe-results-utf8.txt`).
+
+| W | arm | ns/ev, string | ns/ev, UTF-8 | alloc B/ev string → UTF-8 | live state string → UTF-8 | restore string → UTF-8 |
+|--:|---|--:|--:|--:|--:|--:|
+| 1 | engine | 882 | **691** | 1431 → 1007 | 3.1 → 2.9 GB | — |
+| 1 | managed | 284 | 358 | 161 → 488 | 3.7 → 3.7 GB | 2167 → 2113 ms |
+| 1 | poh | 345 | 324 | 331 → 216 | 3.1 → 2.0 GB | 316 → 228 ms |
+| 1 | native | 327 | **313** | 0 → 0 | 3.1 → 2.0 GB | 219 → 152 ms |
+| 8 | engine | 546 | **445** | 1842 → 1418 | 3.1 → 2.9 GB | — |
+| 8 | managed | 197 | 201 | 161 → 488 | 3.7 → 3.7 GB | 775 → 608 ms |
+| 8 | poh | 188 | 179 | 331 → 214 | 3.1 → 2.0 GB | 110 → 89 ms |
+| 8 | native | 174 | **172** | 1 → 1 | 3.1 → 2.0 GB | 60 → 44 ms |
+
+- **The W=1 order flips.** Decoding three strings per bid costs the managed arm +26% (284 → 358)
+  and triples its allocation; the flat arms get slightly faster on half the bytes. Native now leads
+  managed 1.14× at W=1 and 1.17× at W=8 — still under the 1.3× gate.
+- **Flat state shrinks by a third** (3.1 → 2.0 GB, now 45% smaller than managed objects), and so do
+  its checkpoint files (3.1 → 2.0 GB, now 1.5× managed's `BinaryWriter` file rather than 2.3×).
+- **The engine gains most: −22% at W=1, −19% at W=8**, because its boundary encoder no longer
+  allocates a `Utf8String` per string cell (−424 B/ev) and its GC pause falls 764 → 155 ms (W=1).
+  It still runs 1.9–2.2× slower than the managed arm and 2.2–2.6× slower than native. The engine
+  keeps slices of the input buffer, so a buffer stays alive while any row from it does — harmless
+  here (90% of rows live), the chunk-retention risk of design-state-representation §10.H in general.
+- Native's 25–49 ms of pause in this mode are collections triggered by the harness's untimed input
+  conversion landing inside timed ticks; native itself allocates ~0 B/event.
+
 ## 4. Against the thresholds set before building
 
 | decision (from the scoping) | result |
@@ -161,8 +195,8 @@ Dictionaries, whatever the memory model.
 
 - One query. q20 is a join with wide string rows and append-mostly state; aggregates, TOP-K and
   windows were not tested (q4 was the planned second workload).
-- Input arrives as managed strings, which favours the managed arm (zero-copy). The flat arms store
-  UTF-16; the engine stores UTF-8.
+- §3.1–§3.3 feed managed strings, which favours the managed arm (zero-copy) and makes the flat arms
+  store UTF-16; §3.4 re-measures with UTF-8 input, where the managed arm pays to decode.
 - The machine was idle: background GC got 6 spare cores for free at W=8.
 - The managed arm is hand-specialised to q20 (typed fields, one row class per table); the engine
   cannot be that specific without codegen. Its number is a floor for a managed engine, not a forecast.
