@@ -56,7 +56,8 @@ internal static class FlatStateProbe
         var r = new List<string>
         {
             $"arm={arm}", $"W={workers}", $"events={events}", $"retract={(retract ? 1 : 0)}", $"batch={batch}",
-            $"ns_ev={m.TimedNs / events:F1}", $"timed_ms={m.TimedNs / 1e6:F0}",
+            $"ns_ev={m.TimedNs / events:F1}", $"timed_ms={m.TimedNs / 1e6:F0}", $"cpu_ms={m.CpuMs:F0}",
+            $"process_cpu_ms={Environment.CpuUsage.TotalTime.TotalMilliseconds:F0}",
             $"alloc_B_ev={m.AllocBytes / (double)events:F1}", $"pause_ms={m.PauseMs:F0}",
             $"gc0={m.Gen0}", $"gc1={m.Gen1}", $"gc2={m.Gen2}",
             $"live_managed_MB={managedLive / 1048576.0:F0}", $"native_MB={native / 1048576.0:F0}",
@@ -81,6 +82,7 @@ internal static class FlatStateProbe
         public double TimedNs;
         public long AllocBytes;
         public double PauseMs;
+        public double CpuMs;
         public int Gen0;
         public int Gen1;
         public int Gen2;
@@ -147,10 +149,12 @@ internal static class FlatStateProbe
             var g0 = GC.CollectionCount(0);
             var g1 = GC.CollectionCount(1);
             var g2 = GC.CollectionCount(2);
+            var cpu0 = Environment.CpuUsage.TotalTime;
             sw.Restart();
             arm.Step(bids, auctions);
             var (sum, rows) = arm.Sink();
             sw.Stop();
+            m.CpuMs += (Environment.CpuUsage.TotalTime - cpu0).TotalMilliseconds;
             var pause = (GC.GetTotalPauseDuration() - pause0).TotalMilliseconds;
             m.AllocBytes += GC.GetTotalAllocatedBytes(precise: false) - alloc0;
             m.Gen0 += GC.CollectionCount(0) - g0;

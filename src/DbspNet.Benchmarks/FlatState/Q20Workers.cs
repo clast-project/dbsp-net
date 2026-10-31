@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.IO.MemoryMappedFiles;
+using System.Runtime.CompilerServices;
 using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Benchmarks.FlatState;
@@ -493,36 +494,23 @@ internal sealed class ManagedQ20Worker : IQ20Worker
     }
 }
 
+
 // ---------------------------------------------------------------------------------------------
-// Arms 2 and 3: the flat store. Output is a columnar batch in the same kind of pages, reused
+// Arms 2 and 3: the flat store. Output is a batch of records in the same kind of pages, reused
 // every tick; it copies its strings, so it never points into state that the tick may free.
 // ---------------------------------------------------------------------------------------------
 
+/// <summary>Output records: weight (8) · 10 longs (auction, bidder, price, bidTime, initialBid,
+/// reserve, auctionTime, expires, seller, category) · 6 string starts (channel, url, bidExtra,
+/// itemName, description, auctionExtra) · 6 string lengths.</summary>
 internal sealed unsafe class FlatOutBatch<TP> : IDisposable
     where TP : struct, IPageSource
 {
-    public const int Longs = 10; // auction, bidder, price, bidTime, initialBid, reserve, auctionTime, expires, seller, category
-    public const int Strs = 6;   // channel, url, bidExtra, itemName, description, auctionExtra
+    private const int OffS = 8 + (8 * 10);
+    private const int OffN = OffS + (8 * 6);
+    private readonly RecordPages<TP> _rec = new(OffN + (4 * 6));
 
-    public readonly PagedColumn<long, TP>[] L = new PagedColumn<long, TP>[Longs];
-    public readonly PagedColumn<long, TP>[] SStart = new PagedColumn<long, TP>[Strs];
-    public readonly PagedColumn<int, TP>[] SLen = new PagedColumn<int, TP>[Strs];
-    public readonly PagedColumn<long, TP> W = new();
-    public readonly CharArena<TP> Arena = new();
-
-    public FlatOutBatch()
-    {
-        for (var i = 0; i < Longs; i++)
-        {
-            L[i] = new();
-        }
-
-        for (var i = 0; i < Strs; i++)
-        {
-            SStart[i] = new();
-            SLen[i] = new();
-        }
-    }
+    public CharArena<TP> Arena { get; } = new();
 
     public int Count { get; private set; }
 
@@ -532,47 +520,38 @@ internal sealed unsafe class FlatOutBatch<TP> : IDisposable
         Arena.Reset();
     }
 
-    public int Add(long w)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public byte* Add(long w)
     {
         var i = Count++;
-        foreach (var c in L)
+        if (Count > _rec.Capacity)
         {
-            c.Ensure(Count);
+            _rec.Ensure(Count);
         }
 
-        for (var c = 0; c < Strs; c++)
-        {
-            SStart[c].Ensure(Count);
-            SLen[c].Ensure(Count);
-        }
-
-        W.Ensure(Count);
-        W[i] = w;
-        return i;
+        var r = _rec.Rec(i);
+        *(long*)r = w;
+        return r;
     }
 
-    public void SetStr(int col, int row, ReadOnlySpan<char> s)
+    public byte* Rec(int i) => _rec.Rec(i);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ref long Long(byte* r, int c) => ref ((long*)(r + 8))[c];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetStr(byte* r, int c, ReadOnlySpan<char> s)
     {
-        SStart[col][row] = Arena.Append(s);
-        SLen[col][row] = s.Length;
+        ((long*)(r + OffS))[c] = Arena.Append(s);
+        ((int*)(r + OffN))[c] = s.Length;
     }
 
-    public ReadOnlySpan<char> Str(int col, int row) => Arena.Get(SStart[col][row], SLen[col][row]);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlySpan<char> Str(byte* r, int c) => Arena.Get(((long*)(r + OffS))[c], ((int*)(r + OffN))[c]);
 
     public void Dispose()
     {
-        foreach (var c in L)
-        {
-            c.Dispose();
-        }
-
-        for (var i = 0; i < Strs; i++)
-        {
-            SStart[i].Dispose();
-            SLen[i].Dispose();
-        }
-
-        W.Dispose();
+        _rec.Dispose();
         Arena.Dispose();
     }
 }
@@ -586,8 +565,8 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
     private readonly FlatOutBatch<TP> _out = new();
     private readonly long[] _l = new long[8];
     private readonly string[] _s = new string[3];
-    private FlatTable<TP> _bids;
-    private FlatTable<TP> _auctions;
+    private readonly FlatTable<TP> _bids;
+    private readonly FlatTable<TP> _auctions;
     private MemoryMappedFile? _map;
     private MemoryMappedViewAccessor? _view;
 
@@ -612,11 +591,13 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         foreach (var (r, w) in bids)
         {
             Q20Cells.Bid(r, _l, _s);
-            for (var slot = a.ChainHead(_l[0]); slot >= 0; slot = a.Next[slot])
+            for (var slot = a.ChainHead(_l[0]); slot >= 0;)
             {
-                var o = _out.Add(w * a.W[slot]);
+                var ar = a.Rec(slot);
+                var o = _out.Add(w * FlatTable<TP>.Weight(ar));
                 WriteBid(o, _l, _s);
-                WriteAuction(o, a, slot);
+                WriteAuction(o, a, ar);
+                slot = a.NextOf(ar);
             }
 
             b.Upsert(_l.AsSpan(0, Q20Cells.BidLongs), _s, w);
@@ -630,11 +611,13 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
             }
 
             Q20Cells.Auction(r, _l, _s);
-            for (var slot = b.ChainHead(_l[0]); slot >= 0; slot = b.Next[slot])
+            for (var slot = b.ChainHead(_l[0]); slot >= 0;)
             {
-                var o = _out.Add(b.W[slot] * w);
-                WriteBid(o, b, slot);
+                var br = b.Rec(slot);
+                var o = _out.Add(FlatTable<TP>.Weight(br) * w);
+                WriteBid(o, b, br);
                 WriteAuction(o, _l, _s);
+                slot = b.NextOf(br);
             }
 
             a.Upsert(_l.AsSpan(0, Q20Cells.AuctionLongs), _s, w);
@@ -648,11 +631,13 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         var o = _out;
         for (var i = 0; i < o.Count; i++)
         {
-            var w = o.W[i];
+            var r = o.Rec(i);
+            var w = *(long*)r;
             sum += (ulong)w * Q20Cells.OutHash(
-                o.L[0][i], o.L[1][i], o.L[2][i], o.Str(0, i), o.Str(1, i), o.L[3][i], o.Str(2, i),
-                o.Str(3, i), o.Str(4, i), o.L[4][i], o.L[5][i], o.L[6][i], o.L[7][i], o.L[8][i], o.L[9][i],
-                o.Str(5, i));
+                FlatOutBatch<TP>.Long(r, 0), FlatOutBatch<TP>.Long(r, 1), FlatOutBatch<TP>.Long(r, 2),
+                o.Str(r, 0), o.Str(r, 1), FlatOutBatch<TP>.Long(r, 3), o.Str(r, 2), o.Str(r, 3), o.Str(r, 4),
+                FlatOutBatch<TP>.Long(r, 4), FlatOutBatch<TP>.Long(r, 5), FlatOutBatch<TP>.Long(r, 6),
+                FlatOutBatch<TP>.Long(r, 7), FlatOutBatch<TP>.Long(r, 8), FlatOutBatch<TP>.Long(r, 9), o.Str(r, 5));
             rows += w;
         }
 
@@ -669,17 +654,17 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
     public long ProbeOne(long auction)
     {
         long n = 0;
-        for (var slot = _bids.ChainHead(auction); slot >= 0; slot = _bids.Next[slot])
+        for (var slot = _bids.ChainHead(auction); slot >= 0; slot = _bids.NextOf(_bids.Rec(slot)))
         {
-            n += _bids.SLen[0][slot] > 0 ? 1 : 0;
+            n++;
         }
 
         return n;
     }
 
-    // Checkpoint: a 16 KiB header of scalars, then every column's pages, whole, in a fixed order.
-    // Every page size is a multiple of 16 KiB, so every page lands page-aligned in the file and
-    // a mapped restore can point the columns straight at the file.
+    // Checkpoint: a 16 KiB header of scalars, then every part's pages, whole, in a fixed order.
+    // Every page size is a multiple of 16 KiB, so every page lands page-aligned in the file and a
+    // mapped restore can point the tables straight at the file.
     public void Checkpoint(string path)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 0);
@@ -688,18 +673,18 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         header[h++] = Magic;
         foreach (var t in new[] { _bids, _auctions })
         {
-            header[h++] = t.High;
-            header[h++] = t.FreeHead;
-            header[h++] = t.Live;
-            header[h++] = t.Arena.Used;
-            header[h++] = t.Arena.Garbage;
-            header[h++] = t.RtCap;
-            header[h++] = t.RtCount;
-            header[h++] = t.RtTomb;
-            header[h++] = t.KCap;
-            header[h++] = t.KCount;
+            foreach (var v in t.SaveScalars())
+            {
+                header[h++] = v;
+            }
+
             foreach (var c in t.Columns())
             {
+                if ((c.PageBytes & ((16 << 10) - 1)) != 0)
+                {
+                    throw new InvalidOperationException($"page of {c.PageBytes} bytes is not 16 KiB-aligned");
+                }
+
                 header[h++] = c.Pages();
             }
         }
@@ -723,7 +708,7 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
     /// <summary>Restore by reading every page into freshly allocated pages.</summary>
     public static FlatQ20Worker<TP> Restore(string path) => Restore(path, mapped: false);
 
-    /// <summary>Restore by mapping the checkpoint copy-on-write and pointing the columns at it:
+    /// <summary>Restore by mapping the checkpoint copy-on-write and pointing the tables at it:
     /// nothing is read until a page is touched.</summary>
     public static FlatQ20Worker<TP> RestoreMapped(string path) => Restore(path, mapped: true);
 
@@ -760,16 +745,8 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         var counts = new List<int>();
         foreach (var t in new[] { bids, auctions })
         {
-            t.High = (int)header[h++];
-            t.FreeHead = (int)header[h++];
-            t.Live = (int)header[h++];
-            t.Arena.Used = header[h++];
-            t.Arena.Garbage = header[h++];
-            t.RtCap = (int)header[h++];
-            t.RtCount = (int)header[h++];
-            t.RtTomb = (int)header[h++];
-            t.KCap = (int)header[h++];
-            t.KCount = (int)header[h++];
+            t.LoadScalars(header.AsSpan(h, FlatTable<TP>.ScalarCount));
+            h += FlatTable<TP>.ScalarCount;
             foreach (var unused in t.Columns())
             {
                 counts.Add((int)header[h++]);
@@ -807,7 +784,7 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
             foreach (var c in t.Columns())
             {
                 var pages = counts[k++];
-                c.Ensure((long)pages << PagedColumn<int, TP>.Shift);
+                c.AddPages(pages);
                 for (var p = 0; p < pages; p++)
                 {
                     var span = new Span<byte>((void*)c.Page(p), checked((int)c.PageBytes));
@@ -831,49 +808,51 @@ internal sealed unsafe class FlatQ20Worker<TP> : IQ20Worker
         return worker;
     }
 
-    private void WriteBid(int o, long[] l, string[] s)
+    private void WriteBid(byte* o, long[] l, string[] s)
     {
-        _out.L[0][o] = l[0];
-        _out.L[1][o] = l[1];
-        _out.L[2][o] = l[2];
-        _out.L[3][o] = l[3];
-        _out.SetStr(0, o, s[0]);
-        _out.SetStr(1, o, s[1]);
-        _out.SetStr(2, o, s[2]);
+        for (var c = 0; c < Q20Cells.BidLongs; c++)
+        {
+            FlatOutBatch<TP>.Long(o, c) = l[c];
+        }
+
+        _out.SetStr(o, 0, s[0]);
+        _out.SetStr(o, 1, s[1]);
+        _out.SetStr(o, 2, s[2]);
     }
 
-    private void WriteBid(int o, FlatTable<TP> b, int slot)
+    private void WriteBid(byte* o, FlatTable<TP> b, byte* br)
     {
-        _out.L[0][o] = b.L[0][slot];
-        _out.L[1][o] = b.L[1][slot];
-        _out.L[2][o] = b.L[2][slot];
-        _out.L[3][o] = b.L[3][slot];
-        _out.SetStr(0, o, b.Str(0, slot));
-        _out.SetStr(1, o, b.Str(1, slot));
-        _out.SetStr(2, o, b.Str(2, slot));
+        for (var c = 0; c < Q20Cells.BidLongs; c++)
+        {
+            FlatOutBatch<TP>.Long(o, c) = FlatTable<TP>.Long(br, c);
+        }
+
+        _out.SetStr(o, 0, b.Str(br, 0));
+        _out.SetStr(o, 1, b.Str(br, 1));
+        _out.SetStr(o, 2, b.Str(br, 2));
     }
 
-    private void WriteAuction(int o, long[] l, string[] s)
+    private void WriteAuction(byte* o, long[] l, string[] s)
     {
         for (var c = 1; c < Q20Cells.AuctionLongs; c++)
         {
-            _out.L[3 + c][o] = l[c];
+            FlatOutBatch<TP>.Long(o, 3 + c) = l[c];
         }
 
-        _out.SetStr(3, o, s[0]);
-        _out.SetStr(4, o, s[1]);
-        _out.SetStr(5, o, s[2]);
+        _out.SetStr(o, 3, s[0]);
+        _out.SetStr(o, 4, s[1]);
+        _out.SetStr(o, 5, s[2]);
     }
 
-    private void WriteAuction(int o, FlatTable<TP> a, int slot)
+    private void WriteAuction(byte* o, FlatTable<TP> a, byte* ar)
     {
         for (var c = 1; c < Q20Cells.AuctionLongs; c++)
         {
-            _out.L[3 + c][o] = a.L[c][slot];
+            FlatOutBatch<TP>.Long(o, 3 + c) = FlatTable<TP>.Long(ar, c);
         }
 
-        _out.SetStr(3, o, a.Str(0, slot));
-        _out.SetStr(4, o, a.Str(1, slot));
-        _out.SetStr(5, o, a.Str(2, slot));
+        _out.SetStr(o, 3, a.Str(ar, 0));
+        _out.SetStr(o, 4, a.Str(ar, 1));
+        _out.SetStr(o, 5, a.Str(ar, 2));
     }
 }

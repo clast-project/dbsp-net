@@ -247,128 +247,226 @@ internal static class FlatHash
     public const ulong Seed = 0x243F6A8885A308D3UL;
 }
 
+/// <summary>Fixed-size records in pages of 2^13 records. A row's cells, weight and chain links
+/// sit together, so touching a row costs one or two cache lines, as a managed object does.</summary>
+internal sealed unsafe class RecordPages<TP> : IDisposable
+    where TP : struct, IPageSource
+{
+    public const int Shift = 13;
+    public const int PerPage = 1 << Shift;
+    private const int Mask = PerPage - 1;
+
+    private nint[] _pages = new nint[8];
+    private object?[] _owners = new object?[8];
+    private int _count;
+
+    public RecordPages(int recordBytes) => RecordBytes = recordBytes;
+
+    public int RecordBytes { get; }
+
+    public nuint PageBytes => (nuint)(PerPage * RecordBytes);
+
+    public int PageCount => _count;
+
+    public long Capacity => (long)_count << Shift;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public byte* Rec(int slot) => (byte*)_pages[slot >> Shift] + ((slot & Mask) * RecordBytes);
+
+    public byte* Page(int p) => (byte*)_pages[p];
+
+    public void Ensure(long n)
+    {
+        while (Capacity < n)
+        {
+            AddPage(TP.Alloc(PageBytes, out var owner), owner);
+        }
+    }
+
+    public void AdoptMapped(byte* p) => AddPage(p, MappedPage.Instance);
+
+    public void Dispose()
+    {
+        for (var i = 0; i < _count; i++)
+        {
+            if (_owners[i] is not MappedPage)
+            {
+                TP.Free((byte*)_pages[i], PageBytes, _owners[i]);
+            }
+
+            _owners[i] = null;
+            _pages[i] = 0;
+        }
+
+        _count = 0;
+    }
+
+    private void AddPage(byte* p, object? owner)
+    {
+        if (_count == _pages.Length)
+        {
+            Array.Resize(ref _pages, _count * 2);
+            Array.Resize(ref _owners, _count * 2);
+        }
+
+        _pages[_count] = (nint)p;
+        _owners[_count] = owner;
+        _count++;
+    }
+}
+
+/// <summary>A per-key row-index entry: the slot, and its row hash so a mismatch never touches
+/// the record.</summary>
+internal struct RowEntry
+{
+    public int Slot;
+    public int Hash;
+}
+
+/// <summary>A key-index entry: the key, the head and length of its chain of slots, and — once the
+/// chain has grown long — where its own row index sits in the sub-table pool.</summary>
+internal struct KeyEntry
+{
+    public long Key;
+    public int Head;
+    public int Count;
+    public int SubOff;
+    public int SubCap;
+}
+
+/// <summary>A column's pages seen untyped, for the checkpoint writer and reader.</summary>
+internal sealed class ColumnPages(Func<int> pages, Func<int, nint> page, nuint pageBytes, Action<nint> adopt, Action<int> addPages)
+{
+    public nuint PageBytes => pageBytes;
+
+    public int Pages() => pages();
+
+    public nint Page(int p) => page(p);
+
+    public void Adopt(nint p) => adopt(p);
+
+    public void AddPages(int n) => addPages(n);
+
+    public static unsafe ColumnPages Of<T, TP>(PagedColumn<T, TP> c)
+        where T : unmanaged
+        where TP : struct, IPageSource =>
+        new(() => c.PageCount, p => (nint)c.Page(p), PagedColumn<T, TP>.PageBytes, p => c.AdoptMapped((byte*)p),
+            n => c.Ensure((long)(c.PageCount + n) << PagedColumn<T, TP>.Shift));
+
+    public static unsafe ColumnPages Of<TP>(RecordPages<TP> c)
+        where TP : struct, IPageSource =>
+        new(() => c.PageCount, p => (nint)c.Page(p), c.PageBytes, p => c.AdoptMapped((byte*)p),
+            n => c.Ensure((long)(c.PageCount + n) << RecordPages<TP>.Shift));
+}
+
 /// <summary>A Z-set of rows (NL long cells, NS string cells, cell 0 the join key) in flat pages:
-/// slot columns, a string arena, an open-addressing row index (whole-row hash → slot, for
-/// consolidation and retraction) and a key index (key → doubly-linked chain of slots).</summary>
+/// one record per row (weight, cells, string handles, chain links, row hash), a string arena and
+/// a key index (key → doubly-linked chain of slots).</summary>
+/// <remarks>
+/// Finding a row to consolidate or retract walks its key's chain while the chain is short; past
+/// <see cref="ChainLimit"/> rows the key gets its own open-addressing row index, a power-of-two
+/// block from a pooled sub-table store — the flat counterpart of arm 1's one-row-inline /
+/// Dictionary-when-many bucket. Two earlier versions were slower than arm 1 for reasons of
+/// structure, not memory model: column-per-page records (one row touched ~14 pages), then one
+/// global whole-row index (half the bids go to a few hot auctions, and each was a random miss
+/// into a table over every row).
+/// <para>Record layout: weight (8) · longs (8·NL) · string starts (8·NS) · string lengths
+/// (4·NS) · prev (4) · next (4) · row hash (4), rounded up to 8 bytes.</para>
+/// </remarks>
 internal sealed unsafe class FlatTable<TP> : IDisposable
     where TP : struct, IPageSource
 {
     private const int Empty = -1;
-    private const int Tomb = -2;
     private const int NoKey = -2;
     private const int MinCap = PagedColumn<int, TP>.PageElems;
+    private const int ChainLimit = 16;
+    private const int SubClasses = PagedColumn<RowEntry, TP>.Shift + 1;
 
     public readonly int NL;
     public readonly int NS;
-    public readonly PagedColumn<long, TP>[] L;
-    public readonly PagedColumn<long, TP>[] SStart;
-    public readonly PagedColumn<int, TP>[] SLen;
-    public readonly PagedColumn<long, TP> W = new();
-    public readonly PagedColumn<int, TP> Hash = new();
-    public readonly PagedColumn<int, TP> Prev = new();
-    public readonly PagedColumn<int, TP> Next = new();
-
-    private PagedColumn<int, TP> _rt = new();
-    private PagedColumn<long, TP> _kk = new();
-    private PagedColumn<int, TP> _kh = new();
+    private readonly int _offS;
+    private readonly int _offN;
+    private readonly int _offP;
+    private readonly int _offX;
+    private readonly int _offH;
+    private readonly RecordPages<TP> _rec;
+    private readonly PagedColumn<RowEntry, TP> _sub = new();
+    private readonly int[] _subFree = new int[SubClasses];
+    private PagedColumn<KeyEntry, TP> _kt = new();
 
     public FlatTable(int nl, int ns, bool empty = true)
     {
         NL = nl;
         NS = ns;
-        L = new PagedColumn<long, TP>[nl];
-        SStart = new PagedColumn<long, TP>[ns];
-        SLen = new PagedColumn<int, TP>[ns];
-        for (var i = 0; i < nl; i++)
-        {
-            L[i] = new();
-        }
-
-        for (var i = 0; i < ns; i++)
-        {
-            SStart[i] = new();
-            SLen[i] = new();
-        }
-
+        _offS = 8 + (8 * nl);
+        _offN = _offS + (8 * ns);
+        _offP = _offN + (4 * ns);
+        _offX = _offP + 4;
+        _offH = _offX + 4;
+        _rec = new RecordPages<TP>((_offH + 4 + 7) & ~7);
+        Array.Fill(_subFree, -1);
         if (empty)
         {
-            RtCap = MinCap;
-            _rt.Ensure(RtCap);
-            _rt.Fill(Empty, RtCap);
             KCap = MinCap;
-            _kk.Ensure(KCap);
-            _kh.Ensure(KCap);
-            _kh.Fill(NoKey, KCap);
+            _kt.Ensure(KCap);
+            _kt.Fill(new KeyEntry { Head = NoKey }, KCap);
         }
     }
 
     public CharArena<TP> Arena { get; private set; } = new();
 
-    public int High { get; set; }
+    public int High { get; private set; }
 
-    public int FreeHead { get; set; } = -1;
+    public int FreeHead { get; private set; } = -1;
 
-    public int Live { get; set; }
+    public int Live { get; private set; }
 
-    public int RtCap { get; set; }
+    public int KCap { get; private set; }
 
-    public int RtCount { get; set; }
+    public int KCount { get; private set; }
 
-    public int RtTomb { get; set; }
+    public long SubUsed { get; private set; }
 
-    public int KCap { get; set; }
+    /// <summary>Every page-backed part, in checkpoint order.</summary>
+    public List<ColumnPages> Columns() =>
+        [ColumnPages.Of(_rec), ColumnPages.Of(Arena.Chars), ColumnPages.Of(_sub), ColumnPages.Of(_kt)];
 
-    public int KCount { get; set; }
+    /// <summary>The scalars a checkpoint must carry besides the pages.</summary>
+    public long[] SaveScalars() =>
+        [High, FreeHead, Live, Arena.Used, Arena.Garbage, KCap, KCount, SubUsed, .. _subFree.Select(f => (long)f)];
 
-    public PagedColumn<int, TP> RowTable => _rt;
-
-    public PagedColumn<long, TP> KeyKeys => _kk;
-
-    public PagedColumn<int, TP> KeyHeads => _kh;
-
-    /// <summary>Every column, in checkpoint order.</summary>
-    public List<ColumnPages> Columns()
+    public void LoadScalars(ReadOnlySpan<long> v)
     {
-        var all = new List<ColumnPages>();
-        for (var i = 0; i < NL; i++)
+        High = (int)v[0];
+        FreeHead = (int)v[1];
+        Live = (int)v[2];
+        Arena.Used = v[3];
+        Arena.Garbage = v[4];
+        KCap = (int)v[5];
+        KCount = (int)v[6];
+        SubUsed = v[7];
+        for (var i = 0; i < SubClasses; i++)
         {
-            all.Add(ColumnPages.Of(L[i]));
+            _subFree[i] = (int)v[8 + i];
         }
-
-        for (var i = 0; i < NS; i++)
-        {
-            all.Add(ColumnPages.Of(SStart[i]));
-            all.Add(ColumnPages.Of(SLen[i]));
-        }
-
-        all.Add(ColumnPages.Of(W));
-        all.Add(ColumnPages.Of(Hash));
-        all.Add(ColumnPages.Of(Prev));
-        all.Add(ColumnPages.Of(Next));
-        all.Add(ColumnPages.Of(Arena.Chars));
-        all.Add(ColumnPages.Of(_rt));
-        all.Add(ColumnPages.Of(_kk));
-        all.Add(ColumnPages.Of(_kh));
-        return all;
     }
 
-    /// <summary>A column's pages seen untyped, for the checkpoint writer and reader.</summary>
-    public sealed class ColumnPages(Func<int> pages, Func<int, nint> page, nuint pageBytes, Action<nint> adopt, Action<long> ensure)
-    {
-        public nuint PageBytes => pageBytes;
+    public static int ScalarCount => 8 + SubClasses;
 
-        public int Pages() => pages();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public byte* Rec(int slot) => _rec.Rec(slot);
 
-        public nint Page(int p) => page(p);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long Weight(byte* r) => *(long*)r;
 
-        public void Adopt(nint p) => adopt(p);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long Long(byte* r, int c) => ((long*)(r + 8))[c];
 
-        public void Ensure(long elements) => ensure(elements);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlySpan<char> Str(byte* r, int c) => Arena.Get(((long*)(r + _offS))[c], ((int*)(r + _offN))[c]);
 
-        public static ColumnPages Of<T>(PagedColumn<T, TP> c)
-            where T : unmanaged =>
-            new(() => c.PageCount, p => (nint)c.Page(p), PagedColumn<T, TP>.PageBytes, p => c.AdoptMapped((byte*)p), c.Ensure);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int NextOf(byte* r) => *(int*)(r + _offX);
 
     public ulong RowHash(ReadOnlySpan<long> l, string[] s)
     {
@@ -386,24 +484,21 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         return h;
     }
 
-    public ulong RowHash(int slot)
+    public ulong RowHash(byte* r)
     {
         var h = FlatHash.Seed;
         for (var i = 0; i < NL; i++)
         {
-            h = FlatHash.Combine(h, FlatHash.Long(L[i][slot]));
+            h = FlatHash.Combine(h, FlatHash.Long(Long(r, i)));
         }
 
         for (var i = 0; i < NS; i++)
         {
-            h = FlatHash.Combine(h, FlatHash.Str(Str(i, slot)));
+            h = FlatHash.Combine(h, FlatHash.Str(Str(r, i)));
         }
 
         return h;
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ReadOnlySpan<char> Str(int col, int slot) => Arena.Get(SStart[col][slot], SLen[col][slot]);
 
     /// <summary>Head of the chain for <paramref name="key"/>, or -1.</summary>
     public int ChainHead(long key)
@@ -412,15 +507,15 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         var i = (int)(FlatHash.Long(key) & (ulong)mask);
         while (true)
         {
-            var h = _kh[i];
-            if (h == NoKey)
+            ref var e = ref _kt[i];
+            if (e.Head == NoKey)
             {
                 return -1;
             }
 
-            if (_kk[i] == key)
+            if (e.Key == key)
             {
-                return h;
+                return e.Head;
             }
 
             i = (i + 1) & mask;
@@ -430,33 +525,64 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
     /// <summary>Add <paramref name="w"/> copies of the row; a weight reaching zero frees it.</summary>
     public void Upsert(ReadOnlySpan<long> l, string[] s, long w)
     {
-        var full = RowHash(l, s);
-        var h = (int)full;
-        var mask = RtCap - 1;
+        var h = (int)RowHash(l, s);
+        ref var k = ref KeySlot(l[0]);
+        if (k.SubCap == 0)
+        {
+            for (var slot = k.Head; slot >= 0;)
+            {
+                var r = Rec(slot);
+                if (*(int*)(r + _offH) == h && Equal(r, l, s))
+                {
+                    var nw = Weight(r) + w;
+                    *(long*)r = nw;
+                    if (nw == 0)
+                    {
+                        Unlink(ref k, r);
+                        Free(slot, r);
+                    }
+
+                    return;
+                }
+
+                slot = NextOf(r);
+            }
+
+            if (w == 0)
+            {
+                return;
+            }
+
+            Insert(l, s, w, h, ref k);
+            if (k.Count >= ChainLimit)
+            {
+                Promote(ref k);
+            }
+
+            return;
+        }
+
+        var mask = k.SubCap - 1;
         var i = h & mask;
-        var tombAt = -1;
         while (true)
         {
-            var e = _rt[i];
-            if (e == Empty)
+            ref var e = ref _sub[k.SubOff + i];
+            if (e.Slot == Empty)
             {
                 break;
             }
 
-            if (e == Tomb)
+            if (e.Hash == h && Equal(Rec(e.Slot), l, s))
             {
-                if (tombAt < 0)
-                {
-                    tombAt = i;
-                }
-            }
-            else if (Hash[e] == h && Equal(e, l, s))
-            {
-                var nw = W[e] + w;
-                W[e] = nw;
+                var r = Rec(e.Slot);
+                var nw = Weight(r) + w;
+                *(long*)r = nw;
                 if (nw == 0)
                 {
-                    RemoveAt(e, i);
+                    var slot = e.Slot;
+                    SubDelete(k.SubOff, mask, i);
+                    Unlink(ref k, r);
+                    Free(slot, r);
                 }
 
                 return;
@@ -470,42 +596,19 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
             return;
         }
 
-        if ((RtCount + RtTomb + 1) * 2 > RtCap)
+        if ((k.Count + 1) * 2 > k.SubCap)
         {
-            RehashRows(Math.Max(RtCap, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)(RtCount + 1) * 4)));
-            tombAt = -1;
-            mask = RtCap - 1;
+            Resize(ref k, k.SubCap * 2);
+            mask = k.SubCap - 1;
             i = h & mask;
-            while (_rt[i] != Empty)
+            while (_sub[k.SubOff + i].Slot != Empty)
             {
                 i = (i + 1) & mask;
             }
         }
 
-        var slot = AllocSlot();
-        for (var c = 0; c < NL; c++)
-        {
-            L[c][slot] = l[c];
-        }
-
-        for (var c = 0; c < NS; c++)
-        {
-            SStart[c][slot] = Arena.Append(s[c]);
-            SLen[c][slot] = s[c].Length;
-        }
-
-        W[slot] = w;
-        Hash[slot] = h;
-        if (tombAt >= 0)
-        {
-            i = tombAt;
-            RtTomb--;
-        }
-
-        _rt[i] = slot;
-        RtCount++;
-        Live++;
-        Link(slot, l[0]);
+        var added = Insert(l, s, w, h, ref k);
+        _sub[k.SubOff + i] = new RowEntry { Slot = added, Hash = h };
     }
 
     /// <summary>Copy every live string into a fresh arena and drop the old one.</summary>
@@ -519,14 +622,15 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         var fresh = new CharArena<TP>();
         for (var slot = 0; slot < High; slot++)
         {
-            if (W[slot] == 0)
+            var r = Rec(slot);
+            if (Weight(r) == 0)
             {
                 continue;
             }
 
             for (var c = 0; c < NS; c++)
             {
-                SStart[c][slot] = fresh.Append(Str(c, slot));
+                ((long*)(r + _offS))[c] = fresh.Append(Str(r, c));
             }
         }
 
@@ -541,10 +645,11 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         long rows = 0;
         for (var slot = 0; slot < High; slot++)
         {
-            var w = W[slot];
+            var r = Rec(slot);
+            var w = Weight(r);
             if (w != 0)
             {
-                sum += (ulong)w * RowHash(slot);
+                sum += (ulong)w * RowHash(r);
                 rows++;
             }
         }
@@ -554,32 +659,17 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
 
     public void Dispose()
     {
-        foreach (var c in L)
-        {
-            c.Dispose();
-        }
-
-        for (var i = 0; i < NS; i++)
-        {
-            SStart[i].Dispose();
-            SLen[i].Dispose();
-        }
-
-        W.Dispose();
-        Hash.Dispose();
-        Prev.Dispose();
-        Next.Dispose();
+        _rec.Dispose();
         Arena.Dispose();
-        _rt.Dispose();
-        _kk.Dispose();
-        _kh.Dispose();
+        _sub.Dispose();
+        _kt.Dispose();
     }
 
-    private bool Equal(int slot, ReadOnlySpan<long> l, string[] s)
+    private bool Equal(byte* r, ReadOnlySpan<long> l, string[] s)
     {
         for (var c = 0; c < NL; c++)
         {
-            if (L[c][slot] != l[c])
+            if (Long(r, c) != l[c])
             {
                 return false;
             }
@@ -587,7 +677,7 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
 
         for (var c = 0; c < NS; c++)
         {
-            if (!Str(c, slot).SequenceEqual(s[c]))
+            if (!Str(r, c).SequenceEqual(s[c]))
             {
                 return false;
             }
@@ -601,83 +691,176 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         if (FreeHead >= 0)
         {
             var s = FreeHead;
-            FreeHead = Next[s];
+            FreeHead = NextOf(Rec(s));
             return s;
         }
 
         var slot = High++;
-        var n = (long)High;
-        foreach (var c in L)
+        if (High > _rec.Capacity)
         {
-            c.Ensure(n);
+            _rec.Ensure(High);
         }
 
-        for (var c = 0; c < NS; c++)
-        {
-            SStart[c].Ensure(n);
-            SLen[c].Ensure(n);
-        }
-
-        W.Ensure(n);
-        Hash.Ensure(n);
-        Prev.Ensure(n);
-        Next.Ensure(n);
         return slot;
     }
 
-    private void RemoveAt(int slot, int tableIndex)
+    private int Insert(ReadOnlySpan<long> l, string[] s, long w, int h, ref KeyEntry k)
     {
-        _rt[tableIndex] = Tomb;
-        RtTomb++;
-        RtCount--;
-        Unlink(slot);
-        for (var c = 0; c < NS; c++)
+        var slot = AllocSlot();
+        var rec = Rec(slot);
+        *(long*)rec = w;
+        for (var c = 0; c < NL; c++)
         {
-            Arena.Garbage += SLen[c][slot];
+            ((long*)(rec + 8))[c] = l[c];
         }
 
-        W[slot] = 0;
-        Next[slot] = FreeHead;
+        for (var c = 0; c < NS; c++)
+        {
+            ((long*)(rec + _offS))[c] = Arena.Append(s[c]);
+            ((int*)(rec + _offN))[c] = s[c].Length;
+        }
+
+        *(int*)(rec + _offH) = h;
+        var head = k.Head;
+        *(int*)(rec + _offX) = head;
+        *(int*)(rec + _offP) = -1;
+        if (head >= 0)
+        {
+            *(int*)(Rec(head) + _offP) = slot;
+        }
+
+        k.Head = slot;
+        k.Count++;
+        Live++;
+        return slot;
+    }
+
+    /// <summary>The key's chain has grown long: give it its own row index.</summary>
+    private void Promote(ref KeyEntry k) => Resize(ref k, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)k.Count * 4));
+
+    /// <summary>Move the key's rows into a fresh sub-table of <paramref name="cap"/> entries.</summary>
+    private void Resize(ref KeyEntry k, int cap)
+    {
+        if (cap > PagedColumn<RowEntry, TP>.PageElems)
+        {
+            throw new InvalidOperationException($"key {k.Key} has {k.Count} rows: a sub-table would span pages");
+        }
+
+        if (k.SubCap > 0)
+        {
+            SubFree(k.SubOff, k.SubCap);
+        }
+
+        var off = SubAlloc(cap);
+        var mask = cap - 1;
+        for (var slot = k.Head; slot >= 0;)
+        {
+            var r = Rec(slot);
+            var h = *(int*)(r + _offH);
+            var i = h & mask;
+            while (_sub[off + i].Slot != Empty)
+            {
+                i = (i + 1) & mask;
+            }
+
+            _sub[off + i] = new RowEntry { Slot = slot, Hash = h };
+            slot = NextOf(r);
+        }
+
+        k.SubOff = off;
+        k.SubCap = cap;
+    }
+
+    private int SubAlloc(int cap)
+    {
+        var cls = System.Numerics.BitOperations.Log2((uint)cap);
+        int off;
+        if (_subFree[cls] >= 0)
+        {
+            off = _subFree[cls];
+            _subFree[cls] = _sub[off].Slot;
+        }
+        else
+        {
+            // Power-of-two blocks aligned to their size never straddle a page.
+            off = checked((int)((SubUsed + cap - 1) & ~(long)(cap - 1)));
+            SubUsed = off + cap;
+            _sub.Ensure(SubUsed);
+        }
+
+        new Span<RowEntry>(_sub.At(off), cap).Fill(new RowEntry { Slot = Empty });
+        return off;
+    }
+
+    private void SubFree(int off, int cap)
+    {
+        var cls = System.Numerics.BitOperations.Log2((uint)cap);
+        _sub[off].Slot = _subFree[cls];
+        _subFree[cls] = off;
+    }
+
+    /// <summary>Linear-probing delete with backward shift, so the sub-tables need no tombstones.</summary>
+    private void SubDelete(int off, int mask, int i)
+    {
+        var j = i;
+        while (true)
+        {
+            j = (j + 1) & mask;
+            var e = _sub[off + j];
+            if (e.Slot == Empty)
+            {
+                break;
+            }
+
+            var home = e.Hash & mask;
+            var stays = i <= j ? (home > i && home <= j) : (home > i || home <= j);
+            if (!stays)
+            {
+                _sub[off + i] = e;
+                i = j;
+            }
+        }
+
+        _sub[off + i].Slot = Empty;
+    }
+
+    private void Free(int slot, byte* r)
+    {
+        for (var c = 0; c < NS; c++)
+        {
+            Arena.Garbage += ((int*)(r + _offN))[c];
+        }
+
+        *(long*)r = 0;
+        *(int*)(r + _offX) = FreeHead;
         FreeHead = slot;
         Live--;
     }
 
-    private void Link(int slot, long key)
+    private void Unlink(ref KeyEntry k, byte* r)
     {
-        var ki = KeySlot(key, create: true);
-        var head = _kh[ki];
-        Next[slot] = head;
-        Prev[slot] = -1;
-        if (head >= 0)
-        {
-            Prev[head] = slot;
-        }
-
-        _kh[ki] = slot;
-    }
-
-    private void Unlink(int slot)
-    {
-        var p = Prev[slot];
-        var n = Next[slot];
+        var p = *(int*)(r + _offP);
+        var n = *(int*)(r + _offX);
         if (p >= 0)
         {
-            Next[p] = n;
+            *(int*)(Rec(p) + _offX) = n;
         }
         else
         {
-            _kh[KeySlot(L[0][slot], create: false)] = n;
+            k.Head = n;
         }
 
         if (n >= 0)
         {
-            Prev[n] = p;
+            *(int*)(Rec(n) + _offP) = p;
         }
+
+        k.Count--;
     }
 
-    private int KeySlot(long key, bool create)
+    private ref KeyEntry KeySlot(long key)
     {
-        if (create && (KCount + 1) * 2 > KCap)
+        if ((KCount + 1) * 2 > KCap)
         {
             RehashKeys(KCap * 2);
         }
@@ -686,93 +869,57 @@ internal sealed unsafe class FlatTable<TP> : IDisposable
         var i = (int)(FlatHash.Long(key) & (ulong)mask);
         while (true)
         {
-            if (_kh[i] == NoKey)
+            ref var e = ref _kt[i];
+            if (e.Head == NoKey)
             {
-                if (!create)
-                {
-                    throw new InvalidOperationException("key missing from key index");
-                }
-
-                _kk[i] = key;
-                _kh[i] = -1;
+                e = new KeyEntry { Key = key, Head = -1 };
                 KCount++;
-                return i;
+                return ref e;
             }
 
-            if (_kk[i] == key)
+            if (e.Key == key)
             {
-                return i;
+                return ref e;
             }
 
             i = (i + 1) & mask;
         }
     }
 
-    private void RehashRows(int cap)
-    {
-        var old = _rt;
-        var oldCap = RtCap;
-        _rt = new PagedColumn<int, TP>();
-        _rt.Ensure(cap);
-        _rt.Fill(Empty, cap);
-        RtCap = cap;
-        RtTomb = 0;
-        var mask = cap - 1;
-        for (long j = 0; j < oldCap; j++)
-        {
-            var e = old[j];
-            if (e < 0)
-            {
-                continue;
-            }
-
-            var i = Hash[e] & mask;
-            while (_rt[i] != Empty)
-            {
-                i = (i + 1) & mask;
-            }
-
-            _rt[i] = e;
-        }
-
-        old.Dispose();
-    }
-
     private void RehashKeys(int cap)
     {
-        var oldK = _kk;
-        var oldH = _kh;
+        var old = _kt;
         var oldCap = KCap;
-        _kk = new PagedColumn<long, TP>();
-        _kh = new PagedColumn<int, TP>();
-        _kk.Ensure(cap);
-        _kh.Ensure(cap);
-        _kh.Fill(NoKey, cap);
+        _kt = new PagedColumn<KeyEntry, TP>();
+        _kt.Ensure(cap);
+        _kt.Fill(new KeyEntry { Head = NoKey }, cap);
         KCap = cap;
         KCount = 0;
         var mask = cap - 1;
         for (long j = 0; j < oldCap; j++)
         {
-            var head = oldH[j];
-            if (head < 0)
+            var e = old[j];
+            if (e.Head < 0)
             {
-                // Never used, or a key whose chain emptied: drop it.
+                // Never used, or a key whose chain emptied: drop it, and its sub-table.
+                if (e.Head == -1 && e.SubCap > 0)
+                {
+                    SubFree(e.SubOff, e.SubCap);
+                }
+
                 continue;
             }
 
-            var key = oldK[j];
-            var i = (int)(FlatHash.Long(key) & (ulong)mask);
-            while (_kh[i] != NoKey)
+            var i = (int)(FlatHash.Long(e.Key) & (ulong)mask);
+            while (_kt[i].Head != NoKey)
             {
                 i = (i + 1) & mask;
             }
 
-            _kk[i] = key;
-            _kh[i] = head;
+            _kt[i] = e;
             KCount++;
         }
 
-        oldK.Dispose();
-        oldH.Dispose();
+        old.Dispose();
     }
 }
