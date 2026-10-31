@@ -23,6 +23,45 @@ Stream: 1,000,000 events (20,000 person, 60,000 auction, 920,000 bid). Host: .NE
 >
 > Queries q5 / q7 / q8 (tumbling / sliding event-time windows) are omitted: they require TUMBLE / HOP windowing table functions that DbspNet does not yet expose. q9 uses `ROW_NUMBER() OVER (PARTITION … ORDER …)` which compiles to a partitioned incremental TOP-K.
 
+## Nexmark head-to-head vs Feldera — M4 Pro, 2026-10-31 (UTF-8 string cells)
+
+The generator now hands DbspNet VARCHAR cells as `Utf8String` (UTF-8, as Feldera's generator builds
+Rust strings and as every connector delivers them), converted before the timer
+(`NEXMARK_STRINGS=utf8`, the default since `018919b`). Before, every timed push re-encoded each
+string cell — a cost Feldera never paid. DbspNet at `5f937bb`, Feldera at `78afc9077` (unchanged
+since 10-29). 10M events, 14 cores, batch 10,000, the 10-29 query set; DbspNet median of 3 after a
+warm-up, Feldera one run. The string-cell column is DbspNet alone, run straight after on the same
+build, divided by the same Feldera run.
+
+`W=14 / Feldera` > 1.0 means DbspNet is faster.
+
+| Query | 10-29 (strings, `610f184`) | 10-31 strings | **10-31 UTF-8** | UTF-8 ÷ strings (DbspNet W=14) |
+|:--|--:|--:|--:|--:|
+| q0 | 0.83× | 0.84× | **1.28×** | 1.52× |
+| q1 | 0.96× | 0.98× | **1.25×** | 1.28× |
+| q2 | 0.82× | 0.90× | **1.27×** | 1.40× |
+| q3 | 2.10× | 1.70× | **2.14×** | 1.26× |
+| q4 | 1.25× | 1.17× | **1.42×** | 1.22× |
+| q9 | 2.22× | 2.26× | **2.82×** | 1.25× |
+| q15 | 11.25× | 11.44× | **13.33×** | 1.17× |
+| q16 | 14.96× | 17.65× | **20.90×** | 1.18× |
+| q17 | 8.66× | 8.74× | **12.53×** | 1.43× |
+| q18 | 0.86× | 1.20× | **1.77×** | 1.48× |
+| q19 | 1.34× | 1.42× | **2.19×** | 1.54× |
+| q20 | 1.16× | 1.10× | **1.72×** | 1.57× |
+| q22 | 0.64× | 0.84× | **1.14×** | 1.35× |
+
+- **No query loses any more.** The four stateless losses of 10-29 (q0/q1/q2/q22, 0.63–0.85×) are
+  now 1.14–1.28× wins, and q18 moves from parity to 1.77×.
+- **UTF-8 cells are worth 1.17–1.57× at W=14.** The deterministic instrument agrees in direction:
+  `w1profile` drops ~281 B/event on every query and 11–39% of ns/event (docs/w1-profile.md).
+- **Read with the usual noise discipline** (only differences beyond ~1.5× are readable at W=14 on
+  this box; Feldera runs once). The two DbspNet arms ran one after the other, not alternated, so
+  each per-query UTF-8 ÷ strings ratio carries that noise; their consistent direction across all 13
+  queries, and the deterministic B/event drop, are the evidence. The "10-31 strings" column also
+  absorbs everything merged since 10-29 (the chunked map, Arrow fixes), which is why q18 and q22
+  moved before the cell change.
+
 ## Nexmark head-to-head vs Feldera — M4 Pro, 2026-10-29 (Feldera-faithful generator)
 
 Same host and method as the 2026-08-31 section below, except **DbspNet now runs on

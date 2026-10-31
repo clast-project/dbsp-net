@@ -1,0 +1,208 @@
+== Nexmark comparison ==
+   events=10000000  cores=14  batch=10000  runs=3  feldera-generators=14  dbspnet-gen=feldera
+   queries=q0 q1 q2 q3 q4 q9 q15 q16 q17 q18 q19 q20 q22
+   host: Darwin 27.2.0 arm64
+
+-- DbspNet (dotnet, W=1 and W=14) ----------------------------------------
+
+=== Nexmark throughput (events=10,000,000, batch=10,000, runs=3, W=14) ===
+Generating event stream…
+  person=200,000  auction=600,000  bid=9,200,000
+  q0: W1=   5,504,814  W14=  12,596,779 events/s    2.29×  ok
+  q1: W1=   3,875,108  W14=  10,210,205 events/s    2.63×  ok
+  q2: W1=   6,720,258  W14=  11,996,960 events/s    1.79×  ok
+  q3: W1=  39,653,791  W14=  13,555,762 events/s    0.34×  ok
+  q4: W1=   3,898,540  W14=   4,634,298 events/s    1.19×  ok
+  q9: W1=   2,533,558  W14=   4,645,488 events/s    1.83×  ok
+  q5: W1=     606,235  W14=   2,826,577 events/s    4.66×  ok
+  q7:    1,025,892 events/s  (single-only)
+  q8: W1=  25,738,104  W14=  10,331,619 events/s    0.40×  ok
+  q12: W1=   5,413,731  W14=   9,429,483 events/s    1.74×  ok
+  q15: W1=   4,963,776  W14=   5,050,909 events/s    1.02×  ok
+  q16: W1=   3,751,440  W14=   5,499,636 events/s    1.47×  ok
+  q17: W1=   4,286,646  W14=   8,409,283 events/s    1.96×  ok
+  q18: W1=   2,215,577  W14=   6,005,479 events/s    2.71×  ok
+  q19: W1=   2,274,739  W14=   5,573,862 events/s    2.45×  ok
+  q20: W1=   3,175,686  W14=   4,845,716 events/s    1.53×  ok
+  q22: W1=   2,517,639  W14=   9,316,770 events/s    3.70×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+
+Report written to /Users/curthagenlocher/src/dbsp-net/docs/benchmarks-nexmark.md
+
+-- Feldera (cargo bench dbsp_nexmark, --cpu-cores 14) ---------------------
+   (first build compiles the DBSP workspace in release — may take minutes)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.75s
+     Running benches/nexmark/main.rs (target/release/deps/nexmark-321ac5018ff252d0)
+Starting Q0 bench of 10000000 events...
+[2m2026-10-31T15:14:45.756919Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:14:45.758624Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:14:45.759475Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:14:45.759709Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:14:45.767368Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q1 bench of 10000000 events...
+[2m2026-10-31T15:14:47.357799Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:14:47.357852Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:14:47.358221Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:14:47.358231Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:14:47.358858Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q2 bench of 10000000 events...
+[2m2026-10-31T15:14:49.127777Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:14:49.127819Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:14:49.128150Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:14:49.128171Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:14:49.128793Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q3 bench of 10000000 events...
+[2m2026-10-31T15:14:50.729733Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:14:50.729777Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:14:50.730162Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:14:50.730171Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:14:50.733074Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q4 bench of 10000000 events...
+[2m2026-10-31T15:14:52.863295Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:14:52.863331Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:14:52.863671Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:14:52.863678Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:14:52.866194Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q9 bench of 10000000 events...
+[2m2026-10-31T15:14:56.489549Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:14:56.489578Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:14:56.489953Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:14:56.489961Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:14:56.491439Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q15 bench of 10000000 events...
+[2m2026-10-31T15:15:03.140216Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:15:03.140250Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:15:03.140501Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:15:03.140514Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:15:03.151803Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q16 bench of 10000000 events...
+[2m2026-10-31T15:15:30.121540Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:15:30.121575Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:15:30.121960Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:15:30.121981Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:15:30.132576Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q17 bench of 10000000 events...
+[2m2026-10-31T15:16:08.785604Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:16:08.785643Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:16:08.785981Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:16:08.785993Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:16:08.789548Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q18 bench of 10000000 events...
+[2m2026-10-31T15:16:24.309922Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:16:24.309957Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:16:24.310370Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:16:24.310383Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:16:24.310745Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q19 bench of 10000000 events...
+[2m2026-10-31T15:16:27.873665Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:16:27.873738Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:16:27.874313Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:16:27.874325Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:16:27.875437Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q20 bench of 10000000 events...
+[2m2026-10-31T15:16:32.407513Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:16:32.407554Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:16:32.407918Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:16:32.407927Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:16:32.408409Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+Starting Q22 bench of 10000000 events...
+[2m2026-10-31T15:16:36.571610Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up buffer caches: S3Fifo SharedPerWorkerPair buckets=None total_size=0 MiB
+[2m2026-10-31T15:16:36.571643Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m Setting up FBuf slab allocators: bytes_per_class=16777216
+[2m2026-10-31T15:16:36.572002Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m dev_tweaks.streaming_exchange enabled
+[2m2026-10-31T15:16:36.572013Z[0m [32m INFO[0m [2mdbsp::circuit::runtime[0m[2m:[0m starting dbsp merger tokio runtime, workers: 14
+[2m2026-10-31T15:16:36.572346Z[0m [32m INFO[0m [2mdbsp::operator::dynamic::balance::balancer[0m[2m:[0m Join balancer state:
+  Join graph:
+    Streams: 
+    Joins: 
+  Clusters:
+┌───────┬────────────┬───────┬─────────┬─────────────────┬──────────────────┬───────────────┬───────────────┬──────────┬─────────────┐
+│ Query │ #Events    │ Cores │ Elapsed │ Cores * Elapsed │ Throughput/Cores │ Total Usr CPU │ Total Sys CPU │ Peak RSS │ Page Faults │
+├───────┼────────────┼───────┼─────────┼─────────────────┼──────────────────┼───────────────┼───────────────┼──────────┼─────────────┤
+│ Q0    │ 10,000,000 │ 14    │ 1.017s  │ 14.238s         │ 702.330 K/s      │ 7.490s        │ 463.000ms     │ 3.20 GiB │ 53          │
+│ Q1    │ 10,000,000 │ 14    │ 1.224s  │ 17.134s         │ 583.621 K/s      │ 9.226s        │ 478.000ms     │ 3.56 GiB │ 29          │
+│ Q2    │ 10,000,000 │ 14    │ 1.057s  │ 14.793s         │ 676.018 K/s      │ 7.823s        │ 441.000ms     │ 3.70 GiB │ 11          │
+│ Q3    │ 10,000,000 │ 14    │ 1.576s  │ 22.063s         │ 453.249 K/s      │ 13.739s       │ 1.499s        │ 3.79 GiB │ 43          │
+│ Q4    │ 10,000,000 │ 14    │ 3.069s  │ 42.973s         │ 232.706 K/s      │ 27.155s       │ 3.396s        │ 3.86 GiB │ 91          │
+│ Q9    │ 10,000,000 │ 14    │ 6.073s  │ 85.028s         │ 117.609 K/s      │ 62.142s       │ 3.191s        │ 5.93 GiB │ 20          │
+│ Q15   │ 10,000,000 │ 14    │ 26.382s │ 369.352s        │ 27.074 K/s       │ 241.106s      │ 32.325s       │ 5.95 GiB │ 21          │
+│ Q16   │ 10,000,000 │ 14    │ 38.005s │ 532.074s        │ 18.794 K/s       │ 350.908s      │ 40.806s       │ 5.99 GiB │ 13          │
+│ Q17   │ 10,000,000 │ 14    │ 14.897s │ 208.560s        │ 47.948 K/s       │ 146.921s      │ 14.249s       │ 6.02 GiB │ 3           │
+│ Q18   │ 10,000,000 │ 14    │ 2.952s  │ 41.328s         │ 241.969 K/s      │ 32.145s       │ 1.812s        │ 7.15 GiB │ 3           │
+│ Q19   │ 10,000,000 │ 14    │ 3.924s  │ 54.939s         │ 182.020 K/s      │ 43.145s       │ 1.949s        │ 7.67 GiB │ 0           │
+│ Q20   │ 10,000,000 │ 14    │ 3.549s  │ 49.689s         │ 201.253 K/s      │ 36.674s       │ 2.018s        │ 7.73 GiB │ 0           │
+│ Q22   │ 10,000,000 │ 14    │ 1.220s  │ 17.083s         │ 585.374 K/s      │ 9.405s        │ 440.000ms     │ 7.73 GiB │ 1           │
+└───────┴────────────┴───────┴─────────┴─────────────────┴──────────────────┴───────────────┴───────────────┴──────────┴─────────────┘
+
+== Merged: events/s (cold stream, 10000000 events, batch 10000, 14 cores) ==
+
+Query  DbspNet W=1  DbspNet W=14  Feldera (14c)  W=14 / Feldera
+-----  -----------  ------------  -------------  --------------
+q0       5,504,814    12,596,779      9,832,614           1.28x
+q1       3,875,108    10,210,205      8,170,699           1.25x
+q2       6,720,258    11,996,960      9,464,252           1.27x
+q3      39,653,791    13,555,762      6,345,493           2.14x
+q4       3,898,540     4,634,298      3,257,889           1.42x
+q9       2,533,558     4,645,488      1,646,524           2.82x
+q15      4,963,776     5,050,909        379,042          13.33x
+q16      3,751,440     5,499,636        263,121          20.90x
+q17      4,286,646     8,409,283        671,271          12.53x
+q18      2,215,577     6,005,479      3,387,571           1.77x
+q19      2,274,739     5,573,862      2,548,279           2.19x
+q20      3,175,686     4,845,716      2,817,541           1.72x
+q22      2,517,639     9,316,770      8,195,229           1.14x
+
+W=14/Feldera = DbspNet W=14 ÷ Feldera at 14 cores (>1.0x = DbspNet faster).
+
+Methodology: engine-only on both sides (events pre-generated before the
+timer; circuit build excluded). Feldera needs the NEXMARK_PREGEN patch to
+its nexmark bench — if its numbers look ~2x low and flat, the patch isn't
+applied. Small --events (10000000) still slightly understates Feldera (per-
+query DBSP setup); raise --events for a steadier read.

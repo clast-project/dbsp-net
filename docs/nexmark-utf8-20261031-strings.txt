@@ -1,0 +1,50 @@
+== Nexmark comparison ==
+   events=10000000  cores=14  batch=10000  runs=3  feldera-generators=14  dbspnet-gen=feldera
+   queries=q0 q1 q2 q3 q4 q9 q15 q16 q17 q18 q19 q20 q22
+   host: Darwin 27.2.0 arm64
+
+-- DbspNet (dotnet, W=1 and W=14) ----------------------------------------
+
+=== Nexmark throughput (events=10,000,000, batch=10,000, runs=3, W=14) ===
+Generating event stream…
+  person=200,000  auction=600,000  bid=9,200,000
+  q0: W1=   4,296,851  W14=   8,276,742 events/s    1.93×  ok
+  q1: W1=   3,265,978  W14=   8,001,054 events/s    2.45×  ok
+  q2: W1=   4,912,774  W14=   8,547,407 events/s    1.74×  ok
+  q3: W1=  33,114,315  W14=  10,765,274 events/s    0.33×  ok
+  q4: W1=   2,958,482  W14=   3,799,736 events/s    1.28×  ok
+  q9: W1=   2,150,876  W14=   3,717,158 events/s    1.73×  ok
+  q5: W1=     568,198  W14=   2,494,594 events/s    4.39×  ok
+  q7:      913,885 events/s  (single-only)
+  q8: W1=  19,770,289  W14=   9,192,239 events/s    0.46×  ok
+  q12: W1=   3,931,763  W14=   6,308,438 events/s    1.60×  ok
+  q15: W1=   3,863,185  W14=   4,335,307 events/s    1.12×  ok
+  q16: W1=   2,864,406  W14=   4,643,581 events/s    1.62×  ok
+  q17: W1=   3,242,738  W14=   5,864,868 events/s    1.81×  ok
+  q18: W1=   1,804,188  W14=   4,055,338 events/s    2.25×  ok
+  q19: W1=   1,817,799  W14=   3,610,637 events/s    1.99×  ok
+  q20: W1=   2,275,051  W14=   3,095,589 events/s    1.36×  ok
+  q22: W1=   2,195,498  W14=   6,924,615 events/s    3.15×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+
+Report written to /Users/curthagenlocher/src/dbsp-net/docs/benchmarks-nexmark.md
+
+== Merged: events/s (cold stream, 10000000 events, batch 10000, 14 cores) ==
+
+Query  DbspNet W=1  DbspNet W=14
+-----  -----------  ------------
+q0       4,296,851     8,276,742
+q1       3,265,978     8,001,054
+q2       4,912,774     8,547,407
+q3      33,114,315    10,765,274
+q4       2,958,482     3,799,736
+q9       2,150,876     3,717,158
+q15      3,863,185     4,335,307
+q16      2,864,406     4,643,581
+q17      3,242,738     5,864,868
+q18      1,804,188     4,055,338
+q19      1,817,799     3,610,637
+q20      2,275,051     3,095,589
+q22      2,195,498     6,924,615
+
+(Feldera side skipped — --dbsp-only or repo not found.)
