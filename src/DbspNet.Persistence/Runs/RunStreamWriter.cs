@@ -66,6 +66,29 @@ internal sealed class RunStreamWriter : IAsyncDisposable
         _lastHash = last;
     }
 
+    /// <summary>Append a block copied unchanged from another run of the same schema (its stored
+    /// record-batch message), with its distinct order hashes and counts.</summary>
+    internal async ValueTask AppendRawAsync(
+        byte[] message, IReadOnlyList<uint> keyHashes, int entries, int groups, CancellationToken cancellationToken)
+    {
+        var first = keyHashes[0];
+        var last = keyHashes[^1];
+        if (_lastHash is { } previous && first <= previous)
+        {
+            throw new InvalidOperationException("run blocks must arrive in ascending, non-overlapping hash order");
+        }
+
+        // A stored block is a complete, aligned IPC record-batch message: written between the
+        // writer's own batches, the stream stays well formed.
+        var offset = _file.Position;
+        await _file.WriteAsync(message, cancellationToken).ConfigureAwait(false);
+        _index.Add(new RunBlock(first, last, offset, checked((int)(_file.Position - offset)), entries, groups));
+        _keyHashes.AddRange(keyHashes);
+        _entries += entries;
+        _groups += groups;
+        _lastHash = last;
+    }
+
     internal async ValueTask<RunInfo> FinishAsync(CancellationToken cancellationToken)
     {
         await _ipc.WriteEndAsync(cancellationToken).ConfigureAwait(false);
