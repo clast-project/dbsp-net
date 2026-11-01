@@ -50,11 +50,51 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
     public string SchemaFingerprint { get; }
 
+    /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
+    /// is on (docs/design-durable-state.md §1f), otherwise as one Arrow stream.</summary>
     public async ValueTask SaveAsync(
         ISnapshotWriter writer,
         string fileName,
         IndexedZSet<StructuralRow, StructuralRow, Z64> trace,
         CancellationToken cancellationToken = default)
+    {
+        if (Runs.StateLayout.Runs)
+        {
+            ArgumentNullException.ThrowIfNull(trace);
+            await Runs.RunFile.WriteIndexedAsync(writer, fileName, trace, _monolithic, Hash, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await SaveMonolithicAsync(writer, fileName, trace, cancellationToken).ConfigureAwait(false);
+    }
+
+    // The run's hash: the key's stable partition hash under this codec's key schema.
+    private int Hash(StructuralRow key) => DbspNet.Sql.Compiler.StablePartitionHash.OfWholeRow(key, _keySchema);
+
+    // This codec without the run dispatch: what a run encodes each block with.
+    private Monolithic? _monolithicField;
+
+    private Monolithic _monolithic => _monolithicField ??= new Monolithic(this);
+
+    private sealed class Monolithic(ArrowIndexedZSetTraceCodec codec) : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>
+    {
+        public string SchemaFingerprint => codec.SchemaFingerprint;
+
+        public ValueTask SaveAsync(
+            ISnapshotWriter writer, string fileName, IndexedZSet<StructuralRow, StructuralRow, Z64> trace, CancellationToken cancellationToken = default) =>
+            codec.SaveMonolithicAsync(writer, fileName, trace, cancellationToken);
+
+        public ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadAsync(
+            ISnapshotReader reader, string fileName, CancellationToken cancellationToken = default) =>
+            codec.LoadMonolithicAsync(reader, fileName, cancellationToken);
+    }
+
+    private async ValueTask SaveMonolithicAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        IndexedZSet<StructuralRow, StructuralRow, Z64> trace,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(fileName);
@@ -135,6 +175,40 @@ internal sealed class ArrowIndexedZSetTraceCodec
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(fileName);
+        if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+        }
+
+        // Either layout reads back, whatever StateLayout says now: a run ends in its trailer.
+        var probe = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
+        if (await Runs.RunReader.IsRunAsync(probe, cancellationToken).ConfigureAwait(false))
+        {
+            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
+            var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            await foreach (var block in run.ScanIndexedAsync(_monolithic, cancellationToken).ConfigureAwait(false))
+            {
+                foreach (var g in block)
+                {
+                    foreach (var (value, weight) in g.Value)
+                    {
+                        b.Add(g.Key, value, weight);
+                    }
+                }
+            }
+
+            return b.Build();
+        }
+
+        await probe.DisposeAsync().ConfigureAwait(false);
+        return await LoadMonolithicAsync(reader, fileName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadMonolithicAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
         if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
         {
             return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;

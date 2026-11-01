@@ -43,9 +43,32 @@ public static class RunFile
     }
 
     /// <summary>Write <paramref name="set"/> as a run at <paramref name="path"/>.</summary>
-    public static async ValueTask<RunInfo> WriteZSetAsync(
+    public static ValueTask<RunInfo> WriteZSetAsync(
         ITableFileSystem fs,
         string path,
+        ZSet<StructuralRow, Z64> set,
+        IZSetTraceCodec<StructuralRow, Z64> codec,
+        Func<StructuralRow, int> hash,
+        int blockEntries = DefaultBlockEntries,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fs);
+        return WriteZSetAsync(ct => fs.CreateAsync(path, overwrite: true, ct), set, codec, hash, blockEntries, cancellationToken);
+    }
+
+    /// <summary>Write <paramref name="set"/> as a run to <paramref name="fileName"/> of a snapshot.</summary>
+    internal static ValueTask<RunInfo> WriteZSetAsync(
+        Core.Circuit.ISnapshotWriter writer,
+        string fileName,
+        ZSet<StructuralRow, Z64> set,
+        IZSetTraceCodec<StructuralRow, Z64> codec,
+        Func<StructuralRow, int> hash,
+        int blockEntries = DefaultBlockEntries,
+        CancellationToken cancellationToken = default) =>
+        WriteZSetAsync(ct => writer.CreateAsync(fileName, ct), set, codec, hash, blockEntries, cancellationToken);
+
+    private static async ValueTask<RunInfo> WriteZSetAsync(
+        Func<CancellationToken, ValueTask<ISequentialFile>> create,
         ZSet<StructuralRow, Z64> set,
         IZSetTraceCodec<StructuralRow, Z64> codec,
         Func<StructuralRow, int> hash,
@@ -63,7 +86,7 @@ public static class RunFile
         entries.Sort(static (a, b) => a.Hash.CompareTo(b.Hash));
         var blocks = Cut(entries, e => e.Hash, _ => 1, blockEntries);
         return await WriteAsync(
-            fs, path, Kind.ZSet, entries.Count, entries.Count, blocks, entries.Select(e => e.Hash),
+            create, Kind.ZSet, entries.Count, entries.Count, blocks, entries.Select(e => e.Hash),
             async (from, to, scratch, ct) =>
             {
                 var b = new ZSetBuilder<StructuralRow, Z64>(to - from);
@@ -80,9 +103,32 @@ public static class RunFile
 
     /// <summary>Write <paramref name="set"/> as a run at <paramref name="path"/>; the hash is over
     /// the key, and every value of a key lands in the same block.</summary>
-    public static async ValueTask<RunInfo> WriteIndexedAsync(
+    public static ValueTask<RunInfo> WriteIndexedAsync(
         ITableFileSystem fs,
         string path,
+        IndexedZSet<StructuralRow, StructuralRow, Z64> set,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
+        Func<StructuralRow, int> hash,
+        int blockEntries = DefaultBlockEntries,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fs);
+        return WriteIndexedAsync(ct => fs.CreateAsync(path, overwrite: true, ct), set, codec, hash, blockEntries, cancellationToken);
+    }
+
+    /// <summary>Write <paramref name="set"/> as a run to <paramref name="fileName"/> of a snapshot.</summary>
+    internal static ValueTask<RunInfo> WriteIndexedAsync(
+        Core.Circuit.ISnapshotWriter writer,
+        string fileName,
+        IndexedZSet<StructuralRow, StructuralRow, Z64> set,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
+        Func<StructuralRow, int> hash,
+        int blockEntries = DefaultBlockEntries,
+        CancellationToken cancellationToken = default) =>
+        WriteIndexedAsync(ct => writer.CreateAsync(fileName, ct), set, codec, hash, blockEntries, cancellationToken);
+
+    private static async ValueTask<RunInfo> WriteIndexedAsync(
+        Func<CancellationToken, ValueTask<ISequentialFile>> create,
         IndexedZSet<StructuralRow, StructuralRow, Z64> set,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
         Func<StructuralRow, int> hash,
@@ -102,7 +148,7 @@ public static class RunFile
         groups.Sort(static (a, b) => a.Hash.CompareTo(b.Hash));
         var blocks = Cut(groups, g => g.Hash, g => g.Values.Count, blockEntries);
         return await WriteAsync(
-            fs, path, Kind.Indexed, total, groups.Count, blocks, groups.Select(g => g.Hash),
+            create, Kind.Indexed, total, groups.Count, blocks, groups.Select(g => g.Hash),
             async (from, to, scratch, ct) =>
             {
                 var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
@@ -150,8 +196,7 @@ public static class RunFile
     }
 
     private static async ValueTask<RunInfo> WriteAsync(
-        ITableFileSystem fs,
-        string path,
+        Func<CancellationToken, ValueTask<ISequentialFile>> create,
         Kind kind,
         long totalEntries,
         long totalGroups,
@@ -163,7 +208,7 @@ public static class RunFile
         var hashList = hashes.ToList();
         var index = new List<RunBlock>(cuts.Count);
         long offset = 0;
-        await using (var file = await fs.CreateAsync(path, overwrite: true, cancellationToken).ConfigureAwait(false))
+        await using (var file = await create(cancellationToken).ConfigureAwait(false))
         {
             foreach (var (from, to) in cuts)
             {

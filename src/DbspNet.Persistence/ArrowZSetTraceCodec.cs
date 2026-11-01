@@ -46,11 +46,49 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>
 
     public string SchemaFingerprint { get; }
 
+    /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
+    /// is on (docs/design-durable-state.md §1f), otherwise as one Arrow stream.</summary>
     public async ValueTask SaveAsync(
         ISnapshotWriter writer,
         string fileName,
         ZSet<StructuralRow, Z64> trace,
         CancellationToken cancellationToken = default)
+    {
+        if (Runs.StateLayout.Runs)
+        {
+            ArgumentNullException.ThrowIfNull(trace);
+            await Runs.RunFile.WriteZSetAsync(writer, fileName, trace, _monolithic, Hash, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await SaveMonolithicAsync(writer, fileName, trace, cancellationToken).ConfigureAwait(false);
+    }
+
+    // The run's hash: the row's stable partition hash under this codec's schema.
+    private int Hash(StructuralRow row) => DbspNet.Sql.Compiler.StablePartitionHash.OfWholeRow(row, _rowSchema);
+
+    // This codec without the run dispatch: what a run encodes each block with.
+    private Monolithic? _monolithicField;
+
+    private Monolithic _monolithic => _monolithicField ??= new Monolithic(this);
+
+    private sealed class Monolithic(ArrowZSetTraceCodec codec) : IZSetTraceCodec<StructuralRow, Z64>
+    {
+        public string SchemaFingerprint => codec.SchemaFingerprint;
+
+        public ValueTask SaveAsync(ISnapshotWriter writer, string fileName, ZSet<StructuralRow, Z64> trace, CancellationToken cancellationToken = default) =>
+            codec.SaveMonolithicAsync(writer, fileName, trace, cancellationToken);
+
+        public ValueTask<ZSet<StructuralRow, Z64>> LoadAsync(ISnapshotReader reader, string fileName, CancellationToken cancellationToken = default) =>
+            codec.LoadMonolithicAsync(reader, fileName, cancellationToken);
+    }
+
+    private async ValueTask SaveMonolithicAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        ZSet<StructuralRow, Z64> trace,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(fileName);
@@ -99,6 +137,37 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(fileName);
+        if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            return ZSet<StructuralRow, Z64>.Empty;
+        }
+
+        // Either layout reads back, whatever StateLayout says now: a run ends in its trailer.
+        var probe = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
+        if (await Runs.RunReader.IsRunAsync(probe, cancellationToken).ConfigureAwait(false))
+        {
+            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
+            var b = new ZSetBuilder<StructuralRow, Z64>((int)Math.Min(int.MaxValue, run.Entries));
+            await foreach (var block in run.ScanZSetAsync(_monolithic, cancellationToken).ConfigureAwait(false))
+            {
+                foreach (var (row, weight) in block)
+                {
+                    b.Add(row, weight);
+                }
+            }
+
+            return b.Build();
+        }
+
+        await probe.DisposeAsync().ConfigureAwait(false);
+        return await LoadMonolithicAsync(reader, fileName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<ZSet<StructuralRow, Z64>> LoadMonolithicAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
         if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
         {
             return ZSet<StructuralRow, Z64>.Empty;

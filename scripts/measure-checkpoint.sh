@@ -12,7 +12,8 @@
 # restore, as before 2026-10-31; every other arm runs the shipped no-background-GC default)
 # and/or ":journal" (IVM_CHECKPOINT_POLICY=none: tick journal per batch, no snapshot)
 # and/or ":to=N" (restore at N workers: re-shard the last snapshot, then restore; reshard_ms)
-# and/or ":spine" (IVM_TRACE_FAMILY=spine: spine traces instead of flat).
+# and/or ":spine" (IVM_TRACE_FAMILY=spine: spine traces instead of flat)
+# and/or ":runs" (DBSPNET_STATE_LAYOUT=runs: snapshot files in run format).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
 set -euo pipefail
@@ -55,6 +56,8 @@ for run in $(seq 1 "$RUNS"); do
     [[ "$arm" =~ :to=([0-9]+) ]] && restore_workers="${BASH_REMATCH[1]}"
     family=flat
     [[ "$arm" == *:spine* ]] && family=spine
+    layout=""
+    [[ "$arm" == *:runs* ]] && layout=runs
     echo "## run $run arm $arm" | tee -a "$RESULTS"
     DOTNET_gcServer=1 \
     DBSPNET_SNAPSHOT_FSYNC="$fsync" \
@@ -62,6 +65,7 @@ for run in $(seq 1 "$RUNS"); do
     IVM_CHECKPOINT_POLICY="$policy" \
     IVM_RESTORE_WORKERS="$restore_workers" \
     IVM_TRACE_FAMILY="$family" \
+    DBSPNET_STATE_LAYOUT="$layout" \
     IVM_DATA_ROOT="$DATA" \
     IVM_SPEC="$SPEC" \
     IVM_STAGING_ROOT="$DATA/staging-multi" \

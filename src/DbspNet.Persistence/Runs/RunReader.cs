@@ -53,6 +53,27 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
         ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(hash);
         var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        return await OpenAsync(file, hash, path, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>True if <paramref name="file"/> ends in a run trailer.</summary>
+    internal static async ValueTask<bool> IsRunAsync(IRandomAccessFile file, CancellationToken cancellationToken)
+    {
+        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        if (length < RunFile.TrailerBytes)
+        {
+            return false;
+        }
+
+        using var trailer = await file.ReadAsync(new FileRange(length - RunFile.TrailerBytes, RunFile.TrailerBytes), cancellationToken)
+            .ConfigureAwait(false);
+        return trailer.Memory.Span[8..16].SequenceEqual(RunFile.Magic);
+    }
+
+    /// <summary>Open a run over an already-open file, which the reader then owns.</summary>
+    internal static async ValueTask<RunReader> OpenAsync(
+        IRandomAccessFile file, Func<StructuralRow, int> hash, string path, CancellationToken cancellationToken)
+    {
         try
         {
             var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
