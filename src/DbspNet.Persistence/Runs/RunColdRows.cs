@@ -36,7 +36,9 @@ internal sealed class RunColdRows : IColdRows<StructuralRow>
                 chain.Store, chain.Paths[r], RowHash, RowHash, cancellationToken).ConfigureAwait(false);
         }
 
-        return new RunColdRows(runs, codec, chain.Count);
+        var cold = new RunColdRows(runs, codec, chain.Count);
+        RunPins.Add(cold, chain.Store, chain.Paths);
+        return cold;
     }
 
     private static int RowHash(StructuralRow row) => row.GetHashCode();

@@ -45,6 +45,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
         _keySchema = keySchema;
         _valueSchema = valueSchema;
         _arrowSchemaWithWeight = BuildArrowSchema(keySchema, valueSchema);
+        _runSchema = new ArrowSchema(
+            [.. _arrowSchemaWithWeight.FieldsList, new Field("__hash", Int32Type.Default, nullable: false)], metadata: null);
         SchemaFingerprint = Persistence.SchemaFingerprint.Of(keySchema, valueSchema);
     }
 
@@ -77,16 +79,18 @@ internal sealed class ArrowIndexedZSetTraceCodec
     private static int Hash(StructuralRow row) => row.GetHashCode();
 
     /// <inheritdoc/>
-    public ArrowSchema RunSchema => _arrowSchemaWithWeight;
+    public ArrowSchema RunSchema => _runSchema;
+
+    private readonly ArrowSchema _runSchema;
 
     /// <inheritdoc/>
-    public RecordBatch EncodeBlock(StructuralRow[] keys, StructuralRow[] values, long[] weights, int count)
+    public RecordBatch EncodeBlock(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count)
     {
         var keySlice = new ArraySegment<StructuralRow>(keys, 0, count);
         var valueSlice = new ArraySegment<StructuralRow>(values, 0, count);
         var keyCount = _keySchema.Count;
         var valueCount = _valueSchema.Count;
-        var arrays = new IArrowArray[keyCount + valueCount + 1];
+        var arrays = new IArrowArray[keyCount + valueCount + 2];
         for (var c = 0; c < keyCount; c++)
         {
             arrays[c] = ArrowColumns.Build(_keySchema[c].Type, keySlice, c);
@@ -104,11 +108,22 @@ internal sealed class ArrowIndexedZSetTraceCodec
         }
 
         arrays[keyCount + valueCount] = w.Build();
-        return new RecordBatch(_arrowSchemaWithWeight, arrays, count);
+        var h = new Int32Array.Builder().Reserve(count);
+        for (var i = 0; i < count; i++)
+        {
+            h.Append(hashes[i]);
+        }
+
+        arrays[keyCount + valueCount + 1] = h.Build();
+        return new RecordBatch(_runSchema, arrays, count);
     }
 
     /// <inheritdoc/>
     public void DecodeBlock(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) => AddBatch(batch, into);
+
+    /// <inheritdoc/>
+    public void DecodeRange(RecordBatch batch, int from, int count, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) =>
+        AddRange(batch, from, count, into, StringDecoding.Copy);
 
     private async ValueTask SaveMonolithicAsync(
         ISnapshotWriter writer,
@@ -411,24 +426,27 @@ internal sealed class ArrowIndexedZSetTraceCodec
         return b.Build();
     }
 
-    private void AddBatch(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b)
+    private void AddBatch(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b) =>
+        AddRange(batch, 0, batch.Length, b, ShippingStrings);
+
+    private void AddRange(
+        RecordBatch batch, int from, int rowCount, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b, StringDecoding strings)
     {
         var keyCount = _keySchema.Count;
         var valueCount = _valueSchema.Count;
-        var rowCount = batch.Length;
 
         var keyColumns = new object?[keyCount][];
         for (var c = 0; c < keyCount; c++)
         {
             keyColumns[c] = ArrowColumns.Extract(
-                batch.Column(c), _keySchema[c].Type, rowCount, ShippingStrings);
+                batch.Column(c), _keySchema[c].Type, from, rowCount, strings);
         }
 
         var valueColumns = new object?[valueCount][];
         for (var c = 0; c < valueCount; c++)
         {
             valueColumns[c] = ArrowColumns.Extract(
-                batch.Column(keyCount + c), _valueSchema[c].Type, rowCount, ShippingStrings);
+                batch.Column(keyCount + c), _valueSchema[c].Type, from, rowCount, strings);
         }
 
         var weightArray = (Int64Array)batch.Column(keyCount + valueCount);
@@ -451,7 +469,7 @@ internal sealed class ArrowIndexedZSetTraceCodec
             b.Add(
                 new StructuralRow(keyValues),
                 new StructuralRow(rowValues),
-                new Z64(weightValues[i]));
+                new Z64(weightValues[from + i]));
         }
     }
 

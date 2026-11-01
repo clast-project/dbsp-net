@@ -489,9 +489,11 @@ public sealed class ProgramRunner
         // The first write in this process carries the whole view (the connector truncates
         // the sink first); later writes carry the net change since the previous one.
         var m0 = Stopwatch.GetTimestamp();
-        var net = incremental.Written ? incremental.Pending.Build() : output.CurrentView;
+        // The first write streams the view (a lazily restored view is never read into memory).
+        var changes = incremental.Written
+            ? ArrowExtensions.ToArrowChanges(output.Schema, incremental.Pending.Build())
+            : ArrowExtensions.ToArrowChanges(output.Schema, output.EnumerateView());
         incremental.Pending = new ZSetBuilder<StructuralRow, Z64>();
-        var changes = ArrowExtensions.ToArrowChanges(output.Schema, net);
         var matTicks = Stopwatch.GetTimestamp() - m0;
 
         var w0 = Stopwatch.GetTimestamp();

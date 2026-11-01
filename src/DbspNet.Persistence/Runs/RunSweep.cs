@@ -36,7 +36,8 @@ internal static class RunSweep
             return;
         }
 
-        var live = new HashSet<string>(StringComparer.Ordinal);
+        // Runs a live lazily restored state still reads are never swept (RunPins).
+        var live = RunPins.In(fs);
         foreach (var dir in retainedSnapDirs)
         {
             await foreach (var entry in fs.ListAsync(dir + "/", cancellationToken).ConfigureAwait(false))

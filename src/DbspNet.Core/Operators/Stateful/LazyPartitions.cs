@@ -23,6 +23,31 @@ internal interface IColdRows<TRow>
     IEnumerable<KeyValuePair<TRow, Z64>> ReadAll();
 }
 
+/// <summary>
+/// A trace's saved rows, held cold after a lazy restore (docs/design-durable-state.md §1f,
+/// increment 6): read one row at a time by the row itself, or all at once.
+/// </summary>
+internal interface IColdZSet<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    /// <summary>Rows held — exact, known without reading any.</summary>
+    int Count { get; }
+
+    TWeight WeightOf(TKey key);
+
+    IEnumerable<KeyValuePair<TKey, TWeight>> ReadAll();
+}
+
+/// <summary>A codec that can hand a saved trace back cold (null when the file is not a
+/// row-ordered chain, or lazy restore is off).</summary>
+internal interface IColdZSetLoader<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    ValueTask<IColdZSet<TKey, TWeight>?> LoadColdZSetAsync(ISnapshotReader reader, string fileName, CancellationToken cancellationToken);
+}
+
 /// <summary>A codec that can hand back a saved row Z-set cold instead of reading it (null when the
 /// file was not saved partition-ordered, or lazy restore is off).</summary>
 internal interface IColdRowLoader<TRow>

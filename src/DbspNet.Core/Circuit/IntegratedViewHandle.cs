@@ -29,6 +29,10 @@ public sealed class IntegratedViewHandle<TRow>
     /// <summary>The full view contents after the most recent step.</summary>
     public ZSet<TRow, Z64> Current => _op.View;
 
+    /// <summary>Every row of the view, without reading a lazily restored view into memory
+    /// (docs/design-durable-state.md §1f, increment 6).</summary>
+    public IEnumerable<KeyValuePair<TRow, Z64>> EnumerateCurrent() => _op.EnumerateView();
+
     /// <summary>The number of rows in <see cref="Current"/>, without forming it.</summary>
     public int Count => _op.ViewCount;
 

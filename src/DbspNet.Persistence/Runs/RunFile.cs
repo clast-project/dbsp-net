@@ -19,7 +19,9 @@ namespace DbspNet.Persistence.Runs;
 /// <remarks>
 /// <para><b>Layout.</b> Entries are ordered by the key's stable hash (as an unsigned 32-bit value)
 /// and cut into blocks of about <c>blockEntries</c> entries. A block never splits one hash value,
-/// so colliding keys — and every value of an indexed key — share a block. The file opens as one
+/// so colliding keys — and every value of an indexed key — share a block. Each block also carries
+/// every entry's order hash (<c>__hash</c>, ascending), so a point probe binary-searches it and
+/// decodes only the matching entries rather than the whole block. The file opens as one
 /// Arrow IPC stream in the operator's schema: the schema message once, then one record batch per
 /// block, then the end-of-stream marker — so any Arrow reader sees the whole trace. After it comes
 /// a footer: counts, the schema message's length, the block index (hash range, offset, length,
@@ -38,7 +40,7 @@ internal static class RunFile
 {
     internal static ReadOnlySpan<byte> Magic => "DBSPRUN1"u8;
 
-    internal const int FormatVersion = 2;
+    internal const int FormatVersion = 3;
     internal const int TrailerBytes = 16;
     internal const int BlockIndexEntryBytes = 4 + 4 + 8 + 4 + 4 + 4;
     internal const int DefaultBlockEntries = 1024;
@@ -121,6 +123,7 @@ internal static class RunFile
 
         var blockRows = new StructuralRow[largest];
         var blockWeights = new long[largest];
+        var blockHashes = new int[largest];
         return await WriteAsync(
             create, Kind.ZSet, codec.RunSchema, (fingerprint ?? hash)(FingerprintRow), n, n, hashes, cuts,
             (from, to) =>
@@ -131,9 +134,10 @@ internal static class RunFile
                     var at = order[from + j];
                     blockRows[j] = rows[at];
                     blockWeights[j] = weights[at];
+                    blockHashes[j] = (int)hashes[from + j];
                 }
 
-                return (codec.EncodeBlock(blockRows, blockWeights, count), count);
+                return (codec.EncodeBlock(blockRows, blockWeights, blockHashes, count), count);
             },
             cancellationToken).ConfigureAwait(false);
     }
@@ -203,6 +207,7 @@ internal static class RunFile
         var blockKeys = new StructuralRow[largest];
         var blockValues = new StructuralRow[largest];
         var blockWeights = new long[largest];
+        var blockHashes = new int[largest];
         return await WriteAsync(
             create, Kind.Indexed, codec.RunSchema, hash(FingerprintRow), total, g, hashes, cuts,
             (from, to) =>
@@ -217,11 +222,12 @@ internal static class RunFile
                         blockKeys[count] = key;
                         blockValues[count] = value;
                         blockWeights[count] = weight.Value;
+                        blockHashes[count] = (int)hashes[j];
                         count++;
                     }
                 }
 
-                return (codec.EncodeBlock(blockKeys, blockValues, blockWeights, count), count);
+                return (codec.EncodeBlock(blockKeys, blockValues, blockWeights, blockHashes, count), count);
             },
             cancellationToken).ConfigureAwait(false);
     }

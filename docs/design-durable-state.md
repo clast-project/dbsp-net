@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–5 built)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–6 built)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -939,6 +939,75 @@ Against the targets: **restore under 1 s — close but not met** (1.0–1.2 s wi
 remains is the output views (`IntegrateOp`, eager — increment 6, which also removes the full-view
 first write) and the join traces' giant-group preload and run footers. First batch after restore within
 2× — met in 4 of 5 runs (0.12–0.30 s vs 0.08 s; one run 0.76 s).
+
+### Increment 6 — outputs after restore (built 2026-11-01)
+
+**Sink alignment: not built, deliberately.** Skipping the full first write after restore needs the
+sink to already hold the restored view *and* the connector to know where each row sits: the Delta
+connector deletes by file position (deletion vectors), tracked in memory for rows it wrote itself.
+A restarted process knows no positions, so its first write truncates and rewrites the view — and
+that is exactly what Feldera does (truncate-on-start). Recovering every row's position means reading
+the whole table back, about the cost of rewriting it. Per the adopt-Feldera's-assumptions policy the
+rewrite stays; recorded here as the alternative.
+
+**What changed instead: the rewrite streams, and views and DISTINCT restore lazily.**
+- `ZSetTrace` gets a cold backing (`IColdZSet`: exact count, one row's weight, all rows). `Current`
+  promotes first, so every existing caller is unchanged; `Count` is exact without reading; `WeightOf`
+  and `Integrate` read only the rows they touch; GC promotes; `EnumerateWhole` yields every row
+  without reading cold rows into memory; while cold, a whole-state write uses `FullState` (built from
+  the enumeration, not promoted). `IntegrateOp` (output views) and `DistinctOp` adopt a row-ordered
+  chain at restore (`IColdZSetLoader` / `RunColdZSet`); the chain's count is the trace's exact count
+  (`ExactCount`), so a view's row count survives lazy checkpoint after lazy checkpoint.
+- The first incremental write after restore enumerates the view (`RunnerOutput.EnumerateView` →
+  `EnumerateWhole`) straight into the Arrow changes — no hashed copy of the view is formed, and none
+  is kept. Parallel outputs sum the workers' enumerations (also without promoting); the row count a
+  `/wait` reads is formed the same way, once.
+
+**Two things the first SF=3 run exposed.**
+1. *A sweep could delete runs a live cold state still reads.* A checkpoint that rewrites a cold
+   state whole (a new base) stops naming the runs it was restored from; the sweep deleted them; the
+   next cold read failed (`PipelineRunnerTests` under runs, deterministic). The hole was there for
+   every lazy source since increment 4. Fix: `RunPins` — each cold source pins its chain's runs while
+   it is reachable (a weak table), and the sweep never deletes a pinned run.
+   `ALazyState_RewrittenWholeAndSwept_StillReadsItsRuns` reproduces it (it needed a state above the
+   4,096-entry floor below which chains always extend).
+2. *A row probe decoded a whole block.* Views and DISTINCT read the old weight of every row a delta
+   changes; each read decoded a 1,024-row block, so the first batch after restore drained in 0.62 s
+   (vs 0.12 s) allocating 1.4 GiB. Every run block now carries its entries' order hashes (`__hash`,
+   ascending; run format version 3), and a point probe binary-searches them and decodes only the
+   matching entries (`WeightOfRowAsync`, `GroupOfKeyAsync` — the indexed traces' per-key reads use it
+   too). First batch: 0.16 s, 0.42 GiB; cold read time 451 → 97 ms.
+
+**Tests.** `LazyViewTests` (2): a restored view stays cold, counts exactly and streams its full write
+equal to the uninterrupted view, then carries its chain through a checkpoint and a second restore;
+a lazy state rewritten whole and swept still reads its runs. `RunFileTests` check the hash-range
+probes against the sets, colliding hashes included. Full suite passes four ways (2,909 each).
+Mutation-tested: a sweep ignoring pins and `Integrate` not resolving the rows it changes each fail.
+
+**Measured** — restart after batch 1, SF=3, W=12, 5 alternating runs per arm (raw:
+`docs/runs-lazy-views-w12-20261101.txt`). All view row counts after batches 2–3 and every final
+restore matched.
+
+| | today | runs, lazy (increments 4–6) |
+|---|--:|--:|
+| restore after batch 1 | 6.27 s [5.99–6.41] | **0.76 s** [0.73–0.87] |
+| batch 2 drain (first after restore) | 0.09 s [0.07–0.09] | 0.17 s [0.16–0.18] |
+| batch 2 output write (first after restore) | 1.32 s [1.11–1.54] | 3.22 s [3.05–3.65] |
+| restore + first batch + first write | 7.68 s | **4.15 s** |
+| final restore (after batch 3) | 7.13 s [6.55–14.88] | **0.93 s** [0.75–0.96] |
+| checkpoint after batch 2 / 3 | 2.25 / 2.76 s | 0.22 / 0.24 s |
+
+The restore is now steady (the GC bimodality of increment 5 is gone: nothing large is built at
+restore). Against the approved targets: **restore under 1 s — met** (0.73–0.96 s, both restores);
+**checkpoint under 0.5 s — met** (0.21–0.26 s); **first batch within 2× — met** (0.17 vs 0.09 s, 1.9×);
+**no steady-state regression** — batch-1 drain 16.6 vs 15.9 s here (within the ±2.5 s noise of
+earlier measurements; not separately established).
+
+**The cost that moved:** the first output write after restore is 1.9 s slower than today's (3.2 vs
+1.3 s): it now decodes the view from runs rather than writing from a view already in memory. Restore
+plus first write is still 46% faster than today, and nothing view-sized is kept in memory. The next
+lever is to skip the Arrow → rows → Arrow round trip in that write (the run blocks already are the
+view's Arrow batches; only the connector's row-address map needs row keys).
 
 ### Targets (approved 2026-10-31)
 

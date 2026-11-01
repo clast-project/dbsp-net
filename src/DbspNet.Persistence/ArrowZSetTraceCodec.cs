@@ -29,7 +29,7 @@ namespace DbspNet.Persistence;
 /// <c>__weight</c> — same convention as <c>WalRecorder</c> uses for
 /// input replay.
 /// </remarks>
-internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>, Runs.IZSetRunCodec, IColdRowLoader<StructuralRow>
+internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>, Runs.IZSetRunCodec, IColdRowLoader<StructuralRow>, IColdZSetLoader<StructuralRow, Z64>
 {
     private readonly SqlSchema _rowSchema;
     private readonly ArrowSchema _arrowDataSchema;
@@ -41,6 +41,8 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         _rowSchema = rowSchema;
         _arrowDataSchema = ArrowSchemaBridge.ToArrow(rowSchema);
         _arrowSchemaWithWeight = ArrowIpcExtensions.AppendWeightField(_arrowDataSchema);
+        _runSchema = new ArrowSchema(
+            [.. _arrowSchemaWithWeight.FieldsList, new Field("__hash", Apache.Arrow.Types.Int32Type.Default, nullable: false)], metadata: null);
         SchemaFingerprint = Persistence.SchemaFingerprint.Of(rowSchema);
     }
 
@@ -87,19 +89,38 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         return cold;
     }
 
+    /// <summary>The saved trace, cold (increment 6), when <paramref name="fileName"/> is a chain the
+    /// run index records in row order and lazy restore is on; otherwise null.</summary>
+    public async ValueTask<IColdZSet<StructuralRow, Z64>?> LoadColdZSetAsync(
+        ISnapshotReader reader, string fileName, CancellationToken cancellationToken)
+    {
+        if (!Runs.RunColdGroups.Enabled
+            || await Runs.RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is not
+                { PartitionOrder: false, Count: >= 0 } chain)
+        {
+            return null;
+        }
+
+        var cold = await Runs.RunColdZSet.OpenAsync(chain, this, cancellationToken).ConfigureAwait(false);
+        CheckpointTracking.MarkRestored(cold, chain);
+        return cold;
+    }
+
     // The run's order: the row's own cached hash (StructuralRowHash — deterministic across
     // processes, and already computed, so a run write hashes nothing).
     private static int Hash(StructuralRow row) => row.GetHashCode();
 
     /// <inheritdoc/>
-    public ArrowSchema RunSchema => _arrowSchemaWithWeight;
+    public ArrowSchema RunSchema => _runSchema;
+
+    private readonly ArrowSchema _runSchema;
 
     /// <inheritdoc/>
-    public RecordBatch EncodeBlock(StructuralRow[] rows, long[] weights, int count)
+    public RecordBatch EncodeBlock(StructuralRow[] rows, long[] weights, int[] hashes, int count)
     {
         var slice = new ArraySegment<StructuralRow>(rows, 0, count);
         var columnCount = _rowSchema.Count;
-        var arrays = new IArrowArray[columnCount + 1];
+        var arrays = new IArrowArray[columnCount + 2];
         for (var c = 0; c < columnCount; c++)
         {
             arrays[c] = ArrowColumns.Build(_rowSchema[c].Type, slice, c);
@@ -112,11 +133,22 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         }
 
         arrays[columnCount] = w.Build();
-        return new RecordBatch(_arrowSchemaWithWeight, arrays, count);
+        var h = new Int32Array.Builder().Reserve(count);
+        for (var i = 0; i < count; i++)
+        {
+            h.Append(hashes[i]);
+        }
+
+        arrays[columnCount + 1] = h.Build();
+        return new RecordBatch(_runSchema, arrays, count);
     }
 
     /// <inheritdoc/>
     public void DecodeBlock(RecordBatch batch, ZSetBuilder<StructuralRow, Z64> into) => AddBatch(batch, into);
+
+    /// <inheritdoc/>
+    public void DecodeRange(RecordBatch batch, int from, int count, ZSetBuilder<StructuralRow, Z64> into) =>
+        AddRange(batch, from, count, into, StringDecoding.Copy);
 
     private async ValueTask SaveMonolithicAsync(
         ISnapshotWriter writer,
@@ -365,15 +397,17 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         return b.Build();
     }
 
-    private void AddBatch(RecordBatch batch, ZSetBuilder<StructuralRow, Z64> b)
+    private void AddBatch(RecordBatch batch, ZSetBuilder<StructuralRow, Z64> b) =>
+        AddRange(batch, 0, batch.Length, b, ShippingStrings);
+
+    private void AddRange(RecordBatch batch, int from, int rowCount, ZSetBuilder<StructuralRow, Z64> b, StringDecoding strings)
     {
         var columnCount = _rowSchema.Count;
-        var rowCount = batch.Length;
         var perColumn = new object?[columnCount][];
         for (var c = 0; c < columnCount; c++)
         {
             perColumn[c] = ArrowColumns.Extract(
-                batch.Column(c), _rowSchema[c].Type, rowCount, ShippingStrings);
+                batch.Column(c), _rowSchema[c].Type, from, rowCount, strings);
         }
 
         var weightArray = (Int64Array)batch.Column(columnCount);
@@ -387,7 +421,7 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
                 values[c] = perColumn[c][i];
             }
 
-            b.Add(new StructuralRow(values), new Z64(weightValues[i]));
+            b.Add(new StructuralRow(values), new Z64(weightValues[from + i]));
         }
     }
 }

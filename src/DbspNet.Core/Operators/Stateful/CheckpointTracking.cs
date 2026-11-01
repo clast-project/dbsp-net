@@ -102,6 +102,10 @@ internal interface IZSetCheckpointTracked<TKey, TWeight> : ICheckpointTracked
     /// <summary>When set, the attached snapshot may be partial (a lazily restored operator) and
     /// this produces the whole state, for a write that needs all of it.</summary>
     Func<ZSet<TKey, TWeight>>? FullState => null;
+
+    /// <summary>The whole state's exact size when known without reading it (a lazily restored trace
+    /// knows it); null otherwise. Recorded with the chain, so the next lazy restore knows it too.</summary>
+    long? ExactCount => null;
 }
 
 /// <summary>A tracked indexed state; see <see cref="IZSetCheckpointTracked{TKey,TWeight}"/>.</summary>

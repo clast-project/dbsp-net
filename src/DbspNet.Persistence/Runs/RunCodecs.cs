@@ -14,23 +14,30 @@ namespace DbspNet.Persistence.Runs;
 /// </summary>
 internal interface IZSetRunCodec
 {
-    /// <summary>The schema of every block: the row's columns, then <c>__weight : Int64</c>.</summary>
+    /// <summary>The schema of every block: the row's columns, <c>__weight : Int64</c>, then
+    /// <c>__hash : Int32</c> (each entry's order hash, ascending — see <see cref="RunFile"/>).</summary>
     ArrowSchema RunSchema { get; }
 
-    /// <summary>One block: <paramref name="count"/> rows and their weights.</summary>
-    RecordBatch EncodeBlock(StructuralRow[] rows, long[] weights, int count);
+    /// <summary>One block: <paramref name="count"/> rows, their weights and order hashes.</summary>
+    RecordBatch EncodeBlock(StructuralRow[] rows, long[] weights, int[] hashes, int count);
 
     /// <summary>Add every row of a decoded block to <paramref name="into"/>.</summary>
     void DecodeBlock(RecordBatch batch, ZSetBuilder<StructuralRow, Z64> into);
+
+    /// <summary>Add rows <c>[from, from + count)</c> of a decoded block to <paramref name="into"/>.</summary>
+    void DecodeRange(RecordBatch batch, int from, int count, ZSetBuilder<StructuralRow, Z64> into);
 }
 
 /// <summary>The indexed-trace twin of <see cref="IZSetRunCodec"/>: a block row is (key, value, weight).</summary>
 internal interface IIndexedRunCodec
 {
-    /// <summary>The schema of every block: key columns, value columns, <c>__weight : Int64</c>.</summary>
+    /// <summary>The schema of every block: key columns, value columns, <c>__weight : Int64</c>,
+    /// <c>__hash : Int32</c> (the key's order hash).</summary>
     ArrowSchema RunSchema { get; }
 
-    RecordBatch EncodeBlock(StructuralRow[] keys, StructuralRow[] values, long[] weights, int count);
+    RecordBatch EncodeBlock(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count);
 
     void DecodeBlock(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into);
+
+    void DecodeRange(RecordBatch batch, int from, int count, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into);
 }

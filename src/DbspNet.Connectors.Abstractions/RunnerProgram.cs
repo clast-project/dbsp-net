@@ -159,6 +159,8 @@ internal abstract class RunnerProgram
         public override ZSet<StructuralRow, Z64> CurrentView => output.CurrentView;
 
         public override ZSet<StructuralRow, Z64> LastDelta => output.View.LastDelta;
+
+        public override IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() => output.View.EnumerateCurrent();
     }
 
     private sealed class ParallelOutput(ParallelProgramOutput output) : RunnerOutput
@@ -191,4 +193,8 @@ internal abstract class RunnerOutput
     public abstract ZSet<StructuralRow, Z64> CurrentView { get; }
 
     public abstract ZSet<StructuralRow, Z64> LastDelta { get; }
+
+    /// <summary>Every row of the view, for a full write — streamed without reading a lazily
+    /// restored view into memory where the program can (docs/design-durable-state.md §1f, increment 6).</summary>
+    public virtual IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() => CurrentView;
 }

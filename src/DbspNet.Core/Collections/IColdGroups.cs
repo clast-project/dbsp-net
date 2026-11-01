@@ -64,6 +64,21 @@ internal static class ColdStats
 
     private static readonly bool TracePromoters = Environment.GetEnvironmentVariable("DBSPNET_COLD_TRACE") == "1";
 
+    private static long _rowResolves;
+    private static long _rowResolvedPresent;
+
+    /// <summary>Rows read from a cold Z-set trace (views, DISTINCT), and how many were present.</summary>
+    internal static (long Reads, long Present) RowResolves => (Interlocked.Read(ref _rowResolves), Interlocked.Read(ref _rowResolvedPresent));
+
+    internal static void RowResolve(bool present)
+    {
+        Interlocked.Increment(ref _rowResolves);
+        if (present)
+        {
+            Interlocked.Increment(ref _rowResolvedPresent);
+        }
+    }
+
     internal static void Resolve(bool present)
     {
         Interlocked.Increment(ref _resolves);

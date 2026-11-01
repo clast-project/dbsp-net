@@ -59,10 +59,10 @@ internal static class RunCheckpoint
         }
 
         // The size: the whole state's, without reading it when only a delta was written.
-        var size = whole?.Count ?? (trace?.FullState is null ? state.Count : -1);
+        var size = whole?.Count ?? trace?.ExactCount ?? (trace?.FullState is null ? state.Count : -1);
         if (size < 0 && trace?.Tracking?.Chain is RunChain tracked && tracked.Count >= 0 && trace.Tracking.Pending is { } p)
         {
-            size = (int)Math.Min(int.MaxValue, tracked.Count + p.Count); // an upper bound; see RunColdRows
+            size = tracked.Count + p.Count; // an upper bound (a partitioned operator's: only a heuristic there)
         }
 
         chain = chain.WithCount(size);

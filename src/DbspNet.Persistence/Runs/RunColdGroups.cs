@@ -73,7 +73,9 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
             }
         }
 
-        return new RunColdGroups(runs, codec, checked((int)chain.Count), preloaded, [.. keys]);
+        var cold = new RunColdGroups(runs, codec, checked((int)chain.Count), preloaded, [.. keys]);
+        RunPins.Add(cold, chain.Store, chain.Paths);
+        return cold;
     }
 
     public void ReleasePreload()
@@ -95,10 +97,10 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
             }
 
             // Synchronous on purpose: the operator that asked is on the step thread, waiting.
-            var block = _preloaded is not null && _preloaded.TryGetValue((r, b), out var held)
-                ? held
-                : _runs[r].DecodeIndexedBlockAsync(b, _codec).AsTask().GetAwaiter().GetResult();
-            var group = block.GroupFor(key);
+            // A preloaded giant block is already decoded; otherwise only the key's entries are.
+            var group = _preloaded is not null && _preloaded.TryGetValue((r, b), out var held)
+                ? held.GroupFor(key)
+                : _runs[r].GroupOfKeyAsync(key, _codec).AsTask().GetAwaiter().GetResult();
             if (group.IsEmpty)
             {
                 continue;

@@ -48,7 +48,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
     }
 
     /// <summary>Distinct keys retained in the trace. Exposed for GC-bound tests.</summary>
-    internal int RetainedKeyCount => _trace.Current.Count;
+    internal int RetainedKeyCount => _trace.Count;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -59,7 +59,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
                 "to CircuitBuilder.Distinct to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.Current, cancellationToken);
+        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.State, cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -68,6 +68,14 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
         {
             throw new NotSupportedException(
                 "DistinctOp was constructed without a snapshot codec.");
+        }
+
+        // Lazily (increment 6): a row-ordered chain stays cold; Step reads the rows deltas touch.
+        if (_snapshotCodec is IColdZSetLoader<TKey, TWeight> coldLoader
+            && await coldLoader.LoadColdZSetAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false) is { } cold)
+        {
+            _trace.AdoptCold(cold);
+            return;
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
@@ -94,7 +102,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
         var outputBuilder = new ZSetBuilder<TKey, TWeight>(_lastOutputSize);
         foreach (var (key, dw) in delta)
         {
-            var before = _trace.Current.WeightOf(key);
+            var before = _trace.WeightOf(key);
             var after = TWeight.Add(before, dw);
 
             var wasPresent = TWeight.IsPositive(before);
@@ -141,7 +149,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
 
     public string MetricName => "Distinct";
 
-    public long RetainedRows => _trace.Current.Count;
+    public long RetainedRows => _trace.State.Count;
 
     public long LastOutputRows => _output.Current.Count;
 

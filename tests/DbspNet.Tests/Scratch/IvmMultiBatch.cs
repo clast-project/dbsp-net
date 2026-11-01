@@ -355,7 +355,7 @@ public class IvmMultiBatch
             if (restarted)
             {
                 _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                    $"COLD after_batch={batch} resolves={DbspNet.Core.Collections.ColdStats.Resolves} present={DbspNet.Core.Collections.ColdStats.ResolvedPresent} promotions={DbspNet.Core.Collections.ColdStats.Promotions} promoted_groups={DbspNet.Core.Collections.ColdStats.PromotedGroups} read_ms={DbspNet.Core.Collections.ColdStats.ReadMs:F0} promote_ms={DbspNet.Core.Collections.ColdStats.PromoteMs:F0}"));
+                    $"COLD after_batch={batch} resolves={DbspNet.Core.Collections.ColdStats.Resolves} present={DbspNet.Core.Collections.ColdStats.ResolvedPresent} promotions={DbspNet.Core.Collections.ColdStats.Promotions} promoted_groups={DbspNet.Core.Collections.ColdStats.PromotedGroups} read_ms={DbspNet.Core.Collections.ColdStats.ReadMs:F0} promote_ms={DbspNet.Core.Collections.ColdStats.PromoteMs:F0} row_reads={DbspNet.Core.Collections.ColdStats.RowResolves.Reads} row_present={DbspNet.Core.Collections.ColdStats.RowResolves.Present}"));
                 foreach (var (who, n) in DbspNet.Core.Collections.ColdStats.Promoters.OrderByDescending(kv => kv.Value).Take(8))
                 {
                     _out.WriteLine($"PROMOTER {who}{n}");

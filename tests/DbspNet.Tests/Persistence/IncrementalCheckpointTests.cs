@@ -124,7 +124,8 @@ public class IncrementalCheckpointTests
             .ToDictionary(l => l.File[(current.Length + 1)..], l => l.Runs, StringComparer.Ordinal);
     }
 
-    // The sweep's invariant: runs/ holds exactly the runs the retained snapshots' run indexes name.
+    // The sweep's invariant: runs/ holds exactly the runs the retained snapshots' run indexes name,
+    // plus runs pinned by live lazily restored state.
     private static async Task AssertRunsAreExactlyTheReferencedOnesAsync(ITableFileSystem fs)
     {
         var referenced = (await IndexLinesAsync(fs, "snap-")).SelectMany(l => l.Runs).ToHashSet(StringComparer.Ordinal);
@@ -134,8 +135,12 @@ public class IncrementalCheckpointTests
             present.Add(f.Path);
         }
 
-        Assert.True(referenced.SetEquals(present),
-            $"runs/ holds {present.Count} runs, the indexes name {referenced.Count}; extra: {string.Join(", ", present.Except(referenced).Take(3))}; missing: {string.Join(", ", referenced.Except(present).Take(3))}");
+        // Beyond what the indexes name, only runs a live lazily restored state still reads (RunPins).
+        var pinned = RunPins.In(fs);
+        var extra = present.Except(referenced).Where(p => !pinned.Contains(p)).ToList();
+        var missing = referenced.Except(present).ToList();
+        Assert.True(extra.Count == 0 && missing.Count == 0,
+            $"runs/ holds {present.Count} runs, the indexes name {referenced.Count}, {pinned.Count} pinned; extra: {string.Join(", ", extra.Take(3))}; missing: {string.Join(", ", missing.Take(3))}");
 
         // And no trace file is written beside its index entry: one file per directory, not per trace.
         var current = await CurrentAsync(fs);

@@ -246,6 +246,83 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return _bloom.MightContain(h) ? FindBlock(h) : -1;
     }
 
+    /// <summary><paramref name="key"/>'s weight in a Z-set run, decoding only the block's entries
+    /// whose order hash is the key's (a binary search of the block's <c>__hash</c> column).</summary>
+    internal async ValueTask<Z64> WeightOfRowAsync(StructuralRow key, IZSetRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.ZSet);
+        var h = _hash(key);
+        var b = BlockOfHash(h);
+        if (b < 0)
+        {
+            return Z64.Zero;
+        }
+
+        using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
+        var (from, count) = HashRange(block.Batch, h);
+        if (count == 0)
+        {
+            return Z64.Zero;
+        }
+
+        var into = new ZSetBuilder<StructuralRow, Z64>(count);
+        codec.DecodeRange(block.Batch, from, count, into);
+        return into.Build().WeightOf(key);
+    }
+
+    /// <summary><paramref name="key"/>'s group in an indexed run, decoding only its entries.</summary>
+    internal async ValueTask<ZSet<StructuralRow, Z64>> GroupOfKeyAsync(
+        StructuralRow key, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.Indexed);
+        var h = _hash(key);
+        var b = BlockOfHash(h);
+        if (b < 0)
+        {
+            return ZSet<StructuralRow, Z64>.Empty;
+        }
+
+        using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
+        var (from, count) = HashRange(block.Batch, h);
+        if (count == 0)
+        {
+            return ZSet<StructuralRow, Z64>.Empty;
+        }
+
+        var into = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        codec.DecodeRange(block.Batch, from, count, into);
+        return into.Build().GroupFor(key);
+    }
+
+    // The entries of a block whose order hash is h: the block's last column holds the entries'
+    // hashes in ascending unsigned order, so a binary search finds the run of equal ones.
+    private static (int From, int Count) HashRange(RecordBatch batch, int hash)
+    {
+        var hashes = ((Int32Array)batch.Column(batch.ColumnCount - 1)).Values;
+        var h = (uint)hash;
+        int lo = 0, hi = hashes.Length;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) >>> 1;
+            if ((uint)hashes[mid] < h)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid;
+            }
+        }
+
+        var end = lo;
+        while (end < hashes.Length && (uint)hashes[end] == h)
+        {
+            end++;
+        }
+
+        return (lo, end - lo);
+    }
+
     /// <summary>The block holding entries of order hash <paramref name="hash"/>, or -1 when the run certainly has none.</summary>
     internal int BlockOfHash(int hash) => _bloom.MightContain((uint)hash) ? FindBlock((uint)hash) : -1;
 

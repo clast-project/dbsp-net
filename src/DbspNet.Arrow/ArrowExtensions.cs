@@ -89,11 +89,22 @@ public static class ArrowExtensions
         SqlSchema schema,
         DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> changes)
     {
+        ArgumentNullException.ThrowIfNull(changes);
+        return ToArrowChanges(schema, changes, changes.Count);
+    }
+
+    /// <summary>As <see cref="ToArrowChanges(SqlSchema, DbspNet.Core.Collections.ZSet{DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64})"/>,
+    /// from any enumeration of distinct rows and weights (a view streamed without forming it).</summary>
+    public static ArrowChanges ToArrowChanges(
+        SqlSchema schema,
+        IEnumerable<KeyValuePair<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64>> changes,
+        int capacity = 0)
+    {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(changes);
         // The inserted rows are kept anyway (they are InsertKeys), so the Arrow columns are built
         // straight from them — no boxed per-column staging copy (docs/design-chunked-deltas.md §8).
-        var keys = new List<object>(changes.Count);
+        var keys = new List<object>(capacity);
         var deletes = new List<(object Key, long Count)>();
         foreach (var (row, weight) in changes)
         {

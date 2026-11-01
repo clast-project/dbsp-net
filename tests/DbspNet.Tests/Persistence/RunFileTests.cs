@@ -76,6 +76,7 @@ public class RunFileTests
         {
             Assert.True(run.MightContain(row));
             Assert.Equal(weight, await run.WeightOfAsync(row, codec));
+            Assert.Equal(weight, await run.WeightOfRowAsync(row, codec)); // hash-range probe
         }
 
         // Rows the set does not hold: same keys with other cells, and keys out of range.
@@ -84,6 +85,7 @@ public class RunFileTests
         {
             var probe = Row(rng, rng.Next(-50, n * 3));
             Assert.Equal(set.WeightOf(probe), await run.WeightOfAsync(probe, codec));
+            Assert.Equal(set.WeightOf(probe), await run.WeightOfRowAsync(probe, codec));
         }
 
         var scanned = new ZSetBuilder<StructuralRow, Z64>();
@@ -128,7 +130,10 @@ public class RunFileTests
         foreach (var g in set)
         {
             Assert.Equal(Sorted(g.Value), Sorted(await run.GroupForAsync(g.Key, codec)));
+            Assert.Equal(Sorted(g.Value), Sorted(await run.GroupOfKeyAsync(g.Key, codec))); // hash-range probe
         }
+
+        Assert.True((await run.GroupOfKeyAsync(new StructuralRow(-7), codec)).IsEmpty);
 
         Assert.True((await run.GroupForAsync(new StructuralRow(-7), codec)).IsEmpty);
 

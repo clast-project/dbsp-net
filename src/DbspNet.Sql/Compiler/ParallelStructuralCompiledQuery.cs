@@ -278,7 +278,8 @@ public sealed class ParallelProgramOutput
             var builder = new ZSetBuilder<StructuralRow, Z64>();
             foreach (var shard in _shards)
             {
-                foreach (var (row, weight) in shard.Current)
+                // Without reading a lazily restored shard into memory (increment 6).
+                foreach (var (row, weight) in shard.EnumerateCurrent())
                 {
                     builder.Add(row, weight);
                 }
