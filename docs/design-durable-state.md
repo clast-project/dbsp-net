@@ -1130,6 +1130,33 @@ Also fixed: the increment-7b test that turns compaction off used a process-wide 
 switch it off under other compaction tests running in parallel (an intermittent full-suite failure);
 `RunCheckpoint.UseCompaction` is now scoped to the async context, like `StateLayout.Use`.
 
+### The merge bumps (2026-11-01)
+
+Increment 7b left occasional checkpoint bumps (236–453 ms on ~1 in 8) with compaction on.
+`CheckpointChainBench` now records per checkpoint the GC pause, gen-1/gen-2 collections, and merges in
+flight at its start and end. Every bump was a **blocking gen-2 collection inside the checkpoint**
+(118–278 ms of pause), and **no merge was running** at any of them (`merges_at_start=0`): the merges
+were not competing for CPU — they *allocated* (decoding the whole base run into row objects), which
+pushed the GC into full collections that then landed in a later checkpoint, where `CheckpointGcMode`
+makes collections blocking by design.
+
+**Fix: a merge copies untouched blocks unchanged.** The deltas are small, so most base blocks
+receive no delta entry. Such a block is copied as its stored record-batch message
+(`RunReader.ReadBlockRawAsync` → `RunStreamWriter.AppendRawAsync`), reading only its `__hash` column
+(zero-copy) for the Bloom filter — no rows decoded, nothing allocated per entry. Only blocks a delta
+touches are decoded and merged as before.
+
+Measured (`CheckpointChainBench`, 1 s between checkpoints, ticks 1–40, three runs):
+
+| | slowest checkpoint | over 200 ms | gen-2 collections inside checkpoints |
+|---|--:|--:|--:|
+| before | 396–453 ms | 5 | 5 |
+| raw-copy merges | 197–201 ms | 0–1 | 1 |
+
+What remains is the workload's own growth (each tick's join delta grows), not merges. Full suite
+passes three ways (runs off, runs on, runs on + verify — so every adopted merge, raw-copied blocks
+included, was read back against the live state).
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

@@ -55,6 +55,16 @@ internal static class RunCompactor
         var chunk = new Dictionary<StructuralRow, (uint Hash, long Weight)>();
         foreach (var block in runs[0].Blocks.Select((_, i) => i))
         {
+            // No delta entry falls in this block's chunk: copy it unchanged — no decode, no
+            // row objects (most blocks: the deltas are small). Only touched blocks are merged.
+            var meta = runs[0].Blocks[block];
+            if (d >= sorted.Count || sorted[d].Hash > meta.LastHash)
+            {
+                var (message, keyHashes) = await runs[0].ReadBlockRawAsync(block, cancellationToken).ConfigureAwait(false);
+                await writer.AppendRawAsync(message, keyHashes, meta.Entries, meta.Groups, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
             var (entries, hashes) = await runs[0].ReadBlockAsync(block, codec.DecodeEntries, cancellationToken).ConfigureAwait(false);
             chunk.Clear();
             for (var i = 0; i < entries.Length; i++)
@@ -108,6 +118,16 @@ internal static class RunCompactor
         var chunk = new Dictionary<(StructuralRow, StructuralRow), (uint Hash, long Weight)>();
         foreach (var block in runs[0].Blocks.Select((_, i) => i))
         {
+            // No delta entry falls in this block's chunk: copy it unchanged — no decode, no
+            // row objects (most blocks: the deltas are small). Only touched blocks are merged.
+            var meta = runs[0].Blocks[block];
+            if (d >= sorted.Count || sorted[d].Hash > meta.LastHash)
+            {
+                var (message, keyHashes) = await runs[0].ReadBlockRawAsync(block, cancellationToken).ConfigureAwait(false);
+                await writer.AppendRawAsync(message, keyHashes, meta.Entries, meta.Groups, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
             var (entries, hashes) = await runs[0].ReadBlockAsync(block, codec.DecodeEntries, cancellationToken).ConfigureAwait(false);
             chunk.Clear();
             for (var i = 0; i < entries.Length; i++)

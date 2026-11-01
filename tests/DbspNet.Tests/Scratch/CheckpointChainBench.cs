@@ -91,9 +91,15 @@ public class CheckpointChainBench(ITestOutputHelper output)
                         await Task.Delay(gap);
                     }
 
+                    var inFlight = RunCheckpoint.MergesInFlight;
+                    var pause0 = GC.GetTotalPauseDuration();
+                    var gen2 = GC.CollectionCount(2);
+                    var gen1 = GC.CollectionCount(1);
                     sw.Restart();
                     await ParallelSnapshot.WriteAsync(program.Circuit, fs, retainCount: 2);
                     var ms = sw.Elapsed.TotalMilliseconds;
+                    var gcMs = (GC.GetTotalPauseDuration() - pause0).TotalMilliseconds;
+                    var gcs = $"gc_pause_ms={gcMs:F0} gen1={GC.CollectionCount(1) - gen1} gen2={GC.CollectionCount(2) - gen2} merges_at_start={inFlight} merges_at_end={RunCheckpoint.MergesInFlight}";
                     // What this checkpoint wrote: chains that are a single run written now (a whole
                     // rewrite), and chains whose front is a merged run (an adopted compaction).
                     var current = File.ReadAllText(Path.Combine(dir, "current.txt")).Trim();
@@ -110,7 +116,7 @@ public class CheckpointChainBench(ITestOutputHelper output)
                     }
 
                     output.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                        $"CHAIN tick={tick} checkpoint_ms={ms:F0} whole_rewrites={bases} merged_fronts={merged} longest_chain={longest}"));
+                        $"CHAIN tick={tick} checkpoint_ms={ms:F0} whole_rewrites={bases} merged_fronts={merged} longest_chain={longest} {gcs}"));
                 }
 
                 await CheckpointCleanup.WaitAsync(fs);

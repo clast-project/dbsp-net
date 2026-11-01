@@ -339,6 +339,46 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return (decode(block.Batch), hashes);
     }
 
+    /// <summary>Block <paramref name="b"/> as stored — its record-batch message bytes, to copy into
+    /// another run of the same schema unchanged — and its distinct order hashes (read from the
+    /// <c>__hash</c> column only; no row is decoded).</summary>
+    internal async ValueTask<(byte[] Message, List<uint> KeyHashes)> ReadBlockRawAsync(int b, CancellationToken cancellationToken = default)
+    {
+        var block = _blocks[b];
+        var file = _file ?? await _store!.OpenReadAsync(_path!, cancellationToken).ConfigureAwait(false);
+        byte[] message;
+        try
+        {
+            using var bytes = await file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false);
+            message = bytes.Memory.Span[..block.Length].ToArray();
+        }
+        finally
+        {
+            if (_file is null)
+            {
+                await file.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        var buffer = new byte[_schemaMessage.Length + message.Length];
+        _schemaMessage.CopyTo(buffer, 0);
+        message.CopyTo(buffer, _schemaMessage.Length);
+        using var reader = new ArrowStreamReader(new MemoryStream(buffer, writable: false), leaveOpen: false);
+        using var batch = reader.ReadNextRecordBatch()
+            ?? throw new InvalidDataException($"run block at offset {block.Offset} holds no record batch");
+        var stored = ((Int32Array)batch.Column(batch.ColumnCount - 1)).Values;
+        var distinct = new List<uint>();
+        foreach (var h in stored)
+        {
+            if (distinct.Count == 0 || distinct[^1] != (uint)h)
+            {
+                distinct.Add((uint)h);
+            }
+        }
+
+        return (message, distinct);
+    }
+
     /// <summary>The block holding entries of order hash <paramref name="hash"/>, or -1 when the run certainly has none.</summary>
     internal int BlockOfHash(int hash) => _bloom.MightContain((uint)hash) ? FindBlock((uint)hash) : -1;
 

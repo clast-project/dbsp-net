@@ -187,6 +187,9 @@ internal static class RunCheckpoint
         public void Dispose() => undo();
     }
 
+    /// <summary>Merges not yet finished (diagnostics).</summary>
+    internal static int MergesInFlight => Jobs.Count(j => !j.Value.Merge.IsCompleted);
+
     /// <summary>Every merge in flight (tests and benchmarks wait on them).</summary>
     internal static Task WhenAllCompactedAsync() =>
         Task.WhenAll(Jobs.Select(j => j.Value.Merge).ToArray());
