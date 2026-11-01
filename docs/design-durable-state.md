@@ -757,6 +757,48 @@ integrate also merges its delta into the pending change — O(|delta|) per tick,
 the ivm-bench batch-2/3 drains (~0.08 s) are too small to show it; a throughput run with periodic
 checkpoints would.
 
+### Increment 3 — the two bookkeeping levers (2026-10-31; Curt: "build both")
+
+**One run index per directory.** A session-aware checkpoint no longer writes a run-list file per
+trace: each snapshot (worker) directory gets one `runs.txt` (`RunIndex`), a line per trace file —
+`op-{i}/{file}`, base entries, delta entries, its runs. The snapshot reader resolves a trace file
+through its directory's index (`TableFileSystemSnapshotContext.ChainAsync`, read once per context),
+and `ExistsAsync` answers through it too, so re-shard (which asks before loading) and operators are
+unchanged. An operator whose state is all traces now has no `op-{i}` directory at all. The sweep
+reads the same indexes.
+
+**Deferred cleanup.** Prune + sweep start in the background once the pointer commits
+(`CheckpointCleanup`, default on; `DBSPNET_CHECKPOINT_CLEANUP=inline` restores the old order).
+Every later snapshot operation on the same store — write, read, re-shard, listing — waits for it
+first; stores are keyed by identity (a local store's root path), so a second store object over the
+same directory waits too. The string-path convenience overloads and `WalRecorder` stay inline (the
+caller gets a final directory back). Cleanup only deletes what no retained snapshot needs, so
+doing it late changes only when the space returns; a failure in it is ignored and retried by the
+next one, as an inline prune's was. Tests that count mutations run inline;
+`ACrashDuringDeferredCleanup_StillRecoversTheNewCheckpoint` crashes inside the deferred cleanup
+(process crash and power loss) and requires the new checkpoint to restore and checkpoint on.
+Mutation-tested: an `ExistsAsync` that ignores the index, and a sweep that ignores it, each fail.
+Full suite passes four ways: runs off, runs on, runs on + verify, runs on + inline cleanup.
+
+**Measured** (SF=3, W=12, 5 alternating runs per arm; raw: `docs/runs-levers-w12-20261031.txt`).
+`12:inline` is today's layout as it was; `12` is today's layout with deferred cleanup (now the
+default for it too):
+
+| | today, inline cleanup | today, deferred | runs, incremental + both levers |
+|---|--:|--:|--:|
+| checkpoint after batch 1 (base) | 4.86 s [4.13–4.92] | 4.92 s [4.21–5.22] | 5.55 s [4.38–5.68] |
+| checkpoint after batch 2 (delta) | 3.92 s [3.31–3.97] | 3.07 s [2.90–3.22] | **0.27 s** [0.24–0.28] |
+| checkpoint after batch 3 (delta) | 3.47 s [3.42–3.90] | 3.94 s [3.18–4.16] | **0.30 s** [0.29–0.30] |
+| written per delta checkpoint | 4,701 MiB | 4,701 MiB | 51 MiB |
+| restore | 5.43 s | 5.58 s | 6.60 s |
+
+All 15 restores matched. **The checkpoint target (under 0.5 s for a batch-2/3-sized change) is
+met**: 0.92 / 1.48 s → 0.27 / 0.30 s, 11–13× faster than today. The batch-3 figure includes waiting
+for batch 2's deferred cleanup (the batch between them drains in 0.1 s), so it is not flattered by
+the deferral. For today's layout deferral is within noise — it deletes a few large files, not
+thousands of small ones. Still open against the targets: restore (6.6 s, eager — increment 4) and
+the base checkpoint (+0.6 s over today).
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

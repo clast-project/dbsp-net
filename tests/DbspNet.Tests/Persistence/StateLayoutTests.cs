@@ -56,19 +56,27 @@ public class StateLayoutTests
     private static string Digest(ParallelCompiledProgram p) =>
         Digest(v => p.Outputs[v].CurrentView.Select(e => string.Join("|", Enumerable.Range(0, p.Outputs[v].Schema.Count).Select(i => FormattableString.Invariant($"{e.Key[i]}"))) + "#" + e.Value.Value));
 
+    // Trace files by layout: a run (in place, or a chain in a run index — increment 3) or today's
+    // single Arrow stream. Keyed blobs stay in today's layout until increment 4.
     private static async Task<(int Runs, int Other)> CountLayoutsAsync(InMemoryTableFileSystem fs)
     {
+        await CheckpointCleanup.WaitAsync(fs);
         int runs = 0, other = 0;
-        await foreach (var f in fs.ListAsync(""))
+        await foreach (var f in fs.ListAsync("snap-"))
         {
-            if (!f.Path.EndsWith(".arrows", StringComparison.Ordinal) || f.Path.EndsWith("aggstate.arrows", StringComparison.Ordinal))
+            if (f.Path.EndsWith("/" + RunIndex.FileName, StringComparison.Ordinal))
             {
-                continue; // keyed blobs stay in today's layout until increment 4
+                runs += System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(f.Path)).Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
+                continue;
             }
 
-            // A run in place, a run list over runs/ (increment 3), or a run under runs/.
+            if (!f.Path.EndsWith(".arrows", StringComparison.Ordinal) || f.Path.EndsWith("aggstate.arrows", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             await using var file = await fs.OpenReadAsync(f.Path);
-            if (await RunReader.IsRunAsync(file, default) || await RunChain.IsListAsync(file, default))
+            if (await RunReader.IsRunAsync(file, default))
             {
                 runs++;
             }

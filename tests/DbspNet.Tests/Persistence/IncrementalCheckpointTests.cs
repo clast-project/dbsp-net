@@ -88,37 +88,46 @@ public class IncrementalCheckpointTests
 
     private static CompiledProgram Compile() => SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
 
-    // Every run list under the current snapshot: its path and the runs it names.
-    private static async Task<Dictionary<string, string[]>> ChainsAsync(ITableFileSystem fs)
+    // Every run-index line of every directory under a snapshot prefix: (trace file path relative
+    // to the snapshot, base entries, delta entries, runs).
+    private static async Task<List<(string File, long Base, long Delta, string[] Runs)>> IndexLinesAsync(ITableFileSystem fs, string prefix)
     {
-        var current = Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
-        var chains = new Dictionary<string, string[]>(StringComparer.Ordinal);
-        await foreach (var f in fs.ListAsync(current + "/"))
+        await CheckpointCleanup.WaitAsync(fs);
+        var lines = new List<(string, long, long, string[])>();
+        await foreach (var f in fs.ListAsync(prefix))
         {
-            var bytes = await fs.ReadAllBytesAsync(f.Path);
-            if (bytes.Length >= 8 && Encoding.ASCII.GetString(bytes, 0, 8) == "DBSPRLS1")
+            if (!f.Path.EndsWith("/" + RunIndex.FileName, StringComparison.Ordinal))
             {
-                chains[f.Path[(current.Length + 1)..]] = Encoding.UTF8.GetString(bytes, 8, bytes.Length - 8)
-                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)[2..];
+                continue;
+            }
+
+            var dir = f.Path[..^RunIndex.FileName.Length];
+            foreach (var line in Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(f.Path)).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = line.Split('\t');
+                lines.Add((dir + parts[0], long.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture),
+                    long.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture), parts[3..]));
             }
         }
 
-        return chains;
+        return lines;
     }
 
-    // The sweep's invariant: runs/ holds exactly the runs the retained snapshots' refs files name,
-    // and every run a current run list names is in its directory's refs file.
+    private static async Task<string> CurrentAsync(ITableFileSystem fs) =>
+        Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
+
+    // Every chain the current snapshot records, keyed by trace file path within the snapshot.
+    private static async Task<Dictionary<string, string[]>> ChainsAsync(ITableFileSystem fs)
+    {
+        var current = await CurrentAsync(fs);
+        return (await IndexLinesAsync(fs, current + "/"))
+            .ToDictionary(l => l.File[(current.Length + 1)..], l => l.Runs, StringComparer.Ordinal);
+    }
+
+    // The sweep's invariant: runs/ holds exactly the runs the retained snapshots' run indexes name.
     private static async Task AssertRunsAreExactlyTheReferencedOnesAsync(ITableFileSystem fs)
     {
-        var referenced = new HashSet<string>(StringComparer.Ordinal);
-        await foreach (var f in fs.ListAsync("snap-"))
-        {
-            if (f.Path.EndsWith("/" + CheckpointSession.RefsFile, StringComparison.Ordinal))
-            {
-                referenced.UnionWith(Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(f.Path)).Split('\n', StringSplitOptions.RemoveEmptyEntries));
-            }
-        }
-
+        var referenced = (await IndexLinesAsync(fs, "snap-")).SelectMany(l => l.Runs).ToHashSet(StringComparer.Ordinal);
         var present = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var f in fs.ListAsync(RunSweep.RunsPrefix))
         {
@@ -126,10 +135,13 @@ public class IncrementalCheckpointTests
         }
 
         Assert.True(referenced.SetEquals(present),
-            $"runs/ holds {present.Count} runs, the refs name {referenced.Count}; extra: {string.Join(", ", present.Except(referenced).Take(3))}; missing: {string.Join(", ", referenced.Except(present).Take(3))}");
-        foreach (var chain in (await ChainsAsync(fs)).Values)
+            $"runs/ holds {present.Count} runs, the indexes name {referenced.Count}; extra: {string.Join(", ", present.Except(referenced).Take(3))}; missing: {string.Join(", ", referenced.Except(present).Take(3))}");
+
+        // And no trace file is written beside its index entry: one file per directory, not per trace.
+        var current = await CurrentAsync(fs);
+        foreach (var line in await IndexLinesAsync(fs, current + "/"))
         {
-            Assert.All(chain, path => Assert.Contains(path, referenced));
+            Assert.False(await fs.ExistsAsync(line.File), $"{line.File} exists as well as in the run index");
         }
     }
 
@@ -243,6 +255,8 @@ public class IncrementalCheckpointTests
     [Fact]
     public async Task AFailedCheckpoint_LosesNoChange()
     {
+        // Counts mutations: the cleanup a checkpoint defers must happen inside the count.
+        using var inlineCleanup = CheckpointCleanup.Inline();
         // Fail the second checkpoint at each of its mutations in turn (some delta runs written,
         // no commit), carry on in the same process, checkpoint again: the state must restore
         // exactly — and after power loss too, since the failed checkpoint's runs were never synced.
@@ -379,23 +393,9 @@ public class IncrementalCheckpointTests
         Assert.True(sawDrops, "no delta carried a GC drop");
     }
 
-    // Per run list under the current snapshot: its run count and the entries across its deltas.
-    private static async Task<List<(int Runs, long Delta)>> DeltaEntriesAsync(InMemoryTableFileSystem fs)
-    {
-        var current = Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
-        var result = new List<(int, long)>();
-        await foreach (var f in fs.ListAsync(current + "/"))
-        {
-            var bytes = await fs.ReadAllBytesAsync(f.Path);
-            if (bytes.Length >= 8 && Encoding.ASCII.GetString(bytes, 0, 8) == "DBSPRLS1")
-            {
-                var lines = Encoding.UTF8.GetString(bytes, 8, bytes.Length - 8).Split('\n', StringSplitOptions.RemoveEmptyEntries);
-                result.Add((lines.Length - 2, long.Parse(lines[1], System.Globalization.CultureInfo.InvariantCulture)));
-            }
-        }
-
-        return result;
-    }
+    // Per chain in the current snapshot: its run count and the entries across its deltas.
+    private static async Task<List<(int Runs, long Delta)>> DeltaEntriesAsync(InMemoryTableFileSystem fs) =>
+        (await IndexLinesAsync(fs, await CurrentAsync(fs) + "/")).Select(l => (l.Runs.Length, l.Delta)).ToList();
 
     [Fact]
     public async Task ParallelChains_RestoreAndReshard()
@@ -459,6 +459,8 @@ public class IncrementalCheckpointTests
     [Fact]
     public async Task CrashAtEveryMutationOfADeltaCheckpoint_RecoversTheOldOrTheNew()
     {
+        // Counts mutations: the cleanup a checkpoint defers must happen inside the count.
+        using var inlineCleanup = CheckpointCleanup.Inline();
         using var layout = StateLayout.Use(true);
         string Oracle(int ticks)
         {
@@ -537,6 +539,78 @@ public class IncrementalCheckpointTests
                 var again = Compile();
                 await Snapshot.ReadAsync(again.Circuit, restart);
                 Assert.True(Digest(recovered) == Digest(again), $"{where}: checkpoint after recovery restores differently");
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ACrashDuringDeferredCleanup_StillRecoversTheNewCheckpoint()
+    {
+        // Cleanup (prune + sweep) runs after the commit, in the background. A crash in it — at any of
+        // its first mutations — must leave the just-committed checkpoint restorable, after a
+        // process crash or power loss, and the next checkpoint must finish the cleanup.
+        using var layout = StateLayout.Use(true);
+        string after;
+        {
+            var q = Compile();
+            for (var tick = 0; tick < 6; tick++)
+            {
+                Tick(q, tick);
+            }
+
+            after = Digest(q);
+        }
+
+        for (var extra = 0; extra < 6; extra++)
+        {
+            var fs = new CrashSimulatingFileSystem();
+            var p = Compile();
+            for (var tick = 0; tick < 4; tick++)
+            {
+                Tick(p, tick);
+            }
+
+            await Snapshot.WriteAsync(p.Circuit, fs);
+            await CheckpointCleanup.WaitAsync(fs);
+            Tick(p, 4);
+            Tick(p, 5);
+
+            // How many mutations the checkpoint makes before returning (its cleanup deferred):
+            // crash at that one plus `extra`, i.e. inside the cleanup.
+            var probe = new CrashSimulatingFileSystem();
+            var twin = Compile();
+            for (var tick = 0; tick < 6; tick++)
+            {
+                Tick(twin, tick);
+                if (tick == 3)
+                {
+                    await Snapshot.WriteAsync(twin.Circuit, probe);
+                    await CheckpointCleanup.WaitAsync(probe);
+                }
+            }
+
+            var before = probe.Mutations;
+            await Snapshot.WriteAsync(twin.Circuit, probe);
+            var returned = probe.Mutations - before;
+            await CheckpointCleanup.WaitAsync(probe);
+
+            fs.CrashAt = fs.Mutations + returned + extra;
+            await Snapshot.WriteAsync(p.Circuit, fs); // returns: the crash is in the cleanup
+            await CheckpointCleanup.WaitAsync(fs);
+
+            foreach (var powerLoss in new[] { false, true })
+            {
+                var restart = powerLoss ? await fs.AfterPowerLossAsync() : await fs.AfterProcessCrashAsync();
+                var recovered = Compile();
+                await Snapshot.ReadAsync(recovered.Circuit, restart);
+                Assert.True(after == Digest(recovered), $"crash at cleanup mutation {extra} ({(powerLoss ? "power loss" : "process crash")}): not the new checkpoint");
+
+                Tick(recovered, 6);
+                await Snapshot.WriteAsync(recovered.Circuit, restart);
+                await AssertRunsAreExactlyTheReferencedOnesAsync(restart);
+                var again = Compile();
+                await Snapshot.ReadAsync(again.Circuit, restart);
+                Assert.Equal(Digest(recovered), Digest(again));
             }
         }
     }

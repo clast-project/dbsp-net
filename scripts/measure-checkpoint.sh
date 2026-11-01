@@ -13,7 +13,9 @@
 # and/or ":journal" (IVM_CHECKPOINT_POLICY=none: tick journal per batch, no snapshot)
 # and/or ":to=N" (restore at N workers: re-shard the last snapshot, then restore; reshard_ms)
 # and/or ":spine" (IVM_TRACE_FAMILY=spine: spine traces instead of flat)
-# and/or ":runs" (DBSPNET_STATE_LAYOUT=runs: snapshot files in run format).
+# and/or ":runs" (DBSPNET_STATE_LAYOUT=runs: snapshot files in run format, incremental)
+# and/or ":inline" (DBSPNET_CHECKPOINT_CLEANUP=inline: prune + sweep before the checkpoint returns,
+# as before 2026-11-01; otherwise they run in the background after the commit).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
 set -euo pipefail
@@ -58,6 +60,8 @@ for run in $(seq 1 "$RUNS"); do
     [[ "$arm" == *:spine* ]] && family=spine
     layout=""
     [[ "$arm" == *:runs* ]] && layout=runs
+    cleanup=""
+    [[ "$arm" == *:inline* ]] && cleanup=inline
     echo "## run $run arm $arm" | tee -a "$RESULTS"
     DOTNET_gcServer=1 \
     DBSPNET_SNAPSHOT_FSYNC="$fsync" \
@@ -66,6 +70,7 @@ for run in $(seq 1 "$RUNS"); do
     IVM_RESTORE_WORKERS="$restore_workers" \
     IVM_TRACE_FAMILY="$family" \
     DBSPNET_STATE_LAYOUT="$layout" \
+    DBSPNET_CHECKPOINT_CLEANUP="$cleanup" \
     IVM_DATA_ROOT="$DATA" \
     IVM_SPEC="$SPEC" \
     IVM_STAGING_ROOT="$DATA/staging-multi" \

@@ -321,10 +321,11 @@ public class IvmMultiBatch
                         .Sum(f => new FileInfo(f).Length);
 
                     // With incremental runs (DBSPNET_STATE_LAYOUT=runs) the state also includes the
-                    // shared runs the snapshot's runs.txt files name; this checkpoint wrote only
+                    // shared runs the snapshot's run indexes (runs.txt) name; this checkpoint wrote only
                     // the ones under runs/{current}.
                     var referenced = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "runs.txt", SearchOption.AllDirectories)
-                        .SelectMany(File.ReadAllLines).Where(l => l.Length > 0).Distinct()
+                        .SelectMany(File.ReadAllLines).Where(l => l.Length > 0)
+                        .SelectMany(l => l.Split('\t').Skip(3)).Distinct() // op-i/file, base, delta, runs…
                         .Sum(r => new FileInfo(Path.Combine(snapshotDir!, r)).Length);
                     var newRuns = Path.Combine(snapshotDir!, "runs", current);
                     var written = Directory.Exists(newRuns)

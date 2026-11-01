@@ -82,6 +82,7 @@ public static class Snapshot
         using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         if (retainCount < 1)
         {
             throw new ArgumentOutOfRangeException(
@@ -100,7 +101,8 @@ public static class Snapshot
         await WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
         session?.Commit();
 
-        await PruneAsync(fs, (tick, generation), retainCount, ManifestFile, cancellationToken).ConfigureAwait(false);
+        await CheckpointCleanup.RunAsync(
+            fs, ct => PruneAsync(fs, (tick, generation), retainCount, ManifestFile, ct), cancellationToken).ConfigureAwait(false);
 
         return count;
     }
@@ -173,10 +175,10 @@ public static class Snapshot
 
         if (session is not null)
         {
-            // Incremental runs (docs/design-durable-state.md §1f, increment 3): name every run this
-            // directory's run lists use, for the sweep; the runs themselves are durable before the
-            // manifest like any op file.
-            await session.WriteRefsAsync(fs, dir, cancellationToken).ConfigureAwait(false);
+            // Incremental runs (docs/design-durable-state.md §1f, increment 3): one run index per
+            // directory records every trace file's chain; the runs themselves are durable before
+            // the manifest like any op file.
+            await session.WriteIndexAsync(fs, dir, cancellationToken).ConfigureAwait(false);
             if (durable is not null)
             {
                 await SyncTreeAsync(fs, durable, Runs.RunSweep.RunsPrefix + dir + "/", cancellationToken).ConfigureAwait(false);
@@ -248,14 +250,16 @@ public static class Snapshot
     /// <paramref name="snapshotDir"/> and forwards to
     /// <see cref="WriteAsync(RootCircuit, ITableFileSystem, int, CancellationToken)"/>.
     /// </summary>
-    public static ValueTask<int> WriteAsync(
+    public static async ValueTask<int> WriteAsync(
         RootCircuit circuit,
         string snapshotDir,
         int retainCount = 1,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
-        return WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken);
+        // A path, not a store the caller keeps using: the directory is final on return.
+        using var inline = CheckpointCleanup.Inline();
+        return await WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -299,6 +303,7 @@ public static class Snapshot
         ITableFileSystem fs, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         var ticks = new SortedSet<long>();
         foreach (var (tick, _) in await ListSnapshotDirsAsync(fs, cancellationToken).ConfigureAwait(false))
         {
@@ -438,6 +443,7 @@ public static class Snapshot
         using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         if (parallelism < 1)
         {
             throw new ArgumentOutOfRangeException(

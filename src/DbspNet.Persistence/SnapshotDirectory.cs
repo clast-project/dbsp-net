@@ -47,9 +47,29 @@ internal sealed class TableFileSystemSnapshotContext : ISnapshotWriter, ISnapsho
         return _fs.OpenReadAsync(_prefix + filename, cancellationToken);
     }
 
-    public ValueTask<bool> ExistsAsync(string filename, CancellationToken cancellationToken = default)
+    public async ValueTask<bool> ExistsAsync(string filename, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(filename);
-        return _fs.ExistsAsync(_prefix + filename, cancellationToken);
+        return await _fs.ExistsAsync(_prefix + filename, cancellationToken).ConfigureAwait(false)
+            || await ChainAsync(filename, cancellationToken).ConfigureAwait(false) is not null;
+    }
+
+    // The run index of the directory this operator directory sits in ("{dir}/op-{i}/" → "{dir}/runs.txt"),
+    // read once per context (docs/design-durable-state.md §1f, increment 3).
+    private Task<Runs.RunIndex?>? _index;
+
+    /// <summary>The chain the parent directory's run index records for <paramref name="filename"/>, or null.</summary>
+    internal async ValueTask<Runs.RunChain?> ChainAsync(string filename, CancellationToken cancellationToken = default)
+    {
+        var trimmed = _prefix.TrimEnd('/');
+        var slash = trimmed.LastIndexOf('/');
+        if (slash < 0)
+        {
+            return null;
+        }
+
+        _index ??= Runs.RunIndex.ReadAsync(_fs, trimmed[..slash], cancellationToken).AsTask();
+        var index = await _index.ConfigureAwait(false);
+        return index?.Find(trimmed[(slash + 1)..] + "/" + filename, _fs);
     }
 }

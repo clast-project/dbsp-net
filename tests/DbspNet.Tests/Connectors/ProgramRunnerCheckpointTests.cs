@@ -167,6 +167,8 @@ public class ProgramRunnerCheckpointTests
     [InlineData(4)]
     public async Task ParallelRunner_RestoreAfterBatch_ResumesWithoutReplayingOrSkipping(int workers)
     {
+        // Counts mutations: no deferred cleanup may land after the count is taken.
+        using var inlineCleanup = DbspNet.Persistence.CheckpointCleanup.Inline();
         var all = Versions();
         var fs = new DbspNet.Tests.Persistence.CrashSimulatingFileSystem();
         var store = new SnapshotCheckpointStore(fs);
@@ -267,6 +269,8 @@ public class ProgramRunnerCheckpointTests
     [Fact]
     public async Task IdleBatch_WritesNoCheckpoint()
     {
+        // Counts mutations: no deferred cleanup may land after the count is taken.
+        using var inlineCleanup = DbspNet.Persistence.CheckpointCleanup.Inline();
         var fs = new DbspNet.Tests.Persistence.CrashSimulatingFileSystem();
         var store = new SnapshotCheckpointStore(fs);
 

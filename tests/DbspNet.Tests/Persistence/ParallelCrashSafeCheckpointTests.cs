@@ -114,6 +114,8 @@ public class ParallelCrashSafeCheckpointTests
     [MemberData(nameof(Cases))]
     public async Task CrashAtEveryMutation_RecoversAllWorkersAtOneCommitPoint(string family, bool laterTick)
     {
+        // Counts mutations: the cleanup a checkpoint defers must happen inside the count.
+        using var inlineCleanup = CheckpointCleanup.Inline();
         var before = OracleAt(family, withPhaseB: false);
         var after = laterTick ? OracleAt(family, withPhaseB: true) : before;
 

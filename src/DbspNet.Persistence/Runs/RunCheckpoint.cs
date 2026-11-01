@@ -11,7 +11,7 @@ namespace DbspNet.Persistence.Runs;
 /// <summary>
 /// Incremental checkpoints of trace state (docs/design-durable-state.md §1f, increment 3). A trace
 /// with a chain and a pending change writes the change as one more run; anything else writes a
-/// base run of its whole state. Either way the snapshot gets a run list naming the chain, and the
+/// base run of its whole state. Either way the snapshot's run index records the chain, and the
 /// trace restarts tracking on it once the checkpoint commits. Restoring sums the chain's runs and
 /// marks the result, so the trace that integrates it keeps extending the same chain.
 /// </summary>
@@ -46,8 +46,7 @@ internal static class RunCheckpoint
             chain = RunChain.Base(ctx.FileSystem, await WriteAsync(state), state.Count);
         }
 
-        await chain.WriteListAsync(ctx, fileName, cancellationToken).ConfigureAwait(false);
-        session.Reference(ctx.Prefix, chain.Paths);
+        session.Record(ctx.Prefix + fileName, chain);
         if (trace is not null)
         {
             session.OnCommit(() => trace.StartTracking(chain));
@@ -92,8 +91,7 @@ internal static class RunCheckpoint
             chain = RunChain.Base(ctx.FileSystem, await WriteAsync(state), Entries(state));
         }
 
-        await chain.WriteListAsync(ctx, fileName, cancellationToken).ConfigureAwait(false);
-        session.Reference(ctx.Prefix, chain.Paths);
+        session.Record(ctx.Prefix + fileName, chain);
         if (trace is not null)
         {
             session.OnCommit(() => trace.StartTracking(chain));
@@ -129,40 +127,25 @@ internal static class RunCheckpoint
         return n;
     }
 
-    /// <summary>A run list opened from <paramref name="reader"/>: sum its chain and mark the result
-    /// as restored from it.</summary>
+    /// <summary>The chain <paramref name="reader"/>'s run index records for <paramref name="fileName"/>, if any.</summary>
+    internal static ValueTask<RunChain?> FindChainAsync(ISnapshotReader reader, string fileName, CancellationToken cancellationToken) =>
+        reader is TableFileSystemSnapshotContext ctx ? ctx.ChainAsync(fileName, cancellationToken) : ValueTask.FromResult<RunChain?>(null);
+
+    /// <summary>Sum <paramref name="chain"/> and mark the result as restored from it.</summary>
     internal static async ValueTask<ZSet<StructuralRow, Z64>> LoadZSetAsync(
-        ISnapshotReader reader, IRandomAccessFile list, string fileName,
-        IZSetRunCodec codec, Func<StructuralRow, int> hash, CancellationToken cancellationToken)
+        RunChain chain, IZSetRunCodec codec, Func<StructuralRow, int> hash, CancellationToken cancellationToken)
     {
-        var chain = await OpenChainAsync(reader, list, fileName, cancellationToken).ConfigureAwait(false);
         var result = await ReadZSetAsync(chain, codec, hash, cancellationToken).ConfigureAwait(false);
         CheckpointTracking.MarkRestored(result, chain);
         return result;
     }
 
     internal static async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadIndexedAsync(
-        ISnapshotReader reader, IRandomAccessFile list, string fileName,
-        IIndexedRunCodec codec, Func<StructuralRow, int> hash, CancellationToken cancellationToken)
+        RunChain chain, IIndexedRunCodec codec, Func<StructuralRow, int> hash, CancellationToken cancellationToken)
     {
-        var chain = await OpenChainAsync(reader, list, fileName, cancellationToken).ConfigureAwait(false);
         var result = await ReadIndexedAsync(chain, codec, hash, cancellationToken).ConfigureAwait(false);
         CheckpointTracking.MarkRestored(result, chain);
         return result;
-    }
-
-    private static async ValueTask<RunChain> OpenChainAsync(
-        ISnapshotReader reader, IRandomAccessFile list, string fileName, CancellationToken cancellationToken)
-    {
-        await using (list)
-        {
-            if (reader is not TableFileSystemSnapshotContext ctx)
-            {
-                throw new InvalidDataException($"'{fileName}' is a run list, which only a file-system snapshot reader can resolve");
-            }
-
-            return await RunChain.ReadListAsync(list, ctx.FileSystem, ctx.Prefix + fileName, cancellationToken).ConfigureAwait(false);
-        }
     }
 
     private static async ValueTask<ZSet<StructuralRow, Z64>> ReadZSetAsync(

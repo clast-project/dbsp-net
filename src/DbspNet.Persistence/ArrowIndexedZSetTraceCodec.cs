@@ -51,8 +51,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
     public string SchemaFingerprint { get; }
 
     /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
-    /// is on (docs/design-durable-state.md §1f) — inside a checkpoint, as a run list over an
-    /// incremental chain of runs — otherwise as one Arrow stream.</summary>
+    /// is on (docs/design-durable-state.md §1f) — inside a checkpoint, as an incremental chain of
+    /// runs recorded in the snapshot directory's run index — otherwise as one Arrow stream.</summary>
     public async ValueTask SaveAsync(
         ISnapshotWriter writer,
         string fileName,
@@ -195,6 +195,12 @@ internal sealed class ArrowIndexedZSetTraceCodec
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(fileName);
+        // A trace file a checkpoint recorded in its run index (increment 3): sum the chain.
+        if (await Runs.RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is { } chain)
+        {
+            return await Runs.RunCheckpoint.LoadIndexedAsync(chain, this, Hash, cancellationToken).ConfigureAwait(false);
+        }
+
         if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
         {
             return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
@@ -206,11 +212,6 @@ internal sealed class ArrowIndexedZSetTraceCodec
         {
             await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
             return await run.ReadAllIndexedAsync(this, cancellationToken).ConfigureAwait(false);
-        }
-
-        if (await Runs.RunChain.IsListAsync(probe, cancellationToken).ConfigureAwait(false))
-        {
-            return await Runs.RunCheckpoint.LoadIndexedAsync(reader, probe, fileName, this, Hash, cancellationToken).ConfigureAwait(false);
         }
 
         await probe.DisposeAsync().ConfigureAwait(false);

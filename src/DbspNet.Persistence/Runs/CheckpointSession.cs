@@ -1,31 +1,28 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
-using System.Text;
 using DbspNet.Core.IO;
 
 namespace DbspNet.Persistence.Runs;
 
 /// <summary>
-/// One checkpoint's run bookkeeping (docs/design-durable-state.md §1f, increment 3): which runs each
-/// snapshot directory's run lists name (written to <see cref="RefsFile"/> so the sweep can find
-/// them without opening every file), and what to do once the checkpoint commits — restart each
-/// trace's change tracking on its new chain. Tracking restarts only after the commit, so a
-/// checkpoint that fails leaves every trace's pending change intact for the next one.
+/// One checkpoint's run bookkeeping (docs/design-durable-state.md §1f, increment 3): the chain each
+/// trace file now stands for (written per snapshot directory as one <see cref="RunIndex"/>), and what
+/// to do once the checkpoint commits — restart each trace's change tracking on its new chain.
+/// Tracking restarts only after the commit, so a checkpoint that fails leaves every trace's pending
+/// change intact for the next one.
 /// </summary>
 internal sealed class CheckpointSession
 {
-    /// <summary>Per snapshot (worker) directory: every run its run lists name.</summary>
-    internal const string RefsFile = "runs.txt";
-
     private readonly object _gate = new();
-    private readonly List<(string Prefix, IReadOnlyList<string> Paths)> _refs = new();
+    private readonly List<(string Path, RunChain Chain)> _chains = new();
     private readonly List<Action> _onCommit = new();
 
-    internal void Reference(string prefix, IReadOnlyList<string> paths)
+    /// <summary>The trace file at <paramref name="path"/> (store-absolute) is <paramref name="chain"/>.</summary>
+    internal void Record(string path, RunChain chain)
     {
         lock (_gate)
         {
-            _refs.Add((prefix, paths));
+            _chains.Add((path, chain));
         }
     }
 
@@ -37,26 +34,19 @@ internal sealed class CheckpointSession
         }
     }
 
-    /// <summary>Write <c>{dir}/runs.txt</c>: every run named by a run list under <paramref name="dir"/>.
-    /// Written for every snapshot directory, even with none, so its absence means a snapshot from
-    /// before runs existed.</summary>
-    internal async ValueTask WriteRefsAsync(ITableFileSystem fs, string dir, CancellationToken cancellationToken)
+    /// <summary>Write <c>{dir}/runs.txt</c>: the chain of every trace file under <paramref name="dir"/>.</summary>
+    internal async ValueTask WriteIndexAsync(ITableFileSystem fs, string dir, CancellationToken cancellationToken)
     {
         var under = dir.EndsWith('/') ? dir : dir + "/";
-        var paths = new SortedSet<string>(StringComparer.Ordinal);
+        List<(string, RunChain)> mine;
         lock (_gate)
         {
-            foreach (var (prefix, list) in _refs)
-            {
-                if (prefix.StartsWith(under, StringComparison.Ordinal))
-                {
-                    paths.UnionWith(list);
-                }
-            }
+            mine = _chains.Where(c => c.Path.StartsWith(under, StringComparison.Ordinal))
+                .Select(c => (c.Path[under.Length..], c.Chain)).ToList();
         }
 
-        var bytes = Encoding.UTF8.GetBytes(string.Concat(paths.Select(p => p + "\n")));
-        await using var file = await fs.CreateAsync(under + RefsFile, overwrite: true, cancellationToken).ConfigureAwait(false);
+        var bytes = RunIndex.Encode(mine);
+        await using var file = await fs.CreateAsync(under + RunIndex.FileName, overwrite: true, cancellationToken).ConfigureAwait(false);
         await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await file.FlushAsync(cancellationToken).ConfigureAwait(false);
     }

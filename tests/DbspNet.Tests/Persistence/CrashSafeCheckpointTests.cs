@@ -110,6 +110,8 @@ public class CrashSafeCheckpointTests
     [MemberData(nameof(Cases))]
     public async Task CrashAtEveryMutation_RecoversExactlyTheOldOrTheNewCheckpoint(string family, bool laterTick)
     {
+        // Counts mutations: the cleanup a checkpoint defers must happen inside the count.
+        using var inlineCleanup = CheckpointCleanup.Inline();
         var before = OracleAt(family, withPhaseB: false);
         var after = laterTick ? OracleAt(family, withPhaseB: true) : before;
 
@@ -218,6 +220,8 @@ public class CrashSafeCheckpointTests
     [Fact]
     public async Task OrphanAheadOfCurrent_DoesNotCrowdOutTheCurrentSnapshot()
     {
+        // Counts mutations: the cleanup a checkpoint defers must happen inside the count.
+        using var inlineCleanup = CheckpointCleanup.Inline();
         // A crashed write at a later tick leaves an orphan directory; the restarted run restores the
         // older snapshot, ticks to an intermediate tick and commits there. Under retainCount 1 the old
         // prune kept the highest-numbered directory — the orphan — and deleted the new current one.

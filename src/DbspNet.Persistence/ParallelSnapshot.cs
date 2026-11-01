@@ -66,6 +66,7 @@ public static class ParallelSnapshot
         using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         if (retainCount < 1)
         {
             throw new ArgumentOutOfRangeException(
@@ -118,7 +119,8 @@ public static class ParallelSnapshot
         await Snapshot.WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
         session?.Commit();
 
-        await Snapshot.PruneAsync(fs, (tick, generation), retainCount, ParallelManifestFile, cancellationToken)
+        await CheckpointCleanup.RunAsync(
+            fs, ct => Snapshot.PruneAsync(fs, (tick, generation), retainCount, ParallelManifestFile, ct), cancellationToken)
             .ConfigureAwait(false);
 
         var total = 0;
@@ -133,14 +135,17 @@ public static class ParallelSnapshot
     /// <summary>
     /// Local-filesystem convenience overload.
     /// </summary>
-    public static ValueTask<int> WriteAsync(
+    public static async ValueTask<int> WriteAsync(
         ParallelCircuit circuit,
         string snapshotDir,
         int retainCount = 1,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
-        return WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken);
+
+        // A path, not a store the caller keeps using: the directory is final on return.
+        using var inline = CheckpointCleanup.Inline();
+        return await WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -201,6 +206,7 @@ public static class ParallelSnapshot
         using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
 
         var current = await Snapshot.TryReadCurrentPointerAsync(fs, cancellationToken).ConfigureAwait(false);
         if (current is null)

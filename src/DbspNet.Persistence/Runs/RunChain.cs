@@ -2,26 +2,23 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Globalization;
 using System.Text;
-using DbspNet.Core.Circuit;
 using DbspNet.Core.IO;
 
 namespace DbspNet.Persistence.Runs;
 
 /// <summary>
 /// The runs whose sum is one trace's state (docs/design-durable-state.md §1f, increment 3): a base
-/// run, then one delta run per later checkpoint. A snapshot stores the chain as a small <b>run
-/// list</b> file where the trace file would be; the runs themselves live under <c>runs/</c>,
-/// named after the snapshot directory that first wrote them, and are shared by every later
-/// snapshot whose chain extends it. <see cref="RunSweep"/> deletes runs no retained snapshot lists.
+/// run, then one delta run per later checkpoint. Runs live under <c>runs/</c>, named after the
+/// snapshot directory that first wrote them, and are shared by every later snapshot whose chain
+/// extends it. A snapshot directory records its chains in one <see cref="RunIndex"/> file rather than
+/// a file per trace; <see cref="RunSweep"/> deletes runs no retained snapshot's index names.
 /// </summary>
 internal sealed class RunChain
 {
     /// <summary>A chain this long is rewritten whole (compaction by rewrite) instead of extended.</summary>
     internal const int MaxRuns = 8;
 
-    private static ReadOnlySpan<byte> Magic => "DBSPRLS1"u8;
-
-    private RunChain(ITableFileSystem store, IReadOnlyList<string> paths, long baseEntries, long deltaEntries)
+    internal RunChain(ITableFileSystem store, IReadOnlyList<string> paths, long baseEntries, long deltaEntries)
     {
         Store = store;
         Paths = paths;
@@ -50,58 +47,71 @@ internal sealed class RunChain
         && DeltaEntries + pendingEntries <= Math.Max(4096, BaseEntries / 2);
 
     internal RunChain Extend(string path, long entries) => new(Store, [.. Paths, path], BaseEntries, DeltaEntries + entries);
+}
 
-    internal async ValueTask WriteListAsync(ISnapshotWriter writer, string fileName, CancellationToken cancellationToken)
+/// <summary>
+/// One snapshot directory's chains (<c>{dir}/runs.txt</c>): a line per trace file,
+/// <c>op-{i}/{file}\t{base entries}\t{delta entries}\t{run}\t{run}…</c>. It replaces the trace's own
+/// file, so a checkpoint creates, syncs and later deletes one file per directory instead of one per
+/// trace. Written for every directory a session-aware checkpoint writes, even with no chains, so
+/// its absence means a directory whose trace files are self-contained.
+/// </summary>
+internal sealed class RunIndex
+{
+    internal const string FileName = "runs.txt";
+
+    private readonly Dictionary<string, (long Base, long Delta, string[] Paths)> _entries;
+
+    private RunIndex(Dictionary<string, (long, long, string[])> entries) => _entries = entries;
+
+    /// <summary>Every run any chain in this index names.</summary>
+    internal IEnumerable<string> AllPaths => _entries.Values.SelectMany(e => e.Paths);
+
+    /// <summary>The chain recorded for <paramref name="key"/> (<c>op-{i}/{file}</c>), resolved in <paramref name="store"/>.</summary>
+    internal RunChain? Find(string key, ITableFileSystem store) =>
+        _entries.TryGetValue(key, out var e) ? new RunChain(store, e.Paths, e.Base, e.Delta) : null;
+
+    internal static byte[] Encode(IEnumerable<(string Key, RunChain Chain)> chains)
     {
         var text = new StringBuilder();
-        text.Append(CultureInfo.InvariantCulture, $"{BaseEntries}\n{DeltaEntries}\n");
-        foreach (var p in Paths)
+        foreach (var (key, chain) in chains.OrderBy(c => c.Key, StringComparer.Ordinal))
         {
-            text.Append(p).Append('\n');
+            text.Append(key).Append(CultureInfo.InvariantCulture, $"\t{chain.BaseEntries}\t{chain.DeltaEntries}");
+            foreach (var p in chain.Paths)
+            {
+                text.Append('\t').Append(p);
+            }
+
+            text.Append('\n');
         }
 
-        var body = Encoding.UTF8.GetBytes(text.ToString());
-        var bytes = new byte[Magic.Length + body.Length];
-        Magic.CopyTo(bytes);
-        body.CopyTo(bytes, Magic.Length);
-        await using var file = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false);
-        await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
-        await file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        return Encoding.UTF8.GetBytes(text.ToString());
     }
 
-    /// <summary>True if <paramref name="file"/> starts like a run list.</summary>
-    internal static async ValueTask<bool> IsListAsync(IRandomAccessFile file, CancellationToken cancellationToken)
+    /// <summary>The index of snapshot directory <paramref name="dir"/>, or null if it has none.</summary>
+    internal static async ValueTask<RunIndex?> ReadAsync(ITableFileSystem fs, string dir, CancellationToken cancellationToken)
     {
-        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
-        if (length < Magic.Length)
+        var path = dir.TrimEnd('/') + "/" + FileName;
+        if (!await fs.ExistsAsync(path, cancellationToken).ConfigureAwait(false))
         {
-            return false;
+            return null;
         }
 
-        using var head = await file.ReadAsync(new FileRange(0, Magic.Length), cancellationToken).ConfigureAwait(false);
-        return head.Memory.Span[..Magic.Length].SequenceEqual(Magic);
-    }
-
-    /// <summary>Parse a run list; <paramref name="store"/> is where its paths resolve.</summary>
-    internal static async ValueTask<RunChain> ReadListAsync(
-        IRandomAccessFile file, ITableFileSystem store, string path, CancellationToken cancellationToken)
-    {
-        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
-        using var bytes = await file.ReadAsync(new FileRange(0, length), cancellationToken).ConfigureAwait(false);
-        var span = bytes.Memory.Span[..(int)length];
-        if (!span[..Magic.Length].SequenceEqual(Magic))
+        var bytes = await fs.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
+        var entries = new Dictionary<string, (long, long, string[])>(StringComparer.Ordinal);
+        foreach (var line in Encoding.UTF8.GetString(bytes).Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
-            throw new InvalidDataException($"'{path}' is not a run list");
+            var f = line.Split('\t');
+            if (f.Length < 4
+                || !long.TryParse(f[1], NumberStyles.None, CultureInfo.InvariantCulture, out var baseEntries)
+                || !long.TryParse(f[2], NumberStyles.None, CultureInfo.InvariantCulture, out var deltaEntries))
+            {
+                throw new InvalidDataException($"run index '{path}' has a malformed line");
+            }
+
+            entries[f[0]] = (baseEntries, deltaEntries, f[3..]);
         }
 
-        var lines = Encoding.UTF8.GetString(span[Magic.Length..]).Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        if (lines.Length < 3
-            || !long.TryParse(lines[0], NumberStyles.None, CultureInfo.InvariantCulture, out var baseEntries)
-            || !long.TryParse(lines[1], NumberStyles.None, CultureInfo.InvariantCulture, out var deltaEntries))
-        {
-            throw new InvalidDataException($"run list '{path}' is malformed");
-        }
-
-        return new RunChain(store, lines[2..], baseEntries, deltaEntries);
+        return new RunIndex(entries);
     }
 }
