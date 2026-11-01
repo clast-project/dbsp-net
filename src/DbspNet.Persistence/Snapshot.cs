@@ -82,6 +82,7 @@ public static class Snapshot
         using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         if (retainCount < 1)
         {
             throw new ArgumentOutOfRangeException(
@@ -92,13 +93,16 @@ public static class Snapshot
         var snapName = SnapDirName(tick, generation);
         var durable = DurableStore(fs);
 
-        var count = await WriteDirAsync(circuit, fs, snapName, metadata, durable, cancellationToken).ConfigureAwait(false);
+        var session = Runs.StateLayout.Runs ? new Runs.CheckpointSession() : null;
+        var count = await WriteDirAsync(circuit, fs, snapName, metadata, durable, cancellationToken, session).ConfigureAwait(false);
 
         // Commit. After this, the new snapshot is the latest; before, the
         // pointer still names the prior snapshot (or doesn't exist).
         await WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
+        session?.Commit();
 
-        await PruneAsync(fs, (tick, generation), retainCount, ManifestFile, cancellationToken).ConfigureAwait(false);
+        await CheckpointCleanup.RunAsync(
+            fs, ct => PruneAsync(fs, (tick, generation), retainCount, ManifestFile, ct), cancellationToken).ConfigureAwait(false);
 
         return count;
     }
@@ -143,7 +147,8 @@ public static class Snapshot
         string dir,
         IReadOnlyDictionary<string, string>? metadata,
         IDurableTableFileSystem? durable,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Runs.CheckpointSession? session = null)
     {
         // Per-op files go under a directory nothing else names (see the class remarks). If a Save
         // throws partway through, the partial files are orphans, invisible to readers because
@@ -156,7 +161,7 @@ public static class Snapshot
                 continue;
             }
 
-            var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
+            var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i, session);
             var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             await s.SaveAsync(ctx, cancellationToken).ConfigureAwait(false);
             if (ProfileSave)
@@ -166,6 +171,18 @@ public static class Snapshot
             }
 
             snapshotted.Add(i);
+        }
+
+        if (session is not null)
+        {
+            // Incremental runs (docs/design-durable-state.md §1f, increment 3): one run index per
+            // directory records every trace file's chain; the runs themselves are durable before
+            // the manifest like any op file.
+            await session.WriteIndexAsync(fs, dir, cancellationToken).ConfigureAwait(false);
+            if (durable is not null)
+            {
+                await SyncTreeAsync(fs, durable, Runs.RunSweep.RunsPrefix + dir + "/", cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if (durable is not null)
@@ -233,14 +250,16 @@ public static class Snapshot
     /// <paramref name="snapshotDir"/> and forwards to
     /// <see cref="WriteAsync(RootCircuit, ITableFileSystem, int, CancellationToken)"/>.
     /// </summary>
-    public static ValueTask<int> WriteAsync(
+    public static async ValueTask<int> WriteAsync(
         RootCircuit circuit,
         string snapshotDir,
         int retainCount = 1,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshotDir);
-        return WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken);
+        // A path, not a store the caller keeps using: the directory is final on return.
+        using var inline = CheckpointCleanup.Inline();
+        return await WriteAsync(circuit, new LocalTableFileSystem(snapshotDir), retainCount, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -284,6 +303,7 @@ public static class Snapshot
         ITableFileSystem fs, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         var ticks = new SortedSet<long>();
         foreach (var (tick, _) in await ListSnapshotDirsAsync(fs, cancellationToken).ConfigureAwait(false))
         {
@@ -365,6 +385,11 @@ public static class Snapshot
     internal static readonly System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
         SaveProfile = new();
 
+    /// <summary>With <see cref="ProfileSave"/> set, each concurrent restore enqueues (directory,
+    /// operator index, operator type, ms) here too.</summary>
+    internal static System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
+        RestoreProfile { get; } = new();
+
     /// <summary>
     /// Degree of concurrency <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
     /// uses when no explicit degree is passed. Restore is a per-operator walk with no data
@@ -423,6 +448,7 @@ public static class Snapshot
         using var gcMode = CheckpointGcMode.Enter();
         ArgumentNullException.ThrowIfNull(circuit);
         ArgumentNullException.ThrowIfNull(fs);
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
         if (parallelism < 1)
         {
             throw new ArgumentOutOfRangeException(
@@ -549,7 +575,13 @@ public static class Snapshot
                 var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
                 if (profile is null)
                 {
+                    var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+                    if (ProfileSave)
+                    {
+                        RestoreProfile.Enqueue((dir, i, circuit.Operators[i].GetType().Name,
+                            System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+                    }
                 }
                 else
                 {
@@ -603,7 +635,13 @@ public static class Snapshot
                 {
                     var s = Snapshottable(circuit, i);
                     var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+                    var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     await s.LoadAsync(ctx, ct).ConfigureAwait(false);
+                    if (ProfileSave)
+                    {
+                        RestoreProfile.Enqueue((current, i, circuit.Operators[i].GetType().Name,
+                            System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+                    }
                 }).ConfigureAwait(false);
         }
         catch (AggregateException ex) when (ex.InnerExceptions.Count > 0)
@@ -785,5 +823,7 @@ public static class Snapshot
                 }
             }
         }
+
+        await Runs.RunSweep.SweepAsync(fs, keep.Select(d => SnapDirName(d.Item1, d.Item2)), cancellationToken).ConfigureAwait(false);
     }
 }

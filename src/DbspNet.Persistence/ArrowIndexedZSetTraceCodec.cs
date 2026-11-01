@@ -32,7 +32,7 @@ namespace DbspNet.Persistence;
 /// rename is purely cosmetic on the wire.
 /// </remarks>
 internal sealed class ArrowIndexedZSetTraceCodec
-    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>
+    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>, Runs.IIndexedRunCodec
 {
     private readonly SqlSchema _keySchema;
     private readonly SqlSchema _valueSchema;
@@ -45,16 +45,91 @@ internal sealed class ArrowIndexedZSetTraceCodec
         _keySchema = keySchema;
         _valueSchema = valueSchema;
         _arrowSchemaWithWeight = BuildArrowSchema(keySchema, valueSchema);
+        _runSchema = new ArrowSchema(
+            [.. _arrowSchemaWithWeight.FieldsList, new Field("__hash", Int32Type.Default, nullable: false)], metadata: null);
         SchemaFingerprint = Persistence.SchemaFingerprint.Of(keySchema, valueSchema);
     }
 
     public string SchemaFingerprint { get; }
 
+    /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
+    /// is on (docs/design-durable-state.md §1f) — inside a checkpoint, as an incremental chain of
+    /// runs recorded in the snapshot directory's run index — otherwise as one Arrow stream.</summary>
     public async ValueTask SaveAsync(
         ISnapshotWriter writer,
         string fileName,
         IndexedZSet<StructuralRow, StructuralRow, Z64> trace,
         CancellationToken cancellationToken = default)
+    {
+        if (Runs.StateLayout.Runs)
+        {
+            ArgumentNullException.ThrowIfNull(trace);
+            await Runs.RunCheckpoint.SaveIndexedAsync(writer, fileName, trace, this, Hash, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var t = Runs.RunWriteProfile.Now();
+        await SaveMonolithicAsync(writer, fileName, trace, cancellationToken).ConfigureAwait(false);
+        Runs.RunWriteProfile.Add(6, t);
+    }
+
+    // The run's order: the row's own cached hash (StructuralRowHash — deterministic across
+    // processes, and already computed, so a run write hashes nothing).
+    private static int Hash(StructuralRow row) => row.GetHashCode();
+
+    /// <inheritdoc/>
+    public ArrowSchema RunSchema => _runSchema;
+
+    private readonly ArrowSchema _runSchema;
+
+    /// <inheritdoc/>
+    public RecordBatch EncodeBlock(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count)
+    {
+        var keySlice = new ArraySegment<StructuralRow>(keys, 0, count);
+        var valueSlice = new ArraySegment<StructuralRow>(values, 0, count);
+        var keyCount = _keySchema.Count;
+        var valueCount = _valueSchema.Count;
+        var arrays = new IArrowArray[keyCount + valueCount + 2];
+        for (var c = 0; c < keyCount; c++)
+        {
+            arrays[c] = ArrowColumns.Build(_keySchema[c].Type, keySlice, c);
+        }
+
+        for (var c = 0; c < valueCount; c++)
+        {
+            arrays[keyCount + c] = ArrowColumns.Build(_valueSchema[c].Type, valueSlice, c);
+        }
+
+        var w = new Int64Array.Builder().Reserve(count);
+        for (var i = 0; i < count; i++)
+        {
+            w.Append(weights[i]);
+        }
+
+        arrays[keyCount + valueCount] = w.Build();
+        var h = new Int32Array.Builder().Reserve(count);
+        for (var i = 0; i < count; i++)
+        {
+            h.Append(hashes[i]);
+        }
+
+        arrays[keyCount + valueCount + 1] = h.Build();
+        return new RecordBatch(_runSchema, arrays, count);
+    }
+
+    /// <inheritdoc/>
+    public void DecodeBlock(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) => AddBatch(batch, into);
+
+    /// <inheritdoc/>
+    public void DecodeRange(RecordBatch batch, int from, int count, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) =>
+        AddRange(batch, from, count, into, StringDecoding.Copy);
+
+    private async ValueTask SaveMonolithicAsync(
+        ISnapshotWriter writer,
+        string fileName,
+        IndexedZSet<StructuralRow, StructuralRow, Z64> trace,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(fileName);
@@ -135,6 +210,34 @@ internal sealed class ArrowIndexedZSetTraceCodec
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(fileName);
+        // A trace file a checkpoint recorded in its run index (increment 3): sum the chain.
+        if (await Runs.RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is { } chain)
+        {
+            return await Runs.RunCheckpoint.LoadIndexedAsync(chain, this, Hash, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+        }
+
+        // Either layout reads back, whatever StateLayout says now: a run ends in its trailer.
+        var probe = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
+        if (await Runs.RunReader.IsRunAsync(probe, cancellationToken).ConfigureAwait(false))
+        {
+            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, null, cancellationToken).ConfigureAwait(false);
+            return await run.ReadAllIndexedAsync(this, cancellationToken).ConfigureAwait(false);
+        }
+
+        await probe.DisposeAsync().ConfigureAwait(false);
+        return await LoadMonolithicAsync(reader, fileName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadMonolithicAsync(
+        ISnapshotReader reader,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
         if (!await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
         {
             return IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
@@ -318,28 +421,37 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
     private IndexedZSet<StructuralRow, StructuralRow, Z64> BuildIndexedZSet(RecordBatch batch)
     {
+        var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        AddBatch(batch, b);
+        return b.Build();
+    }
+
+    private void AddBatch(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b) =>
+        AddRange(batch, 0, batch.Length, b, ShippingStrings);
+
+    private void AddRange(
+        RecordBatch batch, int from, int rowCount, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b, StringDecoding strings)
+    {
         var keyCount = _keySchema.Count;
         var valueCount = _valueSchema.Count;
-        var rowCount = batch.Length;
 
         var keyColumns = new object?[keyCount][];
         for (var c = 0; c < keyCount; c++)
         {
             keyColumns[c] = ArrowColumns.Extract(
-                batch.Column(c), _keySchema[c].Type, rowCount, ShippingStrings);
+                batch.Column(c), _keySchema[c].Type, from, rowCount, strings);
         }
 
         var valueColumns = new object?[valueCount][];
         for (var c = 0; c < valueCount; c++)
         {
             valueColumns[c] = ArrowColumns.Extract(
-                batch.Column(keyCount + c), _valueSchema[c].Type, rowCount, ShippingStrings);
+                batch.Column(keyCount + c), _valueSchema[c].Type, from, rowCount, strings);
         }
 
         var weightArray = (Int64Array)batch.Column(keyCount + valueCount);
         var weightValues = weightArray.Values;
 
-        var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
         for (var i = 0; i < rowCount; i++)
         {
             var keyValues = new object?[keyCount];
@@ -357,10 +469,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
             b.Add(
                 new StructuralRow(keyValues),
                 new StructuralRow(rowValues),
-                new Z64(weightValues[i]));
+                new Z64(weightValues[from + i]));
         }
-
-        return b.Build();
     }
 
     /// <inheritdoc/>

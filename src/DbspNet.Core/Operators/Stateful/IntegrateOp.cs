@@ -58,18 +58,25 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     /// valid until the next <see cref="Step"/>.</summary>
     public ZSet<TRow, Z64> View => _view.Current;
 
+    /// <summary>Every row of the view, without reading a lazily restored view into memory
+    /// (docs/design-durable-state.md §1f, increment 6): what a sink's first full write streams.</summary>
+    public IEnumerable<KeyValuePair<TRow, Z64>> EnumerateView() => _view.EnumerateWhole();
+
+    /// <summary>True while the view holds rows not yet read from a lazy restore (tests).</summary>
+    internal bool IsCold => _view.IsCold;
+
     /// <summary>The number of rows in <see cref="View"/>.</summary>
-    public int ViewCount => _view.Current.Count;
+    public int ViewCount => _view.Count;
 
     /// <summary>A row's weight in <see cref="View"/>.</summary>
-    public Z64 WeightOf(TRow row) => _view.Current.WeightOf(row);
+    public Z64 WeightOf(TRow row) => _view.WeightOf(row);
 
     /// <summary>The delta the most recent step integrated.</summary>
     public ZSet<TRow, Z64> LastDelta => _input.Current;
 
     public string MetricName => "IntegratedView";
 
-    public long RetainedRows => _view.Current.Count;
+    public long RetainedRows => _view.State.Count;
 
     public long LastOutputRows => _output.Current.Count;
 
@@ -93,7 +100,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
                 "CircuitBuilder.Integrate to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "view.arrows", _view.Current, cancellationToken);
+        return _snapshotCodec.SaveAsync(writer, "view.arrows", _view.State, cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -103,12 +110,20 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
             throw new NotSupportedException("IntegrateOp was constructed without a snapshot codec.");
         }
 
+        // Lazily (increment 6): a row-ordered chain stays cold until rows are asked for.
+        if (_snapshotCodec is IColdZSetLoader<TRow, Z64> coldLoader
+            && await coldLoader.LoadColdZSetAsync(reader, "view.arrows", cancellationToken).ConfigureAwait(false) is { } cold)
+        {
+            _view.AdoptCold(cold);
+            return;
+        }
+
         var loaded = await _snapshotCodec.LoadAsync(reader, "view.arrows", cancellationToken).ConfigureAwait(false);
 
         // Reset the (in-place-mutated) view to the persisted contents. Integrating
         // into a freshly-cleared trace re-establishes exactly the saved multiset.
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _view.Current.MergeInPlace(_view.Current.Negate());
+        _view.Clear();
         _view.Integrate(loaded);
         if (SnapshotRestoreProfile.Enabled)
         {

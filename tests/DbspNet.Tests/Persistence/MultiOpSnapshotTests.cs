@@ -295,10 +295,15 @@ public class MultiOpSnapshotTests : IDisposable
             Assert.True(manifest.SnapshottedIndices[i] > manifest.SnapshottedIndices[i - 1]);
         }
 
-        // Each index resolves to a per-op subdirectory on disk.
+        // Each index resolves to a per-op subdirectory on disk — or, for an operator whose state is
+        // all traces under DBSPNET_STATE_LAYOUT=runs, to entries in the snapshot's run index.
+        var index = Path.Combine(snapDir, "runs.txt");
+        var indexed = File.Exists(index) ? File.ReadAllLines(index) : [];
         foreach (var i in manifest.SnapshottedIndices)
         {
-            Assert.True(Directory.Exists(Path.Combine(snapDir, $"op-{i}")));
+            Assert.True(
+                Directory.Exists(Path.Combine(snapDir, $"op-{i}")) || indexed.Any(l => l.StartsWith($"op-{i}/", StringComparison.Ordinal)),
+                $"op-{i} has neither a directory nor a run-index entry");
         }
     }
 }

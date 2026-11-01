@@ -399,6 +399,626 @@ restore's degree to ~7 s. Changing W therefore costs about one extra restore's w
 - **Spine:** refuse in v1 with a clear error (not the default family); add later if needed.
 - **The engine reshards automatically** when the configured W differs, instead of pinning W.
 
+## 1e. Phase 2 — the deciding numbers (MEASURED 2026-10-31)
+
+Branch `arc/durable-phase2`. All on ivm-bench SF=3 (multi-batch staging: batch 1 = 20 ticks of bulk
+load, batches 2 and 3 = 9 small ticks each), `DOTNET_gcServer=1`, after Increments 0–3 and the
+checkpoint GC fix.
+
+### (a) Spine vs flat at W=8 (`ARMS="8 8:spine" scripts/measure-checkpoint.sh`, 5 alternating runs, medians [ranges])
+
+| | flat | spine |
+|---|--:|--:|
+| batch-1 drain | 16.70 s [15.64–16.97] | 18.64 s [17.29–19.52] (+11.6%, ranges disjoint) |
+| batch-1 drain allocation | 42.69 GiB | 44.56 GiB (+4.4%) |
+| batches 2 / 3 drain | 0.03 / 0.04 s | 0.04 / 0.04 s |
+| checkpoint after batch 1 / 2 / 3 | 4.91 / 3.15 / 4.31 s | 5.88 / 3.99 / 3.71 s |
+| snapshot size | 4.70 GB | 4.86 GB |
+| restore | 6.04 s [5.62–6.23] | 6.45 s [6.12–6.74] |
+
+All 10 restores matched. **Spine costs ~12% of batch-1 drain on ivm-bench at W=8**, far from the
+1.4–2.5× measured on Nexmark at W=24 before the chunked map. Its checkpoint is no cheaper today:
+the spine snapshot still re-serialises every batch (`GetBatches` copies), so the immutable-batch
+structure buys nothing yet. Raw: `docs/spine-vs-flat-w8-20261031.txt`.
+
+### (b) How much does a batch change the state? (`CheckpointDeltaProbe`, `IVM_CHECKPOINT_DELTA=1`, W=8, flat)
+
+For each pair of consecutive snapshots, per worker and per operator file: decode both with the
+operator's codec, take the Z-set difference, encode it with the same codec. This is what a
+batch-granular manifest-of-delta-runs checkpoint would write (per-tick runs cannot cancel within a
+batch, so they would write at least this much).
+
+| | full snapshot | changed | ratio | entries changed / total |
+|---|--:|--:|--:|--:|
+| batch 1 → 2 | 4,698 MiB | **6.73 MiB** | 0.143% | 13,520 / 35.7 M |
+| batch 2 → 3 | 4,699 MiB | **7.03 MiB** | 0.150% | 15,802 / 35.7 M |
+
+Much of the 7 MiB is per-file overhead (an Arrow schema and footer per operator file per worker):
+the partitioned window aggregate writes 1.84 MiB for 73 changed entries. The largest single file,
+a join's left trace (2.1 GB), changes by 0.04%. Raw: `docs/checkpoint-delta-20261031.txt`.
+
+### (c) What restore spends its time on, and how much of the restored state is used
+
+`IvmRestoreProfile`, serial, sequential restore with the stage profile (2 runs; the stages are
+exact, the totals noisy: 26.1 s and 17.1 s, against ~6–8 s for the parallel restore):
+
+| stage | share of restore |
+|---|--:|
+| read (file I/O) | 3.4–5.5% |
+| decode (Arrow IPC) | ~1% |
+| extract (box columns) | 13–19% |
+| materialize (row objects) | 30–49% |
+| index (hash into Z-sets) | ~10% |
+| integrate (into traces) | 4–5% |
+| rebuild (operator state) | 19–28% |
+
+Replay of batches 2–3 after restoring batch 1 (`IVM_RESTORE_MODE=replay`, verified):
+**1,208 distinct keys probed of 9,671,750 restored (0.0125%)**; full scans touched 2 keys. The
+earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
+
+### What the numbers say about options 1–3
+
+- **Checkpoint cost is ~700× larger than the change it records.** A checkpoint rewrites 4.7 GB
+  to record ~7 MiB of change. Any option that writes deltas (all three, once built) turns a
+  3–5 s snapshot into milliseconds plus fsync. With the A2 journal the per-batch commit is already
+  5–11 ms; what incremental snapshots remove is the 3–5 s paid every snapshot interval, which is
+  what bounds recovery replay.
+- **Restore is ~95% reconstruction, and the resumed run uses 0.01% of it.** Option 1 (delta runs on
+  disk, eager restore) avoids none of that — it would even add a merge of runs at load. Only a
+  lazy layout (options 2 and 3) removes it; with a 0.0125% touch rate the reachable floor is
+  near O(#files).
+- **Spine is not ruled out by step cost** on this workload (+12% at W=8), but it is not a shortcut
+  either: its snapshot and restore are not yet incremental or lazy, so option 3 still needs the
+  run-manifest and lazy-load work options 1 and 2 need.
+
+Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
+scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
+
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–6 built)
+
+**Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
+operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
+snapshot, as today).
+
+### Constraints from the measurements and the access-pattern inventory
+
+- A batch changes ~0.15% of state; a resumed run reads ~0.0125% of it; restore is ~95% rebuilding
+  objects and maps (§1e). So: write deltas, and fault state in only where it is read.
+- **Reads are delta-key-driven** for joins, aggregates, distinct and integrate: `GroupFor`,
+  `ContainsKey`, `WeightOf`, and an existence check in every `MergeInPlace`. The partitioned
+  TOP-K / rank / window / LAG ops read **whole partitions**, keyed by the partitions a delta touches.
+  Global `TopKOp` walks an ordered prefix of all its state every tick.
+- **Full-state reads to remove or bound:** the first GC pass after restore (`_lastGcFrontier` is not
+  persisted); the join's "iterate the smaller side" rule, which may enumerate a whole trace; the
+  first output write after restore (both output modes enumerate every view); `ViewRowCounts` needs
+  O(1) counts.
+- **Steady-state step time must not move.** The hot path stays in-memory hash maps; nothing cold
+  is consulted for a key once it is resident.
+- GC: cold bytes live in files; what stays resident (Bloom filters, block indexes) is reference-free
+  arrays. Blocks are read into pooled buffers and decoded only for the keys asked for.
+
+### The layout
+
+**Cold runs.** An immutable run file per trace per checkpoint, holding an **additive** Z-set delta
+(base run = the state at the first checkpoint; each later run = the change since the previous one).
+Entries are ordered by the key's stable hash (`StructuralRowHash`, deterministic across processes)
+and grouped into blocks (~128 KiB; an indexed trace never splits a key's group across blocks). Each
+block is an Arrow record batch in the operator's existing codec schema. A footer holds the block
+index (first hash per block), a Bloom filter over keys, entry/group counts, and min/max monotone
+key per block (for lateness GC). Point probe = Bloom → binary search the index → read and decode
+one block. Hash order needs no comparer and serves every probe these operators make; nothing on this
+path needs key-ordered traversal of a trace.
+
+**Hot tier and fault-in, inside the collections.** `ZSet` / `IndexedZSet` get an optional cold
+backing: a miss in the hot map consults the cold runs once — summing the key's entries across runs —
+and inserts the result into the hot map; a *resolved-keys* set (present or tombstoned) keeps a key
+from being read from cold twice. Every operator that probes through `GroupFor` / `ContainsKey` /
+`WeightOf` / `MergeInPlace` therefore becomes lazy without changing its code. Enumeration of a
+collection that still has cold state either streams the merge of hot + cold without promoting
+(for output and counting) or, where an operator truly needs all of it (global `TopKOp`), promotes
+everything — eager, as today. Counts (`Count`, `GroupCount`) are persisted per run and maintained
+exactly through integration (which resolves each delta key, so a key's crossing of zero is known).
+
+**Operators that keep state outside a trace.**
+- Partitioned TOP-K / rank / window / LAG: persist by partition (key = partition row, values = rows)
+  instead of one flat row Z-set, and fault a whole partition into its `SortedDictionary` (and, for
+  rank / LAG / window, recompute that partition's window) on first touch.
+- Aggregates: `_stateCache` / `_aggCache` fault in per group from the `aggstate` keyed blobs, which
+  move into the same run format.
+- Global `TopKOp` (one gathered partition, read in order every tick): stays eager.
+
+**Checkpoint.** Each trace keeps a pending delta (the sum of what it integrated since the last
+checkpoint — ~0.15% of state per batch on ivm-bench). A checkpoint writes one delta run per trace,
+fsyncs it, and writes a manifest naming every run the state is the sum of; the pointer swap commits
+it as today. Run files are shared by consecutive checkpoints; a mark-and-sweep over the retained
+manifests deletes the rest after the pointer moves. **Compaction** merges a trace's runs (streaming,
+hash-ordered, summing weights, dropping zeros) when they pile up, off the step thread — the files are
+immutable — and the next checkpoint references the merged run.
+
+**Restore.** Read the manifest, open each run's footer (index + Bloom + counts): O(#runs) small
+reads, no decoding. Persist `_lastGcFrontier` so the first tick does no full GC pass; GC drops
+whole blocks/runs below the frontier by their min/max monotone key and resolves the rest lazily.
+The join's smaller-side rule treats a trace with cold state as large (iterate the delta, probe the
+trace). The first output write after restore streams each view from hot + cold without promoting;
+removing it entirely needs sink alignment (the sink's committed tick == the restored tick), a later
+step.
+
+**Parallel and re-shard.** Runs are per worker. `ParallelReshard` learns to read runs and write base
+runs at the new W; the placement specs (§1d) are unchanged.
+
+### Increments (each default-off behind `DBSPNET_STATE_LAYOUT=runs`, byte-identical when off)
+
+1. **Run file format** — writer and reader: hash-ordered blocks, block index, Bloom, counts,
+   monotone ranges; point probe and sequential scan. Property tests against `ZSet` / `IndexedZSet`
+   (random contents, collisions, empty, huge groups); microbenchmark: probe latency, scan
+   throughput vs today's decode.
+2. **Snapshots in run format, restore still eager** — swap the on-disk format only. Byte-identical
+   outputs; write and restore times vs today on SF=3.
+3. **Incremental checkpoints** — pending deltas, delta runs, manifest of runs, mark-and-sweep GC,
+   compaction policy; the crash matrix (`CrashSimulatingFileSystem`) over checkpoint, compaction and
+   GC. Measure checkpoint cost on SF=3 against the delta size.
+4. **Lazy restore for traces** — cold backing + fault-in in `ZSet` / `IndexedZSet`, persisted counts
+   and GC frontier, the join side rule, per-group aggregate state. Property tests: random
+   interleavings of integrate / probe / checkpoint / restore against an eager oracle; digest-verified
+   ivm-bench recovery.
+5. **Lazy partitioned operators** — persist by partition, fault in partitions.
+6. **Outputs after restore** — streaming first write; then sink alignment to skip it.
+7. **Re-shard over runs; compaction off the step thread** if increment 3 left it inline.
+
+### Increment 1 — built (2026-10-31)
+
+`DbspNet.Persistence.Runs`: `RunFile.WriteZSetAsync` / `WriteIndexedAsync` and `RunReader`
+(open = trailer + footer only; `WeightOfAsync` / `GroupForAsync` decode one block; `ScanZSetAsync` /
+`ScanIndexedAsync`). Blocks are the operator's own codec output; the order is the unsigned stable
+hash; a block never splits a hash value; the footer holds the block index, counts and a Bloom
+filter (10 bits/key, 7 probes). `RunFileTests` (12): Z-set and indexed runs from empty to 5,000
+entries at block sizes 1–1,024, with the stable hash and with a 5-value colliding hash, read back
+exactly by point lookup and scan (absent keys absent; an indexed group of 3,000 values never split);
+truncated and corrupted files refused; Bloom false positives under 3%. Letting a block cut between
+equal hashes fails all three collision cases.
+
+Microbenchmark (`Scratch/RunFileBench`, `RUNFILE_BENCH=1`; 1 M ten-column rows, single run, warm
+page cache). Today's monolithic file: 96.7 MiB, write 725 ms, full load 275 ms.
+
+| block | size vs today | write | open | probe, present | probe, absent | full scan |
+|---|--:|--:|--:|--:|--:|--:|
+| 256 | +7.8% | 1,272 ms | 1.74 ms | 98 µs | 1.6 µs | 374 ms |
+| **1,024 (default)** | +2.8% | 764 ms | 0.49 ms | 134 µs | 1.8 µs | 128 ms |
+| 4,096 | +1.6% | 597 ms | 0.42 ms | 590 µs | 7.8 µs | 135 ms |
+
+Read against the targets: opening a run is ~0.5 ms, so restoring ivm-bench's ~200 operator files is
+~0.1 s of footers — inside the 1 s target with room. A present-key probe decodes a whole block,
+~134 µs; ~85 µs of it is per-block fixed cost (the 256-entry block is not 4× cheaper), mostly the
+per-block Arrow IPC schema message and a scratch copy — worth trimming before increment 4, since the
+resumed ivm-bench batches touch ~1,200 keys (~0.16 s at this rate). Absent keys cost ~2 µs (Bloom).
+
+### Increment 2 — built and measured (2026-10-31)
+
+`StateLayout.Runs` (`DBSPNET_STATE_LAYOUT=runs`, or `StateLayout.Use` in tests) makes the Arrow
+Z-set and indexed trace codecs write every trace file as a run; a load checks for the run trailer,
+so either layout restores whatever the setting is now. Keyed aggregate-state blobs are unchanged
+until increment 4. `StateLayoutTests` (4): serial snapshots written in one layout and read in the
+other (and in runs both ways) restore and continue byte-identically; a parallel run-format
+snapshot restores and re-shards 3→2. Full suite passes with runs on (2,876) and off (2,880).
+
+ivm-bench SF=3, W=12, 5 alternating runs per arm (`ARMS="12 12:runs" scripts/measure-checkpoint.sh`;
+raw: `docs/runs-layout-w12-20261031.txt`). Median [min–max]:
+
+| | today | runs | |
+|---|--:|--:|--:|
+| batch-1 drain | 15.89 s [15.12–21.16] | 15.65 s [15.48–16.22] | noise |
+| checkpoint after batch 1 | 5.18 s [4.85–6.72] | 12.95 s [11.92–13.02] | **2.5×** |
+| checkpoint after batch 2 | 3.26 s [2.97–3.95] | 9.58 s [8.98–9.90] | **2.9×** |
+| checkpoint after batch 3 | 4.23 s [3.43–5.09] | 10.02 s [9.89–10.45] | **2.4×** |
+| snapshot size | 4,701 MiB | 4,765 MiB | +1.4% |
+| restore | 5.66 s [5.01–6.45] | 6.66 s [6.62–7.10] | +18% |
+
+All 10 restores matched the uninterrupted view row counts. Steady-state step is untouched (the
+layout only changes what a checkpoint writes).
+
+The write cost is the finding. The 1 M-row microbenchmark predicted +5% (764 vs 725 ms); at SF=3 a
+full run-format snapshot costs 2.5–2.9×. The writer as built does far more than the format needs:
+it collects (hash, entry) for the whole trace, sorts it, then for **each block rebuilds a
+`ZSetBuilder` / `IndexedZSetBuilder`** (whole-row re-hashing into a fresh dictionary, every value
+copied into new inner Z-sets) only so the codec can encode it, into a scratch in-memory file
+system, then copies the bytes out. That is a second materialisation of the whole state per
+checkpoint. Restore's +1 s is the read-side twin (per-block scratch copy and Arrow schema message,
+the ~85 µs fixed cost from increment 1), and increment 4 replaces eager restore anyway.
+
+This matters beyond increment 2: incremental checkpoints (increment 3) write small delta runs, but
+the first checkpoint and every compaction still write whole runs. So before increment 3, encode a
+block straight from a slice of the sorted entries (no intermediate Z-set, no scratch file system),
+and write one Arrow schema per run rather than per block. Target: a full run-format snapshot within
+~10% of today's write time.
+
+### Increment 2 — write fix (2026-10-31)
+
+Phase timers (`DBSPNET_RUN_PROFILE=<file>`, CPU summed over all writer threads, 3 checkpoints of
+106 M entries) on the writer as first built: `collect` (stable hash per row) 40 s, `sort` 11 s,
+**`encode` 236 s** (the per-block Z-set rebuild + codec + scratch file system), `write` 14 s —
+303 s against 95 s for today's monolithic writes. The rewrite:
+
+- **Blocks encode straight from the sorted entries.** The codecs implement `IZSetRunCodec` /
+  `IIndexedRunCodec` (`EncodeBlock` from row slices via `ArrowColumns.Build(type, rows, column)`;
+  `DecodeBlock` into a caller's builder). No intermediate Z-set, no scratch file system.
+- **One Arrow stream per run.** The schema message once, a record batch per block, the
+  end-of-stream marker; the footer records the schema message's length and the reader caches it
+  at open. A run's prefix is now a plain Arrow stream any reader can open (`RunFileTests`).
+- **Sort `(hash, position)` with `Array.Sort(uint[], int[])`** instead of a list of tuples with a
+  comparison delegate.
+- **Restore decodes every block into one builder** (it used to build a Z-set per block and re-add it).
+
+Measured on SF=3, W=12, 5 alternating runs per arm (raw + profiles:
+`docs/runs-writefix-w12-20261031.txt`):
+
+| | today | runs as first built | runs, write fix |
+|---|--:|--:|--:|
+| checkpoint after batch 1 / 2 / 3 | 5.07 / 3.09 / 4.31 s | 12.95 / 9.58 / 10.02 s | 5.91 / 5.78 / 5.87 s |
+| restore | 5.61 s | 6.66 s | 6.35 s |
+
+All restores matched. `encode` is now ~95 s — the same as today's whole write — and what is left
+on top is the per-row stable hash (`collect`, ~18 s; `StablePartitionHash.OfWholeRow` allocates an
+`int[]` per row) and the sort (~4 s).
+
+**Then the hash itself:** the run order is now the row's own cached hash (`StructuralRowHash`,
+already deterministic across processes — strings are XxHash3 seed 0, everything else a value
+type), so a run write hashes nothing and a probe hashes nothing. To keep that safe against a
+future change to the hash function, the footer records the hash of a fixed row holding one cell of
+every engine type, and a reader whose hash disagrees refuses the run
+(`ARunOrderedByAnotherHash_IsRefused`). The 1 M-row microbenchmark now writes a run faster than
+today's file (386 vs 686 ms; absent-key probe 1.0 µs); the SF=3 effect of the hash change is
+measured with increment 3, whose base checkpoints are exactly these writes.
+
+### Increment 3 — built and measured (2026-10-31)
+
+**Change tracking, in Core.** `ZSetTrace` / `IndexedZSetTrace` carry an optional
+`CheckpointTracking`: the chain persistence last wrote (opaque to Core) and the sum of every change
+since (`Pending`). `Integrate` merges each delta into `Pending` too; `DropKeysBelow` (LATENESS GC)
+records the dropped entries negated; `Clear` (the restore reset in `IntegrateOp`, the only mutation
+that bypassed `Integrate`) forgets the chain. Operators whose state lives outside a trace but whose
+snapshot is the integral of their input — partitioned TOP-K, rank, offset (LAG/LEAD), window
+aggregate — hold a `ZSetChangeTracker` that records each step's input delta and the window
+aggregate's GC drops, and tag the snapshot they build. Nothing tracks until the first checkpoint
+commits (no batch-1 memory doubling), and a pending change past half the state stops recording
+and frees itself (the next checkpoint rewrites the state whole). Persistence finds a state's
+tracker through a side table (`ConditionalWeakTable`), not a field: a field on every Z-set costs
+8 bytes, which w1profile's B/ev would see. Steady state pays one null check per integrate while
+runs are off.
+
+**Chains, in Persistence.** Inside a session-aware checkpoint (`Snapshot` / `ParallelSnapshot`
+with `StateLayout.Runs`), a tracked state with a pending change writes it as one delta run;
+anything else writes a base run. Runs live under `runs/{snapshot dir}/…`, named after the snapshot
+that first wrote them; the snapshot's trace file becomes a **run list** naming the chain (base
+first). A chain is rewritten whole once it has `RunChain.MaxRuns` (8) runs or its deltas pass half
+its base. Restore sums the chain into one builder and marks the result, and the trace (or tracker)
+that integrates it into empty state **adopts** the chain — so the first checkpoint after a restore
+is a delta, not a rewrite.
+
+**Commit and crash safety.** Runs are durable before the manifest (the `runs/{dir}` tree is synced
+with the snapshot's). Each snapshot directory gets a `runs.txt` naming every run its run lists
+use. Tracking restarts on the new chains only **after** the pointer commits (`CheckpointSession`),
+so a checkpoint that fails part-way leaves every pending change in place and the next checkpoint
+still carries it (its unsynced runs are never referenced). After each prune, a sweep deletes every
+run no retained snapshot's `runs.txt` names. Re-shard writes self-contained runs (no session), so
+it needed no change.
+
+**Verification.** `DBSPNET_RUNS_VERIFY=1` reads every chain back as it is written and throws if its
+sum differs from the state — a mutation the tracking misses fails at that checkpoint. The full
+suite passes three ways (runs off, runs on, runs on + verify: 2,893 each), and one SF=3 run with
+verify on passed every checkpoint. `IncrementalCheckpointTests` (10): chains grow by deltas from an
+unchanged base and every checkpoint restores and carries on exactly; a restored chain is extended,
+not rewritten; long chains are rewritten and the sweep leaves exactly the referenced runs (retain
+1 and 3); a checkpoint failed at each of its mutations in turn loses nothing, including after power
+loss; LATENESS GC drops reach the deltas (join, DISTINCT, window aggregate); parallel chains restore
+and re-shard 3→2 and checkpoint on; a delta checkpoint crashed before each of its mutations
+(process crash and power loss) recovers the old or the new checkpoint, and the recovered program
+checkpoints on. Mutation-tested: each of these, removed, fails at least one test — pending not
+recorded (trace, LAG step), GC drops not recorded (indexed trace, Z-set trace, window aggregate),
+runs tree not synced, tracking restarted before the commit, restored chain not adopted, sweep that
+deletes nothing.
+
+**Measured** on SF=3, W=12, 5 alternating runs per arm (`ARMS="12 12:runs" scripts/measure-checkpoint.sh`;
+raw: `docs/runs-incremental-w12-20261031.txt`). Median [min–max]; *state* is everything a restore
+reads (the snapshot directory plus the runs it names), *written* is what that checkpoint wrote:
+
+| | today | runs, incremental |
+|---|--:|--:|
+| batch-1 drain | 15.96 s [15.71–16.11] | 15.95 s [15.41–17.74] |
+| checkpoint after batch 1 (base) | 4.96 s [4.78–5.18] | 5.96 s [5.90–6.10] |
+| checkpoint after batch 2 (delta) | 3.04 s [3.00–3.34] | **0.92 s** [0.92–0.93] |
+| checkpoint after batch 3 (delta) | 4.31 s [4.13–4.50] | **1.48 s** [1.45–1.48] |
+| written per delta checkpoint | 4,701 MiB | **51 MiB** (3 MiB runs + 48 MiB aggregate-state blobs) |
+| state | 4,701 MiB | 4,750 MiB |
+| restore | 5.54 s [5.37–5.85] | 6.65 s [6.48–7.28] |
+
+All 10 restores matched. Delta checkpoints are 3.3× / 2.9× faster and write 1% of the bytes; the
+base checkpoint is +1.0 s (+20%) and eager restore +1.1 s (+20%) — increment 4 replaces eager
+restore.
+
+**Against the 0.5 s target — not met yet, and the operators are no longer why.** Phase timing of a
+delta checkpoint (one run, ms; batch 2 / batch 3): listing snapshot directories 60 / 102; operator
+saves 141 / 137 (slowest worker); fsync 262 / 336; manifest + pointer 9 / 8; **prune + sweep
+393 / 756**. What is left is per-file bookkeeping: deleting the previous snapshot's ~2,400 files,
+creating and syncing one small run list per trace per worker, and listing every `snap-` file to
+find directory names. Levers, for a decision:
+1. **Defer prune + sweep past the commit** (background, awaited before the next checkpoint
+   starts): −0.4 to −0.75 s off checkpoint latency. The deletion still happens, overlapped with the
+   next batch; tests that count snapshots right after `WriteAsync` would await it.
+2. **One chain file per worker instead of a run list per trace** (`runs.txt` becomes the map from
+   `op-i/file` to its chain): ~2,400 fewer files to create, sync and later delete per checkpoint —
+   most of the fsync and prune time. Needs the snapshot reader to resolve trace files through the
+   map (operators check `ExistsAsync` before loading).
+3. Aggregate-state keyed blobs (48 MiB per checkpoint, written whole) move into runs with
+   increment 4, as planned.
+
+**Not measured:** the steady-state cost of tracking. Once a checkpoint has committed, every
+integrate also merges its delta into the pending change — O(|delta|) per tick, map entries only
+(rows are shared with the state). It is off until the first commit (batch-1 drain unchanged) and
+the ivm-bench batch-2/3 drains (~0.08 s) are too small to show it; a throughput run with periodic
+checkpoints would.
+
+### Increment 3 — the two bookkeeping levers (2026-10-31; Curt: "build both")
+
+**One run index per directory.** A session-aware checkpoint no longer writes a run-list file per
+trace: each snapshot (worker) directory gets one `runs.txt` (`RunIndex`), a line per trace file —
+`op-{i}/{file}`, base entries, delta entries, its runs. The snapshot reader resolves a trace file
+through its directory's index (`TableFileSystemSnapshotContext.ChainAsync`, read once per context),
+and `ExistsAsync` answers through it too, so re-shard (which asks before loading) and operators are
+unchanged. An operator whose state is all traces now has no `op-{i}` directory at all. The sweep
+reads the same indexes.
+
+**Deferred cleanup.** Prune + sweep start in the background once the pointer commits
+(`CheckpointCleanup`, default on; `DBSPNET_CHECKPOINT_CLEANUP=inline` restores the old order).
+Every later snapshot operation on the same store — write, read, re-shard, listing — waits for it
+first; stores are keyed by identity (a local store's root path), so a second store object over the
+same directory waits too. The string-path convenience overloads and `WalRecorder` stay inline (the
+caller gets a final directory back). Cleanup only deletes what no retained snapshot needs, so
+doing it late changes only when the space returns; a failure in it is ignored and retried by the
+next one, as an inline prune's was. Tests that count mutations run inline;
+`ACrashDuringDeferredCleanup_StillRecoversTheNewCheckpoint` crashes inside the deferred cleanup
+(process crash and power loss) and requires the new checkpoint to restore and checkpoint on.
+Mutation-tested: an `ExistsAsync` that ignores the index, and a sweep that ignores it, each fail.
+Full suite passes four ways: runs off, runs on, runs on + verify, runs on + inline cleanup.
+
+**Measured** (SF=3, W=12, 5 alternating runs per arm; raw: `docs/runs-levers-w12-20261031.txt`).
+`12:inline` is today's layout as it was; `12` is today's layout with deferred cleanup (now the
+default for it too):
+
+| | today, inline cleanup | today, deferred | runs, incremental + both levers |
+|---|--:|--:|--:|
+| checkpoint after batch 1 (base) | 4.86 s [4.13–4.92] | 4.92 s [4.21–5.22] | 5.55 s [4.38–5.68] |
+| checkpoint after batch 2 (delta) | 3.92 s [3.31–3.97] | 3.07 s [2.90–3.22] | **0.27 s** [0.24–0.28] |
+| checkpoint after batch 3 (delta) | 3.47 s [3.42–3.90] | 3.94 s [3.18–4.16] | **0.30 s** [0.29–0.30] |
+| written per delta checkpoint | 4,701 MiB | 4,701 MiB | 51 MiB |
+| restore | 5.43 s | 5.58 s | 6.60 s |
+
+All 15 restores matched. **The checkpoint target (under 0.5 s for a batch-2/3-sized change) is
+met**: 0.92 / 1.48 s → 0.27 / 0.30 s, 11–13× faster than today. The batch-3 figure includes waiting
+for batch 2's deferred cleanup (the batch between them drains in 0.1 s), so it is not flattered by
+the deferral. For today's layout deferral is within noise — it deletes a few large files, not
+thousands of small ones. Still open against the targets: restore (6.6 s, eager — increment 4) and
+the base checkpoint (+0.6 s over today).
+
+### Increment 4 — lazy restore for indexed traces and aggregates (built 2026-11-01)
+
+**Where restore's bytes are** (SF=3, W=12, 4,751 MiB): join traces 57%, aggregate traces 14%,
+output views (`IntegrateOp`) 12%, partitioned window/offset/rank 16% (increment 5), DISTINCT 3%,
+aggregate-state blobs 1%. Indexed traces — joins and aggregates — are ~70%, so they go first.
+
+**Cold backing in `IndexedZSet`.** A restored indexed trace starts with an empty map and a cold
+source (`IColdGroups`: exact group count, read one key, read all). A key is read the first time it
+is asked for — `GroupFor`, `ContainsKey`, or `MergeInPlace` touching it — and then lives in the map;
+a *resolved* set remembers every key read, so a key absent from cold, or emptied since, is never
+read twice. `GroupCount` stays exact without reading: the source's persisted count, minus resolved
+keys it held, plus the map. Anything that needs every group (enumeration, `Keys`, equality,
+`Flatten`, GC's `RemoveKeysBelow`) **promotes** the rest first, so every caller stays correct and
+only loses laziness. The cold state lives in a side table (`ConditionalWeakTable`), not a field —
+an indexed Z-set is no bigger, and until a lazy restore has happened in the process a map miss
+costs one static read. The codec returns a cold-backed collection; the trace that integrates it
+into empty state **adopts** the source (and any groups already read) instead of merging it.
+
+**The run side.** Each run-index line now records the state's exact size at the checkpoint (group
+count, or row count). `RunColdGroups` opens a chain's runs *detached* — footer, block index, Bloom
+filter and schema message in memory, the file opened only to read a block — so thousands of runs
+hold no file handles. A key's group is the sum over the runs whose Bloom filter and index admit it.
+`DBSPNET_RESTORE=eager` reads chains whole at restore instead.
+
+**Joins are lazy as they stand.** `JoinInto` iterates the side with fewer groups and probes the
+other, so with an exact count a restored trace (large) is probed per delta key. Left joins probe
+only touched keys.
+
+**Aggregates rebuild per group.** The eager load folds the whole trace to rebuild the per-group
+caches, then overlays the persisted states — a full scan. Lazily restored, it skips both, holds the
+persisted states (`aggstate`, 48 MiB) in a dictionary, and rebuilds a group's caches the first time a
+delta touches it: exactly the eager fold for that one group, then its persisted state. A checkpoint
+writes untouched groups' states back as they were.
+
+**Giant groups are read at restore.** The first measurement had the first resumed batch at 3.6 s
+(vs 0.1 s): 592 key reads decoded 2.16 M entries. A block never splits a group, so a group larger
+than a block fills a block, and reading its key decodes all of it. On SF=3, 14 such blocks hold 8.4%
+of the state — the low-cardinality join keys every batch touches. The writer now starts a new block
+before any group that fills one by itself (so a giant group always has a block to itself), and the
+restore resolves every key whose block is one group of more than 4,096 entries. Adoption carries
+those already-read groups over (it first refused a source with any read groups, and the trace was
+promoted whole — caught by `AGiantGroup_IsReadAtRestore_TheRestOnDemand`).
+
+**Tests.** `LazyRestoreTests` (9): a cold-backed `IndexedZSet` against an eager oracle under random
+interleavings of probes, merges, counts, enumeration and GC drops (5 seeds × 40 trials); a probe
+reads a key once; a restored join stays cold, reads only touched keys, matches its twin through
+ticks, checkpoint and a second restore; a restored aggregate rebuilds only touched groups and keeps
+untouched groups' persisted states across a checkpoint (the `FloatAggregateRestoreTests` 1e16
+construction, where a re-fold disagrees with the live sum); a giant group is read at restore. Full
+suite passes four ways (runs off; runs on; runs on + verify; runs on + eager restore: 2,904 each).
+Mutation-tested: `GroupCount` ignoring cold, `MergeInPlace` not resolving, no adoption, untouched
+blobs not saved, blob not applied on touch — each fails.
+
+**Measured** — `IVM_RESTART_AFTER=1`: after batch 1's checkpoint the program is dropped and a fresh
+one restored, then batches 2–3 run on it (SF=3, W=12, 5 alternating runs per arm;
+`ARMS="12:restart 12:runs:eager:restart 12:runs:restart"`; raw: `docs/runs-lazy-restore-w12-20261101.txt`).
+Median [min–max]; every arm's view row counts after batches 2 and 3 matched the uninterrupted run,
+and every final restore matched:
+
+| | today | runs, eager restore | runs, **lazy** restore |
+|---|--:|--:|--:|
+| restore after batch 1 | 5.48 s [5.23–5.58] | 6.71 s [6.27–6.85] | **3.63 s** [3.54–3.70] |
+| batch 2 drain (first after restore) | 0.09 s | 0.09 s | **0.11 s** [0.10–0.12] |
+| batch 3 drain | 0.08 s | 0.09 s | 0.13 s [0.12–0.15] |
+| batch 2 output write | 1.25 s [1.14–1.60] | 1.18 s [1.15–1.26] | 3.73 s [1.58–3.87] |
+| final restore (after batch 3) | 7.12 s | 11.74 s | **3.42 s** |
+
+Against the targets: **first batch after restore within 2× — met** (0.11 vs 0.09 s drain).
+**Restore under 1 s — not yet**: 3.6 s, and the restore profile (`IVM_CHECKPOINT_PROFILE=1`, CPU
+summed over workers) says why — partitioned window aggregate 19.8 s and offset 10.8 s of ~36 s are
+still eager (**increment 5**), joins 3.0 s (the giant-group preload and ~3,000 run footers),
+`IntegrateOp` views 1.7 s (increment 6), DISTINCT 0.5 s; aggregates are down to 0.1 s.
+
+**Open — the first output write after a lazy restore is bimodal**: ~1.6 s in two runs, ~3.8 s in
+three, against 1.2 s eager; the drain is unaffected and the time is in the Delta write of the full
+views, not in reading engine state (with `DBSPNET_PROFILE` the same write took 1.16 s; two further
+runs gave 1.63 s and 1.69 s, cleanup deferred or inline). A similar stall shows in batch 1 (one
+view's Delta write took 2.1 s once). To be run down with increment 6, which removes the full-view
+first write.
+
+### Increment 5 — lazy partitioned operators (built 2026-11-01)
+
+After increment 4 the restore profile was 30 of ~36 s of CPU in the partitioned window aggregate and
+offset operators: their load folds every saved row back into a partition-keyed `SortedDictionary`
+and recomputes every partition's window.
+
+**Saved in partition order.** Their snapshot is a flat row Z-set, so the run is now ordered by the
+**partition key's** hash instead of the row's (`ZSetChangeTracker.Attach(..., orderHash)`; only where
+that hash is stable across processes — a `StructuralRow` key's cached hash; typed keys stay eager).
+A block never splits a hash, so one partition is one block per run. The run index records the
+order (`p`/`r`); a chain is never extended across orders; the footer still pins the row hash.
+
+**Restored cold, faulted per partition.** `IColdRowLoader.LoadColdAsync` hands a partition-ordered
+chain back as `IColdRows` (`RunColdRows`, runs open detached). The operator keeps a
+`LazyPartitions`: the first time a delta touches a partition, its rows are read (one block per
+run, filtered to the key) into the bucket and its window rebuilt into a discarded sink — exactly the
+eager load for that one partition — before the delta lands. GC promotes every cold partition first
+(it scans them all); so does a write that needs the whole state.
+
+**Writing while partly cold.** A delta checkpoint needs only the pending change. A write that needs
+everything — a new chain, compaction, another store, the monolithic layout, verify — calls the
+operator's `FullState`, which promotes the rest; the partial in-memory snapshot is never written as
+the whole.
+
+Covered: `PartitionedWindowAggregateOp`, `PartitionedOffsetOp` (LAG/LEAD), `PartitionedRankOp`,
+`PartitionedTopKOp`. **Not covered:** `PartitionedTopKNarrowOp` and `PartitionedTopKCompactOp` (the
+§22 row-narrowing TOP-K and the compact one) — they also have no increment-3 change tracking, so
+they are written whole every checkpoint and restored eagerly. ivm-bench uses neither.
+
+**Tests.** `LazyPartitionTests` (3): restored LAG / RANK / framed SUM OVER operators stay lazy, read only
+touched partitions and match an uninterrupted twin through ticks, a delta checkpoint and a second
+restore; a whole-state write while partitions are cold (into another store) writes every row; LATENESS
+GC after a lazy restore collects cold partitions too (the row count a whole-state write records equals
+a never-restored twin's — skipping the promotion is invisible in outputs, so this is the check). Full
+suite passes four ways (2,907 each). Mutation-tested: a faulted partition without its window rebuilt,
+no full-state callback, GC without promotion, rows saved in row order — each fails.
+
+**Measured** — restart after batch 1 (`IVM_RESTART_AFTER=1`), SF=3, W=12, 5 alternating runs per arm
+(`ARMS="12:restart 12:runs:restart"`; raw: `docs/runs-lazy-partitions-w12-20261101.txt`). All view row
+counts after batches 2–3 and every final restore matched.
+
+| | today | runs, lazy (increments 4 + 5) |
+|---|--:|--:|
+| restore after batch 1 | 6.26 s [6.09–6.56] | **2.19 s** [1.03–2.39] |
+| restore after batch 1 + first output write | 7.33–7.85 s | **3.33–4.07 s** |
+| batch 2 drain (first after restore) | 0.08 s | 0.13 s [0.12–0.76] |
+| final restore (after batch 3) | 6.94 s [6.67–15.16] | **1.20 s** [1.10–1.37] |
+| checkpoint after batch 2 / 3 | 1.79 / 3.22 s | 0.24 / 0.27 s |
+
+The restore after batch 1 is bimodal — 1.03 and 1.12 s in two runs, 2.19–2.39 s in three — and the
+~1.2 s moves to the first output write in exactly the fast-restore runs (output 3.04 / 2.34 s with
+GC pauses of 1.1 / 0.7 s, against 1.1–1.2 s otherwise): one blocking collection landing in one phase
+or the other. Their sum is steady and less than half of today's. The restore profile of a fast run
+(`IVM_CHECKPOINT_PROFILE=1`, CPU summed over workers): `IntegrateOp` views 2.9 s, joins 1.9 s,
+DISTINCT 0.4 s; the partitioned operators went from ~30 s to 0.2 s.
+
+Against the targets: **restore under 1 s — close but not met** (1.0–1.2 s without a GC in it). What
+remains is the output views (`IntegrateOp`, eager — increment 6, which also removes the full-view
+first write) and the join traces' giant-group preload and run footers. First batch after restore within
+2× — met in 4 of 5 runs (0.12–0.30 s vs 0.08 s; one run 0.76 s).
+
+### Increment 6 — outputs after restore (built 2026-11-01)
+
+**Sink alignment: not built, deliberately.** Skipping the full first write after restore needs the
+sink to already hold the restored view *and* the connector to know where each row sits: the Delta
+connector deletes by file position (deletion vectors), tracked in memory for rows it wrote itself.
+A restarted process knows no positions, so its first write truncates and rewrites the view — and
+that is exactly what Feldera does (truncate-on-start). Recovering every row's position means reading
+the whole table back, about the cost of rewriting it. Per the adopt-Feldera's-assumptions policy the
+rewrite stays; recorded here as the alternative.
+
+**What changed instead: the rewrite streams, and views and DISTINCT restore lazily.**
+- `ZSetTrace` gets a cold backing (`IColdZSet`: exact count, one row's weight, all rows). `Current`
+  promotes first, so every existing caller is unchanged; `Count` is exact without reading; `WeightOf`
+  and `Integrate` read only the rows they touch; GC promotes; `EnumerateWhole` yields every row
+  without reading cold rows into memory; while cold, a whole-state write uses `FullState` (built from
+  the enumeration, not promoted). `IntegrateOp` (output views) and `DistinctOp` adopt a row-ordered
+  chain at restore (`IColdZSetLoader` / `RunColdZSet`); the chain's count is the trace's exact count
+  (`ExactCount`), so a view's row count survives lazy checkpoint after lazy checkpoint.
+- The first incremental write after restore enumerates the view (`RunnerOutput.EnumerateView` →
+  `EnumerateWhole`) straight into the Arrow changes — no hashed copy of the view is formed, and none
+  is kept. Parallel outputs sum the workers' enumerations (also without promoting); the row count a
+  `/wait` reads is formed the same way, once.
+
+**Two things the first SF=3 run exposed.**
+1. *A sweep could delete runs a live cold state still reads.* A checkpoint that rewrites a cold
+   state whole (a new base) stops naming the runs it was restored from; the sweep deleted them; the
+   next cold read failed (`PipelineRunnerTests` under runs, deterministic). The hole was there for
+   every lazy source since increment 4. Fix: `RunPins` — each cold source pins its chain's runs while
+   it is reachable (a weak table), and the sweep never deletes a pinned run.
+   `ALazyState_RewrittenWholeAndSwept_StillReadsItsRuns` reproduces it (it needed a state above the
+   4,096-entry floor below which chains always extend).
+2. *A row probe decoded a whole block.* Views and DISTINCT read the old weight of every row a delta
+   changes; each read decoded a 1,024-row block, so the first batch after restore drained in 0.62 s
+   (vs 0.12 s) allocating 1.4 GiB. Every run block now carries its entries' order hashes (`__hash`,
+   ascending; run format version 3), and a point probe binary-searches them and decodes only the
+   matching entries (`WeightOfRowAsync`, `GroupOfKeyAsync` — the indexed traces' per-key reads use it
+   too). First batch: 0.16 s, 0.42 GiB; cold read time 451 → 97 ms.
+
+**Tests.** `LazyViewTests` (2): a restored view stays cold, counts exactly and streams its full write
+equal to the uninterrupted view, then carries its chain through a checkpoint and a second restore;
+a lazy state rewritten whole and swept still reads its runs. `RunFileTests` check the hash-range
+probes against the sets, colliding hashes included. Full suite passes four ways (2,909 each).
+Mutation-tested: a sweep ignoring pins and `Integrate` not resolving the rows it changes each fail.
+
+**Measured** — restart after batch 1, SF=3, W=12, 5 alternating runs per arm (raw:
+`docs/runs-lazy-views-w12-20261101.txt`). All view row counts after batches 2–3 and every final
+restore matched.
+
+| | today | runs, lazy (increments 4–6) |
+|---|--:|--:|
+| restore after batch 1 | 6.27 s [5.99–6.41] | **0.76 s** [0.73–0.87] |
+| batch 2 drain (first after restore) | 0.09 s [0.07–0.09] | 0.17 s [0.16–0.18] |
+| batch 2 output write (first after restore) | 1.32 s [1.11–1.54] | 3.22 s [3.05–3.65] |
+| restore + first batch + first write | 7.68 s | **4.15 s** |
+| final restore (after batch 3) | 7.13 s [6.55–14.88] | **0.93 s** [0.75–0.96] |
+| checkpoint after batch 2 / 3 | 2.25 / 2.76 s | 0.22 / 0.24 s |
+
+The restore is now steady (the GC bimodality of increment 5 is gone: nothing large is built at
+restore). Against the approved targets: **restore under 1 s — met** (0.73–0.96 s, both restores);
+**checkpoint under 0.5 s — met** (0.21–0.26 s); **first batch within 2× — met** (0.17 vs 0.09 s, 1.9×);
+**no steady-state regression** — batch-1 drain 16.6 vs 15.9 s here (within the ±2.5 s noise of
+earlier measurements; not separately established).
+
+**The cost that moved:** the first output write after restore is 1.9 s slower than today's (3.2 vs
+1.3 s): it now decodes the view from runs rather than writing from a view already in memory. Restore
+plus first write is still 46% faster than today, and nothing view-sized is kept in memory. The next
+lever is to skip the Arrow → rows → Arrow round trip in that write (the run blocks already are the
+view's Arrow batches; only the connector's row-address map needs row keys).
+
+### Targets (approved 2026-10-31)
+
+On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
+- **Checkpoint:** proportional to the change — under 0.5 s for a batch-2/3-sized change (today
+  3–5 s).
+- **Restore to ready:** under 1 s, independent of state size (today ~6 s), digest-verified.
+- **First batch after restore:** within 2× of the same batch without a restart.
+- **Steady-state step:** no regression beyond noise (batch-1 drain, 5 runs per arm, layout on vs off).
+- **Memory:** resident state after restore ≈ only what was touched; Bloom + index overhead stated.
+
 ## 2. Plan from here
 
 1. ~~Increment 1 — parallel checkpoint.~~ Done, §1b.

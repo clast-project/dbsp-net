@@ -17,6 +17,9 @@ namespace DbspNet.Persistence.IO.Local;
 public sealed class LocalTableFileSystem : IDurableTableFileSystem
 {
     private readonly string _rootPath;
+
+    /// <summary>The full path of the directory this store is rooted at.</summary>
+    internal string RootPath => _rootPath;
     private readonly BufferAllocator? _allocator;
 
     /// <summary>

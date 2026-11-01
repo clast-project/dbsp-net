@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections;
+using System.Runtime.CompilerServices;
 using DbspNet.Core.Algebra;
 
 namespace DbspNet.Core.Collections;
@@ -45,6 +46,127 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     private MapView<TKey, ZSet<TValue, TWeight>> Groups => new(_groupStore);
 
+    // ---- Cold backing (docs/design-durable-state.md §1f, increment 4: lazy restore) ----
+    //
+    // A restored trace starts with an empty in-memory map and a cold source (the runs it was
+    // checkpointed to). A key is read from cold the first time it is asked for and then lives in
+    // the map like any other; Resolved remembers which keys have been read, so a key absent from
+    // cold, or emptied since, is never read twice. Point reads (GroupFor, ContainsKey) and
+    // MergeInPlace resolve one key; anything that needs every group (enumeration, Keys, equality,
+    // GC) promotes the rest first, so it stays correct, just eager. GroupCount stays exact without
+    // reading: the source knows its count, and every resolved key's truth is in the map.
+    //
+    // A side table, not a field: an indexed Z-set is no bigger than before, and until some
+    // restore has gone lazy in this process the only cost is one static read on a map miss.
+    private sealed class Cold(IColdGroups<TKey, TValue, TWeight> source)
+    {
+        public IColdGroups<TKey, TValue, TWeight> Source { get; } = source;
+
+        public HashSet<TKey> Resolved { get; } = new();
+
+        /// <summary>Resolved keys that cold held (so are no longer counted as cold-only).</summary>
+        public int ResolvedPresent { get; set; }
+    }
+
+    private static readonly ConditionalWeakTable<IndexedZSet<TKey, TValue, TWeight>, Cold> ColdTable = new();
+    private static volatile bool _anyCold;
+
+    private Cold? ColdState => _anyCold && ColdTable.TryGetValue(this, out var c) ? c : null;
+
+    /// <summary>An empty indexed Z-set whose groups are read from <paramref name="source"/> on demand.</summary>
+    internal static IndexedZSet<TKey, TValue, TWeight> ColdBacked(IColdGroups<TKey, TValue, TWeight> source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var z = NewMutable();
+        _anyCold = true;
+        var cold = new Cold(source);
+        ColdTable.Add(z, cold);
+        foreach (var key in source.PreloadKeys)
+        {
+            z.Resolve(cold, key);
+        }
+
+        source.ReleasePreload();
+        return z;
+    }
+
+    /// <summary>True while some groups have not been read from the cold source.</summary>
+    internal bool IsCold => ColdState is not null;
+
+    /// <summary>Keys read from cold so far (diagnostics and tests).</summary>
+    internal int ColdResolvedCount => ColdState?.Resolved.Count ?? 0;
+
+    /// <summary>
+    /// If this is empty and not cold, and <paramref name="other"/> is cold-backed, take its source
+    /// and any groups it has already read (a restored trace adopting what the codec loaded) instead
+    /// of reading it all.
+    /// </summary>
+    internal bool TryAdoptColdFrom(IndexedZSet<TKey, TValue, TWeight> other)
+    {
+        if (!_anyCold || ColdState is not null || Groups.Count != 0 || other.ColdState is not { } cold)
+        {
+            return false;
+        }
+
+        // Groups other already read (a preload) come along; the cold source covers the rest.
+        foreach (var (key, group) in other.Groups)
+        {
+            Groups.Set(key, group);
+        }
+
+        ColdTable.Remove(other);
+        ColdTable.Add(this, cold);
+        return true;
+    }
+
+    // Read key from cold if it has not been; true if it is now in the map.
+    private bool Resolve(Cold cold, TKey key)
+    {
+        if (!cold.Resolved.Add(key))
+        {
+            return false;
+        }
+
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var g = cold.Source.Read(key);
+        ColdStats.ReadTime(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+        ColdStats.Resolve(!g.IsEmpty);
+        if (g.IsEmpty)
+        {
+            return false;
+        }
+
+        Groups.Set(key, g);
+        cold.ResolvedPresent++;
+        return true;
+    }
+
+    // Every group, read into the map: what a whole-collection read needs first.
+    private MapView<TKey, ZSet<TValue, TWeight>> All
+    {
+        get
+        {
+            if (ColdState is { } cold)
+            {
+                ColdStats.Promote(cold.Source.GroupCount);
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                foreach (var (key, group) in cold.Source.ReadAll())
+                {
+                    if (!cold.Resolved.Contains(key) && !group.IsEmpty)
+                    {
+                        Groups.Set(key, group);
+                    }
+                }
+
+                ColdStats.PromoteTime(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+
+                ColdTable.Remove(this);
+            }
+
+            return Groups;
+        }
+    }
+
     /// <summary>An empty indexed Z-set to mutate in place (a trace's state), in the configured map.</summary>
     internal static IndexedZSet<TKey, TValue, TWeight> NewMutable() =>
         ZSetMapMode.Chunked ? new(new ChunkedMap<TKey, ZSet<TValue, TWeight>>()) : new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
@@ -58,7 +180,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             long values = 0, singletons = 0, bytes = 0;
             var groupsBySize = new long[6];
             var valuesBySize = new long[6];
-            foreach (var group in Groups.Values)
+            foreach (var group in All.Values)
             {
                 var n = group.Count;
                 values += n;
@@ -78,7 +200,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     private IEnumerable<object> CensusEntries()
     {
-        foreach (var (key, group) in Groups)
+        foreach (var (key, group) in All)
         {
             yield return key;
             foreach (var entry in group.Entries())
@@ -91,15 +213,16 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =
         new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
 
-    public int GroupCount => Groups.Count;
+    public int GroupCount => ColdState is { } cold ? cold.Source.GroupCount - cold.ResolvedPresent + Groups.Count : Groups.Count;
 
-    public bool IsEmpty => Groups.Count == 0;
+    public bool IsEmpty => GroupCount == 0;
 
-    public IEnumerable<TKey> Keys => Groups.Keys;
+    public IEnumerable<TKey> Keys => All.Keys;
 
     public ZSet<TValue, TWeight> GroupFor(TKey key)
     {
-        var found = Groups.TryGetValue(key, out var g);
+        var found = Groups.TryGetValue(key, out var g)
+            || (ColdState is { } cold && Resolve(cold, key) && Groups.TryGetValue(key, out g));
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Probe(key, found);
@@ -110,7 +233,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     public bool ContainsKey(TKey key)
     {
-        var found = Groups.ContainsKey(key);
+        var found = Groups.ContainsKey(key) || (ColdState is { } cold && Resolve(cold, key));
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
             TraceAccessProfile.For(this)?.Probe(key, found);
@@ -132,13 +255,13 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             TraceAccessProfile.For(this)?.Scan();
         }
 
-        return new Enumerator(Groups.GetEnumerator());
+        return new Enumerator(All.GetEnumerator());
     }
 
     IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
-        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => new Enumerator(Groups.GetEnumerator());
+        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => new Enumerator(All.GetEnumerator());
 
-    IEnumerator IEnumerable.GetEnumerator() => new Enumerator(Groups.GetEnumerator());
+    IEnumerator IEnumerable.GetEnumerator() => new Enumerator(All.GetEnumerator());
 
     /// <summary>Enumerates the groups in either backing map, in the map's order.</summary>
     public struct Enumerator : IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
@@ -173,7 +296,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             return true;
         }
 
-        if (Groups.Count != other.Groups.Count)
+        if (All.Count != other.All.Count)
         {
             return false;
         }
@@ -194,7 +317,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public override int GetHashCode()
     {
         var hash = 0;
-        foreach (var (k, g) in Groups)
+        foreach (var (k, g) in All)
         {
             hash ^= HashCode.Combine(k, g);
         }
@@ -208,7 +331,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public ZSet<(TKey Key, TValue Value), TWeight> Flatten()
     {
         var total = 0L;
-        foreach (var g in Groups.Values)
+        foreach (var g in All.Values)
         {
             total += g.Count;
         }
@@ -229,7 +352,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     {
         ArgumentNullException.ThrowIfNull(other);
         var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (k, g) in Groups)
+        foreach (var (k, g) in All)
         {
             foreach (var (v, w) in g)
             {
@@ -237,7 +360,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
         }
 
-        foreach (var (k, g) in other.Groups)
+        foreach (var (k, g) in other.All)
         {
             foreach (var (v, w) in g)
             {
@@ -252,7 +375,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     {
         ArgumentNullException.ThrowIfNull(other);
         var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (k, g) in Groups)
+        foreach (var (k, g) in All)
         {
             foreach (var (v, w) in g)
             {
@@ -260,7 +383,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
         }
 
-        foreach (var (k, g) in other.Groups)
+        foreach (var (k, g) in other.All)
         {
             foreach (var (v, w) in g)
             {
@@ -285,14 +408,17 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     internal void MergeInPlace(IndexedZSet<TKey, TValue, TWeight> delta)
     {
         ArgumentNullException.ThrowIfNull(delta);
-        if (delta.Groups.Count == 0)
+        if (delta.All.Count == 0)
         {
             return;
         }
 
+        var cold = ColdState;
         foreach (var (key, deltaGroup) in delta.Groups)
         {
-            if (Groups.TryGetValue(key, out var currentGroup))
+            // A key this has not read from cold yet: read it, so the delta adds to what was there.
+            if (Groups.TryGetValue(key, out var currentGroup)
+                || (cold is not null && Resolve(cold, key) && Groups.TryGetValue(key, out currentGroup)))
             {
                 currentGroup.MergeInPlace(deltaGroup);
                 if (currentGroup.IsEmpty)
@@ -324,7 +450,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
         ArgumentNullException.ThrowIfNull(monotoneKey);
         List<TKey>? removed = null;
-        foreach (var key in Groups.Keys)
+        foreach (var key in All.Keys)
         {
             if (monotoneKey(key) < threshold)
             {

@@ -45,6 +45,7 @@ public static class ParallelReshard
         ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(program);
         using var gcMode = CheckpointGcMode.Enter();
+        await CheckpointCleanup.WaitAsync(fs).ConfigureAwait(false);
 
         var current = await Snapshot.TryReadCurrentPointerAsync(fs, cancellationToken).ConfigureAwait(false);
         if (current is null)
@@ -146,7 +147,8 @@ public static class ParallelReshard
         }
 
         await Snapshot.WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
-        await Snapshot.PruneAsync(fs, (tick, generation), retainCount, ParallelSnapshot.ParallelManifestFile, cancellationToken)
+        await CheckpointCleanup.RunAsync(
+            fs, ct => Snapshot.PruneAsync(fs, (tick, generation), retainCount, ParallelSnapshot.ParallelManifestFile, ct), cancellationToken)
             .ConfigureAwait(false);
         return oldW;
     }

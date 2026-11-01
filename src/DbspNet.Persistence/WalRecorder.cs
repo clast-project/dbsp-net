@@ -235,7 +235,10 @@ public sealed class WalRecorder : IAsyncDisposable, IDisposable
                 _currentSegmentId, _currentSegmentTicks, _currentSegmentStartTick));
         }
 
-        await Snapshot.WriteAsync(_compiled.Circuit, _snapshotFs, snapshotRetainCount, cancellationToken).ConfigureAwait(false);
+        using (CheckpointCleanup.Inline())
+        {
+            await Snapshot.WriteAsync(_compiled.Circuit, _snapshotFs, snapshotRetainCount, cancellationToken).ConfigureAwait(false);
+        }
         var snapshotTick = _compiled.Circuit.TickCount;
 
         var keepers = new List<WalSegment>();

@@ -1,0 +1,28 @@
+RESULT batch=1 ticks=20 drain_ms=16611 output_ms=3531 counts_ms=14 view_rows=3585561 parquet_mb=119.5 drain_alloc_gib=42.70 checkpoint_ms=5018 snapshot_mib=4697.9
+RESULT batch=2 ticks=9 drain_ms=33 output_ms=17 counts_ms=0 view_rows=3585588 parquet_mb=119.5 drain_alloc_gib=0.05 checkpoint_ms=3143 snapshot_mib=4698.5
+RESULT batch=3 ticks=9 drain_ms=48 output_ms=9 counts_ms=0 view_rows=3585648 parquet_mb=119.6 drain_alloc_gib=0.06 checkpoint_ms=4099 snapshot_mib=4699.0
+DELTA from=snap-20 to=snap-29 full_mib=4698.4 delta_mib=6.73 ratio=0.143 % full_entries=35675917 delta_entries=13520
+DELTAKIND PartitionedWindowAggregateOp`4/trace.arrows from=snap-20 to=snap-29 full_mib=423.1 delta_mib=1.84 ratio=0.436 % full_entries=3719103 delta_entries=73
+DELTAKIND PartitionedRankOp`3/trace.arrows from=snap-20 to=snap-29 full_mib=15.5 delta_mib=1.56 ratio=10.040 % full_entries=105372 delta_entries=10114
+DELTAKIND IncrementalJoinOp`5/left.arrows from=snap-20 to=snap-29 full_mib=2143.3 delta_mib=0.85 ratio=0.040 % full_entries=15206333 delta_entries=202
+DELTAKIND IntegrateOp`1/view.arrows from=snap-20 to=snap-29 full_mib=546.9 delta_mib=0.68 ratio=0.124 % full_entries=3585588 delta_entries=2709
+DELTAKIND IncrementalJoinOp`5/right.arrows from=snap-20 to=snap-29 full_mib=303.8 delta_mib=0.56 ratio=0.184 % full_entries=4620109 delta_entries=53
+DELTAKIND DistinctOp`2/trace.arrows from=snap-20 to=snap-29 full_mib=120.8 delta_mib=0.50 ratio=0.412 % full_entries=685017 delta_entries=25
+DELTAKIND PartitionedOffsetOp`3/trace.arrows from=snap-20 to=snap-29 full_mib=325.9 delta_mib=0.23 ratio=0.072 % full_entries=2387483 delta_entries=27
+DELTAKIND IncrementalLeftJoinOp`5/left.arrows from=snap-20 to=snap-29 full_mib=122.5 delta_mib=0.22 ratio=0.178 % full_entries=688431 delta_entries=11
+DELTAKIND IncrementalAggregateOp`3/trace.arrows from=snap-20 to=snap-29 full_mib=644.9 delta_mib=0.16 ratio=0.025 % full_entries=4359768 delta_entries=135
+DELTAKIND IncrementalLeftJoinOp`5/right.arrows from=snap-20 to=snap-29 full_mib=3.7 delta_mib=0.07 ratio=1.991 % full_entries=16542 delta_entries=150
+DELTAKIND IncrementalAggregateOp`3/aggstate.arrows from=snap-20 to=snap-29 full_mib=48.1 delta_mib=0.06 ratio=0.117 % full_entries=302171 delta_entries=21
+DELTA from=snap-29 to=snap-38 full_mib=4699.0 delta_mib=7.03 ratio=0.150 % full_entries=35676596 delta_entries=15802
+DELTAKIND PartitionedWindowAggregateOp`4/trace.arrows from=snap-29 to=snap-38 full_mib=423.2 delta_mib=1.85 ratio=0.438 % full_entries=3719211 delta_entries=120
+DELTAKIND PartitionedRankOp`3/trace.arrows from=snap-29 to=snap-38 full_mib=15.5 delta_mib=1.56 ratio=10.040 % full_entries=105374 delta_entries=10118
+DELTAKIND IntegrateOp`1/view.arrows from=snap-29 to=snap-38 full_mib=546.9 delta_mib=0.90 ratio=0.165 % full_entries=3585648 delta_entries=4366
+DELTAKIND IncrementalJoinOp`5/left.arrows from=snap-29 to=snap-38 full_mib=2143.8 delta_mib=0.87 ratio=0.041 % full_entries=15206609 delta_entries=395
+DELTAKIND IncrementalJoinOp`5/right.arrows from=snap-29 to=snap-38 full_mib=303.8 delta_mib=0.56 ratio=0.184 % full_entries=4620126 delta_entries=67
+DELTAKIND DistinctOp`2/trace.arrows from=snap-29 to=snap-38 full_mib=120.8 delta_mib=0.50 ratio=0.416 % full_entries=685028 delta_entries=49
+DELTAKIND PartitionedOffsetOp`3/trace.arrows from=snap-29 to=snap-38 full_mib=325.9 delta_mib=0.24 ratio=0.072 % full_entries=2387533 delta_entries=50
+DELTAKIND IncrementalLeftJoinOp`5/left.arrows from=snap-29 to=snap-38 full_mib=122.5 delta_mib=0.22 ratio=0.181 % full_entries=688455 delta_entries=24
+DELTAKIND IncrementalAggregateOp`3/trace.arrows from=snap-29 to=snap-38 full_mib=644.9 delta_mib=0.18 ratio=0.028 % full_entries=4359894 delta_entries=270
+DELTAKIND IncrementalLeftJoinOp`5/right.arrows from=snap-29 to=snap-38 full_mib=3.7 delta_mib=0.09 ratio=2.531 % full_entries=16542 delta_entries=300
+DELTAKIND IncrementalAggregateOp`3/aggstate.arrows from=snap-29 to=snap-38 full_mib=48.1 delta_mib=0.06 ratio=0.125 % full_entries=302176 delta_entries=43
+RESTORE workers=8 restore_workers=8 reshard_ms=0 tick=38 restore_ms=6077 view_rows_match=True

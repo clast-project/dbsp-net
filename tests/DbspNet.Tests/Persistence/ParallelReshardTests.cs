@@ -265,6 +265,8 @@ public class ParallelReshardTests
     [Fact]
     public async Task ACrashAnywhereInTheRewrite_LeavesARestorableSnapshot()
     {
+        // Counts mutations: the cleanup a checkpoint defers must happen inside the count.
+        using var inlineCleanup = CheckpointCleanup.Inline();
         // Build the source snapshot once, then crash the rewrite at every mutation in turn. After
         // each crash (process crash and power loss), the store must restore either at the old W
         // (before the commit) or at the new W (after it), and either way equal the reference.

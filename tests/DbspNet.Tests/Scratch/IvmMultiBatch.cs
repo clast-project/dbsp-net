@@ -19,11 +19,17 @@
 //                     restore_ms, and check its view row counts. Wiped at start. Compiles with
 //                     snapshot codecs, which turn off shared arrangements, so compare drain_ms
 //                     only against another run with this set.
+//   IVM_RESTART_AFTER=N  (with IVM_SNAPSHOT_DIR) restore a fresh program from batch N's checkpoint
+//                     and run the remaining batches on it (RESTART line; later RESULTs resumed=1)
 //   IVM_RESTORE_WORKERS  (with IVM_SNAPSHOT_DIR, parallel) restore at this W instead: re-shard the
 //                     last snapshot first (reshard_ms on the RESTORE line)
+//   IVM_SNAPSHOT_RETAIN  (optional) snapshots to keep (default 2)
+//   IVM_CHECKPOINT_DELTA=1  (with IVM_SNAPSHOT_DIR, parallel) diff consecutive retained snapshots
+//                     (CheckpointDeltaProbe): DELTA / DELTAKIND lines
+//   IVM_TRACE_FAMILY  (optional) spine = spine traces for every keyed stateful operator; default flat
 //   IVM_CHECKPOINT_POLICY  (with IVM_SNAPSHOT_DIR) a CheckpointPolicy.Parse setting: unset = a
 //                     snapshot every batch; "none" = journal only; N = journal + snapshot every N s
-//   IVM_CHECKPOINT_PROFILE=1  (with IVM_SNAPSHOT_DIR) per checkpoint: wall, CPU, allocation and GC
+//   IVM_CHECKPOINT_PROFILE=1|all  (with IVM_SNAPSHOT_DIR) per checkpoint (all: every op position): wall, CPU, allocation and GC
 //                     deltas, and the operator save times summed by type (CKPT/CKPTOP lines)
 //   IVM_CHECKPOINT_REPEAT=1   after batch 1's checkpoint, write a second one straight away (same
 //                     tick, so a fresh generation directory) and profile it the same way
@@ -45,6 +51,13 @@ public class IvmMultiBatch
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
     private readonly ITestOutputHelper _out;
+
+    // IVM_TRACE_FAMILY=spine compiles every keyed stateful operator onto spine traces (design-durable-state
+    // Phase 2: spine vs flat); default flat.
+    private static readonly TraceFamily TraceFamily =
+        string.Equals(Environment.GetEnvironmentVariable("IVM_TRACE_FAMILY"), "spine", StringComparison.OrdinalIgnoreCase)
+            ? TraceFamily.Spine
+            : TraceFamily.Flat;
 
     public IvmMultiBatch(ITestOutputHelper output) => _out = output;
 
@@ -87,7 +100,9 @@ public class IvmMultiBatch
             }
 
             Directory.CreateDirectory(snapshotDir!);
-            store = new SnapshotCheckpointStore(new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!));
+            // IVM_SNAPSHOT_RETAIN keeps more than the default 2 snapshots (IvmCheckpointDelta diffs them).
+            var retain = int.TryParse(Environment.GetEnvironmentVariable("IVM_SNAPSHOT_RETAIN"), out var r) ? r : 2;
+            store = new SnapshotCheckpointStore(new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!), retain);
         }
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
@@ -98,6 +113,7 @@ public class IvmMultiBatch
             Assert.True(
                 SqlProgram.TryCompileParallel(
                     spec.Program, outputViews, at ?? workers, out var compiled, codecs,
+                    new CompileOptions { TraceFamily = TraceFamily },
                     numericStringCoercion: true, nullCollation: NullCollation.Low),
                 "parallel compile refused the program");
             return compiled;
@@ -117,7 +133,7 @@ public class IvmMultiBatch
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))
             .ToList();
         var inputs = Inputs();
-        var outputs = spec.Output_Bindings
+        List<IOutputConnector> outputs = spec.Output_Bindings
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
             .ToList();
         // IVM_GC_EVENTS=1: every GC pause during batch 1 (suspend → restart), by generation.
@@ -127,7 +143,7 @@ public class IvmMultiBatch
         var runner = parallel is not null
             ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, store, policy)
             : await ProgramRunner.CreateAsync(serial!, inputs, outputs, store, policy);
-        var checkpointProfile = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") == "1";
+        var checkpointProfile = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") is "1" or "all";
         DbspNet.Persistence.Snapshot.ProfileSave = checkpointProfile;
 
         // IVM_TYPE_VIEWS=1 (serial only): each view tries the typed fast path, structural
@@ -137,7 +153,7 @@ public class IvmMultiBatch
         {
             var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") == "1";
             var compiled = SqlProgram.Compile(
-                spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews },
+                spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews, TraceFamily = TraceFamily },
                 numericStringCoercion: true, nullCollation: NullCollation.Low);
             if (typeViews)
             {
@@ -149,6 +165,8 @@ public class IvmMultiBatch
         }
 
         _out.WriteLine($"output mode: {mode}, workers: {workers}");
+        var restartAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_AFTER"), out var ra) ? ra : 0;
+        var restarted = false;
         for (var batch = 1; batch <= 3; batch++)
         {
             if (batch > 1)
@@ -157,6 +175,8 @@ public class IvmMultiBatch
             }
 
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
+            var pause0 = GC.GetTotalPauseDuration();
+            var gen2Before = GC.CollectionCount(2);
             double drainAllocGib = 0;
             var sw = Stopwatch.StartNew();
             DateTime? drainEndUtc = null;
@@ -264,6 +284,7 @@ public class IvmMultiBatch
             // DBSPNET_PROFILE has already written it, so this is then a no-op).
             double checkpointMs = 0;
             double snapshotMb = 0;
+            double writtenMb = 0;
             if (store is not null)
             {
                 if (Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PREGC") == "1")
@@ -302,8 +323,22 @@ public class IvmMultiBatch
                 if (File.Exists(pointer))
                 {
                     var current = File.ReadAllText(pointer).Trim();
-                    snapshotMb = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
-                        .Sum(f => new FileInfo(f).Length) / (1024.0 * 1024.0);
+                    var dirBytes = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
+                        .Sum(f => new FileInfo(f).Length);
+
+                    // With incremental runs (DBSPNET_STATE_LAYOUT=runs) the state also includes the
+                    // shared runs the snapshot's run indexes (runs.txt) name; this checkpoint wrote only
+                    // the ones under runs/{current}.
+                    var referenced = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "runs.txt", SearchOption.AllDirectories)
+                        .SelectMany(File.ReadAllLines).Where(l => l.Length > 0)
+                        .SelectMany(l => l.Split('\t').Skip(5)).Distinct() // op-i/file, base, delta, count, order, runs…
+                        .Sum(r => new FileInfo(Path.Combine(snapshotDir!, r)).Length);
+                    var newRuns = Path.Combine(snapshotDir!, "runs", current);
+                    var written = Directory.Exists(newRuns)
+                        ? Directory.EnumerateFiles(newRuns, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length)
+                        : 0;
+                    snapshotMb = (dirBytes + referenced) / (1024.0 * 1024.0);
+                    writtenMb = (dirBytes + written) / (1024.0 * 1024.0);
                 }
             }
 
@@ -314,8 +349,66 @@ public class IvmMultiBatch
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2}")
-                + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1}")));
+                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2} gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gen2={GC.CollectionCount(2) - gen2Before}")
+                + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1} written_mib={writtenMb:F1}"))
+                + (restarted ? " resumed=1" : ""));
+            if (restarted)
+            {
+                _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"COLD after_batch={batch} resolves={DbspNet.Core.Collections.ColdStats.Resolves} present={DbspNet.Core.Collections.ColdStats.ResolvedPresent} promotions={DbspNet.Core.Collections.ColdStats.Promotions} promoted_groups={DbspNet.Core.Collections.ColdStats.PromotedGroups} read_ms={DbspNet.Core.Collections.ColdStats.ReadMs:F0} promote_ms={DbspNet.Core.Collections.ColdStats.PromoteMs:F0} row_reads={DbspNet.Core.Collections.ColdStats.RowResolves.Reads} row_present={DbspNet.Core.Collections.ColdStats.RowResolves.Present}"));
+                foreach (var (who, n) in DbspNet.Core.Collections.ColdStats.Promoters.OrderByDescending(kv => kv.Value).Take(8))
+                {
+                    _out.WriteLine($"PROMOTER {who}{n}");
+                }
+            }
+
+            // IVM_RESTART_AFTER=N: after batch N's checkpoint, drop the program and restore a fresh
+            // one from that checkpoint (the deploy path), then run the remaining batches on it —
+            // their drain_ms is the "first batch after restore" (docs/design-durable-state.md §1f).
+            if (store is not null && batch == restartAfter)
+            {
+                parallel?.Dispose();
+                parallel = null;
+                runner = null!;
+                foreach (var o in outputs)
+                {
+                    await o.DisposeAsync();
+                }
+
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                GC.WaitForPendingFinalizers();
+                parallel = workers > 1 ? CompileParallel() : null;
+                outputs = spec.Output_Bindings
+                    .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
+                    .ToList();
+                runner = parallel is not null
+                    ? await ProgramRunner.CreateAsync(parallel, Inputs(), outputs, store, policy)
+                    : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), outputs, store, policy);
+                var rs = Stopwatch.GetTimestamp();
+                var tick = await runner.RestoreAsync();
+                _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"RESTART after_batch={batch} tick={tick} restart_ms={Stopwatch.GetElapsedTime(rs).TotalMilliseconds:F0}"));
+                restarted = true;
+                if (DbspNet.Persistence.Snapshot.ProfileSave)
+                {
+                    var loads = DbspNet.Persistence.Snapshot.RestoreProfile.ToArray();
+                    foreach (var g in loads.GroupBy(l => l.Op).OrderByDescending(g => g.Sum(l => l.Ms)).Take(10))
+                    {
+                        _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"RESTOREOP {g.Key} n={g.Count()} sum_ms={g.Sum(l => l.Ms):F0} max_ms={g.Max(l => l.Ms):F0}"));
+                    }
+                }
+            }
+        }
+
+        if (store is not null && parallel is not null && Environment.GetEnvironmentVariable("IVM_CHECKPOINT_DELTA") == "1")
+        {
+            // Phase 2: bytes an incremental checkpoint would write between retained snapshots.
+            var deltaFs = new DbspNet.Persistence.IO.Local.LocalTableFileSystem(snapshotDir!);
+            foreach (var line in await CheckpointDeltaProbe.MeasureAsync(deltaFs, parallel))
+            {
+                _out.WriteLine(line);
+            }
         }
 
         if (store is not null)
@@ -439,6 +532,14 @@ public class IvmMultiBatch
         {
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"CKPTOP {label} {g.Key} n={g.Count()} sum_ms={g.Sum(o => o.Ms):F0} max_ms={g.Max(o => o.Ms):F0}"));
+        }
+
+        // The slowest operator positions (summed over workers): which op-{i} a file belongs to.
+        var all = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") == "all";
+        foreach (var g in ops.GroupBy(o => (o.Index, o.Op)).OrderByDescending(g => g.Sum(o => o.Ms)).Take(all ? int.MaxValue : 12))
+        {
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"CKPTIDX {label} op-{g.Key.Index} {g.Key.Op} sum_ms={g.Sum(o => o.Ms):F0}"));
         }
 
         return wall;
