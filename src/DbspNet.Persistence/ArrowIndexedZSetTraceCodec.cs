@@ -210,7 +210,7 @@ internal sealed class ArrowIndexedZSetTraceCodec
         var probe = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
         if (await Runs.RunReader.IsRunAsync(probe, cancellationToken).ConfigureAwait(false))
         {
-            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
+            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, null, cancellationToken).ConfigureAwait(false);
             return await run.ReadAllIndexedAsync(this, cancellationToken).ConfigureAwait(false);
         }
 

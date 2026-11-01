@@ -331,7 +331,7 @@ public class IvmMultiBatch
                     // the ones under runs/{current}.
                     var referenced = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "runs.txt", SearchOption.AllDirectories)
                         .SelectMany(File.ReadAllLines).Where(l => l.Length > 0)
-                        .SelectMany(l => l.Split('\t').Skip(4)).Distinct() // op-i/file, base, delta, count, runs…
+                        .SelectMany(l => l.Split('\t').Skip(5)).Distinct() // op-i/file, base, delta, count, order, runs…
                         .Sum(r => new FileInfo(Path.Combine(snapshotDir!, r)).Length);
                     var newRuns = Path.Combine(snapshotDir!, "runs", current);
                     var written = Directory.Exists(newRuns)

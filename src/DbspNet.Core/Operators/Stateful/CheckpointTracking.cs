@@ -94,6 +94,14 @@ internal interface IZSetCheckpointTracked<TKey, TWeight> : ICheckpointTracked
 
     /// <summary>The state as just written is the sum of <paramref name="chain"/>; restart the pending change.</summary>
     void StartTracking(object chain);
+
+    /// <summary>When set, runs of this state are ordered by this hash instead of the row's own
+    /// (a partitioned operator: its partition key's hash, so a partition is one block read).</summary>
+    Func<TKey, int>? OrderHash => null;
+
+    /// <summary>When set, the attached snapshot may be partial (a lazily restored operator) and
+    /// this produces the whole state, for a write that needs all of it.</summary>
+    Func<ZSet<TKey, TWeight>>? FullState => null;
 }
 
 /// <summary>A tracked indexed state; see <see cref="IZSetCheckpointTracked{TKey,TWeight}"/>.</summary>
@@ -123,6 +131,10 @@ internal sealed class ZSetChangeTracker<TKey, TWeight> : IZSetCheckpointTracked<
 
     public CheckpointTracking<ZSet<TKey, TWeight>>? Tracking => _tracking;
 
+    public Func<TKey, int>? OrderHash { get; private set; }
+
+    public Func<ZSet<TKey, TWeight>>? FullState { get; private set; }
+
     public void StartTracking(object chain)
     {
         _tracking = new CheckpointTracking<ZSet<TKey, TWeight>>(chain, ZSet<TKey, TWeight>.NewMutable());
@@ -149,20 +161,28 @@ internal sealed class ZSetChangeTracker<TKey, TWeight> : IZSetCheckpointTracked<
         }
     }
 
-    /// <summary><paramref name="snapshot"/> is the operator's state, about to be saved.</summary>
-    public void Attach(ZSet<TKey, TWeight> snapshot)
+    /// <summary><paramref name="snapshot"/> is the operator's state, about to be saved — or, with
+    /// <paramref name="fullState"/>, the part of it in memory (<paramref name="size"/> rows in all).</summary>
+    public void Attach(
+        ZSet<TKey, TWeight> snapshot, Func<TKey, int>? orderHash = null, Func<ZSet<TKey, TWeight>>? fullState = null, long? size = null)
     {
-        _attachedSize = snapshot.Count;
+        _attachedSize = (int)Math.Min(int.MaxValue, size ?? snapshot.Count);
+        OrderHash = orderHash;
+        FullState = fullState;
         CheckpointTracking.Register(snapshot, this);
     }
 
     /// <summary>The operator rebuilt its state from <paramref name="loaded"/>: keep extending the
     /// chain it was read from, if any; otherwise forget any chain.</summary>
-    public void Restored(ZSet<TKey, TWeight> loaded)
+    public void Restored(ZSet<TKey, TWeight> loaded) => Restored(loaded, loaded.Count);
+
+    /// <summary>As <see cref="Restored(ZSet{TKey,TWeight})"/>, for state restored cold
+    /// (<paramref name="loaded"/> is the cold source, <paramref name="size"/> its rows).</summary>
+    public void Restored(object loaded, long size)
     {
         if (CheckpointTracking.Restored(loaded) is { } chain)
         {
-            _attachedSize = loaded.Count;
+            _attachedSize = (int)Math.Min(int.MaxValue, size);
             StartTracking(chain);
         }
         else

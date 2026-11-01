@@ -56,7 +56,9 @@ internal static class RunFile
         Indexed = 1,
     }
 
-    /// <summary>Write <paramref name="set"/> as a run at <paramref name="path"/>.</summary>
+    /// <summary>Write <paramref name="set"/> as a run at <paramref name="path"/>, ordered by
+    /// <paramref name="hash"/>; <paramref name="fingerprint"/> (default: <paramref name="hash"/>) is the
+    /// row hash recorded to pin it — a run ordered by a partition key's hash pins the row hash it is built on.</summary>
     public static ValueTask<RunInfo> WriteZSetAsync(
         ITableFileSystem fs,
         string path,
@@ -64,10 +66,11 @@ internal static class RunFile
         IZSetRunCodec codec,
         Func<StructuralRow, int> hash,
         int blockEntries = DefaultBlockEntries,
+        Func<StructuralRow, int>? fingerprint = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fs);
-        return WriteZSetAsync(ct => fs.CreateAsync(path, overwrite: true, ct), set, codec, hash, blockEntries, cancellationToken);
+        return WriteZSetAsync(ct => fs.CreateAsync(path, overwrite: true, ct), set, codec, hash, blockEntries, fingerprint, cancellationToken);
     }
 
     /// <summary>Write <paramref name="set"/> as a run to <paramref name="fileName"/> of a snapshot.</summary>
@@ -79,7 +82,7 @@ internal static class RunFile
         Func<StructuralRow, int> hash,
         int blockEntries = DefaultBlockEntries,
         CancellationToken cancellationToken = default) =>
-        WriteZSetAsync(ct => writer.CreateAsync(fileName, ct), set, codec, hash, blockEntries, cancellationToken);
+        WriteZSetAsync(ct => writer.CreateAsync(fileName, ct), set, codec, hash, blockEntries, null, cancellationToken);
 
     private static async ValueTask<RunInfo> WriteZSetAsync(
         Func<CancellationToken, ValueTask<ISequentialFile>> create,
@@ -87,6 +90,7 @@ internal static class RunFile
         IZSetRunCodec codec,
         Func<StructuralRow, int> hash,
         int blockEntries,
+        Func<StructuralRow, int>? fingerprint,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(set);
@@ -118,7 +122,7 @@ internal static class RunFile
         var blockRows = new StructuralRow[largest];
         var blockWeights = new long[largest];
         return await WriteAsync(
-            create, Kind.ZSet, codec.RunSchema, hash(FingerprintRow), n, n, hashes, cuts,
+            create, Kind.ZSet, codec.RunSchema, (fingerprint ?? hash)(FingerprintRow), n, n, hashes, cuts,
             (from, to) =>
             {
                 var count = to - from;

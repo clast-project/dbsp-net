@@ -58,6 +58,10 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // the integral of the input, so the change since the last checkpoint is the inputs since.
     private readonly ZSetChangeTracker<TInRow, Z64> _changes = new();
 
+    // Lazy restore (docs/design-durable-state.md §1f, increment 5): partitions still cold, read the
+    // first time a delta touches them; null when everything is in memory.
+    private LazyPartitions<TKey, TInRow>? _lazy;
+
     // The widened output emitted last tick, per partition: widened row -> weight
     // (> 0). Keyed by the *widened* row (rank included) so ROW_NUMBER's one-row-per-
     // position expansion and RANK/DENSE_RANK's shared-rank groups both diff cleanly.
@@ -133,6 +137,11 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             foreach (var (row, dw) in delta)
             {
                 var key = _partitionOf(row);
+                if (_lazy is not null)
+                {
+                    Fault(key);
+                }
+
                 touched.Add(key);
                 if (!_accum.TryGetValue(key, out var bucket))
                 {
@@ -282,6 +291,66 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         return result;
     }
 
+    private ZSet<TInRow, Z64> SnapshotNow() =>
+        ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
+
+    // A partition a lazily restored operator has not touched yet: read its rows from cold and
+    // rebuild its window — what the eager load does for every partition — before the delta lands.
+    private void Fault(TKey key)
+    {
+        if (_lazy!.Take(key) is not { Count: > 0 } rows)
+        {
+            return;
+        }
+
+        var bucket = new SortedDictionary<TInRow, long>(_order);
+        foreach (var (row, weight) in rows)
+        {
+            bucket[row] = weight;
+        }
+
+        _accum[key] = bucket;
+        InitWindow(key, bucket);
+    }
+
+    // Read every partition still cold (a whole-state write, or GC).
+    private void PromoteAll()
+    {
+        if (_lazy is null)
+        {
+            return;
+        }
+
+        var filled = new HashSet<TKey>(_accum.Comparer);
+        foreach (var (key, row, weight) in _lazy.TakeAll())
+        {
+            if (!_accum.TryGetValue(key, out var bucket))
+            {
+                bucket = new SortedDictionary<TInRow, long>(_order);
+                _accum[key] = bucket;
+            }
+
+            bucket[row] = weight;
+            filled.Add(key);
+        }
+
+        _lazy = null;
+        foreach (var key in filled)
+        {
+            InitWindow(key, _accum[key]);
+        }
+    }
+
+    // Record a partition's window as already materialised downstream, emitting nothing.
+    private void InitWindow(TKey key, SortedDictionary<TInRow, long> bucket)
+    {
+        var window = ComputeWindow(bucket);
+        if (window.Count > 0)
+        {
+            _window[key] = window;
+        }
+    }
+
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
@@ -293,9 +362,15 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
         // Flatten every partition into one Z-set; the partition key is recovered
         // from each row on load, so it need not be stored separately.
-        var entries = _accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value))));
-        var snapshot = ZSet.FromEntries(entries);
-        _changes.Attach(snapshot);
+        // Saved in partition order (when the partition hash is stable), so a lazy restore reads a
+        // partition as one block. While partitions are still cold, the snapshot holds only those in
+        // memory, and FullState reads the rest for a write that needs every row.
+        var snapshot = SnapshotNow();
+        _changes.Attach(
+            snapshot,
+            LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf),
+            _lazy is null ? null : () => { PromoteAll(); return SnapshotNow(); },
+            _lazy is null ? null : snapshot.Count + _lazy.ColdCount);
         return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
     }
 
@@ -306,6 +381,19 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             throw new NotSupportedException("PartitionedRankOp was constructed without a snapshot codec.");
         }
 
+        if (_snapshotCodec is IColdRowLoader<TInRow> coldLoader
+            && LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) is not null
+            && await coldLoader.LoadColdAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false) is { } cold)
+        {
+            // Lazily restored: partitions are read as deltas touch them (Fault).
+            _accum.Clear();
+            _window.Clear();
+            _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
+            _changes.Restored(cold, cold.Count);
+            return;
+        }
+
+        _lazy = null;
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         _changes.Restored(loaded);
         _accum.Clear();

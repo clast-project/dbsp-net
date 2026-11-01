@@ -61,7 +61,7 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
         var keys = new HashSet<StructuralRow>();
         for (var r = 0; r < runs.Length; r++)
         {
-            runs[r] = await RunReader.OpenDetachedAsync(chain.Store, chain.Paths[r], hash, cancellationToken).ConfigureAwait(false);
+            runs[r] = await RunReader.OpenDetachedAsync(chain.Store, chain.Paths[r], hash, null, cancellationToken).ConfigureAwait(false);
             for (var b = 0; b < runs[r].Blocks.Count; b++)
             {
                 if (runs[r].Blocks[b] is { Groups: 1, Entries: > GiantGroupEntries })

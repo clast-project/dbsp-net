@@ -106,7 +106,7 @@ public class IncrementalCheckpointTests
             {
                 var parts = line.Split('\t');
                 lines.Add((dir + parts[0], long.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture),
-                    long.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture), parts[4..]));
+                    long.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture), parts[5..]));
             }
         }
 

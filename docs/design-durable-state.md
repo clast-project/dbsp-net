@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–3 built, 4 built for indexed traces and aggregates)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–5 built)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -878,6 +878,67 @@ views, not in reading engine state (with `DBSPNET_PROFILE` the same write took 1
 runs gave 1.63 s and 1.69 s, cleanup deferred or inline). A similar stall shows in batch 1 (one
 view's Delta write took 2.1 s once). To be run down with increment 6, which removes the full-view
 first write.
+
+### Increment 5 — lazy partitioned operators (built 2026-11-01)
+
+After increment 4 the restore profile was 30 of ~36 s of CPU in the partitioned window aggregate and
+offset operators: their load folds every saved row back into a partition-keyed `SortedDictionary`
+and recomputes every partition's window.
+
+**Saved in partition order.** Their snapshot is a flat row Z-set, so the run is now ordered by the
+**partition key's** hash instead of the row's (`ZSetChangeTracker.Attach(..., orderHash)`; only where
+that hash is stable across processes — a `StructuralRow` key's cached hash; typed keys stay eager).
+A block never splits a hash, so one partition is one block per run. The run index records the
+order (`p`/`r`); a chain is never extended across orders; the footer still pins the row hash.
+
+**Restored cold, faulted per partition.** `IColdRowLoader.LoadColdAsync` hands a partition-ordered
+chain back as `IColdRows` (`RunColdRows`, runs open detached). The operator keeps a
+`LazyPartitions`: the first time a delta touches a partition, its rows are read (one block per
+run, filtered to the key) into the bucket and its window rebuilt into a discarded sink — exactly the
+eager load for that one partition — before the delta lands. GC promotes every cold partition first
+(it scans them all); so does a write that needs the whole state.
+
+**Writing while partly cold.** A delta checkpoint needs only the pending change. A write that needs
+everything — a new chain, compaction, another store, the monolithic layout, verify — calls the
+operator's `FullState`, which promotes the rest; the partial in-memory snapshot is never written as
+the whole.
+
+Covered: `PartitionedWindowAggregateOp`, `PartitionedOffsetOp` (LAG/LEAD), `PartitionedRankOp`,
+`PartitionedTopKOp`. **Not covered:** `PartitionedTopKNarrowOp` and `PartitionedTopKCompactOp` (the
+§22 row-narrowing TOP-K and the compact one) — they also have no increment-3 change tracking, so
+they are written whole every checkpoint and restored eagerly. ivm-bench uses neither.
+
+**Tests.** `LazyPartitionTests` (3): restored LAG / RANK / framed SUM OVER operators stay lazy, read only
+touched partitions and match an uninterrupted twin through ticks, a delta checkpoint and a second
+restore; a whole-state write while partitions are cold (into another store) writes every row; LATENESS
+GC after a lazy restore collects cold partitions too (the row count a whole-state write records equals
+a never-restored twin's — skipping the promotion is invisible in outputs, so this is the check). Full
+suite passes four ways (2,907 each). Mutation-tested: a faulted partition without its window rebuilt,
+no full-state callback, GC without promotion, rows saved in row order — each fails.
+
+**Measured** — restart after batch 1 (`IVM_RESTART_AFTER=1`), SF=3, W=12, 5 alternating runs per arm
+(`ARMS="12:restart 12:runs:restart"`; raw: `docs/runs-lazy-partitions-w12-20261101.txt`). All view row
+counts after batches 2–3 and every final restore matched.
+
+| | today | runs, lazy (increments 4 + 5) |
+|---|--:|--:|
+| restore after batch 1 | 6.26 s [6.09–6.56] | **2.19 s** [1.03–2.39] |
+| restore after batch 1 + first output write | 7.33–7.85 s | **3.33–4.07 s** |
+| batch 2 drain (first after restore) | 0.08 s | 0.13 s [0.12–0.76] |
+| final restore (after batch 3) | 6.94 s [6.67–15.16] | **1.20 s** [1.10–1.37] |
+| checkpoint after batch 2 / 3 | 1.79 / 3.22 s | 0.24 / 0.27 s |
+
+The restore after batch 1 is bimodal — 1.03 and 1.12 s in two runs, 2.19–2.39 s in three — and the
+~1.2 s moves to the first output write in exactly the fast-restore runs (output 3.04 / 2.34 s with
+GC pauses of 1.1 / 0.7 s, against 1.1–1.2 s otherwise): one blocking collection landing in one phase
+or the other. Their sum is steady and less than half of today's. The restore profile of a fast run
+(`IVM_CHECKPOINT_PROFILE=1`, CPU summed over workers): `IntegrateOp` views 2.9 s, joins 1.9 s,
+DISTINCT 0.4 s; the partitioned operators went from ~30 s to 0.2 s.
+
+Against the targets: **restore under 1 s — close but not met** (1.0–1.2 s without a GC in it). What
+remains is the output views (`IntegrateOp`, eager — increment 6, which also removes the full-view
+first write) and the join traces' giant-group preload and run footers. First batch after restore within
+2× — met in 4 of 5 runs (0.12–0.30 s vs 0.08 s; one run 0.76 s).
 
 ### Targets (approved 2026-10-31)
 

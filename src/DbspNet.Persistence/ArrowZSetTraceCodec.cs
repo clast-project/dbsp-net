@@ -29,7 +29,7 @@ namespace DbspNet.Persistence;
 /// <c>__weight</c> — same convention as <c>WalRecorder</c> uses for
 /// input replay.
 /// </remarks>
-internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>, Runs.IZSetRunCodec
+internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>, Runs.IZSetRunCodec, IColdRowLoader<StructuralRow>
 {
     private readonly SqlSchema _rowSchema;
     private readonly ArrowSchema _arrowDataSchema;
@@ -64,8 +64,27 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         }
 
         var t = Runs.RunWriteProfile.Now();
-        await SaveMonolithicAsync(writer, fileName, trace, cancellationToken).ConfigureAwait(false);
+        // A partly cold partitioned operator attaches a partial snapshot: write all of it.
+        var whole = (CheckpointTracking.TraceOf(trace) as IZSetCheckpointTracked<StructuralRow, Z64>)?.FullState?.Invoke() ?? trace;
+        await SaveMonolithicAsync(writer, fileName, whole, cancellationToken).ConfigureAwait(false);
         Runs.RunWriteProfile.Add(6, t);
+    }
+
+    /// <summary>The saved rows, cold (increment 5), when <paramref name="fileName"/> is a chain the
+    /// run index records in partition order and lazy restore is on; otherwise null.</summary>
+    public async ValueTask<IColdRows<StructuralRow>?> LoadColdAsync(
+        ISnapshotReader reader, string fileName, CancellationToken cancellationToken)
+    {
+        if (!Runs.RunColdGroups.Enabled
+            || await Runs.RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is not
+                { PartitionOrder: true, Count: >= 0 } chain)
+        {
+            return null;
+        }
+
+        var cold = await Runs.RunColdRows.OpenAsync(chain, this, cancellationToken).ConfigureAwait(false);
+        CheckpointTracking.MarkRestored(cold, chain);
+        return cold;
     }
 
     // The run's order: the row's own cached hash (StructuralRowHash — deterministic across
@@ -167,7 +186,7 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         var probe = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false);
         if (await Runs.RunReader.IsRunAsync(probe, cancellationToken).ConfigureAwait(false))
         {
-            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
+            await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, null, cancellationToken).ConfigureAwait(false);
             return await run.ReadAllZSetAsync(this, cancellationToken).ConfigureAwait(false);
         }
 

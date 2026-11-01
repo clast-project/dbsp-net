@@ -59,15 +59,17 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         ArgumentNullException.ThrowIfNull(fs);
         ArgumentNullException.ThrowIfNull(hash);
         var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
-        return await OpenAsync(file, hash, path, cancellationToken).ConfigureAwait(false);
+        return await OpenAsync(file, hash, path, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Open the run at <paramref name="path"/> <b>detached</b>: read its footer and schema
     /// message, close it, and reopen it only to read a block.</summary>
     internal static async ValueTask<RunReader> OpenDetachedAsync(
-        ITableFileSystem store, string path, Func<StructuralRow, int> hash, CancellationToken cancellationToken = default)
+        ITableFileSystem store, string path, Func<StructuralRow, int> hash, Func<StructuralRow, int>? fingerprint = null,
+        CancellationToken cancellationToken = default)
     {
-        var run = await OpenAsync(store, path, hash, cancellationToken).ConfigureAwait(false);
+        var file = await store.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        var run = await OpenAsync(file, hash, path, fingerprint, cancellationToken).ConfigureAwait(false);
         await run._file!.DisposeAsync().ConfigureAwait(false);
         run._file = null;
         run._store = store;
@@ -91,7 +93,8 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
 
     /// <summary>Open a run over an already-open file, which the reader then owns.</summary>
     internal static async ValueTask<RunReader> OpenAsync(
-        IRandomAccessFile file, Func<StructuralRow, int> hash, string path, CancellationToken cancellationToken)
+        IRandomAccessFile file, Func<StructuralRow, int> hash, string path, Func<StructuralRow, int>? fingerprint,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -126,7 +129,7 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
                 footer = Parse(path, bytes.Memory.Span[..(int)footerLength]);
             }
 
-            if (footer.Fingerprint != hash(RunFile.FingerprintRow))
+            if (footer.Fingerprint != (fingerprint ?? hash)(RunFile.FingerprintRow))
             {
                 throw new InvalidDataException(
                     $"run '{path}' was ordered by a different hash function than this process has; it cannot be read in place");
@@ -241,6 +244,17 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     {
         var h = (uint)_hash(key);
         return _bloom.MightContain(h) ? FindBlock(h) : -1;
+    }
+
+    /// <summary>The block holding entries of order hash <paramref name="hash"/>, or -1 when the run certainly has none.</summary>
+    internal int BlockOfHash(int hash) => _bloom.MightContain((uint)hash) ? FindBlock((uint)hash) : -1;
+
+    /// <summary>Block <paramref name="b"/> of a Z-set run, decoded.</summary>
+    internal ValueTask<ZSet<StructuralRow, Z64>> DecodeZSetBlockAsync(
+        int b, IZSetRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.ZSet);
+        return DecodeZSetAsync(_blocks[b], codec, cancellationToken);
     }
 
     /// <summary>Block <paramref name="b"/> of an indexed run, decoded.</summary>
