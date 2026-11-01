@@ -1,0 +1,121 @@
+# ae5149c Sun Nov  1 04:49:00 PST 2026
+## run 1 arm 12:restart
+RESULT batch=1 ticks=20 drain_ms=16893 output_ms=3785 counts_ms=18 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=7917 gen2=8 checkpoint_ms=5130 snapshot_mib=4700.8 written_mib=4700.8
+RESTART after_batch=1 tick=20 restart_ms=5580
+RESULT batch=2 ticks=9 drain_ms=88 output_ms=1141 counts_ms=19 view_rows=3585588 parquet_mb=240.2 drain_alloc_gib=0.04 gc_pause_ms=522 gen2=1 checkpoint_ms=2294 snapshot_mib=4701.3 written_mib=4701.3 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=77 output_ms=23 counts_ms=0 view_rows=3585648 parquet_mb=240.3 drain_alloc_gib=0.06 gc_pause_ms=1040 gen2=1 checkpoint_ms=3299 snapshot_mib=4701.8 written_mib=4701.8 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=7000 view_rows_match=True
+## run 1 arm 12:runs:eager:restart
+RESULT batch=1 ticks=20 drain_ms=16265 output_ms=3993 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6580 gen2=6 checkpoint_ms=5532 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=6707
+RESULT batch=2 ticks=9 drain_ms=102 output_ms=1259 counts_ms=16 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.04 gc_pause_ms=0 gen2=0 checkpoint_ms=349 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=92 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.07 gc_pause_ms=121 gen2=0 checkpoint_ms=479 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=12155 view_rows_match=True
+## run 1 arm 12:runs:restart
+RESULT batch=1 ticks=20 drain_ms=16363 output_ms=3870 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6814 gen2=6 checkpoint_ms=5466 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=3635
+RESULT batch=2 ticks=9 drain_ms=119 output_ms=1644 counts_ms=16 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.41 gc_pause_ms=464 gen2=0 checkpoint_ms=325 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=650 present=432 promotions=13 promoted_groups=13 read_ms=103 promote_ms=2
+RESULT batch=3 ticks=9 drain_ms=147 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.53 gc_pause_ms=472 gen2=1 checkpoint_ms=831 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=1464 present=990 promotions=13 promoted_groups=13 read_ms=244 promote_ms=2
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=3423 view_rows_match=True
+## run 2 arm 12:restart
+RESULT batch=1 ticks=20 drain_ms=16660 output_ms=4871 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92 gc_pause_ms=7500 gen2=7 checkpoint_ms=4391 snapshot_mib=4700.8 written_mib=4700.8
+RESTART after_batch=1 tick=20 restart_ms=5476
+RESULT batch=2 ticks=9 drain_ms=89 output_ms=1143 counts_ms=15 view_rows=3585588 parquet_mb=240.2 drain_alloc_gib=0.04 gc_pause_ms=526 gen2=1 checkpoint_ms=1864 snapshot_mib=4701.3 written_mib=4701.3 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=101 output_ms=23 counts_ms=0 view_rows=3585648 parquet_mb=240.3 drain_alloc_gib=0.06 gc_pause_ms=1561 gen2=1 checkpoint_ms=3865 snapshot_mib=4701.8 written_mib=4701.8 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=7208 view_rows_match=True
+## run 2 arm 12:runs:eager:restart
+RESULT batch=1 ticks=20 drain_ms=15975 output_ms=3918 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6571 gen2=6 checkpoint_ms=5607 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=6270
+RESULT batch=2 ticks=9 drain_ms=94 output_ms=1181 counts_ms=14 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.04 gc_pause_ms=0 gen2=0 checkpoint_ms=328 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=86 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.07 gc_pause_ms=413 gen2=0 checkpoint_ms=784 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=11742 view_rows_match=True
+## run 2 arm 12:runs:restart
+RESULT batch=1 ticks=20 drain_ms=15819 output_ms=4300 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6418 gen2=6 checkpoint_ms=5477 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=3568
+RESULT batch=2 ticks=9 drain_ms=108 output_ms=3727 counts_ms=16 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.41 gc_pause_ms=256 gen2=1 checkpoint_ms=329 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=650 present=432 promotions=13 promoted_groups=13 read_ms=155 promote_ms=2
+RESULT batch=3 ticks=9 drain_ms=136 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.53 gc_pause_ms=523 gen2=0 checkpoint_ms=870 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=1464 present=990 promotions=13 promoted_groups=13 read_ms=331 promote_ms=2
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=3560 view_rows_match=True
+## run 3 arm 12:restart
+RESULT batch=1 ticks=20 drain_ms=17276 output_ms=3661 counts_ms=18 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=7716 gen2=8 checkpoint_ms=4943 snapshot_mib=4700.8 written_mib=4700.8
+RESTART after_batch=1 tick=20 restart_ms=5380
+RESULT batch=2 ticks=9 drain_ms=87 output_ms=1604 counts_ms=14 view_rows=3585588 parquet_mb=240.2 drain_alloc_gib=0.04 gc_pause_ms=935 gen2=1 checkpoint_ms=1733 snapshot_mib=4701.3 written_mib=4701.3 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=83 output_ms=22 counts_ms=0 view_rows=3585648 parquet_mb=240.3 drain_alloc_gib=0.06 gc_pause_ms=677 gen2=1 checkpoint_ms=2714 snapshot_mib=4701.8 written_mib=4701.8 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=7122 view_rows_match=True
+## run 3 arm 12:runs:eager:restart
+RESULT batch=1 ticks=20 drain_ms=16128 output_ms=3975 counts_ms=14 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6688 gen2=6 checkpoint_ms=5522 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=6560
+RESULT batch=2 ticks=9 drain_ms=87 output_ms=1252 counts_ms=16 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.04 gc_pause_ms=0 gen2=0 checkpoint_ms=335 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=88 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.07 gc_pause_ms=96 gen2=0 checkpoint_ms=470 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=11900 view_rows_match=True
+## run 3 arm 12:runs:restart
+RESULT batch=1 ticks=20 drain_ms=15642 output_ms=3909 counts_ms=19 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92 gc_pause_ms=7043 gen2=6 checkpoint_ms=5815 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=3538
+RESULT batch=2 ticks=9 drain_ms=108 output_ms=3780 counts_ms=15 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.41 gc_pause_ms=174 gen2=1 checkpoint_ms=340 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=650 present=432 promotions=13 promoted_groups=13 read_ms=115 promote_ms=2
+RESULT batch=3 ticks=9 drain_ms=129 output_ms=22 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.53 gc_pause_ms=0 gen2=0 checkpoint_ms=358 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=1464 present=990 promotions=13 promoted_groups=13 read_ms=267 promote_ms=2
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=3363 view_rows_match=True
+## run 4 arm 12:restart
+RESULT batch=1 ticks=20 drain_ms=15542 output_ms=3907 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92 gc_pause_ms=7902 gen2=8 checkpoint_ms=4963 snapshot_mib=4700.8 written_mib=4700.8
+RESTART after_batch=1 tick=20 restart_ms=5526
+RESULT batch=2 ticks=9 drain_ms=79 output_ms=1247 counts_ms=15 view_rows=3585588 parquet_mb=240.2 drain_alloc_gib=0.04 gc_pause_ms=624 gen2=1 checkpoint_ms=1839 snapshot_mib=4701.3 written_mib=4701.3 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=86 output_ms=26 counts_ms=0 view_rows=3585648 parquet_mb=240.3 drain_alloc_gib=0.06 gc_pause_ms=786 gen2=1 checkpoint_ms=2925 snapshot_mib=4701.8 written_mib=4701.8 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=7297 view_rows_match=True
+## run 4 arm 12:runs:eager:restart
+RESULT batch=1 ticks=20 drain_ms=16348 output_ms=3530 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.92 gc_pause_ms=6507 gen2=6 checkpoint_ms=5508 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=6839
+RESULT batch=2 ticks=9 drain_ms=93 output_ms=1154 counts_ms=16 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.04 gc_pause_ms=468 gen2=0 checkpoint_ms=810 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=110 output_ms=22 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.07 gc_pause_ms=0 gen2=0 checkpoint_ms=354 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=11561 view_rows_match=True
+## run 4 arm 12:runs:restart
+RESULT batch=1 ticks=20 drain_ms=15397 output_ms=2266 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6366 gen2=5 checkpoint_ms=5104 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=3703
+RESULT batch=2 ticks=9 drain_ms=115 output_ms=1576 counts_ms=15 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.41 gc_pause_ms=437 gen2=0 checkpoint_ms=315 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=650 present=432 promotions=13 promoted_groups=13 read_ms=98 promote_ms=2
+RESULT batch=3 ticks=9 drain_ms=125 output_ms=19 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.53 gc_pause_ms=0 gen2=0 checkpoint_ms=354 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=1464 present=990 promotions=13 promoted_groups=13 read_ms=240 promote_ms=2
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=3372 view_rows_match=True
+## run 5 arm 12:restart
+RESULT batch=1 ticks=20 drain_ms=17387 output_ms=3668 counts_ms=16 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=7789 gen2=8 checkpoint_ms=4730 snapshot_mib=4700.8 written_mib=4700.8
+RESTART after_batch=1 tick=20 restart_ms=5227
+RESULT batch=2 ticks=9 drain_ms=89 output_ms=1309 counts_ms=14 view_rows=3585588 parquet_mb=240.2 drain_alloc_gib=0.04 gc_pause_ms=745 gen2=1 checkpoint_ms=1737 snapshot_mib=4701.3 written_mib=4701.3 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=70 output_ms=26 counts_ms=0 view_rows=3585648 parquet_mb=240.3 drain_alloc_gib=0.06 gc_pause_ms=1223 gen2=1 checkpoint_ms=2994 snapshot_mib=4701.8 written_mib=4701.8 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=6672 view_rows_match=True
+## run 5 arm 12:runs:eager:restart
+RESULT batch=1 ticks=20 drain_ms=15816 output_ms=4015 counts_ms=15 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6996 gen2=6 checkpoint_ms=5547 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=6854
+RESULT batch=2 ticks=9 drain_ms=104 output_ms=1148 counts_ms=15 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.04 gc_pause_ms=0 gen2=0 checkpoint_ms=327 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESULT batch=3 ticks=9 drain_ms=114 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.07 gc_pause_ms=378 gen2=0 checkpoint_ms=749 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=0 present=0 promotions=0 promoted_groups=0 read_ms=0 promote_ms=0
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=11069 view_rows_match=True
+## run 5 arm 12:runs:restart
+RESULT batch=1 ticks=20 drain_ms=17506 output_ms=3771 counts_ms=18 view_rows=3585561 parquet_mb=120.1 drain_alloc_gib=42.93 gc_pause_ms=6699 gen2=6 checkpoint_ms=5683 snapshot_mib=4748.6 written_mib=4748.6
+RESTART after_batch=1 tick=20 restart_ms=3654
+RESULT batch=2 ticks=9 drain_ms=103 output_ms=3874 counts_ms=16 view_rows=3585588 parquet_mb=295.5 drain_alloc_gib=0.41 gc_pause_ms=186 gen2=1 checkpoint_ms=317 snapshot_mib=4751.2 written_mib=51.2 resumed=1
+COLD after_batch=2 resolves=650 present=432 promotions=13 promoted_groups=13 read_ms=144 promote_ms=2
+RESULT batch=3 ticks=9 drain_ms=122 output_ms=18 counts_ms=0 view_rows=3585648 parquet_mb=295.6 drain_alloc_gib=0.53 gc_pause_ms=0 gen2=0 checkpoint_ms=357 snapshot_mib=4752.4 written_mib=50.9 resumed=1
+COLD after_batch=3 resolves=1464 present=990 promotions=13 promoted_groups=13 read_ms=304 promote_ms=2
+RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=3434 view_rows_match=True

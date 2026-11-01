@@ -46,6 +46,13 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     private readonly IndexedZSetTrace<TKey, TValue, Z64> _trace = new();
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
+
+    // Lazy restore (docs/design-durable-state.md §1f, increment 4): when the trace comes back cold,
+    // the per-group caches are rebuilt one key at a time, the first time a delta touches it, instead
+    // of from a scan of the whole trace at load. _cachesBuilt holds the keys already rebuilt (null:
+    // eager); _pendingBlobs the persisted states not yet applied, keyed by group.
+    private HashSet<TKey>? _cachesBuilt;
+    private Dictionary<TKey, byte[]>? _pendingBlobs;
     private readonly IIndexedZSetTraceCodec<TKey, TValue, Z64>? _snapshotCodec;
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
@@ -102,13 +109,22 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             return;
         }
 
-        var entries = new List<(TKey Key, byte[] Blob)>(_stateCache.Count);
+        var entries = new List<(TKey Key, byte[] Blob)>(_stateCache.Count + (_pendingBlobs?.Count ?? 0));
         var scratch = new System.Buffers.ArrayBufferWriter<byte>();
         foreach (var (key, state) in _stateCache)
         {
             scratch.Clear();
             _aggregator.WriteState(scratch, state);
             entries.Add((key, scratch.WrittenSpan.ToArray()));
+        }
+
+        // Groups a lazily restored operator has not touched keep the state they were restored with.
+        if (_pendingBlobs is not null)
+        {
+            foreach (var (key, blob) in _pendingBlobs)
+            {
+                entries.Add((key, blob));
+            }
         }
 
         await _snapshotCodec.SaveKeyedBlobsAsync(writer, "aggstate.arrows", entries, cancellationToken)
@@ -127,6 +143,30 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         var tIntegrate = System.Diagnostics.Stopwatch.GetTimestamp();
         _trace.Integrate(loaded);
         var tRebuild = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        if (_trace.Current.IsCold)
+        {
+            // Lazily restored: rebuild per group on first touch (EnsureCaches), keeping the
+            // persisted states until then.
+            _aggCache.Clear();
+            _stateCache.Clear();
+            _cachesBuilt = new HashSet<TKey>();
+            _pendingBlobs = null;
+            if (_aggregator.CanPersistState && _snapshotCodec.SupportsKeyedBlobs)
+            {
+                _pendingBlobs = new Dictionary<TKey, byte[]>();
+                foreach (var (key, blob) in await _snapshotCodec
+                    .LoadKeyedBlobsAsync(reader, "aggstate.arrows", cancellationToken).ConfigureAwait(false))
+                {
+                    _pendingBlobs[key] = blob;
+                }
+            }
+
+            return;
+        }
+
+        _cachesBuilt = null;
+        _pendingBlobs = null;
 
         // Rebuild the per-group caches from the restored trace. Each
         // aggregator's Update is already the function that maps a
@@ -229,6 +269,10 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         {
             var groupDelta = delta.GroupFor(key);
             var beforeGroup = before.GroupFor(key);
+            if (_cachesBuilt is not null)
+            {
+                EnsureCaches(key, beforeGroup);
+            }
 
             // The post-delta group. By default a lazy view over (beforeGroup,
             // groupDelta) that the incremental aggregators probe per delta row —
@@ -320,6 +364,36 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     }
 
     /// <summary>
+    /// After a lazy restore: rebuild <paramref name="key"/>'s caches from its group the first time it
+    /// is touched — exactly the eager load's fold for that one group, then its persisted state.
+    /// </summary>
+    private void EnsureCaches(TKey key, ZSet<TValue, Z64> group)
+    {
+        if (!_cachesBuilt!.Add(key))
+        {
+            return;
+        }
+
+        byte[]? blob = null;
+        _pendingBlobs?.Remove(key, out blob);
+        if (group.IsEmpty)
+        {
+            return;   // a group the trace does not hold: no cache, and its state (if any) is moot
+        }
+
+        object? state = null;
+        var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
+        if (blob is not null)
+        {
+            _aggregator.MergePersistedState(ref state, blob);
+            agg = _aggregator.Update(ref state, Optional<TOut>.None, ZSet<TValue, Z64>.Empty, group);
+        }
+
+        _aggCache[key] = agg;
+        _stateCache[key] = state;
+    }
+
+    /// <summary>
     /// Frontier-driven GC: once the advertised frontier advances, drop every
     /// group whose key is strictly below it — those groups can never be touched
     /// by future input, so their already-emitted aggregate stays in the
@@ -345,6 +419,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         {
             _aggCache.Remove(key);
             _stateCache.Remove(key);
+            _pendingBlobs?.Remove(key);
             _gcDropped++;
         }
     }

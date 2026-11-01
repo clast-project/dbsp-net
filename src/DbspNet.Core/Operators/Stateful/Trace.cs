@@ -162,7 +162,13 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight> : IIndexedCheckpoi
 
         if (CheckpointTracking.Restored(delta) is { } chain && Current.IsEmpty)
         {
-            Current.MergeInPlace(delta);
+            // Restored state: take over its cold source if it was loaded lazily (increment 4)
+            // rather than reading it all, and keep extending the chain it came from.
+            if (!Current.TryAdoptColdFrom(delta))
+            {
+                Current.MergeInPlace(delta);
+            }
+
             StartTracking(chain);
             return;
         }

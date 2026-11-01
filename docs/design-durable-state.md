@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–3 built)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–3 built, 4 built for indexed traces and aggregates)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -798,6 +798,86 @@ for batch 2's deferred cleanup (the batch between them drains in 0.1 s), so it i
 the deferral. For today's layout deferral is within noise — it deletes a few large files, not
 thousands of small ones. Still open against the targets: restore (6.6 s, eager — increment 4) and
 the base checkpoint (+0.6 s over today).
+
+### Increment 4 — lazy restore for indexed traces and aggregates (built 2026-11-01)
+
+**Where restore's bytes are** (SF=3, W=12, 4,751 MiB): join traces 57%, aggregate traces 14%,
+output views (`IntegrateOp`) 12%, partitioned window/offset/rank 16% (increment 5), DISTINCT 3%,
+aggregate-state blobs 1%. Indexed traces — joins and aggregates — are ~70%, so they go first.
+
+**Cold backing in `IndexedZSet`.** A restored indexed trace starts with an empty map and a cold
+source (`IColdGroups`: exact group count, read one key, read all). A key is read the first time it
+is asked for — `GroupFor`, `ContainsKey`, or `MergeInPlace` touching it — and then lives in the map;
+a *resolved* set remembers every key read, so a key absent from cold, or emptied since, is never
+read twice. `GroupCount` stays exact without reading: the source's persisted count, minus resolved
+keys it held, plus the map. Anything that needs every group (enumeration, `Keys`, equality,
+`Flatten`, GC's `RemoveKeysBelow`) **promotes** the rest first, so every caller stays correct and
+only loses laziness. The cold state lives in a side table (`ConditionalWeakTable`), not a field —
+an indexed Z-set is no bigger, and until a lazy restore has happened in the process a map miss
+costs one static read. The codec returns a cold-backed collection; the trace that integrates it
+into empty state **adopts** the source (and any groups already read) instead of merging it.
+
+**The run side.** Each run-index line now records the state's exact size at the checkpoint (group
+count, or row count). `RunColdGroups` opens a chain's runs *detached* — footer, block index, Bloom
+filter and schema message in memory, the file opened only to read a block — so thousands of runs
+hold no file handles. A key's group is the sum over the runs whose Bloom filter and index admit it.
+`DBSPNET_RESTORE=eager` reads chains whole at restore instead.
+
+**Joins are lazy as they stand.** `JoinInto` iterates the side with fewer groups and probes the
+other, so with an exact count a restored trace (large) is probed per delta key. Left joins probe
+only touched keys.
+
+**Aggregates rebuild per group.** The eager load folds the whole trace to rebuild the per-group
+caches, then overlays the persisted states — a full scan. Lazily restored, it skips both, holds the
+persisted states (`aggstate`, 48 MiB) in a dictionary, and rebuilds a group's caches the first time a
+delta touches it: exactly the eager fold for that one group, then its persisted state. A checkpoint
+writes untouched groups' states back as they were.
+
+**Giant groups are read at restore.** The first measurement had the first resumed batch at 3.6 s
+(vs 0.1 s): 592 key reads decoded 2.16 M entries. A block never splits a group, so a group larger
+than a block fills a block, and reading its key decodes all of it. On SF=3, 14 such blocks hold 8.4%
+of the state — the low-cardinality join keys every batch touches. The writer now starts a new block
+before any group that fills one by itself (so a giant group always has a block to itself), and the
+restore resolves every key whose block is one group of more than 4,096 entries. Adoption carries
+those already-read groups over (it first refused a source with any read groups, and the trace was
+promoted whole — caught by `AGiantGroup_IsReadAtRestore_TheRestOnDemand`).
+
+**Tests.** `LazyRestoreTests` (9): a cold-backed `IndexedZSet` against an eager oracle under random
+interleavings of probes, merges, counts, enumeration and GC drops (5 seeds × 40 trials); a probe
+reads a key once; a restored join stays cold, reads only touched keys, matches its twin through
+ticks, checkpoint and a second restore; a restored aggregate rebuilds only touched groups and keeps
+untouched groups' persisted states across a checkpoint (the `FloatAggregateRestoreTests` 1e16
+construction, where a re-fold disagrees with the live sum); a giant group is read at restore. Full
+suite passes four ways (runs off; runs on; runs on + verify; runs on + eager restore: 2,904 each).
+Mutation-tested: `GroupCount` ignoring cold, `MergeInPlace` not resolving, no adoption, untouched
+blobs not saved, blob not applied on touch — each fails.
+
+**Measured** — `IVM_RESTART_AFTER=1`: after batch 1's checkpoint the program is dropped and a fresh
+one restored, then batches 2–3 run on it (SF=3, W=12, 5 alternating runs per arm;
+`ARMS="12:restart 12:runs:eager:restart 12:runs:restart"`; raw: `docs/runs-lazy-restore-w12-20261101.txt`).
+Median [min–max]; every arm's view row counts after batches 2 and 3 matched the uninterrupted run,
+and every final restore matched:
+
+| | today | runs, eager restore | runs, **lazy** restore |
+|---|--:|--:|--:|
+| restore after batch 1 | 5.48 s [5.23–5.58] | 6.71 s [6.27–6.85] | **3.63 s** [3.54–3.70] |
+| batch 2 drain (first after restore) | 0.09 s | 0.09 s | **0.11 s** [0.10–0.12] |
+| batch 3 drain | 0.08 s | 0.09 s | 0.13 s [0.12–0.15] |
+| batch 2 output write | 1.25 s [1.14–1.60] | 1.18 s [1.15–1.26] | 3.73 s [1.58–3.87] |
+| final restore (after batch 3) | 7.12 s | 11.74 s | **3.42 s** |
+
+Against the targets: **first batch after restore within 2× — met** (0.11 vs 0.09 s drain).
+**Restore under 1 s — not yet**: 3.6 s, and the restore profile (`IVM_CHECKPOINT_PROFILE=1`, CPU
+summed over workers) says why — partitioned window aggregate 19.8 s and offset 10.8 s of ~36 s are
+still eager (**increment 5**), joins 3.0 s (the giant-group preload and ~3,000 run footers),
+`IntegrateOp` views 1.7 s (increment 6), DISTINCT 0.5 s; aggregates are down to 0.1 s.
+
+**Open — the first output write after a lazy restore is bimodal**: ~1.6 s in two runs, ~3.8 s in
+three, against 1.2 s eager; the drain is unaffected and the time is in the Delta write of the full
+views, not in reading engine state (with `DBSPNET_PROFILE` the same write took 1.16 s; two further
+runs gave 1.63 s and 1.69 s, cleanup deferred or inline). A similar stall shows in batch 1 (one
+view's Delta write took 2.1 s once). To be run down with increment 6, which removes the full-view
+first write.
 
 ### Targets (approved 2026-10-31)
 

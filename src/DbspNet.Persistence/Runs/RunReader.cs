@@ -18,7 +18,11 @@ namespace DbspNet.Persistence.Runs;
 /// </summary>
 internal sealed class RunReader : IAsyncDisposable, IDisposable
 {
-    private readonly IRandomAccessFile _file;
+    // Null when detached: the footer and schema stay in memory and the file is opened per block
+    // read, so a lazily restored state can hold thousands of runs without as many open handles.
+    private IRandomAccessFile? _file;
+    private ITableFileSystem? _store;
+    private string? _path;
     private readonly Func<StructuralRow, int> _hash;
     private readonly RunBlock[] _blocks;
     private readonly RunBloom _bloom;
@@ -56,6 +60,19 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         ArgumentNullException.ThrowIfNull(hash);
         var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
         return await OpenAsync(file, hash, path, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Open the run at <paramref name="path"/> <b>detached</b>: read its footer and schema
+    /// message, close it, and reopen it only to read a block.</summary>
+    internal static async ValueTask<RunReader> OpenDetachedAsync(
+        ITableFileSystem store, string path, Func<StructuralRow, int> hash, CancellationToken cancellationToken = default)
+    {
+        var run = await OpenAsync(store, path, hash, cancellationToken).ConfigureAwait(false);
+        await run._file!.DisposeAsync().ConfigureAwait(false);
+        run._file = null;
+        run._store = store;
+        run._path = path;
+        return run;
     }
 
     /// <summary>True if <paramref name="file"/> ends in a run trailer.</summary>
@@ -219,6 +236,21 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return block.WeightOf(key);
     }
 
+    /// <summary>The block that may hold <paramref name="key"/>, or -1 when the run certainly does not.</summary>
+    internal int BlockOf(StructuralRow key)
+    {
+        var h = (uint)_hash(key);
+        return _bloom.MightContain(h) ? FindBlock(h) : -1;
+    }
+
+    /// <summary>Block <paramref name="b"/> of an indexed run, decoded.</summary>
+    internal ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> DecodeIndexedBlockAsync(
+        int b, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.Indexed);
+        return DecodeIndexedAsync(_blocks[b], codec, cancellationToken);
+    }
+
     /// <summary>The values of <paramref name="key"/> in an indexed run (empty if absent).</summary>
     public async ValueTask<ZSet<StructuralRow, Z64>> GroupForAsync(
         StructuralRow key, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
@@ -298,9 +330,9 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         }
     }
 
-    public void Dispose() => _file.Dispose();
+    public void Dispose() => _file?.Dispose();
 
-    public ValueTask DisposeAsync() => _file.DisposeAsync();
+    public ValueTask DisposeAsync() => _file?.DisposeAsync() ?? ValueTask.CompletedTask;
 
     private void Require(RunFile.Kind kind)
     {
@@ -341,9 +373,18 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     {
         var buffer = new byte[_schemaMessage.Length + block.Length];
         _schemaMessage.CopyTo(buffer, 0);
-        using (var bytes = await _file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false))
+        var file = _file ?? await _store!.OpenReadAsync(_path!, cancellationToken).ConfigureAwait(false);
+        try
         {
+            using var bytes = await file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false);
             bytes.Memory.Span[..block.Length].CopyTo(buffer.AsSpan(_schemaMessage.Length));
+        }
+        finally
+        {
+            if (_file is null)
+            {
+                await file.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         var reader = new ArrowStreamReader(new MemoryStream(buffer, writable: false), leaveOpen: false);

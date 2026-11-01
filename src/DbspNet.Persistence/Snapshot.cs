@@ -385,6 +385,11 @@ public static class Snapshot
     internal static readonly System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
         SaveProfile = new();
 
+    /// <summary>With <see cref="ProfileSave"/> set, each concurrent restore enqueues (directory,
+    /// operator index, operator type, ms) here too.</summary>
+    internal static System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
+        RestoreProfile { get; } = new();
+
     /// <summary>
     /// Degree of concurrency <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
     /// uses when no explicit degree is passed. Restore is a per-operator walk with no data
@@ -570,7 +575,13 @@ public static class Snapshot
                 var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
                 if (profile is null)
                 {
+                    var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
+                    if (ProfileSave)
+                    {
+                        RestoreProfile.Enqueue((dir, i, circuit.Operators[i].GetType().Name,
+                            System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+                    }
                 }
                 else
                 {
@@ -624,7 +635,13 @@ public static class Snapshot
                 {
                     var s = Snapshottable(circuit, i);
                     var ctx = new TableFileSystemSnapshotContext(fs, current + "/op-" + i);
+                    var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     await s.LoadAsync(ctx, ct).ConfigureAwait(false);
+                    if (ProfileSave)
+                    {
+                        RestoreProfile.Enqueue((current, i, circuit.Operators[i].GetType().Name,
+                            System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+                    }
                 }).ConfigureAwait(false);
         }
         catch (AggregateException ex) when (ex.InnerExceptions.Count > 0)

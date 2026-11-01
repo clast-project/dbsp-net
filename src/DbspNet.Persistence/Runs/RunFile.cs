@@ -234,7 +234,9 @@ internal static class RunFile
     }
 
     // Block boundaries [from, to) over sorted hashes: close a block once it holds blockEntries
-    // entries, but only where the hash changes. largest = the most entries any block holds.
+    // entries, but only where the hash changes — and also before a group that fills a block on its
+    // own, so a giant group always has a block to itself (the lazy restore reads those at restore,
+    // by the block index: one group, many entries). largest = the most entries any block holds.
     private static List<(int From, int To)> Cut(uint[] sorted, Func<int, int> sizeOf, int blockEntries, out int largest)
     {
         var blocks = new List<(int, int)>();
@@ -243,7 +245,8 @@ internal static class RunFile
         largest = 0;
         for (var i = 0; i < sorted.Length; i++)
         {
-            if (size >= blockEntries && sorted[i] != sorted[i - 1])
+            var next = sizeOf(i);
+            if (size > 0 && (size >= blockEntries || next >= blockEntries) && sorted[i] != sorted[i - 1])
             {
                 blocks.Add((start, i));
                 largest = Math.Max(largest, size);
@@ -251,7 +254,7 @@ internal static class RunFile
                 size = 0;
             }
 
-            size += sizeOf(i);
+            size += next;
         }
 
         if (start < sorted.Length)

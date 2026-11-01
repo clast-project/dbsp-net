@@ -15,7 +15,10 @@
 # and/or ":spine" (IVM_TRACE_FAMILY=spine: spine traces instead of flat)
 # and/or ":runs" (DBSPNET_STATE_LAYOUT=runs: snapshot files in run format, incremental)
 # and/or ":inline" (DBSPNET_CHECKPOINT_CLEANUP=inline: prune + sweep before the checkpoint returns,
-# as before 2026-11-01; otherwise they run in the background after the commit).
+# as before 2026-11-01; otherwise they run in the background after the commit)
+# and/or ":restart" (IVM_RESTART_AFTER=1: restore a fresh program from batch 1's checkpoint and run
+# batches 2-3 on it; RESTART line, later RESULTs resumed=1)
+# and/or ":eager" (DBSPNET_RESTORE=eager: read run chains whole at restore instead of lazily).
 # Needs the SF=3 data under ~/src/ivm-bench/mount/raw/3/delta, including staging-multi/
 # (see the ivm-bench-local-datagen notes), and ~10 GiB free for the snapshots.
 set -euo pipefail
@@ -62,6 +65,10 @@ for run in $(seq 1 "$RUNS"); do
     [[ "$arm" == *:runs* ]] && layout=runs
     cleanup=""
     [[ "$arm" == *:inline* ]] && cleanup=inline
+    restart=""
+    [[ "$arm" == *:restart* ]] && restart=1
+    restore=""
+    [[ "$arm" == *:eager* ]] && restore=eager
     echo "## run $run arm $arm" | tee -a "$RESULTS"
     DOTNET_gcServer=1 \
     DBSPNET_SNAPSHOT_FSYNC="$fsync" \
@@ -71,6 +78,8 @@ for run in $(seq 1 "$RUNS"); do
     IVM_TRACE_FAMILY="$family" \
     DBSPNET_STATE_LAYOUT="$layout" \
     DBSPNET_CHECKPOINT_CLEANUP="$cleanup" \
+    IVM_RESTART_AFTER="$restart" \
+    DBSPNET_RESTORE="$restore" \
     IVM_DATA_ROOT="$DATA" \
     IVM_SPEC="$SPEC" \
     IVM_STAGING_ROOT="$DATA/staging-multi" \
@@ -81,7 +90,7 @@ for run in $(seq 1 "$RUNS"); do
       "$DOTNET" test "$REPO/tests/DbspNet.Tests" -c Release --no-build \
         --filter 'FullyQualifiedName~IvmMultiBatch.RunThreeBatches_Local' \
         --logger 'console;verbosity=detailed' 2>&1 \
-      | grep -E '^\s*(RESULT|RESTORE)|Failed|error' | sed 's/^ *//' | tee -a "$RESULTS"
+      | grep -E '^\s*(RESULT|RESTORE|RESTART|COLD)|Failed|error' | sed 's/^ *//' | tee -a "$RESULTS"
   done
 done
 

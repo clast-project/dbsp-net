@@ -46,6 +46,7 @@ internal static class RunCheckpoint
             chain = RunChain.Base(ctx.FileSystem, await WriteAsync(state), state.Count);
         }
 
+        chain = chain.WithCount(state.Count);
         session.Record(ctx.Prefix + fileName, chain);
         if (trace is not null)
         {
@@ -91,6 +92,7 @@ internal static class RunCheckpoint
             chain = RunChain.Base(ctx.FileSystem, await WriteAsync(state), Entries(state));
         }
 
+        chain = chain.WithCount(state.GroupCount);
         session.Record(ctx.Prefix + fileName, chain);
         if (trace is not null)
         {
@@ -143,7 +145,12 @@ internal static class RunCheckpoint
     internal static async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadIndexedAsync(
         RunChain chain, IIndexedRunCodec codec, Func<StructuralRow, int> hash, CancellationToken cancellationToken)
     {
-        var result = await ReadIndexedAsync(chain, codec, hash, cancellationToken).ConfigureAwait(false);
+        // Lazy (increment 4): open the runs' footers only; groups are read as keys are asked for.
+        // The trace that integrates this adopts the cold source instead of reading it.
+        var result = RunColdGroups.Enabled && chain.Count >= 0
+            ? IndexedZSet<StructuralRow, StructuralRow, Z64>.ColdBacked(
+                await RunColdGroups.OpenAsync(chain, codec, hash, cancellationToken).ConfigureAwait(false))
+            : await ReadIndexedAsync(chain, codec, hash, cancellationToken).ConfigureAwait(false);
         CheckpointTracking.MarkRestored(result, chain);
         return result;
     }
