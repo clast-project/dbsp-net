@@ -1157,6 +1157,60 @@ What remains is the workload's own growth (each tick's join delta grows), not me
 passes three ways (runs off, runs on, runs on + verify — so every adopted merge, raw-copied blocks
 included, was read back against the live state).
 
+### Restore target, measured as a real restart (2026-11-01)
+
+**The in-process restart had flattered the lazy path.** `IVM_RESTART_AFTER` restores into the same
+process that just ran batch 1: every code path already JIT-compiled, and the old program's garbage
+still on the heap (11 GiB at restore start; the end-of-restore collection was partly clearing *that*).
+ivm-bench now has a real restart: `IVM_STOP_AFTER=1` runs batch 1 and its checkpoint and stops,
+keeping snapshot and outputs; `IVM_RESUME=1` in a **new process** compiles, restores (timed:
+`RESUME` line with JIT time, allocation, GC) and runs batches 2–3. Measured that way, the lazy restore
+was 1.5 s, not 0.76 s, allocating 4.86 GiB: 4.44 GiB of it in the join operators (per-operator
+allocation in the restore profile), and 0.8 s of JIT (`System.Runtime.JitInfo`).
+
+**What changed.**
+- *Giant single-group blocks decode in the background*, started by the restore, instead of being
+  resolved by it (they were the 4.4 GiB). A read of a giant key waits for its block if it is still
+  decoding (`GiantWaits` counts it). The decode is a dedicated single-group path: the key read once,
+  the values materialized in parallel over row ranges, the group's map sized up front.
+- *A cold partition reads by hash range*: `RunColdRows.ReadByHash` now binary-searches the block's
+  `__hash` column and decodes only that partition's rows, not the block (increment 6 had wired the
+  hash-range probe into key and row reads only).
+- *A faulted window-aggregate partition no longer rebuilds its whole window.* The first-batch profile
+  showed the window aggregates at 2,270 ms cumulative (vs 39 ms today): rebuilding a long-frame
+  partition whole is O(rows × frame). Now a faulted partition's window is rebuilt only over the delta
+  ranges steps reach (`EnsureWindow`, a hull per partition), from the partition as it stands before the
+  delta. Covered by added running/descending/bounded window views in `LazyPartitionTests`
+  (mutation-tested: skipping the rebuild fails three tests).
+
+**Measured** — fresh-process restart after batch 1, SF=3, W=12, 5 alternating runs per arm (raw:
+`docs/fresh-restart-w12-20261101.txt`; all view row counts and final restores matched):
+
+| | today | runs, lazy |
+|---|--:|--:|
+| restore | 6.53 s [5.95–6.57] | **0.30 s** [0.28–0.33] |
+| batch 2 drain (first after restore) | 0.17 s | 0.98 s [0.83–1.07] |
+| batch 2 output write | 4.66 s [2.00–4.80] | 3.58 s [3.46–3.77] |
+| batch 3 drain | 0.13 s | 0.35 s [0.32–0.36] |
+| restore + first batch + first write | 10.83 s [8.46–11.54] | **4.96 s** [4.59–5.04] |
+
+**Against the targets:** restore under 1 s — **met** (0.30 s, in a real restart). First batch within 2×
+— **not met** (0.98 vs 0.17 s; batch 3 0.35 vs 0.13 s). Restart to first output is still 2.2× faster
+than today. Where the first batch goes (profile of a fresh run): the window aggregates still ~0.66 s
+cumulative (one `daily_market` operator ~0.44 s on the critical worker — rebuilding old outputs over
+the touched range, then recomputing), inner joins ~0.33 s and views/DISTINCT ~0.2 s of cold reads,
+and one 0.3 s wait on a giant group in some runs.
+
+**Levers left, for a decision:**
+1. *Persist the window aggregate's emitted outputs* with its rows, so a faulted partition reads its
+   old outputs instead of recomputing them (the biggest single item; a format and checkpoint-size
+   cost).
+2. *Cheaper cold reads*: every probe reopens a detached run file and re-parses a block's IPC message;
+   a small per-run cache of open files and recently read blocks would cut the per-batch overhead
+   (batch 3's 0.2 s).
+3. *JIT*: ReadyToRun-compiling the engine assemblies is a deployment choice that would take most of
+   the fresh-process JIT out of restore and the first batch.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
