@@ -1211,6 +1211,38 @@ and one 0.3 s wait on a giant group in some runs.
 3. *JIT*: ReadyToRun-compiling the engine assemblies is a deployment choice that would take most of
    the fresh-process JIT out of restore and the first batch.
 
+### The worker-0 tail after restore (2026-11-01, branch arc/cold-tail)
+
+The first batch's critical worker was worker 0, running the gathered tails of `daily_market_pulse`
+and `market_volatility`. Both are inherently global — `RANK() OVER (ORDER BY …)` and
+`LAG … OVER (ORDER BY …)` with no PARTITION BY, over a CROSS JOIN with a one-row global aggregate —
+so they cannot be spread by partition. They are also tiny (733 and 605 rows of view). Their cost was
+**cold probes**: a change to the global totals changes every scored row, so each view's delta
+retracts and re-inserts all of it, and a lazily restored view read each row with its own probe
+(~0.13 ms: open the run, find and decode the block's hash range) — 2,734 one-row reads in batch 2,
+73 + 48 ms on worker 0 for the two integrated views alone.
+
+**Change:** a lazily restored Z-set trace (views, DISTINCT) whose delta reaches at least 1/64 of the
+rows still cold reads the rest in one pass instead (`ColdPromotion`, `DBSPNET_COLD_PROMOTE_RATIO`,
+0 = always probe; overridable per async context for tests). Batch-2 cold row reads 2,734 → 59; the two
+views ~120 → ~7 ms; worker 0 busy 336 → 234 ms, no longer the slowest worker (workers 8/9 at
+~260 ms). Tests: `LazyViewTests.ADeltaReachingMostOfAColdView_ReadsTheRestInOnePass` (fails with the
+ratio at 0); the swept-runs test pins probing so it still exercises never-read rows.
+
+**Measured** — fresh-process restart after batch 1, SF=3, W=12, 5 alternating runs per arm, one
+binary (raw: `docs/fresh-restart-cold-promote-w12-20261101.txt`; all view row counts matched):
+
+| | probe (ratio 0) | promote (ratio 64) |
+|---|--:|--:|
+| restore | 0.31 s | 0.30 s |
+| batch 2 drain | 0.93 s [0.86–1.24] | **0.81 s** [0.76–0.91] |
+| batch 3 drain | 0.35 s [0.32–0.47] | 0.33 s [0.30–0.34] |
+
+First batch is still ~4× the no-restart batch (0.19 s). What remains is spread across workers rather
+than on one: per-worker busy ≤ 263 ms, the rest barrier waits; the global ranks (~65 ms on worker 0)
+are the only single-worker work left and would need a parallel global rank to spread; plus fresh-process
+JIT and ~0.4 s of GC pauses over the batch (drain + output).
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

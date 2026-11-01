@@ -112,6 +112,7 @@ public class LazyViewTests
     public async Task ALazyState_RewrittenWholeAndSwept_StillReadsItsRuns()
     {
         using var layout = StateLayout.Use(true);
+        using var probe = DbspNet.Core.Operators.Stateful.ColdPromotion.Use(0); // keep reading row by row: the point is the never-read rows
         var fs = new InMemoryTableFileSystem();
         var producer = Compile();
         var twin = Compile();
@@ -134,5 +135,52 @@ public class LazyViewTests
         Touch(restored, 2, 7000, Keys);
         Touch(twin, 2, 7000, Keys);
         Assert.Equal(Digest(twin), Digest(restored));
+    }
+
+    [Fact]
+    public async Task ADeltaReachingMostOfAColdView_ReadsTheRestInOnePass()
+    {
+        // A small view whose every row a global value changes (here: each row carries the table's
+        // total) retracts and re-inserts all of it each tick. Probing row by row costs ~0.1 ms a row;
+        // the trace reads the rest of the cold rows in one pass instead. A small change still probes.
+        using var layout = StateLayout.Use(true);
+        string[] sql =
+        [
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
+            "CREATE VIEW g AS SELECT x.a, x.b, s.total FROM t x CROSS JOIN (SELECT SUM(b) AS total FROM t) s",
+            "CREATE VIEW j AS SELECT a, b FROM t WHERE b >= 0",
+        ];
+        HashSet<string> views = new(["g", "j"], StringComparer.Ordinal);
+        CompiledProgram Make() => SqlProgram.Compile(sql, views, ArrowSqlSnapshotCodecs.Instance);
+        var fs = new InMemoryTableFileSystem();
+        var producer = Make();
+        var twin = Make();
+        foreach (var p in new[] { producer, twin })
+        {
+            for (var a = 0; a < 2000; a++)
+            {
+                p.Table("t").Insert(a, a % 50);
+            }
+
+            p.Step();
+        }
+
+        await Snapshot.WriteAsync(producer.Circuit, fs);
+        var restored = Make();
+        await Snapshot.ReadAsync(restored.Circuit, fs);
+        foreach (var p in new[] { restored, twin })
+        {
+            p.Table("t").Insert(5000, 7); // changes total, so every row of g
+            p.Step();
+        }
+
+        var ops = ViewOps(restored);
+        var cold = ops.ToDictionary(op => op, IsCold);
+        Assert.Equal(1, cold.Count(c => !c.Value)); // g promoted
+        Assert.Equal(1, cold.Count(c => c.Value));  // j: one new row probes, stays cold
+        foreach (var v in views)
+        {
+            Assert.Equal(Show(twin.Outputs[v].CurrentView), Show(restored.Outputs[v].CurrentView));
+        }
     }
 }

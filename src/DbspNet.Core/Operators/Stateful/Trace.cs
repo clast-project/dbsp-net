@@ -149,6 +149,9 @@ internal sealed class ZSetTrace<TKey, TWeight> : IZSetCheckpointTracked<TKey, TW
         }
     }
 
+    private static bool ShouldPromote(ColdRows cold, int n) =>
+        ColdPromotion.Ratio is > 0 and var ratio && (long)n * ratio >= cold.Source.Count - cold.Resolved.Count;
+
     private void Promote()
     {
         var cold = _cold!;
@@ -216,10 +219,20 @@ internal sealed class ZSetTrace<TKey, TWeight> : IZSetCheckpointTracked<TKey, TW
 
         if (_cold is { } cold)
         {
-            // Rows the delta changes are read first, so it adds to what was there.
-            foreach (var (key, _) in delta)
+            if (ShouldPromote(cold, delta.Count))
             {
-                Resolve(cold, key);
+                // The delta reaches a large share of what is still cold: one pass over the rest
+                // costs less than a probe per row (a small view whose every row a global value
+                // changes would otherwise pay hundreds of one-row reads).
+                Promote();
+            }
+            else
+            {
+                // Rows the delta changes are read first, so it adds to what was there.
+                foreach (var (key, _) in delta)
+                {
+                    Resolve(cold, key);
+                }
             }
         }
 
@@ -356,5 +369,35 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight> : IIndexedCheckpoi
         }
 
         return Current.RemoveKeysBelow(threshold, monotoneKey);
+    }
+}
+
+/// <summary>
+/// When a lazily restored Z-set trace reads its remaining cold rows in one pass rather than a probe
+/// per row (docs/design-durable-state.md §1f): when a delta of <c>n</c> rows reaches at least
+/// 1/<see cref="Ratio"/> of the rows still cold. A probe costs ~0.1 ms (open the run, find and decode
+/// the block's hash range), a pass ~1 µs a row. 0 never promotes on a delta.
+/// DBSPNET_COLD_PROMOTE_RATIO sets the default; <see cref="Use"/> overrides it in an async context.
+/// </summary>
+internal static class ColdPromotion
+{
+    private static readonly int Default =
+        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_COLD_PROMOTE_RATIO"), out var r) && r >= 0 ? r : 64;
+
+    private static readonly AsyncLocal<int?> Override = new();
+
+    public static int Ratio => Override.Value ?? Default;
+
+    /// <summary><paramref name="ratio"/> in the current async context until the result is disposed.</summary>
+    public static IDisposable Use(int ratio)
+    {
+        var previous = Override.Value;
+        Override.Value = ratio;
+        return new Restore(() => Override.Value = previous);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
     }
 }
