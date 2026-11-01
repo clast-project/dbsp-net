@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increment 1 built)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–2 built)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -591,6 +591,45 @@ Read against the targets: opening a run is ~0.5 ms, so restoring ivm-bench's ~20
 ~134 µs; ~85 µs of it is per-block fixed cost (the 256-entry block is not 4× cheaper), mostly the
 per-block Arrow IPC schema message and a scratch copy — worth trimming before increment 4, since the
 resumed ivm-bench batches touch ~1,200 keys (~0.16 s at this rate). Absent keys cost ~2 µs (Bloom).
+
+### Increment 2 — built and measured (2026-10-31)
+
+`StateLayout.Runs` (`DBSPNET_STATE_LAYOUT=runs`, or `StateLayout.Use` in tests) makes the Arrow
+Z-set and indexed trace codecs write every trace file as a run; a load checks for the run trailer,
+so either layout restores whatever the setting is now. Keyed aggregate-state blobs are unchanged
+until increment 4. `StateLayoutTests` (4): serial snapshots written in one layout and read in the
+other (and in runs both ways) restore and continue byte-identically; a parallel run-format
+snapshot restores and re-shards 3→2. Full suite passes with runs on (2,876) and off (2,880).
+
+ivm-bench SF=3, W=12, 5 alternating runs per arm (`ARMS="12 12:runs" scripts/measure-checkpoint.sh`;
+raw: `docs/runs-layout-w12-20261031.txt`). Median [min–max]:
+
+| | today | runs | |
+|---|--:|--:|--:|
+| batch-1 drain | 15.89 s [15.12–21.16] | 15.65 s [15.48–16.22] | noise |
+| checkpoint after batch 1 | 5.18 s [4.85–6.72] | 12.95 s [11.92–13.02] | **2.5×** |
+| checkpoint after batch 2 | 3.26 s [2.97–3.95] | 9.58 s [8.98–9.90] | **2.9×** |
+| checkpoint after batch 3 | 4.23 s [3.43–5.09] | 10.02 s [9.89–10.45] | **2.4×** |
+| snapshot size | 4,701 MiB | 4,765 MiB | +1.4% |
+| restore | 5.66 s [5.01–6.45] | 6.66 s [6.62–7.10] | +18% |
+
+All 10 restores matched the uninterrupted view row counts. Steady-state step is untouched (the
+layout only changes what a checkpoint writes).
+
+The write cost is the finding. The 1 M-row microbenchmark predicted +5% (764 vs 725 ms); at SF=3 a
+full run-format snapshot costs 2.5–2.9×. The writer as built does far more than the format needs:
+it collects (hash, entry) for the whole trace, sorts it, then for **each block rebuilds a
+`ZSetBuilder` / `IndexedZSetBuilder`** (whole-row re-hashing into a fresh dictionary, every value
+copied into new inner Z-sets) only so the codec can encode it, into a scratch in-memory file
+system, then copies the bytes out. That is a second materialisation of the whole state per
+checkpoint. Restore's +1 s is the read-side twin (per-block scratch copy and Arrow schema message,
+the ~85 µs fixed cost from increment 1), and increment 4 replaces eager restore anyway.
+
+This matters beyond increment 2: incremental checkpoints (increment 3) write small delta runs, but
+the first checkpoint and every compaction still write whole runs. So before increment 3, encode a
+block straight from a slice of the sorted entries (no intermediate Z-set, no scratch file system),
+and write one Arrow schema per run rather than per block. Target: a full run-format snapshot within
+~10% of today's write time.
 
 ### Targets (approved 2026-10-31)
 
