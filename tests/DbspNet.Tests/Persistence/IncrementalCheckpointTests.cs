@@ -128,6 +128,15 @@ public class IncrementalCheckpointTests
     // plus runs pinned by live lazily restored state.
     private static async Task AssertRunsAreExactlyTheReferencedOnesAsync(ITableFileSystem fs)
     {
+        // Pins on lazily restored state are weak: settle them, then sweep against what is pinned
+        // now, so the check below sees one consistent moment.
+        await CheckpointCleanup.WaitAsync(fs);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        var retained = (await Snapshot.ListSnapshotDirsAsync(fs, default)).Select(d => Snapshot.SnapDirName(d.Tick, d.Gen));
+        await RunSweep.SweepAsync(fs, retained, default);
+
         var referenced = (await IndexLinesAsync(fs, "snap-")).SelectMany(l => l.Runs).ToHashSet(StringComparer.Ordinal);
         var present = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var f in fs.ListAsync(RunSweep.RunsPrefix))
@@ -172,10 +181,11 @@ public class IncrementalCheckpointTests
             await Snapshot.WriteAsync(p.Circuit, fs);
             var chains = await ChainsAsync(fs);
 
-            // Tracked state extends its chain — traces and the partitioned operators alike.
-            var extended = chains.Where(c => c.Value.Length == 1 + checkpoint).ToList();
+            // Tracked state extends its chain — traces and the partitioned operators alike — until
+            // a background compaction (RunChain.CompactAt) replaces its front with a merged run.
+            var extended = chains.Where(c => c.Value.Length == 1 + checkpoint || c.Value[0].EndsWith(".c", StringComparison.Ordinal)).ToList();
             Assert.True(extended.Count > 0, $"checkpoint {checkpoint}: no chain was extended");
-            foreach (var (file, chain) in extended)
+            foreach (var (file, chain) in extended.Where(c => !c.Value[0].EndsWith(".c", StringComparison.Ordinal)))
             {
                 Assert.Equal(first[file][0], chain[0]); // same base run, never rewritten
             }
@@ -233,6 +243,91 @@ public class IncrementalCheckpointTests
         var again = Compile();
         await Snapshot.ReadAsync(again.Circuit, fs);
         Assert.Equal(Digest(producer), Digest(again));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task LongChains_AreCompactedOffTheStepThread_AndRestoreExactly(int retain)
+    {
+        // Increment 7: once a chain has RunChain.CompactAt runs after a commit, a background merge
+        // folds them into one run, and a later checkpoint adopts it — chains stay short without a
+        // whole rewrite on the checkpoint path. Verify (on for this class) reads each chain back
+        // against the state, so a wrong merge fails at the checkpoint that adopts it.
+        using var layout = StateLayout.Use(true);
+        var fs = new InMemoryTableFileSystem();
+        var p = Compile();
+        Tick(p, 0);
+        var compacted = false;
+        for (var checkpoint = 0; checkpoint < 20; checkpoint++)
+        {
+            Tick(p, 1 + checkpoint);
+            await Snapshot.WriteAsync(p.Circuit, fs, retainCount: retain);
+            await RunCheckpoint.WhenAllCompactedAsync(); // let a merge finish before the next checkpoint
+            var chains = await ChainsAsync(fs);
+            compacted |= chains.Values.Any(c => c[0].EndsWith(".c", StringComparison.Ordinal));
+            Assert.All(chains.Values, chain => Assert.InRange(chain.Length, 1, RunChain.CompactAt + 1));
+            await AssertRunsAreExactlyTheReferencedOnesAsync(fs);
+
+            var restored = Compile();
+            await Snapshot.ReadAsync(restored.Circuit, fs);
+            Assert.Equal(Digest(p), Digest(restored));
+        }
+
+        Assert.True(compacted, "no chain was ever compacted");
+    }
+
+    [Fact]
+    public async Task AdoptedCompactions_SurvivePowerLoss()
+    {
+        // A merged run must be durable before any checkpoint names it: lose power after several
+        // adoptions and the last checkpoint still restores exactly.
+        using var layout = StateLayout.Use(true);
+        var fs = new CrashSimulatingFileSystem();
+        var p = Compile();
+        Tick(p, 0);
+        var adopted = false;
+        for (var checkpoint = 0; checkpoint < 12; checkpoint++)
+        {
+            Tick(p, 1 + checkpoint);
+            await Snapshot.WriteAsync(p.Circuit, fs);
+            await RunCheckpoint.WhenAllCompactedAsync();
+            await CheckpointCleanup.WaitAsync(fs);
+            adopted |= (await ChainsAsync(fs)).Values.Any(c => c[0].EndsWith(".c", StringComparison.Ordinal));
+        }
+
+        Assert.True(adopted, "no compaction was adopted");
+        var restored = Compile();
+        await Snapshot.ReadAsync(restored.Circuit, await fs.AfterPowerLossAsync());
+        Assert.Equal(Digest(p), Digest(restored));
+    }
+
+    [Fact]
+    public async Task WithCompactionOff_LongChainsAreRewrittenInlineAtMaxRuns()
+    {
+        using var layout = StateLayout.Use(true);
+        var was = RunCheckpoint.CompactionEnabled;
+        RunCheckpoint.CompactionEnabled = false;
+        try
+        {
+            var fs = new InMemoryTableFileSystem();
+            var p = Compile();
+            Tick(p, 0);
+            for (var checkpoint = 0; checkpoint < RunChain.MaxRuns + 3; checkpoint++)
+            {
+                Tick(p, 1 + checkpoint);
+                await Snapshot.WriteAsync(p.Circuit, fs);
+                Assert.All((await ChainsAsync(fs)).Values, chain => Assert.InRange(chain.Length, 1, RunChain.MaxRuns));
+            }
+
+            var restored = Compile();
+            await Snapshot.ReadAsync(restored.Circuit, fs);
+            Assert.Equal(Digest(p), Digest(restored));
+        }
+        finally
+        {
+            RunCheckpoint.CompactionEnabled = was;
+        }
     }
 
     [Theory]

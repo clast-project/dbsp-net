@@ -22,6 +22,10 @@ internal static class RunPins
     internal static void Add(object holder, ITableFileSystem store, IReadOnlyList<string> paths) =>
         Pins.AddOrUpdate(holder, new Pin(store, paths));
 
+    /// <summary>Release <paramref name="holder"/>'s pin now rather than at collection — for a holder
+    /// whose end is known (a compaction adopted or dropped), so the very next sweep can act.</summary>
+    internal static void Remove(object holder) => Pins.Remove(holder);
+
     /// <summary>Every run a live cold source over <paramref name="fs"/> still reads.</summary>
     internal static HashSet<string> In(ITableFileSystem fs)
     {

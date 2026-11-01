@@ -323,6 +323,22 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return (lo, end - lo);
     }
 
+    /// <summary>Decode block <paramref name="b"/> with <paramref name="decode"/>, alongside its entries'
+    /// stored order hashes (compaction merges by them, never recomputing an order).</summary>
+    internal async ValueTask<(T Entries, uint[] Hashes)> ReadBlockAsync<T>(
+        int b, Func<RecordBatch, T> decode, CancellationToken cancellationToken = default)
+    {
+        using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
+        var stored = ((Int32Array)block.Batch.Column(block.Batch.ColumnCount - 1)).Values;
+        var hashes = new uint[stored.Length];
+        for (var i = 0; i < hashes.Length; i++)
+        {
+            hashes[i] = (uint)stored[i];
+        }
+
+        return (decode(block.Batch), hashes);
+    }
+
     /// <summary>The block holding entries of order hash <paramref name="hash"/>, or -1 when the run certainly has none.</summary>
     internal int BlockOfHash(int hash) => _bloom.MightContain((uint)hash) ? FindBlock((uint)hash) : -1;
 

@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–6 built)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–7 built)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -1042,6 +1042,51 @@ both workers, outputs match the twin; fails without the order tag). Full suite p
 Before the order tag the runs restore was 4.0 s (partitioned operators eager). The re-shard itself is
 2 s slower than today's (it writes hash-sorted runs and reads chains); still well under a restore
 from scratch.
+
+### Increment 7b — compaction off the step thread (built 2026-11-01)
+
+**The problem, measured.** `CheckpointChainBench` (scratch, `CHAIN_BENCH=1`): 2 M rows per table, a
+join, an aggregate and their views at W=12, then 40 ticks of 2,000 rows with a checkpoint after each,
+on the local file system. With chains rewritten whole inline at 8 runs, every 8th checkpoint spiked:
+919 ms against 30–130 ms around it — and every trace hits the cap at the same checkpoint, since every
+chain started at the same one. At SF=3 that is a full ~5–6 s base checkpoint every 8th time.
+
+**What was built.**
+- After a commit, a chain of `RunChain.CompactAt` (4) or more runs gets a background merge into one
+  run (`RunCompactor`), at most two at a time. The deltas (small by construction) are read whole and
+  sorted by their stored order hash; the base streams block by block, each block's hash range taking
+  the delta entries in it; equal entries sum, zeros drop, blocks are cut as a written run's are (never
+  inside a hash; a group bigger than a block alone). It merges by the stored `__hash` column, so it
+  needs no order function and works for row-, key- and partition-ordered chains alike. Output goes
+  through a new streaming writer (`RunStreamWriter`), is synced before it can be named, and is pinned
+  with its inputs while in flight.
+- The next checkpoint for that state adopts the merged run if its input is still the chain's front
+  (`[merged, later deltas…]`); a merge that failed or was overtaken by a rewrite is dropped, unpinned
+  explicitly, and swept.
+- The inline rewrite remains as the fallback: `RunChain.MaxRuns` is now 32, plus the existing
+  overflow/size rules. `DBSPNET_COMPACTION=off` disables compaction.
+
+**Tests.** `LongChains_AreCompactedOffTheStepThread_AndRestoreExactly` (retain 1 and 3; verify on, so a
+wrong merge fails at the checkpoint that adopts it — mutation-tested by dropping the delta entries),
+`AdoptedCompactions_SurvivePowerLoss` (fails without the output sync), `WithCompactionOff_LongChains…`.
+The sweep-invariant helper now settles weak pins (a forced GC and a fresh sweep) before comparing —
+leftovers from pins released by collection were otherwise timing-dependent. Full suite passes four
+ways (2,915).
+
+**Measured** (`CheckpointChainBench`, one run each, checkpoint ms by tick):
+
+| | spikes | chain length |
+|---|---|---|
+| inline at 8 (before) | 919 ms every 8th checkpoint | ≤ 8 |
+| compaction off, inline at 32 | 926–1,085 ms every 32nd | grows to 32 |
+| compaction on, 1 s between checkpoints | none over 0.5 s; bumps of 236–453 ms on ~1 in 8 | 3–5 |
+| compaction on, back to back (stress) | 452–678 ms on 4 of 40 | grows to 27 while merges queue |
+
+So the checkpoint path no longer pays a whole rewrite, and chains stay short when there is any time
+between checkpoints (real deployments checkpoint every ~60 s). The remaining bumps line up with merges
+running beside the checkpoint — most likely their CPU and GC (a merge decodes the base into row objects;
+not yet profiled). Merging Arrow batches directly, without row objects, is the lever if they matter.
+ivm-bench's three batches never reach `CompactAt`, so this is not on the SF=3 numbers.
 
 ### Targets (approved 2026-10-31)
 
