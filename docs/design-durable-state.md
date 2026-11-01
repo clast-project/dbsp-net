@@ -1243,6 +1243,26 @@ than on one: per-worker busy ≤ 263 ms, the rest barrier waits; the global rank
 are the only single-worker work left and would need a parallel global rank to spread; plus fresh-process
 JIT and ~0.4 s of GC pauses over the batch (drain + output).
 
+### GC pauses in the first batch after restore (2026-11-01)
+
+Instrument: `IVM_GC_EVENTS=1` now reports the first batch a process runs (batch 2 after
+`IVM_RESUME=1`), one line per pause labelled with its phase (restore / drain / output), including
+runtime suspensions with no GC and their reason. Fresh-process restart, SF=3, W=12, single runs
+(diagnosis, not a wall-clock claim):
+
+- **~400 ms of pauses over the first batch, but only ~80–120 ms in the drain** (a gen0 GC, ~44 ms,
+  promoting 1.4 GB, plus a background gen2's blocking suspension, reported as `gc-prep`, 36–78 ms)
+  out of a ~0.8 s drain. The other ~280 ms falls in the output write (3.4 s): a gen1 (~85 ms) and a
+  gen0 (~65–120 ms) promoting ~3.2 GB, and another background gen2 suspension (~125 ms).
+- **The cause is restored state reaching memory**, not GC configuration: the faulted partitions,
+  promoted views and output rows are decoded into fresh gen0 objects and copied up the generations.
+  Skipping the post-restore compacting GC (`DBSPNET_RESTORE_GC=0`) only moved the pauses (drain
+  917 ms); non-concurrent GC (`DOTNET_gcConcurrent=0`) turned the background gen2s into blocking ones
+  (112 ms in the drain, 248 ms in the output); the total stayed ~400 ms either way.
+- **No cheap lever:** fewer pauses need fewer objects per restored row (the flat/row-representation
+  direction), not a setting. The larger first-batch gap is now the output write after a lazy
+  restore — 3.4–3.5 s vs 2.1 s after an eager restore — of which GC is under a tenth.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

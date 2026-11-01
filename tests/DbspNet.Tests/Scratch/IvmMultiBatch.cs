@@ -173,6 +173,7 @@ public class IvmMultiBatch
         var restartAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_AFTER"), out var ra) ? ra : 0;
         var restarted = false;
         var firstBatch = 1;
+        DateTime restoreEndUtc = DateTime.MinValue;
         if (resume)
         {
             Assert.True(store is not null, "IVM_RESUME needs IVM_SNAPSHOT_DIR");
@@ -193,6 +194,7 @@ public class IvmMultiBatch
                 $"restore_gc_ms={DbspNet.Persistence.CheckpointGcMode.LastRestoreCollectMs:F0}"));
             restarted = true;
             firstBatch = 2;
+            restoreEndUtc = DateTime.UtcNow;
         }
 
         if (resume && DbspNet.Persistence.Snapshot.ProfileSave)
@@ -217,7 +219,9 @@ public class IvmMultiBatch
             var jit0 = System.Runtime.JitInfo.GetCompilationTime();
             double drainAllocGib = 0;
             var sw = Stopwatch.StartNew();
+            var batchStartUtc = DateTime.UtcNow;
             DateTime? drainEndUtc = null;
+            DateTime? outputEndUtc = null;
             var measureAtDrain = Environment.GetEnvironmentVariable("IVM_MEASURE_AT") == "drain";
             long ticks;
             double drainMs, outputMs;
@@ -243,6 +247,7 @@ public class IvmMultiBatch
 
                 await runner.WriteOutputsAsync();
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
+                outputEndUtc = DateTime.UtcNow;
             }
 
             if (batch == 1 && Environment.GetEnvironmentVariable("IVM_PAUSE_DIR") is { Length: > 0 } pauseDir)
@@ -303,7 +308,7 @@ public class IvmMultiBatch
                 }
             }
 
-            if (batch == 1 && gcEvents is not null)
+            if (batch == firstBatch && gcEvents is not null)
             {
                 await Task.Delay(2000); // runtime events arrive asynchronously
                 _out.WriteLine("GCPAUSE " + gcEvents.Report());
@@ -312,7 +317,9 @@ public class IvmMultiBatch
                 {
                     _out.WriteLine(line);
                 }
-                foreach (var line in gcEvents.PerGc())
+                string PhaseOf(DateTime at) =>
+                    at < restoreEndUtc ? "restore" : at < batchStartUtc ? "before" : at < drainEndUtc ? "drain" : at < outputEndUtc ? "output" : "after";
+                foreach (var line in gcEvents.PerGc(PhaseOf))
                 {
                     _out.WriteLine(line);
                 }
@@ -748,8 +755,13 @@ public class IvmMultiBatch
                     .ToArray();
             }
         }
-        private readonly List<string> _perGc = new();
+        private readonly List<(DateTime At, string Line)> _perGc = new();
         private DateTime _suspend;
+        private int _reason;
+
+        // SUSPEND_REASON (gcinterface.h): why the runtime stopped every thread.
+        private static readonly string[] SuspendReasons =
+            ["other", "gc", "appdomain-shutdown", "code-pitching", "shutdown", "debugger", "gc-prep", "debugger-sweep", "profiler", "rejit"];
         private string? _kind;
         private double _p0, _p1, _g0, _g1, _g2, _loh;
 
@@ -799,6 +811,7 @@ public class IvmMultiBatch
                         break;
                     case "GCSuspendEEBegin_V1":
                         _suspend = e.TimeStamp;
+                        _reason = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Reason")], CultureInfo.InvariantCulture);
                         break;
                     case "GCStart_V2":
                         var depth = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Depth")], CultureInfo.InvariantCulture);
@@ -833,14 +846,20 @@ public class IvmMultiBatch
                             var kind = _kind ?? "no GC (suspension only)";
                             var pause = (e.TimeStamp - _suspend).TotalMilliseconds;
                             _pauses.Add((kind, pause, _p0, _p1, _suspend.ToUniversalTime()));
-                            if (_kind is not null)
+                            if (_kind is null)
                             {
-                                _perGc.Add(string.Create(
+                                _perGc.Add((_suspend.ToUniversalTime(), string.Create(
+                                    CultureInfo.InvariantCulture,
+                                    $"SUSPEND {(_reason < SuspendReasons.Length ? SuspendReasons[_reason] : _reason.ToString(CultureInfo.InvariantCulture))} {pause:F0} ms")));
+                            }
+                            else
+                            {
+                                _perGc.Add((_suspend.ToUniversalTime(), string.Create(
                                     CultureInfo.InvariantCulture,
                                     $"GC {kind} {pause:F0} ms promoted0={_p0 / 1e9:F2} promoted1={_p1 / 1e9:F2} GB | gen0={_g0 / 1e9:F2} gen1={_g1 / 1e9:F2} gen2={_g2 / 1e9:F2} loh={_loh / 1e9:F2} GB | marked ")
                                     + string.Join(" ", _mark.OrderBy(kv => kv.Key).Select(kv => string.Create(
                                         CultureInfo.InvariantCulture,
-                                        $"{(kv.Key < MarkKinds.Length ? MarkKinds[kv.Key] : kv.Key.ToString(CultureInfo.InvariantCulture))}={kv.Value.Sum / 1e9:F2}GB/{_markMs.GetValueOrDefault(kv.Key).MaxMs:F0}ms"))));
+                                        $"{(kv.Key < MarkKinds.Length ? MarkKinds[kv.Key] : kv.Key.ToString(CultureInfo.InvariantCulture))}={kv.Value.Sum / 1e9:F2}GB/{_markMs.GetValueOrDefault(kv.Key).MaxMs:F0}ms")))));
                             }
                         }
 
@@ -856,11 +875,11 @@ public class IvmMultiBatch
         }
 
         /// <summary>One line per GC (IVM_GC_EVENTS=1): pause, promoted bytes, generation sizes.</summary>
-        public string[] PerGc()
+        public string[] PerGc(Func<DateTime, string>? phaseOf = null)
         {
             lock (_gate)
             {
-                return _perGc.ToArray();
+                return _perGc.Select(g => (phaseOf is null ? "" : "[" + phaseOf(g.At) + "] ") + g.Line).ToArray();
             }
         }
 
