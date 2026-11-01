@@ -80,7 +80,12 @@ public class IvmMultiBatch
         };
         var outRoot = Environment.GetEnvironmentVariable("IVM_OUT_ROOT")
                       ?? Path.Combine(Path.GetTempPath(), "ivm-multibatch-out");
-        if (Directory.Exists(outRoot))
+
+        // IVM_RESUME=1: a fresh process restoring the snapshot a run with IVM_STOP_AFTER=1 left
+        // (outputs and snapshot kept), then batches 2-3 — a real restart, not an in-process one.
+        var resume = Environment.GetEnvironmentVariable("IVM_RESUME") == "1";
+        var stopAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_STOP_AFTER"), out var sa) ? sa : 0;
+        if (!resume && Directory.Exists(outRoot))
         {
             Directory.Delete(outRoot, recursive: true);
         }
@@ -94,7 +99,7 @@ public class IvmMultiBatch
         CheckpointPolicy? policy = string.IsNullOrEmpty(policySetting) ? null : CheckpointPolicy.Parse(policySetting);
         if (codecs is not null)
         {
-            if (Directory.Exists(snapshotDir))
+            if (!resume && Directory.Exists(snapshotDir))
             {
                 Directory.Delete(snapshotDir, recursive: true);
             }
@@ -167,7 +172,39 @@ public class IvmMultiBatch
         _out.WriteLine($"output mode: {mode}, workers: {workers}");
         var restartAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_AFTER"), out var ra) ? ra : 0;
         var restarted = false;
-        for (var batch = 1; batch <= 3; batch++)
+        var firstBatch = 1;
+        if (resume)
+        {
+            Assert.True(store is not null, "IVM_RESUME needs IVM_SNAPSHOT_DIR");
+            var allocBefore = GC.GetTotalAllocatedBytes(precise: false);
+            var pauseBefore = GC.GetTotalPauseDuration();
+            var jitBefore = System.Runtime.JitInfo.GetCompilationTime();
+            var jitMethodsBefore = System.Runtime.JitInfo.GetCompiledMethodCount();
+            var heapStart = GC.GetTotalMemory(false);
+            var rs = Stopwatch.GetTimestamp();
+            var tick = await runner.RestoreAsync();
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"RESUME tick={tick} restore_ms={Stopwatch.GetElapsedTime(rs).TotalMilliseconds:F0} " +
+                $"jit_ms={(System.Runtime.JitInfo.GetCompilationTime() - jitBefore).TotalMilliseconds:F0} jit_methods={System.Runtime.JitInfo.GetCompiledMethodCount() - jitMethodsBefore} " +
+                $"heap_start_gib={heapStart / (double)(1L << 30):F2} " +
+                $"alloc_gib={(GC.GetTotalAllocatedBytes(precise: false) - allocBefore) / (double)(1L << 30):F2} " +
+                $"gc_pause_ms={(GC.GetTotalPauseDuration() - pauseBefore).TotalMilliseconds:F0} " +
+                $"heap_end_gib={GC.GetTotalMemory(false) / (double)(1L << 30):F2} " +
+                $"restore_gc_ms={DbspNet.Persistence.CheckpointGcMode.LastRestoreCollectMs:F0}"));
+            restarted = true;
+            firstBatch = 2;
+        }
+
+        if (resume && DbspNet.Persistence.Snapshot.ProfileSave)
+        {
+            foreach (var g in DbspNet.Persistence.Snapshot.RestoreProfile.ToArray().GroupBy(l => l.Op).OrderByDescending(g => g.Sum(l => l.Ms)).Take(10))
+            {
+                _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"RESTOREOP {g.Key} n={g.Count()} sum_ms={g.Sum(l => l.Ms):F0} max_ms={g.Max(l => l.Ms):F0} alloc_mib={DbspNet.Persistence.Snapshot.RestoreAlloc.Where(a => a.Op == g.Key).Sum(a => a.Bytes) / 1048576.0:F0}"));
+            }
+        }
+
+        for (var batch = firstBatch; batch <= 3; batch++)
         {
             if (batch > 1)
             {
@@ -177,6 +214,7 @@ public class IvmMultiBatch
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
             var pause0 = GC.GetTotalPauseDuration();
             var gen2Before = GC.CollectionCount(2);
+            var jit0 = System.Runtime.JitInfo.GetCompilationTime();
             double drainAllocGib = 0;
             var sw = Stopwatch.StartNew();
             DateTime? drainEndUtc = null;
@@ -349,17 +387,22 @@ public class IvmMultiBatch
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
-                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2} gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gen2={GC.CollectionCount(2) - gen2Before}")
+                $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2} gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gen2={GC.CollectionCount(2) - gen2Before} jit_ms={(System.Runtime.JitInfo.GetCompilationTime() - jit0).TotalMilliseconds:F0}")
                 + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1} written_mib={writtenMb:F1}"))
                 + (restarted ? " resumed=1" : ""));
             if (restarted)
             {
                 _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                    $"COLD after_batch={batch} resolves={DbspNet.Core.Collections.ColdStats.Resolves} present={DbspNet.Core.Collections.ColdStats.ResolvedPresent} promotions={DbspNet.Core.Collections.ColdStats.Promotions} promoted_groups={DbspNet.Core.Collections.ColdStats.PromotedGroups} read_ms={DbspNet.Core.Collections.ColdStats.ReadMs:F0} promote_ms={DbspNet.Core.Collections.ColdStats.PromoteMs:F0} row_reads={DbspNet.Core.Collections.ColdStats.RowResolves.Reads} row_present={DbspNet.Core.Collections.ColdStats.RowResolves.Present}"));
+                    $"COLD after_batch={batch} resolves={DbspNet.Core.Collections.ColdStats.Resolves} present={DbspNet.Core.Collections.ColdStats.ResolvedPresent} promotions={DbspNet.Core.Collections.ColdStats.Promotions} promoted_groups={DbspNet.Core.Collections.ColdStats.PromotedGroups} read_ms={DbspNet.Core.Collections.ColdStats.ReadMs:F0} promote_ms={DbspNet.Core.Collections.ColdStats.PromoteMs:F0} row_reads={DbspNet.Core.Collections.ColdStats.RowResolves.Reads} row_present={DbspNet.Core.Collections.ColdStats.RowResolves.Present} giant_waits={DbspNet.Persistence.Runs.RunColdGroups.GiantWaits.Waits} giant_wait_ms={DbspNet.Persistence.Runs.RunColdGroups.GiantWaits.Ms:F0}"));
                 foreach (var (who, n) in DbspNet.Core.Collections.ColdStats.Promoters.OrderByDescending(kv => kv.Value).Take(8))
                 {
                     _out.WriteLine($"PROMOTER {who}{n}");
                 }
+            }
+
+            if (batch == stopAfter)
+            {
+                break; // IVM_STOP_AFTER: leave the snapshot (and outputs) for an IVM_RESUME run
             }
 
             // IVM_RESTART_AFTER=N: after batch N's checkpoint, drop the program and restore a fresh
@@ -384,10 +427,17 @@ public class IvmMultiBatch
                 runner = parallel is not null
                     ? await ProgramRunner.CreateAsync(parallel, Inputs(), outputs, store, policy)
                     : await ProgramRunner.CreateAsync(CompileSerial(), Inputs(), outputs, store, policy);
+                var allocBefore = GC.GetTotalAllocatedBytes(precise: false);
+                var pauseBefore = GC.GetTotalPauseDuration();
+                var heapAtStart = GC.GetTotalMemory(false);
                 var rs = Stopwatch.GetTimestamp();
                 var tick = await runner.RestoreAsync();
                 _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                    $"RESTART after_batch={batch} tick={tick} restart_ms={Stopwatch.GetElapsedTime(rs).TotalMilliseconds:F0}"));
+                    $"RESTART after_batch={batch} tick={tick} restart_ms={Stopwatch.GetElapsedTime(rs).TotalMilliseconds:F0} " +
+                    $"alloc_gib={(GC.GetTotalAllocatedBytes(precise: false) - allocBefore) / (double)(1L << 30):F2} " +
+                    $"gc_pause_ms={(GC.GetTotalPauseDuration() - pauseBefore).TotalMilliseconds:F0} " +
+                    $"heap_start_gib={heapAtStart / (double)(1L << 30):F2} heap_end_gib={GC.GetTotalMemory(false) / (double)(1L << 30):F2} " +
+                    $"restore_gc_ms={DbspNet.Persistence.CheckpointGcMode.LastRestoreCollectMs:F0}"));
                 restarted = true;
 
                 // IVM_RESTART_GC=1: a full compacting collection after the restore (diagnostic).
@@ -405,6 +455,17 @@ public class IvmMultiBatch
                 if (int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_PAUSE_MS"), out var pause) && pause > 0)
                 {
                     await Task.Delay(pause);
+                }
+
+                // IVM_RESTART_PAUSE_DIR: write {dir}/pid after the restore and wait for {dir}/go (to
+                // attach dotnet-gcdump / dotnet-trace to the just-restored process).
+                if (Environment.GetEnvironmentVariable("IVM_RESTART_PAUSE_DIR") is { Length: > 0 } restartPauseDir)
+                {
+                    File.WriteAllText(Path.Combine(restartPauseDir, "pid"), Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+                    while (!File.Exists(Path.Combine(restartPauseDir, "go")))
+                    {
+                        await Task.Delay(500);
+                    }
                 }
                 if (DbspNet.Persistence.Snapshot.ProfileSave)
                 {
@@ -428,7 +489,7 @@ public class IvmMultiBatch
             }
         }
 
-        if (store is not null)
+        if (store is not null && stopAfter == 0)
         {
             // Restart: drop the producer, then restore its last checkpoint into a fresh program at
             // the same W (the deploy path's RestoreAsync), and check every view came back.

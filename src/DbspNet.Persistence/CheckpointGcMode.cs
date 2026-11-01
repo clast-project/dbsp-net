@@ -49,8 +49,13 @@ internal static class CheckpointGcMode
             return;
         }
 
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        LastRestoreCollectMs = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
     }
+
+    /// <summary>How long the last <see cref="AfterLazyRestore"/> collection took (diagnostics).</summary>
+    internal static double LastRestoreCollectMs { get; private set; }
 
     public static Scope Enter()
     {

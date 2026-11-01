@@ -330,10 +330,10 @@ public class LazyRestoreTests
     }
 
     [Fact]
-    public async Task AGiantGroup_IsReadAtRestore_TheRestOnDemand()
+    public async Task AGiantGroup_IsDecodedInTheBackground_AndReadOnDemand()
     {
         // One join key with far more values than a run block holds (its block holds that group
-        // alone), many small keys: the giant key is resolved by the restore itself.
+        // alone), many small keys: the giant block decodes in the background; reads are lazy.
         using var layout = StateLayout.Use(true);
         string[] sql =
         [
@@ -368,8 +368,9 @@ public class LazyRestoreTests
         var restored = SqlProgram.Compile(sql, views, ArrowSqlSnapshotCodecs.Instance);
         await Snapshot.ReadAsync(restored.Circuit, fs);
         var states = JoinTraceStates(restored);
-        Assert.True(states.Any(s => IsCold(s) && Resolved(s) == 1), // the giant key, preloaded
-            "states: " + string.Join(", ", states.Select(s => $"cold={IsCold(s)} resolved={Resolved(s)} groups={s.GetType().GetProperty("GroupCount")!.GetValue(s)}")));
+        // The giant key is decoded in the background from the restore on, not resolved by it:
+        // nothing is read on the restore path, and the first read takes the decoded block.
+        Assert.All(states, s => Assert.Equal(0, Resolved(s)));
         Assert.All(states, s => Assert.True(IsCold(s)));
 
         foreach (var p in new[] { restored, twin })

@@ -46,4 +46,8 @@ internal interface IIndexedRunCodec
 
     /// <summary>A decoded block's entries in stored order (compaction).</summary>
     (StructuralRow Key, StructuralRow Value, long Weight)[] DecodeEntries(RecordBatch batch);
+
+    /// <summary>A block holding a single group: its key (from the first row) and its values, the
+    /// group's map sized up front — the giant-group read, without a key object per entry.</summary>
+    (StructuralRow Key, ZSet<StructuralRow, Z64> Group) DecodeSingleGroup(RecordBatch batch);
 }

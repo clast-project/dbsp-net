@@ -390,6 +390,10 @@ public static class Snapshot
     internal static System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
         RestoreProfile { get; } = new();
 
+    /// <summary>With <see cref="ProfileSave"/> set, each sequentially restored operator's allocation
+    /// (on its thread; an async load that hops threads is undercounted).</summary>
+    internal static System.Collections.Concurrent.ConcurrentQueue<(string Op, long Bytes)> RestoreAlloc { get; } = new();
+
     /// <summary>
     /// Degree of concurrency <see cref="ReadAsync(RootCircuit, ITableFileSystem, CancellationToken)"/>
     /// uses when no explicit degree is passed. Restore is a per-operator walk with no data
@@ -578,11 +582,13 @@ public static class Snapshot
                 if (profile is null)
                 {
                     var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                    var a0 = ProfileSave ? GC.GetAllocatedBytesForCurrentThread() : 0;
                     await s.LoadAsync(ctx, cancellationToken).ConfigureAwait(false);
                     if (ProfileSave)
                     {
                         RestoreProfile.Enqueue((dir, i, circuit.Operators[i].GetType().Name,
                             System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+                        RestoreAlloc.Enqueue((circuit.Operators[i].GetType().Name, GC.GetAllocatedBytesForCurrentThread() - a0));
                     }
                 }
                 else

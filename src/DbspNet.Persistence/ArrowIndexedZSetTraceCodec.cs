@@ -126,6 +126,55 @@ internal sealed class ArrowIndexedZSetTraceCodec
         AddRange(batch, from, count, into, StringDecoding.Copy);
 
     /// <inheritdoc/>
+    public (StructuralRow Key, ZSet<StructuralRow, Z64> Group) DecodeSingleGroup(RecordBatch batch)
+    {
+        var keyCount = _keySchema.Count;
+        var valueCount = _valueSchema.Count;
+        var rowCount = batch.Length;
+        var key = new object?[keyCount];
+        for (var c = 0; c < keyCount; c++)
+        {
+            key[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, 0, 1, StringDecoding.Copy)[0];
+        }
+
+        // A giant group is one long decode: extract and materialize its rows in parallel over row
+        // ranges (each StructuralRow computes its hash as it is built), then insert them in one
+        // pass into a map sized up front.
+        var rows = new StructuralRow[rowCount];
+        const int Chunk = 32 * 1024;
+        Parallel.For(0, (rowCount + Chunk - 1) / Chunk, part =>
+        {
+            var from = part * Chunk;
+            var n = Math.Min(Chunk, rowCount - from);
+            var columns = new object?[valueCount][];
+            for (var c = 0; c < valueCount; c++)
+            {
+                columns[c] = ArrowColumns.Extract(batch.Column(keyCount + c), _valueSchema[c].Type, from, n, StringDecoding.Copy);
+            }
+
+            for (var i = 0; i < n; i++)
+            {
+                var v = new object?[valueCount];
+                for (var c = 0; c < valueCount; c++)
+                {
+                    v[c] = columns[c][i];
+                }
+
+                rows[from + i] = new StructuralRow(v);
+            }
+        });
+
+        var weights = ((Int64Array)batch.Column(keyCount + valueCount)).Values;
+        var group = new ZSetBuilder<StructuralRow, Z64>(rowCount);
+        for (var i = 0; i < rowCount; i++)
+        {
+            group.Add(rows[i], new Z64(weights[i]));
+        }
+
+        return (new StructuralRow(key), group.Build());
+    }
+
+    /// <inheritdoc/>
     public (StructuralRow Key, StructuralRow Value, long Weight)[] DecodeEntries(RecordBatch batch)
     {
         var keyCount = _keySchema.Count;

@@ -45,40 +45,16 @@ internal sealed class RunColdRows : IColdRows<StructuralRow>
 
     public ZSet<StructuralRow, Z64> ReadByHash(int hash)
     {
-        ZSetBuilder<StructuralRow, Z64>? sum = null;
-        ZSet<StructuralRow, Z64>? only = null;
+        // Only the entries of this hash, from each run (a binary search of each block's __hash
+        // column) — not the whole block, which holds many partitions.
+        var into = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var run in _runs)
         {
-            var b = run.BlockOfHash(hash);
-            if (b < 0)
-            {
-                continue;
-            }
-
             // Synchronous on purpose: the operator that asked is on the step thread, waiting.
-            var block = run.DecodeZSetBlockAsync(b, _codec).AsTask().GetAwaiter().GetResult();
-            if (only is null && sum is null)
-            {
-                only = block;
-                continue;
-            }
-
-            if (sum is null)
-            {
-                sum = new ZSetBuilder<StructuralRow, Z64>();
-                foreach (var (row, w) in only!)
-                {
-                    sum.Add(row, w);
-                }
-            }
-
-            foreach (var (row, w) in block)
-            {
-                sum.Add(row, w);
-            }
+            run.ReadEntriesOfHashAsync(hash, _codec, into).AsTask().GetAwaiter().GetResult();
         }
 
-        return sum?.Build() ?? only ?? ZSet<StructuralRow, Z64>.Empty;
+        return into.Build();
     }
 
     public IEnumerable<KeyValuePair<StructuralRow, Z64>> ReadAll()

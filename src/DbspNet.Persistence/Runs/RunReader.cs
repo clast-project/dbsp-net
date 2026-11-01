@@ -270,6 +270,26 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return into.Build().WeightOf(key);
     }
 
+    /// <summary>Every entry of a Z-set run whose stored order hash is <paramref name="hash"/> (a
+    /// partition-ordered run's partition), decoding only those entries, added to <paramref name="into"/>.</summary>
+    internal async ValueTask ReadEntriesOfHashAsync(
+        int hash, IZSetRunCodec codec, ZSetBuilder<StructuralRow, Z64> into, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.ZSet);
+        var b = BlockOfHash(hash);
+        if (b < 0)
+        {
+            return;
+        }
+
+        using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
+        var (from, count) = HashRange(block.Batch, hash);
+        if (count > 0)
+        {
+            codec.DecodeRange(block.Batch, from, count, into);
+        }
+    }
+
     /// <summary><paramref name="key"/>'s group in an indexed run, decoding only its entries.</summary>
     internal async ValueTask<ZSet<StructuralRow, Z64>> GroupOfKeyAsync(
         StructuralRow key, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
