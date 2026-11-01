@@ -55,7 +55,7 @@ public enum RankFunction
 /// TOP-K under retraction — when a windowed row is retracted, the next row must
 /// already be known.</para>
 /// </remarks>
-internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, IIntrospectable
+internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder
     where TRow : notnull
     where TKey : notnull
 {
@@ -78,6 +78,10 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
     // Lazy restore (docs/design-durable-state.md §1f, increment 5): partitions still cold, read the
     // first time a delta touches them; null when everything is in memory.
     private LazyPartitions<TKey, TRow>? _lazy;
+
+    /// <inheritdoc/>
+    public object? OrderFor(string fileName) =>
+        fileName == "trace.arrows" ? LazyPartitions<TKey, TRow>.PartitionOrder(_partitionOf) : null;
 
     // The window emitted last tick, per partition: row -> in-window weight (> 0).
     private readonly Dictionary<TKey, Dictionary<TRow, long>> _window;
@@ -315,8 +319,11 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
         return result;
     }
 
+    // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TRow, Z64> SnapshotNow() =>
-        ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
+        _accum.Count == 0
+            ? ZSet<TRow, Z64>.NewMutable()
+            : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
 
     // A partition a lazily restored operator has not touched yet: read its rows from cold and
     // rebuild its window — what the eager load does for every partition — before the delta lands.

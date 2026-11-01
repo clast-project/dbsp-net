@@ -1009,6 +1009,40 @@ plus first write is still 46% faster than today, and nothing view-sized is kept 
 lever is to skip the Arrow → rows → Arrow round trip in that write (the run blocks already are the
 view's Arrow batches; only the connector's row-address map needs row keys).
 
+### Increment 7a — re-shard over runs (built 2026-11-01)
+
+With runs on, `ParallelReshard.RewriteAsync` writes run chains like a checkpoint (a session: base
+runs under `runs/{new snapshot}`, a run index per worker, the runs tree synced) instead of
+self-contained files, so the restore after a re-shard is lazy and the checkpoints after it extend
+those chains. A partitioned operator's file must keep its partition order or its lazy path declines
+(and its window rebuild is most of an eager restore): the operators say which order each snapshot file
+is written in (`ISnapshotOrder`), and the re-shard tags each rewritten set with it
+(`SnapshotOrderTag`) — taken from the operator itself, not re-derived from placement metadata, since
+a different order would make lazy partition reads miss rows.
+
+**A latent bug closed on the way.** An empty snapshot can be the shared `ZSet.Empty` singleton; a
+tracker attached to it (increment 3, `ZSetChangeTracker.Attach`) would be found by every empty
+Z-set in the process — two empty partitioned operators saved concurrently by different workers could
+each take the other's pending change. Attaching tracking to the shared singleton now throws
+(`RefuseShared`), and empty snapshots are fresh objects.
+
+Tests: the parallel chain test checks the re-shard writes chains and a later checkpoint extends one;
+`AReshard_KeepsPartitionOrder_SoTheRestoreAfterItStaysLazy` (W=3 → 2: partitioned operators lazy on
+both workers, outputs match the twin; fails without the order tag). Full suite passes four ways (2,911).
+
+**Measured** — ivm-bench SF=3, re-shard 12 → 8 after batch 3, then restore at W=8, 5 alternating runs
+(raw: `docs/runs-reshard-w12to8-20261101.txt`; every restore matched):
+
+| | today | runs |
+|---|--:|--:|
+| re-shard | 6.75 s [6.67–6.81] | 8.80 s [8.46–9.15] |
+| restore at W=8 | 5.77 s [5.67–5.98] | **1.25 s** [1.17–1.30] |
+| re-shard + restore | 12.5 s | **10.1 s** |
+
+Before the order tag the runs restore was 4.0 s (partitioned operators eager). The re-shard itself is
+2 s slower than today's (it writes hash-sorted runs and reads chains); still well under a restore
+from scratch.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

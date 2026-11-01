@@ -44,7 +44,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// <typeparam name="TOutRow">The widened output row type (base ⧺ aggregate columns).</typeparam>
 /// <typeparam name="TKey">The PARTITION BY key type.</typeparam>
 internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
-    : IOperator, ISnapshotable, IIntrospectable
+    : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder
     where TInRow : notnull
     where TAgg : notnull
     where TOutRow : notnull
@@ -78,6 +78,10 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     // Lazy restore (docs/design-durable-state.md §1f, increment 5): partitions still cold, read the
     // first time a delta touches them; null when everything is in memory.
     private LazyPartitions<TKey, TInRow>? _lazy;
+
+    /// <inheritdoc/>
+    public object? OrderFor(string fileName) =>
+        fileName == "trace.arrows" ? LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) : null;
 
     // Last-emitted output per partition, keyed by the input (base) row →
     // (widened row, weight). Keying by base row lets GC drop a finalized row
@@ -556,8 +560,11 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
     }
 
+    // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TInRow, Z64> SnapshotNow() =>
-        ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
+        _accum.Count == 0
+            ? ZSet<TInRow, Z64>.NewMutable()
+            : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
 
     // A partition a lazily restored operator has not touched yet: read its rows from cold and
     // rebuild its window — what the eager load does for every partition — before the delta lands.

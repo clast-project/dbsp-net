@@ -57,6 +57,40 @@ internal interface IColdRowLoader<TRow>
 }
 
 /// <summary>
+/// An operator whose snapshot file is saved in an order other than its rows' own hash (a
+/// partitioned operator: its partition key's). Re-shard asks, so the files it rewrites keep that
+/// order and the restore after it can stay lazy (docs/design-durable-state.md §1f, increment 7).
+/// </summary>
+internal interface ISnapshotOrder
+{
+    /// <summary>The order hash for <paramref name="fileName"/> — a <c>Func&lt;TRow, int&gt;</c> over the
+    /// operator's saved row type — or null for the row's own hash.</summary>
+    object? OrderFor(string fileName);
+}
+
+/// <summary>Tags a freshly built snapshot Z-set (one with no trace behind it, as a re-shard writes)
+/// with the order its runs must be written in.</summary>
+internal sealed class SnapshotOrderTag<TKey, TWeight>(Func<TKey, int> order) : IZSetCheckpointTracked<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    public CheckpointTracking<ZSet<TKey, TWeight>>? Tracking => null;
+
+    public Func<TKey, int>? OrderHash => order;
+
+    public void StartTracking(object chain)
+    {
+    }
+
+    /// <summary>Tag <paramref name="snapshot"/>.</summary>
+    public static void Apply(ZSet<TKey, TWeight> snapshot, Func<TKey, int> order)
+    {
+        CheckpointTracking.RefuseShared(snapshot, ZSet<TKey, TWeight>.Empty);
+        CheckpointTracking.Register(snapshot, new SnapshotOrderTag<TKey, TWeight>(order));
+    }
+}
+
+/// <summary>
 /// The cold partitions of a lazily restored partitioned operator: each partition's rows are read
 /// the first time the operator touches the partition, and never again. Partition keys are hashed
 /// with their own <c>GetHashCode</c> — the same function the save ordered the rows by

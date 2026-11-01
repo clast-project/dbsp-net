@@ -59,7 +59,7 @@ public readonly record struct OffsetSpec<TRow>(
 /// <typeparam name="TInRow">The input (base) row type.</typeparam>
 /// <typeparam name="TOutRow">The widened output row type (base ⧺ offset columns).</typeparam>
 /// <typeparam name="TKey">The PARTITION BY key type.</typeparam>
-internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, ISnapshotable, IIntrospectable
+internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder
     where TInRow : notnull
     where TOutRow : notnull
     where TKey : notnull
@@ -81,6 +81,10 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
     // Lazy restore (docs/design-durable-state.md §1f, increment 5): partitions still cold, read the
     // first time a delta touches them; null when everything is in memory.
     private LazyPartitions<TKey, TInRow>? _lazy;
+
+    /// <inheritdoc/>
+    public object? OrderFor(string fileName) =>
+        fileName == "trace.arrows" ? LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) : null;
     private readonly Dictionary<TKey, Dictionary<TOutRow, long>> _window;
 
     // Last tick's output count, used to pre-size this tick's delta builder
@@ -275,8 +279,11 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         return result;
     }
 
+    // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TInRow, Z64> SnapshotNow() =>
-        ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
+        _accum.Count == 0
+            ? ZSet<TInRow, Z64>.NewMutable()
+            : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
 
     // A partition a lazily restored operator has not touched yet: read its rows from cold and
     // rebuild its window — what the eager load does for every partition — before the delta lands.

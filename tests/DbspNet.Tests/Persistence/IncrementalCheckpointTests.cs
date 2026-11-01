@@ -440,6 +440,13 @@ public class IncrementalCheckpointTests
         using (restored)
         {
             Assert.Equal(3, await ParallelReshard.RewriteAsync(fs, restored!));
+
+            // Increment 7: the re-shard writes chains (base runs + run indexes), so the restore
+            // after it is lazy and the checkpoints after it extend them rather than rewrite.
+            var reshardChains = await ChainsAsync(fs);
+            Assert.NotEmpty(reshardChains);
+            Assert.All(reshardChains.Values, chain => Assert.Single(chain));
+
             await ParallelSnapshot.ReadAsync(restored!.Circuit, fs);
             Assert.Equal(Digest(reference), Digest(restored));
             await AssertRunsAreExactlyTheReferencedOnesAsync(fs);
@@ -451,6 +458,9 @@ public class IncrementalCheckpointTests
                 await ParallelSnapshot.WriteAsync(restored.Circuit, fs);
                 await AssertRunsAreExactlyTheReferencedOnesAsync(fs);
             }
+
+            var extended = (await ChainsAsync(fs)).Where(c => reshardChains.TryGetValue(c.Key, out var b) && c.Value.Length > 1 && c.Value[0] == b[0]).ToList();
+            Assert.True(extended.Count > 0, "no chain the re-shard wrote was extended by a later checkpoint");
 
             Assert.True(SqlProgram.TryCompileParallel(Sql, Views, 2, out var last, ArrowSqlSnapshotCodecs.Instance));
             using (last)

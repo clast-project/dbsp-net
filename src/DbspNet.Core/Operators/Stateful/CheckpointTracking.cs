@@ -57,6 +57,17 @@ internal static class CheckpointTracking
     private static readonly ConditionalWeakTable<object, object> RestoredChains = new();
     private static volatile bool _anyRestored;
 
+    /// <summary>A shared singleton (<c>ZSet.Empty</c>) is never a state: registering it would hand
+    /// one operator's tracking to every empty Z-set in the process. Callers give an empty
+    /// snapshot a fresh object instead.</summary>
+    internal static void RefuseShared(object state, object shared)
+    {
+        if (ReferenceEquals(state, shared))
+        {
+            throw new InvalidOperationException("a shared empty Z-set cannot carry checkpoint tracking; snapshot into a fresh one");
+        }
+    }
+
     /// <summary>Called once per trace, at construction.</summary>
     internal static void Register(object state, ICheckpointTracked trace) => Traces.AddOrUpdate(state, trace);
 
@@ -170,6 +181,7 @@ internal sealed class ZSetChangeTracker<TKey, TWeight> : IZSetCheckpointTracked<
     public void Attach(
         ZSet<TKey, TWeight> snapshot, Func<TKey, int>? orderHash = null, Func<ZSet<TKey, TWeight>>? fullState = null, long? size = null)
     {
+        CheckpointTracking.RefuseShared(snapshot, ZSet<TKey, TWeight>.Empty);
         _attachedSize = (int)Math.Min(int.MaxValue, size ?? snapshot.Count);
         OrderHash = orderHash;
         FullState = fullState;
