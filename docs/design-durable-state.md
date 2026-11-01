@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (DESIGN 2026-10-31, awaiting go-ahead)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increment 1 built)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -565,7 +565,34 @@ runs at the new W; the placement specs (§1d) are unchanged.
 6. **Outputs after restore** — streaming first write; then sink alignment to skip it.
 7. **Re-shard over runs; compaction off the step thread** if increment 3 left it inline.
 
-### Proposed targets (to confirm)
+### Increment 1 — built (2026-10-31)
+
+`DbspNet.Persistence.Runs`: `RunFile.WriteZSetAsync` / `WriteIndexedAsync` and `RunReader`
+(open = trailer + footer only; `WeightOfAsync` / `GroupForAsync` decode one block; `ScanZSetAsync` /
+`ScanIndexedAsync`). Blocks are the operator's own codec output; the order is the unsigned stable
+hash; a block never splits a hash value; the footer holds the block index, counts and a Bloom
+filter (10 bits/key, 7 probes). `RunFileTests` (12): Z-set and indexed runs from empty to 5,000
+entries at block sizes 1–1,024, with the stable hash and with a 5-value colliding hash, read back
+exactly by point lookup and scan (absent keys absent; an indexed group of 3,000 values never split);
+truncated and corrupted files refused; Bloom false positives under 3%. Letting a block cut between
+equal hashes fails all three collision cases.
+
+Microbenchmark (`Scratch/RunFileBench`, `RUNFILE_BENCH=1`; 1 M ten-column rows, single run, warm
+page cache). Today's monolithic file: 96.7 MiB, write 725 ms, full load 275 ms.
+
+| block | size vs today | write | open | probe, present | probe, absent | full scan |
+|---|--:|--:|--:|--:|--:|--:|
+| 256 | +7.8% | 1,272 ms | 1.74 ms | 98 µs | 1.6 µs | 374 ms |
+| **1,024 (default)** | +2.8% | 764 ms | 0.49 ms | 134 µs | 1.8 µs | 128 ms |
+| 4,096 | +1.6% | 597 ms | 0.42 ms | 590 µs | 7.8 µs | 135 ms |
+
+Read against the targets: opening a run is ~0.5 ms, so restoring ivm-bench's ~200 operator files is
+~0.1 s of footers — inside the 1 s target with room. A present-key probe decodes a whole block,
+~134 µs; ~85 µs of it is per-block fixed cost (the 256-entry block is not 4× cheaper), mostly the
+per-block Arrow IPC schema message and a scratch copy — worth trimming before increment 4, since the
+resumed ivm-bench batches touch ~1,200 keys (~0.16 s at this rate). Absent keys cost ~2 µs (Bloom).
+
+### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
 - **Checkpoint:** proportional to the change — under 0.5 s for a batch-2/3-sized change (today
