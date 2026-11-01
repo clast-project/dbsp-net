@@ -1,39 +1,53 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Buffers.Binary;
+using Apache.Arrow.Ipc;
+using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.IO;
-using DbspNet.Core.Operators.Stateful;
 using DbspNet.Persistence.IO;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Persistence.Runs;
 
 /// <summary>
 /// A <b>run</b>: an immutable file holding one Z-set (or indexed Z-set) — a trace's state, or the
 /// change to it since the last checkpoint — laid out so a single key can be read without decoding
-/// the rest (docs/design-durable-state.md §1f, increment 1).
+/// the rest (docs/design-durable-state.md §1f).
 /// </summary>
 /// <remarks>
 /// <para><b>Layout.</b> Entries are ordered by the key's stable hash (as an unsigned 32-bit value)
 /// and cut into blocks of about <c>blockEntries</c> entries. A block never splits one hash value,
-/// so colliding keys — and every value of an indexed key — share a block. Each block is the
-/// operator's own codec output (an Arrow IPC stream in the operator's schema), so a block decodes
-/// exactly as today's snapshot file does. After the blocks comes a footer: counts, the block index
-/// (hash range, offset, length, counts per block) and a Bloom filter over the key hashes; then a
-/// 16-byte trailer (footer length, magic).</para>
+/// so colliding keys — and every value of an indexed key — share a block. The file opens as one
+/// Arrow IPC stream in the operator's schema: the schema message once, then one record batch per
+/// block, then the end-of-stream marker — so any Arrow reader sees the whole trace. After it comes
+/// a footer: counts, the schema message's length, the block index (hash range, offset, length,
+/// counts per block) and a Bloom filter over the key hashes; then a 16-byte trailer (footer length,
+/// magic).</para>
 /// <para><b>Reading one key</b> costs a Bloom check, a binary search of the index and one block
-/// decode. The hash must be stable across processes (<c>StablePartitionHash</c>); the writer and
-/// reader are handed the same function.</para>
+/// decode (the cached schema message plus that block's record batch). The hash must be stable
+/// across processes; the trace codecs use the row's own cached hash (<c>StructuralRowHash</c>,
+/// deterministic). The footer records the hash of <see cref="FingerprintRow"/> — one cell of every
+/// type — so a run written under a different hash function is refused at open instead of being
+/// probed in the wrong order.</para>
+/// <para><b>Writing</b> sorts (hash, position) pairs and encodes each block straight from the
+/// trace's own rows: no intermediate Z-set, no scratch file, one schema per file.</para>
 /// </remarks>
-public static class RunFile
+internal static class RunFile
 {
     internal static ReadOnlySpan<byte> Magic => "DBSPRUN1"u8;
 
-    internal const int FormatVersion = 1;
+    internal const int FormatVersion = 2;
     internal const int TrailerBytes = 16;
     internal const int BlockIndexEntryBytes = 4 + 4 + 8 + 4 + 4 + 4;
     internal const int DefaultBlockEntries = 1024;
+
+    /// <summary>A row with one cell of every engine type (and a null): its hash pins the hash
+    /// function a run was ordered by.</summary>
+    internal static readonly StructuralRow FingerprintRow = new(
+        7, 1L, true, 1.5, Utf8String.Of("a"), new Date32(1), new Timestamp(1), new Time64(1),
+        new Decimal128((Int128)1), null);
 
     /// <summary>What kind of collection a run holds.</summary>
     public enum Kind
@@ -47,7 +61,7 @@ public static class RunFile
         ITableFileSystem fs,
         string path,
         ZSet<StructuralRow, Z64> set,
-        IZSetTraceCodec<StructuralRow, Z64> codec,
+        IZSetRunCodec codec,
         Func<StructuralRow, int> hash,
         int blockEntries = DefaultBlockEntries,
         CancellationToken cancellationToken = default)
@@ -61,7 +75,7 @@ public static class RunFile
         Core.Circuit.ISnapshotWriter writer,
         string fileName,
         ZSet<StructuralRow, Z64> set,
-        IZSetTraceCodec<StructuralRow, Z64> codec,
+        IZSetRunCodec codec,
         Func<StructuralRow, int> hash,
         int blockEntries = DefaultBlockEntries,
         CancellationToken cancellationToken = default) =>
@@ -70,33 +84,52 @@ public static class RunFile
     private static async ValueTask<RunInfo> WriteZSetAsync(
         Func<CancellationToken, ValueTask<ISequentialFile>> create,
         ZSet<StructuralRow, Z64> set,
-        IZSetTraceCodec<StructuralRow, Z64> codec,
+        IZSetRunCodec codec,
         Func<StructuralRow, int> hash,
-        int blockEntries = DefaultBlockEntries,
-        CancellationToken cancellationToken = default)
+        int blockEntries,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(set);
         ArgumentNullException.ThrowIfNull(codec);
-        var entries = new List<(uint Hash, StructuralRow Key, Z64 Weight)>(set.Count);
+        var t = RunWriteProfile.Now();
+        var n = set.Count;
+        var hashes = new uint[n];
+        var rows = new StructuralRow[n];
+        var weights = new long[n];
+        var i = 0;
         foreach (var (key, weight) in set)
         {
-            entries.Add(((uint)hash(key), key, weight));
+            hashes[i] = (uint)hash(key);
+            rows[i] = key;
+            weights[i] = weight.Value;
+            i++;
         }
 
-        entries.Sort(static (a, b) => a.Hash.CompareTo(b.Hash));
-        var blocks = Cut(entries, e => e.Hash, _ => 1, blockEntries);
+        RunWriteProfile.Add(0, t);
+        t = RunWriteProfile.Now();
+        var order = Identity(n);
+        Array.Sort(hashes, order);
+        RunWriteProfile.Add(1, t);
+        t = RunWriteProfile.Now();
+        var cuts = Cut(hashes, _ => 1, blockEntries, out var largest);
+        RunWriteProfile.Add(2, t);
+        RunWriteProfile.Write(n);
+
+        var blockRows = new StructuralRow[largest];
+        var blockWeights = new long[largest];
         return await WriteAsync(
-            create, Kind.ZSet, entries.Count, entries.Count, blocks, entries.Select(e => e.Hash),
-            async (from, to, scratch, ct) =>
+            create, Kind.ZSet, codec.RunSchema, hash(FingerprintRow), n, n, hashes, cuts,
+            (from, to) =>
             {
-                var b = new ZSetBuilder<StructuralRow, Z64>(to - from);
-                for (var i = from; i < to; i++)
+                var count = to - from;
+                for (var j = 0; j < count; j++)
                 {
-                    b.Add(entries[i].Key, entries[i].Weight);
+                    var at = order[from + j];
+                    blockRows[j] = rows[at];
+                    blockWeights[j] = weights[at];
                 }
 
-                await codec.SaveAsync(scratch, "b", b.Build(), ct).ConfigureAwait(false);
-                return (to - from, to - from);
+                return (codec.EncodeBlock(blockRows, blockWeights, count), count);
             },
             cancellationToken).ConfigureAwait(false);
     }
@@ -107,7 +140,7 @@ public static class RunFile
         ITableFileSystem fs,
         string path,
         IndexedZSet<StructuralRow, StructuralRow, Z64> set,
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
+        IIndexedRunCodec codec,
         Func<StructuralRow, int> hash,
         int blockEntries = DefaultBlockEntries,
         CancellationToken cancellationToken = default)
@@ -121,7 +154,7 @@ public static class RunFile
         Core.Circuit.ISnapshotWriter writer,
         string fileName,
         IndexedZSet<StructuralRow, StructuralRow, Z64> set,
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
+        IIndexedRunCodec codec,
         Func<StructuralRow, int> hash,
         int blockEntries = DefaultBlockEntries,
         CancellationToken cancellationToken = default) =>
@@ -130,66 +163,101 @@ public static class RunFile
     private static async ValueTask<RunInfo> WriteIndexedAsync(
         Func<CancellationToken, ValueTask<ISequentialFile>> create,
         IndexedZSet<StructuralRow, StructuralRow, Z64> set,
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
+        IIndexedRunCodec codec,
         Func<StructuralRow, int> hash,
-        int blockEntries = DefaultBlockEntries,
-        CancellationToken cancellationToken = default)
+        int blockEntries,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(set);
         ArgumentNullException.ThrowIfNull(codec);
-        var groups = new List<(uint Hash, StructuralRow Key, ZSet<StructuralRow, Z64> Values)>(set.GroupCount);
+        var t = RunWriteProfile.Now();
+        var g = set.GroupCount;
+        var hashes = new uint[g];
+        var keys = new StructuralRow[g];
+        var groups = new ZSet<StructuralRow, Z64>[g];
         long total = 0;
-        foreach (var g in set)
+        var i = 0;
+        foreach (var group in set)
         {
-            groups.Add(((uint)hash(g.Key), g.Key, g.Value));
-            total += g.Value.Count;
+            hashes[i] = (uint)hash(group.Key);
+            keys[i] = group.Key;
+            groups[i] = group.Value;
+            total += group.Value.Count;
+            i++;
         }
 
-        groups.Sort(static (a, b) => a.Hash.CompareTo(b.Hash));
-        var blocks = Cut(groups, g => g.Hash, g => g.Values.Count, blockEntries);
+        RunWriteProfile.Add(0, t);
+        t = RunWriteProfile.Now();
+        var order = Identity(g);
+        Array.Sort(hashes, order);
+        RunWriteProfile.Add(1, t);
+        t = RunWriteProfile.Now();
+        var cuts = Cut(hashes, j => groups[order[j]].Count, blockEntries, out var largest);
+        RunWriteProfile.Add(2, t);
+        RunWriteProfile.Write(total);
+
+        var blockKeys = new StructuralRow[largest];
+        var blockValues = new StructuralRow[largest];
+        var blockWeights = new long[largest];
         return await WriteAsync(
-            create, Kind.Indexed, total, groups.Count, blocks, groups.Select(g => g.Hash),
-            async (from, to, scratch, ct) =>
+            create, Kind.Indexed, codec.RunSchema, hash(FingerprintRow), total, g, hashes, cuts,
+            (from, to) =>
             {
-                var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-                var n = 0;
-                for (var i = from; i < to; i++)
+                var count = 0;
+                for (var j = from; j < to; j++)
                 {
-                    foreach (var (v, w) in groups[i].Values)
+                    var at = order[j];
+                    var key = keys[at];
+                    foreach (var (value, weight) in groups[at])
                     {
-                        b.Add(groups[i].Key, v, w);
-                        n++;
+                        blockKeys[count] = key;
+                        blockValues[count] = value;
+                        blockWeights[count] = weight.Value;
+                        count++;
                     }
                 }
 
-                await codec.SaveAsync(scratch, "b", b.Build(), ct).ConfigureAwait(false);
-                return (n, to - from);
+                return (codec.EncodeBlock(blockKeys, blockValues, blockWeights, count), count);
             },
             cancellationToken).ConfigureAwait(false);
     }
 
-    // Block boundaries [from, to) over sorted items: close a block once it holds blockEntries
-    // entries, but only where the hash changes.
-    private static List<(int From, int To)> Cut<T>(List<T> sorted, Func<T, uint> hashOf, Func<T, int> sizeOf, int blockEntries)
+    private static int[] Identity(int n)
+    {
+        var order = new int[n];
+        for (var i = 0; i < n; i++)
+        {
+            order[i] = i;
+        }
+
+        return order;
+    }
+
+    // Block boundaries [from, to) over sorted hashes: close a block once it holds blockEntries
+    // entries, but only where the hash changes. largest = the most entries any block holds.
+    private static List<(int From, int To)> Cut(uint[] sorted, Func<int, int> sizeOf, int blockEntries, out int largest)
     {
         var blocks = new List<(int, int)>();
         var start = 0;
         var size = 0;
-        for (var i = 0; i < sorted.Count; i++)
+        largest = 0;
+        for (var i = 0; i < sorted.Length; i++)
         {
-            if (size >= blockEntries && hashOf(sorted[i]) != hashOf(sorted[i - 1]))
+            if (size >= blockEntries && sorted[i] != sorted[i - 1])
             {
                 blocks.Add((start, i));
+                largest = Math.Max(largest, size);
                 start = i;
                 size = 0;
             }
 
-            size += sizeOf(sorted[i]);
+            size += sizeOf(i);
         }
 
-        if (start < sorted.Count)
+        if (start < sorted.Length)
         {
-            blocks.Add((start, sorted.Count));
+            blocks.Add((start, sorted.Length));
+            largest = Math.Max(largest, size);
         }
 
         return blocks;
@@ -198,44 +266,61 @@ public static class RunFile
     private static async ValueTask<RunInfo> WriteAsync(
         Func<CancellationToken, ValueTask<ISequentialFile>> create,
         Kind kind,
+        Apache.Arrow.Schema schema,
+        int fingerprint,
         long totalEntries,
         long totalGroups,
+        uint[] sortedHashes,
         List<(int From, int To)> cuts,
-        IEnumerable<uint> hashes,
-        Func<int, int, TableFileSystemSnapshotContext, CancellationToken, ValueTask<(int Entries, int Groups)>> encode,
+        Func<int, int, (Apache.Arrow.RecordBatch Batch, int Entries)> encode,
         CancellationToken cancellationToken)
     {
-        var hashList = hashes.ToList();
         var index = new List<RunBlock>(cuts.Count);
-        long offset = 0;
-        await using (var file = await create(cancellationToken).ConfigureAwait(false))
+        await using var file = await create(cancellationToken).ConfigureAwait(false);
+
+        // Not disposed: disposing the adapter disposes the file, which the using above owns.
+        var stream = file.AsStream();
+        long schemaLength;
+        using (var ipc = new ArrowStreamWriter(stream, schema, leaveOpen: true))
         {
+            await ipc.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+            schemaLength = file.Position;
             foreach (var (from, to) in cuts)
             {
-                var scratchFs = new InMemoryTableFileSystem();
-                var scratch = new TableFileSystemSnapshotContext(scratchFs, "s");
-                var (entries, groups) = await encode(from, to, scratch, cancellationToken).ConfigureAwait(false);
-                var bytes = await scratchFs.ReadAllBytesAsync("s/b", cancellationToken).ConfigureAwait(false);
-                await file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
-                index.Add(new RunBlock(hashList[from], hashList[to - 1], offset, bytes.Length, entries, groups));
-                offset += bytes.Length;
+                var t = RunWriteProfile.Now();
+                var (batch, entries) = encode(from, to);
+                RunWriteProfile.Add(3, t);
+                t = RunWriteProfile.Now();
+                using (batch)
+                {
+                    var offset = file.Position;
+                    await ipc.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                    index.Add(new RunBlock(
+                        sortedHashes[from], sortedHashes[to - 1], offset, checked((int)(file.Position - offset)), entries, to - from));
+                }
+
+                RunWriteProfile.Add(4, t);
             }
 
-            var bloom = RunBloom.Build(hashList);
-            var footer = EncodeFooter(kind, totalEntries, totalGroups, index, bloom);
-            await file.WriteAsync(footer, cancellationToken).ConfigureAwait(false);
-            var trailer = new byte[TrailerBytes];
-            BinaryPrimitives.WriteInt64LittleEndian(trailer, footer.Length);
-            Magic.CopyTo(trailer.AsSpan(8));
-            await file.WriteAsync(trailer, cancellationToken).ConfigureAwait(false);
-            await file.FlushAsync(cancellationToken).ConfigureAwait(false);
-            return new RunInfo(kind, totalEntries, totalGroups, index.Count, offset + footer.Length + TrailerBytes);
+            await ipc.WriteEndAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        var tf = RunWriteProfile.Now();
+        var bloom = RunBloom.Build(sortedHashes);
+        var footer = EncodeFooter(kind, fingerprint, totalEntries, totalGroups, schemaLength, index, bloom);
+        await file.WriteAsync(footer, cancellationToken).ConfigureAwait(false);
+        var trailer = new byte[TrailerBytes];
+        BinaryPrimitives.WriteInt64LittleEndian(trailer, footer.Length);
+        Magic.CopyTo(trailer.AsSpan(8));
+        await file.WriteAsync(trailer, cancellationToken).ConfigureAwait(false);
+        await file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        RunWriteProfile.Add(5, tf);
+        return new RunInfo(kind, totalEntries, totalGroups, index.Count, file.Position);
     }
 
-    private static byte[] EncodeFooter(Kind kind, long entries, long groups, List<RunBlock> index, RunBloom bloom)
+    private static byte[] EncodeFooter(Kind kind, int fingerprint, long entries, long groups, long schemaLength, List<RunBlock> index, RunBloom bloom)
     {
-        var size = 8 + 4 + 4 + 8 + 8 + 4 + (index.Count * BlockIndexEntryBytes) + 4 + 4 + (bloom.Bits.Length * 8);
+        var size = 8 + 4 + 4 + 4 + 8 + 8 + 8 + 4 + (index.Count * BlockIndexEntryBytes) + 4 + 4 + (bloom.Bits.Length * 8);
         var buf = new byte[size];
         var s = buf.AsSpan();
         Magic.CopyTo(s);
@@ -244,9 +329,13 @@ public static class RunFile
         at += 4;
         BinaryPrimitives.WriteInt32LittleEndian(s[at..], (int)kind);
         at += 4;
+        BinaryPrimitives.WriteInt32LittleEndian(s[at..], fingerprint);
+        at += 4;
         BinaryPrimitives.WriteInt64LittleEndian(s[at..], entries);
         at += 8;
         BinaryPrimitives.WriteInt64LittleEndian(s[at..], groups);
+        at += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(s[at..], schemaLength);
         at += 8;
         BinaryPrimitives.WriteInt32LittleEndian(s[at..], index.Count);
         at += 4;
@@ -276,14 +365,14 @@ public static class RunFile
 }
 
 /// <summary>What a run holds, as the writer reports it.</summary>
-public readonly record struct RunInfo(RunFile.Kind Kind, long Entries, long Groups, int Blocks, long Bytes);
+internal readonly record struct RunInfo(RunFile.Kind Kind, long Entries, long Groups, int Blocks, long Bytes);
 
 /// <summary>One block of a run: the hash range it covers, where it is, and how much it holds.</summary>
-public readonly record struct RunBlock(uint FirstHash, uint LastHash, long Offset, int Length, int Entries, int Groups);
+internal readonly record struct RunBlock(uint FirstHash, uint LastHash, long Offset, int Length, int Entries, int Groups);
 
 /// <summary>A Bloom filter over 32-bit key hashes (~10 bits per key, 7 probes): rejects most
 /// probes for keys a run does not hold without touching a block.</summary>
-public sealed class RunBloom
+internal sealed class RunBloom
 {
     internal RunBloom(ulong[] bits, int hashCount)
     {

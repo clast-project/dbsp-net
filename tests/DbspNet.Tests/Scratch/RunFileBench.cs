@@ -49,7 +49,7 @@ public class RunFileBench(ITestOutputHelper output)
         {
             var fs = new LocalTableFileSystem(dir);
             var codec = new ArrowZSetTraceCodec(Wide);
-            Func<StructuralRow, int> hash = row => StablePartitionHash.OfWholeRow(row, Wide);
+            Func<StructuralRow, int> hash = row => row.GetHashCode();
             var rng = new Random(5);
             var b = new ZSetBuilder<StructuralRow, Z64>(rows);
             var keys = new StructuralRow[rows];

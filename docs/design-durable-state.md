@@ -631,6 +631,44 @@ block straight from a slice of the sorted entries (no intermediate Z-set, no scr
 and write one Arrow schema per run rather than per block. Target: a full run-format snapshot within
 ~10% of today's write time.
 
+### Increment 2 — write fix (2026-10-31)
+
+Phase timers (`DBSPNET_RUN_PROFILE=<file>`, CPU summed over all writer threads, 3 checkpoints of
+106 M entries) on the writer as first built: `collect` (stable hash per row) 40 s, `sort` 11 s,
+**`encode` 236 s** (the per-block Z-set rebuild + codec + scratch file system), `write` 14 s —
+303 s against 95 s for today's monolithic writes. The rewrite:
+
+- **Blocks encode straight from the sorted entries.** The codecs implement `IZSetRunCodec` /
+  `IIndexedRunCodec` (`EncodeBlock` from row slices via `ArrowColumns.Build(type, rows, column)`;
+  `DecodeBlock` into a caller's builder). No intermediate Z-set, no scratch file system.
+- **One Arrow stream per run.** The schema message once, a record batch per block, the
+  end-of-stream marker; the footer records the schema message's length and the reader caches it
+  at open. A run's prefix is now a plain Arrow stream any reader can open (`RunFileTests`).
+- **Sort `(hash, position)` with `Array.Sort(uint[], int[])`** instead of a list of tuples with a
+  comparison delegate.
+- **Restore decodes every block into one builder** (it used to build a Z-set per block and re-add it).
+
+Measured on SF=3, W=12, 5 alternating runs per arm (raw + profiles:
+`docs/runs-writefix-w12-20261031.txt`):
+
+| | today | runs as first built | runs, write fix |
+|---|--:|--:|--:|
+| checkpoint after batch 1 / 2 / 3 | 5.07 / 3.09 / 4.31 s | 12.95 / 9.58 / 10.02 s | 5.91 / 5.78 / 5.87 s |
+| restore | 5.61 s | 6.66 s | 6.35 s |
+
+All restores matched. `encode` is now ~95 s — the same as today's whole write — and what is left
+on top is the per-row stable hash (`collect`, ~18 s; `StablePartitionHash.OfWholeRow` allocates an
+`int[]` per row) and the sort (~4 s).
+
+**Then the hash itself:** the run order is now the row's own cached hash (`StructuralRowHash`,
+already deterministic across processes — strings are XxHash3 seed 0, everything else a value
+type), so a run write hashes nothing and a probe hashes nothing. To keep that safe against a
+future change to the hash function, the footer records the hash of a fixed row holding one cell of
+every engine type, and a reader whose hash disagrees refuses the run
+(`ARunOrderedByAnotherHash_IsRefused`). The 1 M-row microbenchmark now writes a run faster than
+today's file (386 vs 686 ms; absent-key probe 1.0 µs); the SF=3 effect of the hash change is
+measured with increment 3, whose base checkpoints are exactly these writes.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

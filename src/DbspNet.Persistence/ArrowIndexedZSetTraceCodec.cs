@@ -32,7 +32,7 @@ namespace DbspNet.Persistence;
 /// rename is purely cosmetic on the wire.
 /// </remarks>
 internal sealed class ArrowIndexedZSetTraceCodec
-    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>
+    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>, Runs.IIndexedRunCodec
 {
     private readonly SqlSchema _keySchema;
     private readonly SqlSchema _valueSchema;
@@ -61,34 +61,53 @@ internal sealed class ArrowIndexedZSetTraceCodec
         if (Runs.StateLayout.Runs)
         {
             ArgumentNullException.ThrowIfNull(trace);
-            await Runs.RunFile.WriteIndexedAsync(writer, fileName, trace, _monolithic, Hash, cancellationToken: cancellationToken)
+            await Runs.RunFile.WriteIndexedAsync(writer, fileName, trace, this, Hash, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
 
+        var t = Runs.RunWriteProfile.Now();
         await SaveMonolithicAsync(writer, fileName, trace, cancellationToken).ConfigureAwait(false);
+        Runs.RunWriteProfile.Add(6, t);
     }
 
-    // The run's hash: the key's stable partition hash under this codec's key schema.
-    private int Hash(StructuralRow key) => DbspNet.Sql.Compiler.StablePartitionHash.OfWholeRow(key, _keySchema);
+    // The run's order: the row's own cached hash (StructuralRowHash — deterministic across
+    // processes, and already computed, so a run write hashes nothing).
+    private static int Hash(StructuralRow row) => row.GetHashCode();
 
-    // This codec without the run dispatch: what a run encodes each block with.
-    private Monolithic? _monolithicField;
+    /// <inheritdoc/>
+    public ArrowSchema RunSchema => _arrowSchemaWithWeight;
 
-    private Monolithic _monolithic => _monolithicField ??= new Monolithic(this);
-
-    private sealed class Monolithic(ArrowIndexedZSetTraceCodec codec) : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>
+    /// <inheritdoc/>
+    public RecordBatch EncodeBlock(StructuralRow[] keys, StructuralRow[] values, long[] weights, int count)
     {
-        public string SchemaFingerprint => codec.SchemaFingerprint;
+        var keySlice = new ArraySegment<StructuralRow>(keys, 0, count);
+        var valueSlice = new ArraySegment<StructuralRow>(values, 0, count);
+        var keyCount = _keySchema.Count;
+        var valueCount = _valueSchema.Count;
+        var arrays = new IArrowArray[keyCount + valueCount + 1];
+        for (var c = 0; c < keyCount; c++)
+        {
+            arrays[c] = ArrowColumns.Build(_keySchema[c].Type, keySlice, c);
+        }
 
-        public ValueTask SaveAsync(
-            ISnapshotWriter writer, string fileName, IndexedZSet<StructuralRow, StructuralRow, Z64> trace, CancellationToken cancellationToken = default) =>
-            codec.SaveMonolithicAsync(writer, fileName, trace, cancellationToken);
+        for (var c = 0; c < valueCount; c++)
+        {
+            arrays[keyCount + c] = ArrowColumns.Build(_valueSchema[c].Type, valueSlice, c);
+        }
 
-        public ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> LoadAsync(
-            ISnapshotReader reader, string fileName, CancellationToken cancellationToken = default) =>
-            codec.LoadMonolithicAsync(reader, fileName, cancellationToken);
+        var w = new Int64Array.Builder().Reserve(count);
+        for (var i = 0; i < count; i++)
+        {
+            w.Append(weights[i]);
+        }
+
+        arrays[keyCount + valueCount] = w.Build();
+        return new RecordBatch(_arrowSchemaWithWeight, arrays, count);
     }
+
+    /// <inheritdoc/>
+    public void DecodeBlock(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) => AddBatch(batch, into);
 
     private async ValueTask SaveMonolithicAsync(
         ISnapshotWriter writer,
@@ -185,19 +204,7 @@ internal sealed class ArrowIndexedZSetTraceCodec
         if (await Runs.RunReader.IsRunAsync(probe, cancellationToken).ConfigureAwait(false))
         {
             await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
-            var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-            await foreach (var block in run.ScanIndexedAsync(_monolithic, cancellationToken).ConfigureAwait(false))
-            {
-                foreach (var g in block)
-                {
-                    foreach (var (value, weight) in g.Value)
-                    {
-                        b.Add(g.Key, value, weight);
-                    }
-                }
-            }
-
-            return b.Build();
+            return await run.ReadAllIndexedAsync(this, cancellationToken).ConfigureAwait(false);
         }
 
         await probe.DisposeAsync().ConfigureAwait(false);
@@ -392,6 +399,13 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
     private IndexedZSet<StructuralRow, StructuralRow, Z64> BuildIndexedZSet(RecordBatch batch)
     {
+        var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        AddBatch(batch, b);
+        return b.Build();
+    }
+
+    private void AddBatch(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b)
+    {
         var keyCount = _keySchema.Count;
         var valueCount = _valueSchema.Count;
         var rowCount = batch.Length;
@@ -413,7 +427,6 @@ internal sealed class ArrowIndexedZSetTraceCodec
         var weightArray = (Int64Array)batch.Column(keyCount + valueCount);
         var weightValues = weightArray.Values;
 
-        var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
         for (var i = 0; i < rowCount; i++)
         {
             var keyValues = new object?[keyCount];
@@ -433,8 +446,6 @@ internal sealed class ArrowIndexedZSetTraceCodec
                 new StructuralRow(rowValues),
                 new Z64(weightValues[i]));
         }
-
-        return b.Build();
     }
 
     /// <inheritdoc/>

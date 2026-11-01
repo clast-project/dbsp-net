@@ -26,7 +26,7 @@ public class RunFileTests
 
     private static Func<StructuralRow, int> Hash(string kind, Schema schema) => kind switch
     {
-        "stable" => row => StablePartitionHash.OfWholeRow(row, schema),
+        "stable" => row => row.GetHashCode(),
         // Few distinct hash values: most keys collide, and blocks can only cut between them.
         "collide" => row => (int)row[0]! % 5,
         _ => throw new ArgumentException(kind),
@@ -141,6 +141,34 @@ public class RunFileTests
         Assert.Equal(set.GroupCount, groups); // a group split across blocks would be counted twice
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(5000)]
+    public async Task ARun_OpensAsOnePlainArrowStream(int n)
+    {
+        // Schema once, a record batch per block, then end-of-stream: any Arrow reader sees the
+        // whole trace and stops before the footer.
+        var fs = new InMemoryTableFileSystem();
+        var codec = new ArrowZSetTraceCodec(RowSchema);
+        var set = RandomZSet(n, 3);
+        var info = await RunFile.WriteZSetAsync(fs, "run", set, codec, Hash("stable", RowSchema), 64);
+        using var stream = new MemoryStream(await fs.ReadAllBytesAsync("run"));
+        using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(stream);
+        long rows = 0;
+        var batches = 0;
+        while (reader.ReadNextRecordBatch() is { } batch)
+        {
+            using (batch)
+            {
+                rows += batch.Length;
+                batches++;
+            }
+        }
+
+        Assert.Equal(set.Count, rows);
+        Assert.Equal(info.Blocks, batches);
+    }
+
     [Fact]
     public async Task ACorruptRun_IsRefused()
     {
@@ -153,6 +181,17 @@ public class RunFileTests
         bytes[^1] ^= 0xFF;
         await fs.WriteAllBytesAsync("magic", bytes);
         await Assert.ThrowsAsync<InvalidDataException>(async () => await RunReader.OpenAsync(fs, "magic", Hash("stable", RowSchema)));
+    }
+
+    [Fact]
+    public async Task ARunOrderedByAnotherHash_IsRefused()
+    {
+        // An engine whose row hash changed would probe the wrong blocks; the footer's fingerprint
+        // (the hash of a row with one cell of every type) catches it at open.
+        var fs = new InMemoryTableFileSystem();
+        var codec = new ArrowZSetTraceCodec(RowSchema);
+        await RunFile.WriteZSetAsync(fs, "run", RandomZSet(100, 1), codec, row => row.GetHashCode(), 16);
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await RunReader.OpenAsync(fs, "run", row => row.GetHashCode() ^ 1));
     }
 
     [Fact]

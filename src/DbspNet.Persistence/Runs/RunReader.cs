@@ -1,38 +1,40 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Buffers.Binary;
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.IO;
-using DbspNet.Core.Operators.Stateful;
 using DbspNet.Persistence.IO;
 
 namespace DbspNet.Persistence.Runs;
 
 /// <summary>
-/// An open run (<see cref="RunFile"/>): its footer is read once — counts, block index, Bloom
-/// filter — and nothing else until a key is asked for. A point lookup decodes the one block whose
-/// hash range holds the key; <see cref="ScanZSetAsync"/> / <see cref="ScanIndexedAsync"/> decode the
-/// blocks in order.
+/// An open run (<see cref="RunFile"/>): its footer and schema message are read once — counts,
+/// block index, Bloom filter — and nothing else until a key is asked for. A point lookup decodes
+/// the one block whose hash range holds the key; <see cref="ScanZSetAsync"/> /
+/// <see cref="ScanIndexedAsync"/> decode the blocks in order.
 /// </summary>
-public sealed class RunReader : IAsyncDisposable, IDisposable
+internal sealed class RunReader : IAsyncDisposable, IDisposable
 {
     private readonly IRandomAccessFile _file;
     private readonly Func<StructuralRow, int> _hash;
     private readonly RunBlock[] _blocks;
     private readonly RunBloom _bloom;
+    private readonly byte[] _schemaMessage;
 
     private RunReader(
-        IRandomAccessFile file, Func<StructuralRow, int> hash, RunFile.Kind kind, long entries, long groups,
-        RunBlock[] blocks, RunBloom bloom)
+        IRandomAccessFile file, Func<StructuralRow, int> hash, Footer footer, byte[] schemaMessage)
     {
         _file = file;
         _hash = hash;
-        Kind = kind;
-        Entries = entries;
-        Groups = groups;
-        _blocks = blocks;
-        _bloom = bloom;
+        Kind = footer.Kind;
+        Entries = footer.Entries;
+        Groups = footer.Groups;
+        _blocks = footer.Blocks;
+        _bloom = footer.Bloom;
+        _schemaMessage = schemaMessage;
     }
 
     public RunFile.Kind Kind { get; }
@@ -45,8 +47,8 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
 
     public IReadOnlyList<RunBlock> Blocks => _blocks;
 
-    /// <summary>Open the run at <paramref name="path"/>; reads only the trailer and the footer.
-    /// <paramref name="hash"/> must be the function the run was written with.</summary>
+    /// <summary>Open the run at <paramref name="path"/>; reads only the trailer, the footer and the
+    /// schema message. <paramref name="hash"/> must be the function the run was written with.</summary>
     public static async ValueTask<RunReader> OpenAsync(
         ITableFileSystem fs, string path, Func<StructuralRow, int> hash, CancellationToken cancellationToken = default)
     {
@@ -100,9 +102,31 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
                 throw new InvalidDataException($"run '{path}' has a footer length of {footerLength}");
             }
 
-            using var footer = await file.ReadAsync(
-                new FileRange(length - RunFile.TrailerBytes - footerLength, footerLength), cancellationToken).ConfigureAwait(false);
-            return Parse(file, hash, path, footer.Memory.Span[..(int)footerLength]);
+            Footer footer;
+            using (var bytes = await file.ReadAsync(
+                new FileRange(length - RunFile.TrailerBytes - footerLength, footerLength), cancellationToken).ConfigureAwait(false))
+            {
+                footer = Parse(path, bytes.Memory.Span[..(int)footerLength]);
+            }
+
+            if (footer.Fingerprint != hash(RunFile.FingerprintRow))
+            {
+                throw new InvalidDataException(
+                    $"run '{path}' was ordered by a different hash function than this process has; it cannot be read in place");
+            }
+
+            if (footer.SchemaLength <= 0 || footer.SchemaLength > length - RunFile.TrailerBytes - footerLength)
+            {
+                throw new InvalidDataException($"run '{path}' has a schema message length of {footer.SchemaLength}");
+            }
+
+            var schema = new byte[footer.SchemaLength];
+            using (var bytes = await file.ReadAsync(new FileRange(0, footer.SchemaLength), cancellationToken).ConfigureAwait(false))
+            {
+                bytes.Memory.Span[..schema.Length].CopyTo(schema);
+            }
+
+            return new RunReader(file, hash, footer, schema);
         }
         catch
         {
@@ -111,7 +135,10 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
         }
     }
 
-    private static RunReader Parse(IRandomAccessFile file, Func<StructuralRow, int> hash, string path, ReadOnlySpan<byte> f)
+    private readonly record struct Footer(
+        RunFile.Kind Kind, int Fingerprint, long Entries, long Groups, int SchemaLength, RunBlock[] Blocks, RunBloom Bloom);
+
+    private static Footer Parse(string path, ReadOnlySpan<byte> f)
     {
         if (!f[..8].SequenceEqual(RunFile.Magic))
         {
@@ -128,10 +155,19 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
 
         var kind = (RunFile.Kind)BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
         at += 4;
+        var fingerprint = BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
+        at += 4;
         var entries = BinaryPrimitives.ReadInt64LittleEndian(f[at..]);
         at += 8;
         var groups = BinaryPrimitives.ReadInt64LittleEndian(f[at..]);
         at += 8;
+        var schemaLength = BinaryPrimitives.ReadInt64LittleEndian(f[at..]);
+        at += 8;
+        if (schemaLength is <= 0 or > int.MaxValue)
+        {
+            throw new InvalidDataException($"run '{path}' has a schema message length of {schemaLength}");
+        }
+
         var count = BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
         at += 4;
         var blocks = new RunBlock[count];
@@ -158,7 +194,7 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
             at += 8;
         }
 
-        return new RunReader(file, hash, kind, entries, groups, blocks, new RunBloom(bits, hashCount));
+        return new Footer(kind, fingerprint, entries, groups, (int)schemaLength, blocks, new RunBloom(bits, hashCount));
     }
 
     /// <summary>False when the run certainly does not hold <paramref name="key"/>.</summary>
@@ -170,7 +206,7 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
 
     /// <summary>The weight of <paramref name="key"/> in a Z-set run (zero if absent).</summary>
     public async ValueTask<Z64> WeightOfAsync(
-        StructuralRow key, IZSetTraceCodec<StructuralRow, Z64> codec, CancellationToken cancellationToken = default)
+        StructuralRow key, IZSetRunCodec codec, CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.ZSet);
         var h = (uint)_hash(key);
@@ -185,7 +221,7 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
 
     /// <summary>The values of <paramref name="key"/> in an indexed run (empty if absent).</summary>
     public async ValueTask<ZSet<StructuralRow, Z64>> GroupForAsync(
-        StructuralRow key, IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec, CancellationToken cancellationToken = default)
+        StructuralRow key, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.Indexed);
         var h = (uint)_hash(key);
@@ -200,7 +236,7 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
 
     /// <summary>Every block of a Z-set run, decoded, in hash order.</summary>
     public async IAsyncEnumerable<ZSet<StructuralRow, Z64>> ScanZSetAsync(
-        IZSetTraceCodec<StructuralRow, Z64> codec,
+        IZSetRunCodec codec,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.ZSet);
@@ -212,13 +248,53 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
 
     /// <summary>Every block of an indexed run, decoded, in hash order.</summary>
     public async IAsyncEnumerable<IndexedZSet<StructuralRow, StructuralRow, Z64>> ScanIndexedAsync(
-        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec,
+        IIndexedRunCodec codec,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.Indexed);
         foreach (var b in _blocks)
         {
             yield return await DecodeIndexedAsync(b, codec, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The whole Z-set run, every block decoded straight into one builder.</summary>
+    public async ValueTask<ZSet<StructuralRow, Z64>> ReadAllZSetAsync(IZSetRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        var into = new ZSetBuilder<StructuralRow, Z64>((int)Math.Min(int.MaxValue, Entries));
+        await ReadAllIntoAsync(codec, into, cancellationToken).ConfigureAwait(false);
+        return into.Build();
+    }
+
+    /// <summary>Add every entry of this Z-set run to <paramref name="into"/> (weights sum).</summary>
+    public async ValueTask ReadAllIntoAsync(IZSetRunCodec codec, ZSetBuilder<StructuralRow, Z64> into, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.ZSet);
+        foreach (var b in _blocks)
+        {
+            using var batch = await ReadBatchAsync(b, cancellationToken).ConfigureAwait(false);
+            codec.DecodeBlock(batch.Batch, into);
+        }
+    }
+
+    /// <summary>The whole indexed run, every block decoded straight into one builder.</summary>
+    public async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> ReadAllIndexedAsync(
+        IIndexedRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        var into = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        await ReadAllIntoAsync(codec, into, cancellationToken).ConfigureAwait(false);
+        return into.Build();
+    }
+
+    /// <summary>Add every entry of this indexed run to <paramref name="into"/> (weights sum).</summary>
+    public async ValueTask ReadAllIntoAsync(
+        IIndexedRunCodec codec, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.Indexed);
+        foreach (var b in _blocks)
+        {
+            using var batch = await ReadBatchAsync(b, cancellationToken).ConfigureAwait(false);
+            codec.DecodeBlock(batch.Batch, into);
         }
     }
 
@@ -258,25 +334,56 @@ public sealed class RunReader : IAsyncDisposable, IDisposable
         return -1;
     }
 
-    private async ValueTask<TableFileSystemSnapshotContext> BlockContextAsync(RunBlock block, CancellationToken cancellationToken)
+    // One block as a record batch: the cached schema message followed by the block's record-batch
+    // message is a well-formed Arrow stream (with no end marker; the reader stops after one batch).
+    // The reader stays alive with the batch, so nothing the batch points at is released early.
+    private async ValueTask<Block> ReadBatchAsync(RunBlock block, CancellationToken cancellationToken)
     {
-        using var bytes = await _file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false);
-        var scratch = new InMemoryTableFileSystem();
-        await scratch.WriteAllBytesAsync("s/b", bytes.Memory[..block.Length], cancellationToken).ConfigureAwait(false);
-        return new TableFileSystemSnapshotContext(scratch, "s");
+        var buffer = new byte[_schemaMessage.Length + block.Length];
+        _schemaMessage.CopyTo(buffer, 0);
+        using (var bytes = await _file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false))
+        {
+            bytes.Memory.Span[..block.Length].CopyTo(buffer.AsSpan(_schemaMessage.Length));
+        }
+
+        var reader = new ArrowStreamReader(new MemoryStream(buffer, writable: false), leaveOpen: false);
+        try
+        {
+            var batch = reader.ReadNextRecordBatch()
+                ?? throw new InvalidDataException($"run block at offset {block.Offset} holds no record batch");
+            return new Block(reader, batch);
+        }
+        catch
+        {
+            reader.Dispose();
+            throw;
+        }
+    }
+
+    private readonly record struct Block(ArrowStreamReader Reader, RecordBatch Batch) : IDisposable
+    {
+        public void Dispose()
+        {
+            Batch.Dispose();
+            Reader.Dispose();
+        }
     }
 
     private async ValueTask<ZSet<StructuralRow, Z64>> DecodeZSetAsync(
-        RunBlock block, IZSetTraceCodec<StructuralRow, Z64> codec, CancellationToken cancellationToken)
+        RunBlock block, IZSetRunCodec codec, CancellationToken cancellationToken)
     {
-        var ctx = await BlockContextAsync(block, cancellationToken).ConfigureAwait(false);
-        return await codec.LoadAsync(ctx, "b", cancellationToken).ConfigureAwait(false);
+        using var batch = await ReadBatchAsync(block, cancellationToken).ConfigureAwait(false);
+        var into = new ZSetBuilder<StructuralRow, Z64>(block.Entries);
+        codec.DecodeBlock(batch.Batch, into);
+        return into.Build();
     }
 
     private async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Z64>> DecodeIndexedAsync(
-        RunBlock block, IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec, CancellationToken cancellationToken)
+        RunBlock block, IIndexedRunCodec codec, CancellationToken cancellationToken)
     {
-        var ctx = await BlockContextAsync(block, cancellationToken).ConfigureAwait(false);
-        return await codec.LoadAsync(ctx, "b", cancellationToken).ConfigureAwait(false);
+        using var batch = await ReadBatchAsync(block, cancellationToken).ConfigureAwait(false);
+        var into = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        codec.DecodeBlock(batch.Batch, into);
+        return into.Build();
     }
 }
