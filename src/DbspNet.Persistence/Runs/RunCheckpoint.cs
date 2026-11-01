@@ -190,9 +190,12 @@ internal static class RunCheckpoint
     /// <summary>Merges not yet finished (diagnostics).</summary>
     internal static int MergesInFlight => Jobs.Count(j => !j.Value.Merge.IsCompleted);
 
-    /// <summary>Every merge in flight (tests and benchmarks wait on them).</summary>
+    /// <summary>Every merge in flight has finished, successfully or not (tests and benchmarks wait
+    /// on them). Never throws: the jobs are process-wide, so a merge of another program's store — one
+    /// whose directory was deleted under it, say — must not fail the caller; a failed merge is dropped
+    /// at its next checkpoint anyway.</summary>
     internal static Task WhenAllCompactedAsync() =>
-        Task.WhenAll(Jobs.Select(j => j.Value.Merge).ToArray());
+        Task.WhenAll(Jobs.Select(j => j.Value.Merge.ContinueWith(static _ => { }, TaskScheduler.Default)).ToArray());
 
     /// <summary>The merge in flight for <paramref name="trace"/>'s chain (tests wait on it).</summary>
     internal static Task WhenCompactedAsync(object trace) =>
