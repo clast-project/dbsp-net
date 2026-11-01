@@ -300,6 +300,7 @@ public static class ParallelSnapshot
             total += c;
         }
 
+        CheckpointGcMode.AfterLazyRestore();
         return total;
     }
 

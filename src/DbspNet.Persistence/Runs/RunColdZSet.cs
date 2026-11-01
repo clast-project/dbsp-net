@@ -70,13 +70,16 @@ internal sealed class RunColdZSet : IColdZSet<StructuralRow, Z64>
         return into.Build();
     }
 
+    // A single run's entries are already consolidated (one per row), so its blocks stream in
+    // stored order with no hashing — the first full write after a restore reads views this way.
     private IEnumerable<KeyValuePair<StructuralRow, Z64>> StreamOne(RunReader run)
     {
         for (var b = 0; b < run.Blocks.Count; b++)
         {
-            foreach (var entry in run.DecodeZSetBlockAsync(b, _codec).AsTask().GetAwaiter().GetResult())
+            var (entries, _) = run.ReadBlockAsync(b, _codec.DecodeEntries).AsTask().GetAwaiter().GetResult();
+            foreach (var (row, weight) in entries)
             {
-                yield return entry;
+                yield return new KeyValuePair<StructuralRow, Z64>(row, new Z64(weight));
             }
         }
     }

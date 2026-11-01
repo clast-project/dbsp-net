@@ -306,9 +306,7 @@ public class IncrementalCheckpointTests
     public async Task WithCompactionOff_LongChainsAreRewrittenInlineAtMaxRuns()
     {
         using var layout = StateLayout.Use(true);
-        var was = RunCheckpoint.CompactionEnabled;
-        RunCheckpoint.CompactionEnabled = false;
-        try
+        using var off = RunCheckpoint.UseCompaction(false); // this test's context only
         {
             var fs = new InMemoryTableFileSystem();
             var p = Compile();
@@ -323,10 +321,6 @@ public class IncrementalCheckpointTests
             var restored = Compile();
             await Snapshot.ReadAsync(restored.Circuit, fs);
             Assert.Equal(Digest(p), Digest(restored));
-        }
-        finally
-        {
-            RunCheckpoint.CompactionEnabled = was;
         }
     }
 

@@ -56,6 +56,10 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
 
     /// <summary>The full current view contents — every delta folded in so far —
     /// valid until the next <see cref="Step"/>.</summary>
+    /// <summary>Restore output views lazily (increment 6); <c>DBSPNET_LAZY_VIEWS=0</c> reads them
+    /// whole at restore instead.</summary>
+    internal static bool LazyViews { get; set; } = Environment.GetEnvironmentVariable("DBSPNET_LAZY_VIEWS") != "0";
+
     public ZSet<TRow, Z64> View => _view.Current;
 
     /// <summary>Every row of the view, without reading a lazily restored view into memory
@@ -111,7 +115,8 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         }
 
         // Lazily (increment 6): a row-ordered chain stays cold until rows are asked for.
-        if (_snapshotCodec is IColdZSetLoader<TRow, Z64> coldLoader
+        if (LazyViews
+            && _snapshotCodec is IColdZSetLoader<TRow, Z64> coldLoader
             && await coldLoader.LoadColdZSetAsync(reader, "view.arrows", cancellationToken).ConfigureAwait(false) is { } cold)
         {
             _view.AdoptCold(cold);

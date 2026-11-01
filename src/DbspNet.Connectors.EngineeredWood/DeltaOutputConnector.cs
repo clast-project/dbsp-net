@@ -126,6 +126,10 @@ public sealed class DeltaOutputConnector : IOutputConnector
             .ConfigureAwait(false);
     }
 
+    // Diagnostic: DBSPNET_OUTPUT_TRACE=<file> appends each incremental write's phase times.
+    private static readonly string? PhaseTrace = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_TRACE");
+    private static readonly object PhaseGate = new();
+
     public async ValueTask ApplyChangesAsync(
         RecordBatch inserts,
         IReadOnlyList<object> insertKeys,
@@ -153,7 +157,19 @@ public sealed class DeltaOutputConnector : IOutputConnector
         }
 
         var table = Table();
+        var phase = PhaseTrace is null ? null : System.Diagnostics.Stopwatch.StartNew();
+        var phases = new List<string>();
+        void Mark(string name)
+        {
+            if (phase is not null)
+            {
+                phases.Add(name + "=" + phase.ElapsedMilliseconds);
+                phase.Restart();
+            }
+        }
+
         await table.RefreshAsync(cancellationToken).ConfigureAwait(false);
+        Mark("refresh");
         await using var txn = table.StartTransaction();
 
         if (first)
@@ -162,6 +178,7 @@ public sealed class DeltaOutputConnector : IOutputConnector
             // The positions of rows written by an earlier process are unknown, so they go whole.
             await txn.DeleteAsync(global::EngineeredWood.Expressions.Expressions.True, cancellationToken).ConfigureAwait(false);
             _addresses.Clear();
+            Mark("truncate");
         }
         else if (deletes.Count > 0)
         {
@@ -202,6 +219,7 @@ public sealed class DeltaOutputConnector : IOutputConnector
             // The files are written uncommitted, in input order; row i of the input is at
             // its file's position (i - the rows in earlier files).
             var files = await table.WriteDataFilesAsync(new[] { inserts }, cancellationToken).ConfigureAwait(false);
+            Mark("write_files");
             var row = 0;
             foreach (var file in files)
             {
@@ -224,9 +242,19 @@ public sealed class DeltaOutputConnector : IOutputConnector
             }
 
             txn.StageDataFiles(files);
+            Mark("addresses");
         }
 
         await txn.CommitAsync(cancellationToken).ConfigureAwait(false);
+        Mark("commit");
+        if (PhaseTrace is { } trace)
+        {
+            lock (PhaseGate)
+            {
+                File.AppendAllText(trace, $"{ViewName} first={first} rows={inserts.Length} {string.Join(' ', phases)}\n");
+            }
+        }
+
         _incrementalStarted = true;
     }
 

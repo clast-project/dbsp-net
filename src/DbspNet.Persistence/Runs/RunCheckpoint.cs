@@ -166,8 +166,26 @@ internal static class RunCheckpoint
 
     /// <summary>On unless <c>DBSPNET_COMPACTION=off</c> (then chains are only ever rewritten
     /// inline, at <see cref="RunChain.MaxRuns"/>).</summary>
-    internal static bool CompactionEnabled { get; set; } =
+    internal static bool CompactionEnabled => CompactionOverride.Value ?? CompactionFromEnvironment;
+
+    private static readonly bool CompactionFromEnvironment =
         !string.Equals(Environment.GetEnvironmentVariable("DBSPNET_COMPACTION"), "off", StringComparison.OrdinalIgnoreCase);
+
+    // Per async context, so a test can switch compaction off for its own checkpoints only.
+    private static readonly AsyncLocal<bool?> CompactionOverride = new();
+
+    /// <summary>Compaction on or off in the current async context until the result is disposed.</summary>
+    internal static IDisposable UseCompaction(bool enabled)
+    {
+        var previous = CompactionOverride.Value;
+        CompactionOverride.Value = enabled;
+        return new Restore(() => CompactionOverride.Value = previous);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
+    }
 
     /// <summary>Every merge in flight (tests and benchmarks wait on them).</summary>
     internal static Task WhenAllCompactedAsync() =>

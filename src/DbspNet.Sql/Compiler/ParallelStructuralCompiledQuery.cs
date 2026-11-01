@@ -259,6 +259,9 @@ public sealed class ParallelProgramOutput
 
     /// <summary>The full current view contents (valid until the next
     /// <see cref="ParallelCompiledProgram.Step"/>).</summary>
+    // Diagnostic: DBSPNET_OUTPUT_TRACE=<file> gets the decode/sum split of each formed view.
+    private static readonly string? OutputTrace = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_TRACE");
+
     public ZSet<StructuralRow, Z64> CurrentView
     {
         get
@@ -275,11 +278,19 @@ public sealed class ParallelProgramOutput
                 return _cached;
             }
 
+            // A lazily restored shard is read from its runs, without reading it into the shard
+            // (increment 6) — the decoding is the expensive part, so the cold shards decode in
+            // parallel first; the sum below is the same single pass either way.
+            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var decoded = new IEnumerable<KeyValuePair<StructuralRow, Z64>>[_shards.Count];
+            Parallel.For(0, _shards.Count, w =>
+                decoded[w] = _shards[w].IsCold ? _shards[w].EnumerateCurrent().ToList() : _shards[w].EnumerateCurrent());
+            var tDecoded = System.Diagnostics.Stopwatch.GetTimestamp();
+
             var builder = new ZSetBuilder<StructuralRow, Z64>();
-            foreach (var shard in _shards)
+            foreach (var rows in decoded)
             {
-                // Without reading a lazily restored shard into memory (increment 6).
-                foreach (var (row, weight) in shard.EnumerateCurrent())
+                foreach (var (row, weight) in rows)
                 {
                     builder.Add(row, weight);
                 }
@@ -287,6 +298,11 @@ public sealed class ParallelProgramOutput
 
             _cached = builder.Build();
             _cachedTick = tick;
+            if (OutputTrace is { } trace)
+            {
+                File.AppendAllText(trace, $"VIEW cold={_shards.Count(x => x.IsCold)} decode={System.Diagnostics.Stopwatch.GetElapsedTime(t0, tDecoded).TotalMilliseconds:F0} sum={System.Diagnostics.Stopwatch.GetElapsedTime(tDecoded).TotalMilliseconds:F0} rows={_cached.Count}\n");
+            }
+
             return _cached;
         }
     }

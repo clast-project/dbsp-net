@@ -33,6 +33,9 @@ public sealed class IntegratedViewHandle<TRow>
     /// (docs/design-durable-state.md §1f, increment 6).</summary>
     public IEnumerable<KeyValuePair<TRow, Z64>> EnumerateCurrent() => _op.EnumerateView();
 
+    /// <summary>True while the view holds rows not yet read from a lazy restore.</summary>
+    internal bool IsCold => _op.IsCold;
+
     /// <summary>The number of rows in <see cref="Current"/>, without forming it.</summary>
     public int Count => _op.ViewCount;
 

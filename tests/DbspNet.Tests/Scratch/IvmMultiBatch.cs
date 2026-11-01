@@ -389,6 +389,23 @@ public class IvmMultiBatch
                 _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
                     $"RESTART after_batch={batch} tick={tick} restart_ms={Stopwatch.GetElapsedTime(rs).TotalMilliseconds:F0}"));
                 restarted = true;
+
+                // IVM_RESTART_GC=1: a full compacting collection after the restore (diagnostic).
+                if (Environment.GetEnvironmentVariable("IVM_RESTART_GC") == "1")
+                {
+                    var g0 = Stopwatch.GetTimestamp();
+                    var heapBefore = GC.GetTotalMemory(false);
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"RESTARTGC ms={Stopwatch.GetElapsedTime(g0).TotalMilliseconds:F0} heap_before_gib={heapBefore / (double)(1L << 30):F2} heap_after_gib={GC.GetTotalMemory(false) / (double)(1L << 30):F2}"));
+                }
+
+                // IVM_RESTART_PAUSE_MS: idle this long after the restore before the next batch (to
+                // separate the restore's own cost from the disk still settling after a checkpoint).
+                if (int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_PAUSE_MS"), out var pause) && pause > 0)
+                {
+                    await Task.Delay(pause);
+                }
                 if (DbspNet.Persistence.Snapshot.ProfileSave)
                 {
                     var loads = DbspNet.Persistence.Snapshot.RestoreProfile.ToArray();
