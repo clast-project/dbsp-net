@@ -217,7 +217,7 @@ public class LazyPartitionTests
                 foreach (var line in System.Text.Encoding.UTF8.GetString(await other.ReadAllBytesAsync(f.Path)).Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
                     var parts = line.Split('\t');
-                    if (parts[4] == "p")
+                    if (parts[4] == "p" && parts[0].EndsWith("/trace.arrows", StringComparison.Ordinal))
                     {
                         recorded = long.Parse(parts[3], System.Globalization.CultureInfo.InvariantCulture);
                     }
@@ -287,5 +287,171 @@ public class LazyPartitionTests
                     string.Join("; ", restored.Outputs[v].CurrentView.Select(e => e.Key.ToString() + "#" + e.Value.Value).Order(StringComparer.Ordinal)));
             }
         }
+    }
+
+    // The window aggregates and what each restored of its window outputs (docs/design-durable-state.md
+    // §1f, window outputs): restored from the file, still cold, and partitions rebuilt in part.
+    private static List<(bool Restored, object? LazyWindow, object? Partial)> WindowStates(IEnumerable<object> operators) =>
+        operators
+            .Where(o => o.GetType().Name.StartsWith("PartitionedWindowAggregateOp", StringComparison.Ordinal))
+            .Select(o => (
+                (bool)Field(o, "_windowRestored")!,
+                Field(o, "_lazyWindow"),
+                Field(o, "_partial")))
+            .ToList();
+
+    private static object? Field(object o, string name) =>
+        o.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(o);
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RestoredWindowAggregates_ReadTheirOutputs_RatherThanRecomputeThem(bool runs)
+    {
+        // A restore reads each window aggregate's emitted outputs back (window.arrows) — a faulted
+        // partition takes its window from it, cold (runs) or whole (monolithic) — instead of
+        // recomputing frames; every output still matches an uninterrupted twin.
+        using var layout = StateLayout.Use(runs);
+        var fs = new InMemoryTableFileSystem();
+        var producer = Compile();
+        var twin = Compile();
+        Load(producer);
+        Load(twin);
+        await Snapshot.WriteAsync(producer.Circuit, fs);
+
+        var restored = Compile();
+        await Snapshot.ReadAsync(restored.Circuit, fs);
+        var states = WindowStates(restored.Circuit.Operators);
+        Assert.Equal(5, states.Count); // ws, wr, wm, wd, wa
+        Assert.All(states, s =>
+        {
+            Assert.True(s.Restored, "window outputs were not restored");
+            Assert.Equal(runs, s.LazyWindow is not null);
+        });
+
+        for (var tick = 1; tick <= 4; tick++)
+        {
+            Touch(restored, tick, 10 * tick, 10 * tick + 5);
+            Touch(twin, tick, 10 * tick, 10 * tick + 5);
+            Assert.Equal(Digest(twin), Digest(restored));
+        }
+
+        Assert.All(WindowStates(restored.Circuit.Operators), s =>
+        {
+            Assert.Null(s.Partial); // nothing was rebuilt
+            Assert.Equal(runs, s.LazyWindow is not null); // small ticks keep it cold
+        });
+
+        // A delta checkpoint while partitions are cold, a second restore, then every partition.
+        await Snapshot.WriteAsync(restored.Circuit, fs);
+        var again = Compile();
+        await Snapshot.ReadAsync(again.Circuit, fs);
+        Assert.All(WindowStates(again.Circuit.Operators), s => Assert.True(s.Restored));
+        Touch(again, 5, 0, Partitions);
+        Touch(twin, 5, 0, Partitions);
+        Assert.Equal(Digest(twin), Digest(again));
+    }
+
+    [Fact]
+    public async Task ASnapshotWithoutWindowOutputs_StillRestores_AndTheNextCheckpointWritesThemWhole()
+    {
+        // A snapshot written before window outputs were persisted: the restore rebuilds windows
+        // where steps need them, as before, and the next checkpoint writes every partition's whole
+        // window — not the partial windows the faulted partitions hold.
+        using var layout = StateLayout.Use(true);
+        var fs = new InMemoryTableFileSystem();
+        var producer = Compile();
+        var twin = Compile();
+        Load(producer);
+        Load(twin);
+        await Snapshot.WriteAsync(producer.Circuit, fs);
+        await CheckpointCleanup.WaitAsync(fs);
+        var stripped = 0;
+        await foreach (var f in fs.ListAsync(string.Empty))
+        {
+            if (f.Path.EndsWith("/" + RunIndex.FileName, StringComparison.Ordinal))
+            {
+                var lines = System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(f.Path)).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                var kept = lines.Where(l => !l.Split('\t')[0].EndsWith("/window.arrows", StringComparison.Ordinal)).ToList();
+                stripped += lines.Length - kept.Count;
+                await fs.WriteAllBytesAsync(f.Path, System.Text.Encoding.UTF8.GetBytes(string.Concat(kept.Select(l => l + "\n"))));
+            }
+        }
+
+        Assert.Equal(5, stripped);
+
+        var restored = Compile();
+        await Snapshot.ReadAsync(restored.Circuit, fs);
+        Assert.All(WindowStates(restored.Circuit.Operators), s => Assert.False(s.Restored));
+        for (var tick = 1; tick <= 3; tick++)
+        {
+            Touch(restored, tick, 10 * tick, 10 * tick + 5);
+            Touch(twin, tick, 10 * tick, 10 * tick + 5);
+            Assert.Equal(Digest(twin), Digest(restored));
+        }
+
+        Assert.All(WindowStates(restored.Circuit.Operators), s => Assert.NotNull(s.Partial));
+        await Snapshot.WriteAsync(restored.Circuit, fs);
+        var again = Compile();
+        await Snapshot.ReadAsync(again.Circuit, fs);
+        Assert.All(WindowStates(again.Circuit.Operators), s => Assert.True(s.Restored));
+        Touch(again, 4, 0, Partitions);
+        Touch(twin, 4, 0, Partitions);
+        Assert.Equal(Digest(twin), Digest(again));
+    }
+
+    [Fact]
+    public async Task WindowOutputsGcDrops_LeaveThePersistedWindowToo()
+    {
+        // LATENESS GC drops window rows without emitting: a delta checkpoint must record those
+        // drops, or the window file keeps every expired output and a restore brings them back.
+        using var layout = StateLayout.Use(true);
+        string[] ddl = ["CREATE TABLE a (ts BIGINT NOT NULL LATENESS 10, x INT NOT NULL)"];
+        const string Query = "SELECT ts, x, SUM(x) OVER (PARTITION BY x ORDER BY ts RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s FROM a";
+        static DbspNet.Sql.Compiler.CompiledQuery CompileQuery(string[] ddl, string query)
+        {
+            var resolver = new DbspNet.Sql.Plan.Resolver(new DbspNet.Sql.Plan.Catalog());
+            foreach (var statement in ddl)
+            {
+                resolver.Resolve(DbspNet.Sql.Parser.Parser.ParseStatement(statement));
+            }
+
+            return PlanToCircuit.Compile(
+                ((DbspNet.Sql.Plan.SelectPlan)resolver.Resolve(DbspNet.Sql.Parser.Parser.ParseStatement(query))).Query,
+                ArrowSqlSnapshotCodecs.Instance);
+        }
+
+        static void Step(DbspNet.Sql.Compiler.CompiledQuery q, long t)
+        {
+            q.Table("a").Insert(t, (int)(t % 3)); // three partitions, touched every tick
+            q.Step();
+        }
+
+        static int WindowRows(DbspNet.Sql.Compiler.CompiledQuery q) =>
+            ((System.Collections.IDictionary)Field(q.Circuit.Operators.Single(o => o.GetType().Name.StartsWith("PartitionedWindowAggregateOp", StringComparison.Ordinal)), "_window")!)
+                .Values.Cast<System.Collections.ICollection>().Sum(w => w.Count);
+
+        var fs = new InMemoryTableFileSystem();
+        var producer = CompileQuery(ddl, Query);
+        var twin = CompileQuery(ddl, Query);
+        for (var t = 0L; t < 100; t++)
+        {
+            Step(producer, t);
+            Step(twin, t);
+        }
+
+        await Snapshot.WriteAsync(producer.Circuit, fs); // the chain the delta extends
+        for (var t = 100L; t < 200; t++)
+        {
+            Step(producer, t); // the frontier passes every row written above
+            Step(twin, t);
+        }
+
+        await Snapshot.WriteAsync(producer.Circuit, fs); // a delta: drops included
+        var restored = CompileQuery(ddl, Query);
+        await Snapshot.ReadAsync(restored.Circuit, fs);
+        Step(restored, 200); // fault all three partitions in
+        Step(twin, 200);
+        Assert.Equal(WindowRows(twin), WindowRows(restored));
     }
 }

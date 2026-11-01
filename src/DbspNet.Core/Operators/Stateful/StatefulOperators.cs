@@ -252,7 +252,8 @@ public static class StatefulOperators
         int aggCount,
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null,
-        IFrontier? frontier = null)
+        IFrontier? frontier = null,
+        IZSetTraceCodec<StructuralRow, Z64>? windowCodec = null)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -260,6 +261,18 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(partitionOf);
         ArgumentNullException.ThrowIfNull(order);
         ArgumentNullException.ThrowIfNull(aggregator);
+
+        // The base row of an output row: its leading columns (Widen appends the aggregates).
+        StructuralRow BaseOf(StructuralRow widened)
+        {
+            var vs = new object?[widened.Count - aggCount];
+            for (var i = 0; i < vs.Length; i++)
+            {
+                vs[i] = widened[i];
+            }
+
+            return new StructuralRow(vs);
+        }
 
         // The structural widener: append the aggregate columns onto the base row.
         // (The typed compile path will supply a struct-fusing widener instead.)
@@ -288,7 +301,7 @@ public static class StatefulOperators
 
         return builder.PartitionedWindowAggregate<StructuralRow, StructuralRow, StructuralRow, TKey>(
             input, partitionOf, order, orderValueOf, preceding, descending,
-            aggregator, Widen, partitionComparer, snapshotCodec, frontier);
+            aggregator, Widen, partitionComparer, snapshotCodec, frontier, windowCodec, windowCodec is null ? null : BaseOf);
     }
 
     /// <summary>
@@ -312,7 +325,9 @@ public static class StatefulOperators
         Func<TInRow, Optional<TAgg>, TOutRow> widen,
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null,
-        IFrontier? frontier = null)
+        IFrontier? frontier = null,
+        IZSetTraceCodec<TOutRow, Z64>? windowCodec = null,
+        Func<TOutRow, TInRow>? baseOf = null)
         where TInRow : notnull
         where TAgg : notnull
         where TOutRow : notnull
@@ -328,7 +343,7 @@ public static class StatefulOperators
         var output = new Stream<ZSet<TOutRow, Z64>>(ZSet<TOutRow, Z64>.Empty);
         builder.AddRawOperator(new PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>(
             input, output, partitionOf, order, orderValueOf, preceding, descending,
-            aggregator, widen, partitionComparer, snapshotCodec, frontier));
+            aggregator, widen, partitionComparer, snapshotCodec, frontier, windowCodec, baseOf));
         return output;
     }
 

@@ -1211,6 +1211,43 @@ and one 0.3 s wait on a giant group in some runs.
 3. *JIT*: ReadyToRun-compiling the engine assemblies is a deployment choice that would take most of
    the fresh-process JIT out of restore and the first batch.
 
+### Persisted window outputs (2026-11-01, branch arc/window-outputs — measured, not merged)
+
+Lever 1 above, built. The window aggregate now saves the outputs it emitted (`window.arrows`, the
+widened rows, in the same partition-hash order as its rows) beside its integrated input, and tracks
+them incrementally (`_windowChanges`: each step's emitted delta plus the rows LATENESS GC drops). A
+lazy restore hands them back cold; a faulted partition reads its old outputs instead of rebuilding
+them (`EnsureWindow` remains the path for a snapshot written before this, and the first checkpoint
+after such a restore completes every partial window so it writes them whole). The eager restore
+reads them too instead of recomputing every frame. Re-shard places the file like the trace. Tests:
+`LazyPartitionTests` — outputs read not recomputed (runs and monolithic), a snapshot without window
+outputs, GC drops leaving the persisted window; four mutations each caught. Full suite green with
+runs off / on / verify.
+
+**Measured** — fresh-process restart after batch 1, SF=3, W=12, 5 alternating runs per arm, main
+(ff43fdc) built in a separate worktree (raw: `docs/fresh-restart-window-outputs-w12-20261101.txt`;
+all view row counts and final restores matched):
+
+| | main, runs | window outputs, runs | window outputs, today (layout off) |
+|---|--:|--:|--:|
+| restore | 0.32 s [0.28–0.40] | 0.32 s [0.29–0.34] | 6.05 s [5.98–6.39] |
+| batch 2 drain | 0.93 s [0.89–1.05] | **0.89 s** [0.84–0.97] | 0.19 s |
+| batch 2 output write | 3.43 s | 3.54 s | 2.11 s [1.99–4.96] |
+| batch 3 drain | 0.37 s [0.33–0.95] | 0.34 s [0.32–0.38] | 0.14 s |
+
+**The window aggregates halved but were not the critical path.** In the first-batch profile their
+cumulative CPU fell 1,401 → 720 ms and the worst worker's `daily_market` window 146 → 58 ms, yet the
+batch-2 drain moved only ~4% (inside the run-to-run range). Worker 0 is the critical worker either
+way (391 ms busy in both): it runs the gathered (single-worker) tail of `daily_market_pulse` and
+`market_volatility` — integrated views and ranks — which the window outputs do not touch. The rest of
+the first batch is cold reads (~0.25–0.44 s summed) and fresh-process JIT (~1.3–1.6 s of JIT across
+threads during batch 2). The cost: the window files add **0.94 GiB** to a 10 GiB SF=3 snapshot, and
+every emitted window delta is held as pending change until the next checkpoint.
+
+**Recommendation: don't merge.** It is correct and tested, but buys nothing measurable on the
+restart path while adding ~10% to checkpoint size. The first-batch target is now bound by the
+gathered single-worker tail, cold-read overhead and JIT (levers 2 and 3), not window rebuild.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

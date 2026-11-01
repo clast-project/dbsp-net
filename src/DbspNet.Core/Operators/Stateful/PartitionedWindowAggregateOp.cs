@@ -80,8 +80,12 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     private LazyPartitions<TKey, TInRow>? _lazy;
 
     /// <inheritdoc/>
-    public object? OrderFor(string fileName) =>
-        fileName == "trace.arrows" ? LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) : null;
+    public object? OrderFor(string fileName) => fileName switch
+    {
+        "trace.arrows" => LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf),
+        WindowFile => LazyPartitions<TKey, TOutRow>.PartitionOrder(WindowPartitionOf),
+        _ => null,
+    };
 
     // Last-emitted output per partition, keyed by the input (base) row →
     // (widened row, weight). Keying by base row lets GC drop a finalized row
@@ -100,7 +104,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         Func<TInRow, Optional<TAgg>, TOutRow> widen,
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null,
-        IFrontier? frontier = null)
+        IFrontier? frontier = null,
+        IZSetTraceCodec<TOutRow, Z64>? windowCodec = null,
+        Func<TOutRow, TInRow>? baseOf = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -122,7 +128,29 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _frontier = frontier;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
         _window = new Dictionary<TKey, Dictionary<TInRow, (TOutRow, long)>>(partitionComparer);
+        _windowCodec = windowCodec;
+        _baseOf = baseOf;
     }
+
+    // Persisted window outputs (window.arrows): the output rows last emitted, weighted as emitted,
+    // in partition order, so a restore reads a partition's old outputs instead of recomputing them
+    // (docs/design-durable-state.md §1f). Their change per step is exactly the step's output delta,
+    // plus the rows GC drops from _window without emitting. Needs the output → base row map
+    // (baseOf); without it — or without the file, an older snapshot — the windows are recomputed.
+    private readonly IZSetTraceCodec<TOutRow, Z64>? _windowCodec;
+    private readonly Func<TOutRow, TInRow>? _baseOf;
+    private readonly ZSetChangeTracker<TOutRow, Z64> _windowChanges = new();
+    private LazyPartitions<TKey, TOutRow>? _lazyWindow;
+
+    // The window outputs were restored from the window file (eagerly, or cold in _lazyWindow):
+    // a faulted partition reads its window rather than recomputing it.
+    private bool _windowRestored;
+
+    private bool PersistsWindow => _windowCodec is not null && _baseOf is not null;
+
+    private TKey WindowPartitionOf(TOutRow row) => _partitionOf(_baseOf!(row));
+
+    private const string WindowFile = "window.arrows";
 
     /// <summary>Total input rows currently retained across all partitions —
     /// exposed for tests that assert frontier-driven GC keeps state bounded.</summary>
@@ -217,6 +245,11 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
         CollectGarbage();
         var result = builder.Build();
+        if (PersistsWindow)
+        {
+            _windowChanges.Record(result); // what was emitted is what changed in _window
+        }
+
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
     }
@@ -541,6 +574,11 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             {
                 foreach (var row in drop)
                 {
+                    if (PersistsWindow && win.TryGetValue(row, out var dropped))
+                    {
+                        _windowChanges.RecordDropped(dropped.Widened, new Z64(dropped.Weight)); // dropped, not retracted
+                    }
+
                     win.Remove(row);
                 }
 
@@ -568,6 +606,22 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
     }
 
+    // The persisted window outputs: every emitted row, weighted as emitted (fresh even when empty).
+    private ZSet<TOutRow, Z64> WindowSnapshotNow()
+    {
+        var b = new ZSetBuilder<TOutRow, Z64>();
+        foreach (var win in _window.Values)
+        {
+            foreach (var (widened, weight) in win.Values)
+            {
+                b.Add(widened, new Z64(weight));
+            }
+        }
+
+        var z = b.Build();
+        return z.IsEmpty ? ZSet<TOutRow, Z64>.NewMutable() : z;
+    }
+
     // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TInRow, Z64> SnapshotNow() =>
         _accum.Count == 0
@@ -590,6 +644,24 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         _accum[key] = bucket;
+
+        // Its window was persisted: read it (the outputs emitted before the restore) rather than
+        // recompute it.
+        if (_windowRestored)
+        {
+            if (_lazyWindow?.Take(key) is { Count: > 0 } outs)
+            {
+                var win = new Dictionary<TInRow, (TOutRow, long)>(outs.Count);
+                foreach (var (widened, weight) in outs)
+                {
+                    win[_baseOf!(widened)] = (widened, weight);
+                }
+
+                _window[key] = win;
+            }
+
+            return;
+        }
 
         // Its window is rebuilt range by range as steps need it (EnsureWindow), not whole: a
         // partition with a long frame costs O(rows x frame) to rebuild whole, and a step reads
@@ -656,6 +728,26 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         _lazy = null;
+        if (_windowRestored)
+        {
+            if (_lazyWindow is { } lazyWindow)
+            {
+                _lazyWindow = null;
+                foreach (var (key, widened, weight) in lazyWindow.TakeAll())
+                {
+                    if (!_window.TryGetValue(key, out var win))
+                    {
+                        win = new Dictionary<TInRow, (TOutRow, long)>();
+                        _window[key] = win;
+                    }
+
+                    win[_baseOf!(widened)] = (widened, weight);
+                }
+            }
+
+            return;
+        }
+
         foreach (var key in filled)
         {
             InitWindow(key, _accum[key]);
@@ -669,7 +761,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         RecomputePartition(new ZSetBuilder<TOutRow, Z64>(), key, (long.MinValue, long.MaxValue));
     }
 
-    public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
+    public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
         {
@@ -687,7 +779,38 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf),
             _lazy is null ? null : () => { PromoteAll(); return SnapshotNow(); },
             _lazy is null ? null : snapshot.Count + _lazy.ColdCount);
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
+        await _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken).ConfigureAwait(false);
+        if (PersistsWindow)
+        {
+            // Restored from a snapshot without window outputs: the first write of them needs every
+            // partition's whole window, so complete what was faulted only in part (once).
+            if (!_windowRestored)
+            {
+                PromoteAll();
+                if (_partial is not null)
+                {
+                    foreach (var key in _partial.Keys.ToList())
+                    {
+                        if (_accum.TryGetValue(key, out var all))
+                        {
+                            InitWindow(key, all);
+                        }
+                    }
+
+                    _partial = null;
+                }
+
+                _windowRestored = true; // _window is now whole
+            }
+
+            var window = WindowSnapshotNow();
+            _windowChanges.Attach(
+                window,
+                LazyPartitions<TKey, TOutRow>.PartitionOrder(WindowPartitionOf),
+                _lazy is null && _lazyWindow is null ? null : () => { PromoteAll(); return WindowSnapshotNow(); },
+                _lazyWindow is null ? null : window.Count + _lazyWindow.ColdCount);
+            await _windowCodec!.SaveAsync(writer, WindowFile, window, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -707,10 +830,32 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             _window.Clear();
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
+            _partial = null;
+            _lazyWindow = null;
+            _windowRestored = false;
+            if (PersistsWindow && await reader.ExistsAsync(WindowFile, cancellationToken).ConfigureAwait(false))
+            {
+                if (_windowCodec is IColdRowLoader<TOutRow> windowLoader
+                    && await windowLoader.LoadColdAsync(reader, WindowFile, cancellationToken).ConfigureAwait(false) is { } coldWindow)
+                {
+                    _lazyWindow = new LazyPartitions<TKey, TOutRow>(coldWindow, WindowPartitionOf, _accum.Comparer);
+                    _windowChanges.Restored(coldWindow, coldWindow.Count);
+                }
+                else
+                {
+                    LoadWindow(await _windowCodec!.LoadAsync(reader, WindowFile, cancellationToken).ConfigureAwait(false));
+                }
+
+                _windowRestored = true;
+            }
+
             return;
         }
 
         _lazy = null;
+        _lazyWindow = null;
+        _partial = null;
+        _windowRestored = false;
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         _changes.Restored(loaded);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -734,12 +879,20 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         // The restored accumulation is current; the windows it implies are already
-        // materialised downstream, so record them without emitting (recompute the
-        // whole partition by passing a full delta range).
-        var sink = new ZSetBuilder<TOutRow, Z64>();
-        foreach (var key in _accum.Keys.ToList())
+        // materialised downstream. Read them when they were persisted; otherwise record them
+        // without emitting (recompute the whole partition by passing a full delta range).
+        if (PersistsWindow && await reader.ExistsAsync(WindowFile, cancellationToken).ConfigureAwait(false))
         {
-            RecomputePartition(sink, key, (long.MinValue, long.MaxValue));
+            LoadWindow(await _windowCodec!.LoadAsync(reader, WindowFile, cancellationToken).ConfigureAwait(false));
+            _windowRestored = true;
+        }
+        else
+        {
+            var sink = new ZSetBuilder<TOutRow, Z64>();
+            foreach (var key in _accum.Keys.ToList())
+            {
+                RecomputePartition(sink, key, (long.MinValue, long.MaxValue));
+            }
         }
 
         // Diagnostic (design-incremental-persistence §10): split this operator's restore into
@@ -754,6 +907,30 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             SnapshotRestoreProfile.AddRebuild(rebuildMs);
         }
+    }
+
+    // The window outputs read whole from the window file.
+    private void LoadWindow(ZSet<TOutRow, Z64> loaded)
+    {
+        _window.Clear();
+        foreach (var (widened, weight) in loaded)
+        {
+            if (weight.Value == 0)
+            {
+                continue;
+            }
+
+            var key = WindowPartitionOf(widened);
+            if (!_window.TryGetValue(key, out var win))
+            {
+                win = new Dictionary<TInRow, (TOutRow, long)>();
+                _window[key] = win;
+            }
+
+            win[_baseOf!(widened)] = (widened, weight.Value);
+        }
+
+        _windowChanges.Restored(loaded);
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;

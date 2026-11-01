@@ -2728,6 +2728,10 @@ public static partial class PlanToCircuit
         // Snapshot codec for the per-partition integrated input (base rows).
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
 
+        // ...and for the window outputs it emitted (widened rows), so a restore reads them back
+        // rather than recomputing every frame (docs/design-durable-state.md §1f).
+        var windowCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
+
         var frontier = ResolveWindowFrontier(plan, ctx);
 
         return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedWindowAggregate<StructuralRow>(
@@ -2741,7 +2745,8 @@ public static partial class PlanToCircuit
             plan.Aggregates.Count,
             partitionComparer: null,
             snapshotCodec: codec,
-            frontier: frontier), Z("trace.arrows", reshardPlace, codec)));
+            frontier: frontier,
+            windowCodec: windowCodec), Z("trace.arrows", reshardPlace, codec), Z("window.arrows", reshardPlace, windowCodec)));
     }
 
     /// <summary>
