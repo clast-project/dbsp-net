@@ -170,6 +170,24 @@ public class IvmMultiBatch
         }
 
         _out.WriteLine($"output mode: {mode}, workers: {workers}");
+        // IVM_STATE_CENSUS=1: retained state by operator kind and structure (StateCensus) after the
+        // restore (IVM_RESUME), after the first batch's drain and after its output write; objects
+        // absent from the restore walk are what that batch created and kept.
+        var stateCensus = Environment.GetEnvironmentVariable("IVM_STATE_CENSUS") == "1";
+        HashSet<object>? censusBaseline = null;
+        HashSet<object> StateCensusAt(string tag, HashSet<object>? baseline)
+        {
+            IReadOnlyList<DbspNet.Core.Circuit.RootCircuit> replicas = parallel is not null ? parallel.Circuit.Replicas : [serial!.Circuit];
+            var depth = int.TryParse(Environment.GetEnvironmentVariable("IVM_CENSUS_DEPTH"), out var d) ? d : 3;
+            var res = StateCensus.Walk(replicas, runner, baseline, depth);
+            foreach (var line in StateCensus.Report(tag, res))
+            {
+                _out.WriteLine(line);
+            }
+
+            return res.Seen;
+        }
+
         var restartAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_AFTER"), out var ra) ? ra : 0;
         var restarted = false;
         var firstBatch = 1;
@@ -194,6 +212,10 @@ public class IvmMultiBatch
                 $"restore_gc_ms={DbspNet.Persistence.CheckpointGcMode.LastRestoreCollectMs:F0}"));
             restarted = true;
             firstBatch = 2;
+            if (stateCensus)
+            {
+                censusBaseline = StateCensusAt("restore", null);
+            }
             restoreEndUtc = DateTime.UtcNow;
         }
 
@@ -238,6 +260,11 @@ public class IvmMultiBatch
                 drainMs = sw.Elapsed.TotalMilliseconds;
                 drainAllocGib = (GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (double)(1L << 30);
                 drainEndUtc = DateTime.UtcNow;
+                if (stateCensus && batch == firstBatch)
+                {
+                    StateCensusAt("drain", censusBaseline);
+                }
+
                 if (measureAtDrain)
                 {
                     // IVM_MEASURE_AT=drain: before the output write forms any view, so the
@@ -248,6 +275,11 @@ public class IvmMultiBatch
                 await runner.WriteOutputsAsync();
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
                 outputEndUtc = DateTime.UtcNow;
+                if (stateCensus && batch == firstBatch)
+                {
+                    StateCensusAt("write", censusBaseline);
+                    censusBaseline = null;
+                }
             }
 
             if (batch == 1 && Environment.GetEnvironmentVariable("IVM_PAUSE_DIR") is { Length: > 0 } pauseDir)
