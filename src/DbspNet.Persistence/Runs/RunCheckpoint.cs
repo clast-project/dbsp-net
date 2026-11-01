@@ -65,11 +65,15 @@ internal static class RunCheckpoint
             size = tracked.Count + p.Count; // an upper bound (a partitioned operator's: only a heuristic there)
         }
 
-        chain = chain.WithCount(size);
+        chain = Adopt(trace, chain).WithCount(size);
         session.Record(ctx.Prefix + fileName, chain);
         if (trace is not null)
         {
-            session.OnCommit(() => trace.StartTracking(chain));
+            session.OnCommit(() =>
+            {
+                trace.StartTracking(chain);
+                MaybeCompact(trace, chain, (c, path, ct) => RunCompactor.CompactZSetAsync(c, codec, path, ct));
+            });
         }
 
         if (Verify)
@@ -113,11 +117,15 @@ internal static class RunCheckpoint
             chain = RunChain.Base(ctx.FileSystem, await WriteAsync(state), Entries(state));
         }
 
-        chain = chain.WithCount(state.GroupCount);
+        chain = Adopt(trace, chain).WithCount(state.GroupCount);
         session.Record(ctx.Prefix + fileName, chain);
         if (trace is not null)
         {
-            session.OnCommit(() => trace.StartTracking(chain));
+            session.OnCommit(() =>
+            {
+                trace.StartTracking(chain);
+                MaybeCompact(trace, chain, (c, path, ct) => RunCompactor.CompactIndexedAsync(c, codec, path, ct));
+            });
         }
 
         if (Verify)
@@ -137,6 +145,101 @@ internal static class RunCheckpoint
             await RunFile.WriteIndexedAsync(ctx.FileSystem, path, set, codec, hash, cancellationToken: cancellationToken).ConfigureAwait(false);
             return path;
         }
+    }
+
+    // ---- Background compaction (increment 7) ----
+
+    private sealed class Job(RunChain input, string outPath, Task<long> merge)
+    {
+        public RunChain Input { get; } = input;
+
+        public string OutPath { get; } = outPath;
+
+        public Task<long> Merge { get; } = merge;
+    }
+
+    // Per tracked state: the merge in flight for its chain, if any. Weak: a dropped program's jobs go.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, Job> Jobs = new();
+
+    // Merges share the machine with the steps: at most two at a time.
+    private static readonly SemaphoreSlim CompactionSlots = new(2);
+
+    /// <summary>On unless <c>DBSPNET_COMPACTION=off</c> (then chains are only ever rewritten
+    /// inline, at <see cref="RunChain.MaxRuns"/>).</summary>
+    internal static bool CompactionEnabled { get; set; } =
+        !string.Equals(Environment.GetEnvironmentVariable("DBSPNET_COMPACTION"), "off", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Every merge in flight (tests and benchmarks wait on them).</summary>
+    internal static Task WhenAllCompactedAsync() =>
+        Task.WhenAll(Jobs.Select(j => j.Value.Merge).ToArray());
+
+    /// <summary>The merge in flight for <paramref name="trace"/>'s chain (tests wait on it).</summary>
+    internal static Task WhenCompactedAsync(object trace) =>
+        Jobs.TryGetValue(trace, out var job) ? job.Merge : Task.CompletedTask;
+
+    // After a commit: a long enough chain gets a merge into one run, off the step thread. Its input
+    // runs and output are pinned until it is adopted (or the state is dropped), and the output is
+    // durable before any checkpoint can name it.
+    private static void MaybeCompact(
+        object trace, RunChain chain, Func<RunChain, string, CancellationToken, ValueTask<long>> compact)
+    {
+        if (!CompactionEnabled || chain.Paths.Count < RunChain.CompactAt || Jobs.TryGetValue(trace, out _))
+        {
+            return;
+        }
+
+        var outPath = chain.Paths[^1] + ".c";
+        var merge = Task.Run(async () =>
+        {
+            await CompactionSlots.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var entries = await compact(chain, outPath, CancellationToken.None).ConfigureAwait(false);
+                if (Snapshot.DurableStore(chain.Store) is { } durable)
+                {
+                    await durable.SyncAsync([outPath]).ConfigureAwait(false);
+                }
+
+                return entries;
+            }
+            finally
+            {
+                CompactionSlots.Release();
+            }
+        });
+        var job = new Job(chain, outPath, merge);
+        RunPins.Add(job, chain.Store, [.. chain.Paths, outPath]);
+        Jobs.AddOrUpdate(trace, job);
+    }
+
+    // At a checkpoint: a finished merge whose input is still the front of the chain replaces it.
+    // A merge that failed, or whose input the chain no longer starts with (a rewrite came first), is
+    // dropped; its output, named nowhere and no longer pinned, is swept.
+    private static RunChain Adopt(object? trace, RunChain chain)
+    {
+        if (trace is null || !Jobs.TryGetValue(trace, out var job) || !job.Merge.IsCompleted)
+        {
+            return chain;
+        }
+
+        Jobs.Remove(trace);
+        RunPins.Remove(job); // adopted: the new chain names what it needs; dropped: its output goes
+        var input = job.Input.Paths;
+        if (!job.Merge.IsCompletedSuccessfully
+            || !ReferenceEquals(job.Input.Store, chain.Store)
+            || chain.Paths.Count < input.Count
+            || !chain.Paths.Take(input.Count).SequenceEqual(input, StringComparer.Ordinal))
+        {
+            return chain;
+        }
+
+        return new RunChain(
+            chain.Store,
+            [job.OutPath, .. chain.Paths.Skip(input.Count)],
+            job.Merge.Result,
+            Math.Max(0, chain.DeltaEntries - job.Input.DeltaEntries),
+            chain.Count,
+            chain.PartitionOrder);
     }
 
     private static long Entries(IndexedZSet<StructuralRow, StructuralRow, Z64> set)

@@ -3,6 +3,7 @@
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.IO;
 using DbspNet.Sql.Compiler;
 
@@ -111,6 +112,10 @@ public static class ParallelReshard
 
         // Operators own disjoint directories, so they rewrite concurrently — at the restore's
         // degree, which also bounds how many operators' state is decoded at once.
+        // With runs on, the rewrite writes run chains (base runs + a run index per worker), like a
+        // checkpoint, so the restore after it is lazy and the next checkpoint extends the chains
+        // (docs/design-durable-state.md §1f, increment 7). Otherwise, files as before.
+        var session = Runs.StateLayout.Runs ? new Runs.CheckpointSession() : null;
         await Parallel.ForEachAsync(
             specs,
             new ParallelOptions { MaxDegreeOfParallelism = Snapshot.DefaultRestoreParallelism, CancellationToken = cancellationToken },
@@ -118,7 +123,10 @@ public static class ParallelReshard
             {
                 foreach (var file in entry.Spec.Files)
                 {
-                    await RewriteFileAsync(fs, current, snapName, oldW, newW, entry.Index, file, ct).ConfigureAwait(false);
+                    await RewriteFileAsync(
+                        fs, current, snapName, oldW, newW, entry.Index, file, session,
+                        (replica0.Operators[entry.Index] as ISnapshotOrder)?.OrderFor(file.Name) as Func<StructuralRow, int>, ct)
+                        .ConfigureAwait(false);
                 }
             }).ConfigureAwait(false);
 
@@ -129,12 +137,20 @@ public static class ParallelReshard
         {
             await fs.WriteAllBytesAsync(WorkerDir(snapName, w) + "/" + Snapshot.ManifestFile, manifestBytes, cancellationToken)
                 .ConfigureAwait(false);
+            if (session is not null)
+            {
+                await session.WriteIndexAsync(fs, WorkerDir(snapName, w), cancellationToken).ConfigureAwait(false);
+            }
         }
 
         var durable = Snapshot.DurableStore(fs);
         if (durable is not null)
         {
             await Snapshot.SyncTreeAsync(fs, durable, snapName + "/", cancellationToken).ConfigureAwait(false);
+            if (session is not null)
+            {
+                await Snapshot.SyncTreeAsync(fs, durable, Runs.RunSweep.RunsPrefix + snapName + "/", cancellationToken).ConfigureAwait(false);
+            }
         }
 
         var newKey = snapName + "/" + ParallelSnapshot.ParallelManifestFile;
@@ -215,7 +231,8 @@ public static class ParallelReshard
     }
 
     private static async ValueTask RewriteFileAsync(
-        ITableFileSystem fs, string current, string snapName, int oldW, int newW, int op, ReshardFile file,
+        ITableFileSystem fs, string current, string snapName, int oldW, int newW, int op, ReshardFile file, Runs.CheckpointSession? session,
+        Func<StructuralRow, int>? order,
         CancellationToken cancellationToken)
     {
         switch (file)
@@ -256,8 +273,21 @@ public static class ParallelReshard
 
                     for (var w = 0; w < newW; w++)
                     {
-                        var writer = new TableFileSystemSnapshotContext(fs, OpDir(snapName, w, op));
-                        await z.Codec.SaveAsync(writer, z.Name, buckets[w].Build(), cancellationToken).ConfigureAwait(false);
+                        var writer = new TableFileSystemSnapshotContext(fs, OpDir(snapName, w, op), session);
+                        var set = buckets[w].Build();
+                        if (order is not null)
+                        {
+                            set = set.IsEmpty ? ZSet<StructuralRow, Z64>.NewMutable() : set; // never tag the shared Empty
+                        }
+
+                        if (order is not null)
+                        {
+                            // Keep the operator's own run order (a partitioned operator's partition
+                            // hash), so the restore after the re-shard can read it lazily.
+                            SnapshotOrderTag<StructuralRow, Z64>.Apply(set, order);
+                        }
+
+                        await z.Codec.SaveAsync(writer, z.Name, set, cancellationToken).ConfigureAwait(false);
                     }
 
                     return;
@@ -302,7 +332,7 @@ public static class ParallelReshard
 
                     for (var w = 0; w < newW; w++)
                     {
-                        var writer = new TableFileSystemSnapshotContext(fs, OpDir(snapName, w, op));
+                        var writer = new TableFileSystemSnapshotContext(fs, OpDir(snapName, w, op), session);
                         await ix.Codec.SaveAsync(writer, ix.Name, buckets[w].Build(), cancellationToken).ConfigureAwait(false);
                     }
 
@@ -345,7 +375,7 @@ public static class ParallelReshard
 
                     for (var w = 0; w < newW; w++)
                     {
-                        var writer = new TableFileSystemSnapshotContext(fs, OpDir(snapName, w, op));
+                        var writer = new TableFileSystemSnapshotContext(fs, OpDir(snapName, w, op), session);
                         await kb.Codec.SaveKeyedBlobsAsync(writer, kb.Name, buckets[w], cancellationToken).ConfigureAwait(false);
                     }
 

@@ -331,7 +331,7 @@ internal static class RunFile
         return new RunInfo(kind, totalEntries, totalGroups, index.Count, file.Position);
     }
 
-    private static byte[] EncodeFooter(Kind kind, int fingerprint, long entries, long groups, long schemaLength, List<RunBlock> index, RunBloom bloom)
+    internal static byte[] EncodeFooter(Kind kind, int fingerprint, long entries, long groups, long schemaLength, List<RunBlock> index, RunBloom bloom)
     {
         var size = 8 + 4 + 4 + 4 + 8 + 8 + 8 + 4 + (index.Count * BlockIndexEntryBytes) + 4 + 4 + (bloom.Bits.Length * 8);
         var buf = new byte[size];

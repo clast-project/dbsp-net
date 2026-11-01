@@ -125,6 +125,46 @@ internal sealed class ArrowIndexedZSetTraceCodec
     public void DecodeRange(RecordBatch batch, int from, int count, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) =>
         AddRange(batch, from, count, into, StringDecoding.Copy);
 
+    /// <inheritdoc/>
+    public (StructuralRow Key, StructuralRow Value, long Weight)[] DecodeEntries(RecordBatch batch)
+    {
+        var keyCount = _keySchema.Count;
+        var valueCount = _valueSchema.Count;
+        var rowCount = batch.Length;
+        var keyColumns = new object?[keyCount][];
+        for (var c = 0; c < keyCount; c++)
+        {
+            keyColumns[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, 0, rowCount, StringDecoding.Copy);
+        }
+
+        var valueColumns = new object?[valueCount][];
+        for (var c = 0; c < valueCount; c++)
+        {
+            valueColumns[c] = ArrowColumns.Extract(batch.Column(keyCount + c), _valueSchema[c].Type, 0, rowCount, StringDecoding.Copy);
+        }
+
+        var weights = ((Int64Array)batch.Column(keyCount + valueCount)).Values;
+        var entries = new (StructuralRow, StructuralRow, long)[rowCount];
+        for (var i = 0; i < rowCount; i++)
+        {
+            var k = new object?[keyCount];
+            for (var c = 0; c < keyCount; c++)
+            {
+                k[c] = keyColumns[c][i];
+            }
+
+            var v = new object?[valueCount];
+            for (var c = 0; c < valueCount; c++)
+            {
+                v[c] = valueColumns[c][i];
+            }
+
+            entries[i] = (new StructuralRow(k), new StructuralRow(v), weights[i]);
+        }
+
+        return entries;
+    }
+
     private async ValueTask SaveMonolithicAsync(
         ISnapshotWriter writer,
         string fileName,

@@ -221,4 +221,65 @@ public class LazyPartitionTests
 
         Assert.True(Retained(twin) == recorded, $"twin retains {Retained(twin)} rows, the whole-state write recorded {recorded} (restored retains {Retained(restored)}; producer had {Retained(producer)})");
     }
+
+    [Fact]
+    public async Task AReshard_KeepsPartitionOrder_SoTheRestoreAfterItStaysLazy()
+    {
+        // Increment 7: the re-shard rewrites each partitioned operator's file in that operator's
+        // own run order (ISnapshotOrder), so restoring at the new worker count reads partitions
+        // on demand instead of all of them.
+        using var layout = StateLayout.Use(true);
+        var fs = new InMemoryTableFileSystem();
+        var twin = Compile();
+        Load(twin);
+        Assert.True(SqlProgram.TryCompileParallel(Sql, Views, 3, out var producer, ArrowSqlSnapshotCodecs.Instance));
+        using (producer)
+        {
+            for (var a = 0; a < Partitions; a++)
+            {
+                for (var b = 0; b < 6; b++)
+                {
+                    producer!.Table("t").Insert(a, (a * 7 + b * 3) % 40);
+                }
+            }
+
+            producer!.Step();
+            await ParallelSnapshot.WriteAsync(producer.Circuit, fs);
+        }
+
+        Assert.True(SqlProgram.TryCompileParallel(Sql, Views, 2, out var restored, ArrowSqlSnapshotCodecs.Instance));
+        using (restored)
+        {
+            Assert.Equal(3, await ParallelReshard.RewriteAsync(fs, restored!));
+            await ParallelSnapshot.ReadAsync(restored!.Circuit, fs);
+            var lazy = restored.Circuit.Replicas
+                .SelectMany(r => r.Operators)
+                .Select(o => o.GetType().GetField("_lazy", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(o))
+                .Where(l => l is not null)
+                .ToList();
+            Assert.True(lazy.Count >= 3 * 2, $"expected the partitioned operators on both workers lazy, found {lazy.Count}");
+
+            foreach (var tick in new[] { 1, 2 })
+            {
+                for (var a = 10 * tick; a < (10 * tick) + 5; a++)
+                {
+                    restored.Table("t").Insert(a, (tick * 13 + a) % 50); // as Touch does
+                    if (tick % 2 == 0)
+                    {
+                        restored.Table("t").Delete(a, (a * 7) % 40);
+                    }
+                }
+
+                restored.Step();
+                Touch(twin, tick, 10 * tick, (10 * tick) + 5);
+            }
+
+            foreach (var v in Views)
+            {
+                Assert.Equal(
+                    string.Join("; ", twin.Outputs[v].CurrentView.Select(e => e.Key.ToString() + "#" + e.Value.Value).Order(StringComparer.Ordinal)),
+                    string.Join("; ", restored.Outputs[v].CurrentView.Select(e => e.Key.ToString() + "#" + e.Value.Value).Order(StringComparer.Ordinal)));
+            }
+        }
+    }
 }

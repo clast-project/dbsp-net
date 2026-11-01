@@ -15,8 +15,13 @@ namespace DbspNet.Persistence.Runs;
 /// </summary>
 internal sealed class RunChain
 {
-    /// <summary>A chain this long is rewritten whole (compaction by rewrite) instead of extended.</summary>
-    internal const int MaxRuns = 8;
+    /// <summary>A chain this long is rewritten whole, inline, instead of extended — the fallback;
+    /// normally a background compaction (<see cref="CompactAt"/>) keeps chains far shorter.</summary>
+    internal const int MaxRuns = 32;
+
+    /// <summary>A chain this long after a commit is merged into one run off the step thread
+    /// (<see cref="RunCompactor"/>), and the next checkpoint adopts the merged run.</summary>
+    internal const int CompactAt = 4;
 
     internal RunChain(
         ITableFileSystem store, IReadOnlyList<string> paths, long baseEntries, long deltaEntries, long count = -1, bool partitionOrder = false)

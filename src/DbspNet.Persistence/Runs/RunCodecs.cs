@@ -26,6 +26,9 @@ internal interface IZSetRunCodec
 
     /// <summary>Add rows <c>[from, from + count)</c> of a decoded block to <paramref name="into"/>.</summary>
     void DecodeRange(RecordBatch batch, int from, int count, ZSetBuilder<StructuralRow, Z64> into);
+
+    /// <summary>A decoded block's entries in stored order, with their weights (compaction).</summary>
+    (StructuralRow Row, long Weight)[] DecodeEntries(RecordBatch batch);
 }
 
 /// <summary>The indexed-trace twin of <see cref="IZSetRunCodec"/>: a block row is (key, value, weight).</summary>
@@ -40,4 +43,7 @@ internal interface IIndexedRunCodec
     void DecodeBlock(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into);
 
     void DecodeRange(RecordBatch batch, int from, int count, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into);
+
+    /// <summary>A decoded block's entries in stored order (compaction).</summary>
+    (StructuralRow Key, StructuralRow Value, long Weight)[] DecodeEntries(RecordBatch batch);
 }

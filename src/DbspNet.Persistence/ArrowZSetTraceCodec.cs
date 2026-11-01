@@ -150,6 +150,33 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
     public void DecodeRange(RecordBatch batch, int from, int count, ZSetBuilder<StructuralRow, Z64> into) =>
         AddRange(batch, from, count, into, StringDecoding.Copy);
 
+    /// <inheritdoc/>
+    public (StructuralRow Row, long Weight)[] DecodeEntries(RecordBatch batch)
+    {
+        var columnCount = _rowSchema.Count;
+        var rowCount = batch.Length;
+        var perColumn = new object?[columnCount][];
+        for (var c = 0; c < columnCount; c++)
+        {
+            perColumn[c] = ArrowColumns.Extract(batch.Column(c), _rowSchema[c].Type, 0, rowCount, StringDecoding.Copy);
+        }
+
+        var weights = ((Int64Array)batch.Column(columnCount)).Values;
+        var entries = new (StructuralRow, long)[rowCount];
+        for (var i = 0; i < rowCount; i++)
+        {
+            var values = new object?[columnCount];
+            for (var c = 0; c < columnCount; c++)
+            {
+                values[c] = perColumn[c][i];
+            }
+
+            entries[i] = (new StructuralRow(values), weights[i]);
+        }
+
+        return entries;
+    }
+
     private async ValueTask SaveMonolithicAsync(
         ISnapshotWriter writer,
         string fileName,
