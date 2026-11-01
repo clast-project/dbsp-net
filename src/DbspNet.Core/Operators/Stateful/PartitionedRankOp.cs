@@ -54,6 +54,10 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // Per-partition integrated input, each sorted by the total-order comparer.
     private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
 
+    // Incremental checkpoints (docs/design-durable-state.md §1f, increment 3): the snapshot is
+    // the integral of the input, so the change since the last checkpoint is the inputs since.
+    private readonly ZSetChangeTracker<TInRow, Z64> _changes = new();
+
     // The widened output emitted last tick, per partition: widened row -> weight
     // (> 0). Keyed by the *widened* row (rank included) so ROW_NUMBER's one-row-per-
     // position expansion and RANK/DENSE_RANK's shared-rank groups both diff cleanly.
@@ -118,6 +122,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     public void Step()
     {
         var delta = _input.Current;
+        _changes.Record(delta);
 
         // Only the partitions a tick touches can change their ranking; collect them
         // so we recompute (and re-diff) just those.
@@ -290,6 +295,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         // from each row on load, so it need not be stored separately.
         var entries = _accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value))));
         var snapshot = ZSet.FromEntries(entries);
+        _changes.Attach(snapshot);
         return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
     }
 
@@ -301,6 +307,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        _changes.Restored(loaded);
         _accum.Clear();
         _window.Clear();
         foreach (var (row, weight) in loaded)

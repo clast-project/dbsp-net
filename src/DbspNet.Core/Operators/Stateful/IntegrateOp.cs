@@ -108,7 +108,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         // Reset the (in-place-mutated) view to the persisted contents. Integrating
         // into a freshly-cleared trace re-establishes exactly the saved multiset.
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _view.Current.MergeInPlace(_view.Current.Negate());
+        _view.Clear();
         _view.Integrate(loaded);
         if (SnapshotRestoreProfile.Enabled)
         {

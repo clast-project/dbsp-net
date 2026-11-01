@@ -278,6 +278,7 @@ public class IvmMultiBatch
             // DBSPNET_PROFILE has already written it, so this is then a no-op).
             double checkpointMs = 0;
             double snapshotMb = 0;
+            double writtenMb = 0;
             if (store is not null)
             {
                 if (Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PREGC") == "1")
@@ -316,8 +317,21 @@ public class IvmMultiBatch
                 if (File.Exists(pointer))
                 {
                     var current = File.ReadAllText(pointer).Trim();
-                    snapshotMb = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
-                        .Sum(f => new FileInfo(f).Length) / (1024.0 * 1024.0);
+                    var dirBytes = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "*", SearchOption.AllDirectories)
+                        .Sum(f => new FileInfo(f).Length);
+
+                    // With incremental runs (DBSPNET_STATE_LAYOUT=runs) the state also includes the
+                    // shared runs the snapshot's runs.txt files name; this checkpoint wrote only
+                    // the ones under runs/{current}.
+                    var referenced = Directory.EnumerateFiles(Path.Combine(snapshotDir!, current), "runs.txt", SearchOption.AllDirectories)
+                        .SelectMany(File.ReadAllLines).Where(l => l.Length > 0).Distinct()
+                        .Sum(r => new FileInfo(Path.Combine(snapshotDir!, r)).Length);
+                    var newRuns = Path.Combine(snapshotDir!, "runs", current);
+                    var written = Directory.Exists(newRuns)
+                        ? Directory.EnumerateFiles(newRuns, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length)
+                        : 0;
+                    snapshotMb = (dirBytes + referenced) / (1024.0 * 1024.0);
+                    writtenMb = (dirBytes + written) / (1024.0 * 1024.0);
                 }
             }
 
@@ -329,7 +343,7 @@ public class IvmMultiBatch
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
                 $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2}")
-                + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1}")));
+                + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1} written_mib={writtenMb:F1}")));
         }
 
         if (store is not null && parallel is not null && Environment.GetEnvironmentVariable("IVM_CHECKPOINT_DELTA") == "1")
@@ -463,6 +477,13 @@ public class IvmMultiBatch
         {
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"CKPTOP {label} {g.Key} n={g.Count()} sum_ms={g.Sum(o => o.Ms):F0} max_ms={g.Max(o => o.Ms):F0}"));
+        }
+
+        // The slowest operator positions (summed over workers): which op-{i} a file belongs to.
+        foreach (var g in ops.GroupBy(o => (o.Index, o.Op)).OrderByDescending(g => g.Sum(o => o.Ms)).Take(12))
+        {
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"CKPTIDX {label} op-{g.Key.Index} {g.Key.Op} sum_ms={g.Sum(o => o.Ms):F0}"));
         }
 
         return wall;

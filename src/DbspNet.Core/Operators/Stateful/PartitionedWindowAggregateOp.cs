@@ -71,6 +71,10 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     // Per-partition integrated input, sorted by the total-order comparer.
     private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
 
+    // Incremental checkpoints (docs/design-durable-state.md §1f, increment 3): the snapshot is
+    // the integral of the input, so the change since the last checkpoint is the inputs since.
+    private readonly ZSetChangeTracker<TInRow, Z64> _changes = new();
+
     // Last-emitted output per partition, keyed by the input (base) row →
     // (widened row, weight). Keying by base row lets GC drop a finalized row
     // from both _accum and here without emitting a retraction.
@@ -141,6 +145,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     public void Step()
     {
         var delta = _input.Current;
+        _changes.Record(delta);
         var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
 
         if (!delta.IsEmpty)
@@ -525,6 +530,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
             foreach (var row in drop)
             {
+                _changes.RecordDropped(row, new Z64(bucket[row]));
                 bucket.Remove(row);
             }
 
@@ -551,6 +557,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
         var entries = _accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value))));
         var snapshot = ZSet.FromEntries(entries);
+        _changes.Attach(snapshot);
         return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
     }
 
@@ -563,6 +570,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        _changes.Restored(loaded);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
         _window.Clear();

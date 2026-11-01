@@ -82,6 +82,7 @@ public static class ParallelSnapshot
         // parallel.json, so one sync over the whole directory before it is enough, and costs one
         // device flush instead of two per worker. Each worker goes on the pool so the writes run
         // concurrently whether or not the file system's calls yield (see ReadAsync: they often don't).
+        var session = Runs.StateLayout.Runs ? new Runs.CheckpointSession() : null;
         var tasks = new Task<int>[replicas.Count];
         for (var w = 0; w < replicas.Count; w++)
         {
@@ -89,7 +90,7 @@ public static class ParallelSnapshot
             var dir = WorkerDir(snapName, w);
             tasks[w] = Task.Run(
                 async () => await Snapshot.WriteDirAsync(
-                    replica, fs, dir, metadata: null, durable: null, cancellationToken).ConfigureAwait(false),
+                    replica, fs, dir, metadata: null, durable: null, cancellationToken, session).ConfigureAwait(false),
                 cancellationToken);
         }
 
@@ -98,6 +99,10 @@ public static class ParallelSnapshot
         if (durable is not null)
         {
             await Snapshot.SyncTreeAsync(fs, durable, snapName + "/", cancellationToken).ConfigureAwait(false);
+            if (session is not null)
+            {
+                await Snapshot.SyncTreeAsync(fs, durable, Runs.RunSweep.RunsPrefix + snapName + "/", cancellationToken).ConfigureAwait(false);
+            }
         }
 
         var manifestKey = snapName + "/" + ParallelManifestFile;
@@ -111,6 +116,7 @@ public static class ParallelSnapshot
 
         // Commit: one pointer for all W workers.
         await Snapshot.WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
+        session?.Commit();
 
         await Snapshot.PruneAsync(fs, (tick, generation), retainCount, ParallelManifestFile, cancellationToken)
             .ConfigureAwait(false);

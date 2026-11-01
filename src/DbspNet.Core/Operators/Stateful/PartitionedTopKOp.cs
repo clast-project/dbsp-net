@@ -71,6 +71,10 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
     // Per-partition integrated input, each sorted by the total-order comparer.
     private readonly Dictionary<TKey, SortedDictionary<TRow, long>> _accum;
 
+    // Incremental checkpoints (docs/design-durable-state.md §1f, increment 3): the snapshot is
+    // the integral of the input, so the change since the last checkpoint is the inputs since.
+    private readonly ZSetChangeTracker<TRow, Z64> _changes = new();
+
     // The window emitted last tick, per partition: row -> in-window weight (> 0).
     private readonly Dictionary<TKey, Dictionary<TRow, long>> _window;
 
@@ -132,6 +136,7 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
     public void Step()
     {
         var delta = _input.Current;
+        _changes.Record(delta);
 
         // Only the partitions a tick touches can change their window; collect
         // them so we recompute (and re-diff) just those.
@@ -314,6 +319,7 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
         // from each row on load, so it need not be stored separately.
         var entries = _accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value))));
         var snapshot = ZSet.FromEntries(entries);
+        _changes.Attach(snapshot);
         return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
     }
 
@@ -325,6 +331,7 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        _changes.Restored(loaded);
         _accum.Clear();
         _window.Clear();
         foreach (var (row, weight) in loaded)

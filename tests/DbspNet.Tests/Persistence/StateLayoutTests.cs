@@ -66,8 +66,9 @@ public class StateLayoutTests
                 continue; // keyed blobs stay in today's layout until increment 4
             }
 
+            // A run in place, a run list over runs/ (increment 3), or a run under runs/.
             await using var file = await fs.OpenReadAsync(f.Path);
-            if (await RunReader.IsRunAsync(file, default))
+            if (await RunReader.IsRunAsync(file, default) || await RunChain.IsListAsync(file, default))
             {
                 runs++;
             }

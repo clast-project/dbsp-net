@@ -17,12 +17,23 @@ internal sealed class TableFileSystemSnapshotContext : ISnapshotWriter, ISnapsho
     private readonly ITableFileSystem _fs;
     private readonly string _prefix;
 
-    public TableFileSystemSnapshotContext(ITableFileSystem fs, string prefix)
+    public TableFileSystemSnapshotContext(ITableFileSystem fs, string prefix, Runs.CheckpointSession? session = null)
     {
         _fs = fs;
         // Normalise: ensure prefix ends with '/' so file keys concatenate cleanly.
         _prefix = prefix.EndsWith('/') ? prefix : prefix + "/";
+        Session = session;
     }
+
+    /// <summary>The store, for files outside this prefix (runs, which snapshots share).</summary>
+    internal ITableFileSystem FileSystem => _fs;
+
+    /// <summary>This context's key prefix, ending in '/'.</summary>
+    internal string Prefix => _prefix;
+
+    /// <summary>The checkpoint this writer belongs to, when it may write incremental runs
+    /// (docs/design-durable-state.md §1f, increment 3); null otherwise.</summary>
+    internal Runs.CheckpointSession? Session { get; }
 
     public ValueTask<ISequentialFile> CreateAsync(string filename, CancellationToken cancellationToken = default)
     {

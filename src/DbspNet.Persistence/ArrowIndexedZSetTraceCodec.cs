@@ -51,7 +51,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
     public string SchemaFingerprint { get; }
 
     /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
-    /// is on (docs/design-durable-state.md §1f), otherwise as one Arrow stream.</summary>
+    /// is on (docs/design-durable-state.md §1f) — inside a checkpoint, as a run list over an
+    /// incremental chain of runs — otherwise as one Arrow stream.</summary>
     public async ValueTask SaveAsync(
         ISnapshotWriter writer,
         string fileName,
@@ -61,7 +62,7 @@ internal sealed class ArrowIndexedZSetTraceCodec
         if (Runs.StateLayout.Runs)
         {
             ArgumentNullException.ThrowIfNull(trace);
-            await Runs.RunFile.WriteIndexedAsync(writer, fileName, trace, this, Hash, cancellationToken: cancellationToken)
+            await Runs.RunCheckpoint.SaveIndexedAsync(writer, fileName, trace, this, Hash, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -205,6 +206,11 @@ internal sealed class ArrowIndexedZSetTraceCodec
         {
             await using var run = await Runs.RunReader.OpenAsync(probe, Hash, fileName, cancellationToken).ConfigureAwait(false);
             return await run.ReadAllIndexedAsync(this, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (await Runs.RunChain.IsListAsync(probe, cancellationToken).ConfigureAwait(false))
+        {
+            return await Runs.RunCheckpoint.LoadIndexedAsync(reader, probe, fileName, this, Hash, cancellationToken).ConfigureAwait(false);
         }
 
         await probe.DisposeAsync().ConfigureAwait(false);

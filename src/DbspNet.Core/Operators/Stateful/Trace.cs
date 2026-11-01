@@ -17,11 +17,38 @@ namespace DbspNet.Core.Operators.Stateful;
 /// Each trace owns its own fresh backing dictionary — <c>ZSet.Empty</c> is a
 /// shared singleton and must not be used as a mutable starting state.
 /// </remarks>
-internal sealed class ZSetTrace<TKey, TWeight>
+internal sealed class ZSetTrace<TKey, TWeight> : IZSetCheckpointTracked<TKey, TWeight>
     where TKey : notnull
     where TWeight : struct, IZRing<TWeight>
 {
+    // Incremental checkpoints (docs/design-durable-state.md §1f, increment 3): null until
+    // persistence starts a chain; then the sum of every change since the chain was last written.
+    private CheckpointTracking<ZSet<TKey, TWeight>>? _tracking;
+
+    public ZSetTrace() => CheckpointTracking.Register(Current, this);
+
     public ZSet<TKey, TWeight> Current { get; } = NewState();
+
+    /// <summary>What persistence last wrote for this trace, and the change since (null: untracked).</summary>
+    public CheckpointTracking<ZSet<TKey, TWeight>>? Tracking => _tracking;
+
+    /// <summary>Start (or restart) tracking: <paramref name="chain"/> describes what was just
+    /// written, which equals <see cref="Current"/>; the pending change is now empty.</summary>
+    public void StartTracking(object chain) =>
+        _tracking = new CheckpointTracking<ZSet<TKey, TWeight>>(chain, ZSet<TKey, TWeight>.NewMutable());
+
+    /// <summary>Forget any chain: the next checkpoint writes the whole trace.</summary>
+    public void StopTracking() => _tracking = null;
+
+    /// <summary>Empty the trace (and forget any chain).</summary>
+    public void Clear()
+    {
+        _tracking = null;
+        if (!Current.IsEmpty)
+        {
+            Current.MergeInPlace(Current.Negate());
+        }
+    }
 
     private static ZSet<TKey, TWeight> NewState()
     {
@@ -42,7 +69,20 @@ internal sealed class ZSetTrace<TKey, TWeight>
             return;
         }
 
+        if (CheckpointTracking.Restored(delta) is { } chain && Current.IsEmpty)
+        {
+            // State restored from a chain: keep extending it instead of rewriting it.
+            Current.MergeInPlace(delta);
+            StartTracking(chain);
+            return;
+        }
+
         Current.MergeInPlace(delta);
+        if (_tracking?.Pending is { } pending)
+        {
+            pending.MergeInPlace(delta);
+            _tracking.CheckOverflow(pending.Count, Current.Count);
+        }
     }
 
     /// <summary>
@@ -53,8 +93,26 @@ internal sealed class ZSetTrace<TKey, TWeight>
     /// non-indexed analogue of <see cref="IndexedZSetTrace{TKey,TValue,TWeight}.DropKeysBelow"/>,
     /// used by DISTINCT (where the key is the whole row).
     /// </summary>
-    public int DropKeysBelow(long threshold, Func<TKey, long> monotoneKey) =>
-        Current.RemoveKeysBelow(threshold, monotoneKey);
+    public int DropKeysBelow(long threshold, Func<TKey, long> monotoneKey)
+    {
+        if (_tracking?.Pending is { } pending)
+        {
+            // The dropped entries leave the state, so they enter the change negated.
+            var dropped = new ZSetBuilder<TKey, TWeight>();
+            foreach (var (key, weight) in Current.Entries())
+            {
+                if (monotoneKey(key) < threshold)
+                {
+                    dropped.Add(key, TWeight.Negate(weight));
+                }
+            }
+
+            pending.MergeInPlace(dropped.Build());
+            _tracking.CheckOverflow(pending.Count, Current.Count);
+        }
+
+        return Current.RemoveKeysBelow(threshold, monotoneKey);
+    }
 }
 
 /// <summary>
@@ -62,12 +120,26 @@ internal sealed class ZSetTrace<TKey, TWeight>
 /// <see cref="Integrate"/> mutates the backing state in place — cheap on the
 /// common case (one key touched) and independent of total state size.
 /// </summary>
-internal sealed class IndexedZSetTrace<TKey, TValue, TWeight>
+internal sealed class IndexedZSetTrace<TKey, TValue, TWeight> : IIndexedCheckpointTracked<TKey, TValue, TWeight>
     where TKey : notnull
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
 {
+    private CheckpointTracking<IndexedZSet<TKey, TValue, TWeight>>? _tracking;
+
+    public IndexedZSetTrace() => CheckpointTracking.Register(Current, this);
+
     public IndexedZSet<TKey, TValue, TWeight> Current { get; } = NewState();
+
+    /// <summary>What persistence last wrote for this trace, and the change since (null: untracked).</summary>
+    public CheckpointTracking<IndexedZSet<TKey, TValue, TWeight>>? Tracking => _tracking;
+
+    /// <summary>Start (or restart) tracking; see <see cref="ZSetTrace{TKey,TWeight}.StartTracking"/>.</summary>
+    public void StartTracking(object chain) =>
+        _tracking = new CheckpointTracking<IndexedZSet<TKey, TValue, TWeight>>(chain, IndexedZSet<TKey, TValue, TWeight>.NewMutable());
+
+    /// <summary>Forget any chain: the next checkpoint writes the whole trace.</summary>
+    public void StopTracking() => _tracking = null;
 
     private static IndexedZSet<TKey, TValue, TWeight> NewState()
     {
@@ -88,7 +160,19 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight>
             return;
         }
 
+        if (CheckpointTracking.Restored(delta) is { } chain && Current.IsEmpty)
+        {
+            Current.MergeInPlace(delta);
+            StartTracking(chain);
+            return;
+        }
+
         Current.MergeInPlace(delta);
+        if (_tracking?.Pending is { } pending)
+        {
+            pending.MergeInPlace(delta);
+            _tracking.CheckOverflow(pending.GroupCount, Current.GroupCount);
+        }
     }
 
     /// <summary>
@@ -98,6 +182,26 @@ internal sealed class IndexedZSetTrace<TKey, TValue, TWeight>
     /// per-key caches. Scans the whole trace, so callers should only invoke it
     /// when the frontier has actually advanced.
     /// </summary>
-    public IReadOnlyList<TKey> DropKeysBelow(long threshold, Func<TKey, long> monotoneKey) =>
-        Current.RemoveKeysBelow(threshold, monotoneKey);
+    public IReadOnlyList<TKey> DropKeysBelow(long threshold, Func<TKey, long> monotoneKey)
+    {
+        if (_tracking?.Pending is { } pending)
+        {
+            var dropped = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+            foreach (var (key, group) in Current)
+            {
+                if (monotoneKey(key) < threshold)
+                {
+                    foreach (var (value, weight) in group)
+                    {
+                        dropped.Add(key, value, TWeight.Negate(weight));
+                    }
+                }
+            }
+
+            pending.MergeInPlace(dropped.Build());
+            _tracking.CheckOverflow(pending.GroupCount, Current.GroupCount);
+        }
+
+        return Current.RemoveKeysBelow(threshold, monotoneKey);
+    }
 }

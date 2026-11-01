@@ -92,11 +92,13 @@ public static class Snapshot
         var snapName = SnapDirName(tick, generation);
         var durable = DurableStore(fs);
 
-        var count = await WriteDirAsync(circuit, fs, snapName, metadata, durable, cancellationToken).ConfigureAwait(false);
+        var session = Runs.StateLayout.Runs ? new Runs.CheckpointSession() : null;
+        var count = await WriteDirAsync(circuit, fs, snapName, metadata, durable, cancellationToken, session).ConfigureAwait(false);
 
         // Commit. After this, the new snapshot is the latest; before, the
         // pointer still names the prior snapshot (or doesn't exist).
         await WriteCurrentPointerAsync(fs, durable, snapName, cancellationToken).ConfigureAwait(false);
+        session?.Commit();
 
         await PruneAsync(fs, (tick, generation), retainCount, ManifestFile, cancellationToken).ConfigureAwait(false);
 
@@ -143,7 +145,8 @@ public static class Snapshot
         string dir,
         IReadOnlyDictionary<string, string>? metadata,
         IDurableTableFileSystem? durable,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Runs.CheckpointSession? session = null)
     {
         // Per-op files go under a directory nothing else names (see the class remarks). If a Save
         // throws partway through, the partial files are orphans, invisible to readers because
@@ -156,7 +159,7 @@ public static class Snapshot
                 continue;
             }
 
-            var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i);
+            var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i, session);
             var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             await s.SaveAsync(ctx, cancellationToken).ConfigureAwait(false);
             if (ProfileSave)
@@ -166,6 +169,18 @@ public static class Snapshot
             }
 
             snapshotted.Add(i);
+        }
+
+        if (session is not null)
+        {
+            // Incremental runs (docs/design-durable-state.md §1f, increment 3): name every run this
+            // directory's run lists use, for the sweep; the runs themselves are durable before the
+            // manifest like any op file.
+            await session.WriteRefsAsync(fs, dir, cancellationToken).ConfigureAwait(false);
+            if (durable is not null)
+            {
+                await SyncTreeAsync(fs, durable, Runs.RunSweep.RunsPrefix + dir + "/", cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if (durable is not null)
@@ -785,5 +800,7 @@ public static class Snapshot
                 }
             }
         }
+
+        await Runs.RunSweep.SweepAsync(fs, keep.Select(d => SnapDirName(d.Item1, d.Item2)), cancellationToken).ConfigureAwait(false);
     }
 }

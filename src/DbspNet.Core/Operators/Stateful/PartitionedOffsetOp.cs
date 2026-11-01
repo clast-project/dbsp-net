@@ -73,6 +73,10 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
     private readonly IZSetTraceCodec<TInRow, Z64>? _snapshotCodec;
 
     private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
+
+    // Incremental checkpoints (docs/design-durable-state.md §1f, increment 3): the snapshot is
+    // the integral of the input, so the change since the last checkpoint is the inputs since.
+    private readonly ZSetChangeTracker<TInRow, Z64> _changes = new();
     private readonly Dictionary<TKey, Dictionary<TOutRow, long>> _window;
 
     // Last tick's output count, used to pre-size this tick's delta builder
@@ -133,6 +137,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
     public void Step()
     {
         var delta = _input.Current;
+        _changes.Record(delta);
 
         HashSet<TKey>? touched = null;
         if (!delta.IsEmpty)
@@ -271,7 +276,9 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         }
 
         var entries = _accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value))));
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", ZSet.FromEntries(entries), cancellationToken);
+        var snapshot = ZSet.FromEntries(entries);
+        _changes.Attach(snapshot);
+        return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -282,6 +289,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         }
 
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
+        _changes.Restored(loaded);
         var tRebuild = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
         _window.Clear();

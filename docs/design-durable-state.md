@@ -474,7 +474,7 @@ earlier arc measured 0.0135%. Raw: `docs/restore-apportionment-20261031.txt`.
 Not yet measured: the Nexmark stream scenario with checkpointing on (Phase 1), and how the numbers
 scale with state size (only SF=3 exists locally; SF<3 cannot be generated).
 
-## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–2 built)
+## 1f. Phase 3 — design: option 2, flat hot tier + lazy cold runs (APPROVED 2026-10-31; increments 1–3 built)
 
 **Decisions (Curt, 2026-10-31):** option 2; a recompiled program may start from fresh state (no
 operator identity across recompiles — the plan/schema fingerprints keep refusing a mismatched
@@ -668,6 +668,94 @@ every engine type, and a reader whose hash disagrees refuses the run
 (`ARunOrderedByAnotherHash_IsRefused`). The 1 M-row microbenchmark now writes a run faster than
 today's file (386 vs 686 ms; absent-key probe 1.0 µs); the SF=3 effect of the hash change is
 measured with increment 3, whose base checkpoints are exactly these writes.
+
+### Increment 3 — built and measured (2026-10-31)
+
+**Change tracking, in Core.** `ZSetTrace` / `IndexedZSetTrace` carry an optional
+`CheckpointTracking`: the chain persistence last wrote (opaque to Core) and the sum of every change
+since (`Pending`). `Integrate` merges each delta into `Pending` too; `DropKeysBelow` (LATENESS GC)
+records the dropped entries negated; `Clear` (the restore reset in `IntegrateOp`, the only mutation
+that bypassed `Integrate`) forgets the chain. Operators whose state lives outside a trace but whose
+snapshot is the integral of their input — partitioned TOP-K, rank, offset (LAG/LEAD), window
+aggregate — hold a `ZSetChangeTracker` that records each step's input delta and the window
+aggregate's GC drops, and tag the snapshot they build. Nothing tracks until the first checkpoint
+commits (no batch-1 memory doubling), and a pending change past half the state stops recording
+and frees itself (the next checkpoint rewrites the state whole). Persistence finds a state's
+tracker through a side table (`ConditionalWeakTable`), not a field: a field on every Z-set costs
+8 bytes, which w1profile's B/ev would see. Steady state pays one null check per integrate while
+runs are off.
+
+**Chains, in Persistence.** Inside a session-aware checkpoint (`Snapshot` / `ParallelSnapshot`
+with `StateLayout.Runs`), a tracked state with a pending change writes it as one delta run;
+anything else writes a base run. Runs live under `runs/{snapshot dir}/…`, named after the snapshot
+that first wrote them; the snapshot's trace file becomes a **run list** naming the chain (base
+first). A chain is rewritten whole once it has `RunChain.MaxRuns` (8) runs or its deltas pass half
+its base. Restore sums the chain into one builder and marks the result, and the trace (or tracker)
+that integrates it into empty state **adopts** the chain — so the first checkpoint after a restore
+is a delta, not a rewrite.
+
+**Commit and crash safety.** Runs are durable before the manifest (the `runs/{dir}` tree is synced
+with the snapshot's). Each snapshot directory gets a `runs.txt` naming every run its run lists
+use. Tracking restarts on the new chains only **after** the pointer commits (`CheckpointSession`),
+so a checkpoint that fails part-way leaves every pending change in place and the next checkpoint
+still carries it (its unsynced runs are never referenced). After each prune, a sweep deletes every
+run no retained snapshot's `runs.txt` names. Re-shard writes self-contained runs (no session), so
+it needed no change.
+
+**Verification.** `DBSPNET_RUNS_VERIFY=1` reads every chain back as it is written and throws if its
+sum differs from the state — a mutation the tracking misses fails at that checkpoint. The full
+suite passes three ways (runs off, runs on, runs on + verify: 2,893 each), and one SF=3 run with
+verify on passed every checkpoint. `IncrementalCheckpointTests` (10): chains grow by deltas from an
+unchanged base and every checkpoint restores and carries on exactly; a restored chain is extended,
+not rewritten; long chains are rewritten and the sweep leaves exactly the referenced runs (retain
+1 and 3); a checkpoint failed at each of its mutations in turn loses nothing, including after power
+loss; LATENESS GC drops reach the deltas (join, DISTINCT, window aggregate); parallel chains restore
+and re-shard 3→2 and checkpoint on; a delta checkpoint crashed before each of its mutations
+(process crash and power loss) recovers the old or the new checkpoint, and the recovered program
+checkpoints on. Mutation-tested: each of these, removed, fails at least one test — pending not
+recorded (trace, LAG step), GC drops not recorded (indexed trace, Z-set trace, window aggregate),
+runs tree not synced, tracking restarted before the commit, restored chain not adopted, sweep that
+deletes nothing.
+
+**Measured** on SF=3, W=12, 5 alternating runs per arm (`ARMS="12 12:runs" scripts/measure-checkpoint.sh`;
+raw: `docs/runs-incremental-w12-20261031.txt`). Median [min–max]; *state* is everything a restore
+reads (the snapshot directory plus the runs it names), *written* is what that checkpoint wrote:
+
+| | today | runs, incremental |
+|---|--:|--:|
+| batch-1 drain | 15.96 s [15.71–16.11] | 15.95 s [15.41–17.74] |
+| checkpoint after batch 1 (base) | 4.96 s [4.78–5.18] | 5.96 s [5.90–6.10] |
+| checkpoint after batch 2 (delta) | 3.04 s [3.00–3.34] | **0.92 s** [0.92–0.93] |
+| checkpoint after batch 3 (delta) | 4.31 s [4.13–4.50] | **1.48 s** [1.45–1.48] |
+| written per delta checkpoint | 4,701 MiB | **51 MiB** (3 MiB runs + 48 MiB aggregate-state blobs) |
+| state | 4,701 MiB | 4,750 MiB |
+| restore | 5.54 s [5.37–5.85] | 6.65 s [6.48–7.28] |
+
+All 10 restores matched. Delta checkpoints are 3.3× / 2.9× faster and write 1% of the bytes; the
+base checkpoint is +1.0 s (+20%) and eager restore +1.1 s (+20%) — increment 4 replaces eager
+restore.
+
+**Against the 0.5 s target — not met yet, and the operators are no longer why.** Phase timing of a
+delta checkpoint (one run, ms; batch 2 / batch 3): listing snapshot directories 60 / 102; operator
+saves 141 / 137 (slowest worker); fsync 262 / 336; manifest + pointer 9 / 8; **prune + sweep
+393 / 756**. What is left is per-file bookkeeping: deleting the previous snapshot's ~2,400 files,
+creating and syncing one small run list per trace per worker, and listing every `snap-` file to
+find directory names. Levers, for a decision:
+1. **Defer prune + sweep past the commit** (background, awaited before the next checkpoint
+   starts): −0.4 to −0.75 s off checkpoint latency. The deletion still happens, overlapped with the
+   next batch; tests that count snapshots right after `WriteAsync` would await it.
+2. **One chain file per worker instead of a run list per trace** (`runs.txt` becomes the map from
+   `op-i/file` to its chain): ~2,400 fewer files to create, sync and later delete per checkpoint —
+   most of the fsync and prune time. Needs the snapshot reader to resolve trace files through the
+   map (operators check `ExistsAsync` before loading).
+3. Aggregate-state keyed blobs (48 MiB per checkpoint, written whole) move into runs with
+   increment 4, as planned.
+
+**Not measured:** the steady-state cost of tracking. Once a checkpoint has committed, every
+integrate also merges its delta into the pending change — O(|delta|) per tick, map entries only
+(rows are shared with the state). It is off until the first commit (batch-1 drain unchanged) and
+the ivm-bench batch-2/3 drains (~0.08 s) are too small to show it; a throughput run with periodic
+checkpoints would.
 
 ### Targets (approved 2026-10-31)
 
