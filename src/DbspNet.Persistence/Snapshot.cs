@@ -475,7 +475,9 @@ public static class Snapshot
         }
 
         var manifest = await ReadManifestAsync(circuit, fs, current, cancellationToken).ConfigureAwait(false);
-        return await LoadDirAsync(circuit, fs, current, manifest, parallelism, cancellationToken).ConfigureAwait(false);
+        var loaded = await LoadDirAsync(circuit, fs, current, manifest, parallelism, cancellationToken).ConfigureAwait(false);
+        CheckpointGcMode.AfterLazyRestore();
+        return loaded;
     }
 
     /// <summary>

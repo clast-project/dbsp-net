@@ -439,6 +439,9 @@ public sealed class ProgramRunner
 
     /// <summary>Write every output view's full current contents to its sink (truncate).
     /// Call after <see cref="DrainAsync"/> to materialise a batch's results.</summary>
+    // Diagnostic: DBSPNET_OUTPUT_TRACE=<file> also gets each incremental write's runner-side times.
+    private static readonly string? OutputTrace = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_TRACE");
+
     public async ValueTask WriteOutputsAsync(CancellationToken cancellationToken = default)
     {
         var tick = _program.TickCount;
@@ -446,7 +449,13 @@ public sealed class ProgramRunner
         {
             if (_incremental.TryGetValue(connector, out var incremental))
             {
+                var t0 = Stopwatch.GetTimestamp();
                 await WriteIncrementalAsync(connector, output, incremental, tick, cancellationToken).ConfigureAwait(false);
+                if (OutputTrace is { } trace)
+                {
+                    File.AppendAllText(trace, $"RUNNER {connector.ViewName} total={Stopwatch.GetElapsedTime(t0).TotalMilliseconds:F0}\n");
+                }
+
                 continue;
             }
 
@@ -499,6 +508,10 @@ public sealed class ProgramRunner
         var w0 = Stopwatch.GetTimestamp();
         await connector.ApplyChangesAsync(changes.Inserts, changes.InsertKeys, changes.Deletes, tick, cancellationToken)
             .ConfigureAwait(false);
+        if (OutputTrace is { } outputTrace)
+        {
+            File.AppendAllText(outputTrace, $"RUNNER-SPLIT {connector.ViewName} mat={matTicks * 1000.0 / Stopwatch.Frequency:F0} apply={Stopwatch.GetElapsedTime(w0).TotalMilliseconds:F0}\n");
+        }
         incremental.Written = true;
         _profile?.Output(connector.ViewName).Add(
             matTicks, Stopwatch.GetTimestamp() - w0, changes.Inserts.Length + changes.Deletes.Count);

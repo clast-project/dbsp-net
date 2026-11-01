@@ -32,6 +32,26 @@ internal static class CheckpointGcMode
     private static int _depth;
     private static GCLatencyMode _saved;
 
+    /// <summary>
+    /// After a lazy restore (runs layout, docs/design-durable-state.md §1f): one blocking, compacting
+    /// collection, while the heap is still small. Without it the first allocation-heavy work after the
+    /// restore — the first full output write — took ~1 s of GC pauses on ivm-bench SF=3 (first write
+    /// 2.4–2.8 s against 1.3 s; with it 1.34–1.39 s, for a collection of ~0.18 s at the restored heap
+    /// of ~5.7 GiB). An eager restore leaves a heap of tens of GiB, where the same collection costs
+    /// ~1 s and buys nothing, so it is skipped there. <c>DBSPNET_RESTORE_GC=0</c> opts out.
+    /// </summary>
+    internal static void AfterLazyRestore()
+    {
+        if (!Runs.StateLayout.Runs || !Runs.RunColdGroups.Enabled
+            || Environment.GetEnvironmentVariable("DBSPNET_RESTORE_GC") == "0"
+            || GC.GetTotalMemory(forceFullCollection: false) < (1L << 30)) // a small heap has no debt worth paying early
+        {
+            return;
+        }
+
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+    }
+
     public static Scope Enter()
     {
         if (!Enabled)

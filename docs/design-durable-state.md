@@ -1088,6 +1088,48 @@ running beside the checkpoint — most likely their CPU and GC (a merge decodes 
 not yet profiled). Merging Arrow batches directly, without row objects, is the lever if they matter.
 ivm-bench's three batches never reach `CompactAt`, so this is not on the SF=3 numbers.
 
+### The first output write after a lazy restore (2026-11-01)
+
+After increment 6 the first incremental write after a lazy restart took 2.4–3.2 s against today's
+1.3 s. Run down with per-view runner and connector timers (`DBSPNET_OUTPUT_TRACE=<file>`, kept as a
+diagnostic) and a few one-off experiments on the restart scenario:
+
+- **The views were not the cause.** Decoding the cold views was ~0.6 s, single-threaded across the
+  workers; now the cold workers decode in parallel and a single run streams in stored order without
+  building a hashed Z-set per block (decode 500 ms → parallel, sum unchanged). But restoring the views
+  *eagerly* (`DBSPNET_LAZY_VIEWS=0`) still left the write at 1.8–2.4 s.
+- **Nor the disk or the thread pool.** A 10 s pause before the batch, or a 64-thread pool minimum,
+  changed nothing; the extra second moved between building the changes and the connector's write
+  from run to run.
+- **It was GC debt.** One blocking, compacting collection right after the restore — 0.18–0.35 s at the
+  ~5.7 GiB lazily restored heap — brought the write back to 1.34–1.39 s, with 57–116 ms of GC pauses in
+  the batch instead of 617–954 ms. The restore leaves the heap in a state where the next collection,
+  landing in the allocation-heavy first write, pauses ~1 s; paying it while the heap is small is cheap.
+  `CheckpointGcMode.AfterLazyRestore` does this at the end of a runs-layout lazy restore when the heap
+  is over 1 GiB (an eager restore leaves tens of GiB, where it costs ~1 s and buys nothing; a small
+  heap has nothing to pay). `DBSPNET_RESTORE_GC=0` opts out.
+- **A correction to increment 6.** Lazy views save no memory with the Delta connector: in
+  incremental mode it keeps every view row as a key in its position map (for deletion vectors), so
+  the rows stay resident — in the connector instead of the engine.
+
+**Measured** — restart after batch 1, SF=3, W=12, 5 alternating runs (raw:
+`docs/first-output-write-w12-20261101.txt`; all restores matched):
+
+| | today | lazy, before | lazy, now |
+|---|--:|--:|--:|
+| restore | 5.61 s [5.52–5.68] | 0.76 s | 1.10 s [1.10–1.15] |
+| first batch drain | 0.09 s | 0.17 s | 0.17 s [0.17–0.18] |
+| first output write | 1.25 s [1.14–1.32] | 2.40 s | **1.33 s** [1.31–1.37] |
+| restore + drain + first write | 6.95 s | 3.35 s | **2.61 s** [2.58–2.69] |
+| final restore (after batch 3) | 6.94 s | 0.93 s | 1.12 s [1.06–1.14] |
+
+The first write is back to today's. The collection is paid inside restore, which now measures
+1.1 s — just over the 1 s target it met before — for a restart-to-first-write 0.7 s shorter.
+
+Also fixed: the increment-7b test that turns compaction off used a process-wide static, which could
+switch it off under other compaction tests running in parallel (an intermittent full-suite failure);
+`RunCheckpoint.UseCompaction` is now scoped to the async context, like `StateLayout.Use`.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
