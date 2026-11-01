@@ -158,10 +158,10 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
         if (!delta.IsEmpty)
         {
-            // Integrate, and track per touched partition the value range the delta
-            // spans (used to bound which output rows must be recomputed).
+            // Track per touched partition the value range the delta spans (used to bound
+            // which output rows must be recomputed); fault in cold partitions.
             var touched = new Dictionary<TKey, (long Min, long Max)>(_accum.Comparer);
-            foreach (var (row, dw) in delta)
+            foreach (var (row, _) in delta)
             {
                 var key = _partitionOf(row);
                 if (_lazy is not null)
@@ -170,15 +170,23 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 }
 
                 var v = _orderValueOf?.Invoke(row) ?? 0L;
-                if (touched.TryGetValue(key, out var range))
-                {
-                    touched[key] = (Math.Min(range.Min, v), Math.Max(range.Max, v));
-                }
-                else
-                {
-                    touched[key] = (v, v);
-                }
+                touched[key] = touched.TryGetValue(key, out var range) ? (Math.Min(range.Min, v), Math.Max(range.Max, v)) : (v, v);
+            }
 
+            // A faulted partition's window is known only where a step has needed it: before the
+            // delta lands, rebuild it over this delta's range from the partition as it stands.
+            if (_partial is not null)
+            {
+                foreach (var (key, range) in touched)
+                {
+                    EnsureWindow(key, range);
+                }
+            }
+
+            // Integrate.
+            foreach (var (row, dw) in delta)
+            {
+                var key = _partitionOf(row);
                 if (!_accum.TryGetValue(key, out var bucket))
                 {
                     bucket = new SortedDictionary<TInRow, long>(_order);
@@ -582,7 +590,48 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         _accum[key] = bucket;
-        InitWindow(key, bucket);
+
+        // Its window is rebuilt range by range as steps need it (EnsureWindow), not whole: a
+        // partition with a long frame costs O(rows x frame) to rebuild whole, and a step reads
+        // only the rows its delta's frame reaches.
+        _partial ??= new Dictionary<TKey, (long Min, long Max)>(_accum.Comparer);
+        _partial[key] = (long.MaxValue, long.MinValue); // nothing known yet
+    }
+
+    // Faulted partitions whose window (_window) is known only over a hull of delta ranges; a
+    // partition absent here has its whole window.
+    private Dictionary<TKey, (long Min, long Max)>? _partial;
+
+    // Before a delta over `range` lands in a faulted partition: rebuild its window over the
+    // rows that delta's frame reaches, from the partition as it stands (the outputs emitted
+    // before the restore). Known spans are recomputed to the same values, so widening the hull
+    // is safe; a whole-partition frame (no ORDER BY) is rebuilt whole.
+    private void EnsureWindow(TKey key, (long Min, long Max) range)
+    {
+        if (!_partial!.TryGetValue(key, out var known))
+        {
+            return;
+        }
+
+        if (_orderValueOf is null)
+        {
+            _partial.Remove(key);
+            if (_accum.TryGetValue(key, out var all))
+            {
+                InitWindow(key, all);
+            }
+
+            return;
+        }
+
+        if (range.Min >= known.Min && range.Max <= known.Max)
+        {
+            return;
+        }
+
+        var hull = (Math.Min(range.Min, known.Min), Math.Max(range.Max, known.Max));
+        RecomputePartition(new ZSetBuilder<TOutRow, Z64>(), key, hull);
+        _partial[key] = hull;
     }
 
     // Read every partition still cold (a whole-state write, or GC).

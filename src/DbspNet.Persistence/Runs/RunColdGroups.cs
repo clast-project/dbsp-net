@@ -12,12 +12,13 @@ namespace DbspNet.Persistence.Runs;
 /// few filter checks and no I/O. Runs are open detached (footer and schema in memory).
 /// </summary>
 /// <remarks>
-/// <b>Giant groups are read at restore.</b> A block never splits a group, so a group larger than
-/// a block fills a block of its own, and reading its key means decoding all of it. Those keys are
-/// the low-cardinality join keys almost every batch touches (on ivm-bench SF=3, 14 blocks holding
-/// 8% of the state, and the first resumed batch decoded nearly all of them). A block holding one
-/// group of more than <see cref="GiantGroupEntries"/> entries is decoded when the chain is opened
-/// and its key resolved straight away.
+/// <b>Giant groups are decoded in the background from the restore on.</b> A block never splits a
+/// group, so a group larger than a block fills a block of its own, and reading its key means
+/// decoding all of it. Those keys are the low-cardinality join keys almost every batch touches (on
+/// ivm-bench SF=3, 14 blocks holding 8% of the state). Each block holding one group of more than
+/// <see cref="GiantGroupEntries"/> entries starts decoding when the chain is opened, off the restore
+/// path (resolving them at restore put ~4.4 GiB of allocation and most of a fresh-process restore's
+/// time on it); the first read of a giant key waits for its block if it is still decoding.
 /// </remarks>
 internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, Z64>
 {
@@ -26,22 +27,35 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
 
     private readonly RunReader[] _runs;
     private readonly IIndexedRunCodec _codec;
-    private Dictionary<(int Run, int Block), IndexedZSet<StructuralRow, StructuralRow, Z64>>? _preloaded;
+
+    // Giant single-group blocks, decoded in the background from the restore on (see the class
+    // remarks): a read of a giant key waits for its block, then takes it — one group per block, so
+    // the block is dropped once read.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(int Run, int Block), Task<(StructuralRow Key, ZSet<StructuralRow, Z64> Group)>> _giant;
 
     private RunColdGroups(
         RunReader[] runs, IIndexedRunCodec codec, int groupCount,
-        Dictionary<(int, int), IndexedZSet<StructuralRow, StructuralRow, Z64>> preloaded, List<StructuralRow> preloadKeys)
+        System.Collections.Concurrent.ConcurrentDictionary<(int, int), Task<(StructuralRow Key, ZSet<StructuralRow, Z64> Group)>> giant)
     {
         _runs = runs;
         _codec = codec;
         GroupCount = groupCount;
-        _preloaded = preloaded;
-        PreloadKeys = preloadKeys;
+        _giant = giant;
     }
 
     public int GroupCount { get; }
 
-    public IReadOnlyCollection<StructuralRow> PreloadKeys { get; private set; }
+    private static long _giantWaitTicks;
+    private static long _giantWaits;
+
+    /// <summary>Reads that waited for a giant block still decoding, and the wall time waited (diagnostics).</summary>
+    internal static (long Waits, double Ms) GiantWaits =>
+        (Interlocked.Read(ref _giantWaits), Interlocked.Read(ref _giantWaitTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+
+    /// <summary>None: giant groups are decoded in the background and taken when first read, not
+    /// resolved at restore (which put their decode — most of a restore's allocation — on the
+    /// restore path).</summary>
+    public IReadOnlyCollection<StructuralRow> PreloadKeys => [];
 
     /// <summary>Lazy restore is the default for chains; <c>DBSPNET_RESTORE=eager</c> reads every
     /// chain whole at restore instead (the increment 3 behaviour).</summary>
@@ -57,8 +71,7 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
         }
 
         var runs = new RunReader[chain.Paths.Count];
-        var preloaded = new Dictionary<(int, int), IndexedZSet<StructuralRow, StructuralRow, Z64>>();
-        var keys = new HashSet<StructuralRow>();
+        var giant = new System.Collections.Concurrent.ConcurrentDictionary<(int, int), Task<(StructuralRow Key, ZSet<StructuralRow, Z64> Group)>>();
         for (var r = 0; r < runs.Length; r++)
         {
             runs[r] = await RunReader.OpenDetachedAsync(chain.Store, chain.Paths[r], hash, null, cancellationToken).ConfigureAwait(false);
@@ -66,22 +79,20 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
             {
                 if (runs[r].Blocks[b] is { Groups: 1, Entries: > GiantGroupEntries })
                 {
-                    var block = await runs[r].DecodeIndexedBlockAsync(b, codec, cancellationToken).ConfigureAwait(false);
-                    preloaded[(r, b)] = block;
-                    keys.UnionWith(block.Keys);
+                    var (run, block) = (runs[r], b);
+                    giant[(r, b)] = Task.Run(async () =>
+                        (await run.ReadBlockAsync(block, codec.DecodeSingleGroup, CancellationToken.None).ConfigureAwait(false)).Entries);
                 }
             }
         }
 
-        var cold = new RunColdGroups(runs, codec, checked((int)chain.Count), preloaded, [.. keys]);
+        var cold = new RunColdGroups(runs, codec, checked((int)chain.Count), giant);
         RunPins.Add(cold, chain.Store, chain.Paths);
         return cold;
     }
 
     public void ReleasePreload()
     {
-        _preloaded = null;
-        PreloadKeys = [];
     }
 
     public ZSet<StructuralRow, Z64> Read(StructuralRow key)
@@ -98,9 +109,34 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
 
             // Synchronous on purpose: the operator that asked is on the step thread, waiting.
             // A preloaded giant block is already decoded; otherwise only the key's entries are.
-            var group = _preloaded is not null && _preloaded.TryGetValue((r, b), out var held)
-                ? held.GroupFor(key)
-                : _runs[r].GroupOfKeyAsync(key, _codec).AsTask().GetAwaiter().GetResult();
+            ZSet<StructuralRow, Z64> group;
+            if (_giant.TryGetValue((r, b), out var held))
+            {
+                // Decoded in the background (one group per block). A different key that shares the
+                // block's hash is not in it; the giant key is taken, so the block is dropped.
+                if (!held.IsCompleted)
+                {
+                    var w0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    held.Wait();
+                    Interlocked.Add(ref _giantWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - w0);
+                    Interlocked.Increment(ref _giantWaits);
+                }
+
+                var (giantKey, giantGroup) = held.GetAwaiter().GetResult();
+                if (giantKey.Equals(key))
+                {
+                    _giant.TryRemove((r, b), out _);
+                    group = giantGroup;
+                }
+                else
+                {
+                    group = ZSet<StructuralRow, Z64>.Empty;
+                }
+            }
+            else
+            {
+                group = _runs[r].GroupOfKeyAsync(key, _codec).AsTask().GetAwaiter().GetResult();
+            }
             if (group.IsEmpty)
             {
                 continue;

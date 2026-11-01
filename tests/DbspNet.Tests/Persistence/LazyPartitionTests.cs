@@ -28,9 +28,15 @@ public class LazyPartitionTests
         "CREATE VIEW rk AS SELECT a, b, RANK() OVER (PARTITION BY a ORDER BY b) AS r FROM t",
         "CREATE VIEW top AS SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC) AS rn FROM t) x WHERE rn <= 2",
         "CREATE VIEW ws AS SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s FROM t",
+        // Window shapes a lazily faulted partition rebuilds only where a step needs it: running
+        // (UNBOUNDED PRECEDING) and bounded, ascending and descending.
+        "CREATE VIEW wr AS SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM t",
+        "CREATE VIEW wm AS SELECT a, b, MIN(b) OVER (PARTITION BY a ORDER BY b DESC RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS m FROM t",
+        "CREATE VIEW wd AS SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b DESC RANGE BETWEEN 7 PRECEDING AND CURRENT ROW) AS s FROM t",
+        "CREATE VIEW wa AS SELECT a, b, AVG(b) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 20 PRECEDING AND CURRENT ROW) AS v FROM t",
     ];
 
-    private static readonly HashSet<string> Views = new(["lg", "rk", "top", "ws"], StringComparer.Ordinal);
+    private static readonly HashSet<string> Views = new(["lg", "rk", "top", "ws", "wr", "wm", "wd", "wa"], StringComparer.Ordinal);
 
     private static CompiledProgram Compile() => SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
 
@@ -94,7 +100,7 @@ public class LazyPartitionTests
         var states = LazyStates(restored);
         Assert.Equal(
             ["PartitionedOffsetOp`3", "PartitionedRankOp`3", "PartitionedWindowAggregateOp`4"],
-            states.Select(s => s.Op).Order(StringComparer.Ordinal));
+            states.Select(s => s.Op).Distinct().Order(StringComparer.Ordinal));
         Assert.All(states, s => Assert.True(s.Lazy is not null, $"{s.Op} restored eagerly"));
         Assert.Equal(Digest(twin), Digest(restored));
 
