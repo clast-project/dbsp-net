@@ -2,7 +2,9 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using Clast.DatabaseDecimal;
 using Clast.DatabaseDecimal.Arithmetic;
+using Clast.DatabaseDecimal.Text;
 using Clast.DatabaseDecimal.Values;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Expressions;
 
@@ -92,6 +94,15 @@ internal static class DecimalRuntime
     /// </summary>
     public static double ToDouble(Decimal128 value, int scale) =>
         (double)value.Mantissa / Math.Pow(10, scale);
+
+    public static Utf8String ToUtf8(Decimal128 value, DecimalType type) =>
+        Utf8String.Of(DecimalText.Format(value, type));
+
+    public static int ToInt32(Decimal128 value, int scale) =>
+        checked((int)ScaleHelper.Rescale128(value.Mantissa, scale, 0, DecimalRounding.HalfUp));
+
+    public static long ToInt64(Decimal128 value, int scale) =>
+        checked((long)ScaleHelper.Rescale128(value.Mantissa, scale, 0, DecimalRounding.HalfUp));
 
     /// <summary>
     /// Narrow a <see cref="Int256"/> SUM accumulator back to <see cref="Decimal128"/>.

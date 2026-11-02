@@ -137,6 +137,16 @@ public class NullOnErrorAndJsonTests
     [InlineData("DECIMAL(12,0)", "DECIMAL(3,0)", "1000")]
     [InlineData("BIGINT", "DECIMAL(38,37)", "9223372036854775807")]
     [InlineData("DOUBLE", "DECIMAL(3,0)", "1000")]
+    [InlineData("DOUBLE", "REAL", "-1e100")]
+    [InlineData("DECIMAL(12,0)", "INTEGER", "-2147483649")]
+    [InlineData("DECIMAL(20,0)", "BIGINT", "9223372036854775808")]
+    [InlineData("DECIMAL(20,0)", "BIGINT", "-9223372036854775809")]
+    [InlineData("DECIMAL(12,0)", "DECIMAL(3,0)", "-1000")]
+    [InlineData("DECIMAL(8,2)", "DECIMAL(3,1)", "99.96")]
+    [InlineData("DECIMAL(38,0)", "DECIMAL(38,37)", "99999999999999999999999999999999999999")]
+    [InlineData("BIGINT", "DECIMAL(3,0)", "1000")]
+    [InlineData("DOUBLE", "DECIMAL(38,0)", "1e100")]
+    [InlineData("DOUBLE", "DECIMAL(38,0)", "NaN")]
     public void StrictAndSafeCastsShareRangeChecks(string source, string target, string value)
     {
         Assert.Throws<OverflowException>(() => Eval($"CAST(CAST(s AS {source}) AS {target})", value));
@@ -154,25 +164,6 @@ public class NullOnErrorAndJsonTests
     [Fact]
     public void NestedTryCastRetainsNullOnErrorBehavior() =>
         Assert.Null(Eval("TRY_CAST(TRY_CAST(s AS INTEGER) AS VARCHAR)", "bad"));
-
-    [Theory]
-    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS REAL)", "1e100")]
-    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS REAL)", "-1e100")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS INTEGER)", "4294967296")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS INTEGER)", "-2147483649")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(20,0)) AS BIGINT)", "9223372036854775808")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(20,0)) AS BIGINT)", "-9223372036854775809")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS DECIMAL(3,0))", "1000")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS DECIMAL(3,0))", "-1000")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(8,2)) AS DECIMAL(3,1))", "99.96")]
-    [InlineData("TRY_CAST(CAST(s AS DECIMAL(38,0)) AS DECIMAL(38,37))", "99999999999999999999999999999999999999")]
-    [InlineData("TRY_CAST(CAST(s AS BIGINT) AS DECIMAL(3,0))", "1000")]
-    [InlineData("TRY_CAST(CAST(s AS BIGINT) AS DECIMAL(38,37))", "9223372036854775807")]
-    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS DECIMAL(3,0))", "1000")]
-    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS DECIMAL(38,0))", "1e100")]
-    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS DECIMAL(38,0))", "NaN")]
-    public void TryCastReturnsNullForNumericRangeOverflow(string expression, string value) =>
-        Assert.Null(Eval(expression, value));
 
     [Theory]
     [InlineData("2147483647", int.MaxValue)]

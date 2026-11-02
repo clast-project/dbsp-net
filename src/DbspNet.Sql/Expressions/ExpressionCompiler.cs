@@ -743,8 +743,8 @@ public static class ExpressionCompiler
 
     /// <summary>
     /// Cast a <see cref="SqlDecimalType"/> source to a non-decimal target.
-    /// Decimal → string formats via <c>DecimalText</c>; decimal → integer /
-    /// float / double rescales the mantissa to scale 0 then casts.
+    /// Decimal → string preserves the source scale; integer targets round
+    /// half away from zero, while floating-point targets preserve the fraction.
     /// </summary>
     private static Expression BuildCastFromDecimal(
         Expression operand, SqlDecimalType src, SqlType dstType, Type dstClr)
@@ -756,16 +756,11 @@ public static class ExpressionCompiler
         Expression converted;
         if (dstType is SqlVarcharType)
         {
-            var format = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Text.DecimalText.Format),
-                    [typeof(Clast.DatabaseDecimal.Values.Decimal128), typeof(Clast.DatabaseDecimal.DecimalType)])!,
+            var text = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.ToUtf8))!,
                 unboxed,
                 Expression.Constant(sourceType));
-            var toUtf8 = Expression.Call(
-                typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
-                format);
-            converted = Expression.Convert(toUtf8, typeof(object));
+            converted = Expression.Convert(text, typeof(object));
         }
         else if (dstClr == typeof(float) || dstClr == typeof(double))
         {
@@ -783,16 +778,11 @@ public static class ExpressionCompiler
         }
         else if (dstClr == typeof(int) || dstClr == typeof(long))
         {
-            // Integer targets drop the fraction (rescale to scale 0), then cast.
-            var mantissa = Expression.Field(unboxed, nameof(Clast.DatabaseDecimal.Values.Decimal128.Mantissa));
-            var rescaled = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
-                mantissa,
-                Expression.Constant(src.Scale),
-                Expression.Constant(0),
-                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfUp));
-            var cast = SqlCasts.ConvertNumeric(rescaled, dstClr);
+            var cast = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(dstClr == typeof(int)
+                    ? nameof(DecimalRuntime.ToInt32) : nameof(DecimalRuntime.ToInt64))!,
+                unboxed,
+                Expression.Constant(src.Scale));
             converted = Expression.Convert(cast, typeof(object));
         }
         else
@@ -847,20 +837,12 @@ internal static class SqlCasts
         {
             return Expression.Call(typeof(SqlCasts).GetMethod(nameof(DoubleToSingleChecked))!, operand);
         }
-        // Expression.ConvertChecked does not select Int128's checked user-defined operator.
-        if (operand.Type == typeof(Int128) && (target == typeof(int) || target == typeof(long)))
-            return Expression.Call(typeof(SqlCasts).GetMethod(target == typeof(int)
-                ? nameof(Int128ToInt32Checked) : nameof(Int128ToInt64Checked))!, operand);
         return Expression.ConvertChecked(operand, target);
     }
 
     public static double RoundIntegralCast(double value) => Math.Round(value, MidpointRounding.ToEven);
 
     public static float RoundIntegralCast(float value) => MathF.Round(value, MidpointRounding.ToEven);
-
-    public static int Int128ToInt32Checked(Int128 value) => checked((int)value);
-
-    public static long Int128ToInt64Checked(Int128 value) => checked((long)value);
 
     public static float DoubleToSingleChecked(double value)
     {
