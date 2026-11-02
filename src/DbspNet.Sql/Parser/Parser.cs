@@ -1652,6 +1652,8 @@ public sealed class Parser
                 return ParseTypedTemporalLiteral();
             case TokenKind.Extract:
                 return ParseExtractExpression();
+            case TokenKind.Identifier when IsContextualKeyword("try_cast"):
+                return ParseCastExpression(safe: true);
             case TokenKind.Cast:
                 return ParseCastExpression();
             case TokenKind.Coalesce:
@@ -1832,15 +1834,16 @@ public sealed class Parser
         }
     }
 
-    private CastExpression ParseCastExpression()
+    private CastExpression ParseCastExpression(bool safe = false)
     {
-        Expect(TokenKind.Cast);
+        if (safe) Advance();
+        else Expect(TokenKind.Cast);
         Expect(TokenKind.LParen);
         var expr = ParseExpression();
         Expect(TokenKind.As);
         var type = ParseTypeSpec();
         Expect(TokenKind.RParen);
-        return new CastExpression(expr, type);
+        return new CastExpression(expr, type, safe);
     }
 
     /// <summary>
@@ -2070,7 +2073,26 @@ public sealed class Parser
                 }
             }
 
+            var ignoreNulls = false;
+            if (IsContextualKeyword("ignore"))
+            {
+                Advance();
+                Expect(TokenKind.Nulls);
+                ignoreNulls = true;
+            }
             Expect(TokenKind.RParen);
+            if (IsContextualKeyword("ignore"))
+            {
+                if (ignoreNulls) throw Error(Peek(), "duplicate IGNORE NULLS clause");
+                Advance();
+                Expect(TokenKind.Nulls);
+                ignoreNulls = true;
+            }
+            if (ignoreNulls && first.Text is not ("first_value" or "last_value"))
+            {
+                throw Error(first, "IGNORE NULLS is supported for FIRST_VALUE and LAST_VALUE");
+            }
+
 
             // PERCENTILE_CONT(f) / PERCENTILE_DISC(f) WITHIN GROUP (ORDER BY x):
             // the ANSI ordered-set spelling of an approximate quantile. Lower to
@@ -2133,8 +2155,10 @@ public sealed class Parser
                 }
 
                 Advance();
-                return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseOverSpec());
+                return new WindowFunctionExpression(first.Text, args, IsStar: false, ParseOverSpec(), ignoreNulls);
             }
+
+            if (ignoreNulls) throw Error(first, "IGNORE NULLS requires OVER");
 
             // Event-time tumbling-window functions. TUMBLE(t, size) (a GROUP BY
             // auxiliary) and TUMBLE_START(t, size) both name the window's start —

@@ -660,6 +660,8 @@ public static class TypedExpressionCompiler
 
     private static Expression BuildCast(ResolvedCast cast, ParameterExpression row, Type rowType)
     {
+        // The structural compiler preserves conversion failures as SQL NULL.
+        if (cast.Safe) throw Unsupported();
         var operand = Build(cast.Operand, row, rowType);
         var srcType = cast.Operand.Type;
         var dstType = cast.Type;

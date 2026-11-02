@@ -118,6 +118,9 @@ internal static class ScalarFunctionRegistry
             new DateTruncFunction(),
             new DateAddFunction(),
             new DateDiffFunction(),
+            new StrptimeFunction("strptime", safe: false),
+            new StrptimeFunction("try_strptime", safe: true),
+            new JsonExtractStringFunction(),
             new WindowStartFunction(),
 
             // General.

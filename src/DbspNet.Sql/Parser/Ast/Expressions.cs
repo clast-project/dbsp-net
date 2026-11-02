@@ -105,7 +105,7 @@ public sealed record UnaryExpression(UnaryOperator Operator, Expression Operand)
 
 public sealed record IsNullExpression(Expression Operand, bool Negated) : Expression;
 
-public sealed record CastExpression(Expression Operand, SqlTypeSpec TargetType) : Expression;
+public sealed record CastExpression(Expression Operand, SqlTypeSpec TargetType, bool Safe = false) : Expression;
 
 /// <summary>
 /// A function or aggregate call. <see cref="IsStar"/> is set for
@@ -196,7 +196,8 @@ public sealed record WindowFunctionExpression(
     string FunctionName,
     IReadOnlyList<Expression> Arguments,
     bool IsStar,
-    WindowSpec Over) : Expression;
+    WindowSpec Over,
+    bool IgnoreNulls = false) : Expression;
 
 /// <summary>
 /// A parenthesised query appearing in expression position — a scalar

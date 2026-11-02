@@ -744,6 +744,12 @@ internal static class BatchPlanEvaluator
                 for (var s = 0; s < plan.Functions.Count; s++)
                 {
                     var fn = plan.Functions[s];
+                    if (fn.Kind is OffsetKind.FirstNonNull or OffsetKind.LastNonNull)
+                    {
+                        var candidates = fn.Kind == OffsetKind.FirstNonNull ? slots : slots.AsEnumerable().Reverse();
+                        vs[baseRow.Count + s] = candidates.Select(valueFns[s]).FirstOrDefault(v => v is not null);
+                        continue;
+                    }
                     var src = fn.Kind switch
                     {
                         OffsetKind.Lag => j - fn.Offset,

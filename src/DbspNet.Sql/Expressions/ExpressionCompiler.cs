@@ -492,6 +492,19 @@ public static class ExpressionCompiler
 
     private static Expression BuildCast(ResolvedCast cast, ParameterExpression row)
     {
+        var value = BuildCastValue(cast, row);
+        return cast.Safe ? Expression.TryCatch(value,
+            Expression.Catch(typeof(FormatException), NullObject),
+            Expression.Catch(typeof(OverflowException), NullObject),
+            Expression.Catch(typeof(ArgumentException), NullObject)) : value;
+    }
+
+    private static Expression BuildCastValue(ResolvedCast cast, ParameterExpression row)
+    {
+        if (cast.Operand.Type is SqlNullType)
+        {
+            return NullObject;
+        }
         var operand = Build(cast.Operand, row);
         var srcClr = ClrOf(cast.Operand.Type);
         var dstClr = ClrOf(cast.Type);
@@ -521,8 +534,13 @@ public static class ExpressionCompiler
         {
             var unboxed = Expression.Convert(operand, srcClr);
             // Explicit narrowing between numeric CLR types; exceptions surface as runtime errors.
-            var widened = Expression.Convert(unboxed, dstClr);
+            var widened = cast.Safe ? Expression.ConvertChecked(unboxed, dstClr) : Expression.Convert(unboxed, dstClr);
             converted = Expression.Convert(widened, typeof(object));
+        }
+        else if (IsNumeric(srcClr) && dstClr == typeof(bool))
+        {
+            converted = Expression.Convert(Expression.NotEqual(
+                Expression.Convert(operand, srcClr), Expression.Default(srcClr)), typeof(object));
         }
         else if (srcClr == typeof(bool) && dstClr == typeof(Utf8String))
         {

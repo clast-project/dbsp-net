@@ -1611,11 +1611,12 @@ public sealed class Resolver
                 throw new ResolveException("LAG / LEAD / FIRST_VALUE / LAST_VALUE requires an ORDER BY");
             }
 
-            if (firstWin.Over.Frame is not null)
+            if (firstWin.Over.Frame is { } frame &&
+                !(firstWin.FunctionName is "first_value" or "last_value" &&
+                  frame.Start.Kind == FrameBoundKind.UnboundedPreceding &&
+                  frame.End.Kind == FrameBoundKind.UnboundedFollowing))
             {
-                throw new ResolveException(
-                    "LAG / LEAD / FIRST_VALUE / LAST_VALUE does not take a frame clause in v1 " +
-                    "(FIRST_VALUE / LAST_VALUE span the whole partition — UNLIMITED RANGE)");
+                throw new ResolveException("Offset windows support only the whole-partition frame");
             }
 
             var functions = new List<OffsetFunctionCall>(group.Count);
@@ -1860,8 +1861,8 @@ public sealed class Resolver
         {
             "lag" => OffsetKind.Lag,
             "lead" => OffsetKind.Lead,
-            "first_value" => OffsetKind.FirstValue,
-            "last_value" => OffsetKind.LastValue,
+            "first_value" => w.IgnoreNulls ? OffsetKind.FirstNonNull : OffsetKind.FirstValue,
+            "last_value" => w.IgnoreNulls ? OffsetKind.LastNonNull : OffsetKind.LastValue,
             _ => throw new ResolveException($"unsupported offset function '{w.FunctionName}'"),
         };
 
@@ -3924,7 +3925,7 @@ public sealed class Resolver
     }
 
     private static ResolvedExpression TryUnwrapCast(ResolvedExpression e) =>
-        e is ResolvedCast c ? c.Operand : e;
+        e is ResolvedCast { Safe: false } c ? c.Operand : e;
 
     /// <summary>
     /// Walk <paramref name="plan"/> to collect every outer-column index
@@ -5367,7 +5368,7 @@ public sealed class Resolver
         IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
         var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap, outerSchema, preBound);
-        var target = TypeInference.FromSpec(cast.TargetType, nullable: operand.Type.Nullable);
+        var target = TypeInference.FromSpec(cast.TargetType, nullable: cast.Safe || operand.Type.Nullable);
 
         // Constant-fold CAST('<literal>' AS INTERVAL q) — the shape the parser
         // emits for an INTERVAL literal — into a typed interval value so it is
@@ -5387,7 +5388,7 @@ public sealed class Resolver
             return new ResolvedLiteral(LiteralKind.Null, null, target.WithNullable(true));
         }
 
-        return new ResolvedCast(operand, target);
+        return new ResolvedCast(operand, target, cast.Safe);
     }
 
     private static ResolvedExpression ResolveScalarFunction(
@@ -5798,8 +5799,12 @@ public sealed class Resolver
         IReadOnlyDictionary<Expression, ResolvedExpression>? preBound = null)
     {
         var op = ResolvePostAggregateExpression(cast.Operand, pre, gk, aggs, idx, start, subMap, postSchema, preBound);
-        var target = TypeInference.FromSpec(cast.TargetType, nullable: op.Type.Nullable);
-        return new ResolvedCast(op, target);
+        var target = TypeInference.FromSpec(cast.TargetType, nullable: cast.Safe || op.Type.Nullable);
+        if (op is ResolvedLiteral { Kind: LiteralKind.Null })
+        {
+            return new ResolvedLiteral(LiteralKind.Null, null, target.WithNullable(true));
+        }
+        return new ResolvedCast(op, target, cast.Safe);
     }
 
     private static ResolvedExpression BuildBuiltinCallPost(
@@ -5986,7 +5991,7 @@ public sealed class Resolver
             case (ResolvedIsNull x, ResolvedIsNull y):
                 return x.Negated == y.Negated && ResolvedExprEqual(x.Operand, y.Operand);
             case (ResolvedCast x, ResolvedCast y):
-                return ResolvedExprEqual(x.Operand, y.Operand);
+                return x.Safe == y.Safe && ResolvedExprEqual(x.Operand, y.Operand);
             case (ResolvedFunctionCall x, ResolvedFunctionCall y):
                 return string.Equals(x.FunctionName, y.FunctionName, StringComparison.Ordinal)
                     && ResolvedListEqual(x.Arguments, y.Arguments);
@@ -6060,7 +6065,7 @@ public sealed class Resolver
             (IsNullExpression x, IsNullExpression y) =>
                 x.Negated == y.Negated && AstEqual(x.Operand, y.Operand),
             (CastExpression x, CastExpression y) =>
-                Equals(x.TargetType, y.TargetType) && AstEqual(x.Operand, y.Operand),
+                x.Safe == y.Safe && Equals(x.TargetType, y.TargetType) && AstEqual(x.Operand, y.Operand),
             (FunctionCallExpression x, FunctionCallExpression y) =>
                 string.Equals(x.FunctionName, y.FunctionName, StringComparison.Ordinal)
                 && x.IsStar == y.IsStar && AstListEqual(x.Arguments, y.Arguments),

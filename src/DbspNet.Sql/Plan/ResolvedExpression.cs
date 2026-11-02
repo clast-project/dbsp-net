@@ -48,7 +48,7 @@ public sealed record ResolvedUnary(
 
 public sealed record ResolvedIsNull(ResolvedExpression Operand, bool Negated, SqlType Type) : ResolvedExpression(Type);
 
-public sealed record ResolvedCast(ResolvedExpression Operand, SqlType Type) : ResolvedExpression(Type);
+public sealed record ResolvedCast(ResolvedExpression Operand, SqlType Type, bool Safe = false) : ResolvedExpression(Type);
 
 /// <summary>
 /// A scalar (non-aggregate) function call: <c>COALESCE</c> in v1. The
