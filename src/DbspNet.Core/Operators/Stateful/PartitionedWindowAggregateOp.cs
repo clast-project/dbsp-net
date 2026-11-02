@@ -83,10 +83,8 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     public object? OrderFor(string fileName) =>
         fileName == "trace.arrows" ? LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) : null;
 
-    // Last-emitted output per partition, keyed by the input (base) row →
-    // (widened row, weight). Keying by base row lets GC drop a finalized row
-    // from both _accum and here without emitting a retraction.
-    private readonly Dictionary<TKey, Dictionary<TInRow, (TOutRow Widened, long Weight)>> _window;
+    // The emitted output is not stored: a row's previous output is recomputed from the partition
+    // as it stood before the delta (docs/design-flat-trace-state.md §3.11).
 
     public PartitionedWindowAggregateOp(
         Stream<ZSet<TInRow, Z64>> input,
@@ -121,7 +119,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
-        _window = new Dictionary<TKey, Dictionary<TInRow, (TOutRow, long)>>(partitionComparer);
     }
 
     /// <summary>Total input rows currently retained across all partitions —
@@ -158,10 +155,10 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
         if (!delta.IsEmpty)
         {
-            // Track per touched partition the value range the delta spans (used to bound
-            // which output rows must be recomputed); fault in cold partitions.
-            var touched = new Dictionary<TKey, (long Min, long Max)>(_accum.Comparer);
-            foreach (var (row, _) in delta)
+            // Per touched partition: the value range the delta spans (it bounds which output rows
+            // must be recomputed) and the delta's rows; fault in cold partitions.
+            var touched = new Dictionary<TKey, PartitionDelta>(_accum.Comparer);
+            foreach (var (row, dw) in delta)
             {
                 var key = _partitionOf(row);
                 if (_lazy is not null)
@@ -170,17 +167,12 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 }
 
                 var v = _orderValueOf?.Invoke(row) ?? 0L;
-                touched[key] = touched.TryGetValue(key, out var range) ? (Math.Min(range.Min, v), Math.Max(range.Max, v)) : (v, v);
-            }
-
-            // A faulted partition's window is known only where a step has needed it: before the
-            // delta lands, rebuild it over this delta's range from the partition as it stands.
-            if (_partial is not null)
-            {
-                foreach (var (key, range) in touched)
+                if (!touched.TryGetValue(key, out var pd))
                 {
-                    EnsureWindow(key, range);
+                    touched[key] = pd = new PartitionDelta(v);
                 }
+
+                pd.Add(row, dw.Value, v);
             }
 
             // Integrate.
@@ -209,9 +201,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 }
             }
 
-            foreach (var (key, range) in touched)
+            foreach (var (key, pd) in touched)
             {
-                RecomputePartition(builder, key, range);
+                RecomputePartition(builder, key, pd);
             }
         }
 
@@ -221,155 +213,175 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _output.SetCurrent(result);
     }
 
-    /// <summary>Recompute the output rows of one partition whose frame the delta
-    /// (spanning value range <paramref name="deltaRange"/>) could have changed, and
-    /// emit the +/- diffs against the previously emitted output.</summary>
-    private void RecomputePartition(ZSetBuilder<TOutRow, Z64> builder, TKey key, (long Min, long Max) deltaRange)
+    // One partition's share of a tick's delta.
+    private sealed class PartitionDelta(long first)
+    {
+        public long Min = first;
+        public long Max = first;
+        public readonly List<(TInRow Row, long Dw)> Rows = new();
+
+        public void Add(TInRow row, long dw, long v)
+        {
+            Rows.Add((row, dw));
+            Min = Math.Min(Min, v);
+            Max = Math.Max(Max, v);
+        }
+    }
+
+    // A row of a touched partition before (Old) and after (New) the delta; a weight of zero is
+    // absence on that side.
+    private readonly record struct Entry(TInRow Row, long Old, long New, long Value);
+
+    /// <summary>The union of a partition's rows before and after the delta, each with both
+    /// weights, ascending by order value with ties in the total order — the order every output
+    /// row of either side was folded in, so the old side reproduces exactly what was emitted
+    /// (docs/design-flat-trace-state.md §3.11).</summary>
+    private List<Entry> Union(SortedDictionary<TInRow, long>? bucket, PartitionDelta pd)
+    {
+        var dws = new Dictionary<TInRow, long>(pd.Rows.Count);
+        foreach (var (row, dw) in pd.Rows)
+        {
+            dws[row] = dw;
+        }
+
+        // Rows the delta removed entirely, in the total order, merged into the bucket's sequence.
+        List<TInRow>? removed = null;
+        foreach (var (row, _) in pd.Rows)
+        {
+            if (bucket is null || !bucket.ContainsKey(row))
+            {
+                (removed ??= new List<TInRow>()).Add(row);
+            }
+        }
+
+        removed?.Sort(_order);
+        var merged = new List<Entry>((bucket?.Count ?? 0) + (removed?.Count ?? 0));
+        var r = 0;
+        if (bucket is not null)
+        {
+            foreach (var (row, weight) in bucket)
+            {
+                while (removed is not null && r < removed.Count && _order.Compare(removed[r], row) < 0)
+                {
+                    merged.Add(Gone(removed[r++]));
+                }
+
+                merged.Add(new Entry(row, weight - dws.GetValueOrDefault(row), weight, _orderValueOf?.Invoke(row) ?? 0L));
+            }
+        }
+
+        while (removed is not null && r < removed.Count)
+        {
+            merged.Add(Gone(removed[r++]));
+        }
+
+        if (_orderValueOf is null)
+        {
+            return merged;
+        }
+
+        // Stable: equal values keep the total order.
+        return [.. merged.OrderBy(e => e.Value)];
+
+        Entry Gone(TInRow row) => new(row, -dws[row], 0, _orderValueOf?.Invoke(row) ?? 0L);
+    }
+
+    /// <summary>Recompute the output rows of one partition whose frame the delta could have
+    /// changed, on both sides of the delta, and emit the difference.</summary>
+    private void RecomputePartition(ZSetBuilder<TOutRow, Z64> builder, TKey key, PartitionDelta pd)
     {
         _accum.TryGetValue(key, out var bucket);
-        _window.TryGetValue(key, out var win);
-        win ??= new Dictionary<TInRow, (TOutRow, long)>();
-
-        // Materialise the current partition ascending by order value; the frame
-        // for any row is then a contiguous slice.
-        var rows = bucket is null
-            ? new List<(TInRow Row, long Weight, long Value)>()
-            : bucket.Select(kv => (Row: kv.Key, Weight: kv.Value, Value: _orderValueOf?.Invoke(kv.Key) ?? 0L))
-                    .OrderBy(r => r.Value).ToList();
-
+        var rows = Union(bucket, pd);
         var whole = _orderValueOf is null;
 
-        // A full (MinValue, MaxValue) delta range is the "recompute everything"
-        // sentinel used by Load; treat it (and whole-partition) as all-rows,
-        // short-circuiting the frame arithmetic to avoid overflow.
-        var recomputeAll = whole
-            || (deltaRange.Min == long.MinValue && deltaRange.Max == long.MaxValue);
-
-        // The affected output value range. For whole-partition every row is
-        // affected; otherwise it is bounded by the frame geometry.
+        // The affected output value range. For whole-partition every row is affected;
+        // otherwise it is bounded by the frame geometry.
         long lo, hi;
-        if (recomputeAll)
+        if (whole)
         {
             lo = long.MinValue;
             hi = long.MaxValue;
         }
         else if (_preceding is null)
         {
-            // Running: a change at value d shifts every row at/after d (ASC) or
-            // at/before d (DESC).
-            lo = _descending ? long.MinValue : deltaRange.Min;
-            hi = _descending ? deltaRange.Max : long.MaxValue;
+            // Running: a change at value d shifts every row at/after d (ASC) or at/before d (DESC).
+            lo = _descending ? long.MinValue : pd.Min;
+            hi = _descending ? pd.Max : long.MaxValue;
         }
         else
         {
             // Bounded: a change at d affects rows whose frame contains d.
-            lo = _descending ? deltaRange.Min - _preceding.Value : deltaRange.Min;
-            hi = _descending ? deltaRange.Max : deltaRange.Max + _preceding.Value;
+            lo = _descending ? pd.Min - _preceding.Value : pd.Min;
+            hi = _descending ? pd.Max : pd.Max + _preceding.Value;
         }
 
-        // Running frame (ORDER BY present, UNBOUNDED PRECEDING): recompute the
-        // affected rows in one ordered pass that folds each row into a running
-        // aggregate via the incremental IAggregator.Update, instead of rebuilding
-        // and re-aggregating every row's whole prefix from scratch. The old
-        // per-row FrameFor + Compute was O(partition²) in both time and
-        // allocation and dominated ivm-bench batch-1 (the running MIN/MAX 52-week
-        // windows over daily_market). Linear per touched partition.
+        // Running frame (ORDER BY present, UNBOUNDED PRECEDING): one ordered pass folding each
+        // side into its running aggregate via the incremental IAggregator.Update — linear per
+        // touched partition (a per-row prefix rebuild was O(partition²) and dominated ivm-bench
+        // batch 1).
         if (!whole && _preceding is null)
         {
-            RecomputeRunningRange(builder, bucket, win, key, rows, lo, hi);
+            RecomputeRunningRange(builder, rows, lo, hi);
             return;
         }
 
-        // For whole-partition the aggregate is shared, so compute it once.
-        var wholeAgg = whole
-            ? _aggregator.Compute(ZSet.FromEntries(rows.Select(r => (r.Row, new Z64(r.Weight)))))
-            : default;
-
-        // Candidate base rows = current rows in range ∪ previously-emitted rows in
-        // range (the latter catches rows the delta retracted).
-        var candidates = new HashSet<TInRow>();
-        foreach (var r in rows)
+        // For whole-partition the aggregate is shared, so compute it once per side.
+        Optional<TAgg> wholeOld = default, wholeNew = default;
+        if (whole)
         {
-            if (r.Value >= lo && r.Value <= hi)
-            {
-                candidates.Add(r.Row);
-            }
+            wholeOld = _aggregator.Compute(ZSet.FromEntries(rows.Where(e => e.Old != 0).Select(e => (e.Row, new Z64(e.Old)))));
+            wholeNew = _aggregator.Compute(ZSet.FromEntries(rows.Where(e => e.New != 0).Select(e => (e.Row, new Z64(e.New)))));
         }
 
-        foreach (var baseRow in win.Keys)
+        foreach (var e in rows)
         {
-            var v = _orderValueOf?.Invoke(baseRow) ?? 0L;
-            if (v >= lo && v <= hi)
+            if (e.Value < lo || e.Value > hi)
             {
-                candidates.Add(baseRow);
+                continue;
             }
-        }
 
-        foreach (var baseRow in candidates)
-        {
-            if (bucket is not null && bucket.TryGetValue(baseRow, out var weight))
-            {
-                var agg = whole ? wholeAgg : _aggregator.Compute(FrameFor(rows, _orderValueOf!(baseRow)));
-                var widened = _widen(baseRow, agg);
-                EmitRowDiff(builder, win, baseRow, widened, weight);
-            }
-            else if (win.TryGetValue(baseRow, out var old))
-            {
-                builder.Add(old.Widened, new Z64(-old.Weight));
-                win.Remove(baseRow);
-            }
-        }
-
-        if (win.Count == 0)
-        {
-            _window.Remove(key);
-        }
-        else
-        {
-            _window[key] = win;
+            var before = e.Old != 0 ? _widen(e.Row, whole ? wholeOld : _aggregator.Compute(FrameFor(rows, e.Value, old: true))) : default;
+            var after = e.New != 0 ? _widen(e.Row, whole ? wholeNew : _aggregator.Compute(FrameFor(rows, e.Value, old: false))) : default;
+            EmitRowDiff(builder, before, e.Old, after, e.New);
         }
     }
 
-    /// <summary>Recompute a partition's running-frame (UNBOUNDED PRECEDING →
-    /// CURRENT ROW) output in a single ordered pass. <paramref name="rows"/> is
-    /// ascending by order value; for ASC the frame is the growing prefix (scan
-    /// ascending), for DESC the growing suffix (scan descending). Each row is
-    /// folded into a running aggregate via the incremental
-    /// <see cref="IAggregator{TInRow,TAgg}.Update"/>; a whole peer group (equal
-    /// order value) is folded before any of its rows is emitted, so peers share
-    /// one frame (RANGE semantics). Only rows whose order value is in the affected
-    /// range [<paramref name="lo"/>, <paramref name="hi"/>] are diffed against the
-    /// last emitted output; earlier rows are folded but not re-emitted (their
-    /// frame is unchanged by a delta at or after them).</summary>
-    private void RecomputeRunningRange(
-        ZSetBuilder<TOutRow, Z64> builder,
-        SortedDictionary<TInRow, long>? bucket,
-        Dictionary<TInRow, (TOutRow Widened, long Weight)> win,
-        TKey key,
-        List<(TInRow Row, long Weight, long Value)> rows,
-        long lo,
-        long hi)
+    /// <summary>Recompute a partition's running-frame (UNBOUNDED PRECEDING → CURRENT ROW)
+    /// output on both sides of the delta in a single ordered pass. <paramref name="rows"/> is
+    /// ascending by order value; for ASC the frame is the growing prefix (scan ascending), for
+    /// DESC the growing suffix (scan descending). Each side folds its rows into its own running
+    /// aggregate via the incremental <see cref="IAggregator{TInRow,TAgg}.Update"/>; a whole peer
+    /// group (equal order value) is folded before any of its rows is emitted, so peers share one
+    /// frame (RANGE semantics). Only rows whose order value is in [<paramref name="lo"/>,
+    /// <paramref name="hi"/>] are diffed; earlier rows are folded but not re-emitted.</summary>
+    private void RecomputeRunningRange(ZSetBuilder<TOutRow, Z64> builder, List<Entry> rows, long lo, long hi)
     {
         var seq = _descending ? Enumerable.Reverse(rows).ToList() : rows;
-        object? state = null;
-        var running = Optional<TAgg>.None;
-        var frame = new GrowingMultiset<TInRow>();
-        var emitted = new HashSet<TInRow>();
+        object? oldState = null, newState = null;
+        Optional<TAgg> oldRunning = Optional<TAgg>.None, newRunning = Optional<TAgg>.None;
+        var oldFrame = new GrowingMultiset<TInRow>();
+        var newFrame = new GrowingMultiset<TInRow>();
 
         var i = 0;
         while (i < seq.Count)
         {
             var v = seq[i].Value;
-
-            // Fold the whole peer group (equal order value) before emitting, so
-            // peers see the same frame.
             var j = i;
             while (j < seq.Count && seq[j].Value == v)
             {
-                var (row, weight, _) = seq[j];
-                frame.Add(row, weight);
-                running = _aggregator.Update(
-                    ref state, running, ZSet.FromEntries(new[] { (row, new Z64(weight)) }), frame);
+                var e = seq[j];
+                if (e.Old != 0)
+                {
+                    oldFrame.Add(e.Row, e.Old);
+                    oldRunning = _aggregator.Update(ref oldState, oldRunning, ZSet.FromEntries(new[] { (e.Row, new Z64(e.Old)) }), oldFrame);
+                }
+
+                if (e.New != 0)
+                {
+                    newFrame.Add(e.Row, e.New);
+                    newRunning = _aggregator.Update(ref newState, newRunning, ZSet.FromEntries(new[] { (e.Row, new Z64(e.New)) }), newFrame);
+                }
+
                 j++;
             }
 
@@ -377,60 +389,23 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             {
                 for (var k = i; k < j; k++)
                 {
-                    var (row, weight, _) = seq[k];
-                    EmitRowDiff(builder, win, row, _widen(row, running), weight);
-                    emitted.Add(row);
+                    var e = seq[k];
+                    EmitRowDiff(
+                        builder,
+                        e.Old != 0 ? _widen(e.Row, oldRunning) : default,
+                        e.Old,
+                        e.New != 0 ? _widen(e.Row, newRunning) : default,
+                        e.New);
                 }
             }
 
             i = j;
         }
-
-        // Retract previously-emitted rows in the affected range that the delta
-        // removed (present in the last output, no longer in the partition).
-        if (win.Count > 0)
-        {
-            List<TInRow>? gone = null;
-            foreach (var baseRow in win.Keys)
-            {
-                if (emitted.Contains(baseRow))
-                {
-                    continue;
-                }
-
-                var v = _orderValueOf!(baseRow);
-                if (v < lo || v > hi || (bucket is not null && bucket.ContainsKey(baseRow)))
-                {
-                    continue;
-                }
-
-                (gone ??= new List<TInRow>()).Add(baseRow);
-            }
-
-            if (gone is not null)
-            {
-                foreach (var baseRow in gone)
-                {
-                    var old = win[baseRow];
-                    builder.Add(old.Widened, new Z64(-old.Weight));
-                    win.Remove(baseRow);
-                }
-            }
-        }
-
-        if (win.Count == 0)
-        {
-            _window.Remove(key);
-        }
-        else
-        {
-            _window[key] = win;
-        }
     }
 
-    /// <summary>The frame multiset for a row at order value <paramref name="v"/>
-    /// over the ascending-by-value <paramref name="rows"/>.</summary>
-    private ZSet<TInRow, Z64> FrameFor(List<(TInRow Row, long Weight, long Value)> rows, long v)
+    /// <summary>The frame multiset (one side of the delta) for a row at order value
+    /// <paramref name="v"/> over the ascending-by-value <paramref name="rows"/>.</summary>
+    private ZSet<TInRow, Z64> FrameFor(List<Entry> rows, long v, bool old)
     {
         long lo, hi;
         if (_preceding is null)
@@ -449,54 +424,48 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         var entries = new List<(TInRow, Z64)>();
         foreach (var r in rows)
         {
-            if (r.Value >= lo && r.Value <= hi)
+            var w = old ? r.Old : r.New;
+            if (w != 0 && r.Value >= lo && r.Value <= hi)
             {
-                entries.Add((r.Row, new Z64(r.Weight)));
+                entries.Add((r.Row, new Z64(w)));
             }
         }
 
         return ZSet.FromEntries(entries);
     }
 
-    /// <summary>Emit the diff moving base row <paramref name="baseRow"/>'s previous
-    /// output (in <paramref name="win"/>) to (<paramref name="widened"/>,
-    /// <paramref name="weight"/>), and update <paramref name="win"/>.</summary>
-    private static void EmitRowDiff(
-        ZSetBuilder<TOutRow, Z64> builder,
-        Dictionary<TInRow, (TOutRow Widened, long Weight)> win,
-        TInRow baseRow,
-        TOutRow widened,
-        long weight)
+    /// <summary>Emit the change of one base row's output from (<paramref name="before"/>,
+    /// <paramref name="oldWeight"/>) to (<paramref name="after"/>, <paramref name="newWeight"/>);
+    /// a zero weight means no row on that side.</summary>
+    private static void EmitRowDiff(ZSetBuilder<TOutRow, Z64> builder, TOutRow? before, long oldWeight, TOutRow? after, long newWeight)
     {
-        if (win.TryGetValue(baseRow, out var old))
+        if (oldWeight != 0 && newWeight != 0 && before!.Equals(after))
         {
-            if (old.Widened.Equals(widened))
+            if (oldWeight != newWeight)
             {
-                if (old.Weight != weight)
-                {
-                    builder.Add(widened, new Z64(weight - old.Weight));
-                }
+                builder.Add(after!, new Z64(newWeight - oldWeight));
             }
-            else
-            {
-                builder.Add(old.Widened, new Z64(-old.Weight));
-                builder.Add(widened, new Z64(weight));
-            }
-        }
-        else
-        {
-            builder.Add(widened, new Z64(weight));
+
+            return;
         }
 
-        win[baseRow] = (widened, weight);
+        if (oldWeight != 0)
+        {
+            builder.Add(before!, new Z64(-oldWeight));
+        }
+
+        if (newWeight != 0)
+        {
+            builder.Add(after!, new Z64(newWeight));
+        }
     }
 
     /// <summary>Frontier-driven GC for bounded ascending frames: drop rows whose
-    /// order value is below <c>frontier − preceding</c> from both <see cref="_accum"/>
-    /// and <see cref="_window"/>. Such rows can neither enter a future row's
-    /// backward frame nor be recomputed (future deltas land at or above the
-    /// frontier), and their already-emitted output is final — so the drop emits
-    /// nothing.</summary>
+    /// order value is below <c>frontier − preceding</c> from <see cref="_accum"/>.
+    /// Such rows can neither enter a future row's backward frame nor be recomputed
+    /// (future deltas land at or above the frontier), nor can any row whose frame
+    /// holds them, so their already-emitted output is final and its old side is
+    /// never recomputed without them — the drop emits nothing.</summary>
     private void CollectGarbage()
     {
         if (_frontier is null || _orderValueOf is null || _preceding is null || _descending)
@@ -537,19 +506,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
             _gcDropped += drop.Count;
 
-            if (_window.TryGetValue(key, out var win))
-            {
-                foreach (var row in drop)
-                {
-                    win.Remove(row);
-                }
-
-                if (win.Count == 0)
-                {
-                    _window.Remove(key);
-                }
-            }
-
             foreach (var row in drop)
             {
                 _changes.RecordDropped(row, new Z64(bucket[row]));
@@ -574,8 +530,8 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             ? ZSet<TInRow, Z64>.NewMutable()
             : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
 
-    // A partition a lazily restored operator has not touched yet: read its rows from cold and
-    // rebuild its window — what the eager load does for every partition — before the delta lands.
+    // A partition a lazily restored operator has not touched yet: read its rows from cold before
+    // the delta lands. Nothing else is rebuilt: the emitted output is recomputed when needed.
     private void Fault(TKey key)
     {
         if (_lazy!.Take(key) is not { Count: > 0 } rows)
@@ -590,48 +546,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         }
 
         _accum[key] = bucket;
-
-        // Its window is rebuilt range by range as steps need it (EnsureWindow), not whole: a
-        // partition with a long frame costs O(rows x frame) to rebuild whole, and a step reads
-        // only the rows its delta's frame reaches.
-        _partial ??= new Dictionary<TKey, (long Min, long Max)>(_accum.Comparer);
-        _partial[key] = (long.MaxValue, long.MinValue); // nothing known yet
-    }
-
-    // Faulted partitions whose window (_window) is known only over a hull of delta ranges; a
-    // partition absent here has its whole window.
-    private Dictionary<TKey, (long Min, long Max)>? _partial;
-
-    // Before a delta over `range` lands in a faulted partition: rebuild its window over the
-    // rows that delta's frame reaches, from the partition as it stands (the outputs emitted
-    // before the restore). Known spans are recomputed to the same values, so widening the hull
-    // is safe; a whole-partition frame (no ORDER BY) is rebuilt whole.
-    private void EnsureWindow(TKey key, (long Min, long Max) range)
-    {
-        if (!_partial!.TryGetValue(key, out var known))
-        {
-            return;
-        }
-
-        if (_orderValueOf is null)
-        {
-            _partial.Remove(key);
-            if (_accum.TryGetValue(key, out var all))
-            {
-                InitWindow(key, all);
-            }
-
-            return;
-        }
-
-        if (range.Min >= known.Min && range.Max <= known.Max)
-        {
-            return;
-        }
-
-        var hull = (Math.Min(range.Min, known.Min), Math.Max(range.Max, known.Max));
-        RecomputePartition(new ZSetBuilder<TOutRow, Z64>(), key, hull);
-        _partial[key] = hull;
     }
 
     // Read every partition still cold (a whole-state write, or GC).
@@ -642,7 +556,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             return;
         }
 
-        var filled = new HashSet<TKey>(_accum.Comparer);
         foreach (var (key, row, weight) in _lazy.TakeAll())
         {
             if (!_accum.TryGetValue(key, out var bucket))
@@ -652,21 +565,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             }
 
             bucket[row] = weight;
-            filled.Add(key);
         }
 
         _lazy = null;
-        foreach (var key in filled)
-        {
-            InitWindow(key, _accum[key]);
-        }
-    }
-
-    // Record a partition's window as already materialised downstream, emitting nothing.
-    private void InitWindow(TKey key, SortedDictionary<TInRow, long> bucket)
-    {
-        _ = bucket; // the window aggregate recomputes from _accum[key]
-        RecomputePartition(new ZSetBuilder<TOutRow, Z64>(), key, (long.MinValue, long.MaxValue));
     }
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
@@ -704,7 +605,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             // Lazily restored: partitions are read as deltas touch them (Fault).
             _accum.Clear();
-            _window.Clear();
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
             return;
@@ -715,7 +615,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _changes.Restored(loaded);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
-        _window.Clear();
         foreach (var (row, weight) in loaded)
         {
             if (weight.Value == 0)
@@ -733,19 +632,10 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             bucket[row] = weight.Value;
         }
 
-        // The restored accumulation is current; the windows it implies are already
-        // materialised downstream, so record them without emitting (recompute the
-        // whole partition by passing a full delta range).
-        var sink = new ZSetBuilder<TOutRow, Z64>();
-        foreach (var key in _accum.Keys.ToList())
-        {
-            RecomputePartition(sink, key, (long.MinValue, long.MaxValue));
-        }
-
         // Diagnostic (design-incremental-persistence §10): split this operator's restore into
         // the part any trace-shaped operator pays — deserialize — and the part that exists only
-        // because the runtime state is a partition-keyed SortedDictionary plus a materialised
-        // window, which must be re-partitioned, re-sorted and recomputed from the flat Z-set.
+        // because the runtime state is a partition-keyed SortedDictionary, which must be
+        // re-partitioned and re-sorted from the flat Z-set.
         // Two Stopwatch reads per restore; not on any hot path.
         var freq = (double)System.Diagnostics.Stopwatch.Frequency;
         var rebuildMs = (System.Diagnostics.Stopwatch.GetTimestamp() - t1) * 1000.0 / freq;

@@ -85,7 +85,9 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
     /// <inheritdoc/>
     public object? OrderFor(string fileName) =>
         fileName == "trace.arrows" ? LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) : null;
-    private readonly Dictionary<TKey, Dictionary<TOutRow, long>> _window;
+
+    // The emitted output is not stored: a touched partition's previous output is recomputed from
+    // the partition as it stood before the delta (docs/design-flat-trace-state.md §3.11).
 
     // Last tick's output count, used to pre-size this tick's delta builder
     // (docs/design-row-representation.md §16.8). The emitted diff spans only
@@ -117,7 +119,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         _widen = widen;
         _snapshotCodec = snapshotCodec;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
-        _window = new Dictionary<TKey, Dictionary<TOutRow, long>>(partitionComparer);
     }
 
     public string MetricName => "WindowOffset";
@@ -147,10 +148,10 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         var delta = _input.Current;
         _changes.Record(delta);
 
-        HashSet<TKey>? touched = null;
+        Dictionary<TKey, Dictionary<TInRow, long>>? touched = null;
         if (!delta.IsEmpty)
         {
-            touched = new HashSet<TKey>(_accum.Comparer);
+            touched = new Dictionary<TKey, Dictionary<TInRow, long>>(_accum.Comparer);
             foreach (var (row, dw) in delta)
             {
                 var key = _partitionOf(row);
@@ -159,7 +160,12 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
                     Fault(key);
                 }
 
-                touched.Add(key);
+                if (!touched.TryGetValue(key, out var dws))
+                {
+                    touched[key] = dws = new Dictionary<TInRow, long>();
+                }
+
+                dws[row] = dw.Value;
                 if (!_accum.TryGetValue(key, out var bucket))
                 {
                     bucket = new SortedDictionary<TInRow, long>(_order);
@@ -186,22 +192,13 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
         if (touched is not null)
         {
-            foreach (var key in touched)
+            foreach (var (key, dws) in touched)
             {
-                var newWindow = _accum.TryGetValue(key, out var bucket)
-                    ? ComputeWindow(bucket)
-                    : new Dictionary<TOutRow, long>();
-                _window.TryGetValue(key, out var oldWindow);
-                EmitDiff(builder, newWindow, oldWindow);
-
-                if (newWindow.Count == 0)
-                {
-                    _window.Remove(key);
-                }
-                else
-                {
-                    _window[key] = newWindow;
-                }
+                _accum.TryGetValue(key, out var bucket);
+                var newWindow = bucket is null
+                    ? new Dictionary<TOutRow, long>()
+                    : ComputeWindow(bucket.Select(kv => (kv.Key, kv.Value)));
+                EmitDiff(builder, newWindow, ComputeWindow(Before(bucket, dws)));
             }
         }
 
@@ -237,10 +234,37 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         }
     }
 
+    /// <summary>A partition's rows before the delta <paramref name="dws"/> landed, in the total
+    /// order: the current rows with the delta subtracted, and the rows it removed merged in.</summary>
+    private IEnumerable<(TInRow Row, long Weight)> Before(SortedDictionary<TInRow, long>? bucket, Dictionary<TInRow, long> dws)
+    {
+        var removed = dws.Keys.Where(row => bucket is null || !bucket.ContainsKey(row)).ToList();
+        removed.Sort(_order);
+        var r = 0;
+        if (bucket is not null)
+        {
+            foreach (var (row, weight) in bucket)
+            {
+                while (r < removed.Count && _order.Compare(removed[r], row) < 0)
+                {
+                    yield return (removed[r], -dws[removed[r]]);
+                    r++;
+                }
+
+                yield return (row, weight - dws.GetValueOrDefault(row));
+            }
+        }
+
+        for (; r < removed.Count; r++)
+        {
+            yield return (removed[r], -dws[removed[r]]);
+        }
+    }
+
     /// <summary>Recompute one partition's widened output multiset: expand the
     /// sorted rows into positional slots (weight-aware), then for each slot read
     /// each spec's value from its offset slot.</summary>
-    private Dictionary<TOutRow, long> ComputeWindow(SortedDictionary<TInRow, long> bucket)
+    private Dictionary<TOutRow, long> ComputeWindow(IEnumerable<(TInRow Row, long Weight)> bucket)
     {
         // Positional slots in total order; a weight-w row fills w consecutive
         // slots. Negative-weight rows (an invalid multiset state) contribute none.
@@ -285,8 +309,8 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             ? ZSet<TInRow, Z64>.NewMutable()
             : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
 
-    // A partition a lazily restored operator has not touched yet: read its rows from cold and
-    // rebuild its window — what the eager load does for every partition — before the delta lands.
+    // A partition a lazily restored operator has not touched yet: read its rows from cold before
+    // the delta lands. Nothing else is rebuilt: the emitted output is recomputed when needed.
     private void Fault(TKey key)
     {
         if (_lazy!.Take(key) is not { Count: > 0 } rows)
@@ -301,7 +325,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         }
 
         _accum[key] = bucket;
-        InitWindow(key, bucket);
     }
 
     // Read every partition still cold (a whole-state write, or GC).
@@ -312,7 +335,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             return;
         }
 
-        var filled = new HashSet<TKey>(_accum.Comparer);
         foreach (var (key, row, weight) in _lazy.TakeAll())
         {
             if (!_accum.TryGetValue(key, out var bucket))
@@ -322,24 +344,9 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             }
 
             bucket[row] = weight;
-            filled.Add(key);
         }
 
         _lazy = null;
-        foreach (var key in filled)
-        {
-            InitWindow(key, _accum[key]);
-        }
-    }
-
-    // Record a partition's window as already materialised downstream, emitting nothing.
-    private void InitWindow(TKey key, SortedDictionary<TInRow, long> bucket)
-    {
-        var window = ComputeWindow(bucket);
-        if (window.Count > 0)
-        {
-            _window[key] = window;
-        }
     }
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
@@ -376,7 +383,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         {
             // Lazily restored: partitions are read as deltas touch them (Fault).
             _accum.Clear();
-            _window.Clear();
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
             return;
@@ -387,7 +393,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         _changes.Restored(loaded);
         var tRebuild = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
-        _window.Clear();
         foreach (var (row, weight) in loaded)
         {
             if (weight.Value == 0)
@@ -403,15 +408,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             }
 
             bucket[row] = weight.Value;
-        }
-
-        foreach (var (key, bucket) in _accum)
-        {
-            var window = ComputeWindow(bucket);
-            if (window.Count > 0)
-            {
-                _window[key] = window;
-            }
         }
 
         // §10 inferred this operator's rebuild share from PartitionedWindowAggregateOp's
