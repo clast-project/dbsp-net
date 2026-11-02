@@ -170,13 +170,25 @@ public class TraceBlockTests
         var block = schema.Encode([.. ks], [.. vs], [.. ws], [.. hs], ks.Count);
         var adopted = schema.Adopt(block.Message.Span);
         var viaArrow = schema.EncodeViaArrow([.. ks], [.. vs], [.. ws], [.. hs], ks.Count);
+
+        // The same entries encoded in 1–4 consecutive pieces and concatenated byte-wise.
+        var cuts = Enumerable.Range(0, rnd.Next(0, 4)).Select(_ => rnd.Next(ks.Count + 1)).Append(0).Append(ks.Count).Distinct().Order().ToArray();
+        var pieces = new List<TraceBlock>();
+        for (var p = 0; p + 1 < cuts.Length; p++)
+        {
+            var (from, to) = (cuts[p], cuts[p + 1]);
+            pieces.Add(schema.Encode([.. ks[from..to]], [.. vs[from..to]], [.. ws[from..to]], [.. hs[from..to]], to - from));
+        }
+
+        var concatenated = BlockWriter.Concat(schema, pieces);
+        Assert.Equal(ks.Count, Oracle(schema, concatenated).Length);
         var oracle = Oracle(schema, block);
         Assert.Equal(ks.Count, block.Count);
         Assert.Equal(ks.Count, oracle.Length);
         Assert.Equal((uint)hs[0], block.FirstHash);
         Assert.Equal((uint)hs[^1], block.LastHash);
 
-        foreach (var b in new[] { block, adopted, viaArrow })
+        foreach (var b in new[] { block, adopted, viaArrow, concatenated, schema.Adopt(concatenated.Message.Span) })
         {
             for (var i = 0; i < b.Count; i++)
             {

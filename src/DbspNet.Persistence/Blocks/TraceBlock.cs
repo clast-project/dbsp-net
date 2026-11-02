@@ -48,6 +48,15 @@ internal sealed class TraceBlock : ITraceBlock
         LastHash = count == 0 ? 0 : hashes[^1];
     }
 
+    // Raw layout, for BlockWriter.Concat: offsets into Bytes (−1: absent).
+    internal byte[] Bytes => _bytes;
+
+    internal int ValidityAt(int column) => _validity[column];
+
+    internal int ValuesAt(int column) => _values[column];
+
+    internal int DataAt(int column) => _data[column];
+
     /// <summary>The trace's block layout.</summary>
     public BlockSchema Schema { get; }
 

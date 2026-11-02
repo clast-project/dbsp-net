@@ -400,6 +400,11 @@ public class IvmMultiBatch
                         }
                     });
                 }
+                if (DbspNet.Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
+                {
+                    _out.WriteLine("CKPT " + DbspNet.Core.Operators.Stateful.Blocks.BlockTraceProfile.Report());
+                }
+
                 if (stateCensus && batch == firstBatch)
                 {
                     // After the checkpoint: a blocked trace (DBSPNET_TRACE_BLOCKS) has frozen every level.

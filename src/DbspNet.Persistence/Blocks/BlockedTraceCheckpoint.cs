@@ -36,7 +36,14 @@ internal static class BlockedTraceCheckpoint
             return;
         }
 
+        var t0 = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
         var runs = trace.PrepareCheckpoint();
+        if (Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
+        {
+            Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(4, t0);
+            t0 = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
+        }
+
         var paths = new List<string>(runs.Count);
         var written = new List<(BlockedIndexedTrace.Run Run, string Path)>();
         long baseEntries = 0, deltaEntries = 0;
@@ -66,6 +73,11 @@ internal static class BlockedTraceCheckpoint
             {
                 deltaEntries += run.Entries;
             }
+        }
+
+        if (Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
+        {
+            Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(5, t0, written.Count);
         }
 
         // An empty trace writes an empty run, as the managed path does: a chain names at least one.
@@ -150,7 +162,13 @@ internal static class BlockedTraceCheckpoint
                 end++;
             }
 
+            var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
             var block = end == b + 1 ? Materialized(blocks[b]) : Join(schema, blocks, b, end);
+            if (end > b + 1 && Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
+            {
+                Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, block.Count);
+            }
+
             var hashes = Distinct(block.Hashes);
             await writer.AppendRawAsync(block.Message.ToArray(), hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
             b = end;
@@ -166,34 +184,9 @@ internal static class BlockedTraceCheckpoint
         _ => throw new InvalidOperationException($"unexpected block type {block.GetType().Name}"),
     };
 
-    private static TraceBlock Join(BlockSchema schema, ITraceBlock[] blocks, int from, int to)
-    {
-        var n = 0;
-        for (var b = from; b < to; b++)
-        {
-            n += blocks[b].Count;
-        }
-
-        var keys = new StructuralRow[n];
-        var values = new StructuralRow[n];
-        var weights = new long[n];
-        var hashes = new int[n];
-        var at = 0;
-        for (var b = from; b < to; b++)
-        {
-            var block = blocks[b];
-            var h = block.Hashes;
-            for (var i = 0; i < block.Count; i++, at++)
-            {
-                keys[at] = block.Key(i);
-                values[at] = block.Value(i);
-                weights[at] = block.Weight(i);
-                hashes[at] = (int)h[i];
-            }
-        }
-
-        return schema.Encode(keys, values, weights, hashes, n);
-    }
+    // A hash spanning blocks in memory, as one block: concatenated byte-wise, not decoded.
+    private static TraceBlock Join(BlockSchema schema, ITraceBlock[] blocks, int from, int to) =>
+        BlockWriter.Concat(schema, [.. blocks[from..to].Select(Materialized)]);
 
     private static List<uint> Distinct(ReadOnlySpan<uint> hashes)
     {

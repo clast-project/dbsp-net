@@ -160,6 +160,180 @@ internal static class BlockWriter
         return new TraceBlock(schema, message, n, validity, valueAt, dataAt);
     }
 
+    /// <summary>
+    /// One block holding <paramref name="parts"/>' entries in order, built from their bytes: fixed
+    /// widths and string heaps copied, string offsets rebased, validity and BOOLEAN bits copied —
+    /// no cell decoded. Checkpoints use it to write a giant group whose hash spans blocks in memory
+    /// as the single block the v3 format requires (design §3.2): decoding and re-encoding those
+    /// spans cost 36 s of summed checkpoint time on ivm-bench.
+    /// </summary>
+    public static TraceBlock Concat(BlockSchema schema, IReadOnlyList<TraceBlock> parts)
+    {
+        var columns = schema.HashColumn + 1;
+        var n = 0;
+        foreach (var part in parts)
+        {
+            n = checked(n + part.Count);
+        }
+
+        var nulls = new int[columns];
+        var heap = new long[columns];
+        var bufferCount = 0;
+        for (var c = 0; c < columns; c++)
+        {
+            var kind = KindOf(schema, c);
+            bufferCount += kind == CellKind.Utf8 ? 3 : 2;
+            foreach (var part in parts)
+            {
+                var v = part.ValidityAt(c);
+                if (v >= 0)
+                {
+                    for (var i = 0; i < part.Count; i++)
+                    {
+                        nulls[c] += (part.Bytes[v + (i >> 3)] >> (i & 7)) & 1 ^ 1;
+                    }
+                }
+
+                if (kind == CellKind.Utf8 && part.Count > 0)
+                {
+                    heap[c] += Offset(part, c, part.Count);
+                }
+            }
+        }
+
+        var buffers = new (long Offset, long Length)[bufferCount];
+        var validity = new int[columns];
+        var valueAt = new int[columns];
+        var dataAt = new int[columns];
+        long body = 0;
+        var b = 0;
+        (long, long) Next(long length)
+        {
+            var at = body;
+            body += Pad8(length);
+            return (at, length);
+        }
+
+        for (var c = 0; c < columns; c++)
+        {
+            var kind = KindOf(schema, c);
+            buffers[b] = Next(nulls[c] > 0 ? (n + 7) / 8 : 0);
+            validity[c] = nulls[c] > 0 ? (int)buffers[b].Offset : -1;
+            b++;
+            buffers[b] = Next(kind switch
+            {
+                CellKind.Bool => (n + 7) / 8,
+                CellKind.Utf8 => (n + 1) * 4L,
+                _ => (long)Width(kind) * n,
+            });
+            valueAt[c] = n == 0 ? -1 : (int)buffers[b].Offset;
+            b++;
+            if (kind == CellKind.Utf8)
+            {
+                buffers[b] = Next(heap[c]);
+                dataAt[c] = heap[c] > 0 ? (int)buffers[b].Offset : -1;
+                b++;
+            }
+            else
+            {
+                dataAt[c] = -1;
+            }
+        }
+
+        var buffersVector = NodesVector + 4 + (16 * columns) + 4;
+        var metadata = (int)Pad8(buffersVector + 4 + (16 * bufferCount));
+        var bodyStart = Prefix + metadata;
+        var message = new byte[checked(bodyStart + body)];
+        var span = message.AsSpan();
+        BinaryPrimitives.WriteUInt32LittleEndian(span, 0xFFFFFFFF);
+        BinaryPrimitives.WriteInt32LittleEndian(span[4..], metadata);
+        WriteHeader(span.Slice(Prefix, metadata), n, nulls, buffers, buffersVector, body);
+        var out_ = span[bodyStart..];
+
+        for (var c = 0; c < columns && n > 0; c++)
+        {
+            var kind = KindOf(schema, c);
+            var at = 0;       // entries written so far
+            var heapAt = 0;   // heap bytes written so far
+            if (kind == CellKind.Utf8)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(out_[valueAt[c]..], 0);
+            }
+
+            foreach (var part in parts)
+            {
+                var src = part.Bytes.AsSpan();
+                var count = part.Count;
+                if (count == 0)
+                {
+                    continue;
+                }
+
+                if (validity[c] >= 0)
+                {
+                    var v = part.ValidityAt(c);
+                    for (var i = 0; i < count; i++)
+                    {
+                        if (v < 0 || ((src[v + (i >> 3)] >> (i & 7)) & 1) != 0)
+                        {
+                            var bit = at + i;
+                            out_[validity[c] + (bit >> 3)] |= (byte)(1 << (bit & 7));
+                        }
+                    }
+                }
+
+                switch (kind)
+                {
+                    case CellKind.Bool:
+                        var bits = part.ValuesAt(c);
+                        for (var i = 0; i < count; i++)
+                        {
+                            if (((src[bits + (i >> 3)] >> (i & 7)) & 1) != 0)
+                            {
+                                var bit = at + i;
+                                out_[valueAt[c] + (bit >> 3)] |= (byte)(1 << (bit & 7));
+                            }
+                        }
+
+                        break;
+                    case CellKind.Utf8:
+                        var length = Offset(part, c, count);
+                        if (length > 0)
+                        {
+                            src.Slice(part.DataAt(c), length).CopyTo(out_[(dataAt[c] + heapAt)..]);
+                        }
+
+                        for (var i = 1; i <= count; i++)
+                        {
+                            BinaryPrimitives.WriteInt32LittleEndian(out_[(valueAt[c] + ((at + i) * 4))..], heapAt + Offset(part, c, i));
+                        }
+
+                        heapAt += length;
+                        break;
+                    default:
+                        var width = c == schema.WeightColumn ? 8 : c == schema.HashColumn ? 4 : Width(kind);
+                        src.Slice(part.ValuesAt(c), count * width).CopyTo(out_[(valueAt[c] + (at * width))..]);
+                        break;
+                }
+
+                at += count;
+            }
+        }
+
+        for (var c = 0; c < columns; c++)
+        {
+            validity[c] = validity[c] < 0 ? -1 : validity[c] + bodyStart;
+            valueAt[c] = valueAt[c] < 0 ? -1 : valueAt[c] + bodyStart;
+            dataAt[c] = dataAt[c] < 0 ? -1 : dataAt[c] + bodyStart;
+        }
+
+        return new TraceBlock(schema, message, n, validity, valueAt, dataAt);
+
+        // A string column's int32 offset i (i = Count: its heap length).
+        static int Offset(TraceBlock part, int column, int i) =>
+            BinaryPrimitives.ReadInt32LittleEndian(part.Bytes.AsSpan(part.ValuesAt(column) + (i * 4)));
+    }
+
     private static CellKind KindOf(BlockSchema schema, int c) =>
         c < schema.KeyKinds.Length ? schema.KeyKinds[c]
         : c < schema.WeightColumn ? schema.ValueKinds[c - schema.KeyKinds.Length]

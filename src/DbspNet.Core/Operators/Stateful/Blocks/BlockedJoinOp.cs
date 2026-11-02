@@ -88,6 +88,17 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
     {
         var dl = Own(_leftIn.Current);
         var dr = Own(_rightIn.Current);
+        if (dl.IsEmpty && dr.IsEmpty)
+        {
+            // An idle tick: freeze what waits in managed levels now, under the step's ordinary
+            // (concurrent) GC, rather than at the next checkpoint, whose batch latency mode turns
+            // the conversion into blocking full GCs (design §3.2).
+            _left.Freeze();
+            _right.Freeze();
+            _output.SetCurrent(ZSet<StructuralRow, Z64>.Empty);
+            CollectGarbage();
+            return;
+        }
 
         // As IncrementalJoinOp: R_t = R_{t-1} + dr before the first pass absorbs dl ⋈ dr; the left
         // trace stays at L_{t-1} for the second pass.
