@@ -525,6 +525,67 @@ internal sealed class BlockedIndexedTrace
         return builder.Build();
     }
 
+    /// <summary>A Z-set trace's net contents streamed from its runs in hash order, consolidated across
+    /// runs without forming the whole set; null while managed levels wait (the caller materialises).</summary>
+    public IEnumerable<KeyValuePair<StructuralRow, Z64>>? StreamRows() =>
+        _managed.Count > 0 ? null : StreamRunsCore([.. _runs]);
+
+    private IEnumerable<KeyValuePair<StructuralRow, Z64>> StreamRunsCore(Run[] runs)
+    {
+        var cursors = runs.Select(r => new Cursor(r)).ToArray();
+        var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
+        while (true)
+        {
+            var hash = uint.MaxValue;
+            var any = false;
+            foreach (var c in cursors)
+            {
+                if (!c.Done && (!any || c.Hash < hash))
+                {
+                    hash = c.Hash;
+                    any = true;
+                }
+            }
+
+            if (!any)
+            {
+                yield break;
+            }
+
+            group.Clear();
+            var sources = 0;
+            foreach (var c in cursors)
+            {
+                if (c.Done || c.Hash != hash)
+                {
+                    continue;
+                }
+
+                sources++;
+                while (!c.Done && c.Hash == hash)
+                {
+                    var row = c.Block.Key(c.Index);
+                    if (!Dropped(row, c.Run.Floor))
+                    {
+                        group.Add((row, NoValue, c.Block.Weight(c.Index)));
+                    }
+
+                    c.Advance();
+                }
+            }
+
+            if (sources > 1)
+            {
+                Consolidate(group);
+            }
+
+            foreach (var (row, _, weight) in group)
+            {
+                yield return new KeyValuePair<StructuralRow, Z64>(row, new Z64(weight));
+            }
+        }
+    }
+
     /// <summary>Consolidate the managed levels into one run, then merge runs geometrically.</summary>
     public void Freeze()
     {

@@ -74,6 +74,9 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     /// <summary>True while the view holds rows not yet read from a lazy restore (tests).</summary>
     internal bool IsCold => _view.IsCold;
 
+    /// <summary>Whether enumerating the view decodes rows (cold, or held as blocks).</summary>
+    internal bool EnumerationDecodes => _view.EnumerationDecodes;
+
     /// <summary>The number of rows in <see cref="View"/>.</summary>
     public int ViewCount => _view.Count;
 

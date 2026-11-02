@@ -89,7 +89,13 @@ internal sealed class BlockedZSetTrace : IRowTrace<StructuralRow, Z64>
         Trace.IntegrateRows(_cloneDeltas ? delta.Clone() : delta);
     }
 
-    public IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateWhole() => Current;
+    /// <summary>Streamed from the runs when no managed level waits (a full write after a restore or an
+    /// idle tick); otherwise the materialised set. Either way the rows are decoded as they are read.</summary>
+    public IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateWhole() =>
+        _current.TryGetTarget(out var cached) && cached is not null ? cached : Trace.StreamRows() ?? Current;
+
+    /// <summary>Always: every row read is decoded from a block.</summary>
+    public bool EnumerationDecodes => true;
 
     public int DropKeysBelow(long threshold, Func<StructuralRow, long> monotoneKey)
     {

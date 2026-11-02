@@ -25,6 +25,10 @@ internal interface IRowTrace<TKey, TWeight>
     /// <summary>True while rows remain unread from a lazy restore.</summary>
     bool IsCold { get; }
 
+    /// <summary>Whether <see cref="EnumerateWhole"/> decodes rows (cold or block-held), so a reader of
+    /// several shards does well to enumerate them in parallel.</summary>
+    bool EnumerationDecodes { get; }
+
     /// <summary>The whole state, valid until the next change.</summary>
     ZSet<TKey, TWeight> Current { get; }
 
@@ -61,6 +65,8 @@ internal sealed class ManagedRowTrace<TKey, TWeight> : IRowTrace<TKey, TWeight>
     public long RetainedRows => Trace.State.Count;
 
     public bool IsCold => Trace.IsCold;
+
+    public bool EnumerationDecodes => Trace.IsCold;
 
     public ZSet<TKey, TWeight> Current => Trace.Current;
 

@@ -36,6 +36,9 @@ public sealed class IntegratedViewHandle<TRow>
     /// <summary>True while the view holds rows not yet read from a lazy restore.</summary>
     internal bool IsCold => _op.IsCold;
 
+    /// <summary>Whether enumerating the view decodes rows (cold, or held as blocks).</summary>
+    internal bool EnumerationDecodes => _op.EnumerationDecodes;
+
     /// <summary>The number of rows in <see cref="Current"/>, without forming it.</summary>
     public int Count => _op.ViewCount;
 

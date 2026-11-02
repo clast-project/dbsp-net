@@ -104,13 +104,15 @@ public class BlockedZSetTraceTests
                 }
 
                 case 7:
+                    // Freezes the managed levels, so the enumeration streams the runs (merged by hash).
                     blocked.Idle();
+                    AssertEnumerates(oracle.Current, blocked.EnumerateWhole());
                     break;
 
                 default:
                     blocked.Trace.CheckRuns();
+                    AssertEnumerates(oracle.Current, blocked.EnumerateWhole());
                     Assert.Equal(oracle.Current, blocked.Current);
-                    Assert.Equal(oracle.Current, ZSet.FromEntries(blocked.EnumerateWhole()));
                     break;
             }
 
@@ -125,6 +127,15 @@ public class BlockedZSetTraceTests
         blocked.Idle();
         blocked.Trace.CheckRuns();
         Assert.Equal(oracle.Current, blocked.Current);
+    }
+
+    // As a sink sees it: each row once, with a non-zero weight, summing to the oracle.
+    private static void AssertEnumerates(ZSet<StructuralRow, Z64> expected, IEnumerable<KeyValuePair<StructuralRow, Z64>> rows)
+    {
+        var list = rows.ToList();
+        Assert.All(list, e => Assert.NotEqual(0, e.Value.Value));
+        Assert.Equal(list.Count, list.Select(e => e.Key).Distinct().Count());
+        Assert.Equal(expected, ZSet.FromEntries(list));
     }
 
     private static readonly string[] Ddl = ["CREATE TABLE t (g INT NOT NULL, s VARCHAR, d DOUBLE)"];
