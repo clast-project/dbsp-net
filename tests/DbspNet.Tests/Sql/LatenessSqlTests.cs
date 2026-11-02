@@ -138,8 +138,9 @@ public class LatenessSqlTests
     private static int JoinRetainedKeys(CompiledQuery q) =>
         q.Circuit.Operators
             .OfType<IncrementalJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>()
-            .Single()
-            .RetainedKeyCount;
+            .Select(op => op.RetainedKeyCount)
+            .Concat(q.Circuit.Operators.OfType<DbspNet.Core.Operators.Stateful.Blocks.BlockedJoinOp>().Select(op => op.RetainedKeyCount))
+            .Single();
 
     [Fact]
     public void InnerJoinOnMonotoneKey_BoundsBothTraces()

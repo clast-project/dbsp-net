@@ -110,7 +110,9 @@ public sealed record SnapshotManifest(
         for (var i = 0; i < circuit.Operators.Count; i++)
         {
             var op = circuit.Operators[i];
-            var type = useAliases && op is IFingerprintAlias alias ? alias.FingerprintAliasType : op.GetType();
+            var type = op is IFingerprintIdentity identity ? identity.FingerprintType
+                : useAliases && op is IFingerprintAlias alias ? alias.FingerprintAliasType
+                : op.GetType();
             sb.Append(i).Append(':').Append(type.FullName).Append(';');
         }
 

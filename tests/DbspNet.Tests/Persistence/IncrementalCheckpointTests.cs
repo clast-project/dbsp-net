@@ -484,7 +484,10 @@ public class IncrementalCheckpointTests
             }
         }
 
-        Assert.True(sawDrops, "no delta carried a GC drop");
+        // A blocked join trace (DBSPNET_TRACE_BLOCKS=join) checkpoints whole until checkpoints write
+        // its blocks (docs/design-flat-trace-state.md §2.7, phase 3 step 4), so no delta carries its
+        // drops; the restore checks above still hold for it.
+        Assert.True(sawDrops || DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Join, "no delta carried a GC drop");
     }
 
     // Per chain in the current snapshot: its run count and the entries across its deltas.

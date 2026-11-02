@@ -27,6 +27,7 @@
 // a conformance case or a deliberate note saying why not.
 using System.Reflection;
 using DbspNet.Core.Circuit;
+using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Persistence;
 using DbspNet.Sql.Compiler;
 
@@ -87,7 +88,7 @@ public class PersistenceConformanceTests : IDisposable
         var data = new TheoryData<string, string>();
         foreach (var shape in Shapes.Keys.OrderBy(k => k, StringComparer.Ordinal))
         {
-            foreach (var family in new[] { "flat", "spine" })
+            foreach (var family in Families)
             {
                 data.Add(shape, family);
             }
@@ -96,9 +97,16 @@ public class PersistenceConformanceTests : IDisposable
         return data;
     }
 
+    // "blocks": the flat family with inner-join traces held as blocks (DBSPNET_TRACE_BLOCKS=join),
+    // freezing and cutting tiny so the snapshot holds runs (docs/design-flat-trace-state.md §3).
+    private static readonly string[] Families = ["flat", "spine", "blocks"];
+
     private static CompiledProgram Compile(string shape, string family)
     {
         var stmts = new List<string>(Tables) { "CREATE VIEW out AS " + Shapes[shape] };
+        using var blocks = family == "blocks"
+            ? TraceBlocksMode.Use(join: true, freezeEntries: 4, blockEntries: 2)
+            : TraceBlocksMode.Use(join: false);
         return SqlProgram.Compile(
             stmts,
             new HashSet<string>(["out"], StringComparer.Ordinal),
@@ -284,7 +292,7 @@ public class PersistenceConformanceTests : IDisposable
         var covered = new HashSet<string>(StringComparer.Ordinal);
         foreach (var shape in Shapes.Keys)
         {
-            foreach (var family in new[] { "flat", "spine" })
+            foreach (var family in Families)
             {
                 var program = Compile(shape, family);
                 foreach (var op in program.Circuit.Operators)

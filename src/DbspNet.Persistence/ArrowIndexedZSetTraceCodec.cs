@@ -32,7 +32,7 @@ namespace DbspNet.Persistence;
 /// rename is purely cosmetic on the wire.
 /// </remarks>
 internal sealed class ArrowIndexedZSetTraceCodec
-    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>, Runs.IIndexedRunCodec
+    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>, Runs.IIndexedRunCodec, DbspNet.Core.Operators.Stateful.Blocks.IBlockedTraceCodec
 {
     private readonly SqlSchema _keySchema;
     private readonly SqlSchema _valueSchema;
@@ -51,6 +51,20 @@ internal sealed class ArrowIndexedZSetTraceCodec
     }
 
     public string SchemaFingerprint { get; }
+
+    internal SqlSchema KeySchema => _keySchema;
+
+    internal SqlSchema ValueSchema => _valueSchema;
+
+    /// <inheritdoc/>
+    public ValueTask SaveBlockedAsync(
+        ISnapshotWriter writer, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        Blocks.BlockedTraceCheckpoint.SaveAsync(this, writer, fileName, trace, cancellationToken);
+
+    /// <inheritdoc/>
+    public ValueTask LoadBlockedAsync(
+        ISnapshotReader reader, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        Blocks.BlockedTraceCheckpoint.LoadAsync(this, reader, fileName, trace, cancellationToken);
 
     /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
     /// is on (docs/design-durable-state.md §1f) — inside a checkpoint, as an incremental chain of
