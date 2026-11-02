@@ -667,6 +667,85 @@ DISTINCT does. The view half needs the connector's index made reference-free, a 
 work. Until then, decided: `all` means joins, aggregates and DISTINCT, and views are opt-in
 (`DBSPNET_TRACE_BLOCKS=all,view`).
 
+### 3.9 The output connector's row index, reference-free: plan (2026-11-02)
+
+**What holds the rows.** `DeltaOutputConnector` in `OutputMode.Incremental` keeps
+`Dictionary<object, List<RowAddress>>` (`DeltaOutputConnector.cs:41`), keyed by each written view
+row (the `StructuralRow` the runner passes as `insertKeys`). A `RowAddress` is a file path and a
+position, and a retraction becomes a deletion vector at that position. Per distinct row the
+dictionary holds the row itself, a `List`, its backing array, and a path reference. With a managed
+view the row object is shared with the view, so the index costs only the list. With a blocked view
+the index is the row's only owner, which is why the census put 57.5M references under `(runner)`
+(§3.8). The runner's own structures (`Pending`, the `ArrowChanges` key list) live for one write and
+are not retained.
+
+**Feldera keeps no such index.** Its Delta output truncates on start and then appends each
+batch's records; it writes no deletion vectors. Our Incremental mode keeps the table equal to the
+view, which needs a row → position map, so this is a cost Feldera does not have. The design keeps
+that semantics and changes only how the map is held.
+
+**Alternatives considered:**
+- **Key by a 64-bit row hash only** (struct arrays, no row bytes). This is the smallest option, but
+  two live rows with equal hashes cannot be told apart at delete time. Making it exact needs the row
+  somewhere (in the view, or read back from Parquet). Rejected: every other blocked structure is
+  exact, including NaN payloads (§3.5).
+- **Store addresses in the view's trace** (row → its positions as the value). This saves the second
+  copy of the row bytes, but it ties engine state to one sink. A view can have several sinks, and
+  the parallel view is sharded. Rejected.
+- **Shrink the managed index** (an int file id instead of a path, a single address inline instead
+  of a `List`). This removes two to three references per row, but the row objects stay alive. Worth
+  doing for the managed arm anyway (below), but it is not the lever.
+
+**Design: the index is a `BlockedIndexedTrace`**, with the **row as the key** and one **packed
+`long` address as the value** (file id << 40 | position, so up to 2^24 files of up to 2^40 rows,
+checked). Each live copy of a row is one entry with weight +1, and deleting a copy integrates the
+same entry with weight −1. This reuses the tested machinery as it stands: exact encoded-key
+equality, hash-ordered blocks below the LOH threshold, freezing and merging, and giant groups
+spanning blocks. The only new code is the address bookkeeping.
+- **Where it lives:** a public `OutputRowIndex` in DbspNet.Persistence, which already sees Core's
+  internals and owns the block format (`BlockSchema`). Connectors.Abstractions references
+  Persistence, so `IOutputConnector` does not change. The connector creates the index in
+  `BindSchemaAsync` from the view schema. The index is **managed** (today's dictionary, with the
+  int-file-id shrink) unless the view is blocked: `TraceBlocksMode.View` is set and every column is
+  block-encodable, the same condition `PlanToCircuit` uses (`PlanToCircuit.cs:1432`). A blocked index
+  beside a managed view would only add bytes. `OutputRowIndex.Use(...)` overrides the choice in tests.
+- **Apply:** one call per `ApplyChangesAsync`. For each delete `(row, count)`, read the row's group
+  as a consolidated view (addresses whose net weight is +1; a −1 may sit in a later level than its
+  +1), take `count` of them, and stage them as −1 entries. Then write the inserted files, stage a
+  +1 entry per inserted copy, and integrate the whole batch as one delta. The runner's Z-set is
+  consolidated, so a row is either deleted or inserted in one call, never both, and the lookups see
+  the state before the batch, as today.
+- **Freeze:** after each apply (once per batch, off the step path), and at the usual threshold
+  within a large apply.
+- **The first write** carries the whole view (tens of millions of rows on ivm-bench). Integrating it
+  as a single managed delta would recreate exactly the transient object peak this arc removes. It is
+  integrated in chunks of `FreezeEntries`, freezing each chunk, so at most one chunk is managed at a
+  time, and merges compact the resulting runs.
+- **Not persisted.** The index is rebuilt by the first write after a restart, which truncates the
+  table and writes the whole view, as today. Persisting the index together with the table version
+  (to make restart writes incremental) is a separate decision.
+
+**Expected effect, to be measured.** The `(runner)` references (57.5M under `all,view`) go to near
+zero. Bytes trade the row object graphs (the 0.42 GB §3.8 added, plus the managed rows themselves)
+for a second block copy of each row (about the view's block size) plus 8 bytes per entry. That
+should be net negative, but it has not been measured. Apply time gains a hash-and-encode per inserted
+row and a decode per deleted row's group. That cost is small next to Parquet encoding, but the first
+write encodes every row, so watch it.
+
+**Gate:** `DBSPNET_TRACE_BLOCKS=view` (with `all,view` in the A/B). There is no separate flag: the
+blocked index exists only to make the blocked view pay.
+
+**Tests:** a random-operation oracle against the managed index (insert copies, delete counts,
+re-insert, freeze at tiny thresholds so runs and merges are exercised, giant groups, NaN payloads):
+after each apply, the set of live addresses per row must match. Run the existing incremental-connector
+tests (read the table back, compare to the view) in both arms, plus a mutation pass.
+
+**Measure:** the census after the checkpoint (`(runner)` references, total bytes), the batch-1 and
+restart output write (the `addresses` phase of `DBSPNET_OUTPUT_TRACE`, plus totals), and the drain
+as a guard. Use 5 alternating runs of `all` against `all,view`, and compare outputs. **Decision rule:**
+if `all,view` has fewer references and no more bytes than `all`, and the output write is no slower
+beyond noise, views join `all`.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
