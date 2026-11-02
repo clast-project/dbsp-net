@@ -46,11 +46,19 @@ public sealed class IncrementalDeltaOutputTests : IDisposable
     }
 
     [Theory]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(3)]
-    public async Task SinkEqualsView_AfterEveryBatch_AndEachBatchAddsAtMostOneFile(int seed)
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(3, false)]
+    [InlineData(1, true)]
+    [InlineData(2, true)]
+    [InlineData(3, true)]
+    public async Task SinkEqualsView_AfterEveryBatch_AndEachBatchAddsAtMostOneFile(int seed, bool blocks)
     {
+        // blocks: views and the connector's row index held as blocks (docs/design-flat-trace-state.md
+        // §3.9), with tiny runs so freezes and merges happen every batch.
+        using var mode = blocks
+            ? DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: true, freezeEntries: 4, blockEntries: 2, view: true)
+            : null;
         var rng = new Random(seed);
         var versions = new List<IReadOnlyList<(object?[] Row, long Weight)>>();
         var live = new List<object?[]>();

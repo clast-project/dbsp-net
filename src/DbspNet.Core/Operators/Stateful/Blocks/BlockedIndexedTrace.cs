@@ -218,6 +218,179 @@ internal sealed class BlockedIndexedTrace
         Push(new Managed(null, delta, delta.Count));
     }
 
+    /// <summary>
+    /// Push <paramref name="count"/> entries as one new run, encoded straight from the caller's
+    /// entries: sorted by key hash once and encoded once, with no managed level, so a large batch (an
+    /// output sink's first write carries a whole view) is not frozen in chunks and merged up the
+    /// levels (docs/design-flat-trace-state.md §3.10). The entries need not be ordered; equal
+    /// (key, value) entries are summed and zero weights dropped. <paramref name="value"/> is called
+    /// once per entry while its block is encoded, so values can be formed on the fly.
+    /// </summary>
+    public void IntegrateEntries(int count, Func<int, StructuralRow> key, Func<int, StructuralRow> value, Func<int, long> weight)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentNullException.ThrowIfNull(weight);
+        if (count == 0)
+        {
+            return;
+        }
+
+        var t0 = BlockTraceProfile.Now();
+        _materialized = null;
+
+        // Hash above index: one primitive sort orders by hash, ties by arrival. A large batch is cut
+        // into hash ranges (the top bits) that sort and encode in parallel; a range's blocks are a
+        // contiguous stretch of the run, so the run is their concatenation in range order. Visiting
+        // rows in hash order is a cache miss per row, which is what the parallelism hides.
+        var order = new ulong[count];
+        var bits = count < ParallelEntries ? 0 : Math.Min(8, (int)Math.Ceiling(Math.Log2(Environment.ProcessorCount * 2)));
+        var buckets = 1 << bits;
+        var sizes = new int[buckets + 1];
+        var hashes = new uint[count];
+        Parallel.For(0, (count + HashChunk - 1) / HashChunk, c =>
+        {
+            for (int i = c * HashChunk, end = Math.Min(count, i + HashChunk); i < end; i++)
+            {
+                hashes[i] = (uint)_hash(key(i));
+            }
+        });
+
+        foreach (var h in hashes)
+        {
+            sizes[bits == 0 ? 1 : (int)(h >> (32 - bits)) + 1]++;
+        }
+
+        for (var b = 0; b < buckets; b++)
+        {
+            sizes[b + 1] += sizes[b];
+        }
+
+        var next = sizes[..buckets];
+        for (var i = 0; i < count; i++)
+        {
+            var h = hashes[i];
+            order[next[bits == 0 ? 0 : (int)(h >> (32 - bits))]++] = ((ulong)h << 32) | (uint)i;
+        }
+
+        var tHashed = BlockTraceProfile.Now();
+        var parts = new (List<ITraceBlock> Blocks, long Entries)[buckets];
+        Parallel.For(0, buckets, b =>
+        {
+            Array.Sort(order, sizes[b], sizes[b + 1] - sizes[b]);
+            parts[b] = BuildRange(order, sizes[b], sizes[b + 1], key, value, weight);
+        });
+
+        var blocks = new List<ITraceBlock>();
+        long entries = 0;
+        foreach (var (partBlocks, partEntries) in parts)
+        {
+            blocks.AddRange(partBlocks);
+            entries += partEntries;
+        }
+
+        if (blocks.Count > 0)
+        {
+            _runs.Insert(0, new Run([.. blocks], entries));
+        }
+
+        if (BlockTraceProfile.Enabled)
+        {
+            BlockTraceProfile.Section(3, t0);
+            BlockTraceProfile.Section(7, tHashed);
+            BlockTraceProfile.Freeze(t0, entries);
+        }
+
+        Compact();
+    }
+
+    // A batch below this many entries is sorted and encoded on the calling thread.
+    private const int ParallelEntries = 1 << 16;
+
+    private const int HashChunk = 1 << 14;
+
+    // Entries order[from..to) (sorted, hash above index) as blocks.
+    private (List<ITraceBlock> Blocks, long Entries) BuildRange(
+        ulong[] order, int from, int to, Func<int, StructuralRow> key, Func<int, StructuralRow> value, Func<int, long> weight)
+    {
+        var run = new RunBuilder(this);
+        long entries = 0;
+        var keys = new List<StructuralRow>();
+        var members = new List<List<int>>();
+        for (var i = from; i < to;)
+        {
+            var hash = (uint)(order[i] >> 32);
+            var j = i + 1;
+            while (j < to && (uint)(order[j] >> 32) == hash)
+            {
+                j++;
+            }
+
+            if (j - i == 1)
+            {
+                var only = (int)(uint)order[i];
+                if (weight(only) is var w && w != 0)
+                {
+                    run.Add(hash, key(only), value(only), w);
+                    entries++;
+                }
+            }
+            else
+            {
+                // A hash's entries: grouped by key (a run keeps a key's entries contiguous), and
+                // equal values within a key summed (a run is consolidated).
+                keys.Clear();
+                members.Clear();
+                for (var e = i; e < j; e++)
+                {
+                    var index = (int)(uint)order[e];
+                    var k = key(index);
+                    var g = keys.IndexOf(k);
+                    if (g < 0)
+                    {
+                        keys.Add(k);
+                        members.Add(new List<int>());
+                        g = keys.Count - 1;
+                    }
+
+                    members[g].Add(index);
+                }
+
+                for (var g = 0; g < keys.Count; g++)
+                {
+                    var values = new Dictionary<StructuralRow, long>();
+                    var arrival = new List<StructuralRow>();
+                    foreach (var index in members[g])
+                    {
+                        var v = value(index);
+                        if (values.TryGetValue(v, out var sum))
+                        {
+                            values[v] = sum + weight(index);
+                        }
+                        else
+                        {
+                            values[v] = weight(index);
+                            arrival.Add(v);
+                        }
+                    }
+
+                    foreach (var v in arrival)
+                    {
+                        if (values[v] != 0)
+                        {
+                            run.Add(hash, keys[g], v, values[v]);
+                            entries++;
+                        }
+                    }
+                }
+            }
+
+            i = j;
+        }
+
+        return run.Finish() is { } built ? ([.. built.Blocks], entries) : (new List<ITraceBlock>(), 0);
+    }
+
     private void Push(Managed level)
     {
         _managed.Add(level);

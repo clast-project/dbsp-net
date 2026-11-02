@@ -63,6 +63,38 @@ public class BlockedIndexedTraceTests
         Strings[rnd.Next(Strings.Length)] is { } s ? Utf8String.Of(s) : null,
         rnd.Next(5) == 0 ? null : Doubles[rnd.Next(Doubles.Length)]);
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IntegrateEntries_LargeBatch_SortsAndEncodesInHashRanges(bool collide)
+    {
+        // Above the parallel threshold: hash ranges built on several threads, concatenated.
+        var rnd = new Random(collide ? 11 : 12);
+        var format = BlockSchema.TryCreate(KeySchema, ValueSchema)!;
+        var blocked = new BlockedIndexedTrace(format, blockEntries: 16, hash: collide ? static k => k.GetHashCode() & 7 : null);
+        var oracle = new IndexedZSetTrace<StructuralRow, StructuralRow, Z64>();
+        for (var batch = 0; batch < 2; batch++)
+        {
+            var raw = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
+            for (var n = 0; n < 150_000; n++)
+            {
+                var key = collide ? Key(rnd) : new StructuralRow((long)rnd.Next(100_000), Utf8String.Of("k"));
+                raw.Add((key, Value(rnd), rnd.Next(3) == 0 ? -1 : 1));
+            }
+
+            var delta = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            foreach (var (k, v, w) in raw)
+            {
+                delta.Add(k, v, new Z64(w));
+            }
+
+            blocked.IntegrateEntries(raw.Count, i => raw[i].Key, i => raw[i].Value, i => raw[i].Weight);
+            oracle.Integrate(delta.Build());
+            blocked.CheckRuns();
+            Assert.Equal(oracle.Current, blocked.Materialize());
+        }
+    }
+
     public static TheoryData<int> Seeds() => new(Enumerable.Range(1, 60));
 
     [Theory]
@@ -85,6 +117,7 @@ public class BlockedIndexedTraceTests
                 case < 6:
                 {
                     var delta = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+                    var raw = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
                     if (rnd.Next(3) == 0 && !oracle.Current.IsEmpty)
                     {
                         // Cancel (part of) what the trace holds.
@@ -94,7 +127,7 @@ public class BlockedIndexedTraceTests
                             {
                                 if (rnd.Next(2) == 0)
                                 {
-                                    delta.Add(key, value, Z64.Negate(weight));
+                                    raw.Add((key, value, -weight.Value));
                                 }
                             }
                         }
@@ -102,11 +135,35 @@ public class BlockedIndexedTraceTests
 
                     for (var n = rnd.Next(0, 25); n > 0; n--)
                     {
-                        delta.Add(Key(rnd), Value(rnd), new Z64(rnd.Next(2) == 0 ? rnd.Next(1, 3) : -rnd.Next(1, 3)));
+                        var entry = (Key(rnd), Value(rnd), (long)(rnd.Next(2) == 0 ? rnd.Next(1, 3) : -rnd.Next(1, 3)));
+                        raw.Add(entry);
+                        if (rnd.Next(4) == 0)
+                        {
+                            raw.Add(entry with { Item3 = -entry.Item3 }); // cancels in the same batch
+                        }
+                    }
+
+                    foreach (var (k, v, w) in raw)
+                    {
+                        delta.Add(k, v, new Z64(w));
                     }
 
                     var built = delta.Build();
-                    blocked.Integrate(built);
+                    if (rnd.Next(2) == 0)
+                    {
+                        // The same entries unconsolidated (zero weights too), straight into a run (§3.10).
+                        if (raw.Count > 0)
+                        {
+                            raw.Add(raw[0] with { Weight = 0 });
+                        }
+
+                        blocked.IntegrateEntries(raw.Count, i => raw[i].Key, i => raw[i].Value, i => raw[i].Weight);
+                    }
+                    else
+                    {
+                        blocked.Integrate(built);
+                    }
+
                     oracle.Integrate(built);
                     break;
                 }
