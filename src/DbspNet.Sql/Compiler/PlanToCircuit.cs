@@ -2790,6 +2790,13 @@ public static partial class PlanToCircuit
             ? TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema)
             : null;
 
+        // A large partition's ordered chunks (§3.15): no key, the row.
+        var chunkFormat = blockFormat is null ? null : TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema);
+        if (chunkFormat is null)
+        {
+            blockFormat = null;
+        }
+
         return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedWindowAggregate<StructuralRow>(
             input,
             PartitionOf,
@@ -2802,7 +2809,8 @@ public static partial class PlanToCircuit
             partitionComparer: null,
             snapshotCodec: codec,
             frontier: frontier,
-            blockFormat: blockFormat), Z("trace.arrows", reshardPlace, codec)));
+            blockFormat: blockFormat,
+            chunkFormat: chunkFormat), Z("trace.arrows", reshardPlace, codec)));
     }
 
     /// <summary>

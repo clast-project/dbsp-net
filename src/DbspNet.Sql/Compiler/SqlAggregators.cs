@@ -56,6 +56,23 @@ internal abstract class SqlAggregator
     public virtual void MergePersistedState(ref object? state, ReadOnlySpan<byte> blob)
         => throw new NotSupportedException($"{GetType().Name} does not persist state.");
 
+    /// <summary>Whether this aggregate combines exactly from partial results (§3.15): COUNT, MIN
+    /// and MAX. The slot accumulator is an immutable value (a boxed count, the best value so far).</summary>
+    public virtual bool IsExactPartial => false;
+
+    /// <summary>The slot accumulator of the empty multiset.</summary>
+    public virtual object? PartialEmpty() => throw new NotSupportedException(GetType().Name);
+
+    /// <summary><paramref name="acc"/> with <paramref name="row"/> at <paramref name="weight"/> folded in.</summary>
+    public virtual object? PartialAdd(object? acc, StructuralRow row, long weight) => throw new NotSupportedException(GetType().Name);
+
+    /// <summary><paramref name="earlier"/> and <paramref name="later"/> combined, ties going to the
+    /// earlier in fold order (as the fold and <see cref="Compute"/> keep the first best value).</summary>
+    public virtual object? PartialCombine(object? earlier, object? later) => throw new NotSupportedException(GetType().Name);
+
+    /// <summary>The slot's value, equal to <see cref="Compute"/> over the same rows.</summary>
+    public virtual object? PartialResult(object? acc) => acc;
+
     /// <summary>Writes a <c>double</c> then a <c>long</c> — the shape every persisted
     /// accumulator here starts with.</summary>
     private protected static void WriteDoubleLong(IBufferWriter<byte> writer, double d, long n)
@@ -73,6 +90,14 @@ internal sealed class SqlCountStarAggregator : SqlAggregator
     {
         public long Count;
     }
+
+    public override bool IsExactPartial => true;
+
+    public override object? PartialEmpty() => 0L;
+
+    public override object? PartialAdd(object? acc, StructuralRow row, long weight) => (long)acc! + weight;
+
+    public override object? PartialCombine(object? earlier, object? later) => (long)earlier! + (long)later!;
 
     public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
@@ -110,6 +135,15 @@ internal sealed class SqlCountAggregator : SqlAggregator
     {
         _argExtract = argExtract;
     }
+
+    public override bool IsExactPartial => true;
+
+    public override object? PartialEmpty() => 0L;
+
+    public override object? PartialAdd(object? acc, StructuralRow row, long weight) =>
+        _argExtract(row) is null ? acc : (long)acc! + weight;
+
+    public override object? PartialCombine(object? earlier, object? later) => (long)earlier! + (long)later!;
 
     private sealed class CountState
     {
@@ -393,6 +427,31 @@ internal sealed class SqlMinMaxAggregator : SqlAggregator
     {
         _argExtract = argExtract;
         _wantMin = wantMin;
+    }
+
+    public override bool IsExactPartial => true;
+
+    // The best value so far (null for none): Compute's rule, rows of non-positive weight and NULL
+    // values ignored, a later value replacing only a strictly better one.
+    public override object? PartialEmpty() => null;
+
+    public override object? PartialAdd(object? acc, StructuralRow row, long weight) =>
+        weight <= 0 || _argExtract(row) is not { } v ? acc : PartialCombine(acc, v);
+
+    public override object? PartialCombine(object? earlier, object? later)
+    {
+        if (later is null)
+        {
+            return earlier;
+        }
+
+        if (earlier is null)
+        {
+            return later;
+        }
+
+        var cmp = ((IComparable)later).CompareTo(earlier);
+        return (_wantMin ? cmp < 0 : cmp > 0) ? later : earlier;
     }
 
     /// <summary>
@@ -1067,8 +1126,91 @@ internal sealed class SqlExactQuantileAggregator : SqlAggregator
 /// multiset, packing the results into a <see cref="StructuralRow"/> whose
 /// columns line up with the resolver's declared aggregate order.
 /// </summary>
-internal sealed class CompositeAggregator : IAggregator<StructuralRow, StructuralRow>
+internal sealed class CompositeAggregator : IAggregator<StructuralRow, StructuralRow>, IPartialAggregator<StructuralRow, StructuralRow>
 {
+    // The partial accumulator (§3.15): one slot accumulator per aggregate, plus the total weight
+    // for the emission gate (None when the multiset's weights sum to zero).
+    private sealed class Partial(object?[] slots, long total)
+    {
+        public readonly object?[] Slots = slots;
+        public long Total = total;
+    }
+
+    /// <summary>Whether every aggregate combines exactly, so this composite can be used as an
+    /// <see cref="IPartialAggregator{TRow,TOut}"/>.</summary>
+    public bool IsExactPartial
+    {
+        get
+        {
+            foreach (var a in _aggs)
+            {
+                if (!a.IsExactPartial)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    object IPartialAggregator<StructuralRow, StructuralRow>.NewAccumulator()
+    {
+        var slots = new object?[_aggs.Count];
+        for (var i = 0; i < slots.Length; i++)
+        {
+            slots[i] = _aggs[i].PartialEmpty();
+        }
+
+        return new Partial(slots, 0);
+    }
+
+    void IPartialAggregator<StructuralRow, StructuralRow>.Add(object accumulator, StructuralRow row, long weight)
+    {
+        var p = (Partial)accumulator;
+        for (var i = 0; i < _aggs.Count; i++)
+        {
+            p.Slots[i] = _aggs[i].PartialAdd(p.Slots[i], row, weight);
+        }
+
+        p.Total += weight;
+    }
+
+    void IPartialAggregator<StructuralRow, StructuralRow>.CombineInto(object accumulator, object other)
+    {
+        var p = (Partial)accumulator;
+        var o = (Partial)other;
+        for (var i = 0; i < _aggs.Count; i++)
+        {
+            p.Slots[i] = _aggs[i].PartialCombine(p.Slots[i], o.Slots[i]);
+        }
+
+        p.Total += o.Total;
+    }
+
+    object IPartialAggregator<StructuralRow, StructuralRow>.Clone(object accumulator)
+    {
+        var p = (Partial)accumulator;
+        return new Partial((object?[])p.Slots.Clone(), p.Total);
+    }
+
+    Optional<StructuralRow> IPartialAggregator<StructuralRow, StructuralRow>.Result(object accumulator)
+    {
+        var p = (Partial)accumulator;
+        if (p.Total == 0)
+        {
+            return Optional<StructuralRow>.None;
+        }
+
+        var results = new object?[_aggs.Count];
+        for (var i = 0; i < results.Length; i++)
+        {
+            results[i] = _aggs[i].PartialResult(p.Slots[i]);
+        }
+
+        return Optional<StructuralRow>.Some(_codec.BuildRow(_outputSchema, results));
+    }
+
     private readonly IReadOnlyList<SqlAggregator> _aggs;
     private readonly IRowCodec<StructuralRow> _codec;
     private readonly Schema _outputSchema;
