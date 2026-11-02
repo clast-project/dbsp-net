@@ -545,6 +545,35 @@ and 1.75 → 5.17 GiB allocated.
 3. A per-block "no hash collisions" flag, so a probed range needs one key comparison, not one
    per entry.
 
+### 3.6 Lever 1, freezing aggregates less eagerly: tried, no gain (2026-11-02)
+
+Separate aggregate settings were built behind env knobs: the freeze threshold, the managed-level
+cap, and an opt-out for the idle-tick freeze. All were reverted.
+
+**The threshold and level cap alone change nothing.** With the threshold at 64K, 1M or 10^9, the
+profile is identical: 1,019 freezes, 60 merges, 2,264,138 merged entries. The checkpoint freezes
+nothing, so the aggregate traces are frozen during the drain by idle ticks. A busy tick's delta
+exceeds 64K, so with idle freezing off but the default threshold, the counts barely move (954
+freezes, the same merges).
+
+**Idle freeze off and no effective threshold** (4M entries, 64 levels) makes the drain profile
+exactly the join arm's: 906 freezes, 48 merges, 47K merged entries. The aggregate freeze moves to
+the checkpoint as one freeze per trace with no merges: 4.36M entries, 13.5 s CPU summed over
+workers.
+
+**Wall clock** (SF=3, W=12, batch 1, 5 alternating runs per arm, outputs identical, medians):
+
+| median | join | all (current) | all + lazy aggregate freeze |
+|---|---|---|---|
+| drain | 16,338 ms | 16,475 ms (+0.8%) | 16,544 ms (+1.3%) |
+| checkpoint | 3,511 ms | 3,129 ms | 3,721 ms |
+| GC pause | 6,793 ms | 6,305 ms | 6,949 ms |
+
+Spreads per arm are about 600–900 ms. The lazy freeze is no better on the drain and worse on the
+checkpoint, so it was dropped. In this round `all` cost only +0.8% over `join`, against +2.5% in
+§3.5. The aggregate drain cost is within run-to-run noise at five runs, and the 5.3 s of extra
+aggregate CPU (≈0.4 s per worker) is at most a few percent of wall clock.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
