@@ -1891,10 +1891,22 @@ public sealed class Resolver
                 }
             }
 
-            if (w.Arguments.Count == 3
-                && !TryFoldConstant(ResolveScalarExpression(w.Arguments[2], baseSchema), out def))
+            if (w.Arguments.Count == 3)
             {
-                throw new ResolveException($"the {fnUpper} default must be a constant");
+                var defaultExpr = ResolveScalarExpression(w.Arguments[2], baseSchema);
+                if (!TryFoldConstant(defaultExpr, out def))
+                {
+                    throw new ResolveException($"the {fnUpper} default must be a constant");
+                }
+
+                // The default fills the value's column, so it takes the value's type (0.0 is a
+                // DECIMAL literal, the value may be DOUBLE): cast as SQL would, once, here.
+                var valueType = ResolveScalarExpression(w.Arguments[0], baseSchema).Type;
+                if (def is not null && defaultExpr.Type is not SqlNullType
+                    && defaultExpr.Type.WithNullable(true) != valueType.WithNullable(true))
+                {
+                    def = ExpressionCompiler.CompileScalar(new ResolvedCast(defaultExpr, valueType.WithNullable(true)))([]);
+                }
             }
         }
         else
