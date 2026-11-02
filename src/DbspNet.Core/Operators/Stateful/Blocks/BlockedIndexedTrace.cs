@@ -3,6 +3,7 @@
 using System.Buffers;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
+using DbspNet.Core.IO;
 
 namespace DbspNet.Core.Operators.Stateful.Blocks;
 
@@ -62,6 +63,11 @@ internal sealed class BlockedIndexedTrace
         public long Entries { get; } = entries;
 
         public long Floor { get; set; } = long.MinValue;
+
+        /// <summary>The run file this run's blocks were written to (or restored from), once a
+        /// checkpoint that wrote it has committed; a later checkpoint names it instead of writing
+        /// it again. Runs are immutable, so it stays valid until the run is merged away.</summary>
+        public (ITableFileSystem Store, string Path)? Persisted { get; set; }
 
         /// <summary>The first block that can hold <paramref name="hash"/>, or −1. A giant group's
         /// hash can span consecutive blocks; the caller continues while the next block's first hash
@@ -206,6 +212,49 @@ internal sealed class BlockedIndexedTrace
                 previous = hashes.Length > 0 ? hashes[^1] : previous;
             }
         }
+    }
+
+    /// <summary>Runs, newest first (checkpoints).</summary>
+    internal IReadOnlyList<Run> Runs => _runs;
+
+    /// <summary>Get the trace ready to be written as runs (docs/design-flat-trace-state.md §2.7):
+    /// freeze the managed levels, and rewrite any run with a GC floor so that what it holds is what
+    /// the trace holds. Returns the runs, newest first.</summary>
+    internal IReadOnlyList<Run> PrepareCheckpoint()
+    {
+        Freeze();
+        for (var r = 0; r < _runs.Count; r++)
+        {
+            if (_runs[r].Floor == long.MinValue)
+            {
+                continue;
+            }
+
+            var filtered = Merge(_runs[r], new Run([], 0));
+            if (filtered is null)
+            {
+                _runs.RemoveAt(r--);
+            }
+            else
+            {
+                _runs[r] = filtered;
+            }
+        }
+
+        return [.. _runs];
+    }
+
+    /// <summary>Adopt a restored run as the newest level (a chain's runs in order, base first).</summary>
+    internal void AdoptRun(ITraceBlock[] blocks, long entries, (ITableFileSystem Store, string Path)? persisted)
+    {
+        ArgumentNullException.ThrowIfNull(blocks);
+        if (blocks.Length == 0)
+        {
+            return;
+        }
+
+        _materialized = null;
+        _runs.Insert(0, new Run(blocks, entries) { Persisted = persisted });
     }
 
     /// <summary>Visit every entry of <paramref name="key"/> in every level (unconsolidated).</summary>

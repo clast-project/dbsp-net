@@ -19,8 +19,12 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 /// builder. Snapshots go through <see cref="BlockedIndexedTrace.Materialize"/> and the operator's
 /// ordinary trace codecs, with the same file names, until checkpoints write blocks raw (§2.7).
 /// </remarks>
-internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable
+internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable, IFingerprintIdentity
 {
+    /// <summary>Its snapshot is the managed structural join's, file for file (same names, v3 run
+    /// chains), so either restores the other's.</summary>
+    public Type FingerprintType => typeof(IncrementalJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>);
+
     private const string LeftTraceFile = "left.arrows";
     private const string RightTraceFile = "right.arrows";
 
@@ -209,8 +213,13 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable
             throw new NotSupportedException("BlockedJoinOp was constructed without snapshot codecs.");
         }
 
-        await _leftCodec.SaveAsync(writer, LeftTraceFile, _left.Materialize(), cancellationToken).ConfigureAwait(false);
-        await _rightCodec.SaveAsync(writer, RightTraceFile, _right.Materialize(), cancellationToken).ConfigureAwait(false);
+        await Save(_leftCodec, LeftTraceFile, _left).ConfigureAwait(false);
+        await Save(_rightCodec, RightTraceFile, _right).ConfigureAwait(false);
+
+        ValueTask Save(IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec, string file, BlockedIndexedTrace trace) =>
+            codec is IBlockedTraceCodec blocked
+                ? blocked.SaveBlockedAsync(writer, file, trace, cancellationToken)
+                : codec.SaveAsync(writer, file, trace.Materialize(), cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -220,8 +229,20 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable
             throw new NotSupportedException("BlockedJoinOp was constructed without snapshot codecs.");
         }
 
-        _left.Integrate(await _leftCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false));
-        _right.Integrate(await _rightCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false));
+        await Load(_leftCodec, LeftTraceFile, _left).ConfigureAwait(false);
+        await Load(_rightCodec, RightTraceFile, _right).ConfigureAwait(false);
+
+        async ValueTask Load(IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> codec, string file, BlockedIndexedTrace trace)
+        {
+            if (codec is IBlockedTraceCodec blocked)
+            {
+                await blocked.LoadBlockedAsync(reader, file, trace, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                trace.Integrate(await codec.LoadAsync(reader, file, cancellationToken).ConfigureAwait(false));
+            }
+        }
     }
 
     public string SchemaFingerprint =>

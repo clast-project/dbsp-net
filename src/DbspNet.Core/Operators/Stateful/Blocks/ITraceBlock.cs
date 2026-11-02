@@ -61,3 +61,13 @@ internal interface ITraceBlockFormat
     /// each the hash of its key — as one block.</summary>
     ITraceBlock Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count);
 }
+
+/// <summary>Checkpoints a <see cref="BlockedIndexedTrace"/> as run files written from its blocks and
+/// restores it by adopting them (docs/design-flat-trace-state.md §2.6–§2.7). Implemented in
+/// DbspNet.Persistence by the trace's ordinary snapshot codec.</summary>
+internal interface IBlockedTraceCodec
+{
+    ValueTask SaveBlockedAsync(Circuit.ISnapshotWriter writer, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken);
+
+    ValueTask LoadBlockedAsync(Circuit.ISnapshotReader reader, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken);
+}
