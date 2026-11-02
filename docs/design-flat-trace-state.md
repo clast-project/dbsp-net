@@ -500,6 +500,51 @@ aggregates add about 2% on top of joins.
 **The remaining aggregate references are the caches** (`_aggCache`, `_stateCache`). They are
 charged the key rows the trace used to reach first, so they are now the structure to convert.
 
+### 3.5 The aggregate group view, and where the aggregate cost really is (2026-11-02)
+
+**Built.** `BlockedGroupView` gives an aggregate its before-group without decoding:
+
+- `WeightOf` matches by value hash, then compares the encoded value. Hashes are stored per
+  block: written at freeze, computed once for restored blocks.
+- `SumWeights` reads the stored weights.
+- `IsEmpty` stops at the first non-zero net.
+- Enumeration decodes the group once.
+
+It is exact, including where equal cells hash differently (NaN payloads). Property tests and
+mutations pass.
+
+**It did not move the drain** (three arms, 5 runs each):
+
+| median | off | join | all |
+|---|---|---|---|
+| batch-1 drain | 16,060 ms | 16,183 ms (+0.8%) | 16,595 ms (+3.3%; **+2.5% over join**) |
+| batch-1 output write / first checkpoint | 5,066 / 4,698 ms | 3,450 / 3,489 ms | 3,492 / 3,180 ms |
+| restart: first drain | 897 ms | 441 ms | 519 ms |
+| census: aggregate references | — | 71.6M | 22.6M |
+
+**Why: the §3.4 diagnosis was wrong.** SQL's SUM, COUNT, AVG and MIN/MAX are all incremental: they
+call `WeightOf` on the delta's rows and never walk the group, so decoding was not the cost. A
+per-operator profile (one run per arm) plus block counters shows aggregates at 9.4 → 14.7 s CPU
+and 1.75 → 5.17 GiB allocated.
+
+- **The cost is converting the aggregate traces into blocks:**
+  - +5.5M entries frozen;
+  - 2.26M entries rewritten by merges (+2.2 s CPU);
+  - +1.2 s of encoding;
+  - +1.1 GB of block bytes.
+- **Why there is so much merging:** an aggregate gets a small delta every tick, so idle-tick
+  freezes cut many small runs, which merge repeatedly.
+- **The remainder** is the view's scans (my estimate: ~1.8 s CPU): a key-equality check per
+  entry for `SumWeights`, and hash scans for `WeightOf`.
+
+**Levers, not yet tried:**
+
+1. Freeze aggregate traces less eagerly (a larger threshold, or only at checkpoint or on longer
+   idleness), trading memory held in managed form during a batch for less encoding and merging.
+2. A tiered merge policy with a larger fan-in (fewer rewrites).
+3. A per-block "no hash collisions" flag, so a probed range needs one key comparison, not one
+   per entry.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
