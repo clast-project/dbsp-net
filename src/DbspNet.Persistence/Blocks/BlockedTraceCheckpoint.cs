@@ -259,6 +259,10 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     public object? ValueCell(int i, int column) => Loaded.ValueCell(i, column);
 
+    public int ValueHash(int i) => Loaded.ValueHash(i);
+
+    public bool ValueEquals(int i, StructuralRow value) => Loaded.ValueEquals(i, value);
+
     // A probe on the step thread: synchronous by necessity. Two threads may both read it; the
     // blocks they build are identical, and either may win.
     private TraceBlock Load()

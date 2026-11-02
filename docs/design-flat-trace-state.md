@@ -460,6 +460,120 @@ scalar subquery, and the correlated scalar join.
 Drain went from +0.6% (§3.2) to +1.8%. Both runs are within each other's ranges, but the trend
 is the decoded group read; it is the thing to watch as more operators convert.
 
+### 3.4 Aggregate traces (2026-11-02, branch `arc/flat-trace-agg`, not merged)
+
+**Design.** `IncrementalAggregateOp` reaches its input trace through `IGroupTrace`; this is the
+outer joins' interface, renamed. The flag is now a list: `DBSPNET_TRACE_BLOCKS=join|agg|all`.
+
+- **Consolidated read:** the before-group is the decoded, consolidated group.
+- **Restore:** a blocked trace always restores lazily, so the per-group caches are rebuilt on
+  first touch.
+- **Frontier GC:** a blocked trace drops lazily and doesn't list the dropped keys, so the
+  operator prunes its caches by scanning them.
+
+**Measured** with three arms in one session (5 runs each, rotated order, view digests identical):
+
+| median | off | join | all (join + agg) |
+|---|---|---|---|
+| batch-1 drain | 15,871 ms | 16,466 ms (+3.7%) | 16,809 ms (**+5.9%**; +2.1% over join) |
+| batch-1 output write | 4,091 ms | 3,445 ms | 3,219 ms |
+| batch-1 first checkpoint | 5,527 ms | 3,498 ms | 3,287 ms |
+| batch-1 drain + write + checkpoint | 25.5 s | 23.4 s | 23.3 s |
+| restart: restore | 338 ms | 238 ms | 250 ms |
+| restart: first drain | 841 ms | 436 ms | 513 ms (+18% over join) |
+| census: aggregate trace references | — | 57.9M | 0.12M |
+| census: aggregate references (trace + caches) | — | 71.6M | 22.5M (−69%) |
+| census: whole heap, references / bytes | 592M / 10.8 GB | 374M / 10.79 GB | 333M / 10.57 GB |
+
+**The drain gate is missed.** The join-only arm measured +3.7% in this session, against +1.8%
+and +0.6% in earlier ones. Between-session variation is visible, but within this session
+aggregates add about 2% on top of joins.
+
+- **Likely cause:** the aggregate decodes each touched key's whole group on every tick it is
+  touched. Most aggregators (SUM, COUNT, AVG) only ask the after-group whether it is empty and
+  what weight it gives the delta's values.
+- **Next lever:** a lazy blocked group view (`IMultiset`) that answers `IsEmpty` and `WeightOf`
+  from encoded value equality, and decodes only when an aggregator walks the group (MIN/MAX
+  recompute).
+- **Restart:** the +18% first drain over join is the same decode, in the first-touch cache rebuild.
+
+**The remaining aggregate references are the caches** (`_aggCache`, `_stateCache`). They are
+charged the key rows the trace used to reach first, so they are now the structure to convert.
+
+### 3.5 The aggregate group view, and where the aggregate cost really is (2026-11-02)
+
+**Built.** `BlockedGroupView` gives an aggregate its before-group without decoding:
+
+- `WeightOf` matches by value hash, then compares the encoded value. Hashes are stored per
+  block: written at freeze, computed once for restored blocks.
+- `SumWeights` reads the stored weights.
+- `IsEmpty` stops at the first non-zero net.
+- Enumeration decodes the group once.
+
+It is exact, including where equal cells hash differently (NaN payloads). Property tests and
+mutations pass.
+
+**It did not move the drain** (three arms, 5 runs each):
+
+| median | off | join | all |
+|---|---|---|---|
+| batch-1 drain | 16,060 ms | 16,183 ms (+0.8%) | 16,595 ms (+3.3%; **+2.5% over join**) |
+| batch-1 output write / first checkpoint | 5,066 / 4,698 ms | 3,450 / 3,489 ms | 3,492 / 3,180 ms |
+| restart: first drain | 897 ms | 441 ms | 519 ms |
+| census: aggregate references | — | 71.6M | 22.6M |
+
+**Why: the §3.4 diagnosis was wrong.** SQL's SUM, COUNT, AVG and MIN/MAX are all incremental: they
+call `WeightOf` on the delta's rows and never walk the group, so decoding was not the cost. A
+per-operator profile (one run per arm) plus block counters shows aggregates at 9.4 → 14.7 s CPU
+and 1.75 → 5.17 GiB allocated.
+
+- **The cost is converting the aggregate traces into blocks:**
+  - +5.5M entries frozen;
+  - 2.26M entries rewritten by merges (+2.2 s CPU);
+  - +1.2 s of encoding;
+  - +1.1 GB of block bytes.
+- **Why there is so much merging:** an aggregate gets a small delta every tick, so idle-tick
+  freezes cut many small runs, which merge repeatedly.
+- **The remainder** is the view's scans (my estimate: ~1.8 s CPU): a key-equality check per
+  entry for `SumWeights`, and hash scans for `WeightOf`.
+
+**Levers, not yet tried:**
+
+1. Freeze aggregate traces less eagerly (a larger threshold, or only at checkpoint or on longer
+   idleness), trading memory held in managed form during a batch for less encoding and merging.
+2. A tiered merge policy with a larger fan-in (fewer rewrites).
+3. A per-block "no hash collisions" flag, so a probed range needs one key comparison, not one
+   per entry.
+
+### 3.6 Lever 1, freezing aggregates less eagerly: tried, no gain (2026-11-02)
+
+Separate aggregate settings were built behind env knobs: the freeze threshold, the managed-level
+cap, and an opt-out for the idle-tick freeze. All were reverted.
+
+**The threshold and level cap alone change nothing.** With the threshold at 64K, 1M or 10^9, the
+profile is identical: 1,019 freezes, 60 merges, 2,264,138 merged entries. The checkpoint freezes
+nothing, so the aggregate traces are frozen during the drain by idle ticks. A busy tick's delta
+exceeds 64K, so with idle freezing off but the default threshold, the counts barely move (954
+freezes, the same merges).
+
+**Idle freeze off and no effective threshold** (4M entries, 64 levels) makes the drain profile
+exactly the join arm's: 906 freezes, 48 merges, 47K merged entries. The aggregate freeze moves to
+the checkpoint as one freeze per trace with no merges: 4.36M entries, 13.5 s CPU summed over
+workers.
+
+**Wall clock** (SF=3, W=12, batch 1, 5 alternating runs per arm, outputs identical, medians):
+
+| median | join | all (current) | all + lazy aggregate freeze |
+|---|---|---|---|
+| drain | 16,338 ms | 16,475 ms (+0.8%) | 16,544 ms (+1.3%) |
+| checkpoint | 3,511 ms | 3,129 ms | 3,721 ms |
+| GC pause | 6,793 ms | 6,305 ms | 6,949 ms |
+
+Spreads per arm are about 600–900 ms. The lazy freeze is no better on the drain and worse on the
+checkpoint, so it was dropped. In this round `all` cost only +0.8% over `join`, against +2.5% in
+§3.5. The aggregate drain cost is within run-to-run noise at five runs, and the 5.3 s of extra
+aggregate CPU (≈0.4 s per worker) is at most a few percent of wall clock.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).

@@ -301,6 +301,8 @@ public class LazyRestoreTests
     [Fact]
     public async Task ARestoredAggregate_RebuildsOnlyTouchedGroups_AndKeepsTheRestsPersistedState()
     {
+        // The managed trace's cold restore (block-held traces restore their own way).
+        using var managed = DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false);
         using var layout = StateLayout.Use(true);
         var fs = new InMemoryTableFileSystem();
         var producer = SqlProgram.Compile(AggSql, AggViews, ArrowSqlSnapshotCodecs.Instance);

@@ -157,7 +157,14 @@ internal static class BlockWriter
             dataAt[c] = dataAt[c] < 0 ? -1 : dataAt[c] + bodyStart;
         }
 
-        return new TraceBlock(schema, message, n, validity, valueAt, dataAt);
+        // Value hashes for group lookups (§3.5): free here, each row caches its hash.
+        var valueHashes = new int[n];
+        for (var i = 0; i < n; i++)
+        {
+            valueHashes[i] = values[i].GetHashCode();
+        }
+
+        return new TraceBlock(schema, message, n, validity, valueAt, dataAt, valueHashes);
     }
 
     /// <summary>
@@ -327,7 +334,19 @@ internal static class BlockWriter
             dataAt[c] = dataAt[c] < 0 ? -1 : dataAt[c] + bodyStart;
         }
 
-        return new TraceBlock(schema, message, n, validity, valueAt, dataAt);
+        int[]? valueHashes = null;
+        if (parts.All(p => p.KnownValueHashes is not null))
+        {
+            valueHashes = new int[n];
+            var at = 0;
+            foreach (var part in parts)
+            {
+                part.KnownValueHashes!.AsSpan(0, part.Count).CopyTo(valueHashes.AsSpan(at));
+                at += part.Count;
+            }
+        }
+
+        return new TraceBlock(schema, message, n, validity, valueAt, dataAt, valueHashes);
 
         // A string column's int32 offset i (i = Count: its heap length).
         static int Offset(TraceBlock part, int column, int i) =>

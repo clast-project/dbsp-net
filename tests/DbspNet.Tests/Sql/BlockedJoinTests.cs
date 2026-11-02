@@ -57,10 +57,12 @@ public class BlockedJoinTests
             .Sample((sql, ticks, freeze, block, emitted) => CheckOne(sql, ticks, freeze, block, emitted), iter: 1500, threads: 1);
         Assert.True(_engaged >= 100, $"only {_engaged} of 1500 random queries compiled a blocked join");
         Assert.True(_engagedOuter >= 50, $"only {_engagedOuter} of 1500 random queries compiled a blocked outer join");
+        Assert.True(_engagedAggregate >= 100, $"only {_engagedAggregate} of 1500 random queries compiled a blocked aggregate");
     }
 
     private static int _engaged;
     private static int _engagedOuter;
+    private static int _engagedAggregate;
 
     private static bool CheckOne(string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks, int freeze, int block, bool emitted)
     {
@@ -77,6 +79,7 @@ public class BlockedJoinTests
             var compiled = Structural(PlanOptimizer.Optimize(plan), emitted);
             _engaged += Blocked(compiled) > 0 ? 1 : 0;
             _engagedOuter += BlockedOuter(compiled) > 0 ? 1 : 0;
+            _engagedAggregate += compiled.Circuit.Operators.OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>().Any(o => o.IsBlocked) ? 1 : 0;
             accumulated = IncrementalOracle.RunAndAccumulate(
                 compiled,
                 [.. ticks.Select(t => (IReadOnlyList<InputEvent>)[.. t.Where(e => compiled.Inputs.ContainsKey(e.Table))])]);

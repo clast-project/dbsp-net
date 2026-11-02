@@ -320,6 +320,54 @@ internal sealed class BlockedIndexedTrace
         }
     }
 
+    /// <summary>The key's group as a view that decodes nothing until asked to enumerate
+    /// (<see cref="BlockedGroupView"/>): its managed groups and its entry ranges per run.</summary>
+    public BlockedGroupView GroupView(StructuralRow key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        var projected = _monotoneKey is { } mk ? mk(key) : long.MaxValue;
+        var managed = new List<ZSet<StructuralRow, Z64>>();
+        foreach (var level in _managed)
+        {
+            if (projected >= level.Floor && level.Set.GroupFor(key) is { IsEmpty: false } group)
+            {
+                managed.Add(group);
+            }
+        }
+
+        var ranges = new List<(ITraceBlock, int, int)>();
+        if (_runs.Count > 0)
+        {
+            var hash = (uint)_hash(key);
+            foreach (var run in _runs)
+            {
+                if (projected < run.Floor || run.Find(hash) is var b && b < 0)
+                {
+                    continue;
+                }
+
+                for (; b < run.Blocks.Length && run.FirstOf(b) <= hash; b++)
+                {
+                    var block = run.Blocks[b];
+                    var hashes = block.Hashes;
+                    var from = block.LowerBound(hash);
+                    var to = from;
+                    while (to < hashes.Length && hashes[to] == hash)
+                    {
+                        to++;
+                    }
+
+                    if (to > from)
+                    {
+                        ranges.Add((block, from, to));
+                    }
+                }
+            }
+        }
+
+        return new BlockedGroupView(key, managed, ranges);
+    }
+
     /// <summary>Drop every key whose <paramref name="monotoneKey"/> projection is below
     /// <paramref name="threshold"/> — recorded as level floors, applied on probe and at
     /// freeze/merge (see the remarks).</summary>

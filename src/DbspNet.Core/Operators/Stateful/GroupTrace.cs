@@ -7,12 +7,13 @@ using DbspNet.Core.Collections;
 namespace DbspNet.Core.Operators.Stateful;
 
 /// <summary>
-/// What an outer join needs from each side's trace: a key's <b>consolidated</b> group (match
-/// presence decides between joined and NULL-padded output, so cancelled entries must cancel),
-/// integration, frontier GC, and its snapshot. Managed by default; held as blocks under
-/// <c>DBSPNET_TRACE_BLOCKS=join</c> (docs/design-flat-trace-state.md §3.3).
+/// A keyed trace read a group at a time: what an outer join needs from each side and an aggregate
+/// from its input — a key's <b>consolidated</b> group (match presence and aggregate values depend on
+/// net weights, so cancelled entries must cancel), integration, frontier GC, and its snapshot.
+/// Managed by default; held as blocks under <c>DBSPNET_TRACE_BLOCKS</c>
+/// (docs/design-flat-trace-state.md §3.3–§3.4).
 /// </summary>
-internal interface IJoinTrace<TKey, TValue, TWeight>
+internal interface IGroupTrace<TKey, TValue, TWeight>
     where TKey : notnull
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
@@ -20,11 +21,20 @@ internal interface IJoinTrace<TKey, TValue, TWeight>
     /// <summary>The key's entries with their net weights (zeros dropped).</summary>
     ZSet<TValue, TWeight> GroupFor(TKey key);
 
+    /// <summary>The same group as a read-only view, which a blocked trace answers without decoding
+    /// (lookups, sums, emptiness); a managed trace returns <see cref="GroupFor"/>.</summary>
+    IMultiset<TValue, TWeight> GroupView(TKey key);
+
     void Integrate(IndexedZSet<TKey, TValue, TWeight> delta);
 
-    /// <summary>Drop keys below the frontier; returns how many were dropped now (a blocked trace
-    /// drops lazily and counts when the entries go).</summary>
-    int DropKeysBelow(long threshold, Func<TKey, long> monotoneKey);
+    /// <summary>Drop keys below the frontier. Returns the keys dropped, or <see langword="null"/>
+    /// when the trace drops lazily and cannot list them (a caller with per-key caches then scans
+    /// those itself).</summary>
+    IReadOnlyList<TKey>? DropKeysBelow(long threshold, Func<TKey, long> monotoneKey);
+
+    /// <summary>Whether the state came back lazily from a snapshot, so per-key caches should be
+    /// rebuilt on first touch rather than by scanning the whole trace.</summary>
+    bool IsLazy { get; }
 
     int GroupCount { get; }
 
@@ -36,8 +46,8 @@ internal interface IJoinTrace<TKey, TValue, TWeight>
     ValueTask LoadAsync(IIndexedZSetTraceCodec<TKey, TValue, TWeight> codec, ISnapshotReader reader, string file, CancellationToken cancellationToken);
 }
 
-/// <summary>The managed <see cref="IJoinTrace{TKey,TValue,TWeight}"/>: an <see cref="IndexedZSetTrace{TKey,TValue,TWeight}"/>.</summary>
-internal sealed class ManagedJoinTrace<TKey, TValue, TWeight> : IJoinTrace<TKey, TValue, TWeight>
+/// <summary>The managed <see cref="IGroupTrace{TKey,TValue,TWeight}"/>: an <see cref="IndexedZSetTrace{TKey,TValue,TWeight}"/>.</summary>
+internal sealed class ManagedGroupTrace<TKey, TValue, TWeight> : IGroupTrace<TKey, TValue, TWeight>
     where TKey : notnull
     where TValue : notnull
     where TWeight : struct, IZRing<TWeight>
@@ -49,9 +59,13 @@ internal sealed class ManagedJoinTrace<TKey, TValue, TWeight> : IJoinTrace<TKey,
 
     public ZSet<TValue, TWeight> GroupFor(TKey key) => _trace.Current.GroupFor(key);
 
+    public IMultiset<TValue, TWeight> GroupView(TKey key) => _trace.Current.GroupFor(key);
+
     public void Integrate(IndexedZSet<TKey, TValue, TWeight> delta) => _trace.Integrate(delta);
 
-    public int DropKeysBelow(long threshold, Func<TKey, long> monotoneKey) => _trace.DropKeysBelow(threshold, monotoneKey).Count;
+    public IReadOnlyList<TKey>? DropKeysBelow(long threshold, Func<TKey, long> monotoneKey) => _trace.DropKeysBelow(threshold, monotoneKey);
+
+    public bool IsLazy => _trace.Current.IsCold;
 
     public int GroupCount => _trace.Current.GroupCount;
 

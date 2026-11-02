@@ -7,14 +7,14 @@ using DbspNet.Core.Collections;
 namespace DbspNet.Core.Operators.Stateful.Blocks;
 
 /// <summary>
-/// An outer join's side held as a <see cref="BlockedIndexedTrace"/> (docs/design-flat-trace-state.md
-/// §3.3). <see cref="GroupFor"/> reads the key from every level and sums its entries by value, so
+/// An outer join's side, or an aggregate's input, held as a <see cref="BlockedIndexedTrace"/>
+/// (docs/design-flat-trace-state.md §3.3–§3.4). <see cref="GroupFor"/> reads the key from every level and sums its entries by value, so
 /// the group is consolidated — what an outer join's match-presence test needs; the entries it
 /// returns are decoded rows, which the join's combine takes as they are.
 /// </summary>
-internal sealed class BlockedJoinTrace : IJoinTrace<StructuralRow, StructuralRow, Z64>
+internal sealed class BlockedGroupTrace : IGroupTrace<StructuralRow, StructuralRow, Z64>
 {
-    public BlockedJoinTrace(ITraceBlockFormat format) =>
+    public BlockedGroupTrace(ITraceBlockFormat format) =>
         Trace = new BlockedIndexedTrace(format, TraceBlocksMode.FreezeEntries, blockEntries: TraceBlocksMode.BlockEntries);
 
     internal BlockedIndexedTrace Trace { get; }
@@ -26,13 +26,18 @@ internal sealed class BlockedJoinTrace : IJoinTrace<StructuralRow, StructuralRow
         return visitor.Builder?.Build() ?? ZSet<StructuralRow, Z64>.Empty;
     }
 
+    public IMultiset<StructuralRow, Z64> GroupView(StructuralRow key) => Trace.GroupView(key);
+
     public void Integrate(IndexedZSet<StructuralRow, StructuralRow, Z64> delta) => Trace.Integrate(delta);
 
-    public int DropKeysBelow(long threshold, Func<StructuralRow, long> monotoneKey)
+    public IReadOnlyList<StructuralRow>? DropKeysBelow(long threshold, Func<StructuralRow, long> monotoneKey)
     {
         Trace.DropKeysBelow(threshold, monotoneKey);
-        return 0;
+        return null;
     }
+
+    /// <summary>Always: a blocked trace never decodes its whole state to rebuild caches.</summary>
+    public bool IsLazy => true;
 
     public int GroupCount => Trace.GroupCount;
 

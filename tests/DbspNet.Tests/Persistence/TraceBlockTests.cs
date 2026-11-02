@@ -210,6 +210,21 @@ public class TraceBlockTests
                     Assert.Equal(oracle[i].Value[c], b.ValueCell(i, c));
                 }
 
+                // Value hash and encoded value equality: with equal hashes, ValueEquals is row equality.
+                Assert.Equal(oracle[i].Value.GetHashCode(), b.ValueHash(i));
+                for (var m = 0; m < 4; m++)
+                {
+                    var cells = vs[i].ToArray();
+                    var at = rnd.Next(cells.Length);
+                    cells[at] = Mutate(cells[at], rnd);
+                    foreach (var probe in new[] { vs[i], new StructuralRow(cells), vs[rnd.Next(vs.Count)] })
+                    {
+                        Check(
+                            probe.Equals(oracle[i].Value) == (probe.GetHashCode() == b.ValueHash(i) && b.ValueEquals(i, probe)),
+                            () => $"ValueEquals({i}, {probe}) disagrees with the decoded value {oracle[i].Value}");
+                    }
+                }
+
                 var into = new object?[valueKinds.Length + 2];
                 b.ValueCellsInto(i, into, 2);
                 Assert.True(CellwiseEquals(new StructuralRow(into[2..]), oracle[i].Value));

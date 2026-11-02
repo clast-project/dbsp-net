@@ -741,8 +741,26 @@ public static class StatefulOperators
         return output;
     }
 
+    /// <summary>The structural incremental aggregate with its input trace held as blocks
+    /// (<see cref="Blocks.BlockedGroupTrace"/>, docs/design-flat-trace-state.md §3.4).</summary>
+    internal static Stream<ZSet<(StructuralRow Key, StructuralRow Value), Z64>> BlockedAggregate(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> input,
+        IAggregator<StructuralRow, StructuralRow> aggregator,
+        Blocks.ITraceBlockFormat format,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<(StructuralRow, StructuralRow), Z64>>(ZSet<(StructuralRow, StructuralRow), Z64>.Empty);
+        builder.AddRawOperator(new IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>(
+            input, output, aggregator, snapshotCodec, frontier, monotoneKey, new Blocks.BlockedGroupTrace(format)));
+        return output;
+    }
+
     /// <summary>The structural LEFT OUTER join with both sides' traces held as blocks
-    /// (<see cref="Blocks.BlockedJoinTrace"/>, docs/design-flat-trace-state.md §3.3).</summary>
+    /// (<see cref="Blocks.BlockedGroupTrace"/>, docs/design-flat-trace-state.md §3.3).</summary>
     internal static Stream<ZSet<StructuralRow, Z64>> BlockedLeftJoin(
         this CircuitBuilder builder,
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
@@ -761,7 +779,7 @@ public static class StatefulOperators
         builder.AddRawOperator(
             new IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
                 left, right, output, joinCombine, nullPadCombine, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey,
-                new Blocks.BlockedJoinTrace(leftFormat), new Blocks.BlockedJoinTrace(rightFormat)));
+                new Blocks.BlockedGroupTrace(leftFormat), new Blocks.BlockedGroupTrace(rightFormat)));
         return output;
     }
 
@@ -785,7 +803,7 @@ public static class StatefulOperators
         builder.AddRawOperator(
             new IncrementalFullJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
                 left, right, output, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftSnapshotCodec, rightSnapshotCodec,
-                frontier, monotoneKey, new Blocks.BlockedJoinTrace(leftFormat), new Blocks.BlockedJoinTrace(rightFormat)));
+                frontier, monotoneKey, new Blocks.BlockedGroupTrace(leftFormat), new Blocks.BlockedGroupTrace(rightFormat)));
         return output;
     }
 
