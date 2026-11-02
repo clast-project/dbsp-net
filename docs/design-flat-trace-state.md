@@ -298,6 +298,46 @@ These costs are why §3 gates step time before anything widens.
 | restart | fresh restart (`resume.sh`): restore, first drain, output write | restore ≤ main; first drain ≤ main; drain GC pauses down; output write unchanged |
 | checkpoint | batch-2/3 checkpoint ms, MiB written | no worse than main |
 
+### 3.0 De-risk first: the row boundary, measured (2026-11-01)
+
+Before building the trace, a microbenchmark priced §2.4's main risk (`FLAT_PROBE_BENCH=1`,
+`tests/.../Scratch/FlatTraceProbeBench.cs`). It runs one join probe pass, delta ⋈ trace, through
+the structural `MergeRows` combine and a `ZSetBuilder`, over the same trace held two ways. The
+trace has 400k BIGINT keys, 1.6M entries, and 8 value columns (BIGINT, INT, 3 VARCHAR, DOUBLE,
+DATE, DECIMAL). The block arms use v3 blocks encoded by the production codec, held in managed
+`byte[]`s: 1,561 blocks, 170 MB. All three join arms produce identical Z-sets. Setup: 5 processes,
+7 alternating rounds each, `DOTNET_gcServer=1`. The ns figures are the median of the per-process
+medians.
+
+| arm | small delta (2k keys) ns / B per output row | large delta (200k keys) ns / B |
+|---|---|---|
+| A: today (`IndexedZSet`, shared rows) | 233 / 204 | 237 / 199 |
+| B: blocks, value rebuilt as a `StructuralRow`, then combined | 346 (+48%) / 545 | 333 (+41%) / 474 |
+| B2: blocks, cells boxed straight into the output row | 302 (+30%) / 426 | 297 (+25%) / 421 |
+| probe only, hash map (no rows built) | 60 / 0 | 48 / 0 |
+| probe only, blocks (block index → `__hash` → key column) | 55 / 0 | 45 / 0 |
+
+What this decides:
+
+- **Lookup is not the risk.** Two binary searches over hash-ordered blocks match the hash map, and
+  are slightly faster.
+- **The cost is the boxes.** B2 adds about 220 B (five 24 B boxes and three 32 B `Utf8String`
+  boxes) and about 65 ns per output row. B also pays a whole-row hash for the intermediate value
+  row: `StructuralRow`'s constructor hashes eagerly.
+- **B2 becomes the first cut,** not a later lever. The structural inner join's combine is a pure
+  concatenation (`MergeRows`; pruning happens on the inputs), so the blocked join writes output
+  rows itself.
+- **Scale in batch 1.** A per-operator profile (`DBSPNET_PROFILE=1`, one run, W=12) shows inner
+  joins at 21.1 s of about 112 s non-exchange operator CPU, allocating 8.9 GiB. That is about 45M
+  output rows at today's ~200 B each. At +65 ns each this is about +2.9 s CPU, about +0.25 s wall
+  across 12 workers, or +1.7% of the 14.8 s step, before any GC saving. Batch 1's GC pause in the
+  same run was 6.1 s.
+- **One case is worse: residual joins.** A pushed-down residual (`broker_performance`'s
+  `IncrementalInnerJoin`: 5.1 s CPU, only 53 MiB allocated) evaluates the residual on every
+  candidate pair. Under B2 each candidate would be boxed before the residual rejects it. Either
+  evaluate the residual on cells read from the block, or leave residual joins on the managed
+  trace in the first cut.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
