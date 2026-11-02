@@ -1595,8 +1595,14 @@ public static partial class PlanToCircuit
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec,
         IFrontier? frontier = null,
         Func<StructuralRow, long>? monotoneKey = null,
-        ReshardPlacement? reshard = null)
+        ReshardPlacement? reshard = null,
+        (Schema Key, Schema Value)? shape = null)
     {
+        // DBSPNET_TRACE_BLOCKS=agg: the input trace as blocks (docs/design-flat-trace-state.md §3.4).
+        var format = TraceBlocksMode.Aggregate && ctx.Options.TraceFamily != TraceFamily.Spine && shape is ({ } key, { } value)
+            ? TraceBlockFormats.Create(key, value)
+            : null;
+
         // The keyed state blobs (aggstate.arrows) are keyed by the group key, like the trace.
         var blobs = snapshotCodec is { SupportsKeyedBlobs: true } && reshard is not null
             ? new KeyedBlobsReshardFile("aggstate.arrows", reshard, snapshotCodec)
@@ -1611,7 +1617,9 @@ public static partial class PlanToCircuit
                     valueComparer: StructuralRowComparer.Instance,
                     frontier: frontier,
                     monotoneKey: monotoneKey)
-                : builder.IncrementalAggregate(input, aggregator, snapshotCodec, frontier, monotoneKey),
+                : format is not null
+                    ? builder.BlockedAggregate(input, aggregator, format, snapshotCodec, frontier, monotoneKey)
+                    : builder.IncrementalAggregate(input, aggregator, snapshotCodec, frontier, monotoneKey),
             IZ("trace.arrows", reshard, snapshotCodec),
             blobs);
     }
@@ -4773,7 +4781,8 @@ public static partial class PlanToCircuit
             builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey,
             reshard: ctx.Workers <= 1 ? null
                 : needsExchange ? ReshardPlacement.WholeRow(groupKeySchema)
-                : ElidedAggregatePlacement(ctx.GetPartition(input), bareGroupIndices!));
+                : ElidedAggregatePlacement(ctx.GetPartition(input), bareGroupIndices!),
+            shape: (groupKeySchema, plan.Input.Schema));
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;

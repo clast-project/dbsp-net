@@ -43,7 +43,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         DeltaPoolMode.Enabled ? new ZSetBuilder<(TKey, TOut), Z64>() : null;
 
     private readonly IAggregator<TValue, TOut> _aggregator;
-    private readonly IndexedZSetTrace<TKey, TValue, Z64> _trace = new();
+    private readonly IGroupTrace<TKey, TValue, Z64> _trace;
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
 
@@ -65,8 +65,10 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         IAggregator<TValue, TOut> aggregator,
         IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
         IFrontier? frontier = null,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null,
+        IGroupTrace<TKey, TValue, Z64>? trace = null)
     {
+        _trace = trace ?? new ManagedGroupTrace<TKey, TValue, Z64>();
         _input = input;
         _output = output;
         _aggregator = aggregator;
@@ -79,7 +81,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     /// Number of group keys currently retained in the trace. Exposed for tests
     /// that assert frontier-driven GC keeps state bounded.
     /// </summary>
-    internal int RetainedGroupCount => _trace.Current.GroupCount;
+    internal int RetainedGroupCount => _trace.GroupCount;
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -101,10 +103,10 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     private async ValueTask SaveTraceAndStateAsync(
         ISnapshotWriter writer, CancellationToken cancellationToken)
     {
-        await _snapshotCodec!.SaveAsync(writer, "trace.arrows", _trace.Current, cancellationToken)
+        await _trace.SaveAsync(_snapshotCodec!, writer, "trace.arrows", cancellationToken)
             .ConfigureAwait(false);
 
-        if (!_aggregator.CanPersistState || !_snapshotCodec.SupportsKeyedBlobs)
+        if (!_aggregator.CanPersistState || !_snapshotCodec!.SupportsKeyedBlobs)
         {
             return;
         }
@@ -139,12 +141,11 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
                 "IncrementalAggregateOp was constructed without a snapshot codec.");
         }
 
-        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
-        var tIntegrate = System.Diagnostics.Stopwatch.GetTimestamp();
-        _trace.Integrate(loaded);
+        await _trace.LoadAsync(_snapshotCodec, reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         var tRebuild = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        if (_trace.Current.IsCold)
+        // Lazily restored (a cold managed trace, or any blocked one): caches are rebuilt per group.
+        if (_trace.IsLazy)
         {
             // Lazily restored: rebuild per group on first touch (EnsureCaches), keeping the
             // persisted states until then.
@@ -176,7 +177,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         // AVG fold weights into running totals; MIN/MAX walk transitions
         // out of beforeW=0 into the active set). One pass of size
         // |trace|; amortised across subsequent ticks.
-        foreach (var (key, group) in _trace.Current)
+        foreach (var (key, group) in Managed.Current)
         {
             object? state = null;
             var agg = _aggregator.Update(ref state, Optional<TOut>.None, group, group);
@@ -186,7 +187,6 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         if (SnapshotRestoreProfile.Enabled)
         {
-            SnapshotRestoreProfile.AddIntegrate(SnapshotRestoreProfile.Ms(tIntegrate, tRebuild));
             SnapshotRestoreProfile.AddRebuild(SnapshotRestoreProfile.MsSince(tRebuild));
         }
 
@@ -223,12 +223,12 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         foreach (var (key, blob) in blobs)
         {
-            if (!_trace.Current.ContainsKey(key))
+            if (!Managed.Current.ContainsKey(key))
             {
                 continue;   // a group the trace no longer holds; its state is moot
             }
 
-            var group = _trace.Current.GroupFor(key);
+            var group = Managed.Current.GroupFor(key);
             _stateCache.TryGetValue(key, out var state);
             _aggregator.MergePersistedState(ref state, blob);
             _stateCache[key] = state;
@@ -236,6 +236,12 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             _stateCache[key] = state;
         }
     }
+
+    // The eager restore path only runs over a managed trace (a blocked one is always lazy).
+    private ManagedGroupTrace<TKey, TValue, Z64> Managed => (ManagedGroupTrace<TKey, TValue, Z64>)_trace;
+
+    /// <summary>Whether the trace is held as blocks (DBSPNET_TRACE_BLOCKS).</summary>
+    internal bool IsBlocked => _trace is Blocks.BlockedGroupTrace;
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
 
@@ -246,13 +252,15 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         {
             // No input deltas to process, but the frontier may still
             // have advanced — drop sub-frontier state before returning.
-            // Mirrors DistinctOp's empty-path CollectGarbage.
+            // Mirrors DistinctOp's empty-path CollectGarbage. An idle tick
+            // is also when a blocked trace freezes.
+            _trace.Idle();
             _output.SetCurrent(ZSet<(TKey, TOut), Z64>.Empty);
             CollectGarbage();
             return;
         }
 
-        var before = _trace.Current;
+        var before = _trace;
 
         ZSetBuilder<(TKey, TOut), Z64> builder;
         if (_pooledBuilder is not null)
@@ -415,7 +423,18 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         }
 
         _lastGcFrontier = frontier;
-        foreach (var key in _trace.DropKeysBelow(frontier, _monotoneKey))
+        var dropped = _trace.DropKeysBelow(frontier, _monotoneKey);
+        if (dropped is null)
+        {
+            // A blocked trace drops lazily and does not list the keys: the caches below the
+            // frontier are exactly the groups it held there (a cache is pruned when its group
+            // empties), plus restored states not yet applied.
+            var monotone = _monotoneKey;
+            dropped = [.. _stateCache.Keys.Concat(_aggCache.Keys).Concat(_pendingBlobs?.Keys ?? Enumerable.Empty<TKey>())
+                .Distinct().Where(k => monotone(k) < frontier)];
+        }
+
+        foreach (var key in dropped)
         {
             _aggCache.Remove(key);
             _stateCache.Remove(key);
@@ -426,7 +445,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
     public string MetricName => "IncrementalAggregate";
 
-    public long RetainedRows => _trace.Current.GroupCount;
+    public long RetainedRows => _trace.GroupCount;
 
     public long LastOutputRows => _output.Current.Count;
 

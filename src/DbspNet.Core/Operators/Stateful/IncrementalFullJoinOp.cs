@@ -62,8 +62,8 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private readonly Func<TKey, TLeft, TRight, TOut> _joinCombine;
     private readonly Func<TKey, TLeft, TOut> _nullPadRightCombine;
     private readonly Func<TKey, TRight, TOut> _nullPadLeftCombine;
-    private readonly IJoinTrace<TKey, TLeft, TWeight> _leftTrace;
-    private readonly IJoinTrace<TKey, TRight, TWeight> _rightTrace;
+    private readonly IGroupTrace<TKey, TLeft, TWeight> _leftTrace;
+    private readonly IGroupTrace<TKey, TRight, TWeight> _rightTrace;
     private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
     private readonly IIndexedZSetTraceCodec<TKey, TRight, TWeight>? _rightSnapshotCodec;
     private readonly IFrontier? _frontier;
@@ -86,11 +86,11 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
         IFrontier? frontier = null,
         Func<TKey, long>? monotoneKey = null,
-        IJoinTrace<TKey, TLeft, TWeight>? leftTrace = null,
-        IJoinTrace<TKey, TRight, TWeight>? rightTrace = null)
+        IGroupTrace<TKey, TLeft, TWeight>? leftTrace = null,
+        IGroupTrace<TKey, TRight, TWeight>? rightTrace = null)
     {
-        _leftTrace = leftTrace ?? new ManagedJoinTrace<TKey, TLeft, TWeight>();
-        _rightTrace = rightTrace ?? new ManagedJoinTrace<TKey, TRight, TWeight>();
+        _leftTrace = leftTrace ?? new ManagedGroupTrace<TKey, TLeft, TWeight>();
+        _rightTrace = rightTrace ?? new ManagedGroupTrace<TKey, TRight, TWeight>();
         _leftIn = leftIn;
         _rightIn = rightIn;
         _output = output;
@@ -104,7 +104,7 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     }
 
     /// <summary>Whether both traces are held as blocks (DBSPNET_TRACE_BLOCKS=join).</summary>
-    internal bool IsBlocked => _leftTrace is Blocks.BlockedJoinTrace && _rightTrace is Blocks.BlockedJoinTrace;
+    internal bool IsBlocked => _leftTrace is Blocks.BlockedGroupTrace && _rightTrace is Blocks.BlockedGroupTrace;
 
     /// <summary>Total keys retained across both traces. Exposed for GC-bound tests.</summary>
     internal int RetainedKeyCount => _leftTrace.GroupCount + _rightTrace.GroupCount;
@@ -248,8 +248,8 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         }
 
         _lastGcFrontier = frontier;
-        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey);
-        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey)?.Count ?? 0;
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey)?.Count ?? 0;
     }
 
     public string MetricName => "IncrementalFullJoin";
