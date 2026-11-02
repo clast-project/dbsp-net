@@ -400,6 +400,12 @@ public class IvmMultiBatch
                         }
                     });
                 }
+                if (stateCensus && batch == firstBatch)
+                {
+                    // After the checkpoint: a blocked trace (DBSPNET_TRACE_BLOCKS) has frozen every level.
+                    StateCensusAt("ckpt", null);
+                }
+
                 var pointer = Path.Combine(snapshotDir!, "current.txt");
                 if (File.Exists(pointer))
                 {

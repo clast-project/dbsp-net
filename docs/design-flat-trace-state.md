@@ -338,6 +338,64 @@ What this decides:
   evaluate the residual on cells read from the block, or leave residual joins on the managed
   trace in the first cut.
 
+### 3.1 First cut built and measured (2026-11-02)
+
+**What was built** (commits 9b2b809..eb783e9 on `arc/flat-trace-state`):
+
+- **Block reader:** `TraceBlock`, with encoded-key equality held against the run decoder.
+- **Trace:** `BlockedIndexedTrace`, with managed levels, runs, geometric merge and GC floors.
+- **Operator:** `BlockedJoinOp`, which builds output rows straight from block cells, and its
+  compiler wiring.
+- **Encoder:** `BlockWriter`, a hand-written Arrow IPC block encoder.
+- **Checkpoint and restore:** blocked checkpoints as v3 run chains written from blocks; restore
+  adopts blocks lazily; snapshots are interchangeable both ways with the managed join
+  (`IFingerprintIdentity`).
+
+Freeze and merge are **synchronous** and there is no background merger. The full suite passes
+three ways with the flag on.
+
+**What the first measurement taught:**
+
+- **Freezing was allocation-bound.** Through Arrow's builders it cost ~6.8 µs per entry in place,
+  against 0.4 µs alone.
+  - A 12-thread microbenchmark and section timers traced it to the large-object heap.
+  - ivm-bench's giant groups made one-hash blocks huge: 1.27 GB in 7,785 blocks, most over 85 KB.
+  - Fix: a hand-written encoder (one exact `byte[]` per block); blocks cut at ~60 KB; a giant
+    group's hash may span blocks in memory.
+  - On disk the v3 invariant still holds: such a span is re-encoded as one block when written.
+- **Re-shard works unchanged.** The existing rewrite reads blocked chains as v3 runs, so the first
+  cut does not need to refuse re-shard.
+
+**Gates** (ivm-bench SF=3 W=12, 5 alternating runs per arm, clean build, all view digests
+identical across arms):
+
+| measurement | managed | blocked | gate |
+|---|---|---|---|
+| batch-1 drain, median (range) | 15,945 ms (15,583–16,751) | 15,976 ms (15,886–16,239) | ≤ +3%: **met (+0.2%)** |
+| batch-1 drain GC pause, median | 5,118 ms | 5,081 ms | reported (unchanged) |
+| batch-1 output write, median | 4,437 ms | 4,219 ms | reported |
+| batch-1 checkpoint (first, whole) | 4.7–5.7 s | 8.4–15.5 s | **regressed** (see below) |
+| restart: restore, median | 360 ms | 244 ms | ≤ managed: **met** |
+| restart: first drain, median | 817 ms | 359 ms (−56%) | ≤ managed: **met** |
+| restart: drain GC pause, median | 168 ms | 37 ms | down: **met** |
+| restart: output write, median | 3,404 ms | 3,315 ms | unchanged: **met** |
+| batch-2 checkpoint, median / written | 292 ms / 51.2 MiB | 298 ms / 51.1 MiB | no worse: **met** |
+| census after the batch-1 checkpoint: inner-join references | 237.1M | 87.5M (−63%) | −90%: **met for converted joins, not overall** |
+
+Notes on the misses:
+
+- **Census.** The converted traces hold 180k objects and 270k references (1.55 GB, all
+  reference-free). The remaining 86.7M references are joins that stayed managed: the residual
+  joins the first cut leaves out (§3.0). Converting them is the next lever, by evaluating the
+  residual on block cells.
+- **First checkpoint.** It freezes the ~2/3 of join state still in managed levels at the end of
+  batch 1 (traces under the 64k freeze threshold per worker). It does this under the checkpoint's
+  `GCLatencyMode.Batch`, so the managed rows die in blocking gen2 GCs (gc_pause +3–10 s).
+  Later checkpoints write only new runs (batch 2: 298 ms). Remedies to try: freeze those levels
+  at the end of the drain or in idle time instead, or outside the Batch latency window.
+- **w1profile B/ev** was not measured. w1profile compiles single queries, which take the typed path
+  when they can, so the blocked join probably never engages there. That is unverified.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
