@@ -62,8 +62,9 @@ public class LatenessSnapshotTests : IDisposable
     private static int JoinRetained(CompiledQuery q) =>
         q.Circuit.Operators
             .OfType<IncrementalJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>()
-            .Single()
-            .RetainedKeyCount;
+            .Select(op => op.RetainedKeyCount)
+            .Concat(q.Circuit.Operators.OfType<DbspNet.Core.Operators.Stateful.Blocks.BlockedJoinOp>().Select(op => op.RetainedKeyCount))
+            .Single();
 
     private static int DistinctRetained(CompiledQuery q) =>
         q.Circuit.Operators
