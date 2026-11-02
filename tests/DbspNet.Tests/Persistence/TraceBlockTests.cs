@@ -169,13 +169,14 @@ public class TraceBlockTests
 
         var block = schema.Encode([.. ks], [.. vs], [.. ws], [.. hs], ks.Count);
         var adopted = schema.Adopt(block.Message.Span);
+        var viaArrow = schema.EncodeViaArrow([.. ks], [.. vs], [.. ws], [.. hs], ks.Count);
         var oracle = Oracle(schema, block);
         Assert.Equal(ks.Count, block.Count);
         Assert.Equal(ks.Count, oracle.Length);
         Assert.Equal((uint)hs[0], block.FirstHash);
         Assert.Equal((uint)hs[^1], block.LastHash);
 
-        foreach (var b in new[] { block, adopted })
+        foreach (var b in new[] { block, adopted, viaArrow })
         {
             for (var i = 0; i < b.Count; i++)
             {

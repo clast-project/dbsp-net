@@ -69,7 +69,8 @@ public class BlockedIndexedTraceTests
         var format = BlockSchema.TryCreate(KeySchema, ValueSchema)!;
         Func<StructuralRow, int>? hash = seed % 3 == 0 ? static k => k.GetHashCode() & 7 : null;
         var blocked = new BlockedIndexedTrace(
-            format, freezeEntries: rnd.Next(1, 60), maxManaged: rnd.Next(0, 4), blockEntries: rnd.Next(1, 9), hash: hash);
+            format, freezeEntries: rnd.Next(1, 60), maxManaged: rnd.Next(0, 4), blockEntries: rnd.Next(1, 9), hash: hash,
+            blockBytes: seed % 4 == 1 ? rnd.Next(40, 400) : BlockedIndexedTrace.BlockBytes);
         var oracle = new IndexedZSetTrace<StructuralRow, StructuralRow, Z64>();
         static long Monotone(StructuralRow key) => (long)key[0]!;
 

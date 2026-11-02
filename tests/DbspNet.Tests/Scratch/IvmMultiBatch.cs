@@ -260,6 +260,10 @@ public class IvmMultiBatch
                 drainMs = sw.Elapsed.TotalMilliseconds;
                 drainAllocGib = (GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (double)(1L << 30);
                 drainEndUtc = DateTime.UtcNow;
+                if (DbspNet.Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
+                {
+                    _out.WriteLine(DbspNet.Core.Operators.Stateful.Blocks.BlockTraceProfile.Report());
+                }
                 if (stateCensus && batch == firstBatch)
                 {
                     StateCensusAt("drain", censusBaseline);

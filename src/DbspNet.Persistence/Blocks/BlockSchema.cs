@@ -64,6 +64,7 @@ internal sealed class BlockSchema : ITraceBlockFormat
         }
 
         SchemaMessage = ms.ToArray();
+        SizeEntries();
     }
 
     /// <summary>The key columns' kinds, in order.</summary>
@@ -80,6 +81,44 @@ internal sealed class BlockSchema : ITraceBlockFormat
 
     /// <inheritdoc/>
     public int ValueColumns => ValueKinds.Length;
+
+    /// <inheritdoc/>
+    public int EntryBytes(StructuralRow key, StructuralRow value)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(value);
+        var bytes = _fixedBytes;
+        foreach (var c in _keyStrings)
+        {
+            bytes += key[c] is Utf8String s ? s.Span.Length : 0;
+        }
+
+        foreach (var c in _valueStrings)
+        {
+            bytes += value[c] is Utf8String s ? s.Span.Length : 0;
+        }
+
+        return bytes;
+    }
+
+    private int _fixedBytes;
+    private int[] _keyStrings = [];
+    private int[] _valueStrings = [];
+
+    private void SizeEntries()
+    {
+        static int Width(CellKind kind) => kind switch
+        {
+            CellKind.Bool => 1,
+            CellKind.Int32 or CellKind.Float32 or CellKind.Date32 or CellKind.Utf8 => 4,
+            CellKind.Decimal128 => 16,
+            _ => 8,
+        };
+
+        _fixedBytes = KeyKinds.Sum(Width) + ValueKinds.Sum(Width) + 8 + 4 + 1;
+        _keyStrings = [.. Enumerable.Range(0, KeyKinds.Length).Where(c => KeyKinds[c] == CellKind.Utf8)];
+        _valueStrings = [.. Enumerable.Range(0, ValueKinds.Length).Where(c => ValueKinds[c] == CellKind.Utf8)];
+    }
 
     ITraceBlock ITraceBlockFormat.Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count) =>
         Encode(keys, values, weights, hashes, count);
@@ -133,8 +172,13 @@ internal sealed class BlockSchema : ITraceBlockFormat
     }
 
     /// <summary>Encode entries <c>[0, count)</c> — already in ascending unsigned key-hash order, a
-    /// key's entries contiguous — as one block.</summary>
-    public TraceBlock Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count)
+    /// key's entries contiguous — as one block (<see cref="BlockWriter"/>).</summary>
+    public TraceBlock Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count) =>
+        BlockWriter.Write(this, keys, values, weights, hashes, count);
+
+    /// <summary>The same block through Arrow's builders and stream writer — the reference the
+    /// hand-written <see cref="BlockWriter"/> is tested against.</summary>
+    internal TraceBlock EncodeViaArrow(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count)
     {
         using var batch = Codec.EncodeBlock(keys, values, weights, hashes, count);
         using var ms = new MemoryStream();

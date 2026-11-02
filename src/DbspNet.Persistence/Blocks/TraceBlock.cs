@@ -35,7 +35,7 @@ internal sealed class TraceBlock : ITraceBlock
     private readonly int[] _values;
     private readonly int[] _data;
 
-    private TraceBlock(BlockSchema schema, byte[] bytes, int count, int[] validity, int[] values, int[] data)
+    internal TraceBlock(BlockSchema schema, byte[] bytes, int count, int[] validity, int[] values, int[] data)
     {
         Schema = schema;
         _bytes = bytes;

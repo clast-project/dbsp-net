@@ -6,7 +6,8 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 
 /// <summary>
 /// One immutable, reference-free block of an indexed trace (docs/design-flat-trace-state.md §2.2):
-/// entries in ascending unsigned key-hash order, a hash never split across blocks. Core reads it
+/// entries in ascending unsigned key-hash order (a giant group's hash can continue into the next
+/// block of its run). Core reads it
 /// through this interface; the encoding (the v3 run block) lives in DbspNet.Persistence, which
 /// knows Arrow and the SQL cell types.
 /// </summary>
@@ -51,6 +52,10 @@ internal interface ITraceBlockFormat
 {
     /// <summary>Columns in a value row.</summary>
     int ValueColumns { get; }
+
+    /// <summary>About how many bytes one entry adds to a block (fixed widths plus string bytes), so
+    /// blocks can be cut below the large-object-heap threshold.</summary>
+    int EntryBytes(StructuralRow key, StructuralRow value);
 
     /// <summary>Encode entries <c>[0, count)</c> — ascending unsigned <paramref name="hashes"/>,
     /// each the hash of its key — as one block.</summary>

@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Buffers;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 
@@ -62,14 +63,16 @@ internal sealed class BlockedIndexedTrace
 
         public long Floor { get; set; } = long.MinValue;
 
-        /// <summary>The block holding <paramref name="hash"/>, or −1.</summary>
+        /// <summary>The first block that can hold <paramref name="hash"/>, or −1. A giant group's
+        /// hash can span consecutive blocks; the caller continues while the next block's first hash
+        /// is still <paramref name="hash"/>.</summary>
         public int Find(uint hash)
         {
-            int lo = 0, hi = _first.Length;
+            int lo = 0, hi = _last.Length;
             while (lo < hi)
             {
                 var mid = (lo + hi) >>> 1;
-                if (_first[mid] <= hash)
+                if (_last[mid] < hash)
                 {
                     lo = mid + 1;
                 }
@@ -79,8 +82,11 @@ internal sealed class BlockedIndexedTrace
                 }
             }
 
-            return lo > 0 && _last[lo - 1] >= hash ? lo - 1 : -1;
+            return lo < _first.Length && _first[lo] <= hash ? lo : -1;
         }
+
+        /// <summary>The first hash of block <paramref name="b"/>.</summary>
+        public uint FirstOf(int b) => _first[b];
     }
 
     private readonly ITraceBlockFormat _format;
@@ -88,6 +94,7 @@ internal sealed class BlockedIndexedTrace
     private readonly int _freezeEntries;
     private readonly int _maxManaged;
     private readonly int _blockEntries;
+    private readonly int _blockBytes;
     private readonly List<Managed> _managed = new();
     private readonly List<Run> _runs = new();
     private long _managedEntries;
@@ -97,15 +104,20 @@ internal sealed class BlockedIndexedTrace
     /// <param name="format">The block encoding (key and value schema).</param>
     /// <param name="freezeEntries">Managed entries that trigger a freeze.</param>
     /// <param name="maxManaged">Managed levels allowed to wait before a freeze.</param>
-    /// <param name="blockEntries">Entries per block (a hash never splits, so a block can exceed it).</param>
+    /// <param name="blockEntries">Entries per block, cut where the hash changes (a block can exceed it
+    /// up to <paramref name="blockBytes"/>).</param>
     /// <param name="hash">The key hash (a test seam for forced collisions; default the row's own).</param>
+    /// <param name="blockBytes">Encoded bytes at which a block is cut even inside one hash
+    /// (default <see cref="BlockBytes"/>).</param>
     public BlockedIndexedTrace(
         ITraceBlockFormat format,
         int freezeEntries = 1 << 16,
         int maxManaged = 8,
         int blockEntries = 1024,
-        Func<StructuralRow, int>? hash = null)
+        Func<StructuralRow, int>? hash = null,
+        int blockBytes = BlockBytes)
     {
+        _blockBytes = blockBytes;
         ArgumentNullException.ThrowIfNull(format);
         ArgumentOutOfRangeException.ThrowIfLessThan(blockEntries, 1);
         _format = format;
@@ -156,9 +168,9 @@ internal sealed class BlockedIndexedTrace
         }
     }
 
-    /// <summary>Throws unless every run is consolidated (no repeated key and value, no zero weight),
-    /// in ascending hash order, with no hash split across blocks — the invariants freeze and merge
-    /// keep, which probes and <see cref="Materialize"/> cannot see.</summary>
+    /// <summary>Throws unless every run is consolidated (no repeated key and value, no zero weight)
+    /// and in ascending hash order across its blocks — the invariants freeze and merge keep, which
+    /// probes and <see cref="Materialize"/> cannot see.</summary>
     internal void CheckRuns()
     {
         foreach (var run in _runs)
@@ -168,9 +180,9 @@ internal sealed class BlockedIndexedTrace
             foreach (var block in run.Blocks)
             {
                 var hashes = block.Hashes;
-                if (previous is { } p && hashes.Length > 0 && hashes[0] <= p)
+                if (previous is { } p && hashes.Length > 0 && hashes[0] < p)
                 {
-                    throw new InvalidOperationException($"hash {hashes[0]} repeats or descends across blocks");
+                    throw new InvalidOperationException($"hash {hashes[0]} descends across blocks");
                 }
 
                 for (var i = 0; i < block.Count; i++)
@@ -198,6 +210,17 @@ internal sealed class BlockedIndexedTrace
 
     /// <summary>Visit every entry of <paramref name="key"/> in every level (unconsolidated).</summary>
     public void Probe<TVisitor>(StructuralRow key, ref TVisitor visitor)
+        where TVisitor : struct, ITraceVisitor
+    {
+        var t0 = BlockTraceProfile.Now();
+        ProbeCore(key, ref visitor);
+        if (BlockTraceProfile.Enabled)
+        {
+            BlockTraceProfile.Probe(t0);
+        }
+    }
+
+    private void ProbeCore<TVisitor>(StructuralRow key, ref TVisitor visitor)
         where TVisitor : struct, ITraceVisitor
     {
         var projected = _monotoneKey is { } mk ? mk(key) : long.MaxValue;
@@ -233,13 +256,16 @@ internal sealed class BlockedIndexedTrace
                 continue;
             }
 
-            var block = run.Blocks[b];
-            var hashes = block.Hashes;
-            for (var i = block.LowerBound(hash); i < hashes.Length && hashes[i] == hash; i++)
+            for (; b < run.Blocks.Length && run.FirstOf(b) <= hash; b++)
             {
-                if (block.KeyEquals(i, key))
+                var block = run.Blocks[b];
+                var hashes = block.Hashes;
+                for (var i = block.LowerBound(hash); i < hashes.Length && hashes[i] == hash; i++)
                 {
-                    visitor.Entry(block, i, new Z64(block.Weight(i)));
+                    if (block.KeyEquals(i, key))
+                    {
+                        visitor.Entry(block, i, new Z64(block.Weight(i)));
+                    }
                 }
             }
         }
@@ -317,50 +343,84 @@ internal sealed class BlockedIndexedTrace
             return;
         }
 
-        var builder = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-        var dropped = new HashSet<StructuralRow>();
-        foreach (var level in _managed)
-        {
-            foreach (var (key, group) in level.Set)
-            {
-                if (Dropped(key, level.Floor))
-                {
-                    dropped.Add(key);
-                    continue;
-                }
+        var t0 = BlockTraceProfile.Now();
 
-                foreach (var (value, weight) in group)
+        // One level with no floor is already consolidated: freeze it as it is. Otherwise sum the
+        // levels (dropping what their floors cover) first.
+        IndexedZSet<StructuralRow, StructuralRow, Z64> source;
+        if (_managed.Count == 1 && _managed[0].Floor == long.MinValue)
+        {
+            source = _managed[0].Set;
+        }
+        else
+        {
+            var builder = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            var dropped = new HashSet<StructuralRow>();
+            foreach (var level in _managed)
+            {
+                foreach (var (key, group) in level.Set)
                 {
-                    builder.Add(key, value, weight);
+                    if (Dropped(key, level.Floor))
+                    {
+                        dropped.Add(key);
+                        continue;
+                    }
+
+                    foreach (var (value, weight) in group)
+                    {
+                        builder.Add(key, value, weight);
+                    }
                 }
             }
+
+            DroppedKeys += dropped.Count;
+            source = builder.Build();
         }
 
-        DroppedKeys += dropped.Count;
-        var consolidated = builder.Build();
         _managed.Clear();
         _managedEntries = 0;
 
-        var entries = new List<(uint Hash, int ValueHash, StructuralRow Key, StructuralRow Value, long Weight)>();
-        foreach (var (key, group) in consolidated)
+        // Groups in key-hash order (pooled arrays: a large freeze would otherwise put two arrays
+        // on the large-object heap), each group's entries streamed into blocks.
+        var count = source.GroupCount;
+        var hashes = ArrayPool<uint>.Shared.Rent(count);
+        var groups = ArrayPool<KeyValuePair<StructuralRow, ZSet<StructuralRow, Z64>>>.Shared.Rent(count);
+        long entries = 0;
+        try
         {
-            var hash = (uint)_hash(key);
-            foreach (var (value, weight) in group)
+            var g = 0;
+            foreach (var group in source)
             {
-                entries.Add((hash, value.GetHashCode(), key, value, weight.Value));
+                hashes[g] = (uint)_hash(group.Key);
+                groups[g++] = group;
+            }
+
+            Array.Sort(hashes, groups, 0, g);
+            var run = new RunBuilder(this);
+            for (var i = 0; i < g; i++)
+            {
+                var key = groups[i].Key;
+                foreach (var (value, weight) in groups[i].Value)
+                {
+                    run.Add(hashes[i], key, value, weight.Value);
+                    entries++;
+                }
+            }
+
+            if (run.Finish() is { } frozen)
+            {
+                _runs.Insert(0, frozen);
             }
         }
-
-        entries.Sort(static (a, b) => a.Hash != b.Hash ? a.Hash.CompareTo(b.Hash) : a.ValueHash.CompareTo(b.ValueHash));
-        var run = new RunBuilder(this);
-        foreach (var e in entries)
+        finally
         {
-            run.Add(e.Hash, e.Key, e.Value, e.Weight);
+            ArrayPool<KeyValuePair<StructuralRow, ZSet<StructuralRow, Z64>>>.Shared.Return(groups, clearArray: true);
+            ArrayPool<uint>.Shared.Return(hashes);
         }
 
-        if (run.Finish() is { } frozen)
+        if (BlockTraceProfile.Enabled)
         {
-            _runs.Insert(0, frozen);
+            BlockTraceProfile.Freeze(t0, entries);
         }
 
         Compact();
@@ -386,6 +446,22 @@ internal sealed class BlockedIndexedTrace
     // A two-way merge in hash order. Entries of one hash from both runs are consolidated by key and
     // value (weights summed, zeros dropped); entries under a floor are dropped.
     private Run? Merge(Run newer, Run older)
+    {
+        var t0 = BlockTraceProfile.Now();
+        try
+        {
+            return MergeCore(newer, older);
+        }
+        finally
+        {
+            if (BlockTraceProfile.Enabled)
+            {
+                BlockTraceProfile.Merge(t0, newer.Entries + older.Entries);
+            }
+        }
+    }
+
+    private Run? MergeCore(Run newer, Run older)
     {
         var a = new Cursor(newer);
         var b = new Cursor(older);
@@ -505,9 +581,16 @@ internal sealed class BlockedIndexedTrace
         }
     }
 
-    // Cuts entries (ascending hash) into blocks of about blockEntries, only where the hash changes.
+    /// <summary>Encoded bytes at which a block is cut: below the 85,000-byte large-object-heap
+    /// threshold. LOH blocks made a 12-worker freeze six times slower than a single thread's, and
+    /// ivm-bench's giant groups made most blocks LOH-sized until a hash could span blocks (§3.1).</summary>
+    internal const int BlockBytes = 60_000;
+
+    // Cuts entries (ascending hash) into blocks: after blockEntries entries where the hash changes,
+    // and after the byte budget anywhere — a giant group's hash then spans consecutive blocks.
     private sealed class RunBuilder(BlockedIndexedTrace trace)
     {
+        private long _bytes;
         private readonly List<ITraceBlock> _blocks = new();
         private StructuralRow[] _keys = new StructuralRow[64];
         private StructuralRow[] _values = new StructuralRow[64];
@@ -518,10 +601,12 @@ internal sealed class BlockedIndexedTrace
 
         public void Add(uint hash, StructuralRow key, StructuralRow value, long weight)
         {
-            if (_count >= trace._blockEntries && (uint)_hashes[_count - 1] != hash)
+            if (_count > 0 && (_bytes >= trace._blockBytes || (_count >= trace._blockEntries && (uint)_hashes[_count - 1] != hash)))
             {
                 Flush();
             }
+
+            _bytes += trace._format.EntryBytes(key, value);
 
             if (_count == _keys.Length)
             {
@@ -552,10 +637,16 @@ internal sealed class BlockedIndexedTrace
                 return;
             }
 
+            var t0 = BlockTraceProfile.Now();
             _blocks.Add(trace._format.Encode(_keys, _values, _weights, _hashes, _count));
+            if (BlockTraceProfile.Enabled)
+            {
+                BlockTraceProfile.Encode(t0);
+            }
             Array.Clear(_keys, 0, _count);
             Array.Clear(_values, 0, _count);
             _count = 0;
+            _bytes = 0;
         }
     }
 }
