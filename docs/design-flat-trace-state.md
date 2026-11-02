@@ -892,6 +892,43 @@ and new folds agree up to the first delta row, so one fold could serve both unti
 **What is left:** the remaining references are the two operators' `_accum`, a `SortedDictionary`
 of input rows per partition: about 119M of 155M. Holding it as blocks is the next step (§3.13).
 
+### 3.13 The window aggregate's input as blocks: plan (2026-11-02, branch `arc/flat-trace-window-accum`)
+
+**Profile first** (batch 1, SF=3, W=12, CPU summed over workers): the window aggregates spend
+21 s in four places:
+- **Integrating 4M delta rows into per-partition `SortedDictionary`s: 9.1 s.** Every insert makes
+  about log n full structural comparisons through the ORDER BY comparer.
+- **The running fold: about 8.7 s.** It builds a one-row Z-set per row.
+- **The union: 2.1 s.**
+- **Widening and diffing: 1.5 s.**
+
+Each partition is touched about once per batch (4M union rows for 4M delta rows). So `_accum`
+costs CPU on insert as well as references (the two window operators' `_accum` hold about 119M of
+the remaining 155M).
+
+**Design.**
+- **One store, two representations.** The operator reads its per-partition input through a store
+  (`IPartitionRows`): managed (today's sorted dictionaries) or blocked.
+- **The blocked store is a `BlockedIndexedTrace`**, keyed by the partition key and holding the
+  whole input row as its value. A tick's delta is integrated as one level, or as one run through
+  `IntegrateEntries` when it is large. A touched partition is read as its decoded group.
+- **The union is formed by one sort,** by (order value, then the total order), over the
+  partition's rows and the delta's. Equal rows end up adjacent and are coalesced into old and new
+  weights. That is the order the operator already folds in, and the order value is a precomputed
+  `long`, so most comparisons never reach the structural comparer. The managed store keeps
+  today's merge, since its rows are already in the total order.
+- **Checkpoints.** The blocked store attaches an empty in-memory snapshot plus a `fullState`
+  hook, so an incremental checkpoint writes only the pending changes. Only a full write decodes
+  the whole state.
+- **Restore** stays lazy: a faulted partition's rows enter as a level.
+- **Not blocked:** frontier GC (bounded ascending frames with LATENESS: dropping rows inside a
+  partition is not a key drop), and non-structural rows.
+
+**Gate:** `DBSPNET_TRACE_BLOCKS=window`, not in `all` until measured. Measure the batch-1 drain
+(≤ +3%), batch 3 (steady state: every partition touched by one new day), restart, and the census,
+over 5 alternating runs. The offset operator follows if this holds. It has no numeric order value,
+so it needs a numeric prefix of its first ORDER BY key to keep its sort cheap.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

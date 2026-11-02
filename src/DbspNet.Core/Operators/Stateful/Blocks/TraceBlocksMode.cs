@@ -26,11 +26,14 @@ internal static class TraceBlocksMode
 
     private static readonly bool DefaultDistinct = Kinds.Contains("distinct") || Kinds.Contains("all");
 
+    // Not in `all` until measured (§3.13).
+    private static readonly bool DefaultWindow = Kinds.Contains("window");
+
     private static readonly int DefaultFreeze = Positive("DBSPNET_TRACE_BLOCKS_FREEZE", 1 << 16);
 
     private static readonly int DefaultBlock = Positive("DBSPNET_TRACE_BLOCKS_BLOCK", 1024);
 
-    private static readonly AsyncLocal<(bool Join, int Freeze, int Block, bool Aggregate, bool View, bool Distinct)?> Override = new();
+    private static readonly AsyncLocal<(bool Join, int Freeze, int Block, bool Aggregate, bool View, bool Distinct, bool Window)?> Override = new();
 
     /// <summary>Whether join traces are compiled as blocks.</summary>
     public static bool Join => Override.Value?.Join ?? Default;
@@ -44,6 +47,9 @@ internal static class TraceBlocksMode
     /// <summary>Whether DISTINCT's traces are compiled as blocks.</summary>
     public static bool Distinct => Override.Value?.Distinct ?? DefaultDistinct;
 
+    /// <summary>Whether the window aggregate's per-partition input is compiled as blocks (§3.13).</summary>
+    public static bool Window => Override.Value?.Window ?? DefaultWindow;
+
     /// <summary>Managed entries that make a blocked trace freeze.</summary>
     public static int FreezeEntries => Override.Value?.Freeze ?? DefaultFreeze;
 
@@ -52,12 +58,13 @@ internal static class TraceBlocksMode
 
     /// <summary>These settings in the current async context until the result is disposed;
     /// <paramref name="aggregate"/>, <paramref name="view"/> and <paramref name="distinct"/> default to
-    /// <paramref name="join"/> (as <c>all</c>).</summary>
+    /// <paramref name="join"/> (as <c>all</c>), and <paramref name="window"/> to false.</summary>
     public static IDisposable Use(
-        bool join, int? freezeEntries = null, int? blockEntries = null, bool? aggregate = null, bool? view = null, bool? distinct = null)
+        bool join, int? freezeEntries = null, int? blockEntries = null, bool? aggregate = null, bool? view = null, bool? distinct = null,
+        bool? window = null)
     {
         var previous = Override.Value;
-        Override.Value = (join, freezeEntries ?? FreezeEntries, blockEntries ?? BlockEntries, aggregate ?? join, view ?? join, distinct ?? join);
+        Override.Value = (join, freezeEntries ?? FreezeEntries, blockEntries ?? BlockEntries, aggregate ?? join, view ?? join, distinct ?? join, window ?? false);
         return new Restore(() => Override.Value = previous);
     }
 

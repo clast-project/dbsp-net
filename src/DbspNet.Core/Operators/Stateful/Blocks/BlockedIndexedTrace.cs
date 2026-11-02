@@ -164,6 +164,19 @@ internal sealed class BlockedIndexedTrace
         _hash = hash ?? (static row => row.GetHashCode());
     }
 
+    /// <summary>Forget every level (a restore replaces the state).</summary>
+    public void Clear()
+    {
+        _managed.Clear();
+        _runs.Clear();
+        _managedEntries = 0;
+        _materialized = null;
+    }
+
+    /// <summary>Entries held across every level (cancelling entries in separate levels both count):
+    /// a cheap upper bound on the net entries.</summary>
+    public long Entries => _managedEntries + _runs.Sum(r => r.Entries);
+
     /// <summary>Managed levels waiting to freeze.</summary>
     public int ManagedLevels => _managed.Count;
 
