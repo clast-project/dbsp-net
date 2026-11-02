@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using Apache.Arrow.Ipc;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
 
@@ -49,7 +50,7 @@ internal enum CellKind : byte
 /// <see cref="CellKind"/>, and the encoded schema message, which a block's record-batch message
 /// follows in a run file.
 /// </summary>
-internal sealed class BlockSchema
+internal sealed class BlockSchema : ITraceBlockFormat
 {
     private BlockSchema(Schema keySchema, Schema valueSchema, CellKind[] keyKinds, CellKind[] valueKinds)
     {
@@ -76,6 +77,12 @@ internal sealed class BlockSchema
 
     /// <summary>The Arrow IPC schema message (stream start) every block's message follows.</summary>
     internal byte[] SchemaMessage { get; }
+
+    /// <inheritdoc/>
+    public int ValueColumns => ValueKinds.Length;
+
+    ITraceBlock ITraceBlockFormat.Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count) =>
+        Encode(keys, values, weights, hashes, count);
 
     /// <summary>Column index of <c>__weight</c>.</summary>
     internal int WeightColumn => KeyKinds.Length + ValueKinds.Length;

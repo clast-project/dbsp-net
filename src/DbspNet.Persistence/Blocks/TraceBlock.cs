@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using Apache.Arrow.Ipc;
 using Clast.DatabaseDecimal.Values;
 using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Persistence.Blocks;
@@ -27,7 +28,7 @@ namespace DbspNet.Persistence.Blocks;
 /// <see cref="Utf8String"/> keeps the whole block alive, and a row kept downstream (a view, an
 /// aggregate key) would then pin blocks the trace has merged away.</para>
 /// </remarks>
-internal sealed class TraceBlock
+internal sealed class TraceBlock : ITraceBlock
 {
     private readonly byte[] _bytes;
     private readonly int[] _validity;
@@ -113,6 +114,12 @@ internal sealed class TraceBlock
 
         return true;
     }
+
+    StructuralRow ITraceBlock.Key(int i) => Key(i);
+
+    StructuralRow ITraceBlock.Value(int i) => Value(i);
+
+    void ITraceBlock.ValueCellsInto(int i, object?[] destination, int at) => ValueCellsInto(i, destination, at);
 
     /// <summary>Entry <paramref name="i"/>'s key, decoded.</summary>
     public StructuralRow Key(int i, bool aliasStrings = false)
