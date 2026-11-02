@@ -129,7 +129,11 @@ public sealed class OutputRowIndexTests
     [Fact]
     public void Create_IsBlockedOnlyWhenViewsAreBlocksAndColumnsEncode()
     {
-        Assert.False(OutputRowIndex.Create(ViewSchema).IsBlocked);
+        using (TraceBlocksMode.Use(join: true))
+        {
+            Assert.False(OutputRowIndex.Create(ViewSchema).IsBlocked); // `all` leaves views managed
+        }
+
         using (TraceBlocksMode.Use(join: false, view: true))
         {
             Assert.True(OutputRowIndex.Create(ViewSchema).IsBlocked);
