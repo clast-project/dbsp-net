@@ -664,7 +664,8 @@ view. A blocked view frees its dictionary, but the rows stay alive through the c
 also held as block bytes: references move rather than disappear, and bytes grow by 0.42 GB.
 Without such a connector (truncate sinks, embedded programs), views would save as much as
 DISTINCT does. The view half needs the connector's index made reference-free, a separate piece of
-work. Until then, the open question is whether `all` should include views.
+work. Until then, decided: `all` means joins, aggregates and DISTINCT, and views are opt-in
+(`DBSPNET_TRACE_BLOCKS=all,view`).
 
 ## 4. Open questions for review
 
