@@ -492,20 +492,24 @@ public static class ExpressionCompiler
 
     private static Expression BuildCast(ResolvedCast cast, ParameterExpression row)
     {
-        var value = BuildCastValue(cast, row);
-        return cast.Safe ? Expression.TryCatch(value,
-            Expression.Catch(typeof(FormatException), NullObject),
-            Expression.Catch(typeof(OverflowException), NullObject),
-            Expression.Catch(typeof(ArgumentException), NullObject)) : value;
+        var operand = Build(cast.Operand, row);
+        if (!cast.Safe) return BuildCastValue(cast, operand);
+
+        // Evaluate the operand once, outside the conversion's error handler.
+        var input = Expression.Variable(typeof(object), "castInput");
+        return Expression.Block([input], Expression.Assign(input, operand),
+            Expression.TryCatch(BuildCastValue(cast, input),
+                Expression.Catch(typeof(FormatException), NullObject),
+                Expression.Catch(typeof(OverflowException), NullObject),
+                Expression.Catch(typeof(ArgumentException), NullObject)));
     }
 
-    private static Expression BuildCastValue(ResolvedCast cast, ParameterExpression row)
+    private static Expression BuildCastValue(ResolvedCast cast, Expression operand)
     {
         if (cast.Operand.Type is SqlNullType)
         {
             return NullObject;
         }
-        var operand = Build(cast.Operand, row);
         var srcClr = ClrOf(cast.Operand.Type);
         var dstClr = ClrOf(cast.Type);
 
@@ -514,12 +518,12 @@ public static class ExpressionCompiler
         // decimal-aware paths first, then fall through to primitive logic.
         if (cast.Type is SqlDecimalType targetDec)
         {
-            return BuildCastToDecimal(operand, cast.Operand.Type, targetDec);
+            return BuildCastToDecimal(operand, cast.Operand.Type, targetDec, cast.Safe);
         }
 
         if (cast.Operand.Type is SqlDecimalType sourceDec)
         {
-            return BuildCastFromDecimal(operand, sourceDec, cast.Type, dstClr);
+            return BuildCastFromDecimal(operand, sourceDec, cast.Type, dstClr, cast.Safe);
         }
 
         if (srcClr == dstClr)
@@ -534,7 +538,9 @@ public static class ExpressionCompiler
         {
             var unboxed = Expression.Convert(operand, srcClr);
             // Explicit narrowing between numeric CLR types; exceptions surface as runtime errors.
-            var widened = cast.Safe ? Expression.ConvertChecked(unboxed, dstClr) : Expression.Convert(unboxed, dstClr);
+            Expression widened = cast.Safe && srcClr == typeof(double) && dstClr == typeof(float)
+                ? Expression.Call(typeof(SqlCasts).GetMethod(nameof(SqlCasts.DoubleToSingleChecked))!, unboxed)
+                : cast.Safe ? Expression.ConvertChecked(unboxed, dstClr) : Expression.Convert(unboxed, dstClr);
             converted = Expression.Convert(widened, typeof(object));
         }
         else if (IsNumeric(srcClr) && dstClr == typeof(bool))
@@ -671,7 +677,7 @@ public static class ExpressionCompiler
     /// <c>DecimalText</c> using the target's declared precision/scale.
     /// </summary>
     private static Expression BuildCastToDecimal(
-        Expression operand, SqlType srcType, SqlDecimalType target)
+        Expression operand, SqlType srcType, SqlDecimalType target, bool safe)
     {
         var isNull = Expression.Equal(operand, NullObject);
         var targetType = Clast.DatabaseDecimal.DecimalType.Numeric(target.Precision, target.Scale);
@@ -679,23 +685,33 @@ public static class ExpressionCompiler
         Expression converted;
         if (srcType is SqlDecimalType srcDec)
         {
-            // Cross-scale rescale via ScaleHelper.Rescale128.
-            if (srcDec.Scale == target.Scale)
+            if (safe)
             {
-                return operand;
+                converted = Expression.Convert(Expression.Call(
+                    typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
+                    Expression.Convert(operand, typeof(Clast.DatabaseDecimal.Values.Decimal128)),
+                    Expression.Constant(srcDec.Scale), Expression.Constant(targetType)), typeof(object));
             }
+            else
+            {
+                // Cross-scale rescale via ScaleHelper.Rescale128.
+                if (srcDec.Scale == target.Scale)
+                {
+                    return operand;
+                }
 
-            var unboxed = Expression.Convert(operand, typeof(Clast.DatabaseDecimal.Values.Decimal128));
-            var mantissa = Expression.Field(unboxed, nameof(Clast.DatabaseDecimal.Values.Decimal128.Mantissa));
-            var rescale = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
-                mantissa,
-                Expression.Constant(srcDec.Scale),
-                Expression.Constant(target.Scale),
-                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
-            var ctor = typeof(Clast.DatabaseDecimal.Values.Decimal128).GetConstructor([typeof(Int128)])!;
-            converted = Expression.Convert(Expression.New(ctor, rescale), typeof(object));
+                var unboxed = Expression.Convert(operand, typeof(Clast.DatabaseDecimal.Values.Decimal128));
+                var mantissa = Expression.Field(unboxed, nameof(Clast.DatabaseDecimal.Values.Decimal128.Mantissa));
+                var rescale = Expression.Call(
+                    typeof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper).GetMethod(
+                        nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
+                    mantissa,
+                    Expression.Constant(srcDec.Scale),
+                    Expression.Constant(target.Scale),
+                    Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
+                var ctor = typeof(Clast.DatabaseDecimal.Values.Decimal128).GetConstructor([typeof(Int128)])!;
+                converted = Expression.Convert(Expression.New(ctor, rescale), typeof(object));
+            }
         }
         else if (srcType is SqlIntegerType or SqlBigintType)
         {
@@ -709,7 +725,12 @@ public static class ExpressionCompiler
                     nameof(Clast.DatabaseDecimal.Values.Decimal128.FromInteger))!,
                 asInt128,
                 Expression.Constant((byte)target.Scale));
-            converted = Expression.Convert(fromInt, typeof(object));
+            converted = safe
+                ? Expression.Convert(Expression.Call(
+                    typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
+                    Expression.New(typeof(Clast.DatabaseDecimal.Values.Decimal128).GetConstructor([typeof(Int128)])!, asInt128),
+                    Expression.Constant(0), Expression.Constant(targetType)), typeof(object))
+                : Expression.Convert(fromInt, typeof(object));
         }
         else if (srcType is SqlDoubleType or SqlRealType)
         {
@@ -719,7 +740,7 @@ public static class ExpressionCompiler
                 ? (Expression)Expression.Convert(unboxed, typeof(double))
                 : unboxed;
             var fromDouble = Expression.Call(
-                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.FromDouble))!,
+                typeof(DecimalRuntime).GetMethod(safe ? nameof(DecimalRuntime.FromDoubleChecked) : nameof(DecimalRuntime.FromDouble))!,
                 asDouble,
                 Expression.Constant(targetType));
             converted = Expression.Convert(fromDouble, typeof(object));
@@ -762,7 +783,7 @@ public static class ExpressionCompiler
     /// float / double rescales the mantissa to scale 0 then casts.
     /// </summary>
     private static Expression BuildCastFromDecimal(
-        Expression operand, SqlDecimalType src, SqlType dstType, Type dstClr)
+        Expression operand, SqlDecimalType src, SqlType dstType, Type dstClr, bool safe)
     {
         var isNull = Expression.Equal(operand, NullObject);
         var sourceType = Clast.DatabaseDecimal.DecimalType.Numeric(src.Precision, src.Scale);
@@ -807,7 +828,11 @@ public static class ExpressionCompiler
                 Expression.Constant(src.Scale),
                 Expression.Constant(0),
                 Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
-            var cast = Expression.Convert(rescaled, dstClr);
+            // Expression.ConvertChecked does not select Int128's checked user-defined operator.
+            Expression cast = safe
+                ? Expression.Call(typeof(SqlCasts).GetMethod(dstClr == typeof(int)
+                    ? nameof(SqlCasts.Int128ToInt32Checked) : nameof(SqlCasts.Int128ToInt64Checked))!, rescaled)
+                : Expression.Convert(rescaled, dstClr);
             converted = Expression.Convert(cast, typeof(object));
         }
         else
@@ -851,6 +876,20 @@ public static class ExpressionCompiler
 /// <summary>Thin helpers invoked from compiled Expression trees for CAST operations.</summary>
 internal static class SqlCasts
 {
+    public static int Int128ToInt32Checked(Int128 value) => checked((int)value);
+
+    public static long Int128ToInt64Checked(Int128 value) => checked((long)value);
+
+    public static float DoubleToSingleChecked(double value)
+    {
+        var result = (float)value;
+        if (double.IsFinite(value) && float.IsInfinity(result))
+        {
+            throw new OverflowException("finite DOUBLE exceeds REAL range");
+        }
+        return result;
+    }
+
     public static int ParseInt32(string s) => int.Parse(s, CultureInfo.InvariantCulture);
 
     public static long ParseInt64(string s) => long.Parse(s, CultureInfo.InvariantCulture);

@@ -76,6 +76,22 @@ internal static class DecimalRuntime
         return new Decimal128((Int128)scaled);
     }
 
+    public static Decimal128 FromDoubleChecked(double value, DecimalType type)
+    {
+        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.ToEven);
+        var result = new Decimal128(checked((Int128)scaled));
+        DecimalRange.Validate(result.Mantissa, type);
+        return result;
+    }
+
+    public static Decimal128 RescaleChecked(Decimal128 value, int sourceScale, DecimalType target)
+    {
+        // Widen before scaling so overflow cannot wrap into a valid mantissa.
+        var wide = ScaleHelper.Widen128To256(value.Mantissa, sourceScale, target.Scale, DecimalRounding.HalfEven);
+        DecimalRange.Validate(wide, target);
+        return NarrowToDecimal128(wide);
+    }
+
     /// <summary>
     /// Convert a <see cref="Decimal128"/> to <see cref="double"/> at
     /// <paramref name="scale"/> — <c>CAST(DECIMAL(p, s) AS DOUBLE/REAL)</c>.

@@ -50,6 +50,69 @@ public class NullOnErrorAndJsonTests
     }
 
     [Fact]
+    public void TryCastDoesNotSuppressOperandErrors() =>
+        Assert.Throws<FormatException>(() => Eval("TRY_CAST(CAST(s AS INTEGER) AS VARCHAR)", "bad"));
+
+    [Fact]
+    public void TryCastDoesNotSuppressOperandOverflow() =>
+        Assert.Throws<OverflowException>(() => Eval("TRY_CAST(CAST(s AS BIGINT) AS VARCHAR)", "9223372036854775808"));
+
+    [Fact]
+    public void NestedTryCastRetainsNullOnErrorBehavior() =>
+        Assert.Null(Eval("TRY_CAST(TRY_CAST(s AS INTEGER) AS VARCHAR)", "bad"));
+
+    [Theory]
+    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS REAL)", "1e100")]
+    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS REAL)", "-1e100")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS INTEGER)", "4294967296")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS INTEGER)", "-2147483649")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(20,0)) AS BIGINT)", "9223372036854775808")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(20,0)) AS BIGINT)", "-9223372036854775809")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS DECIMAL(3,0))", "1000")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS DECIMAL(3,0))", "-1000")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(8,2)) AS DECIMAL(3,1))", "99.96")]
+    [InlineData("TRY_CAST(CAST(s AS DECIMAL(38,0)) AS DECIMAL(38,37))", "99999999999999999999999999999999999999")]
+    [InlineData("TRY_CAST(CAST(s AS BIGINT) AS DECIMAL(3,0))", "1000")]
+    [InlineData("TRY_CAST(CAST(s AS BIGINT) AS DECIMAL(38,37))", "9223372036854775807")]
+    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS DECIMAL(3,0))", "1000")]
+    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS DECIMAL(38,0))", "1e100")]
+    [InlineData("TRY_CAST(CAST(s AS DOUBLE) AS DECIMAL(38,0))", "NaN")]
+    public void TryCastReturnsNullForNumericRangeOverflow(string expression, string value) =>
+        Assert.Null(Eval(expression, value));
+
+    [Theory]
+    [InlineData("2147483647", int.MaxValue)]
+    [InlineData("-2147483648", int.MinValue)]
+    public void TryCastPreservesDecimalToIntegerBoundaries(string value, int expected) =>
+        Assert.Equal(expected, Eval("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS INTEGER)", value));
+
+    [Theory]
+    [InlineData("999", 999)]
+    [InlineData("-999", -999)]
+    public void TryCastPreservesDecimalPrecisionBoundaries(string value, int mantissa) =>
+        Assert.Equal(new Clast.DatabaseDecimal.Values.Decimal128(mantissa),
+            Eval("TRY_CAST(CAST(s AS DECIMAL(12,0)) AS DECIMAL(3,0))", value));
+
+    [Theory]
+    [InlineData("3.4e38")]
+    [InlineData("Infinity")]
+    [InlineData("-Infinity")]
+    [InlineData("NaN")]
+    public void TryCastPreservesRepresentableAndAlreadyNonfiniteFloatingValues(string value) =>
+        Assert.Equal((float)double.Parse(value, System.Globalization.CultureInfo.InvariantCulture),
+            Eval("TRY_CAST(CAST(s AS DOUBLE) AS REAL)", value));
+
+    [Fact]
+    public void TryCastIntervalLiteralsAndColumnsShareNullOnErrorSemantics()
+    {
+        Assert.Null(Eval("TRY_CAST('bad' AS INTERVAL DAY)", "unused"));
+        Assert.Null(Eval("TRY_CAST(s AS INTERVAL DAY)", "bad"));
+        Assert.Equal(Eval("TRY_CAST(s AS INTERVAL DAY)", "2"),
+            Eval("TRY_CAST('2' AS INTERVAL DAY)", "unused"));
+        Assert.Throws<FormatException>(() => Eval("CAST('bad' AS INTERVAL DAY)", "unused"));
+    }
+
+    [Fact]
     public void PostAggregateNullCastsKeepTheirDeclaredType()
     {
         var q = Compile("CREATE TABLE t (s VARCHAR)", "SELECT TRY_CAST(NULL AS INTEGER) AS n, COUNT(*) AS c FROM t");
@@ -107,6 +170,14 @@ public class NullOnErrorAndJsonTests
     [InlineData(null, null)]
     public void JsonScalarExtractionPreservesValuesAndNulls(string? value, string? expected) =>
         Assert.Equal(expected, Eval("JSON_EXTRACT_STRING(s, '$.x')", value));
+
+    [Theory]
+    [InlineData("{\"x\":1,\"x\":2}", "$.x", "1")]
+    [InlineData("{\"x\":null,\"x\":2}", "$.x", null)]
+    [InlineData("{\"x\":{\"a\":1,\"a\":2},\"x\":{\"a\":3}}", "$.x.a", "1")]
+    [InlineData("{\"x\":null,\"x\":{\"a\":2}}", "$.x.a", null)]
+    public void JsonExtractionSelectsTheFirstDuplicateKeyAtEachLevel(string json, string path, string? expected) =>
+        Assert.Equal(expected, Eval($"JSON_EXTRACT_STRING(s, '{path}')", json));
 
     [Theory]
     [InlineData("SELECT FIRST_VALUE(s IGNORE NULLS) FROM t")]

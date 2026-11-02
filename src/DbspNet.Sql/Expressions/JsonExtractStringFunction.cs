@@ -52,7 +52,17 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
         var value = document.RootElement;
         foreach (var key in path)
         {
-            if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(key, out value)) return null;
+            if (value.ValueKind != JsonValueKind.Object) return null;
+            // DuckDB selects the first duplicate key; TryGetProperty selects the last.
+            var found = false;
+            foreach (var property in value.EnumerateObject())
+            {
+                if (!property.NameEquals(key)) continue;
+                value = property.Value;
+                found = true;
+                break;
+            }
+            if (!found) return null;
         }
 
         return value.ValueKind switch

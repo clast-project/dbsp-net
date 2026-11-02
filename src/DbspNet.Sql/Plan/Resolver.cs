@@ -5370,10 +5370,10 @@ public sealed class Resolver
         var operand = ResolveScalarExpression(cast.Operand, schema, subqueryMap, outerSchema, preBound);
         var target = TypeInference.FromSpec(cast.TargetType, nullable: cast.Safe || operand.Type.Nullable);
 
-        // Constant-fold CAST('<literal>' AS INTERVAL q) — the shape the parser
+        // Constant-fold strict CAST('<literal>' AS INTERVAL q) — the shape the parser
         // emits for an INTERVAL literal — into a typed interval value so it is
         // parsed once at compile time rather than per row.
-        if (target is SqlIntervalType intervalType
+        if (!cast.Safe && target is SqlIntervalType intervalType
             && operand is ResolvedLiteral { Kind: LiteralKind.String, Value: Utf8String text })
         {
             var value = Interval.Parse(text.ToStringDecoded(), intervalType.Qualifier);
