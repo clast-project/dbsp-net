@@ -617,6 +617,55 @@ block-encodable columns only.
 output-write time (the view is read for the incremental connector's deltas only, but truncate
 sinks materialise it), restart, and the census.
 
+### 3.8 Views and DISTINCT: built and measured (2026-11-02, branch `arc/flat-trace-zset`)
+
+**Built as planned (§3.7):** b72af15, c45d502, 7bd7117. Tests: a random-operation oracle against
+`ZSetTrace` (drops, idle freezes, NaN payloads; enumeration must yield each row once with a
+non-zero weight), SQL DISTINCT and UNION twins every tick, stored-view twins (contents, counts,
+weights), and checkpoints in both directions with and without the runs layout. The random-query
+oracle compiles a blocked DISTINCT in 326 of 1,500 queries. The suite passes 3,134 tests in each
+of the four arms, and 11 mutations were tried: 10 caught, and 1 changed no behaviour.
+
+**One regression found and fixed on the way.** After a restart, the first incremental write
+enumerates each view whole, and it was 26% slower (3.45 → 4.36 s). It was not the decode count but
+cell locality. The Arrow builder reads column-wise; the managed cold reader decodes a column at a
+time into an arena, while blocks decoded a row at a time with each string copied. Over the same
+rows with no GC, the Arrow conversion took twice as long. The full-view stream now merges runs by
+hash and decodes each block whole on entry, column-major, with strings aliasing the immutable
+block bytes. The parallel output decodes such shards in parallel (`EnumerationDecodes`).
+
+**Wall clock** (SF=3, W=12, 5 alternating runs per arm against `join,agg`, outputs identical,
+medians, ms):
+
+| | join,agg | all |
+|---|---|---|
+| batch-1 drain | 16,631 | 16,595 |
+| batch-1 output write | 3,505 | 2,744 (spread 2,283–4,824) |
+| batch-1 checkpoint | 3,254 | 2,740 |
+| batch-1 GC pause | 6,641 | 6,153 |
+| restart: restore | 252 | 267 |
+| restart: first drain | 459 | 520 |
+| restart: output write | 3,515 | 3,595 |
+| restart: checkpoint | 403 | 264 |
+
+**Census after the checkpoint (one run each):**
+
+| | join,agg | all |
+|---|---|---|
+| total references | 333.5M | 320.4M (−4%) |
+| total bytes | 10.67 GB | 11.09 GB (+0.42 GB) |
+| IntegratedView references | 48.5M | 0.4M |
+| Distinct references | 10.4M | 0.47M |
+| output connector (`ProgramRunner`) references | 14.7M | 57.5M |
+
+**DISTINCT is a clean win; views are not, on ivm-bench.** The incremental Delta connector keeps
+every row it has written as a key (its row-address index) and shares the row objects with the
+view. A blocked view frees its dictionary, but the rows stay alive through the connector, and are
+also held as block bytes: references move rather than disappear, and bytes grow by 0.42 GB.
+Without such a connector (truncate sinks, embedded programs), views would save as much as
+DISTINCT does. The view half needs the connector's index made reference-free, a separate piece of
+work. Until then, the open question is whether `all` should include views.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

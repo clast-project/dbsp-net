@@ -1,0 +1,64 @@
+Test run for /Users/curthagenlocher/src/dbsp-net/tests/DbspNet.Tests/bin/Release/net10.0/DbspNet.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/Users/curthagenlocher/src/dbsp-net/tests/DbspNet.Tests/bin/Release/net10.0/DbspNet.Tests.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.8)
+[xUnit.net 00:00:00.04]   Discovering: DbspNet.Tests
+[xUnit.net 00:00:00.16]   Discovered:  DbspNet.Tests
+[xUnit.net 00:00:00.17]   Starting:    DbspNet.Tests
+[xUnit.net 00:00:28.89]   Finished:    DbspNet.Tests
+  Passed DbspNet.Tests.Scratch.IvmMultiBatch.RunThreeBatches_Local [28 s]
+  Standard Output Messages:
+ output mode: Incremental, workers: 12
+ GCPAUSE gen0 blocking: 7 GCs 978 ms (promoted 7.50/0.00 GB); gen0 foreground: 2 GCs 395 ms (promoted 3.54/0.00 GB); gen1 blocking: 7 GCs 2537 ms (promoted 7.54/10.25 GB); gen1 foreground: 4 GCs 1021 ms (promoted 5.02/8.07 GB); gen2 background: 2 GCs 3 ms (promoted 0.00/0.00 GB); no GC (suspension only): 5 GCs 335 ms; total 5268 ms; young 5265 ms promoted 23.60/18.33 GB
+ GCPAUSE-DRAIN gen0 blocking: 7 GCs 978 ms (promoted 7.50/0.00 GB); gen0 foreground: 2 GCs 395 ms (promoted 3.54/0.00 GB); gen1 blocking: 7 GCs 2537 ms (promoted 7.54/10.25 GB); gen1 foreground: 4 GCs 1021 ms (promoted 5.02/8.07 GB); gen2 background: 2 GCs 3 ms (promoted 0.00/0.00 GB); no GC (suspension only): 4 GCs 157 ms; total 5090 ms; young 5087 ms promoted 23.60/18.33 GB
+ [drain] GC gen2 background 2 ms promoted0=0.00 promoted1=0.00 GB | gen0=0.00 gen1=0.00 gen2=0.00 loh=0.00 GB | marked 
+ [drain] SUSPEND gc-prep 10 ms
+ [drain] GC gen1 blocking 118 ms promoted0=0.29 promoted1=0.01 GB | gen0=0.00 gen1=0.29 gen2=0.01 loh=0.05 GB | marked stack=0.27GB/85ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=0.03GB/1ms dephandles=0.00GB/85ms newFQ=0.00GB/0ms
+ [drain] GC gen2 background 1 ms promoted0=0.00 promoted1=0.00 GB | gen0=0.00 gen1=0.00 gen2=0.00 loh=0.00 GB | marked 
+ [drain] SUSPEND gc-prep 32 ms
+ [drain] GC gen0 blocking 120 ms promoted0=0.73 promoted1=0.00 GB | gen0=0.00 gen1=0.96 gen2=0.01 loh=0.05 GB | marked stack=0.05GB/32ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=0.68GB/43ms dephandles=0.00GB/13ms newFQ=0.00GB/0ms
+ [drain] GC gen1 blocking 822 ms promoted0=0.61 promoted1=0.82 GB | gen0=0.00 gen1=0.62 gen2=0.84 loh=0.05 GB | marked stack=1.42GB/651ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=0.01GB/1ms dephandles=0.00GB/651ms newFQ=0.00GB/1ms
+ [drain] GC gen0 blocking 116 ms promoted0=0.68 promoted1=0.00 GB | gen0=0.00 gen1=1.31 gen2=0.84 loh=0.05 GB | marked stack=0.04GB/25ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=0.64GB/29ms dephandles=0.00GB/10ms newFQ=0.00GB/1ms
+ [drain] GC gen0 blocking 116 ms promoted0=1.37 promoted1=0.00 GB | gen0=0.00 gen1=2.70 gen2=0.84 loh=0.05 GB | marked stack=0.09GB/26ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.28GB/26ms dephandles=0.00GB/15ms newFQ=0.00GB/0ms
+ [drain] GC gen1 foreground 155 ms promoted0=0.99 promoted1=1.93 GB | gen0=0.00 gen1=2.63 gen2=3.54 loh=0.17 GB | marked stack=0.09GB/48ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=2.51GB/48ms dephandles=0.00GB/68ms newFQ=0.00GB/0ms bgcsaved=0.30GB/54ms
+ [drain] SUSPEND gc-prep 15 ms
+ [drain] GC gen1 blocking 114 ms promoted0=0.95 promoted1=0.28 GB | gen0=0.00 gen1=0.96 gen2=3.54 loh=0.09 GB | marked stack=0.14GB/30ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.09GB/23ms dephandles=0.00GB/14ms newFQ=0.00GB/1ms
+ [drain] GC gen0 blocking 212 ms promoted0=1.53 promoted1=0.00 GB | gen0=0.00 gen1=2.51 gen2=3.54 loh=0.20 GB | marked stack=0.14GB/43ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.39GB/59ms dephandles=0.00GB/20ms newFQ=0.00GB/1ms
+ [drain] GC gen1 blocking 404 ms promoted0=0.71 promoted1=2.48 GB | gen0=0.00 gen1=0.72 gen2=5.37 loh=0.20 GB | marked stack=0.05GB/31ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=3.13GB/133ms dephandles=0.00GB/52ms newFQ=0.00GB/1ms
+ [drain] GC gen0 blocking 192 ms promoted0=1.45 promoted1=0.00 GB | gen0=0.00 gen1=2.19 gen2=5.37 loh=0.27 GB | marked stack=0.15GB/66ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.29GB/47ms dephandles=0.00GB/37ms newFQ=0.00GB/0ms
+ [drain] GC gen0 blocking 93 ms promoted0=0.78 promoted1=0.00 GB | gen0=0.00 gen1=2.97 gen2=5.37 loh=0.27 GB | marked stack=0.29GB/11ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=0.49GB/18ms dephandles=0.00GB/3ms newFQ=0.00GB/0ms
+ [drain] GC gen1 foreground 195 ms promoted0=1.19 promoted1=2.47 GB | gen0=0.00 gen1=2.91 gen2=8.34 loh=0.28 GB | marked stack=0.09GB/17ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=3.08GB/128ms dephandles=0.00GB/44ms newFQ=0.00GB/1ms bgcsaved=0.49GB/85ms
+ [drain] GC gen1 foreground 208 ms promoted0=0.90 promoted1=0.35 GB | gen0=0.00 gen1=0.91 gen2=8.35 loh=0.37 GB | marked stack=0.06GB/33ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.19GB/52ms dephandles=0.00GB/9ms newFQ=0.00GB/0ms bgcsaved=0.00GB/0ms
+ [drain] SUSPEND gc-prep 99 ms
+ [drain] GC gen0 foreground 200 ms promoted0=1.59 promoted1=0.00 GB | gen0=0.00 gen1=2.40 gen2=8.35 loh=0.37 GB | marked stack=0.08GB/12ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.49GB/110ms dephandles=0.00GB/106ms newFQ=0.00GB/1ms bgcsaved=0.00GB/0ms
+ [drain] GC gen1 blocking 342 ms promoted0=1.78 promoted1=2.13 GB | gen0=0.00 gen1=1.80 gen2=8.43 loh=0.28 GB | marked stack=0.20GB/126ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=3.67GB/142ms dephandles=0.00GB/66ms newFQ=0.00GB/0ms
+ [drain] GC gen0 blocking 128 ms promoted0=0.95 promoted1=0.00 GB | gen0=0.00 gen1=2.76 gen2=8.43 loh=0.30 GB | marked stack=0.06GB/15ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=0.89GB/40ms dephandles=0.00GB/5ms newFQ=0.00GB/0ms
+ [drain] GC gen1 blocking 432 ms promoted0=1.82 promoted1=2.73 GB | gen0=0.00 gen1=1.84 gen2=10.90 loh=0.30 GB | marked stack=0.14GB/38ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=4.40GB/134ms dephandles=0.00GB/23ms newFQ=0.00GB/0ms
+ [drain] GC gen1 blocking 305 ms promoted0=1.39 promoted1=1.80 GB | gen0=0.00 gen1=1.40 gen2=12.56 loh=0.30 GB | marked stack=0.18GB/67ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=3.01GB/83ms dephandles=0.00GB/17ms newFQ=0.00GB/0ms
+ [drain] GC gen0 foreground 195 ms promoted0=1.95 promoted1=0.00 GB | gen0=0.00 gen1=3.37 gen2=12.56 loh=0.31 GB | marked stack=0.18GB/62ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=1.77GB/54ms dephandles=0.00GB/53ms newFQ=0.00GB/0ms bgcsaved=0.00GB/0ms
+ [drain] GC gen1 foreground 462 ms promoted0=1.94 promoted1=3.32 GB | gen0=0.00 gen1=1.95 gen2=15.88 loh=0.31 GB | marked stack=0.31GB/88ms finalizeQ=0.00GB/0ms handles=0.00GB/0ms cards=4.94GB/177ms dephandles=0.00GB/94ms newFQ=0.00GB/0ms bgcsaved=0.01GB/4ms
+ [output] SUSPEND gc-prep 178 ms
+ RESULT batch=1 ticks=20 drain_ms=16528 output_ms=3505 counts_ms=22 view_rows=3585561 parquet_mb=126.3 drain_alloc_gib=48.72 gc_pause_ms=6770 gen2=7 jit_ms=4979 checkpoint_ms=3469 snapshot_mib=4879.6 written_mib=4879.6
+ VIEW broker_performance rows=23 digest=f2aaeb113dc48e47
+ VIEW customer_concentration rows=563 digest=2644430be94d40b7
+ VIEW dim_account rows=11055 digest=60d5ff0376df0b6e
+ VIEW dim_broker rows=15000 digest=25c6b2e7d0f917f6
+ VIEW dim_company rows=1500 digest=a911bd299a597806
+ VIEW dim_customer rows=6440 digest=807fa9533a023fcb
+ VIEW dim_date rows=25933 digest=635fbffd45e83a95
+ VIEW dim_security rows=1227 digest=505530c0c7b8856e
+ VIEW dim_trade rows=982180 digest=adcbebefce9f8872
+ VIEW fact_cash_balances rows=229343 digest=4b0a87366e8c21d3
+ VIEW fact_cash_transactions rows=229343 digest=641c5d80280fe57b
+ VIEW fact_holdings rows=912231 digest=5e30aa357255024f
+ VIEW fact_trade rows=129983 digest=340798186d7b3743
+ VIEW fact_watches rows=456028 digest=98abac5b6097f2ec
+ VIEW market_volatility rows=1796 digest=853b1a6daddf4d2d
+ VIEW trade_volume_stats rows=181 digest=ddb39f0d6bfa774a
+
+
+
+Test Run Successful.
+Total tests: 1
+     Passed: 1
+ Total time: 29.1865 Seconds
