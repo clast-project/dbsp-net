@@ -929,6 +929,62 @@ the remaining 155M).
 over 5 alternating runs. The offset operator follows if this holds. It has no numeric order value,
 so it needs a numeric prefix of its first ORDER BY key to keep its sort cheap.
 
+### 3.14 The window aggregate's input as blocks: built and measured (2026-11-02)
+
+**Built as planned (§3.13):** 3e86c63, c2e4020. Tests:
+- the bit-exact window test (§3.12) with a blocked arm, which also checks blocked against managed;
+- the lazy partition restore tests with a blocked arm;
+- the persistence conformance suite's blocks family, now with blocked windows.
+
+The suite passes 3,162 tests with blocks off, with `all`, with `all,window`, and with tiny runs.
+5 mutations were tried: 4 were caught, and the fifth (no idle freeze) only affects performance.
+The lazy-restore mutation survived until the lazy tests gained their blocked arm.
+
+**Found on the way: a bug on main, fixed separately.** `LAG(x, 1, 0.0)` over a DOUBLE emitted its
+default as a DECIMAL cell, because the constant was never cast to the value's type. Managed views
+carried it silently. The blocked view's encoder rejected it.
+
+**Three rounds of measurement:**
+1. **The first A/B grew the state** (objects 23M → 68M). The first checkpoint's full write called
+   `Materialize()`, which caches a decoded copy of the whole trace. Full writes now use
+   `MaterializeUncached`.
+2. **Drain was +4.1%.** The profile (CPU summed over workers) showed the union at 15.6 s against
+   2.1 s managed, while the integrate fell from 9.2 to 6.5 s. Most of the union was the sort. In
+   batch 1 every row sat next to its own delta copy, and each such tie cost a full structural
+   comparison. Consolidating first (decode the group, subtract the delta by lookup, then sort only
+   distinct rows) cut the sort from 10.1 s to 2.7 s.
+3. **What remains is decoding.** Each touched partition is decoded whole every tick, because a
+   running frame folds from the partition's start: about 10 s CPU in batch 1.
+
+**Census after the checkpoint** (SF=3, W=12, one run each):
+
+| | all | all,window |
+|---|---|---|
+| objects | 82.6M | 70.6M (−15%) |
+| references | 155.4M | 96.7M (−38%) |
+| bytes | 8.57 GB | 8.25 GB (−0.32 GB) |
+| WindowAggregate references | 60.9M | 1.4M |
+
+**Wall clock** (5 alternating runs per arm, one binary, outputs identical, medians, ms):
+
+| | all | all,window |
+|---|---|---|
+| batch-1 drain | 16,752 | 17,079 (+2.0%) |
+| batch-1 output write | 3,033 | 2,227 |
+| batch-1 GC pause | 5,899 | 6,292 (+6.7%) |
+| batch-1 checkpoint | 2,537 | 2,457 |
+| restart: restore | 222 | 264 (+19%) |
+| restart: first drain | 469 | 531 (+13%) |
+| batch 3 drain | 295 | 287 |
+
+**Not decided: left opt-in (`DBSPNET_TRACE_BLOCKS=window`).** The memory gain is large and the
+batch-1 gate holds. The restart costs about 100 ms more (restore plus first drain), because
+faulted partitions are decoded whole on first touch. The structural fix is algorithmic: a touch
+should read only the frame it changes, not the whole partition. That needs partial aggregates
+stored at block boundaries (a running frame's prefix, Feldera's tree of partial aggregates),
+after which decoding scales with the delta, not the partition. The offset operator waits on the
+same question.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
