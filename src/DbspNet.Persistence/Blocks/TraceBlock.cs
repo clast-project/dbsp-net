@@ -178,6 +178,35 @@ internal sealed class TraceBlock : ITraceBlock
 
     StructuralRow ITraceBlock.Key(int i) => Key(i);
 
+    StructuralRow ITraceBlock.KeyAliased(int i) => Key(i, aliasStrings: true);
+
+    /// <inheritdoc/>
+    public StructuralRow[] KeysAliased()
+    {
+        var kinds = Schema.KeyKinds;
+        var cells = new object?[Count][];
+        for (var i = 0; i < cells.Length; i++)
+        {
+            cells[i] = new object?[kinds.Length];
+        }
+
+        for (var c = 0; c < kinds.Length; c++)
+        {
+            for (var i = 0; i < cells.Length; i++)
+            {
+                cells[i][c] = Cell(c, kinds[c], i, aliasStrings: true);
+            }
+        }
+
+        var rows = new StructuralRow[cells.Length];
+        for (var i = 0; i < rows.Length; i++)
+        {
+            rows[i] = new StructuralRow(cells[i]);
+        }
+
+        return rows;
+    }
+
     StructuralRow ITraceBlock.Value(int i) => Value(i);
 
     void ITraceBlock.ValueCellsInto(int i, object?[] destination, int at) => ValueCellsInto(i, destination, at);

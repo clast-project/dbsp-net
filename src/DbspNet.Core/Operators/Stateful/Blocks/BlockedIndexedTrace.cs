@@ -533,6 +533,7 @@ internal sealed class BlockedIndexedTrace
     private IEnumerable<KeyValuePair<StructuralRow, Z64>> StreamRunsCore(Run[] runs)
     {
         var cursors = runs.Select(r => new Cursor(r)).ToArray();
+        var decoded = new (ITraceBlock? Block, StructuralRow[] Rows)[cursors.Length];
         var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
         while (true)
         {
@@ -554,8 +555,9 @@ internal sealed class BlockedIndexedTrace
 
             group.Clear();
             var sources = 0;
-            foreach (var c in cursors)
+            for (var r = 0; r < cursors.Length; r++)
             {
+                var c = cursors[r];
                 if (c.Done || c.Hash != hash)
                 {
                     continue;
@@ -564,7 +566,14 @@ internal sealed class BlockedIndexedTrace
                 sources++;
                 while (!c.Done && c.Hash == hash)
                 {
-                    var row = c.Block.Key(c.Index);
+                    // A block is decoded whole on entry, a column at a time, its strings aliasing the
+                    // block's bytes: what the Arrow write that reads these rows reads fastest.
+                    if (!ReferenceEquals(decoded[r].Block, c.Block))
+                    {
+                        decoded[r] = (c.Block, c.Block.KeysAliased());
+                    }
+
+                    var row = decoded[r].Rows[c.Index];
                     if (!Dropped(row, c.Run.Floor))
                     {
                         group.Add((row, NoValue, c.Block.Weight(c.Index)));

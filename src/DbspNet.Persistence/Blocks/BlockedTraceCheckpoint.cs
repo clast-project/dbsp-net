@@ -284,6 +284,10 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     public StructuralRow Key(int i) => Loaded.Key(i);
 
+    public StructuralRow KeyAliased(int i) => Loaded.Key(i, aliasStrings: true);
+
+    public StructuralRow[] KeysAliased() => Loaded.KeysAliased();
+
     public StructuralRow Value(int i) => Loaded.Value(i);
 
     public void ValueCellsInto(int i, object?[] destination, int at) => Loaded.ValueCellsInto(i, destination, at);
