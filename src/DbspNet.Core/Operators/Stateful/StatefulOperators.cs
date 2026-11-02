@@ -270,6 +270,27 @@ public static class StatefulOperators
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null,
         IFrontier? frontier = null)
+        where TKey : notnull =>
+        PartitionedWindowAggregate(
+            builder, input, partitionOf, order, orderValueOf, preceding, descending, aggregator, aggCount,
+            partitionComparer, snapshotCodec, frontier, blockFormat: null);
+
+    /// <summary>As the public overload, with the per-partition input held as blocks when
+    /// <paramref name="blockFormat"/> is set (docs/design-flat-trace-state.md §3.13).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> PartitionedWindowAggregate<TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, TKey> partitionOf,
+        IComparer<StructuralRow> order,
+        Func<StructuralRow, long>? orderValueOf,
+        long? preceding,
+        bool descending,
+        IAggregator<StructuralRow, StructuralRow> aggregator,
+        int aggCount,
+        IEqualityComparer<TKey>? partitionComparer,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Blocks.ITraceBlockFormat? blockFormat)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -303,9 +324,9 @@ public static class StatefulOperators
             return new StructuralRow(vs);
         }
 
-        return builder.PartitionedWindowAggregate<StructuralRow, StructuralRow, StructuralRow, TKey>(
+        return builder.AddPartitionedWindowAggregate<StructuralRow, StructuralRow, StructuralRow, TKey>(
             input, partitionOf, order, orderValueOf, preceding, descending,
-            aggregator, Widen, partitionComparer, snapshotCodec, frontier);
+            aggregator, Widen, partitionComparer, snapshotCodec, frontier, blockFormat);
     }
 
     /// <summary>
@@ -333,6 +354,28 @@ public static class StatefulOperators
         where TInRow : notnull
         where TAgg : notnull
         where TOutRow : notnull
+        where TKey : notnull =>
+        builder.AddPartitionedWindowAggregate(
+            input, partitionOf, order, orderValueOf, preceding, descending, aggregator, widen,
+            partitionComparer, snapshotCodec, frontier, blockFormat: null);
+
+    private static Stream<ZSet<TOutRow, Z64>> AddPartitionedWindowAggregate<TInRow, TAgg, TOutRow, TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TInRow, Z64>> input,
+        Func<TInRow, TKey> partitionOf,
+        IComparer<TInRow> order,
+        Func<TInRow, long>? orderValueOf,
+        long? preceding,
+        bool descending,
+        IAggregator<TInRow, TAgg> aggregator,
+        Func<TInRow, Optional<TAgg>, TOutRow> widen,
+        IEqualityComparer<TKey>? partitionComparer,
+        IZSetTraceCodec<TInRow, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Blocks.ITraceBlockFormat? blockFormat)
+        where TInRow : notnull
+        where TAgg : notnull
+        where TOutRow : notnull
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -345,7 +388,7 @@ public static class StatefulOperators
         var output = new Stream<ZSet<TOutRow, Z64>>(ZSet<TOutRow, Z64>.Empty);
         builder.AddRawOperator(new PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>(
             input, output, partitionOf, order, orderValueOf, preceding, descending,
-            aggregator, widen, partitionComparer, snapshotCodec, frontier));
+            aggregator, widen, partitionComparer, snapshotCodec, frontier, blockFormat));
         return output;
     }
 

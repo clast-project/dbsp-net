@@ -16,18 +16,33 @@ public sealed class WindowOldSideTests
 {
     private static readonly double[] Values = [1e16, -1e16, 1.0, 1.0, 0.1, 0.2, 3.3, -1e16, 1e16, 7.0, -0.3, 2.5];
 
-    public static TheoryData<string> Windows() => new()
-    {
+    private static readonly string[] WindowSql =
+    [
         "SUM(x) OVER (PARTITION BY p ORDER BY t)",
         "SUM(x) OVER (PARTITION BY p ORDER BY t RANGE BETWEEN 2 PRECEDING AND CURRENT ROW)",
         "SUM(x) OVER (PARTITION BY p)",
         "AVG(x) OVER (PARTITION BY p ORDER BY t DESC)",
         "LAG(x, 1, 0.0) OVER (PARTITION BY p ORDER BY t)",
-    };
+        "MIN(x) OVER (ORDER BY t)",
+    ];
+
+    // blocks: the window's input held as blocks (§3.13), with tiny runs so freezes and merges
+    // happen every tick; the fresh run is managed, so this also checks the two agree.
+    public static TheoryData<string, bool> Windows()
+    {
+        var data = new TheoryData<string, bool>();
+        foreach (var w in WindowSql)
+        {
+            data.Add(w, false);
+            data.Add(w, true);
+        }
+
+        return data;
+    }
 
     [Theory]
     [MemberData(nameof(Windows))]
-    public void IntegratedView_EqualsAFreshRun_EveryTick(string window)
+    public void IntegratedView_EqualsAFreshRun_EveryTick(string window, bool blocks)
     {
         string[] sql =
         [
@@ -35,7 +50,12 @@ public sealed class WindowOldSideTests
             $"CREATE VIEW w AS SELECT id, p, t, x, {window} AS s FROM t",
         ];
         var views = new HashSet<string>(["w"], StringComparer.Ordinal);
-        var program = SqlProgram.Compile(sql, views);
+        CompiledProgram program;
+        using (blocks ? DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false, freezeEntries: 3, blockEntries: 2, window: true) : null)
+        {
+            program = SqlProgram.Compile(sql, views);
+        }
+
         var rnd = new Random(window.Length);
         var live = new List<object?[]>();
         var next = 0;

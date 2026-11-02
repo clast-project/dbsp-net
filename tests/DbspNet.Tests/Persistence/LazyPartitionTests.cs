@@ -38,7 +38,13 @@ public class LazyPartitionTests
 
     private static readonly HashSet<string> Views = new(["lg", "rk", "top", "ws", "wr", "wm", "wd", "wa"], StringComparer.Ordinal);
 
-    private static CompiledProgram Compile() => SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
+    // blocks: the window aggregate's input held as blocks (docs/design-flat-trace-state.md §3.13),
+    // tiny so the state is in runs; a twin is always managed, so outputs also compare the two.
+    private static CompiledProgram Compile(bool blocks = false)
+    {
+        using var mode = blocks ? DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: true, freezeEntries: 4, blockEntries: 2, window: true) : null;
+        return SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
+    }
 
     private static void Load(CompiledProgram p)
     {
@@ -84,18 +90,20 @@ public class LazyPartitionTests
 
     private static int Resolved(object lazy) => (int)lazy.GetType().GetProperty("Resolved")!.GetValue(lazy)!;
 
-    [Fact]
-    public async Task RestoredPartitionedOperators_StayLazy_ReadOnlyTouchedPartitions_AndMatchTheirTwin()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoredPartitionedOperators_StayLazy_ReadOnlyTouchedPartitions_AndMatchTheirTwin(bool blocks)
     {
         using var layout = StateLayout.Use(true);
         var fs = new InMemoryTableFileSystem();
-        var producer = Compile();
+        var producer = Compile(blocks);
         var twin = Compile();
         Load(producer);
         Load(twin);
         await Snapshot.WriteAsync(producer.Circuit, fs);
 
-        var restored = Compile();
+        var restored = Compile(blocks);
         await Snapshot.ReadAsync(restored.Circuit, fs);
         var states = LazyStates(restored);
         Assert.Equal(
@@ -119,25 +127,27 @@ public class LazyPartitionTests
 
         // A delta checkpoint while partitions are cold, a second restore, then every partition.
         await Snapshot.WriteAsync(restored.Circuit, fs);
-        var again = Compile();
+        var again = Compile(blocks);
         await Snapshot.ReadAsync(again.Circuit, fs);
         Touch(again, 5, 0, Partitions);
         Touch(twin, 5, 0, Partitions);
         Assert.Equal(Digest(twin), Digest(again));
     }
 
-    [Fact]
-    public async Task AWholeStateWrite_WhilePartitionsAreCold_WritesEveryRow()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AWholeStateWrite_WhilePartitionsAreCold_WritesEveryRow(bool blocks)
     {
         using var layout = StateLayout.Use(true);
         var fs = new InMemoryTableFileSystem();
-        var producer = Compile();
+        var producer = Compile(blocks);
         var twin = Compile();
         Load(producer);
         Load(twin);
         await Snapshot.WriteAsync(producer.Circuit, fs);
 
-        var restored = Compile();
+        var restored = Compile(blocks);
         await Snapshot.ReadAsync(restored.Circuit, fs);
         Touch(restored, 1, 0, 3);
         Touch(twin, 1, 0, 3);
@@ -145,7 +155,7 @@ public class LazyPartitionTests
         // Another store: no chain extends into it, so every operator writes its whole state.
         var other = new InMemoryTableFileSystem();
         await Snapshot.WriteAsync(restored.Circuit, other);
-        var fromOther = Compile();
+        var fromOther = Compile(blocks);
         await Snapshot.ReadAsync(fromOther.Circuit, other);
         Touch(fromOther, 2, 0, Partitions);
         Touch(twin, 2, 0, Partitions);

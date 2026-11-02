@@ -2783,6 +2783,13 @@ public static partial class PlanToCircuit
 
         var frontier = ResolveWindowFrontier(plan, ctx);
 
+        // The per-partition input as blocks (§3.13): partition key → row, when every column has a
+        // block encoding and no frontier GC drops rows inside partitions.
+        var gc = frontier is not null && orderValueOf is not null && plan.Frame?.Preceding is not null && !descending;
+        var blockFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine && !gc
+            ? TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema)
+            : null;
+
         return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedWindowAggregate<StructuralRow>(
             input,
             PartitionOf,
@@ -2794,7 +2801,8 @@ public static partial class PlanToCircuit
             plan.Aggregates.Count,
             partitionComparer: null,
             snapshotCodec: codec,
-            frontier: frontier), Z("trace.arrows", reshardPlace, codec)));
+            frontier: frontier,
+            blockFormat: blockFormat), Z("trace.arrows", reshardPlace, codec)));
     }
 
     /// <summary>

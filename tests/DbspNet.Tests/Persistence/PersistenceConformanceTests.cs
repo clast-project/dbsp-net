@@ -97,7 +97,7 @@ public class PersistenceConformanceTests : IDisposable
         return data;
     }
 
-    // "blocks": the flat family with inner-join traces held as blocks (DBSPNET_TRACE_BLOCKS=join),
+    // "blocks": the flat family with traces held as blocks (DBSPNET_TRACE_BLOCKS=all,window),
     // freezing and cutting tiny so the snapshot holds runs (docs/design-flat-trace-state.md §3).
     private static readonly string[] Families = ["flat", "spine", "blocks"];
 
@@ -105,7 +105,7 @@ public class PersistenceConformanceTests : IDisposable
     {
         var stmts = new List<string>(Tables) { "CREATE VIEW out AS " + Shapes[shape] };
         using var blocks = family == "blocks"
-            ? TraceBlocksMode.Use(join: true, freezeEntries: 4, blockEntries: 2)
+            ? TraceBlocksMode.Use(join: true, freezeEntries: 4, blockEntries: 2, window: true)
             : TraceBlocksMode.Use(join: false);
         return SqlProgram.Compile(
             stmts,

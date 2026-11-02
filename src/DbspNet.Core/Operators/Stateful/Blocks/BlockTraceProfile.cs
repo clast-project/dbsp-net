@@ -23,8 +23,8 @@ internal static class BlockTraceProfile
     private static long _encodeTicks;
     private static long _blocks;
 
-    private static readonly long[] Sections = new long[8];
-    private static readonly long[] SectionBytes = new long[8];
+    private static readonly long[] Sections = new long[16];
+    private static readonly long[] SectionBytes = new long[16];
 
     internal static long Now() => Enabled ? Stopwatch.GetTimestamp() : 0;
 
