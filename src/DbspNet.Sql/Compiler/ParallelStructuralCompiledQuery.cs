@@ -284,7 +284,7 @@ public sealed class ParallelProgramOutput
             var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             var decoded = new IEnumerable<KeyValuePair<StructuralRow, Z64>>[_shards.Count];
             Parallel.For(0, _shards.Count, w =>
-                decoded[w] = _shards[w].IsCold ? _shards[w].EnumerateCurrent().ToList() : _shards[w].EnumerateCurrent());
+                decoded[w] = _shards[w].EnumerationDecodes ? _shards[w].EnumerateCurrent().ToList() : _shards[w].EnumerateCurrent());
             var tDecoded = System.Diagnostics.Stopwatch.GetTimestamp();
 
             var builder = new ZSetBuilder<StructuralRow, Z64>();

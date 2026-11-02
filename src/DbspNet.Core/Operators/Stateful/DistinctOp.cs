@@ -20,7 +20,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
 {
     private readonly Stream<ZSet<TKey, TWeight>> _input;
     private readonly Stream<ZSet<TKey, TWeight>> _output;
-    private readonly ZSetTrace<TKey, TWeight> _trace = new();
+    private readonly IRowTrace<TKey, TWeight> _trace;
     private readonly IZSetTraceCodec<TKey, TWeight>? _snapshotCodec;
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
@@ -38,8 +38,10 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
         Stream<ZSet<TKey, TWeight>> output,
         IZSetTraceCodec<TKey, TWeight>? snapshotCodec = null,
         IFrontier? frontier = null,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null,
+        IRowTrace<TKey, TWeight>? trace = null)
     {
+        _trace = trace ?? new ManagedRowTrace<TKey, TWeight>();
         _input = input;
         _output = output;
         _snapshotCodec = snapshotCodec;
@@ -50,6 +52,9 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
     /// <summary>Distinct keys retained in the trace. Exposed for GC-bound tests.</summary>
     internal int RetainedKeyCount => _trace.Count;
 
+    /// <summary>Whether the trace is held as blocks (DBSPNET_TRACE_BLOCKS).</summary>
+    internal bool IsBlocked => _trace is Blocks.BlockedZSetTrace;
+
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
@@ -59,7 +64,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
                 "to CircuitBuilder.Distinct to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "trace.arrows", _trace.State, cancellationToken);
+        return _trace.SaveAsync(_snapshotCodec, writer, "trace.arrows", cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -71,20 +76,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
         }
 
         // Lazily (increment 6): a row-ordered chain stays cold; Step reads the rows deltas touch.
-        if (_snapshotCodec is IColdZSetLoader<TKey, TWeight> coldLoader
-            && await coldLoader.LoadColdZSetAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false) is { } cold)
-        {
-            _trace.AdoptCold(cold);
-            return;
-        }
-
-        var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
-        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _trace.Integrate(loaded);
-        if (SnapshotRestoreProfile.Enabled)
-        {
-            SnapshotRestoreProfile.AddIntegrate(SnapshotRestoreProfile.MsSince(t0));
-        }
+        await _trace.LoadAsync(_snapshotCodec, reader, "trace.arrows", lazy: true, cancellationToken).ConfigureAwait(false);
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;
@@ -94,6 +86,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
         var delta = _input.Current;
         if (delta.IsEmpty)
         {
+            _trace.Idle();
             _output.SetCurrent(ZSet<TKey, TWeight>.Empty);
             CollectGarbage();
             return;
@@ -149,7 +142,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
 
     public string MetricName => "Distinct";
 
-    public long RetainedRows => _trace.State.Count;
+    public long RetainedRows => _trace.RetainedRows;
 
     public long LastOutputRows => _output.Current.Count;
 

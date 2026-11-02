@@ -48,6 +48,14 @@ internal interface ITraceBlock
     /// <summary>Entry <paramref name="i"/>'s key, decoded (strings copied).</summary>
     StructuralRow Key(int i);
 
+    /// <summary>Entry <paramref name="i"/>'s key, decoded with its strings aliasing the block's bytes
+    /// (immutable, so safe; the row keeps the block's bytes alive while it lives).</summary>
+    StructuralRow KeyAliased(int i);
+
+    /// <summary>Every entry's key, as <see cref="KeyAliased"/>, decoded a column at a time so each
+    /// column's cells are allocated together — what a column-wise reader (an Arrow write) reads fastest.</summary>
+    StructuralRow[] KeysAliased();
+
     /// <summary>Entry <paramref name="i"/>'s value, decoded (strings copied).</summary>
     StructuralRow Value(int i);
 

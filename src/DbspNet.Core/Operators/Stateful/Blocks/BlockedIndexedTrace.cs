@@ -44,13 +44,44 @@ internal interface ITraceVisitor
 /// </remarks>
 internal sealed class BlockedIndexedTrace
 {
-    private sealed class Managed(IndexedZSet<StructuralRow, StructuralRow, Z64> set, long entries)
+    // A managed level: an indexed delta, or (a Z-set trace, §3.7) a Z-set delta whose rows are
+    // keys with the empty value.
+    private sealed class Managed(IndexedZSet<StructuralRow, StructuralRow, Z64>? set, ZSet<StructuralRow, Z64>? rows, long entries)
     {
-        public IndexedZSet<StructuralRow, StructuralRow, Z64> Set { get; } = set;
+        public IndexedZSet<StructuralRow, StructuralRow, Z64>? Set { get; } = set;
+
+        public ZSet<StructuralRow, Z64>? Rows { get; } = rows;
 
         public long Entries { get; } = entries;
 
         public long Floor { get; set; } = long.MinValue;
+
+        public ZSet<StructuralRow, Z64> Group(StructuralRow key) =>
+            Rows is { } rows
+                ? rows.WeightOf(key) is { Value: not 0 } w ? ZSet<StructuralRow, Z64>.Inline(NoValue, w) : ZSet<StructuralRow, Z64>.Empty
+                : Set!.GroupFor(key);
+
+        /// <summary>Every entry, as (key, value, weight).</summary>
+        public IEnumerable<(StructuralRow Key, StructuralRow Value, Z64 Weight)> AllEntries()
+        {
+            if (Rows is { } rows)
+            {
+                foreach (var (row, weight) in rows)
+                {
+                    yield return (row, NoValue, weight);
+                }
+
+                yield break;
+            }
+
+            foreach (var (key, group) in Set!)
+            {
+                foreach (var (value, weight) in group)
+                {
+                    yield return (key, value, weight);
+                }
+            }
+        }
     }
 
     internal sealed class Run(ITraceBlock[] blocks, long entries)
@@ -166,8 +197,31 @@ internal sealed class BlockedIndexedTrace
             entries += group.Count;
         }
 
-        _managed.Add(new Managed(delta, entries));
-        _managedEntries += entries;
+        Push(new Managed(delta, null, entries));
+    }
+
+    /// <summary>The value of every entry of a Z-set trace (<see cref="IntegrateRows"/>): no columns.</summary>
+    internal static readonly StructuralRow NoValue = new([]);
+
+    /// <summary>Push a Z-set delta as a new managed level: each row a key with the empty value
+    /// (<see cref="NoValue"/>; the format has no value columns). A trace takes Z-set or indexed
+    /// deltas, never both. The trace keeps it, so it must not be mutated afterwards.</summary>
+    public void IntegrateRows(ZSet<StructuralRow, Z64> delta)
+    {
+        ArgumentNullException.ThrowIfNull(delta);
+        if (delta.IsEmpty)
+        {
+            return;
+        }
+
+        _materialized = null;
+        Push(new Managed(null, delta, delta.Count));
+    }
+
+    private void Push(Managed level)
+    {
+        _managed.Add(level);
+        _managedEntries += level.Entries;
         if (_managedEntries >= _freezeEntries || _managed.Count > _maxManaged)
         {
             Freeze();
@@ -280,7 +334,17 @@ internal sealed class BlockedIndexedTrace
                 continue;
             }
 
-            foreach (var (value, weight) in level.Set.GroupFor(key))
+            if (level.Rows is { } rows)
+            {
+                if (rows.WeightOf(key) is { Value: not 0 } w)
+                {
+                    visitor.Row(NoValue, w);
+                }
+
+                continue;
+            }
+
+            foreach (var (value, weight) in level.Set!.GroupFor(key))
             {
                 visitor.Row(value, weight);
             }
@@ -329,7 +393,7 @@ internal sealed class BlockedIndexedTrace
         var managed = new List<ZSet<StructuralRow, Z64>>();
         foreach (var level in _managed)
         {
-            if (projected >= level.Floor && level.Set.GroupFor(key) is { IsEmpty: false } group)
+            if (projected >= level.Floor && level.Group(key) is { IsEmpty: false } group)
             {
                 managed.Add(group);
             }
@@ -399,14 +463,9 @@ internal sealed class BlockedIndexedTrace
         var builder = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
         foreach (var level in _managed)
         {
-            foreach (var (key, group) in level.Set)
+            foreach (var (key, value, weight) in level.AllEntries())
             {
-                if (Dropped(key, level.Floor))
-                {
-                    continue;
-                }
-
-                foreach (var (value, weight) in group)
+                if (!Dropped(key, level.Floor))
                 {
                     builder.Add(key, value, weight);
                 }
@@ -432,6 +491,110 @@ internal sealed class BlockedIndexedTrace
         return _materialized = builder.Build();
     }
 
+    /// <summary>A Z-set trace's net contents (<see cref="IntegrateRows"/>): every row with a non-zero
+    /// weight. Not cached: the caller decides how long to hold it.</summary>
+    public ZSet<StructuralRow, Z64> MaterializeRows()
+    {
+        var builder = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var level in _managed)
+        {
+            foreach (var (row, weight) in level.Rows ?? throw new InvalidOperationException("not a Z-set trace"))
+            {
+                if (!Dropped(row, level.Floor))
+                {
+                    builder.Add(row, weight);
+                }
+            }
+        }
+
+        foreach (var run in _runs)
+        {
+            foreach (var block in run.Blocks)
+            {
+                for (var i = 0; i < block.Count; i++)
+                {
+                    var row = block.Key(i);
+                    if (!Dropped(row, run.Floor))
+                    {
+                        builder.Add(row, new Z64(block.Weight(i)));
+                    }
+                }
+            }
+        }
+
+        return builder.Build();
+    }
+
+    /// <summary>A Z-set trace's net contents streamed from its runs in hash order, consolidated across
+    /// runs without forming the whole set; null while managed levels wait (the caller materialises).</summary>
+    public IEnumerable<KeyValuePair<StructuralRow, Z64>>? StreamRows() =>
+        _managed.Count > 0 ? null : StreamRunsCore([.. _runs]);
+
+    private IEnumerable<KeyValuePair<StructuralRow, Z64>> StreamRunsCore(Run[] runs)
+    {
+        var cursors = runs.Select(r => new Cursor(r)).ToArray();
+        var decoded = new (ITraceBlock? Block, StructuralRow[] Rows)[cursors.Length];
+        var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
+        while (true)
+        {
+            var hash = uint.MaxValue;
+            var any = false;
+            foreach (var c in cursors)
+            {
+                if (!c.Done && (!any || c.Hash < hash))
+                {
+                    hash = c.Hash;
+                    any = true;
+                }
+            }
+
+            if (!any)
+            {
+                yield break;
+            }
+
+            group.Clear();
+            var sources = 0;
+            for (var r = 0; r < cursors.Length; r++)
+            {
+                var c = cursors[r];
+                if (c.Done || c.Hash != hash)
+                {
+                    continue;
+                }
+
+                sources++;
+                while (!c.Done && c.Hash == hash)
+                {
+                    // A block is decoded whole on entry, a column at a time, its strings aliasing the
+                    // block's bytes: what the Arrow write that reads these rows reads fastest.
+                    if (!ReferenceEquals(decoded[r].Block, c.Block))
+                    {
+                        decoded[r] = (c.Block, c.Block.KeysAliased());
+                    }
+
+                    var row = decoded[r].Rows[c.Index];
+                    if (!Dropped(row, c.Run.Floor))
+                    {
+                        group.Add((row, NoValue, c.Block.Weight(c.Index)));
+                    }
+
+                    c.Advance();
+                }
+            }
+
+            if (sources > 1)
+            {
+                Consolidate(group);
+            }
+
+            foreach (var (row, _, weight) in group)
+            {
+                yield return new KeyValuePair<StructuralRow, Z64>(row, new Z64(weight));
+            }
+        }
+    }
+
     /// <summary>Consolidate the managed levels into one run, then merge runs geometrically.</summary>
     public void Freeze()
     {
@@ -441,13 +604,18 @@ internal sealed class BlockedIndexedTrace
         }
 
         var t0 = BlockTraceProfile.Now();
+        if (_managed[0].Rows is not null)
+        {
+            FreezeRows(t0);
+            return;
+        }
 
         // One level with no floor is already consolidated: freeze it as it is. Otherwise sum the
         // levels (dropping what their floors cover) first.
         IndexedZSet<StructuralRow, StructuralRow, Z64> source;
         if (_managed.Count == 1 && _managed[0].Floor == long.MinValue)
         {
-            source = _managed[0].Set;
+            source = _managed[0].Set!;
         }
         else
         {
@@ -455,7 +623,7 @@ internal sealed class BlockedIndexedTrace
             var dropped = new HashSet<StructuralRow>();
             foreach (var level in _managed)
             {
-                foreach (var (key, group) in level.Set)
+                foreach (var (key, group) in level.Set!)
                 {
                     if (Dropped(key, level.Floor))
                     {
@@ -518,6 +686,84 @@ internal sealed class BlockedIndexedTrace
         if (BlockTraceProfile.Enabled)
         {
             BlockTraceProfile.Freeze(t0, entries);
+        }
+
+        Compact();
+    }
+
+    // Freeze for a Z-set trace: the levels' rows summed (unless one level, unfloored, already is),
+    // sorted by hash, each a key with the empty value.
+    private void FreezeRows(long t0)
+    {
+        ZSet<StructuralRow, Z64> source;
+        if (_managed.Count == 1 && _managed[0].Floor == long.MinValue)
+        {
+            source = _managed[0].Rows!;
+        }
+        else
+        {
+            var builder = new ZSetBuilder<StructuralRow, Z64>();
+            var dropped = new HashSet<StructuralRow>();
+            foreach (var level in _managed)
+            {
+                foreach (var (row, weight) in level.Rows!)
+                {
+                    if (Dropped(row, level.Floor))
+                    {
+                        dropped.Add(row);
+                    }
+                    else
+                    {
+                        builder.Add(row, weight);
+                    }
+                }
+            }
+
+            DroppedKeys += dropped.Count;
+            source = builder.Build();
+        }
+
+        _managed.Clear();
+        _managedEntries = 0;
+
+        var count = source.Count;
+        var hashes = ArrayPool<uint>.Shared.Rent(count);
+        var rows = ArrayPool<KeyValuePair<StructuralRow, Z64>>.Shared.Rent(count);
+        var g = 0;
+        try
+        {
+            foreach (var entry in source)
+            {
+                if (entry.Value.Value == 0)
+                {
+                    continue;
+                }
+
+                hashes[g] = (uint)_hash(entry.Key);
+                rows[g++] = entry;
+            }
+
+            Array.Sort(hashes, rows, 0, g);
+            var run = new RunBuilder(this);
+            for (var i = 0; i < g; i++)
+            {
+                run.Add(hashes[i], rows[i].Key, NoValue, rows[i].Value.Value);
+            }
+
+            if (run.Finish() is { } frozen)
+            {
+                _runs.Insert(0, frozen);
+            }
+        }
+        finally
+        {
+            ArrayPool<KeyValuePair<StructuralRow, Z64>>.Shared.Return(rows, clearArray: true);
+            ArrayPool<uint>.Shared.Return(hashes);
+        }
+
+        if (BlockTraceProfile.Enabled)
+        {
+            BlockTraceProfile.Freeze(t0, g);
         }
 
         Compact();

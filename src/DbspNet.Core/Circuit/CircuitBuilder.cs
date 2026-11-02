@@ -133,6 +133,20 @@ public sealed class CircuitBuilder
         return (output, new IntegratedViewHandle<TRow>(op));
     }
 
+    /// <summary>A stored output view of structural rows held as blocks
+    /// (docs/design-flat-trace-state.md §3.7); otherwise as <see cref="Integrate{TRow}"/>.</summary>
+    internal (Stream<ZSet<StructuralRow, Z64>> Output, IntegratedViewHandle<StructuralRow> View) BlockedIntegrate(
+        Stream<ZSet<StructuralRow, Z64>> input,
+        DbspNet.Core.Operators.Stateful.Blocks.ITraceBlockFormat format,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        var op = new IntegrateOp<StructuralRow>(input, output, snapshotCodec, new DbspNet.Core.Operators.Stateful.Blocks.BlockedZSetTrace(format));
+        AddRawOperator(op);
+        return (output, new IntegratedViewHandle<StructuralRow>(op));
+    }
+
     /// <summary>
     /// Register a raw operator with the circuit in topological order.
     /// Internal hook used by stateful operators that need direct control

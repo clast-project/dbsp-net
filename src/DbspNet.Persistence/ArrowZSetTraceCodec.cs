@@ -29,7 +29,8 @@ namespace DbspNet.Persistence;
 /// <c>__weight</c> — same convention as <c>WalRecorder</c> uses for
 /// input replay.
 /// </remarks>
-internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>, Runs.IZSetRunCodec, IColdRowLoader<StructuralRow>, IColdZSetLoader<StructuralRow, Z64>
+internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>, Runs.IZSetRunCodec, IColdRowLoader<StructuralRow>, IColdZSetLoader<StructuralRow, Z64>,
+    DbspNet.Core.Operators.Stateful.Blocks.IBlockedTraceCodec, Blocks.BlockedTraceCheckpoint.ILayout
 {
     private readonly SqlSchema _rowSchema;
     private readonly ArrowSchema _arrowDataSchema;
@@ -47,6 +48,36 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
     }
 
     public string SchemaFingerprint { get; }
+
+    // A blocked Z-set trace (docs/design-flat-trace-state.md §3.7): the rows are keys with no value
+    // columns, so its blocks have this codec's run layout, and its checkpoint is a Z-set chain.
+    Runs.RunFile.Kind Blocks.BlockedTraceCheckpoint.ILayout.Kind => Runs.RunFile.Kind.ZSet;
+
+    Blocks.BlockSchema? Blocks.BlockedTraceCheckpoint.ILayout.Blocks => _blocks ??= Blocks.BlockSchema.TryCreate(_rowSchema, SqlSchema.Empty);
+
+    private Blocks.BlockSchema? _blocks;
+
+    ValueTask Blocks.BlockedTraceCheckpoint.ILayout.SaveWholeAsync(
+        ISnapshotWriter writer, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        SaveAsync(writer, fileName, trace.MaterializeRows(), cancellationToken);
+
+    async ValueTask Blocks.BlockedTraceCheckpoint.ILayout.LoadWholeAsync(
+        ISnapshotReader reader, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        trace.IntegrateRows(await LoadAsync(reader, fileName, cancellationToken).ConfigureAwait(false));
+
+    async ValueTask<bool> Blocks.BlockedTraceCheckpoint.ILayout.MatchesAsync(
+        Runs.RunChain chain, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        (await Blocks.BlockedTraceCheckpoint.ReadZSetAsync(chain, this, cancellationToken).ConfigureAwait(false)).Equals(trace.MaterializeRows());
+
+    /// <inheritdoc/>
+    public ValueTask SaveBlockedAsync(
+        ISnapshotWriter writer, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        Blocks.BlockedTraceCheckpoint.SaveAsync(this, writer, fileName, trace, cancellationToken);
+
+    /// <inheritdoc/>
+    public ValueTask LoadBlockedAsync(
+        ISnapshotReader reader, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        Blocks.BlockedTraceCheckpoint.LoadAsync(this, reader, fileName, trace, cancellationToken);
 
     /// <summary>Write <paramref name="trace"/>: as a run when <see cref="Runs.StateLayout.Runs"/>
     /// is on (docs/design-durable-state.md §1f) — inside a checkpoint, as an incremental chain of

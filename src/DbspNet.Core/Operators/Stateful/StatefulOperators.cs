@@ -89,6 +89,23 @@ public static class StatefulOperators
         return output;
     }
 
+    /// <summary>DISTINCT over structural rows with its trace held as blocks
+    /// (<see cref="Blocks.BlockedZSetTrace"/>, docs/design-flat-trace-state.md §3.7).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> BlockedDistinct(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Blocks.ITraceBlockFormat format,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new DistinctOp<StructuralRow, Z64>(
+            input, output, snapshotCodec, frontier, monotoneKey, new Blocks.BlockedZSetTrace(format)));
+        return output;
+    }
+
     /// <summary>
     /// Incremental TOP-K (<c>ORDER BY … LIMIT [OFFSET]</c>): keep the rows
     /// occupying sort positions <c>[offset, offset + limit)</c> under

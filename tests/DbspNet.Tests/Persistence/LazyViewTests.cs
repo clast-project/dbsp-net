@@ -76,6 +76,8 @@ public class LazyViewTests
     [Fact]
     public async Task ARestoredView_StaysCold_CountsExactly_AndStreamsItsFullWrite()
     {
+        // The managed view's cold restore (block-held views restore their own way, §3.7).
+        using var managed = DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false);
         using var layout = StateLayout.Use(true);
         var fs = new InMemoryTableFileSystem();
         var producer = Compile();
@@ -140,6 +142,8 @@ public class LazyViewTests
     [Fact]
     public async Task ADeltaReachingMostOfAColdView_ReadsTheRestInOnePass()
     {
+        // The managed view's cold restore (block-held views restore their own way, §3.7).
+        using var managed = DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false);
         // A small view whose every row a global value changes (here: each row carries the table's
         // total) retracts and re-inserts all of it each tick. Probing row by row costs ~0.1 ms a row;
         // the trace reads the rest of the cold rows in one pass instead. A small change still probes.
