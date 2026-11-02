@@ -1263,9 +1263,9 @@ runtime suspensions with no GC and their reason. Fresh-process restart, SF=3, W=
   direction), not a setting. The larger first-batch gap is now the output write after a lazy
   restore — 3.4–3.5 s vs 2.1 s after an eager restore — of which GC is under a tenth.
 
-### Giant groups decoded without sharing (2026-11-01, branch arc/giant-group-arena)
+### Giant groups decoded without sharing (2026-11-01)
 
-The flat-trace-state census (`IVM_STATE_CENSUS=1`, docs/design-flat-trace-state.md) attributed
+The flat-trace-state census (`IVM_STATE_CENSUS=1`, the retained-state walk in tests/DbspNet.Tests/Scratch/StateCensus.cs) attributed
 what the first batch after a fresh restart retains: **97.7% of it (1.88 GB, 53.2M objects) was
 the giant groups of three inner-join left traces**, decoded in the background at restore and taken
 by the first probes. They were decoded with `StringDecoding.Copy` and one box per cell: **28 objects
