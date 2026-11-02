@@ -396,6 +396,42 @@ Notes on the misses:
 - **w1profile B/ev** was not measured. w1profile compiles single queries, which take the typed path
   when they can, so the blocked join probably never engages there. That is unverified.
 
+### 3.2 Residual joins and the first checkpoint (2026-11-02)
+
+**Residual joins.** These now use `BlockedJoinOp`. The compiled residual reads cells through
+`IReadOnlyList<object?>`'s indexer, so it runs on one reusable view of each candidate pair. That
+view boxes only the cells the residual reads, from a block, and a rejected pair builds no row.
+
+**First checkpoint.** Two causes, found with section timers:
+
+1. **Levels still managed at the end of the batch froze inside the checkpoint's batch GC latency
+   mode.** A join now freezes its managed levels on an idle tick, when both input deltas are empty.
+   19.4M entries freeze during batch 1, against 9.2M before.
+2. **Writing giant groups was expensive.** A giant group whose hash spans blocks in memory was
+   decoded and re-encoded to keep v3's one-hash-per-block rule on disk: 36 s summed, because 16M
+   entries sit in giant groups. `BlockWriter.Concat` now joins the blocks at the byte level: 3.3 s.
+
+**Gates, re-measured** (5 alternating runs per arm, clean build, view digests identical):
+
+| measurement | managed | blocked |
+|---|---|---|
+| batch-1 drain, median (range) | 16,167 ms (15,768–16,214) | 16,269 ms (16,087–16,844): **+0.6%, met** |
+| batch-1 drain GC pause, median | 5,205 ms | 5,345 ms |
+| batch-1 output write, median | 5,075 ms | 3,663 ms (−28%) |
+| batch-1 checkpoint (first, whole), median | 4,678 ms | 3,583 ms (−23%): **met** |
+| restart: restore, median | 352 ms | 252 ms |
+| restart: first drain, median | 746 ms | 363 ms (−51%) |
+| restart: drain GC pause, median | 156 ms | 39 ms |
+| restart: output write / batch-2 checkpoint | 3,391 / 277 ms | 3,387 / 286 ms |
+| census after the batch-1 checkpoint: inner-join references | 237.1M | 6.47M (**−97.3%, met**) |
+| census: whole heap, references / objects / bytes | 592M / 168M / 10.8 GB | 385M (−35%) / 151M (−10%) / 10.8 GB |
+
+The heap-wide object and byte counts barely move. Rows the join traces held are mostly still
+reachable from other operators (views, aggregates, window state), so freeing them needs those
+converted too: the widening order of §3. The remaining 5.5M join references are in joins that
+stayed managed (a column type without a block encoding, or a typed or spine path); not yet
+attributed.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
