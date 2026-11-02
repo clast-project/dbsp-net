@@ -364,27 +364,34 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     private List<Entry> ReadUnion(StructuralRow key, PartitionDelta pd, long from, long to, bool needPrefix, out object? before)
     {
         var current = _store!.Read(key, from, to, needPrefix, out before);
-        var dws = new Dictionary<TInRow, long>(pd.Rows.Count);
+
+        // One lookup per row read: the delta's weight, and whether the row was found — a delta row
+        // never found was taken out entirely.
+        var dws = new Dictionary<TInRow, (long Dw, bool Seen)>(pd.Rows.Count);
         foreach (var (row, dw) in pd.Rows)
         {
-            dws[row] = dw;
+            dws[row] = (dw, false);
         }
 
-        // Rows the delta took out entirely: in the delta, absent from what was read.
-        var present = new HashSet<TInRow>();
-        foreach (var (row, _, _) in current)
+        var olds = new long[current.Count];
+        for (var i = 0; i < current.Count; i++)
         {
-            var r = As<TInRow>(row);
-            if (dws.ContainsKey(r))
+            ref var slot = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(dws, As<TInRow>(current[i].Row));
+            if (!System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
             {
-                present.Add(r);
+                slot.Seen = true;
+                olds[i] = current[i].Weight - slot.Dw;
+            }
+            else
+            {
+                olds[i] = current[i].Weight;
             }
         }
 
         var gone = new List<Entry>();
-        foreach (var (row, dw) in pd.Rows)
+        foreach (var (row, (dw, seen)) in dws)
         {
-            if (!present.Contains(row))
+            if (!seen)
             {
                 gone.Add(new Entry(row, -dw, 0, _orderValueOf?.Invoke(row) ?? 0L));
             }
@@ -393,10 +400,10 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         gone.Sort(CompareEntries);
         var rows = new List<Entry>(current.Count + gone.Count);
         var g = 0;
-        foreach (var (row, weight, value) in current)
+        for (var i = 0; i < current.Count; i++)
         {
-            var r = As<TInRow>(row);
-            var e = new Entry(r, weight - dws.GetValueOrDefault(r), weight, value);
+            var (row, weight, value) = current[i];
+            var e = new Entry(As<TInRow>(row), olds[i], weight, value);
             while (g < gone.Count && CompareEntries(gone[g], e) < 0)
             {
                 rows.Add(gone[g++]);
