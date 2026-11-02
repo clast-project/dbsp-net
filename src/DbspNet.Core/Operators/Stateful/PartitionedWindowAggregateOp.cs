@@ -71,10 +71,11 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     // Per-partition integrated input, sorted by the total-order comparer.
     private readonly Dictionary<TKey, SortedDictionary<TInRow, long>> _accum;
 
-    // Or, under DBSPNET_TRACE_BLOCKS=window (docs/design-flat-trace-state.md §3.13), the same
-    // integral as reference-free blocks keyed by partition, each row a value; _accum then stays
-    // empty. Only for structural rows and keys (TInRow = TKey = StructuralRow), without frontier GC.
-    private readonly Blocks.BlockedIndexedTrace? _blocks;
+    // Or, under DBSPNET_TRACE_BLOCKS=window (docs/design-flat-trace-state.md §3.13, §3.15), the same
+    // integral reference-free: small partitions in a shared trace, large ones as ordered chunks
+    // with partial aggregates; _accum then stays empty. Only for structural rows and keys
+    // (TInRow = TKey = StructuralRow), without frontier GC.
+    private readonly Blocks.OrderedPartitionStore? _store;
 
     // Incremental checkpoints (docs/design-durable-state.md §1f, increment 3): the snapshot is
     // the integral of the input, so the change since the last checkpoint is the inputs since.
@@ -104,7 +105,8 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null,
         IFrontier? frontier = null,
-        Blocks.ITraceBlockFormat? blockFormat = null)
+        Blocks.ITraceBlockFormat? blockFormat = null,
+        Blocks.ITraceBlockFormat? chunkFormat = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -137,8 +139,16 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 throw new ArgumentException("Blocked window state does not support frontier GC.", nameof(blockFormat));
             }
 
-            _blocks = new Blocks.BlockedIndexedTrace(
-                blockFormat, Blocks.TraceBlocksMode.FreezeEntries, blockEntries: Blocks.TraceBlocksMode.BlockEntries);
+            _store = new Blocks.OrderedPartitionStore(
+                blockFormat,
+                chunkFormat ?? throw new ArgumentNullException(nameof(chunkFormat)),
+                _orderValueOf is null ? null : row => _orderValueOf(As<TInRow>(row)),
+                (IComparer<StructuralRow>)(object)_order,
+                aggregator as Aggregators.IPartialAggregator<StructuralRow, StructuralRow>,
+                Blocks.TraceBlocksMode.FreezeEntries,
+                Blocks.TraceBlocksMode.BlockEntries,
+                promoteAt: Blocks.TraceBlocksMode.PromoteRows,
+                chunkRows: Blocks.TraceBlocksMode.ChunkRows);
         }
     }
 
@@ -149,29 +159,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
     private static T As<T>(StructuralRow row) => (T)(object)row;
 
-    // A tick's delta (or restored rows) into the blocked integral: one level, or one run when
-    // large (sorted and encoded once, §3.10).
-    private void IntegrateBlocks(List<(TInRow Row, long Weight)> rows)
-    {
-        if (rows.Count == 0)
-        {
-            return;
-        }
-
-        if (rows.Count >= Blocks.TraceBlocksMode.FreezeEntries)
-        {
-            _blocks!.IntegrateEntries(rows.Count, i => S(_partitionOf(rows[i].Row)), i => S(rows[i].Row), i => rows[i].Weight);
-            return;
-        }
-
-        var indexed = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-        foreach (var (row, weight) in rows)
-        {
-            indexed.Add(S(_partitionOf(row)), S(row), new Z64(weight));
-        }
-
-        _blocks!.Integrate(indexed.Build());
-    }
+    // A tick's delta (or restored rows) into the ordered store (§3.15).
+    private void IntegrateBlocks(List<(TInRow Row, long Weight)> rows) =>
+        _store!.Integrate([.. rows.Select(e => (S(_partitionOf(e.Row)), S(e.Row), e.Weight))]);
 
     /// <summary>Total input rows currently retained across all partitions —
     /// exposed for tests that assert frontier-driven GC keeps state bounded.</summary>
@@ -179,9 +169,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     {
         get
         {
-            if (_blocks is not null)
+            if (_store is not null)
             {
-                return _blocks.MaterializeUncached().Sum(g => g.Value.Count);
+                return _store.All().Count();
             }
 
             var n = 0;
@@ -234,7 +224,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
             // Integrate.
             var tIntegrate = Blocks.BlockTraceProfile.Now();
-            if (_blocks is not null)
+            if (_store is not null)
             {
                 IntegrateBlocks([.. delta.Select(kv => (kv.Key, kv.Value.Value))]);
             }
@@ -285,7 +275,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             // An idle tick moves the blocked integral's managed levels into runs off the
             // checkpoint's path (§3.2).
-            _blocks?.Freeze();
+            _store?.Freeze();
         }
 
         CollectGarbage();
@@ -367,70 +357,82 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         Entry Gone(TInRow row) => new(row, -dws[row], 0, _orderValueOf?.Invoke(row) ?? 0L);
     }
 
-    /// <summary>As <see cref="Union"/>, for a partition read from blocks (§3.13): its rows decoded
-    /// and consolidated, the delta subtracted by lookup (a row caches its hash), and the distinct
-    /// rows then sorted once by (order value, total order). Ties reach the structural comparer only
-    /// for real peers: sorting the delta's rows alongside the partition's put every row next to its
-    /// own copy, and each such tie cost a full structural comparison.</summary>
-    private List<Entry> UnionBySort(StructuralRow key, PartitionDelta pd)
+    /// <summary>As <see cref="Union"/>, for a partition in the ordered store (§3.15): the rows it
+    /// returns for [<paramref name="from"/>, <paramref name="to"/>] (already ordered and
+    /// consolidated, after the delta), the delta subtracted by lookup, and the rows the delta
+    /// removed merged in by (order value, total order). No sort of the partition.</summary>
+    private List<Entry> ReadUnion(StructuralRow key, PartitionDelta pd, long from, long to, bool needPrefix, out object? before)
     {
-        var current = _blocks!.GroupView(key).Decoded();
-        var dws = new Dictionary<TInRow, long>(pd.Rows.Count);
+        var current = _store!.Read(key, from, to, needPrefix, out before);
+
+        // One lookup per row read: the delta's weight, and whether the row was found — a delta row
+        // never found was taken out entirely.
+        var dws = new Dictionary<TInRow, (long Dw, bool Seen)>(pd.Rows.Count);
         foreach (var (row, dw) in pd.Rows)
         {
-            dws[row] = dw;
+            dws[row] = (dw, false);
         }
 
-        var rows = new List<Entry>(current.Count + pd.Rows.Count);
-        foreach (var (value, weight) in current)
+        var olds = new long[current.Count];
+        for (var i = 0; i < current.Count; i++)
         {
-            var row = As<TInRow>(value);
-            rows.Add(new Entry(row, weight.Value - dws.GetValueOrDefault(row), weight.Value, _orderValueOf?.Invoke(row) ?? 0L));
-        }
-
-        foreach (var (row, dw) in pd.Rows)
-        {
-            if (current.WeightOf(S(row)).Value == 0)
+            ref var slot = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(dws, As<TInRow>(current[i].Row));
+            if (!System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
             {
-                rows.Add(new Entry(row, -dw, 0, _orderValueOf?.Invoke(row) ?? 0L)); // gone: it was there at -dw
+                slot.Seen = true;
+                olds[i] = current[i].Weight - slot.Dw;
+            }
+            else
+            {
+                olds[i] = current[i].Weight;
             }
         }
 
-        var tSort = Blocks.BlockTraceProfile.Now();
-        rows.Sort((a, b) =>
+        var gone = new List<Entry>();
+        foreach (var (row, (dw, seen)) in dws)
         {
-            var c = a.Value.CompareTo(b.Value);
-            return c != 0 ? c : _order.Compare(a.Row, b.Row);
-        });
-        if (Blocks.BlockTraceProfile.Enabled)
+            if (!seen)
+            {
+                gone.Add(new Entry(row, -dw, 0, _orderValueOf?.Invoke(row) ?? 0L));
+            }
+        }
+
+        gone.Sort(CompareEntries);
+        var rows = new List<Entry>(current.Count + gone.Count);
+        var g = 0;
+        for (var i = 0; i < current.Count; i++)
         {
-            Blocks.BlockTraceProfile.Section(13, tSort, rows.Count);
+            var (row, weight, value) = current[i];
+            var e = new Entry(As<TInRow>(row), olds[i], weight, value);
+            while (g < gone.Count && CompareEntries(gone[g], e) < 0)
+            {
+                rows.Add(gone[g++]);
+            }
+
+            rows.Add(e);
+        }
+
+        while (g < gone.Count)
+        {
+            rows.Add(gone[g++]);
         }
 
         return rows;
     }
 
+    private int CompareEntries(Entry a, Entry b)
+    {
+        var c = a.Value.CompareTo(b.Value);
+        return c != 0 ? c : _order.Compare(a.Row, b.Row);
+    }
+
+    private static long Saturating(long a, long b) =>
+        b > 0 && a > long.MaxValue - b ? long.MaxValue : b < 0 && a < long.MinValue - b ? long.MinValue : a + b;
+
     /// <summary>Recompute the output rows of one partition whose frame the delta could have
     /// changed, on both sides of the delta, and emit the difference.</summary>
     private void RecomputePartition(ZSetBuilder<TOutRow, Z64> builder, TKey key, PartitionDelta pd)
     {
-        var tUnion = Blocks.BlockTraceProfile.Now();
-        List<Entry> rows;
-        if (_blocks is not null)
-        {
-            rows = UnionBySort(S(key), pd);
-        }
-        else
-        {
-            _accum.TryGetValue(key, out var bucket);
-            rows = Union(bucket, pd);
-        }
-
-        if (Blocks.BlockTraceProfile.Enabled)
-        {
-            Blocks.BlockTraceProfile.Section(10, tUnion, rows.Count);
-        }
-
         var whole = _orderValueOf is null;
 
         // The affected output value range. For whole-partition every row is affected;
@@ -450,17 +452,56 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         else
         {
             // Bounded: a change at d affects rows whose frame contains d.
-            lo = _descending ? pd.Min - _preceding.Value : pd.Min;
-            hi = _descending ? pd.Max : pd.Max + _preceding.Value;
+            lo = _descending ? Saturating(pd.Min, -_preceding.Value) : pd.Min;
+            hi = _descending ? pd.Max : Saturating(pd.Max, _preceding.Value);
+        }
+
+        var tUnion = Blocks.BlockTraceProfile.Now();
+        List<Entry> rows;
+        object? before = null;
+        if (_store is not null)
+        {
+            // What the change reaches: an ascending running frame from its lowest value (the
+            // chunks below as one partial); a bounded frame its frames' span; otherwise everything.
+            if (!whole && _preceding is null && !_descending)
+            {
+                rows = ReadUnion(S(key), pd, pd.Min, long.MaxValue, needPrefix: true, out before);
+            }
+            else if (!whole && _preceding is not null)
+            {
+                rows = ReadUnion(
+                    S(key), pd, Saturating(pd.Min, -_preceding.Value), Saturating(pd.Max, _preceding.Value), needPrefix: false, out _);
+            }
+            else
+            {
+                rows = ReadUnion(S(key), pd, long.MinValue, long.MaxValue, needPrefix: false, out _);
+            }
+        }
+        else
+        {
+            _accum.TryGetValue(key, out var bucket);
+            rows = Union(bucket, pd);
+        }
+
+        if (Blocks.BlockTraceProfile.Enabled)
+        {
+            Blocks.BlockTraceProfile.Section(10, tUnion, rows.Count);
         }
 
         // Running frame (ORDER BY present, UNBOUNDED PRECEDING): one ordered pass folding each
-        // side into its running aggregate via the incremental IAggregator.Update — linear per
-        // touched partition (a per-row prefix rebuild was O(partition²) and dominated ivm-bench
-        // batch 1).
+        // side into its running aggregate — linear in what was read (a per-row prefix rebuild was
+        // O(partition²) and dominated ivm-bench batch 1).
         if (!whole && _preceding is null)
         {
-            RecomputeRunningRange(builder, rows, lo, hi);
+            if (_store is { HasPartials: true } && !_descending)
+            {
+                RecomputeRunningPartial(builder, rows, lo, hi, before);
+            }
+            else
+            {
+                RecomputeRunningRange(builder, rows, lo, hi);
+            }
+
             return;
         }
 
@@ -479,9 +520,58 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 continue;
             }
 
-            var before = e.Old != 0 ? _widen(e.Row, whole ? wholeOld : _aggregator.Compute(FrameFor(rows, e.Value, old: true))) : default;
-            var after = e.New != 0 ? _widen(e.Row, whole ? wholeNew : _aggregator.Compute(FrameFor(rows, e.Value, old: false))) : default;
-            EmitRowDiff(builder, before, e.Old, after, e.New);
+            var old = e.Old != 0 ? _widen(e.Row, whole ? wholeOld : _aggregator.Compute(FrameFor(rows, e.Value, old: true))) : default;
+            var now = e.New != 0 ? _widen(e.Row, whole ? wholeNew : _aggregator.Compute(FrameFor(rows, e.Value, old: false))) : default;
+            EmitRowDiff(builder, old, e.Old, now, e.New);
+        }
+    }
+
+    /// <summary>As <see cref="RecomputeRunningRange"/> (ascending only), folding exact partial
+    /// accumulators (§3.15) from <paramref name="before"/>, the partial of the chunks below the
+    /// rows read: both sides start from it, since the delta does not reach below them.</summary>
+    private void RecomputeRunningPartial(ZSetBuilder<TOutRow, Z64> builder, List<Entry> rows, long lo, long hi, object? before)
+    {
+        var partial = (Aggregators.IPartialAggregator<TInRow, TAgg>)_aggregator;
+        var oldAcc = before is null ? partial.NewAccumulator() : partial.Clone(before);
+        var newAcc = before is null ? partial.NewAccumulator() : partial.Clone(before);
+        var i = 0;
+        while (i < rows.Count)
+        {
+            var v = rows[i].Value;
+            var j = i;
+            while (j < rows.Count && rows[j].Value == v)
+            {
+                var e = rows[j];
+                if (e.Old != 0)
+                {
+                    partial.Add(oldAcc, e.Row, e.Old);
+                }
+
+                if (e.New != 0)
+                {
+                    partial.Add(newAcc, e.Row, e.New);
+                }
+
+                j++;
+            }
+
+            if (v >= lo && v <= hi)
+            {
+                var oldValue = partial.Result(oldAcc);
+                var newValue = partial.Result(newAcc);
+                for (var k = i; k < j; k++)
+                {
+                    var e = rows[k];
+                    EmitRowDiff(
+                        builder,
+                        e.Old != 0 ? _widen(e.Row, oldValue) : default,
+                        e.Old,
+                        e.New != 0 ? _widen(e.Row, newValue) : default,
+                        e.New);
+                }
+            }
+
+            i = j;
         }
     }
 
@@ -671,8 +761,8 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
 
     // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TInRow, Z64> SnapshotNow() =>
-        _blocks is not null
-            ? ZSet.FromEntries(_blocks.MaterializeUncached().SelectMany(g => g.Value.Select(kv => (As<TInRow>(kv.Key), kv.Value))))
+        _store is not null
+            ? ZSet.FromEntries(_store.All().Select(e => (As<TInRow>(e.Row), new Z64(e.Weight))))
         : _accum.Count == 0
             ? ZSet<TInRow, Z64>.NewMutable()
             : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));
@@ -686,7 +776,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             return;
         }
 
-        if (_blocks is not null)
+        if (_store is not null)
         {
             IntegrateBlocks(rows);
             return;
@@ -709,7 +799,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             return;
         }
 
-        if (_blocks is not null)
+        if (_store is not null)
         {
             IntegrateBlocks([.. _lazy.TakeAll().Select(e => (e.Row, e.Weight))]);
             _lazy = null;
@@ -742,7 +832,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         // Saved in partition order (when the partition hash is stable), so a lazy restore reads a
         // partition as one block. While partitions are still cold, the snapshot holds only those in
         // memory, and FullState reads the rest for a write that needs every row.
-        if (_blocks is not null)
+        if (_store is not null)
         {
             // Blocks are not decoded for a checkpoint that writes only the changes since the last:
             // nothing is "in memory" as rows, and FullState decodes everything for a whole write.
@@ -751,7 +841,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 empty,
                 LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf),
                 () => { PromoteAll(); return SnapshotNow(); },
-                _blocks.Entries + (_lazy?.ColdCount ?? 0));
+                _store.Entries + (_lazy?.ColdCount ?? 0));
             return _snapshotCodec.SaveAsync(writer, "trace.arrows", empty, cancellationToken);
         }
 
@@ -778,7 +868,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             // Lazily restored: partitions are read as deltas touch them (Fault).
             _accum.Clear();
-            _blocks?.Clear();
+            _store?.Clear();
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
             return;
@@ -789,9 +879,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _changes.Restored(loaded);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         _accum.Clear();
-        if (_blocks is not null)
+        if (_store is not null)
         {
-            _blocks.Clear();
+            _store.Clear();
             IntegrateBlocks([.. loaded.Where(kv => kv.Value.Value != 0).Select(kv => (kv.Key, kv.Value.Value))]);
         }
         else

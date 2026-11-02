@@ -24,6 +24,13 @@ public sealed class WindowOldSideTests
         "AVG(x) OVER (PARTITION BY p ORDER BY t DESC)",
         "LAG(x, 1, 0.0) OVER (PARTITION BY p ORDER BY t)",
         "MIN(x) OVER (ORDER BY t)",
+        // Exact aggregates: on blocks, large partitions fold from chunk partials (§3.15).
+        "COUNT(*) OVER (PARTITION BY p ORDER BY t)",
+        "MAX(x) OVER (PARTITION BY p ORDER BY t)",
+        "MIN(id) OVER (PARTITION BY p ORDER BY t)",
+        "COUNT(x) OVER (PARTITION BY p ORDER BY t RANGE BETWEEN 3 PRECEDING AND CURRENT ROW)",
+        "MAX(x) OVER (PARTITION BY p ORDER BY t DESC)",
+        "COUNT(CASE WHEN x > 1 THEN x END) OVER (PARTITION BY p ORDER BY t)",
     ];
 
     // blocks: the window's input held as blocks (§3.13), with tiny runs so freezes and merges
@@ -52,6 +59,7 @@ public sealed class WindowOldSideTests
         var views = new HashSet<string>(["w"], StringComparer.Ordinal);
         CompiledProgram program;
         using (blocks ? DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false, freezeEntries: 3, blockEntries: 2, window: true) : null)
+        using (blocks ? DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.UseChunks(promoteRows: 3, chunkRows: 2) : null)
         {
             program = SqlProgram.Compile(sql, views);
         }
@@ -74,7 +82,7 @@ public sealed class WindowOldSideTests
 
             for (var n = rnd.Next(1, 6); n > 0; n--)
             {
-                var row = new object?[] { next++, rnd.Next(2), rnd.Next(3), Values[rnd.Next(Values.Length)] };
+                var row = new object?[] { next++, rnd.Next(2), rnd.Next(blocks ? 12 : 3), Values[rnd.Next(Values.Length)] };
                 live.Add(row);
                 input.Insert(row);
             }

@@ -50,6 +50,31 @@ internal static class TraceBlocksMode
     /// <summary>Whether the window aggregate's per-partition input is compiled as blocks (§3.13).</summary>
     public static bool Window => Override.Value?.Window ?? DefaultWindow;
 
+    /// <summary>Rows at which a blocked window partition moves to ordered chunks (§3.15);
+    /// <c>DBSPNET_TRACE_BLOCKS_PROMOTE</c>, default 512.</summary>
+    public static int PromoteRows => PromoteOverride.Value ?? DefaultPromote;
+
+    /// <summary>Rows per ordered chunk (§3.15); <c>DBSPNET_TRACE_BLOCKS_CHUNK</c>, default 512.</summary>
+    public static int ChunkRows => ChunkOverride.Value ?? DefaultChunk;
+
+    private static readonly int DefaultPromote = Positive("DBSPNET_TRACE_BLOCKS_PROMOTE", 512);
+
+    private static readonly int DefaultChunk = Positive("DBSPNET_TRACE_BLOCKS_CHUNK", 512);
+
+    private static readonly AsyncLocal<int?> PromoteOverride = new();
+
+    private static readonly AsyncLocal<int?> ChunkOverride = new();
+
+    /// <summary><see cref="PromoteRows"/> and <see cref="ChunkRows"/> in the current async context
+    /// until the result is disposed (tests).</summary>
+    public static IDisposable UseChunks(int promoteRows, int chunkRows)
+    {
+        var (p, c) = (PromoteOverride.Value, ChunkOverride.Value);
+        PromoteOverride.Value = promoteRows;
+        ChunkOverride.Value = chunkRows;
+        return new Restore(() => (PromoteOverride.Value, ChunkOverride.Value) = (p, c));
+    }
+
     /// <summary>Managed entries that make a blocked trace freeze.</summary>
     public static int FreezeEntries => Override.Value?.Freeze ?? DefaultFreeze;
 

@@ -1036,6 +1036,56 @@ full write decodes the chunks, and a faulted partition's rows are sorted once in
 **Gate:** batch-1 drain no worse than `all` (+3%), restart first drain and restore no worse than
 `all`, batch 3 no worse. Then `window` joins `all`.
 
+### 3.16 Ordered chunks with exact partials: built and measured (2026-11-02, branch `arc/flat-trace-window-chunks`)
+
+**Built as designed (§3.15, design C):** 43472a6, 68d9650, f47bab2.
+- `OrderedPartitionStore`: small partitions in a shared trace; a partition past 512 rows moves to
+  ordered 512-row chunks, each with its order values and, when exact, its partial aggregate.
+- `IPartialAggregator`, implemented by `CompositeAggregator` when every slot is COUNT, COUNT(*),
+  MIN or MAX.
+- A running ascending frame reads from the chunk its change lands in, with the chunks below as
+  one partial. A bounded frame reads its frames' span.
+
+**Tests:** a store oracle against a model (random batches, tiny promote and chunk sizes; reads
+must be ordered, consolidated, cover their range, and carry the exact prefix partial), and the
+bit-exact window test with exact running, descending and nullable-COUNT windows on tiny chunks.
+The suite passes 3,181 tests in four arms. 11 mutations were tried: 8 were caught, and 3 change
+no behaviour (MIN/MAX tie-breaking between values that compare equal but are not `Equals`, and
+the weight check on rows that are always positive). Two shapes survived until the test gained
+them (an exact DESC window, a nullable COUNT).
+
+**Found while profiling:**
+- **The default MIN/MAX is the hybrid aggregator** (`SqlMinMaxHybridAggregator`), which had no
+  partials, so every MIN/MAX window silently took the full fold. Fixed by delegating to the plain
+  MIN/MAX.
+- **A bulk-loaded partition crossed the shared trace twice:** it was written there, read back,
+  promoted, and retracted (13.8 s CPU in batch 1). A partition whose share of a change alone passes
+  the threshold now goes straight to chunks.
+- **The union hashed each row twice;** it now does one lookup. Small reads consolidate by sort,
+  not by hashing.
+
+**Wall clock against `all`** (5 alternating runs, one binary, outputs identical, medians):
+
+| | §3.14 (decode whole) | §3.15 (ordered chunks) |
+|---|---|---|
+| batch-1 drain | +2.0% | +4.1% (17,002 → 17,699 ms) |
+| batch-1 output write | −27% | −15% |
+| restart: restore | +19% | +3% |
+| restart: first drain | +13% | +4% |
+| batch 3 drain | −3% | −8% |
+| references (census) | −38% | −37% (155.4M → 97.3M) |
+
+**Reading.** The design does what it was for: restart and steady state are at parity or better
+(the first drain after a restart no longer decodes partitions whole). Batch 1 pays instead,
++4.1% against the +3% gate, because a bulk load encodes 4M rows into chunks and reads about a
+million one-row partitions (`trades`, partitioned by trade id) from the shared trace. Window
+operator CPU in batch 1 (summed over workers) is 28.6 s against 18.8 s managed: integrate 11.8 s
+(chunk encoding), union 10.6 s (5.2 s of it the tiny-partition probes), fold 6.2 s (the partial
+fold is cheaper than the incremental one, 7.8 s).
+
+**Left opt-in, pending a decision.** The remaining batch-1 levers: one-row partitions need no
+window state at all (a row's frame is itself), and the bulk encode could move off the step thread.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
