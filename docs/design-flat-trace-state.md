@@ -432,6 +432,34 @@ converted too: the widening order of §3. The remaining 5.5M join references are
 stayed managed (a column type without a block encoding, or a typed or spine path); not yet
 attributed.
 
+### 3.3 Outer joins (2026-11-02)
+
+**Design.** The left and full outer join operators reach their traces through `IJoinTrace`:
+
+- `ManagedJoinTrace` is the `IndexedZSetTrace`, as before.
+- `BlockedJoinTrace` is used under the flag. An outer join's match test needs a key's consolidated
+  group, so its `GroupFor` probes every level and sums the entries by value. These groups are
+  decoded, unlike the inner join's cells-into-output path; outer-join probes touch only the keys a
+  tick touches.
+
+The operator types are unchanged, so snapshots, fingerprints and the typed compiler's reflected
+builders are untouched. All five outer-join compile sites are covered: LEFT, RIGHT, FULL, the
+scalar subquery, and the correlated scalar join.
+
+**Gates** (5 alternating runs per arm, clean build, view digests identical):
+
+| measurement | managed | blocked |
+|---|---|---|
+| batch-1 drain, median (range) | 15,945 ms (15,716–16,467) | 16,236 ms (15,944–16,408): **+1.8%, met** |
+| batch-1 output write / first checkpoint, median | 4,058 / 5,479 ms | 3,689 / 3,436 ms |
+| restart: restore / first drain / drain GC pause, median | 334 / 987 / 203 ms | 256 / 446 / 48 ms |
+| census after the checkpoint: left-join references | 10.45M | 0.16M (−98.4%) |
+| census: inner-join references | 237.1M | 6.47M |
+| census: whole heap, references / objects / bytes | 592M / 168M / 10.8 GB | 374M (−37%) / 150M / 10.8 GB |
+
+Drain went from +0.6% (§3.2) to +1.8%. Both runs are within each other's ranges, but the trend
+is the decoded group read; it is the thing to watch as more operators convert.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
