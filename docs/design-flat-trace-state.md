@@ -849,6 +849,49 @@ partitions are new, so the old side is empty. Later batches pay it, and they are
 drain, census and identical outputs. There is no flag: the change is a simplification, kept only
 if it holds.
 
+### 3.12 Window operators without stored output: measured (2026-11-02)
+
+**Built as planned (§3.11):** 6228aaa. Both operators walk each touched partition's union of
+rows (old and new weights), with the removed rows merged in by the total order. The window
+aggregate folds two running aggregates side by side, or computes old and new frames. The offset
+operator expands both slot lists and diffs them.
+- **Restore no longer rebuilds windows:** `_partial`, `EnsureWindow` and `InitWindow` are gone, and
+  the eager load no longer recomputes every partition.
+- **Tests:** the suite passes 3,150 tests in both arms. 6 mutations were tried, and 5 were caught by
+  the existing tests. The sixth (not sorting the removed rows) changes only the order in which
+  peers are folded, so only floating-point sums can see it. A new test catches it: running,
+  bounded, whole-partition, descending and LAG windows over peers summing 1e16 ± 1, with several
+  rows deleted per tick, checked every tick against a fresh run.
+
+**Census after the checkpoint** (SF=3, W=12, `all`, one run each):
+
+| | main | no stored window output |
+|---|---|---|
+| objects | 98.9M | 82.6M (−16%) |
+| references | 263.0M | 155.4M (−41%) |
+| bytes | 10.08 GB | 8.57 GB (−1.5 GB) |
+| WindowAggregate references | 119.9M | 60.9M |
+| WindowOffset references | 108.3M | 58.4M |
+
+**Wall clock** (5 alternating runs per arm, two builds, outputs identical, medians, ms):
+
+| | main | no stored window output |
+|---|---|---|
+| batch-1 drain | 16,521 | 16,727 (+1.2%, gate +3%) |
+| batch-1 output write | 2,973 | 2,483 (−16%) |
+| batch-1 checkpoint | 2,625 | 2,462 (−6%) |
+| batch-1 GC pause | 6,068 | 5,743 (−5%) |
+| restart: restore | 260 | 256 |
+| restart: first drain (batch 2) | 509 | 467 (−8%) |
+| batch 3 drain (steady state) | 301 | 322 (+7%) |
+
+**Kept and merged.** The steady-state batch pays the doubled recompute: about +21 ms on a 0.3 s
+batch. If that matters, the lever is to stop refolding unchanged prefixes. A running frame's old
+and new folds agree up to the first delta row, so one fold could serve both until there.
+
+**What is left:** the remaining references are the two operators' `_accum`, a `SortedDictionary`
+of input rows per partition: about 119M of 155M. Holding it as blocks is the next step (§3.13).
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
