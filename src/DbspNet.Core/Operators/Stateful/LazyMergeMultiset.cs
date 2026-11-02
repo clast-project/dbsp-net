@@ -108,6 +108,89 @@ internal sealed class LazyMergeMultiset<T> : IMultiset<T, Z64>
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 }
 
+/// <summary>A group that can answer "does any value keep a non-zero weight once
+/// <c>adjust</c> is added to it?" without enumerating (decoding) itself whole.</summary>
+internal interface ILazyGroup<T>
+    where T : notnull
+{
+    bool AnyNonZero(Func<T, Z64>? adjust);
+}
+
+/// <summary>
+/// <see cref="LazyMergeMultiset{T}"/> over a before-group that is any <see cref="IMultiset{TKey,TWeight}"/>
+/// — a blocked trace's <c>BlockedGroupView</c>, which answers lookups without decoding
+/// (docs/design-flat-trace-state.md §3.5). Same answers; membership is a non-zero weight.
+/// </summary>
+internal sealed class LazyViewMergeMultiset<T> : IMultiset<T, Z64>
+    where T : notnull
+{
+    private readonly IMultiset<T, Z64> _before;
+    private readonly ZSet<T, Z64> _delta;
+
+    public LazyViewMergeMultiset(IMultiset<T, Z64> before, ZSet<T, Z64> delta)
+    {
+        _before = before;
+        _delta = delta;
+    }
+
+    public bool IsEmpty
+    {
+        get
+        {
+            // Every delta value with a non-zero net keeps the group; otherwise the before-group
+            // survives unless the delta cancels all of it.
+            foreach (var (v, dw) in _delta)
+            {
+                if (!Z64.IsZero(Z64.Add(dw, _before.WeightOf(v))))
+                {
+                    return false;
+                }
+            }
+
+            if (_before is ILazyGroup<T> lazy)
+            {
+                return !lazy.AnyNonZero(_delta.WeightOf);
+            }
+
+            foreach (var (v, bw) in _before)
+            {
+                if (!Z64.IsZero(Z64.Add(bw, _delta.WeightOf(v))))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    public Z64 WeightOf(T key) => Z64.Add(_before.WeightOf(key), _delta.WeightOf(key));
+
+    public Z64 SumWeights() => Z64.Add(_before.SumWeights(), _delta.SumWeights());
+
+    public IEnumerator<KeyValuePair<T, Z64>> GetEnumerator()
+    {
+        foreach (var (v, bw) in _before)
+        {
+            var net = Z64.Add(bw, _delta.WeightOf(v));
+            if (!Z64.IsZero(net))
+            {
+                yield return new KeyValuePair<T, Z64>(v, net);
+            }
+        }
+
+        foreach (var (v, dw) in _delta)
+        {
+            if (!Z64.IsZero(dw) && Z64.IsZero(_before.WeightOf(v)))
+            {
+                yield return new KeyValuePair<T, Z64>(v, dw);
+            }
+        }
+    }
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
 /// <summary>
 /// Test/benchmark seam: force the flat aggregate to rebuild the after-group
 /// eagerly (<c>beforeGroup + groupDelta</c>) instead of using the lazy

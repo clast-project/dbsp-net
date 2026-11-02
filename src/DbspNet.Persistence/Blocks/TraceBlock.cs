@@ -35,8 +35,11 @@ internal sealed class TraceBlock : ITraceBlock
     private readonly int[] _values;
     private readonly int[] _data;
 
-    internal TraceBlock(BlockSchema schema, byte[] bytes, int count, int[] validity, int[] values, int[] data)
+    private int[]? _valueHashes;
+
+    internal TraceBlock(BlockSchema schema, byte[] bytes, int count, int[] validity, int[] values, int[] data, int[]? valueHashes = null)
     {
+        _valueHashes = valueHashes;
         Schema = schema;
         _bytes = bytes;
         Count = count;
@@ -116,6 +119,48 @@ internal sealed class TraceBlock : ITraceBlock
         for (var c = 0; c < kinds.Length; c++)
         {
             if (!CellEquals(c, kinds[c], i, key[c]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>The value hashes, if known (BlockWriter.Concat carries them over).</summary>
+    internal int[]? KnownValueHashes => _valueHashes;
+
+    /// <inheritdoc/>
+    public int ValueHash(int i) => (_valueHashes ?? ComputeValueHashes())[i];
+
+    // A block adopted from a file: decode each value once (strings aliased: only hashed) and keep
+    // only the hashes. Two threads may both compute; the arrays are equal.
+    private int[] ComputeValueHashes()
+    {
+        var hashes = new int[Count];
+        for (var i = 0; i < Count; i++)
+        {
+            hashes[i] = Value(i, aliasStrings: true).GetHashCode();
+        }
+
+        Interlocked.CompareExchange(ref _valueHashes, hashes, null);
+        return _valueHashes!;
+    }
+
+    /// <inheritdoc/>
+    public bool ValueEquals(int i, StructuralRow value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        var kinds = Schema.ValueKinds;
+        if (value.Count != kinds.Length)
+        {
+            return false;
+        }
+
+        var first = Schema.KeyKinds.Length;
+        for (var c = 0; c < kinds.Length; c++)
+        {
+            if (!CellEquals(first + c, kinds[c], i, value[c]))
             {
                 return false;
             }

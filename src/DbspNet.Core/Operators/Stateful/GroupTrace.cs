@@ -21,6 +21,10 @@ internal interface IGroupTrace<TKey, TValue, TWeight>
     /// <summary>The key's entries with their net weights (zeros dropped).</summary>
     ZSet<TValue, TWeight> GroupFor(TKey key);
 
+    /// <summary>The same group as a read-only view, which a blocked trace answers without decoding
+    /// (lookups, sums, emptiness); a managed trace returns <see cref="GroupFor"/>.</summary>
+    IMultiset<TValue, TWeight> GroupView(TKey key);
+
     void Integrate(IndexedZSet<TKey, TValue, TWeight> delta);
 
     /// <summary>Drop keys below the frontier. Returns the keys dropped, or <see langword="null"/>
@@ -54,6 +58,8 @@ internal sealed class ManagedGroupTrace<TKey, TValue, TWeight> : IGroupTrace<TKe
     public IndexedZSet<TKey, TValue, TWeight> Current => _trace.Current;
 
     public ZSet<TValue, TWeight> GroupFor(TKey key) => _trace.Current.GroupFor(key);
+
+    public IMultiset<TValue, TWeight> GroupView(TKey key) => _trace.Current.GroupFor(key);
 
     public void Integrate(IndexedZSet<TKey, TValue, TWeight> delta) => _trace.Integrate(delta);
 

@@ -35,6 +35,16 @@ internal interface ITraceBlock
     /// (<c>object.Equals</c>), without decoding it.</summary>
     bool KeyEquals(int i, StructuralRow key);
 
+    /// <summary>Entry <paramref name="i"/>'s value row hash (<see cref="StructuralRow.GetHashCode"/>
+    /// of its decoded value), without decoding it on the step path: written at freeze, computed
+    /// once for a block restored from a file.</summary>
+    int ValueHash(int i);
+
+    /// <summary>Whether entry <paramref name="i"/>'s value equals <paramref name="value"/> cell by
+    /// cell (<c>object.Equals</c>), without decoding it. Row equality also needs equal hashes —
+    /// compare <see cref="ValueHash"/> first.</summary>
+    bool ValueEquals(int i, StructuralRow value);
+
     /// <summary>Entry <paramref name="i"/>'s key, decoded (strings copied).</summary>
     StructuralRow Key(int i);
 

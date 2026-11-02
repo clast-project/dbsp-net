@@ -54,10 +54,14 @@ public class BlockedIndexedTraceTests
     private static StructuralRow Key(Random rnd) =>
         new((long)rnd.Next(-3, 12), Strings[rnd.Next(Strings.Length)] is { } s ? Utf8String.Of(s) : null);
 
+    // Doubles include −0.0 (hashes and equals as 0.0) and two NaN payloads (equal cells, different
+    // row hashes): what makes a value lookup by hash then cells exact, or not.
+    private static readonly double[] Doubles = [0.0, -0.0, 0.5, 1.0, double.NaN, BitConverter.Int64BitsToDouble(0x7ff8000000000001)];
+
     private static StructuralRow Value(Random rnd) => new(
         rnd.Next(5) == 0 ? null : rnd.Next(4),
         Strings[rnd.Next(Strings.Length)] is { } s ? Utf8String.Of(s) : null,
-        rnd.Next(5) == 0 ? null : (double)rnd.Next(3) / 2);
+        rnd.Next(5) == 0 ? null : Doubles[rnd.Next(Doubles.Length)]);
 
     public static TheoryData<int> Seeds() => new(Enumerable.Range(1, 60));
 
@@ -126,6 +130,43 @@ public class BlockedIndexedTraceTests
                     break;
             }
 
+            // The group view against the oracle group, and merged with a random delta.
+            for (var p = 0; p < 4; p++)
+            {
+                var key = Key(rnd);
+                var expected = oracle.Current.GroupFor(key);
+                var view = blocked.GroupView(key);
+                Assert.Equal(expected.IsEmpty, view.IsEmpty);
+                Assert.Equal(expected.SumWeights(), view.SumWeights());
+                for (var v = 0; v < 8; v++)
+                {
+                    var value = v < 3 && !expected.IsEmpty ? expected.ElementAt(rnd.Next(expected.Count)).Key : Value(rnd);
+                    Assert.Equal(expected.WeightOf(value), view.WeightOf(value));
+                }
+
+                var groupDelta = new ZSetBuilder<StructuralRow, Z64>();
+                foreach (var (value, weight) in expected)
+                {
+                    if (rnd.Next(2) == 0)
+                    {
+                        groupDelta.Add(value, Z64.Negate(weight));
+                    }
+                }
+
+                if (rnd.Next(2) == 0)
+                {
+                    groupDelta.Add(Value(rnd), new Z64(rnd.Next(1, 3)));
+                }
+
+                var d = groupDelta.Build();
+                var merged = new LazyViewMergeMultiset<StructuralRow>(blocked.GroupView(key), d);
+                var truth = expected + d;
+                Assert.Equal(truth.IsEmpty, merged.IsEmpty);
+                Assert.Equal(truth.SumWeights(), merged.SumWeights());
+                Assert.Equal(truth, ZSet.FromEntries(merged));
+                Assert.Equal(expected, ZSet.FromEntries(view));
+            }
+
             for (var p = 0; p < 6; p++)
             {
                 var key = Key(rnd);
@@ -137,7 +178,9 @@ public class BlockedIndexedTraceTests
                     expected[value] = weight.Value;
                 }
 
-                Assert.Equal(expected.OrderBy(e => e.Key.ToString()), visitor.Net.OrderBy(e => e.Key.ToString()));
+                // As dictionaries: two NaN payloads print alike, so no textual order is stable.
+                Assert.Equal(expected.Count, visitor.Net.Count);
+                Assert.All(expected, e => Assert.Equal(e.Value, visitor.Net.GetValueOrDefault(e.Key)));
             }
         }
 

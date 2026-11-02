@@ -237,6 +237,17 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         }
     }
 
+    private static ZSet<TValue, Z64> Decode(IMultiset<TValue, Z64> view)
+    {
+        var builder = new ZSetBuilder<TValue, Z64>();
+        foreach (var (value, weight) in view)
+        {
+            builder.Add(value, weight);
+        }
+
+        return builder.Build();
+    }
+
     // The eager restore path only runs over a managed trace (a blocked one is always lazy).
     private ManagedGroupTrace<TKey, TValue, Z64> Managed => (ManagedGroupTrace<TKey, TValue, Z64>)_trace;
 
@@ -276,7 +287,26 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         foreach (var key in delta.Keys)
         {
             var groupDelta = delta.GroupFor(key);
-            var beforeGroup = before.GroupFor(key);
+            var beforeView = before.GroupView(key);
+            if (beforeView is not ZSet<TValue, Z64> beforeGroup)
+            {
+                // A blocked trace (docs/design-flat-trace-state.md §3.5): the aggregator sees the
+                // before-group as a view that decodes only if it walks the group.
+                if (_cachesBuilt is not null)
+                {
+                    EnsureCaches(key, Decode(beforeView));
+                }
+
+                EmitForKey(
+                    key,
+                    groupDelta,
+                    FlatAggregateMode.ForceEagerRebuild
+                        ? Decode(beforeView) + groupDelta
+                        : new LazyViewMergeMultiset<TValue>(beforeView, groupDelta),
+                    builder);
+                continue;
+            }
+
             if (_cachesBuilt is not null)
             {
                 EnsureCaches(key, beforeGroup);

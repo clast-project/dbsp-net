@@ -26,6 +26,8 @@ internal sealed class BlockedGroupTrace : IGroupTrace<StructuralRow, StructuralR
         return visitor.Builder?.Build() ?? ZSet<StructuralRow, Z64>.Empty;
     }
 
+    public IMultiset<StructuralRow, Z64> GroupView(StructuralRow key) => Trace.GroupView(key);
+
     public void Integrate(IndexedZSet<StructuralRow, StructuralRow, Z64> delta) => Trace.Integrate(delta);
 
     public IReadOnlyList<StructuralRow>? DropKeysBelow(long threshold, Func<StructuralRow, long> monotoneKey)
