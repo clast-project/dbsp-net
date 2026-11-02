@@ -62,8 +62,8 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private readonly Func<TKey, TLeft, TRight, TOut> _joinCombine;
     private readonly Func<TKey, TLeft, TOut> _nullPadRightCombine;
     private readonly Func<TKey, TRight, TOut> _nullPadLeftCombine;
-    private readonly IndexedZSetTrace<TKey, TLeft, TWeight> _leftTrace = new();
-    private readonly IndexedZSetTrace<TKey, TRight, TWeight> _rightTrace = new();
+    private readonly IJoinTrace<TKey, TLeft, TWeight> _leftTrace;
+    private readonly IJoinTrace<TKey, TRight, TWeight> _rightTrace;
     private readonly IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? _leftSnapshotCodec;
     private readonly IIndexedZSetTraceCodec<TKey, TRight, TWeight>? _rightSnapshotCodec;
     private readonly IFrontier? _frontier;
@@ -85,8 +85,12 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         IIndexedZSetTraceCodec<TKey, TLeft, TWeight>? leftSnapshotCodec = null,
         IIndexedZSetTraceCodec<TKey, TRight, TWeight>? rightSnapshotCodec = null,
         IFrontier? frontier = null,
-        Func<TKey, long>? monotoneKey = null)
+        Func<TKey, long>? monotoneKey = null,
+        IJoinTrace<TKey, TLeft, TWeight>? leftTrace = null,
+        IJoinTrace<TKey, TRight, TWeight>? rightTrace = null)
     {
+        _leftTrace = leftTrace ?? new ManagedJoinTrace<TKey, TLeft, TWeight>();
+        _rightTrace = rightTrace ?? new ManagedJoinTrace<TKey, TRight, TWeight>();
         _leftIn = leftIn;
         _rightIn = rightIn;
         _output = output;
@@ -99,8 +103,11 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         _monotoneKey = monotoneKey;
     }
 
+    /// <summary>Whether both traces are held as blocks (DBSPNET_TRACE_BLOCKS=join).</summary>
+    internal bool IsBlocked => _leftTrace is Blocks.BlockedJoinTrace && _rightTrace is Blocks.BlockedJoinTrace;
+
     /// <summary>Total keys retained across both traces. Exposed for GC-bound tests.</summary>
-    internal int RetainedKeyCount => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
+    internal int RetainedKeyCount => _leftTrace.GroupCount + _rightTrace.GroupCount;
 
     public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
@@ -111,8 +118,8 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
                 "them to CircuitBuilder.IncrementalFullJoin to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        await _leftSnapshotCodec.SaveAsync(writer, LeftTraceFile, _leftTrace.Current, cancellationToken).ConfigureAwait(false);
-        await _rightSnapshotCodec.SaveAsync(writer, RightTraceFile, _rightTrace.Current, cancellationToken).ConfigureAwait(false);
+        await _leftTrace.SaveAsync(_leftSnapshotCodec, writer, LeftTraceFile, cancellationToken).ConfigureAwait(false);
+        await _rightTrace.SaveAsync(_rightSnapshotCodec, writer, RightTraceFile, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -123,18 +130,8 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
                 "IncrementalFullJoinOp was constructed without snapshot codecs.");
         }
 
-        var left = await _leftSnapshotCodec.LoadAsync(reader, LeftTraceFile, cancellationToken).ConfigureAwait(false);
-        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _leftTrace.Integrate(left);
-        var integrateMs = SnapshotRestoreProfile.MsSince(t0);
-
-        var right = await _rightSnapshotCodec.LoadAsync(reader, RightTraceFile, cancellationToken).ConfigureAwait(false);
-        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _rightTrace.Integrate(right);
-        if (SnapshotRestoreProfile.Enabled)
-        {
-            SnapshotRestoreProfile.AddIntegrate(integrateMs + SnapshotRestoreProfile.MsSince(t1));
-        }
+        await _leftTrace.LoadAsync(_leftSnapshotCodec, reader, LeftTraceFile, cancellationToken).ConfigureAwait(false);
+        await _rightTrace.LoadAsync(_rightSnapshotCodec, reader, RightTraceFile, cancellationToken).ConfigureAwait(false);
     }
 
     public string SchemaFingerprint =>
@@ -144,8 +141,13 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     {
         var dl = _leftIn.Current;
         var dr = _rightIn.Current;
-        var leftOld = _leftTrace.Current;
-        var rightOld = _rightTrace.Current;
+        if (dl.IsEmpty && dr.IsEmpty)
+        {
+            _leftTrace.Idle();
+            _rightTrace.Idle();
+        }
+        var leftOld = _leftTrace;
+        var rightOld = _rightTrace;
 
         var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
 
@@ -246,13 +248,13 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         }
 
         _lastGcFrontier = frontier;
-        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey).Count;
-        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey).Count;
+        _gcDropped += _leftTrace.DropKeysBelow(frontier, _monotoneKey);
+        _gcDropped += _rightTrace.DropKeysBelow(frontier, _monotoneKey);
     }
 
     public string MetricName => "IncrementalFullJoin";
 
-    public long RetainedRows => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
+    public long RetainedRows => _leftTrace.GroupCount + _rightTrace.GroupCount;
 
     public long LastOutputRows => _output.Current.Count;
 

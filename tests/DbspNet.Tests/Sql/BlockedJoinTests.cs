@@ -46,15 +46,21 @@ public class BlockedJoinTests
 
     private static int Blocked(CompiledQuery q) => q.Circuit.Operators.OfType<BlockedJoinOp>().Count();
 
+    private static int BlockedOuter(CompiledQuery q) =>
+        q.Circuit.Operators.OfType<IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>().Count(o => o.IsBlocked)
+        + q.Circuit.Operators.OfType<IncrementalFullJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>>().Count(o => o.IsBlocked);
+
     [Fact]
     public void RandomQuery_BlockedCircuitEqualsBatch()
     {
         Gen.Select(RandomQuery.GenQuery, RandomQuery.GenTicks, Gen.Int[1, 6], Gen.Int[1, 4], Gen.Bool)
             .Sample((sql, ticks, freeze, block, emitted) => CheckOne(sql, ticks, freeze, block, emitted), iter: 1500, threads: 1);
         Assert.True(_engaged >= 100, $"only {_engaged} of 1500 random queries compiled a blocked join");
+        Assert.True(_engagedOuter >= 50, $"only {_engagedOuter} of 1500 random queries compiled a blocked outer join");
     }
 
     private static int _engaged;
+    private static int _engagedOuter;
 
     private static bool CheckOne(string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks, int freeze, int block, bool emitted)
     {
@@ -70,6 +76,7 @@ public class BlockedJoinTests
         {
             var compiled = Structural(PlanOptimizer.Optimize(plan), emitted);
             _engaged += Blocked(compiled) > 0 ? 1 : 0;
+            _engagedOuter += BlockedOuter(compiled) > 0 ? 1 : 0;
             accumulated = IncrementalOracle.RunAndAccumulate(
                 compiled,
                 [.. ticks.Select(t => (IReadOnlyList<InputEvent>)[.. t.Where(e => compiled.Inputs.ContainsKey(e.Table))])]);
@@ -276,6 +283,95 @@ public class BlockedJoinTests
         }
     }
 
+    public static TheoryData<string, int> OuterCases()
+    {
+        var data = new TheoryData<string, int>();
+        foreach (var kind in new[] { "LEFT", "RIGHT", "FULL OUTER" })
+        {
+            foreach (var seed in new[] { 1, 2, 3, 4 })
+            {
+                data.Add(kind, seed);
+            }
+        }
+
+        return data;
+    }
+
+    // Outer joins read consolidated old groups to decide match presence: deletes make keys gain and
+    // lose matches across ticks, and key 0 is a giant group, so groups span levels and blocks.
+    [Theory]
+    [MemberData(nameof(OuterCases))]
+    public void OuterJoin_MatchesTheManagedTwin_EveryTick(string kind, int seed)
+    {
+        var sql = $"SELECT a.k, a.s, a.d, b.name, b.flag FROM a {kind} JOIN b ON a.k = b.k";
+        var rnd = new Random(seed);
+        CompiledQuery blocked;
+        using (TraceBlocksMode.Use(join: true, freezeEntries: 1 + rnd.Next(20), blockEntries: 1 + rnd.Next(6)))
+        {
+            blocked = Compile(WideDdl, sql, emitted: seed % 2 == 0);
+        }
+
+        CompiledQuery managed;
+        using (TraceBlocksMode.Use(join: false))
+        {
+            managed = Compile(WideDdl, sql, emitted: seed % 2 == 0);
+        }
+
+        Assert.Equal(1, BlockedOuter(blocked));
+        Assert.Equal(0, BlockedOuter(managed));
+        string?[] names = [null, "", "x", "é", "日本語"];
+        var liveA = new List<object?[]>();
+        var liveB = new List<object?[]>();
+        void Push(string table, List<object?[]> live, Func<object?[]> make, int deleteOneIn)
+        {
+            var deleting = live.Count > 0 && rnd.Next(deleteOneIn) == 0;
+            var row = deleting ? live[rnd.Next(live.Count)] : make();
+            foreach (var q in new[] { blocked, managed })
+            {
+                if (deleting)
+                {
+                    q.Table(table).Delete(row);
+                }
+                else
+                {
+                    q.Table(table).Insert(row);
+                }
+            }
+
+            if (deleting)
+            {
+                live.Remove(row);
+            }
+            else
+            {
+                live.Add(row);
+            }
+        }
+
+        for (var tick = 0; tick < 60; tick++)
+        {
+            for (var n = rnd.Next(0, 12); n > 0; n--)
+            {
+                Push("a", liveA, () => [rnd.Next(4) == 0 ? 0 : rnd.Next(1, 8), names[rnd.Next(names.Length)], rnd.Next(4) == 0 ? null : rnd.Next(3) / 2.0, null, (long)rnd.Next(100)], 4);
+            }
+
+            for (var n = rnd.Next(0, 4); n > 0; n--)
+            {
+                Push("b", liveB, () => [rnd.Next(0, 8), names[rnd.Next(names.Length)], null, rnd.Next(3) == 0 ? null : rnd.Next(2) == 0], 2);
+            }
+
+            blocked.Step();
+            managed.Step();
+            Assert.Equal(managed.Current, blocked.Current);
+            if (tick % 7 == 6)
+            {
+                blocked.Step(); // an idle tick: the blocked traces freeze
+                managed.Step();
+                Assert.Equal(managed.Current, blocked.Current);
+            }
+        }
+    }
+
     [Fact]
     public void Compiler_EngagesBlocks_ForAStructuralInnerJoin_WithOrWithoutResidual()
     {
@@ -284,7 +380,8 @@ public class BlockedJoinTests
         {
             Assert.Equal(1, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t JOIN u ON t.k = u.k")));
             Assert.Equal(1, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t JOIN u ON t.k = u.k AND t.v < u.v")));
-            Assert.Equal(0, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t LEFT JOIN u ON t.k = u.k")));
+            Assert.Equal(1, BlockedOuter(Compile(ddl, "SELECT t.v, u.v FROM t LEFT JOIN u ON t.k = u.k")));
+            Assert.Equal(1, BlockedOuter(Compile(ddl, "SELECT t.v, u.v FROM t FULL OUTER JOIN u ON t.k = u.k")));
         }
 
         using (TraceBlocksMode.Use(join: false))

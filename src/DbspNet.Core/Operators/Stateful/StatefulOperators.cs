@@ -741,6 +741,54 @@ public static class StatefulOperators
         return output;
     }
 
+    /// <summary>The structural LEFT OUTER join with both sides' traces held as blocks
+    /// (<see cref="Blocks.BlockedJoinTrace"/>, docs/design-flat-trace-state.md §3.3).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> BlockedLeftJoin(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadCombine,
+        Blocks.ITraceBlockFormat leftFormat,
+        Blocks.ITraceBlockFormat rightFormat,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(
+            new IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                left, right, output, joinCombine, nullPadCombine, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey,
+                new Blocks.BlockedJoinTrace(leftFormat), new Blocks.BlockedJoinTrace(rightFormat)));
+        return output;
+    }
+
+    /// <summary>The structural FULL OUTER join with both sides' traces held as blocks.</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> BlockedFullJoin(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadRightCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadLeftCombine,
+        Blocks.ITraceBlockFormat leftFormat,
+        Blocks.ITraceBlockFormat rightFormat,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(
+            new IncrementalFullJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                left, right, output, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftSnapshotCodec, rightSnapshotCodec,
+                frontier, monotoneKey, new Blocks.BlockedJoinTrace(leftFormat), new Blocks.BlockedJoinTrace(rightFormat)));
+        return output;
+    }
+
     /// <summary>
     /// Incremental per-group aggregate. Input is an indexed Z-set (keyed by
     /// the GROUP BY columns); output is a flat Z-set of (key, aggregateValue)
