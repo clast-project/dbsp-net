@@ -181,7 +181,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             if (_blocks is not null)
             {
-                return _blocks.Materialize().Sum(g => g.Value.Count);
+                return _blocks.MaterializeUncached().Sum(g => g.Value.Count);
             }
 
             var n = 0;
@@ -367,53 +367,44 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         Entry Gone(TInRow row) => new(row, -dws[row], 0, _orderValueOf?.Invoke(row) ?? 0L);
     }
 
-    /// <summary>As <see cref="Union"/>, for a partition read from blocks (its rows in no order):
-    /// the partition's rows and the delta's sorted together by (order value, total order), so equal
-    /// rows meet and coalesce into one entry with both weights (§3.13). The order value is a
-    /// precomputed long, so most comparisons never reach the structural comparer.</summary>
-    private List<Entry> UnionBySort(IEnumerable<KeyValuePair<StructuralRow, Z64>> current, PartitionDelta pd)
+    /// <summary>As <see cref="Union"/>, for a partition read from blocks (§3.13): its rows decoded
+    /// and consolidated, the delta subtracted by lookup (a row caches its hash), and the distinct
+    /// rows then sorted once by (order value, total order). Ties reach the structural comparer only
+    /// for real peers: sorting the delta's rows alongside the partition's put every row next to its
+    /// own copy, and each such tie cost a full structural comparison.</summary>
+    private List<Entry> UnionBySort(StructuralRow key, PartitionDelta pd)
     {
-        var all = new List<(Entry Entry, long Dw, bool Delta)>(pd.Rows.Count + 16);
-        foreach (var (row, weight) in current)
+        var current = _blocks!.GroupView(key).Decoded();
+        var dws = new Dictionary<TInRow, long>(pd.Rows.Count);
+        foreach (var (row, dw) in pd.Rows)
         {
-            var r = As<TInRow>(row);
-            all.Add((new Entry(r, weight.Value, weight.Value, _orderValueOf?.Invoke(r) ?? 0L), 0, false));
+            dws[row] = dw;
+        }
+
+        var rows = new List<Entry>(current.Count + pd.Rows.Count);
+        foreach (var (value, weight) in current)
+        {
+            var row = As<TInRow>(value);
+            rows.Add(new Entry(row, weight.Value - dws.GetValueOrDefault(row), weight.Value, _orderValueOf?.Invoke(row) ?? 0L));
         }
 
         foreach (var (row, dw) in pd.Rows)
         {
-            all.Add((new Entry(row, 0, 0, _orderValueOf?.Invoke(row) ?? 0L), dw, true));
+            if (current.WeightOf(S(row)).Value == 0)
+            {
+                rows.Add(new Entry(row, -dw, 0, _orderValueOf?.Invoke(row) ?? 0L)); // gone: it was there at -dw
+            }
         }
 
-        all.Sort((a, b) =>
+        var tSort = Blocks.BlockTraceProfile.Now();
+        rows.Sort((a, b) =>
         {
-            var c = a.Entry.Value.CompareTo(b.Entry.Value);
-            if (c != 0)
-            {
-                return c;
-            }
-
-            c = _order.Compare(a.Entry.Row, b.Entry.Row);
-            return c != 0 ? c : a.Delta.CompareTo(b.Delta); // a row's current entry before its delta
+            var c = a.Value.CompareTo(b.Value);
+            return c != 0 ? c : _order.Compare(a.Row, b.Row);
         });
-
-        var rows = new List<Entry>(all.Count);
-        for (var i = 0; i < all.Count; i++)
+        if (Blocks.BlockTraceProfile.Enabled)
         {
-            var (entry, _, isDelta) = all[i];
-            if (!isDelta)
-            {
-                // A current row: its old weight is the new one minus the delta's, if the delta has it.
-                var dw = i + 1 < all.Count && all[i + 1].Delta && _order.Compare(all[i + 1].Entry.Row, entry.Row) == 0
-                    ? all[++i].Dw
-                    : 0;
-                rows.Add(entry with { Old = entry.New - dw });
-            }
-            else
-            {
-                // A delta row no longer in the partition: it was there before at -dw.
-                rows.Add(new Entry(entry.Row, -all[i].Dw, 0, entry.Value));
-            }
+            Blocks.BlockTraceProfile.Section(13, tSort, rows.Count);
         }
 
         return rows;
@@ -427,7 +418,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         List<Entry> rows;
         if (_blocks is not null)
         {
-            rows = UnionBySort(_blocks.GroupView(S(key)).Decoded(), pd);
+            rows = UnionBySort(S(key), pd);
         }
         else
         {
@@ -681,7 +672,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TInRow, Z64> SnapshotNow() =>
         _blocks is not null
-            ? ZSet.FromEntries(_blocks.Materialize().SelectMany(g => g.Value.Select(kv => (As<TInRow>(kv.Key), kv.Value))))
+            ? ZSet.FromEntries(_blocks.MaterializeUncached().SelectMany(g => g.Value.Select(kv => (As<TInRow>(kv.Key), kv.Value))))
         : _accum.Count == 0
             ? ZSet<TInRow, Z64>.NewMutable()
             : ZSet.FromEntries(_accum.SelectMany(p => p.Value.Select(kv => (kv.Key, new Z64(kv.Value)))));

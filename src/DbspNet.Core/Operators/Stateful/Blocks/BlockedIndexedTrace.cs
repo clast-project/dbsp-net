@@ -639,7 +639,12 @@ internal sealed class BlockedIndexedTrace
 
     /// <summary>The trace's net contents as an <see cref="IndexedZSet{TKey,TValue,TWeight}"/>
     /// (snapshot, metrics, tests). Cached until the next change.</summary>
-    public IndexedZSet<StructuralRow, StructuralRow, Z64> Materialize()
+    public IndexedZSet<StructuralRow, StructuralRow, Z64> Materialize() =>
+        _materialized ??= MaterializeUncached();
+
+    /// <summary>As <see cref="Materialize"/>, without caching the result: for a one-off whole read
+    /// (a full checkpoint write) that must not leave a decoded copy of the trace alive (§3.13).</summary>
+    public IndexedZSet<StructuralRow, StructuralRow, Z64> MaterializeUncached()
     {
         if (_materialized is { } cached)
         {
@@ -674,7 +679,7 @@ internal sealed class BlockedIndexedTrace
             }
         }
 
-        return _materialized = builder.Build();
+        return builder.Build();
     }
 
     /// <summary>A Z-set trace's net contents (<see cref="IntegrateRows"/>): every row with a non-zero
