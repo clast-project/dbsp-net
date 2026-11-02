@@ -578,6 +578,30 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// The structural inner join with both traces held as reference-free blocks
+    /// (<see cref="Blocks.BlockedJoinOp"/>, docs/design-flat-trace-state.md §3). The output row is
+    /// the left value's cells then the right value's, built by <paramref name="row"/>.
+    /// </summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> BlockedInnerJoin(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Blocks.ITraceBlockFormat leftFormat,
+        Blocks.ITraceBlockFormat rightFormat,
+        Func<object?[], StructuralRow> row,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec = null,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec = null,
+        IFrontier? frontier = null,
+        Func<StructuralRow, long>? monotoneKey = null)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new Blocks.BlockedJoinOp(
+            left, right, output, leftFormat, rightFormat, row, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey));
+        return output;
+    }
+
+    /// <summary>
     /// Build a <b>shared</b> indexed arrangement over an already-indexed Z-set
     /// delta stream: one <see cref="ArrangeOp{TKey,TValue,TWeight}"/> integrates
     /// the stream into a single trace whose post-tick integral many downstream

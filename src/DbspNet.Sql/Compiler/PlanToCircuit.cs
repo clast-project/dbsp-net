@@ -9,6 +9,7 @@ using DbspNet.Core.Operators.Linear;
 using DbspNet.Core.Operators.Nested;
 using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.Operators.Stateful.Aggregators;
+using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Core.Operators.Stateful.Spine;
 using DbspNet.Sql.Expressions;
 using DbspNet.Sql.Plan;
@@ -1439,6 +1440,9 @@ public static partial class PlanToCircuit
             Z("trace.arrows", reshard, snapshotCodec));
     }
 
+    // A structural inner join whose traces are held as blocks: both formats and the output row's builder.
+    private sealed record BlockedJoinSpec(ITraceBlockFormat LeftFormat, ITraceBlockFormat RightFormat, Func<object?[], StructuralRow> Row);
+
     private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoin(
         CircuitBuilder builder,
         CompileContext ctx,
@@ -1451,11 +1455,14 @@ public static partial class PlanToCircuit
         Func<StructuralRow, long>? monotoneKey = null,
         Func<StructuralRow, bool>? residual = null,
         ReshardPlacement? leftReshard = null,
-        ReshardPlacement? rightReshard = null)
+        ReshardPlacement? rightReshard = null,
+        BlockedJoinSpec? blocked = null)
     {
         return Recorded(
             builder, ctx,
-            () => EmitInnerJoinCore(builder, ctx, left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual),
+            () => blocked is { } b
+                ? builder.BlockedInnerJoin(left, right, b.LeftFormat, b.RightFormat, b.Row, leftCodec, rightCodec, frontier, monotoneKey)
+                : EmitInnerJoinCore(builder, ctx, left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual),
             IZ("left.arrows", leftReshard, leftCodec),
             IZ("right.arrows", rightReshard, rightCodec));
     }
@@ -3363,13 +3370,28 @@ public static partial class PlanToCircuit
             // Re-sharding (§1d): a hash join keeps both traces on OfWholeRow(key) — the same
             // hash the exchanges compute from the row's key columns. A broadcast join holds a
             // full right copy on every worker, and its left is linear given that copy.
+            // DBSPNET_TRACE_BLOCKS=join: both traces as reference-free blocks, output rows built
+            // straight from block cells (docs/design-flat-trace-state.md §3). Joins with a residual
+            // stay managed: blocks would box every candidate before the residual rejects it (§3.0).
+            BlockedJoinSpec? blocked = null;
+            if (TraceBlocksMode.Join && residualFn is null && ctx.Options.TraceFamily != TraceFamily.Spine
+                && TraceBlockFormats.Create(leftKeySchema, plan.Left.Schema) is { } leftFormat
+                && TraceBlockFormats.Create(rightKeySchema, plan.Right.Schema) is { } rightFormat)
+            {
+                Func<object?[], StructuralRow> row = ReferenceEquals(codec, StructuralRowCodec.Instance)
+                    ? static cells => new StructuralRow(cells)
+                    : cells => codec.BuildRow(joinedSchema, cells);
+                blocked = new BlockedJoinSpec(leftFormat, rightFormat, row);
+            }
+
             joined = EmitInnerJoin(
                 builder, ctx, leftIndexed, rightIndexed, Combine,
                 leftCodec, rightCodec, gcFrontier, gcMonotoneKey, residualFn,
                 leftReshard: ctx.Workers <= 1 ? null
                     : broadcastRight ? ReshardPlacement.Anywhere : ReshardPlacement.WholeRow(leftKeySchema),
                 rightReshard: ctx.Workers <= 1 ? null
-                    : broadcastRight ? ReshardPlacement.OnEveryWorker : ReshardPlacement.WholeRow(rightKeySchema));
+                    : broadcastRight ? ReshardPlacement.OnEveryWorker : ReshardPlacement.WholeRow(rightKeySchema),
+                blocked: blocked);
 
             // A broadcast join leaves the fact side on its incoming partition (not
             // the join key), so the output is partitioned as the left was — inherit
