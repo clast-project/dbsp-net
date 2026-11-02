@@ -38,13 +38,14 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
 {
     private readonly Stream<ZSet<TRow, Z64>> _input;
     private readonly Stream<ZSet<TRow, Z64>> _output;
-    private readonly ZSetTrace<TRow, Z64> _view = new();
+    private readonly IRowTrace<TRow, Z64> _view;
     private readonly IZSetTraceCodec<TRow, Z64>? _snapshotCodec;
 
     public IntegrateOp(
         Stream<ZSet<TRow, Z64>> input,
         Stream<ZSet<TRow, Z64>> output,
-        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null,
+        IRowTrace<TRow, Z64>? view = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -52,7 +53,11 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         _input = input;
         _output = output;
         _snapshotCodec = snapshotCodec;
+        _view = view ?? new ManagedRowTrace<TRow, Z64>();
     }
+
+    /// <summary>Whether the view is held as blocks (DBSPNET_TRACE_BLOCKS).</summary>
+    internal bool IsBlocked => _view is Blocks.BlockedZSetTrace;
 
     /// <summary>The full current view contents — every delta folded in so far —
     /// valid until the next <see cref="Step"/>.</summary>
@@ -80,7 +85,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
 
     public string MetricName => "IntegratedView";
 
-    public long RetainedRows => _view.State.Count;
+    public long RetainedRows => _view.RetainedRows;
 
     public long LastOutputRows => _output.Current.Count;
 
@@ -91,6 +96,11 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     public void Step()
     {
         var delta = _input.Current;
+        if (delta.IsEmpty)
+        {
+            _view.Idle();
+        }
+
         _view.Integrate(delta);      // O(|delta|): fold the tick's delta into the view.
         _output.SetCurrent(delta);   // the delta flows through unchanged.
     }
@@ -104,7 +114,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
                 "CircuitBuilder.Integrate to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
-        return _snapshotCodec.SaveAsync(writer, "view.arrows", _view.State, cancellationToken);
+        return _view.SaveAsync(_snapshotCodec, writer, "view.arrows", cancellationToken);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -115,25 +125,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         }
 
         // Lazily (increment 6): a row-ordered chain stays cold until rows are asked for.
-        if (LazyViews
-            && _snapshotCodec is IColdZSetLoader<TRow, Z64> coldLoader
-            && await coldLoader.LoadColdZSetAsync(reader, "view.arrows", cancellationToken).ConfigureAwait(false) is { } cold)
-        {
-            _view.AdoptCold(cold);
-            return;
-        }
-
-        var loaded = await _snapshotCodec.LoadAsync(reader, "view.arrows", cancellationToken).ConfigureAwait(false);
-
-        // Reset the (in-place-mutated) view to the persisted contents. Integrating
-        // into a freshly-cleared trace re-establishes exactly the saved multiset.
-        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _view.Clear();
-        _view.Integrate(loaded);
-        if (SnapshotRestoreProfile.Enabled)
-        {
-            SnapshotRestoreProfile.AddIntegrate(SnapshotRestoreProfile.MsSince(t0));
-        }
+        await _view.LoadAsync(_snapshotCodec, reader, "view.arrows", LazyViews, cancellationToken).ConfigureAwait(false);
     }
 
     public string SchemaFingerprint => _snapshotCodec?.SchemaFingerprint ?? string.Empty;

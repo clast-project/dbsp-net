@@ -4,6 +4,7 @@ using DbspNet.Core.Collections;
 using DbspNet.Core.IO;
 using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Persistence.Runs;
+using ArrowSchema = Apache.Arrow.Schema;
 
 namespace DbspNet.Persistence.Blocks;
 
@@ -24,15 +25,36 @@ namespace DbspNet.Persistence.Blocks;
 /// </remarks>
 internal static class BlockedTraceCheckpoint
 {
+    /// <summary>What a codec supplies to checkpoint a blocked trace: an indexed trace's codec writes
+    /// indexed chains, a Z-set trace's (§3.7: rows as keys, no value columns) Z-set chains.</summary>
+    internal interface ILayout
+    {
+        ArrowSchema RunSchema { get; }
+
+        RunFile.Kind Kind { get; }
+
+        /// <summary>The block encoding of the run blocks (null: the schema has none).</summary>
+        BlockSchema? Blocks { get; }
+
+        /// <summary>Write the trace whole, outside the runs layout.</summary>
+        ValueTask SaveWholeAsync(Core.Circuit.ISnapshotWriter writer, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken);
+
+        /// <summary>Read a snapshot that is not a chain into the (empty) trace.</summary>
+        ValueTask LoadWholeAsync(Core.Circuit.ISnapshotReader reader, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken);
+
+        /// <summary>Whether <paramref name="chain"/> sums to the trace's contents (verify mode).</summary>
+        ValueTask<bool> MatchesAsync(RunChain chain, BlockedIndexedTrace trace, CancellationToken cancellationToken);
+    }
+
     private static int RowHash(StructuralRow row) => row.GetHashCode();
 
     public static async ValueTask SaveAsync(
-        ArrowIndexedZSetTraceCodec codec, Core.Circuit.ISnapshotWriter writer, string fileName, BlockedIndexedTrace trace,
+        ILayout codec, Core.Circuit.ISnapshotWriter writer, string fileName, BlockedIndexedTrace trace,
         CancellationToken cancellationToken)
     {
         if (!StateLayout.Runs || writer is not TableFileSystemSnapshotContext { Session: { } session } ctx)
         {
-            await codec.SaveAsync(writer, fileName, trace.Materialize(), cancellationToken).ConfigureAwait(false);
+            await codec.SaveWholeAsync(writer, fileName, trace, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -85,7 +107,7 @@ internal static class BlockedTraceCheckpoint
         {
             var path = "runs/" + ctx.Prefix + fileName;
             await using (var empty = await RunStreamWriter.CreateAsync(
-                ctx.FileSystem, path, codec.RunSchema, RunFile.Kind.Indexed, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false))
+                ctx.FileSystem, path, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false))
             {
                 await empty.FinishAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -103,29 +125,23 @@ internal static class BlockedTraceCheckpoint
             }
         });
 
-        if (RunCheckpoint.Verify)
+        if (RunCheckpoint.Verify && !await codec.MatchesAsync(chain, trace, cancellationToken).ConfigureAwait(false))
         {
-            var back = await ReadAllAsync(chain, codec, cancellationToken).ConfigureAwait(false);
-            if (!back.Equals(trace.Materialize()))
-            {
-                throw new InvalidOperationException(
-                    $"blocked run chain for '{ctx.Prefix}{fileName}' sums to {back.GroupCount} keys, the trace has {trace.GroupCount}");
-            }
+            throw new InvalidOperationException($"blocked run chain for '{ctx.Prefix}{fileName}' does not sum to the trace");
         }
     }
 
     public static async ValueTask LoadAsync(
-        ArrowIndexedZSetTraceCodec codec, Core.Circuit.ISnapshotReader reader, string fileName, BlockedIndexedTrace trace,
+        ILayout codec, Core.Circuit.ISnapshotReader reader, string fileName, BlockedIndexedTrace trace,
         CancellationToken cancellationToken)
     {
         if (await RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is not { } chain)
         {
-            trace.Integrate(await codec.LoadAsync(reader, fileName, cancellationToken).ConfigureAwait(false));
+            await codec.LoadWholeAsync(reader, fileName, trace, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        var schema = BlockSchema.TryCreate(codec.KeySchema, codec.ValueSchema)
-            ?? throw new InvalidOperationException("a blocked trace's schema has no block encoding");
+        var schema = codec.Blocks ?? throw new InvalidOperationException("a blocked trace's schema has no block encoding");
         foreach (var path in chain.Paths)
         {
             await using var run = await RunReader.OpenDetachedAsync(chain.Store, path, RowHash, cancellationToken: cancellationToken)
@@ -148,11 +164,11 @@ internal static class BlockedTraceCheckpoint
 
     // One run file from a run's blocks, raw. A hash spanning blocks in memory becomes one block.
     private static async ValueTask WriteRunAsync(
-        ITableFileSystem fs, string path, ArrowIndexedZSetTraceCodec codec, BlockedIndexedTrace.Run run, CancellationToken cancellationToken)
+        ITableFileSystem fs, string path, ILayout codec, BlockedIndexedTrace.Run run, CancellationToken cancellationToken)
     {
-        var schema = BlockSchema.TryCreate(codec.KeySchema, codec.ValueSchema)!;
+        var schema = codec.Blocks!;
         await using var writer = await RunStreamWriter.CreateAsync(
-            fs, path, codec.RunSchema, RunFile.Kind.Indexed, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
+            fs, path, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
         var blocks = run.Blocks;
         for (var b = 0; b < blocks.Length;)
         {
@@ -202,14 +218,29 @@ internal static class BlockedTraceCheckpoint
         return distinct;
     }
 
-    private static async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Core.Algebra.Z64>> ReadAllAsync(
-        RunChain chain, ArrowIndexedZSetTraceCodec codec, CancellationToken cancellationToken)
+    /// <summary>The chain read whole as an indexed Z-set (verify mode).</summary>
+    internal static async ValueTask<IndexedZSet<StructuralRow, StructuralRow, Core.Algebra.Z64>> ReadIndexedAsync(
+        RunChain chain, IIndexedRunCodec codec, CancellationToken cancellationToken)
     {
         var into = new IndexedZSetBuilder<StructuralRow, StructuralRow, Core.Algebra.Z64>();
         foreach (var path in chain.Paths)
         {
             await using var run = await RunReader.OpenAsync(chain.Store, path, RowHash, cancellationToken).ConfigureAwait(false);
-            await run.ReadAllIntoAsync((IIndexedRunCodec)codec, into, cancellationToken).ConfigureAwait(false);
+            await run.ReadAllIntoAsync(codec, into, cancellationToken).ConfigureAwait(false);
+        }
+
+        return into.Build();
+    }
+
+    /// <summary>The chain read whole as a Z-set (verify mode).</summary>
+    internal static async ValueTask<ZSet<StructuralRow, Core.Algebra.Z64>> ReadZSetAsync(
+        RunChain chain, IZSetRunCodec codec, CancellationToken cancellationToken)
+    {
+        var into = new ZSetBuilder<StructuralRow, Core.Algebra.Z64>();
+        foreach (var path in chain.Paths)
+        {
+            await using var run = await RunReader.OpenAsync(chain.Store, path, RowHash, cancellationToken).ConfigureAwait(false);
+            await run.ReadAllIntoAsync(codec, into, cancellationToken).ConfigureAwait(false);
         }
 
         return into.Build();

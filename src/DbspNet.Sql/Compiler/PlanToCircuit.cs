@@ -306,7 +306,7 @@ public static partial class PlanToCircuit
             if (options.StoredOutput)
             {
                 var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-                var integrated = builder.Integrate(queryStream, viewCodec);
+                var integrated = EmitIntegrate(builder, queryStream, plan.Schema, viewCodec, options);
                 queryStream = integrated.Output;
                 view = integrated.View;
             }
@@ -520,7 +520,7 @@ public static partial class PlanToCircuit
                     if (v.IsOutput)
                     {
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
-                        var integrated = builder.Integrate(stream, viewCodec);
+                        var integrated = EmitIntegrate(builder, stream, v.Query.Schema, viewCodec, options);
                         outputs[v.ViewName] = new ProgramOutput(v.Query.Schema, integrated.View);
                     }
                 }
@@ -729,7 +729,7 @@ public static partial class PlanToCircuit
                         // The delta still flows through unchanged for the sharded output.
                         var viewCodec = snapshotCodecs?.CreateZSetTraceCodec(v.Query.Schema);
                         var mark = ReshardRecorder.Mark(builder);
-                        var integrated = builder.Integrate(stream, viewCodec);
+                        var integrated = EmitIntegrate(builder, stream, v.Query.Schema, viewCodec, options);
                         // Linear: a view row may be split across workers, and every consumer
                         // reads the sum over workers.
                         reshard.Record(builder, mark, Z("view.arrows", ReshardPlacement.Anywhere, viewCodec));
@@ -1421,10 +1421,24 @@ public static partial class PlanToCircuit
     // supplied by StructuralRowComparer; the flat trace ignores ordering.
     // These helpers are the single place the trace family is selected.
 
+    // A stored output view: held as blocks under DBSPNET_TRACE_BLOCKS=view (§3.7) when its columns
+    // have a block encoding, otherwise the managed integral.
+    private static (Stream<ZSet<StructuralRow, Z64>> Output, IntegratedViewHandle<StructuralRow> View) EmitIntegrate(
+        CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Schema schema,
+        IZSetTraceCodec<StructuralRow, Z64>? viewCodec,
+        CompileOptions options) =>
+        TraceBlocksMode.View && options.TraceFamily != TraceFamily.Spine
+            && TraceBlockFormats.Create(schema, Schema.Empty) is { } format
+            ? builder.BlockedIntegrate(input, format, viewCodec)
+            : builder.Integrate(input, viewCodec);
+
     private static Stream<ZSet<StructuralRow, Z64>> EmitDistinct(
         CircuitBuilder builder,
         CompileContext ctx,
         Stream<ZSet<StructuralRow, Z64>> input,
+        Schema schema,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
         IFrontier? frontier = null,
         Func<StructuralRow, long>? monotoneKey = null,
@@ -1436,7 +1450,9 @@ public static partial class PlanToCircuit
                 ? builder.SpineDistinct(
                     input, ctx.Options.Compaction, snapshotCodec, StructuralRowComparer.Instance,
                     frontier: frontier, monotoneKey: monotoneKey)
-                : builder.Distinct(input, snapshotCodec, frontier, monotoneKey),
+                : TraceBlocksMode.Distinct && TraceBlockFormats.Create(schema, Schema.Empty) is { } format
+                    ? builder.BlockedDistinct(input, format, snapshotCodec, frontier, monotoneKey)
+                    : builder.Distinct(input, snapshotCodec, frontier, monotoneKey),
             Z("trace.arrows", reshard, snapshotCodec));
     }
 
@@ -2370,7 +2386,7 @@ public static partial class PlanToCircuit
                     }
 
                     return EmitDistinct(
-                        builder, ctx, distinctInput, distinctCodec,
+                        builder, ctx, distinctInput, d.Schema, distinctCodec,
                         gcFrontier, gcMonotoneKey,
                         reshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(d.Schema) : null);
                 }
@@ -3772,11 +3788,11 @@ public static partial class PlanToCircuit
         ReshardPlacement? reshard)
     {
         var positive = EmitDistinct(
-            builder, ctx, input,
+            builder, ctx, input, schema,
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema),
             reshard: reshard);
         var negative = EmitDistinct(
-            builder, ctx, builder.Negate(input),
+            builder, ctx, builder.Negate(input), schema,
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(schema),
             reshard: reshard);
         return builder.Union(positive, negative);
@@ -3844,7 +3860,7 @@ public static partial class PlanToCircuit
         // all +1, so plain Distinct is enough.
         var sidePlace = ctx.Workers > 1 ? ReshardPlacement.WholeRow(sideSchema) : null;
         var distinct = EmitDistinct(
-            builder, ctx, projected,
+            builder, ctx, projected, sideSchema,
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(sideSchema),
             reshard: sidePlace);
 
@@ -4321,7 +4337,7 @@ public static partial class PlanToCircuit
 
         var keyPlace = ctx.Workers > 1 ? ReshardPlacement.WholeRow(keySchema) : null;
         var subqueryDistinct = EmitDistinct(
-            builder, ctx, subqueryProjected,
+            builder, ctx, subqueryProjected, keySchema,
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(keySchema),
             reshard: keyPlace);
 

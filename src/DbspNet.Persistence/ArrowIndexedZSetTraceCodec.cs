@@ -32,7 +32,8 @@ namespace DbspNet.Persistence;
 /// rename is purely cosmetic on the wire.
 /// </remarks>
 internal sealed class ArrowIndexedZSetTraceCodec
-    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>, Runs.IIndexedRunCodec, DbspNet.Core.Operators.Stateful.Blocks.IBlockedTraceCodec
+    : IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>, Runs.IIndexedRunCodec, DbspNet.Core.Operators.Stateful.Blocks.IBlockedTraceCodec,
+        Blocks.BlockedTraceCheckpoint.ILayout
 {
     private readonly SqlSchema _keySchema;
     private readonly SqlSchema _valueSchema;
@@ -55,6 +56,24 @@ internal sealed class ArrowIndexedZSetTraceCodec
     internal SqlSchema KeySchema => _keySchema;
 
     internal SqlSchema ValueSchema => _valueSchema;
+
+    Runs.RunFile.Kind Blocks.BlockedTraceCheckpoint.ILayout.Kind => Runs.RunFile.Kind.Indexed;
+
+    Blocks.BlockSchema? Blocks.BlockedTraceCheckpoint.ILayout.Blocks => _blocks ??= Blocks.BlockSchema.TryCreate(_keySchema, _valueSchema);
+
+    private Blocks.BlockSchema? _blocks;
+
+    ValueTask Blocks.BlockedTraceCheckpoint.ILayout.SaveWholeAsync(
+        ISnapshotWriter writer, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        SaveAsync(writer, fileName, trace.Materialize(), cancellationToken);
+
+    async ValueTask Blocks.BlockedTraceCheckpoint.ILayout.LoadWholeAsync(
+        ISnapshotReader reader, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        trace.Integrate(await LoadAsync(reader, fileName, cancellationToken).ConfigureAwait(false));
+
+    async ValueTask<bool> Blocks.BlockedTraceCheckpoint.ILayout.MatchesAsync(
+        Runs.RunChain chain, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        (await Blocks.BlockedTraceCheckpoint.ReadIndexedAsync(chain, this, cancellationToken).ConfigureAwait(false)).Equals(trace.Materialize());
 
     /// <inheritdoc/>
     public ValueTask SaveBlockedAsync(

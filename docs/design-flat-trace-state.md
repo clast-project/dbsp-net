@@ -582,6 +582,41 @@ level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
 consolidated group, so their reads merge levels by value hash, which is why freeze sorts values by
 hash within a key), then flat `ZSetTrace` views and DISTINCT.
 
+### 3.7 Views and DISTINCT: plan (2026-11-02, branch `arc/flat-trace-zset`)
+
+**Census (SF=3, W=12, after the checkpoint, joins and aggregates on blocks):** the stored output
+views' `ZSetTrace`s hold 48.4M references (14.5% of the heap's), and DISTINCT's hold 10.2M (3.1%).
+The window operators hold 68%, but they are a different structure (per-partition sorted state) and
+out of scope here. Some of a view's rows may also be held by the incremental output connector
+(`ProgramRunner`, 4.4%, which keys on the written rows). The census after the change shows how
+much of the 14.5% is really freed.
+
+**Shape.** Both operators keep a consolidated Z-set (row → weight). DISTINCT asks
+`WeightOf(row)` once per delta row; a view integrates each delta and is read whole (truncate sinks,
+tests, the parallel `CurrentView`), counted (`Count`), and asked `WeightOf` (the parallel
+`RowCount`).
+
+**Design.** A `BlockedZSetTrace` over the existing `BlockedIndexedTrace`, with the **row as the
+key and an empty value**:
+- **Managed levels:** a level may be the tick's `ZSet` as it arrived (no indexed copy). Probes look
+  the row up, and freeze sorts its rows by hash.
+- **Runs:** unchanged blocks with zero value columns. Their column layout is the Z-set run's (row
+  columns, `__weight`, `__hash`), so a checkpoint writes an ordinary **Z-set chain**. A managed
+  trace restores it, and a blocked trace adopts a managed Z-set chain's blocks lazily, as joins do.
+- **`WeightOf`:** a probe summed over levels.
+- **`Count`:** computed on first read by materialising, then kept up to date by probing each delta
+  row while anyone reads it (as the parallel `RowCount` does).
+- **`Current` and enumeration:** materialised and cached until the next change.
+- **GC:** level floors, as before.
+- **Freeze:** at the threshold, and on an idle tick (an empty delta).
+
+**Gate:** `DBSPNET_TRACE_BLOCKS=view,distinct` (and `all`); flat trace family and
+block-encodable columns only.
+
+**Measure:** the batch-1 drain and the first checkpoint (5 runs per arm against `join,agg`), the
+output-write time (the view is read for the incremental connector's deltas only, but truncate
+sinks materialise it), restart, and the census.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
