@@ -201,6 +201,9 @@ public class LazyRestoreTests
     [Fact]
     public async Task ARestoredJoin_StaysCold_ReadsOnlyTouchedKeys_AndMatchesItsTwin()
     {
+        // The managed traces' cold restore; block-held traces restore lazily their own way
+        // (BlockedCheckpointTests), so this pins them off under DBSPNET_TRACE_BLOCKS=join.
+        using var managed = DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false);
         using var layout = StateLayout.Use(true);
         var fs = new InMemoryTableFileSystem();
         var producer = SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);

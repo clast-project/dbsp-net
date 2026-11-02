@@ -1502,6 +1502,16 @@ public static partial class PlanToCircuit
             left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual);
     }
 
+    // DBSPNET_TRACE_BLOCKS=join: an outer join's two traces as blocks, when both sides' shapes are
+    // known and block-encodable on the flat family (docs/design-flat-trace-state.md §3.3).
+    private static (ITraceBlockFormat Left, ITraceBlockFormat Right)? OuterBlockFormats(
+        CompileContext ctx, (Schema Key, Schema Value)? left, (Schema Key, Schema Value)? right) =>
+        TraceBlocksMode.Join && ctx.Options.TraceFamily != TraceFamily.Spine
+            && left is ({ } lk, { } lv) && right is ({ } rk, { } rv)
+            && TraceBlockFormats.Create(lk, lv) is { } lf && TraceBlockFormats.Create(rk, rv) is { } rf
+            ? (lf, rf)
+            : null;
+
     private static Stream<ZSet<StructuralRow, Z64>> EmitLeftJoin(
         CircuitBuilder builder,
         CompileContext ctx,
@@ -1514,11 +1524,16 @@ public static partial class PlanToCircuit
         IFrontier? frontier = null,
         Func<StructuralRow, long>? monotoneKey = null,
         ReshardPlacement? leftReshard = null,
-        ReshardPlacement? rightReshard = null)
+        ReshardPlacement? rightReshard = null,
+        (Schema Key, Schema Value)? leftShape = null,
+        (Schema Key, Schema Value)? rightShape = null)
     {
+        var blocks = OuterBlockFormats(ctx, leftShape, rightShape);
         return Recorded(
             builder, ctx,
-            () => ctx.Options.TraceFamily == TraceFamily.Spine
+            () => blocks is ({ } lf, { } rf)
+                ? builder.BlockedLeftJoin(left, right, joinCombine, nullPadCombine, lf, rf, leftCodec, rightCodec, frontier, monotoneKey)
+                : ctx.Options.TraceFamily == TraceFamily.Spine
                 ? builder.SpineIncrementalLeftJoin(
                     left, right, joinCombine, nullPadCombine, leftCodec, rightCodec,
                     ctx.Options.Compaction,
@@ -1546,11 +1561,17 @@ public static partial class PlanToCircuit
         IFrontier? frontier = null,
         Func<StructuralRow, long>? monotoneKey = null,
         ReshardPlacement? leftReshard = null,
-        ReshardPlacement? rightReshard = null)
+        ReshardPlacement? rightReshard = null,
+        (Schema Key, Schema Value)? leftShape = null,
+        (Schema Key, Schema Value)? rightShape = null)
     {
+        var blocks = OuterBlockFormats(ctx, leftShape, rightShape);
         return Recorded(
             builder, ctx,
-            () => ctx.Options.TraceFamily == TraceFamily.Spine
+            () => blocks is ({ } lf, { } rf)
+                ? builder.BlockedFullJoin(
+                    left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, lf, rf, leftCodec, rightCodec, frontier, monotoneKey)
+                : ctx.Options.TraceFamily == TraceFamily.Spine
                 ? builder.SpineIncrementalFullJoin(
                     left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftCodec, rightCodec,
                     ctx.Options.Compaction,
@@ -3576,7 +3597,8 @@ public static partial class PlanToCircuit
             nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
-            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null);
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
+            leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema));
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
@@ -3904,7 +3926,8 @@ public static partial class PlanToCircuit
             nullPadCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
             preservedCodec, probedCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
-            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null);
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
+            leftShape: (rightKeySchema, plan.Right.Schema), rightShape: (leftKeySchema, plan.Left.Schema));
 
         var nullKeyPadded = builder.MapRows(
             nullKeyRight,
@@ -3988,7 +4011,8 @@ public static partial class PlanToCircuit
             nullPadLeftCombine: (_, rrow) => NullPadLeft(codec, joinedSchema, rrow, leftCount, rightCount),
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
-            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null);
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
+            leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema));
 
         var nullKeyLeftPadded = builder.MapRows(
             nullKeyLeft,
@@ -4451,7 +4475,8 @@ public static partial class PlanToCircuit
             subqIndexed,
             joinCombine: (_, outerRow, scalarRow) => AppendColumn(codec, null, outerRow, scalarRow[0]),
             nullPadCombine: (_, outerRow) => AppendColumn(codec, null, outerRow, null),
-            leftCodec, rightCodec);
+            leftCodec, rightCodec,
+            leftShape: (Schema.Empty, outerSchema), rightShape: (Schema.Empty, subqSchema));
     }
 
     /// <summary>
@@ -4555,7 +4580,8 @@ public static partial class PlanToCircuit
                 AppendColumn(codec, joinedSchema, outerRow, innerRow[scalarColumnIndex]),
             nullPadCombine: (_, outerRow) =>
                 AppendColumn(codec, joinedSchema, outerRow, null),
-            leftCodec, rightCodec);
+            leftCodec, rightCodec,
+            leftShape: (keySchema, outerSchema), rightShape: (keySchema, plan.Subquery.Schema));
 
         // NULL-key outer rows bypass the join — append NULL directly.
         var nullPadded = builder.MapRows<StructuralRow, StructuralRow, Z64>(
