@@ -173,6 +173,8 @@ internal abstract class RunnerProgram
         // The last tick's delta gathered (Z-set sum) across the replicas — the same
         // Z-set the serial program's in-circuit integral was fed that tick.
         public override ZSet<StructuralRow, Z64> LastDelta => output.CurrentDelta;
+
+        public override IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() => output.EnumerateView();
     }
 }
 

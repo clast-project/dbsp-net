@@ -290,6 +290,14 @@ public sealed class ParallelProgramOutput
         }
     }
 
+    /// <summary>The full current view for one pass (a sink's full write): the cached
+    /// <see cref="CurrentView"/> if this tick's is formed, otherwise formed for the caller only, so
+    /// a decoded copy of every row is not kept until the next step (docs/design-flat-trace-state.md §3.10).</summary>
+    public IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() =>
+        _shards.Count == 1 ? _shards[0].EnumerateCurrent()
+        : _cached is not null && _cachedTick == _circuit.TickCount ? _cached
+        : FormView();
+
     // The sum of the shard integrals, formed (W > 1).
     private ZSet<StructuralRow, Z64> FormView()
     {
