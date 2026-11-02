@@ -16,7 +16,7 @@ namespace DbspNet.Persistence.Blocks;
 /// <remarks>
 /// <para>Two representations. <b>Managed</b>: a dictionary keyed by the row object, which then stays
 /// alive as long as a copy is live. <b>Blocked</b> (when the view itself is held as blocks,
-/// <c>DBSPNET_TRACE_BLOCKS=view</c>, and every column has a block encoding): a
+/// <c>DBSPNET_TRACE_BLOCKS=view</c> or <c>all</c>, and every column has a block encoding): a
 /// <see cref="BlockedIndexedTrace"/> keyed by the row with the address as its value, each copy an
 /// entry of weight +1 and its removal the same entry at −1, so the index holds no reference to a
 /// row. A blocked index beside a managed view would only add bytes, hence the coupling.</para>

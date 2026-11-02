@@ -746,6 +746,69 @@ as a guard. Use 5 alternating runs of `all` against `all,view`, and compare outp
 if `all,view` has fewer references and no more bytes than `all`, and the output write is no slower
 beyond noise, views join `all`.
 
+### 3.10 The output row index: built and measured; views join `all` (2026-11-02, branch `arc/flat-trace-view-index`)
+
+**Built as planned (§3.9):** `OutputRowIndex` (DbspNet.Persistence) holds a row → packed address map,
+blocked or managed, and `DeltaOutputConnector` uses it with int file ids. Tests:
+- a model oracle over both representations (tiny runs, large groups, NaN payloads, clears);
+- the incremental-connector tests with views and the index on blocks;
+- `IntegrateEntries` inside the random trace oracle, and a 150k-entry batch with and without forced
+  collisions.
+
+The suite passes 3,150 tests with blocks off and with `all`. 6 mutations were tried: 4 were caught,
+and 2 changed no behaviour (clearing an index that is always empty at truncate, and a zero-weight
+check that decoding already makes).
+
+**Two things the first A/B found:**
+1. **Chunked freezes merged each entry about 6.6 times.** Indexing a first write of 4M rows took
+   5.3 s: 3.9 s of merges and 0.9 s of freezes. The index now gives a batch to the trace whole, as
+   one run, through `BlockedIndexedTrace.IntegrateEntries`. The entries are sorted by hash once and
+   encoded once, with no managed level. The encoding also replaces §3.9's chunked first write: the
+   flat lists hold only the keys the runner already holds. A large batch is cut into hash ranges
+   (the top bits of the hash) that are sorted and encoded in parallel. A run is the ranges'
+   blocks concatenated, and building it is cache-miss bound: rows are visited in hash order. The
+   output write is off the step path, when cores are idle. A 4M-row first write now takes 0.34 s
+   (managed: 0.39 s).
+2. **The parallel view kept a decoded copy of every row.** `ParallelProgramOutput.CurrentView`
+   caches the formed view (the sum of the shard integrals) until the next read. The runner's first
+   incremental write and the harness's first `RowCount` both went through it, and nothing released
+   it before the checkpoint. With managed views the cache shares row objects with the traces, so
+   it was nearly invisible (2.9M references). With blocked views it was the whole view decoded:
+   32.8M objects and 45.7M references, which §3.8 had blamed on the connector. Now a full write
+   (`EnumerateView`) and a first count form the view for that pass only, and a step drops the
+   cache.
+
+**Census after the checkpoint** (SF=3, W=12, one run each, both arms on the fixed code):
+
+| | all (join, agg, DISTINCT) | all + views + row index |
+|---|---|---|
+| objects | 133.1M | 98.9M (−26%) |
+| references | 319.6M | 263.0M (−18%) |
+| bytes | 10.59 GB | 10.08 GB (−0.51 GB) |
+| IntegratedView references | 48.5M | 0.4M |
+| `(runner)` references | 8.8M | 0.09M (the index: 0.54 GB of blocks, 77k refs) |
+
+**Wall clock** (5 alternating runs per arm, outputs identical, medians, ms):
+
+| | all | all + views + row index |
+|---|---|---|
+| batch-1 drain | 16,814 | 16,794 |
+| batch-1 output write | 3,352 | 2,647 (−21%) |
+| (of which index upkeep) | 189 | 564 |
+| batch-1 checkpoint | 3,091 | 2,575 (−17%) |
+| batch-1 GC pause | 6,331 | 6,172 |
+| restart: restore | 256 | 250 |
+| restart: first drain | 508 | 510 |
+| restart: output write | 3,471 | 3,513 (+1%, noise) |
+| restart: checkpoint | 284 | 299 |
+
+**Decided (by §3.9's rule):** views and the connector's row index join `all`
+(`DBSPNET_TRACE_BLOCKS=all` is now joins, aggregates, DISTINCT and views), and `TraceBlocksMode.Use`
+defaults `view` to `join`. The index upkeep costs about 0.4 s more per first write, but it is
+outweighed by the cheaper Arrow conversion and GC: the output write gets faster overall.
+**Lesson:** a census that attributes references to an owner names only the first path found. Check
+which field actually holds the rows (`STATE … path`) before designing the fix.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

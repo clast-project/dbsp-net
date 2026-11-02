@@ -1421,7 +1421,7 @@ public static partial class PlanToCircuit
     // supplied by StructuralRowComparer; the flat trace ignores ordering.
     // These helpers are the single place the trace family is selected.
 
-    // A stored output view: held as blocks under DBSPNET_TRACE_BLOCKS=view (§3.7) when its columns
+    // A stored output view: held as blocks under DBSPNET_TRACE_BLOCKS=view or all (§3.7, §3.10) when its columns
     // have a block encoding, otherwise the managed integral.
     private static (Stream<ZSet<StructuralRow, Z64>> Output, IntegratedViewHandle<StructuralRow> View) EmitIntegrate(
         CircuitBuilder builder,
