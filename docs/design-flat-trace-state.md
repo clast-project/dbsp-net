@@ -460,6 +460,46 @@ scalar subquery, and the correlated scalar join.
 Drain went from +0.6% (§3.2) to +1.8%. Both runs are within each other's ranges, but the trend
 is the decoded group read; it is the thing to watch as more operators convert.
 
+### 3.4 Aggregate traces (2026-11-02, branch `arc/flat-trace-agg`, not merged)
+
+**Design.** `IncrementalAggregateOp` reaches its input trace through `IGroupTrace`; this is the
+outer joins' interface, renamed. The flag is now a list: `DBSPNET_TRACE_BLOCKS=join|agg|all`.
+
+- **Consolidated read:** the before-group is the decoded, consolidated group.
+- **Restore:** a blocked trace always restores lazily, so the per-group caches are rebuilt on
+  first touch.
+- **Frontier GC:** a blocked trace drops lazily and doesn't list the dropped keys, so the
+  operator prunes its caches by scanning them.
+
+**Measured** with three arms in one session (5 runs each, rotated order, view digests identical):
+
+| median | off | join | all (join + agg) |
+|---|---|---|---|
+| batch-1 drain | 15,871 ms | 16,466 ms (+3.7%) | 16,809 ms (**+5.9%**; +2.1% over join) |
+| batch-1 output write | 4,091 ms | 3,445 ms | 3,219 ms |
+| batch-1 first checkpoint | 5,527 ms | 3,498 ms | 3,287 ms |
+| batch-1 drain + write + checkpoint | 25.5 s | 23.4 s | 23.3 s |
+| restart: restore | 338 ms | 238 ms | 250 ms |
+| restart: first drain | 841 ms | 436 ms | 513 ms (+18% over join) |
+| census: aggregate trace references | — | 57.9M | 0.12M |
+| census: aggregate references (trace + caches) | — | 71.6M | 22.5M (−69%) |
+| census: whole heap, references / bytes | 592M / 10.8 GB | 374M / 10.79 GB | 333M / 10.57 GB |
+
+**The drain gate is missed.** The join-only arm measured +3.7% in this session, against +1.8%
+and +0.6% in earlier ones. Between-session variation is visible, but within this session
+aggregates add about 2% on top of joins.
+
+- **Likely cause:** the aggregate decodes each touched key's whole group on every tick it is
+  touched. Most aggregators (SUM, COUNT, AVG) only ask the after-group whether it is empty and
+  what weight it gives the delta's values.
+- **Next lever:** a lazy blocked group view (`IMultiset`) that answers `IsEmpty` and `WeightOf`
+  from encoded value equality, and decodes only when an aggregator walks the group (MIN/MAX
+  recompute).
+- **Restart:** the +18% first drain over join is the same decode, in the first-touch cache rebuild.
+
+**The remaining aggregate references are the caches** (`_aggCache`, `_stateCache`). They are
+charged the key rows the trace used to reach first, so they are now the structure to convert.
+
 **Widen only if the batch-1 drain gate holds.** If it fails, the first question is which part
 costs: probe depth (levels), materialisation, or merger contention. Each has its own instrument (the
 level-count histogram, `DBSPNET_PROFILE` per-operator ms, merge-thread CPU).
