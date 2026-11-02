@@ -809,6 +809,89 @@ outweighed by the cheaper Arrow conversion and GC: the output write gets faster 
 **Lesson:** a census that attributes references to an owner names only the first path found. Check
 which field actually holds the rows (`STATE … path`) before designing the fix.
 
+### 3.11 Window operators: plan — stop storing the emitted output (2026-11-02, branch `arc/flat-trace-window`)
+
+**Census (after §3.10, `all`):** the window operators hold 228M of the heap's 263M references (87%).
+WindowAggregate holds 120M and WindowOffset 108M. Each has two per-partition structures:
+- `_accum`: the integrated input, as a `SortedDictionary` per partition (52M and 58M references).
+- `_window`: the last emitted output, as one widened row per base row (base cells plus aggregate
+  or offset cells: 67M and 50M references).
+
+**`_window` is redundant.** An emitted row is a pure function of its partition's contents:
+- Running frames fold the partition from its start.
+- Bounded and whole-partition frames call `Compute` over a frame slice.
+- Offsets index positional slots.
+
+Lazy restore already relies on this: `EnsureWindow` and `InitWindow` rebuild `_window` from `_accum`.
+So the previous output of any row can be recomputed from the partition as it stood before the
+delta: the current rows with the delta subtracted. GC drops a row only once no row whose frame
+holds it can be recomputed again (the existing argument), so recomputing never meets a frame that
+lost a row.
+
+**Design.**
+- **Union list.** Each touched partition gets the union of its rows before and after the delta,
+  each with its old and new weight, ordered as today (order value, then the total order).
+- **Window aggregate.** A running frame folds two aggregates side by side in one pass. Bounded
+  and whole-partition frames compute old and new over the same candidates (rows in the affected
+  value range with a non-zero weight on either side). A row is emitted only where its widened
+  row or its weight changed, as `EmitRowDiff` does now.
+- **Offsets.** The positional slots are expanded for the old and the new partition, and the two
+  widened multisets are diffed.
+- **Removed:** `_window`, the faulted-partition window hulls (`_partial`, `EnsureWindow`), and
+  `InitWindow` at restore. A restored partition needs nothing beyond its rows.
+- **Unchanged:** the snapshot format (only `_accum` is persisted). `_accum` itself moves to blocks
+  in a second step, if this one holds.
+
+**Cost:** about twice the aggregator work and widening per touched partition. In batch 1 most
+partitions are new, so the old side is empty. Later batches pay it, and they are small.
+
+**Gate:** batch-1 drain ≤ +3% against main (5 alternating runs, two builds), plus restart first
+drain, census and identical outputs. There is no flag: the change is a simplification, kept only
+if it holds.
+
+### 3.12 Window operators without stored output: measured (2026-11-02)
+
+**Built as planned (§3.11):** 6228aaa. Both operators walk each touched partition's union of
+rows (old and new weights), with the removed rows merged in by the total order. The window
+aggregate folds two running aggregates side by side, or computes old and new frames. The offset
+operator expands both slot lists and diffs them.
+- **Restore no longer rebuilds windows:** `_partial`, `EnsureWindow` and `InitWindow` are gone, and
+  the eager load no longer recomputes every partition.
+- **Tests:** the suite passes 3,150 tests in both arms. 6 mutations were tried, and 5 were caught by
+  the existing tests. The sixth (not sorting the removed rows) changes only the order in which
+  peers are folded, so only floating-point sums can see it. A new test catches it: running,
+  bounded, whole-partition, descending and LAG windows over peers summing 1e16 ± 1, with several
+  rows deleted per tick, checked every tick against a fresh run.
+
+**Census after the checkpoint** (SF=3, W=12, `all`, one run each):
+
+| | main | no stored window output |
+|---|---|---|
+| objects | 98.9M | 82.6M (−16%) |
+| references | 263.0M | 155.4M (−41%) |
+| bytes | 10.08 GB | 8.57 GB (−1.5 GB) |
+| WindowAggregate references | 119.9M | 60.9M |
+| WindowOffset references | 108.3M | 58.4M |
+
+**Wall clock** (5 alternating runs per arm, two builds, outputs identical, medians, ms):
+
+| | main | no stored window output |
+|---|---|---|
+| batch-1 drain | 16,521 | 16,727 (+1.2%, gate +3%) |
+| batch-1 output write | 2,973 | 2,483 (−16%) |
+| batch-1 checkpoint | 2,625 | 2,462 (−6%) |
+| batch-1 GC pause | 6,068 | 5,743 (−5%) |
+| restart: restore | 260 | 256 |
+| restart: first drain (batch 2) | 509 | 467 (−8%) |
+| batch 3 drain (steady state) | 301 | 322 (+7%) |
+
+**Kept and merged.** The steady-state batch pays the doubled recompute: about +21 ms on a 0.3 s
+batch. If that matters, the lever is to stop refolding unchanged prefixes. A running frame's old
+and new folds agree up to the first delta row, so one fold could serve both until there.
+
+**What is left:** the remaining references are the two operators' `_accum`, a `SortedDictionary`
+of input rows per partition: about 119M of 155M. Holding it as blocks is the next step (§3.13).
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
