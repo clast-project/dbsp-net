@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Runtime.InteropServices;
 using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Parser.Ast;
@@ -124,6 +125,23 @@ public class NullOnErrorAndJsonTests
     [InlineData("3814585150461789134281.40e-15", null)]
     public void TextIntegralCastChecksRangeAfterRoundingAndRejectsMalformedNumbers(string value, int? expected) =>
         Assert.Equal(expected, Eval("TRY_CAST(s AS INTEGER)", value));
+
+    [Theory]
+    [InlineData("DOUBLE", "INTEGER", "2147483647.6")]
+    [InlineData("DOUBLE", "INTEGER", "-2147483648.6")]
+    [InlineData("DOUBLE", "BIGINT", "9.23e18")]
+    [InlineData("DOUBLE", "INTEGER", "NaN")]
+    [InlineData("DOUBLE", "REAL", "1e100")]
+    [InlineData("BIGINT", "INTEGER", "2147483648")]
+    [InlineData("DECIMAL(12,0)", "INTEGER", "4294967296")]
+    [InlineData("DECIMAL(12,0)", "DECIMAL(3,0)", "1000")]
+    [InlineData("BIGINT", "DECIMAL(38,37)", "9223372036854775807")]
+    [InlineData("DOUBLE", "DECIMAL(3,0)", "1000")]
+    public void StrictAndSafeCastsShareRangeChecks(string source, string target, string value)
+    {
+        Assert.Throws<OverflowException>(() => Eval($"CAST(CAST(s AS {source}) AS {target})", value));
+        Assert.Null(Eval($"TRY_CAST(CAST(s AS {source}) AS {target})", value));
+    }
 
     [Fact]
     public void TryCastDoesNotSuppressOperandErrors() =>
@@ -281,6 +299,46 @@ public class NullOnErrorAndJsonTests
     [InlineData("SELECT SUM(s) IGNORE NULLS OVER (ORDER BY s) FROM t")]
     public void IgnoreNullsRejectsNonWindowOrUnsupportedFunctions(string sql) =>
         Assert.Throws<ParseException>(() => Parser.ParseStatement(sql));
+
+    [Theory]
+    [InlineData("FIRST_VALUE(s IGNORE NULLS) OVER (ORDER BY s)")]
+    [InlineData("LAST_VALUE(s IGNORE NULLS) OVER (ORDER BY s)")]
+    [InlineData("FIRST_VALUE(s) OVER (ORDER BY s), LAST_VALUE(s IGNORE NULLS) OVER (ORDER BY s)")]
+    [InlineData("LAST_VALUE(s IGNORE NULLS) OVER (ORDER BY s), FIRST_VALUE(s) OVER (ORDER BY s)")]
+    [InlineData("FIRST_VALUE(s IGNORE NULLS) OVER (ORDER BY s ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)")]
+    public void IgnoreNullsRejectsImplicitAndPartialFrames(string expressions) =>
+        Assert.Throws<ResolveException>(() => Compile("CREATE TABLE t(s VARCHAR)", $"SELECT {expressions} FROM t"));
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExplicitFrameValidationDoesNotDependOnSelectOrder(bool lagFirst)
+    {
+        const string frame = "OVER (ORDER BY s ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)";
+        var first = $"FIRST_VALUE(s IGNORE NULLS) {frame}";
+        var lag = $"LAG(s) {frame}";
+        var expressions = lagFirst ? lag + ", " + first : first + ", " + lag;
+        Assert.Throws<ResolveException>(() => Compile("CREATE TABLE t(s VARCHAR)", $"SELECT {expressions} FROM t"));
+    }
+
+    [Theory]
+    [InlineData("{\"x\":12}", "12")]
+    [InlineData("{\"x\":true}", "true")]
+    [InlineData("{\"x\":false}", "false")]
+    [InlineData("{\"x\":\"abc\"}", "abc")]
+    [InlineData("{\"x\":{\"a\":[1e2]}}", "{\"a\":[100.0]}")]
+    [InlineData("{\"x\":[1e2]}", "[100.0]")]
+    public void JsonResultsRetainOnlyTheirUtf8Payload(string source, string expected)
+    {
+        var q = Compile("CREATE TABLE t(s VARCHAR)", "SELECT JSON_EXTRACT_STRING(s, '$.x') FROM t");
+        q.Table("t").Insert(source);
+        q.Step();
+        var value = Assert.IsType<Utf8String>(Assert.Single(q.Current).Key[0]);
+        Assert.Equal(expected, value.ToStringDecoded());
+        Assert.True(MemoryMarshal.TryGetArray(value.Memory, out var bytes));
+        Assert.NotNull(bytes.Array);
+        Assert.Equal(value.ByteLength, bytes.Array!.Length);
+    }
 
     [Fact]
     public void IgnoreNullsUsesEachColumnsFirstAndLastNonNullValuesAfterRetraction()

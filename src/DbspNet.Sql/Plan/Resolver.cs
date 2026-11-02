@@ -1611,19 +1611,18 @@ public sealed class Resolver
                 throw new ResolveException("LAG / LEAD / FIRST_VALUE / LAST_VALUE requires an ORDER BY");
             }
 
-            if (firstWin.Over.Frame is { } frame &&
-                !(firstWin.FunctionName is "first_value" or "last_value" &&
-                  frame.Start.Kind == FrameBoundKind.UnboundedPreceding &&
-                  frame.End.Kind == FrameBoundKind.UnboundedFollowing))
-            {
-                throw new ResolveException("Offset windows support only the whole-partition frame");
-            }
-
             var functions = new List<OffsetFunctionCall>(group.Count);
             for (var k = 0; k < group.Count; k++)
             {
                 var wi = group[k];
                 var w = (WindowFunctionExpression)wi.Expression;
+                if (w.IgnoreNulls && w.Over.Frame is null)
+                    throw new ResolveException("IGNORE NULLS requires an explicit whole-partition frame");
+                if (w.Over.Frame is { } frame &&
+                    !(w.FunctionName is "first_value" or "last_value" &&
+                      frame.Start.Kind == FrameBoundKind.UnboundedPreceding &&
+                      frame.End.Kind == FrameBoundKind.UnboundedFollowing))
+                    throw new ResolveException("Offset windows support only the whole-partition frame");
                 var (fn, resultType) = ResolveOffsetFunction(w, baseSchema);
                 functions.Add(fn);
 

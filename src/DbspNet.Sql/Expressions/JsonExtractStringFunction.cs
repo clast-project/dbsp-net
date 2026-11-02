@@ -71,6 +71,9 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
         {
             JsonValueKind.Null => null,
             JsonValueKind.String => Utf8String.Of(value.GetString()!),
+            JsonValueKind.Number => Utf8String.Of(FormatNumber(value)),
+            JsonValueKind.True => Utf8String.Of("true"),
+            JsonValueKind.False => Utf8String.Of("false"),
             _ => Serialize(value),
         };
     }
@@ -81,7 +84,7 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
         using var writer = new Utf8JsonWriter(buffer, JsonOptions);
         Write(value, writer);
         writer.Flush();
-        return Utf8String.FromBytes(buffer.WrittenMemory);
+        return Utf8String.FromBytes(buffer.WrittenSpan.ToArray());
     }
 
     private static void Write(JsonElement value, Utf8JsonWriter writer)

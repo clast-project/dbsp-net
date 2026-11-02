@@ -834,38 +834,23 @@ public static class TypedExpressionCompiler
     private static Expression BuildCastToDecimal(
         Expression operand, SqlType srcType, SqlDecimalType target)
     {
+        var targetType = DecimalType.Numeric(target.Precision, target.Scale);
         if (srcType is SqlDecimalType srcDec)
         {
-            if (srcDec.Scale == target.Scale)
-            {
-                return operand;
-            }
-
-            var mantissa = Expression.Field(operand, nameof(Decimal128.Mantissa));
-            var rescaled = Expression.Call(
-                typeof(ScaleHelper).GetMethod(nameof(ScaleHelper.Rescale128))!,
-                mantissa,
-                Expression.Constant(srcDec.Scale),
-                Expression.Constant(target.Scale),
-                Expression.Constant(DecimalRounding.HalfUp));
-            var ctor = typeof(Decimal128).GetConstructor([typeof(Int128)])!;
-            return Expression.New(ctor, rescaled);
+            return Expression.Call(typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
+                operand, Expression.Constant(srcDec.Scale), Expression.Constant(targetType));
         }
 
         if (srcType is SqlIntegerType or SqlBigintType)
         {
-            var srcClr = srcType.ClrType;
-            if (operand.Type != srcClr) operand = Expression.Convert(operand, srcClr);
-            var asInt128 = Expression.Convert(operand, typeof(Int128));
-            return Expression.Call(
-                typeof(Decimal128).GetMethod(nameof(Decimal128.FromInteger))!,
-                asInt128,
-                Expression.Constant((byte)target.Scale));
+            var unboxed = operand.Type == srcType.ClrType ? operand : Expression.Convert(operand, srcType.ClrType);
+            var value = Expression.New(typeof(Decimal128).GetConstructor([typeof(Int128)])!, Expression.Convert(unboxed, typeof(Int128)));
+            return Expression.Call(typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
+                value, Expression.Constant(0), Expression.Constant(targetType));
         }
 
         if (srcType is SqlVarcharType)
         {
-            var targetType = DecimalType.Numeric(target.Precision, target.Scale);
             var asString = Expression.Call(operand,
                 typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
             var asSpan = Expression.Call(
@@ -924,7 +909,7 @@ public static class TypedExpressionCompiler
             Expression.Constant(src.Scale),
             Expression.Constant(0),
             Expression.Constant(DecimalRounding.HalfUp));
-        return Expression.Convert(rescaled, dstClr);
+        return SqlCasts.ConvertNumeric(rescaled, dstClr);
     }
 
     /// <summary>

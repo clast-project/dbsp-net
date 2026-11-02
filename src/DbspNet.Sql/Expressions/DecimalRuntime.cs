@@ -67,17 +67,6 @@ internal static class DecimalRuntime
     /// </summary>
     public static Decimal128 FromDouble(double value, DecimalType type)
     {
-        if (double.IsNaN(value) || double.IsInfinity(value))
-        {
-            throw new OverflowException($"cannot cast {value} to DECIMAL");
-        }
-
-        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.AwayFromZero);
-        return new Decimal128((Int128)scaled);
-    }
-
-    public static Decimal128 FromDoubleChecked(double value, DecimalType type)
-    {
         var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.AwayFromZero);
         var result = new Decimal128(checked((Int128)scaled));
         DecimalRange.Validate(result.Mantissa, type);

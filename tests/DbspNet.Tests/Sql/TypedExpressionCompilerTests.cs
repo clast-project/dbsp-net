@@ -742,4 +742,28 @@ public class TypedExpressionCompilerTests
         Assert.Equal(expected, Invoke(compiled!, factory(new object?[] { value })));
     }
 
+    [Fact]
+    public void TypedStrictCastChecksOverflowAfterRounding()
+    {
+        var (rowType, factory) = RowFor(("v", new SqlDoubleType(false)));
+        var expression = ResolveOnDdl("CREATE TABLE t (v DOUBLE NOT NULL)", "CAST(v AS INTEGER)");
+        var compiled = TypedExpressionCompiler.TryCompile(expression, rowType);
+        Assert.NotNull(compiled);
+        var error = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+            Invoke(compiled!, factory(new object?[] { 2147483647.6 })));
+        Assert.IsType<OverflowException>(error.InnerException);
+    }
+
+    [Fact]
+    public void TypedDecimalCastChecksNarrowedPrecision()
+    {
+        var (rowType, factory) = RowFor(("v", new SqlDecimalType(12, 0, false)));
+        var expression = ResolveOnDdl("CREATE TABLE t (v DECIMAL(12,0) NOT NULL)", "CAST(v AS DECIMAL(3,0))");
+        var compiled = TypedExpressionCompiler.TryCompile(expression, rowType);
+        Assert.NotNull(compiled);
+        var error = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+            Invoke(compiled!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(1000) })));
+        Assert.IsType<OverflowException>(error.InnerException);
+    }
+
 }
