@@ -193,6 +193,11 @@ public class TraceBlockTests
                 Assert.Equal(oracle[i].Key.GetHashCode(), b.Key(i).GetHashCode());
                 Assert.Equal(oracle[i].Value.GetHashCode(), b.Value(i).GetHashCode());
 
+                for (var c = 0; c < valueKinds.Length; c++)
+                {
+                    Assert.Equal(oracle[i].Value[c], b.ValueCell(i, c));
+                }
+
                 var into = new object?[valueKinds.Length + 2];
                 b.ValueCellsInto(i, into, 2);
                 Assert.True(CellwiseEquals(new StructuralRow(into[2..]), oracle[i].Value));

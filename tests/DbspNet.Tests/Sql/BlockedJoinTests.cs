@@ -195,14 +195,95 @@ public class BlockedJoinTests
         Assert.True(op.LeftTrace.RunEntries.Count + op.RightTrace.RunEntries.Count > 0, "the traces never froze");
     }
 
+    private static readonly string[] ScdDdl =
+    [
+        "CREATE TABLE f (k INT NOT NULL, ts BIGINT NOT NULL, s VARCHAR)",
+        "CREATE TABLE d (k INT NOT NULL, lo BIGINT NOT NULL, hi BIGINT NOT NULL, name VARCHAR)",
+    ];
+
+    // The temporal-SCD shape (broker_performance): an equi-key plus a range residual spanning both
+    // sides, so most candidate pairs are rejected.
+    private const string ScdJoin = "SELECT f.k, f.ts, f.s, d.name FROM f JOIN d ON f.k = d.k AND f.ts BETWEEN d.lo AND d.hi";
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void ResidualJoin_MatchesTheManagedTwin_EveryTick(int seed)
+    {
+        var rnd = new Random(seed);
+        CompiledQuery blocked;
+        using (TraceBlocksMode.Use(join: true, freezeEntries: 1 + rnd.Next(20), blockEntries: 1 + rnd.Next(6)))
+        {
+            blocked = Compile(ScdDdl, ScdJoin, emitted: seed % 2 == 0);
+        }
+
+        CompiledQuery managed;
+        using (TraceBlocksMode.Use(join: false))
+        {
+            managed = Compile(ScdDdl, ScdJoin, emitted: seed % 2 == 0);
+        }
+
+        Assert.Equal(1, Blocked(blocked));
+        var liveF = new List<object?[]>();
+        var liveD = new List<object?[]>();
+        void Push(string table, List<object?[]> live, Func<object?[]> make)
+        {
+            var deleting = live.Count > 0 && rnd.Next(4) == 0;
+            var row = deleting ? live[rnd.Next(live.Count)] : make();
+            foreach (var q in new[] { blocked, managed })
+            {
+                if (deleting)
+                {
+                    q.Table(table).Delete(row);
+                }
+                else
+                {
+                    q.Table(table).Insert(row);
+                }
+            }
+
+            if (deleting)
+            {
+                live.Remove(row);
+            }
+            else
+            {
+                live.Add(row);
+            }
+        }
+
+        for (var tick = 0; tick < 60; tick++)
+        {
+            for (var n = rnd.Next(0, 15); n > 0; n--)
+            {
+                Push("f", liveF, () => [rnd.Next(4), (long)rnd.Next(100), rnd.Next(3) == 0 ? null : "s" + rnd.Next(5)]);
+            }
+
+            for (var n = rnd.Next(0, 4); n > 0; n--)
+            {
+                Push("d", liveD, () =>
+                {
+                    var lo = (long)rnd.Next(100);
+                    return [rnd.Next(4), lo, lo + rnd.Next(30), rnd.Next(3) == 0 ? null : "n" + rnd.Next(3)];
+                });
+            }
+
+            blocked.Step();
+            managed.Step();
+            Assert.Equal(managed.Current, blocked.Current);
+        }
+    }
+
     [Fact]
-    public void Compiler_EngagesBlocks_OnlyForAResidualFreeStructuralInnerJoin()
+    public void Compiler_EngagesBlocks_ForAStructuralInnerJoin_WithOrWithoutResidual()
     {
         string[] ddl = ["CREATE TABLE t (k INT NOT NULL, v INT NOT NULL)", "CREATE TABLE u (k INT NOT NULL, v INT NOT NULL)"];
         using (TraceBlocksMode.Use(join: true))
         {
             Assert.Equal(1, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t JOIN u ON t.k = u.k")));
-            Assert.Equal(0, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t JOIN u ON t.k = u.k AND t.v < u.v")));
+            Assert.Equal(1, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t JOIN u ON t.k = u.k AND t.v < u.v")));
             Assert.Equal(0, Blocked(Compile(ddl, "SELECT t.v, u.v FROM t LEFT JOIN u ON t.k = u.k")));
         }
 

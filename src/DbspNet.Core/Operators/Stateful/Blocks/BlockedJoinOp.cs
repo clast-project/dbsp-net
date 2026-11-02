@@ -12,6 +12,8 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 /// the same factoring, <c>out = dl ⋈ R_t + L_{t-1} ⋈ dr</c>, for a combine that concatenates the left
 /// and right value rows. Because the combine is a concatenation, a trace entry read from a block
 /// has its cells boxed straight into the output row (§3.0, arm B2) — no intermediate value row.
+/// A residual (a non-equi ON conjunct) is evaluated first on a view of the candidate pair that
+/// boxes only the cells it reads, so a rejected pair builds no row.
 /// </summary>
 /// <remarks>
 /// Each delta is probed against the trace (never the other way round), and the probe visits every
@@ -41,6 +43,8 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
     private readonly IFrontier? _frontier;
     private readonly Func<StructuralRow, long>? _monotoneKey;
     private readonly bool _cloneDeltas = DeltaPoolMode.Enabled;
+    private readonly Func<IReadOnlyList<object?>, bool>? _residual;
+    private readonly Candidate? _candidate;
     private long _lastGcFrontier = long.MinValue;
     private int _lastOutputSize;
 
@@ -54,7 +58,8 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftCodec,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier,
-        Func<StructuralRow, long>? monotoneKey)
+        Func<StructuralRow, long>? monotoneKey,
+        Func<IReadOnlyList<object?>, bool>? residual = null)
     {
         _leftIn = leftIn;
         _rightIn = rightIn;
@@ -68,6 +73,8 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         _rightCodec = rightCodec;
         _frontier = frontier;
         _monotoneKey = monotoneKey;
+        _residual = residual;
+        _candidate = residual is null ? null : new Candidate(_leftColumns, _rightColumns);
     }
 
     /// <summary>Total keys retained across both traces (materialises them). For GC-bound tests.</summary>
@@ -152,14 +159,21 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         }
     }
 
-    // dl ⋈ R_t: the delta's rows on the left of the output, the trace's on the right.
+    // dl ⋈ R_t: the delta's rows on the left of the output, the trace's on the right. A residual
+    // is evaluated on the candidate view first, so a rejected pair builds nothing.
     private readonly struct DeltaOnLeft(BlockedJoinOp op, ZSet<StructuralRow, Z64> delta, ZSetBuilder<StructuralRow, Z64> output)
         : ITraceVisitor
     {
         public void Row(StructuralRow value, Z64 weight)
         {
+            op._candidate?.Right(value);
             foreach (var (left, leftWeight) in delta)
             {
+                if (op._residual is { } residual && !residual(op._candidate!.Left(left)))
+                {
+                    continue;
+                }
+
                 var cells = new object?[op._leftColumns + op._rightColumns];
                 Copy(left, cells, 0);
                 Copy(value, cells, op._leftColumns);
@@ -169,8 +183,14 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
 
         public void Entry(ITraceBlock block, int index, Z64 weight)
         {
+            op._candidate?.Right(block, index);
             foreach (var (left, leftWeight) in delta)
             {
+                if (op._residual is { } residual && !residual(op._candidate!.Left(left)))
+                {
+                    continue;
+                }
+
                 var cells = new object?[op._leftColumns + op._rightColumns];
                 Copy(left, cells, 0);
                 block.ValueCellsInto(index, cells, op._leftColumns);
@@ -185,8 +205,14 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
     {
         public void Row(StructuralRow value, Z64 weight)
         {
+            op._candidate?.Left(value);
             foreach (var (right, rightWeight) in delta)
             {
+                if (op._residual is { } residual && !residual(op._candidate!.Right(right)))
+                {
+                    continue;
+                }
+
                 var cells = new object?[op._leftColumns + op._rightColumns];
                 Copy(value, cells, 0);
                 Copy(right, cells, op._leftColumns);
@@ -196,14 +222,76 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
 
         public void Entry(ITraceBlock block, int index, Z64 weight)
         {
+            op._candidate?.Left(block, index);
             foreach (var (right, rightWeight) in delta)
             {
+                if (op._residual is { } residual && !residual(op._candidate!.Right(right)))
+                {
+                    continue;
+                }
+
                 var cells = new object?[op._leftColumns + op._rightColumns];
                 block.ValueCellsInto(index, cells, 0);
                 Copy(right, cells, op._leftColumns);
                 output.Add(op._row(cells), Z64.Multiply(weight, rightWeight));
             }
         }
+    }
+
+    /// <summary>
+    /// The output row a candidate pair would make, as a view: a cell is read (and, from a block,
+    /// boxed) only when the residual asks for it. One instance per operator, repointed per pair;
+    /// a compiled predicate reads cells through <see cref="IReadOnlyList{T}"/>'s indexer and keeps
+    /// nothing, so reuse is safe.
+    /// </summary>
+    private sealed class Candidate(int leftColumns, int rightColumns) : IReadOnlyList<object?>
+    {
+        private StructuralRow? _leftRow;
+        private ITraceBlock? _leftBlock;
+        private int _leftIndex;
+        private StructuralRow? _rightRow;
+        private ITraceBlock? _rightBlock;
+        private int _rightIndex;
+
+        public int Count => leftColumns + rightColumns;
+
+        public object? this[int index] => index < leftColumns
+            ? _leftRow is { } l ? l[index] : _leftBlock!.ValueCell(_leftIndex, index)
+            : _rightRow is { } r ? r[index - leftColumns] : _rightBlock!.ValueCell(_rightIndex, index - leftColumns);
+
+        public Candidate Left(StructuralRow row)
+        {
+            (_leftRow, _leftBlock) = (row, null);
+            return this;
+        }
+
+        public Candidate Left(ITraceBlock block, int index)
+        {
+            (_leftRow, _leftBlock, _leftIndex) = (null, block, index);
+            return this;
+        }
+
+        public Candidate Right(StructuralRow row)
+        {
+            (_rightRow, _rightBlock) = (row, null);
+            return this;
+        }
+
+        public Candidate Right(ITraceBlock block, int index)
+        {
+            (_rightRow, _rightBlock, _rightIndex) = (null, block, index);
+            return this;
+        }
+
+        public IEnumerator<object?> GetEnumerator()
+        {
+            for (var i = 0; i < Count; i++)
+            {
+                yield return this[i];
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     public async ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)

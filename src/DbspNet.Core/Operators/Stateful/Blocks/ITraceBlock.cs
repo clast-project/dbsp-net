@@ -41,6 +41,10 @@ internal interface ITraceBlock
     /// <summary>Entry <paramref name="i"/>'s value, decoded (strings copied).</summary>
     StructuralRow Value(int i);
 
+    /// <summary>Entry <paramref name="i"/>'s value cell <paramref name="column"/>, boxed (strings
+    /// copied) — one cell, for a predicate that reads a few.</summary>
+    object? ValueCell(int i, int column);
+
     /// <summary>Box entry <paramref name="i"/>'s value cells into <paramref name="destination"/>
     /// from <paramref name="at"/> (strings copied).</summary>
     void ValueCellsInto(int i, object?[] destination, int at);

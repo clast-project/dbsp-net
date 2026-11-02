@@ -115,6 +115,13 @@ internal sealed class TraceBlock : ITraceBlock
         return true;
     }
 
+    /// <inheritdoc/>
+    public object? ValueCell(int i, int column)
+    {
+        var first = Schema.KeyKinds.Length;
+        return Cell(first + column, Schema.ValueKinds[column], i, aliasStrings: false);
+    }
+
     StructuralRow ITraceBlock.Key(int i) => Key(i);
 
     StructuralRow ITraceBlock.Value(int i) => Value(i);

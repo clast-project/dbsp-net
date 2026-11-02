@@ -1441,7 +1441,8 @@ public static partial class PlanToCircuit
     }
 
     // A structural inner join whose traces are held as blocks: both formats and the output row's builder.
-    private sealed record BlockedJoinSpec(ITraceBlockFormat LeftFormat, ITraceBlockFormat RightFormat, Func<object?[], StructuralRow> Row);
+    private sealed record BlockedJoinSpec(
+        ITraceBlockFormat LeftFormat, ITraceBlockFormat RightFormat, Func<object?[], StructuralRow> Row, Func<IReadOnlyList<object?>, bool>? Residual);
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoin(
         CircuitBuilder builder,
@@ -1461,7 +1462,7 @@ public static partial class PlanToCircuit
         return Recorded(
             builder, ctx,
             () => blocked is { } b
-                ? builder.BlockedInnerJoin(left, right, b.LeftFormat, b.RightFormat, b.Row, leftCodec, rightCodec, frontier, monotoneKey)
+                ? builder.BlockedInnerJoin(left, right, b.LeftFormat, b.RightFormat, b.Row, leftCodec, rightCodec, frontier, monotoneKey, b.Residual)
                 : EmitInnerJoinCore(builder, ctx, left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual),
             IZ("left.arrows", leftReshard, leftCodec),
             IZ("right.arrows", rightReshard, rightCodec));
@@ -3276,9 +3277,11 @@ public static partial class PlanToCircuit
         // intermediate shrinks. GC is unaffected — key retention does not depend
         // on which output rows survive the residual.
         Func<StructuralRow, bool>? residualFn = null;
+        Func<IReadOnlyList<object?>, bool>? residualView = null;
         if (plan.Residual is { } residual)
         {
             var residualPredicate = ExpressionCompiler.CompilePredicate(residual);
+            residualView = residualPredicate;
             residualFn = row => residualPredicate(row);
         }
 
@@ -3371,17 +3374,17 @@ public static partial class PlanToCircuit
             // hash the exchanges compute from the row's key columns. A broadcast join holds a
             // full right copy on every worker, and its left is linear given that copy.
             // DBSPNET_TRACE_BLOCKS=join: both traces as reference-free blocks, output rows built
-            // straight from block cells (docs/design-flat-trace-state.md §3). Joins with a residual
-            // stay managed: blocks would box every candidate before the residual rejects it (§3.0).
+            // straight from block cells (docs/design-flat-trace-state.md §3). A residual is evaluated
+            // on a view of each candidate pair that boxes only the cells it reads (§3.2).
             BlockedJoinSpec? blocked = null;
-            if (TraceBlocksMode.Join && residualFn is null && ctx.Options.TraceFamily != TraceFamily.Spine
+            if (TraceBlocksMode.Join && ctx.Options.TraceFamily != TraceFamily.Spine
                 && TraceBlockFormats.Create(leftKeySchema, plan.Left.Schema) is { } leftFormat
                 && TraceBlockFormats.Create(rightKeySchema, plan.Right.Schema) is { } rightFormat)
             {
                 Func<object?[], StructuralRow> row = ReferenceEquals(codec, StructuralRowCodec.Instance)
                     ? static cells => new StructuralRow(cells)
                     : cells => codec.BuildRow(joinedSchema, cells);
-                blocked = new BlockedJoinSpec(leftFormat, rightFormat, row);
+                blocked = new BlockedJoinSpec(leftFormat, rightFormat, row, residualView);
             }
 
             joined = EmitInnerJoin(

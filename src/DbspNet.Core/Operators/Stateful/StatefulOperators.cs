@@ -592,12 +592,13 @@ public static class StatefulOperators
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec = null,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec = null,
         IFrontier? frontier = null,
-        Func<StructuralRow, long>? monotoneKey = null)
+        Func<StructuralRow, long>? monotoneKey = null,
+        Func<IReadOnlyList<object?>, bool>? residual = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
         builder.AddRawOperator(new Blocks.BlockedJoinOp(
-            left, right, output, leftFormat, rightFormat, row, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey));
+            left, right, output, leftFormat, rightFormat, row, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey, residual));
         return output;
     }
 
