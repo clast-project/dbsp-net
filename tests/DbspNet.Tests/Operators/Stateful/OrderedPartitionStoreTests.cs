@@ -80,8 +80,10 @@ public class OrderedPartitionStoreTests
             blockEntries: 2,
             promoteAt: promoteAt,
             chunkRows: chunkRows);
+        // Enough partitions that new ones keep arriving (read from the tick's own rows, §3.17).
+        var partitions = 3 + (seed * 7);
         var model = new Dictionary<int, Dictionary<StructuralRow, long>>();
-        for (var p = 0; p < 3; p++)
+        for (var p = 0; p < partitions; p++)
         {
             model[p] = new();
         }
@@ -89,10 +91,23 @@ public class OrderedPartitionStoreTests
         string?[] strings = [null, "a", "bb", "é"];
         for (var batch = 0; batch < 80; batch++)
         {
+            if (rnd.Next(40) == 0)
+            {
+                store.Clear(); // every key new again
+                foreach (var m in model.Values)
+                {
+                    m.Clear();
+                }
+            }
+            else if (rnd.Next(40) == 0)
+            {
+                store.ForgetKeys(); // as after a lazy restore: always probe
+            }
+
             var delta = new Dictionary<(int P, StructuralRow Row), long>();
             for (var n = rnd.Next(1, 12); n > 0; n--)
             {
-                var p = rnd.Next(3);
+                var p = rnd.Next(partitions);
                 StructuralRow row;
                 long w;
                 if (model[p].Count > 0 && rnd.Next(3) == 0)
@@ -138,7 +153,7 @@ public class OrderedPartitionStoreTests
                 store.Freeze();
             }
 
-            for (var p = 0; p < 3; p++)
+            for (var p = 0; p < partitions; p++)
             {
                 var expected = model[p].OrderBy(e => e.Key, Comparer<StructuralRow>.Create(Compare)).ToList();
                 long from = rnd.Next(-2, 17), to = rnd.Next(-2, 17);

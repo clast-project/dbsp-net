@@ -31,6 +31,16 @@ internal sealed class OrderedPartitionStore
     private readonly BlockedIndexedTrace _small;
     private readonly Dictionary<StructuralRow, List<Chunk>> _large = new();
 
+    // Keys the store has ever held (a Bloom filter: no false negatives), so a partition first seen
+    // this tick is read from the tick's own rows instead of probed for in every run (§3.17). In
+    // batch 1 almost every partition is new, and a million one-row partitions were each probed for
+    // nothing older. Unknown after a lazy restore (cold partitions never pass through here).
+    private KeyFilter _keys = new();
+    private bool _keysKnown = true;
+
+    // This tick's partitions that the filter says were absent before it: their whole content.
+    private Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>? _fresh;
+
     private static readonly StructuralRow NoKey = new([]);
 
     /// <param name="smallFormat">Blocks of the shared trace: the partition key, then the row.</param>
@@ -107,6 +117,7 @@ internal sealed class OrderedPartitionStore
     /// <summary>Apply a tick's change (or restored rows): (partition key, row, weight).</summary>
     public void Integrate(List<(StructuralRow Key, StructuralRow Row, long Weight)> rows)
     {
+        _fresh = null;
         if (rows.Count == 0)
         {
             return;
@@ -170,6 +181,35 @@ internal sealed class OrderedPartitionStore
 
         if (small is not null)
         {
+            // Which of these partitions are new (decided before any of their keys is added).
+            if (_keysKnown)
+            {
+                var isNew = new Dictionary<StructuralRow, bool>();
+                foreach (var (key, row, weight) in small)
+                {
+                    if (!isNew.TryGetValue(key, out var fresh))
+                    {
+                        isNew[key] = fresh = !_keys.MayContain(key);
+                    }
+
+                    if (fresh)
+                    {
+                        _fresh ??= new();
+                        if (!_fresh.TryGetValue(key, out var list))
+                        {
+                            _fresh[key] = list = new();
+                        }
+
+                        list.Add((row, weight, ValueOf(row)));
+                    }
+                }
+
+                foreach (var key in isNew.Keys)
+                {
+                    _keys.Add(key);
+                }
+            }
+
             if (small.Count >= TraceBlocksMode.FreezeEntries)
             {
                 _small.IntegrateEntries(small.Count, i => small[i].Key, i => small[i].Row, i => small[i].Weight);
@@ -203,7 +243,14 @@ internal sealed class OrderedPartitionStore
     {
         _small.Clear();
         _large.Clear();
+        _keys = new KeyFilter();
+        _keysKnown = true;
+        _fresh = null;
     }
+
+    /// <summary>Partitions may exist that never passed through <see cref="Integrate"/> (a lazy
+    /// restore's cold ones): stop trusting the key filter.</summary>
+    public void ForgetKeys() => _keysKnown = false;
 
     /// <summary>Every row and weight (a whole-state write).</summary>
     public IEnumerable<(StructuralRow Row, long Weight)> All()
@@ -283,10 +330,19 @@ internal sealed class OrderedPartitionStore
         }
 
         // A small partition: its raw entries across levels, consolidated by the sort (equal rows
-        // meet) rather than by hashing every decoded row.
-        var raw = new List<(StructuralRow Row, long Weight, long Value)>();
-        var visitor = new Collect(raw, this);
-        _small.Probe(key, ref visitor);
+        // meet) rather than by hashing every decoded row — or, new this tick, the tick's own rows.
+        List<(StructuralRow Row, long Weight, long Value)> raw;
+        if (_fresh is not null && _fresh.TryGetValue(key, out var own))
+        {
+            raw = own;
+        }
+        else
+        {
+            raw = new List<(StructuralRow Row, long Weight, long Value)>();
+            var visitor = new Collect(raw, this);
+            _small.Probe(key, ref visitor);
+        }
+
         var tSort = BlockTraceProfile.Now();
         raw.Sort(Compare);
         var all = new List<(StructuralRow Row, long Weight, long Value)>(raw.Count);
@@ -357,6 +413,7 @@ internal sealed class OrderedPartitionStore
     // any) leave the shared trace, and the sum becomes chunks.
     private void PromoteWith(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> change)
     {
+        _keys.Add(key);
         var existing = _small.GroupView(key).Decoded();
         if (!existing.IsEmpty)
         {
@@ -516,5 +573,66 @@ internal sealed class OrderedPartitionStore
         }
 
         return new Chunk(_chunkFormat.Encode(keys, rows, weights, hashes, n), values, partial);
+    }
+
+    // A scalable Bloom filter over partition-key hashes: reference-free bit arrays, a new one twice
+    // as large once the newest is full; a key is absent only if every filter says so.
+    private sealed class KeyFilter
+    {
+        private const int BitsPerKey = 10;
+        private const int Probes = 4;
+        private readonly List<(ulong[] Bits, long Capacity)> _filters = [(new ulong[(1024 * BitsPerKey + 63) / 64], 1024)];
+        private long _inNewest;
+
+        public void Add(StructuralRow key)
+        {
+            var (bits, capacity) = _filters[^1];
+            if (_inNewest >= capacity)
+            {
+                capacity *= 2;
+                bits = new ulong[(capacity * BitsPerKey + 63) / 64];
+                _filters.Add((bits, capacity));
+                _inNewest = 0;
+            }
+
+            var m = (ulong)bits.Length * 64;
+            var (h1, h2) = Hashes(key);
+            for (var i = 0UL; i < Probes; i++)
+            {
+                var bit = (h1 + (i * h2)) % m;
+                bits[bit >> 6] |= 1UL << (int)(bit & 63);
+            }
+
+            _inNewest++;
+        }
+
+        public bool MayContain(StructuralRow key)
+        {
+            var (h1, h2) = Hashes(key);
+            foreach (var (bits, _) in _filters)
+            {
+                var m = (ulong)bits.Length * 64;
+                var all = true;
+                for (var i = 0UL; i < Probes && all; i++)
+                {
+                    var bit = (h1 + (i * h2)) % m;
+                    all = (bits[bit >> 6] & (1UL << (int)(bit & 63))) != 0;
+                }
+
+                if (all)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static (ulong, ulong) Hashes(StructuralRow key)
+        {
+            var x = (ulong)(uint)key.GetHashCode() * 0x9E3779B97F4A7C15UL;
+            x ^= x >> 29;
+            return (x, (x >> 32) | 1);
+        }
     }
 }

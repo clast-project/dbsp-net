@@ -869,6 +869,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             // Lazily restored: partitions are read as deltas touch them (Fault).
             _accum.Clear();
             _store?.Clear();
+            _store?.ForgetKeys(); // cold partitions never pass through the store
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
             return;
