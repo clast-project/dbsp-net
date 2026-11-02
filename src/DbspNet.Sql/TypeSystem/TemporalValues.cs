@@ -177,7 +177,8 @@ public readonly record struct Timestamp(long Microseconds) : IComparable<Timesta
     public static bool operator >=(Timestamp a, Timestamp b) => a.Microseconds >= b.Microseconds;
 
     public override string ToString() =>
-        ToDateTime().ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture);
+        ToDateTime().ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture)
+            .TrimEnd('0').TrimEnd('.');
 }
 
 /// <summary>

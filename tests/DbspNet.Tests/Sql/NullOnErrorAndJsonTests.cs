@@ -59,6 +59,13 @@ public class NullOnErrorAndJsonTests
     }
 
     [Theory]
+    [InlineData("2002-12-31 00:00:00", "2002-12-31 00:00:00")]
+    [InlineData("2002-12-31 00:00:00.120000", "2002-12-31 00:00:00.12")]
+    [InlineData("2002-12-31 00:00:00.123456", "2002-12-31 00:00:00.123456")]
+    public void TimestampTextOmitsInsignificantFractionalZeros(string input, string expected) =>
+        Assert.Equal(expected, Eval("CAST(CAST(s AS TIMESTAMP) AS VARCHAR)", input));
+
+    [Theory]
     [InlineData("0", false)]
     [InlineData("-1", true)]
     [InlineData(null, null)]
