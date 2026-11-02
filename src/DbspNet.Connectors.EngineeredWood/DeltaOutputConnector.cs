@@ -4,6 +4,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using DbspNet.Arrow;
 using DbspNet.Connectors.Abstractions;
+using DbspNet.Persistence.Blocks;
 using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Table;
@@ -36,12 +37,38 @@ public sealed class DeltaOutputConnector : IOutputConnector
     private DeltaTable? _table;
     private ArrowSchema? _changelogArrow;
 
-    // Incremental mode: where every live copy of every row sits (file, position), so a
-    // retraction can be deleted by position with a deletion vector, as Feldera does.
-    private readonly Dictionary<object, List<RowAddress>> _addresses = new();
+    // Incremental mode: where every live copy of every row sits (file id, position), so a
+    // retraction can be deleted by position with a deletion vector. Held as blocks when the view is
+    // (docs/design-flat-trace-state.md §3.9), so it keeps no written row alive.
+    private OutputRowIndex? _index;
+    private readonly List<string> _files = new();
+    private readonly Dictionary<string, int> _fileIds = new(StringComparer.Ordinal);
     private bool _incrementalStarted;
 
-    private readonly record struct RowAddress(string Path, long Position);
+    // An address packs a file id (the index into _files) above a position within the file.
+    private const int PositionBits = 40;
+
+    private long Address(string path, long position)
+    {
+        if (!_fileIds.TryGetValue(path, out var id))
+        {
+            id = _files.Count;
+            if (id >= 1 << (63 - PositionBits))
+            {
+                throw new InvalidOperationException($"DeltaOutputConnector '{ViewName}': too many data files to address.");
+            }
+
+            _fileIds[path] = id;
+            _files.Add(path);
+        }
+
+        if ((ulong)position >= 1UL << PositionBits)
+        {
+            throw new InvalidOperationException($"DeltaOutputConnector '{ViewName}': position {position} is out of range.");
+        }
+
+        return ((long)id << PositionBits) | position;
+    }
 
     public DeltaOutputConnector(string viewName, ITableFileSystem fs, OutputMode mode = OutputMode.Truncate)
     {
@@ -101,6 +128,8 @@ public sealed class DeltaOutputConnector : IOutputConnector
 
         if (Mode == OutputMode.Incremental)
         {
+            _index = OutputRowIndex.Create(viewSchema);
+
             // Deleting by position needs deletion vectors, which only a create can turn on.
             var exists = await new TransactionLog(_fs).GetLatestVersionAsync(cancellationToken).ConfigureAwait(false) >= 0;
             if (!exists)
@@ -177,37 +206,36 @@ public sealed class DeltaOutputConnector : IOutputConnector
             // Truncate once, in the same commit as the first write (Feldera's truncate-on-start).
             // The positions of rows written by an earlier process are unknown, so they go whole.
             await txn.DeleteAsync(global::EngineeredWood.Expressions.Expressions.True, cancellationToken).ConfigureAwait(false);
-            _addresses.Clear();
+            _index!.Clear();
+            _files.Clear();
+            _fileIds.Clear();
             Mark("truncate");
         }
         else if (deletes.Count > 0)
         {
             var positions = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+            var taken = new List<long>();
             foreach (var (key, count) in deletes)
             {
-                if (!_addresses.TryGetValue(key, out var live) || live.Count < count)
+                try
                 {
-                    throw new InvalidOperationException(
-                        $"DeltaOutputConnector '{ViewName}': asked to delete {count} copies of a row it holds "
-                        + $"{live?.Count ?? 0} of.");
+                    _index!.Take(key, count, taken);
+                }
+                catch (InvalidOperationException e)
+                {
+                    throw new InvalidOperationException($"DeltaOutputConnector '{ViewName}': {e.Message}", e);
+                }
+            }
+
+            foreach (var address in taken)
+            {
+                var path = _files[(int)(address >>> PositionBits)];
+                if (!positions.TryGetValue(path, out var list))
+                {
+                    positions[path] = list = new List<long>();
                 }
 
-                for (long i = 0; i < count; i++)
-                {
-                    var at = live[^1];
-                    live.RemoveAt(live.Count - 1);
-                    if (!positions.TryGetValue(at.Path, out var list))
-                    {
-                        positions[at.Path] = list = new List<long>();
-                    }
-
-                    ((List<long>)list).Add(at.Position);
-                }
-
-                if (live.Count == 0)
-                {
-                    _addresses.Remove(key);
-                }
+                ((List<long>)list).Add(address & ((1L << PositionBits) - 1));
             }
 
             await txn.StageRowDeletesAsync(RowSelection.ByPath(positions), RowDeleteMode.DeletionVector, cancellationToken)
@@ -225,13 +253,7 @@ public sealed class DeltaOutputConnector : IOutputConnector
             {
                 for (long position = 0; position < file.NumRecords; position++, row++)
                 {
-                    var key = insertKeys[row];
-                    if (!_addresses.TryGetValue(key, out var live))
-                    {
-                        _addresses[key] = live = new List<RowAddress>(1);
-                    }
-
-                    live.Add(new RowAddress(file.RelativePath, position));
+                    _index!.Add(insertKeys[row], Address(file.RelativePath, position));
                 }
             }
 
@@ -242,8 +264,10 @@ public sealed class DeltaOutputConnector : IOutputConnector
             }
 
             txn.StageDataFiles(files);
-            Mark("addresses");
         }
+
+        _index!.Commit();
+        Mark("addresses");
 
         await txn.CommitAsync(cancellationToken).ConfigureAwait(false);
         Mark("commit");
