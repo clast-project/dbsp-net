@@ -29,6 +29,8 @@ public sealed class WindowOldSideTests
         "MAX(x) OVER (PARTITION BY p ORDER BY t)",
         "MIN(id) OVER (PARTITION BY p ORDER BY t)",
         "COUNT(x) OVER (PARTITION BY p ORDER BY t RANGE BETWEEN 3 PRECEDING AND CURRENT ROW)",
+        "MAX(x) OVER (PARTITION BY p ORDER BY t DESC)",
+        "COUNT(CASE WHEN x > 1 THEN x END) OVER (PARTITION BY p ORDER BY t)",
     ];
 
     // blocks: the window's input held as blocks (§3.13), with tiny runs so freezes and merges

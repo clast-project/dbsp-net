@@ -85,6 +85,17 @@ internal sealed class SqlMinMaxHybridAggregator : SqlAggregator
 
     public override object? Compute(IMultiset<StructuralRow, Z64> rows) => _promoted.Compute(rows);
 
+    // The same aggregate as the plain MIN/MAX, so the same exact partials (§3.15).
+    public override bool IsExactPartial => true;
+
+    public override object? PartialEmpty() => _promoted.PartialEmpty();
+
+    public override object? PartialAdd(object? acc, StructuralRow row, long weight) => _promoted.PartialAdd(acc, row, weight);
+
+    public override object? PartialCombine(object? earlier, object? later) => _promoted.PartialCombine(earlier, later);
+
+    public override object? PartialResult(object? acc) => _promoted.PartialResult(acc);
+
     public override object? Update(
         ref object? state,
         object? oldValue,
