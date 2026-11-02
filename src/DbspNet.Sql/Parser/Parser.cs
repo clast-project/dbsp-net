@@ -1652,7 +1652,7 @@ public sealed class Parser
                 return ParseTypedTemporalLiteral();
             case TokenKind.Extract:
                 return ParseExtractExpression();
-            case TokenKind.Identifier when IsContextualKeyword("try_cast"):
+            case TokenKind.Identifier when IsContextualKeyword("try_cast") && PeekAt(1).Kind == TokenKind.LParen:
                 return ParseCastExpression(safe: true);
             case TokenKind.Cast:
                 return ParseCastExpression();

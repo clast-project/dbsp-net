@@ -696,7 +696,7 @@ public static class TypedExpressionCompiler
 
         if (IsNumericNonDecimal(srcClr) && IsNumericNonDecimal(dstClr))
         {
-            return PropagateUnary(operand, op => Expression.Convert(op, dstClr));
+            return PropagateUnary(operand, op => SqlCasts.ConvertNumeric(op, dstClr));
         }
 
         if (srcClr == typeof(bool) && dstClr == typeof(Utf8String))
@@ -847,7 +847,7 @@ public static class TypedExpressionCompiler
                 mantissa,
                 Expression.Constant(srcDec.Scale),
                 Expression.Constant(target.Scale),
-                Expression.Constant(DecimalRounding.HalfEven));
+                Expression.Constant(DecimalRounding.HalfUp));
             var ctor = typeof(Decimal128).GetConstructor([typeof(Int128)])!;
             return Expression.New(ctor, rescaled);
         }
@@ -877,7 +877,7 @@ public static class TypedExpressionCompiler
                     [typeof(ReadOnlySpan<char>), typeof(DecimalType), typeof(DecimalRounding)])!,
                 asSpan,
                 Expression.Constant(targetType),
-                Expression.Constant(DecimalRounding.HalfEven));
+                Expression.Constant(DecimalRounding.HalfUp));
         }
 
         throw Unsupported();
@@ -923,7 +923,7 @@ public static class TypedExpressionCompiler
             mantissa,
             Expression.Constant(src.Scale),
             Expression.Constant(0),
-            Expression.Constant(DecimalRounding.HalfEven));
+            Expression.Constant(DecimalRounding.HalfUp));
         return Expression.Convert(rescaled, dstClr);
     }
 

@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Linq.Expressions;
+using System.Buffers;
+using System.Globalization;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using DbspNet.Sql.Plan;
@@ -11,7 +13,7 @@ namespace DbspNet.Sql.Expressions;
 /// <summary>Extract a JSON value through a constant dotted member path.</summary>
 internal sealed class JsonExtractStringFunction : IScalarFunction
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    private static readonly JsonWriterOptions JsonOptions = new()
     {
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
@@ -69,7 +71,71 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
         {
             JsonValueKind.Null => null,
             JsonValueKind.String => Utf8String.Of(value.GetString()!),
-            _ => Utf8String.Of(JsonSerializer.Serialize(value, JsonOptions)),
+            _ => Serialize(value),
         };
     }
+
+    private static Utf8String Serialize(JsonElement value)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using var writer = new Utf8JsonWriter(buffer, JsonOptions);
+        Write(value, writer);
+        writer.Flush();
+        return Utf8String.FromBytes(buffer.WrittenMemory);
+    }
+
+    private static void Write(JsonElement value, Utf8JsonWriter writer)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject())
+                {
+                    writer.WritePropertyName(property.Name);
+                    Write(property.Value, writer);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray()) Write(item, writer);
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.Number:
+                writer.WriteRawValue(FormatNumber(value), skipInputValidation: true);
+                break;
+            default:
+                value.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static string FormatNumber(JsonElement value)
+    {
+        var raw = value.GetRawText();
+        // Preserve integer precision and numbers beyond DOUBLE's finite range.
+        if (raw.IndexOfAny(['.', 'e', 'E']) < 0) return raw == "-0" ? "0" : raw;
+        var number = value.GetDouble();
+        if (!double.IsFinite(number)) return raw;
+        var text = number.ToString("R", CultureInfo.InvariantCulture);
+        var e = text.IndexOf('E');
+        if (e < 0) return text.Contains('.') ? text : text + ".0";
+
+        var exponent = int.Parse(text.AsSpan(e + 1), CultureInfo.InvariantCulture);
+        var mantissa = text[..e];
+        // DuckDB uses fixed notation for exponents -6 through 20.
+        if (exponent < -6 || exponent >= 21)
+            return mantissa + "e" + exponent.ToString(CultureInfo.InvariantCulture);
+        var negative = mantissa[0] == '-';
+        if (negative) mantissa = mantissa[1..];
+        var dot = mantissa.IndexOf('.');
+        var point = (dot < 0 ? mantissa.Length : dot) + exponent;
+        var digits = mantissa.Replace(".", "");
+        text = point <= 0 ? "0." + new string('0', -point) + digits
+            : point >= digits.Length ? digits + new string('0', point - digits.Length) + ".0"
+            : digits.Insert(point, ".");
+        return negative ? "-" + text : text;
+    }
+
 }

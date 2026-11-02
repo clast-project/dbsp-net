@@ -61,7 +61,7 @@ internal static class DecimalRuntime
     /// <summary>
     /// Convert a floating-point value to <see cref="Decimal128"/> at
     /// <paramref name="type"/>'s scale — <c>CAST(DOUBLE/REAL AS DECIMAL(p, s))</c>.
-    /// Scales by <c>10^s</c> and rounds half-to-even to the mantissa. Only the source
+    /// Scales by <c>10^s</c> and rounds half away from zero to the mantissa. Only the source
     /// double's ~15–16 significant digits are preserved (a double never held more), the
     /// same lossy contract as Spark / DuckDB / Feldera. NaN / Infinity throw.
     /// </summary>
@@ -72,13 +72,13 @@ internal static class DecimalRuntime
             throw new OverflowException($"cannot cast {value} to DECIMAL");
         }
 
-        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.ToEven);
+        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.AwayFromZero);
         return new Decimal128((Int128)scaled);
     }
 
     public static Decimal128 FromDoubleChecked(double value, DecimalType type)
     {
-        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.ToEven);
+        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.AwayFromZero);
         var result = new Decimal128(checked((Int128)scaled));
         DecimalRange.Validate(result.Mantissa, type);
         return result;
@@ -87,7 +87,7 @@ internal static class DecimalRuntime
     public static Decimal128 RescaleChecked(Decimal128 value, int sourceScale, DecimalType target)
     {
         // Widen before scaling so overflow cannot wrap into a valid mantissa.
-        var wide = ScaleHelper.Widen128To256(value.Mantissa, sourceScale, target.Scale, DecimalRounding.HalfEven);
+        var wide = ScaleHelper.Widen128To256(value.Mantissa, sourceScale, target.Scale, DecimalRounding.HalfUp);
         DecimalRange.Validate(wide, target);
         return NarrowToDecimal128(wide);
     }

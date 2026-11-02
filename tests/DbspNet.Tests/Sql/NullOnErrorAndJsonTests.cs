@@ -50,6 +50,82 @@ public class NullOnErrorAndJsonTests
     }
 
     [Fact]
+    public void TryCastRemainsAnOrdinaryColumnName()
+    {
+        var q = Compile("CREATE TABLE t (try_cast INTEGER)", "SELECT try_cast, t.try_cast + 1 FROM t");
+        q.Table("t").Insert(7);
+        q.Step();
+        var row = Assert.Single(q.Current).Key;
+        Assert.Equal(7, row[0]);
+        Assert.Equal(8, row[1]);
+    }
+
+    [Theory]
+    [InlineData("2.9", 3)]
+    [InlineData("-2.9", -3)]
+    [InlineData("2.5", 2)]
+    [InlineData("-2.5", -2)]
+    [InlineData("3.5", 4)]
+    public void FloatingIntegralCastsRoundNearestWithEvenTies(string value, int expected)
+    {
+        foreach (var type in new[] { "REAL", "DOUBLE" })
+        {
+            Assert.Equal(expected, Eval($"CAST(CAST(s AS {type}) AS INTEGER)", value));
+            Assert.Equal(expected, Eval($"TRY_CAST(CAST(s AS {type}) AS INTEGER)", value));
+            Assert.Equal((long)expected, Eval($"TRY_CAST(CAST(s AS {type}) AS BIGINT)", value));
+        }
+    }
+
+    [Theory]
+    [InlineData("2.5", 3)]
+    [InlineData("-2.5", -3)]
+    [InlineData("2.4999999999999999999999999999999999999999", 2)]
+    [InlineData("1e2", 100)]
+    [InlineData("1.5e1", 15)]
+    [InlineData(".5", 1)]
+    [InlineData("-.5", -1)]
+    [InlineData("000.5", 1)]
+    [InlineData("1e-32768", 0)]
+    [InlineData("0e100", 0)]
+    public void TextIntegralCastsRoundExactDecimalDigitsAwayFromZero(string value, int expected)
+    {
+        Assert.Equal(expected, Eval("CAST(s AS INTEGER)", value));
+        Assert.Equal(expected, Eval("TRY_CAST(s AS INTEGER)", value));
+        Assert.Equal((long)expected, Eval("TRY_CAST(s AS BIGINT)", value));
+    }
+
+    [Theory]
+    [InlineData("2.5", 3)]
+    [InlineData("-2.5", -3)]
+    public void DecimalCastsRoundTiesAwayFromZero(string value, int expected)
+    {
+        foreach (var cast in new[] { "CAST", "TRY_CAST" })
+        {
+            Assert.Equal(expected, Eval($"{cast}(CAST(s AS DECIMAL(3,1)) AS INTEGER)", value));
+            Assert.Equal(new Clast.DatabaseDecimal.Values.Decimal128(expected),
+                Eval($"{cast}(CAST(s AS DECIMAL(3,1)) AS DECIMAL(2,0))", value));
+            Assert.Equal(new Clast.DatabaseDecimal.Values.Decimal128(expected),
+                Eval($"{cast}(CAST(s AS DOUBLE) AS DECIMAL(2,0))", value));
+            Assert.Equal(new Clast.DatabaseDecimal.Values.Decimal128(expected),
+                Eval($"{cast}(s AS DECIMAL(2,0))", value));
+        }
+    }
+
+    [Theory]
+    [InlineData("2147483647.49", 2147483647)]
+    [InlineData("-2147483648.49", -2147483648)]
+    [InlineData("2147483647.5", null)]
+    [InlineData("-2147483648.5", null)]
+    [InlineData("1e9999999999999", null)]
+    [InlineData("1e-9999999999999", null)]
+    [InlineData("0e9999999999999", null)]
+    [InlineData("1e 2", null)]
+    [InlineData("1.2.3", null)]
+    [InlineData("3814585150461789134281.40e-15", null)]
+    public void TextIntegralCastChecksRangeAfterRoundingAndRejectsMalformedNumbers(string value, int? expected) =>
+        Assert.Equal(expected, Eval("TRY_CAST(s AS INTEGER)", value));
+
+    [Fact]
     public void TryCastDoesNotSuppressOperandErrors() =>
         Assert.Throws<FormatException>(() => Eval("TRY_CAST(CAST(s AS INTEGER) AS VARCHAR)", "bad"));
 
@@ -178,6 +254,27 @@ public class NullOnErrorAndJsonTests
     [InlineData("{\"x\":null,\"x\":{\"a\":2}}", "$.x.a", null)]
     public void JsonExtractionSelectsTheFirstDuplicateKeyAtEachLevel(string json, string path, string? expected) =>
         Assert.Equal(expected, Eval($"JSON_EXTRACT_STRING(s, '{path}')", json));
+
+    [Theory]
+    [InlineData("1e2", "100.0")]
+    [InlineData("1.2300", "1.23")]
+    [InlineData("-0", "0")]
+    [InlineData("-0.0", "-0.0")]
+    [InlineData("1e-6", "0.000001")]
+    [InlineData("1e-7", "1e-7")]
+    [InlineData("1.23e-5", "0.0000123")]
+    [InlineData("1e20", "100000000000000000000.0")]
+    [InlineData("1e21", "1e21")]
+    [InlineData("-1.23e20", "-123000000000000000000.0")]
+    [InlineData("18446744073709551616", "18446744073709551616")]
+    [InlineData("1e400", "1e400")]
+    [InlineData("1e-400", "0.0")]
+    [InlineData("1.234567890123456789", "1.2345678901234567")]
+    public void JsonNumbersUseReferenceTextAtEveryNestingLevel(string number, string expected)
+    {
+        Assert.Equal(expected, Eval("JSON_EXTRACT_STRING(s, '$.x')", $"{{\"x\":{number}}}"));
+        Assert.Equal($"{{\"a\":[{expected}]}}", Eval("JSON_EXTRACT_STRING(s, '$.x')", $"{{\"x\":{{\"a\":[{number}]}}}}"));
+    }
 
     [Theory]
     [InlineData("SELECT FIRST_VALUE(s IGNORE NULLS) FROM t")]
