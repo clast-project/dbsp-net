@@ -210,7 +210,10 @@ public sealed class ParallelProgramOutput
             var tick = _circuit.TickCount;
             if (_rowCountTick != tick)
             {
-                _rowCount = CurrentView.Count;
+                // Counted from a view formed for this read only: caching it would keep a decoded
+                // copy of every row alive, which a blocked view (and its sink's index) otherwise
+                // holds as bytes (docs/design-flat-trace-state.md §3.10).
+                _rowCount = _cached is not null && _cachedTick == tick ? _cached.Count : FormView().Count;
                 _rowCountTick = tick;
             }
 
@@ -227,6 +230,9 @@ public sealed class ParallelProgramOutput
     /// </summary>
     internal void AfterStep()
     {
+        // The formed view is stale once the circuit steps; let it go rather than hold every row
+        // until the next read.
+        _cached = null;
         var tick = _circuit.TickCount;
         if (_shards.Count == 1 || _rowCountTick < 0 || _rowCountTick != tick - 1)
         {
@@ -278,33 +284,40 @@ public sealed class ParallelProgramOutput
                 return _cached;
             }
 
-            // A lazily restored shard is read from its runs, without reading it into the shard
-            // (increment 6) — the decoding is the expensive part, so the cold shards decode in
-            // parallel first; the sum below is the same single pass either way.
-            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            var decoded = new IEnumerable<KeyValuePair<StructuralRow, Z64>>[_shards.Count];
-            Parallel.For(0, _shards.Count, w =>
-                decoded[w] = _shards[w].EnumerationDecodes ? _shards[w].EnumerateCurrent().ToList() : _shards[w].EnumerateCurrent());
-            var tDecoded = System.Diagnostics.Stopwatch.GetTimestamp();
-
-            var builder = new ZSetBuilder<StructuralRow, Z64>();
-            foreach (var rows in decoded)
-            {
-                foreach (var (row, weight) in rows)
-                {
-                    builder.Add(row, weight);
-                }
-            }
-
-            _cached = builder.Build();
+            _cached = FormView();
             _cachedTick = tick;
-            if (OutputTrace is { } trace)
-            {
-                File.AppendAllText(trace, $"VIEW cold={_shards.Count(x => x.IsCold)} decode={System.Diagnostics.Stopwatch.GetElapsedTime(t0, tDecoded).TotalMilliseconds:F0} sum={System.Diagnostics.Stopwatch.GetElapsedTime(tDecoded).TotalMilliseconds:F0} rows={_cached.Count}\n");
-            }
-
             return _cached;
         }
+    }
+
+    // The sum of the shard integrals, formed (W > 1).
+    private ZSet<StructuralRow, Z64> FormView()
+    {
+        // A lazily restored shard is read from its runs, without reading it into the shard
+        // (increment 6) — the decoding is the expensive part, so the cold shards decode in
+        // parallel first; the sum below is the same single pass either way.
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var decoded = new IEnumerable<KeyValuePair<StructuralRow, Z64>>[_shards.Count];
+        Parallel.For(0, _shards.Count, w =>
+            decoded[w] = _shards[w].EnumerationDecodes ? _shards[w].EnumerateCurrent().ToList() : _shards[w].EnumerateCurrent());
+        var tDecoded = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        var builder = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var rows in decoded)
+        {
+            foreach (var (row, weight) in rows)
+            {
+                builder.Add(row, weight);
+            }
+        }
+
+        var view = builder.Build();
+        if (OutputTrace is { } trace)
+        {
+            File.AppendAllText(trace, $"VIEW cold={_shards.Count(x => x.IsCold)} decode={System.Diagnostics.Stopwatch.GetElapsedTime(t0, tDecoded).TotalMilliseconds:F0} sum={System.Diagnostics.Stopwatch.GetElapsedTime(tDecoded).TotalMilliseconds:F0} rows={view.Count}\n");
+        }
+
+        return view;
     }
 }
 

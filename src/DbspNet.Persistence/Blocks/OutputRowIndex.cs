@@ -135,8 +135,11 @@ public abstract class OutputRowIndex
         private readonly int _freezeEntries;
         private readonly int _blockEntries;
         private BlockedIndexedTrace _trace;
-        private IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> _pending = new();
-        private int _pendingEntries;
+
+        // The batch's entries, flat: integrated as one run at commit (sorted and encoded once; §3.10).
+        private List<StructuralRow> _keys = new();
+        private List<long> _addresses = new();
+        private List<long> _weights = new();
 
         // Rows taken from since the last commit: Take reads the committed state, so a second Take of
         // the same row in one batch would hand out the same addresses again.
@@ -208,41 +211,43 @@ public abstract class OutputRowIndex
 
         private void Stage(StructuralRow key, long address, long weight)
         {
-            _pending.Add(key, new StructuralRow(address), new Z64(weight));
-            if (++_pendingEntries >= _freezeEntries)
-            {
-                // A large batch (the first write carries the whole view) goes in chunks, so at most
-                // one chunk is managed at a time. Taken rows were all looked up already: a batch's
-                // takes come before its adds.
-                Flush();
-            }
-        }
-
-        private void Flush()
-        {
-            if (_pendingEntries == 0)
-            {
-                return;
-            }
-
-            _trace.Integrate(_pending.Build());
-            _pending = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-            _pendingEntries = 0;
+            _keys.Add(key);
+            _addresses.Add(address);
+            _weights.Add(weight);
         }
 
         public override void Commit()
         {
-            Flush();
-            _trace.Freeze();
+            var keys = _keys;
+            var addresses = _addresses;
+            var weights = _weights;
+            _trace.IntegrateEntries(keys.Count, i => keys[i], i => new StructuralRow(addresses[i]), i => weights[i]);
+            ResetBatch();
+        }
+
+        private void ResetBatch()
+        {
+            // A large batch's lists are dropped, not cleared, so their capacity is not kept.
+            if (_keys.Capacity > 1 << 16)
+            {
+                _keys = new();
+                _addresses = new();
+                _weights = new();
+            }
+            else
+            {
+                _keys.Clear();
+                _addresses.Clear();
+                _weights.Clear();
+            }
+
             _taken.Clear();
         }
 
         public override void Clear()
         {
             _trace = NewTrace();
-            _pending = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-            _pendingEntries = 0;
-            _taken.Clear();
+            ResetBatch();
             Count = 0;
         }
 
