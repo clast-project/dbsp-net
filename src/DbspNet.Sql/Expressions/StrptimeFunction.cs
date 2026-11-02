@@ -10,6 +10,8 @@ namespace DbspNet.Sql.Expressions;
 /// <summary>Compact calendar-date parsing with strict and null-on-error variants.</summary>
 internal sealed class StrptimeFunction(string name, bool safe) : IScalarFunction
 {
+    private static readonly string[] Formats = ["yyyyMMdd", "yyyyMMd"];
+
     public string Name => name;
 
     public ResolvedFunctionCall Resolve(IReadOnlyList<ResolvedExpression> args)
@@ -34,7 +36,7 @@ internal sealed class StrptimeFunction(string name, bool safe) : IScalarFunction
     {
         if (value is null) return null;
         var text = ((Utf8String)value).ToStringDecoded().Trim();
-        if (DateTime.TryParseExact(text, new[] { "yyyyMMdd", "yyyyMMd" }, CultureInfo.InvariantCulture,
+        if (DateTime.TryParseExact(text, Formats, CultureInfo.InvariantCulture,
                 DateTimeStyles.None, out var date))
         {
             return Timestamp.FromDateTime(date);
