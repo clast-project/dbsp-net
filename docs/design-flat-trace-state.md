@@ -985,6 +985,57 @@ stored at block boundaries (a running frame's prefix, Feldera's tree of partial 
 after which decoding scales with the delta, not the partition. The offset operator waits on the
 same question.
 
+### 3.15 Reading only what a change reaches: design (2026-11-02)
+
+**Problem.** A touched partition costs O(partition): the blocked store (§3.13) decodes and sorts
+it whole, and the managed store walks it whole. A running frame refolds from the partition's start
+because the operator has no prefix state. In ivm-bench the cost lands where it hurts most, on the
+first drain after a restart: about 100 ms (§3.14).
+
+**Two constraints found while designing:**
+- **Float exactness ties partial aggregates to stored outputs.** §3.11 recomputes the old side by
+  refolding, which reproduces a floating-point SUM bit for bit only in the same fold order.
+  Combining partial aggregates over a tree changes the association, so a recomputed old value can
+  differ in the last bits from the one emitted, and the retraction would not cancel. Feldera
+  stores its emitted outputs (an integrated output trace) and reads the old side from them; that
+  is what lets it use a tree of partial aggregates.
+- **The fold state is heavy and opaque.** `IAggregator` has no way to clone or combine state, and
+  SQL MIN/MAX keep a `SortedSet` and `Dictionary` of every distinct value in the prefix. A running
+  fold therefore cannot resume from a checkpoint without new aggregator support.
+
+**What ivm-bench runs:** every window aggregate is MIN, MAX or COUNT (52-week highs and lows,
+flag dates, dim_customer counts). All three combine exactly under any association.
+
+**Options:**
+
+| | how | what a touch reads | risk |
+|---|---|---|---|
+| A. Feldera's | ordered input chunks + partial-aggregate tree + emitted outputs stored as blocks (old side read, not recomputed) | O(log p + affected rows) for every aggregate | largest: undoes §3.11's storage saving (outputs back, as blocks) and adds an output trace with its own checkpoint |
+| B. Ranges only | ordered input chunks, read by order-value range | bounded frames and offsets: the frame's range. Running frames: still the whole prefix | small, but does not help ivm-bench's running frames |
+| **C. Exact partials** | ordered input chunks, each with a partial aggregate when every aggregate in the window combines exactly (COUNT, MIN, MAX, integer and DECIMAL SUM/AVG). Otherwise the full fold, from already-ordered chunks with no sort | running: the chunks from the change on, plus O(chunks) partials. Bounded: the frame's range | moderate: §3.11's recompute stays exact because the combination is exact |
+
+**Recommended: C.**
+1. **Ordered chunk store.** Per partition, a list of chunks sorted by (order value, total order).
+   Each chunk is one reference-free block with its first and last order value, row count, and
+   (when exact) its partial aggregate. An insert or retract rewrites the one chunk its value
+   lands in, splitting at about 1,000 rows. Appends, the time-series case, touch only the last
+   chunk. This replaces the LSM for the window input: no hash order, no merges, no per-touch sort.
+2. **A partial interface for exact SQL aggregates.** An accumulator from rows, a combine and a
+   result, implemented by `CompositeAggregator` only when every slot is exact. Floats (DOUBLE
+   SUM/AVG, STDDEV) and sketches keep the full fold.
+3. **Running frames** combine the partials of the chunks before the change, fold the boundary
+   chunk's rows below it, then fold the suffix on both sides, decoding only from the boundary
+   chunk on. **Bounded frames** decode only [dmin − preceding, dmax + preceding].
+   **Whole-partition frames:** if the partition's aggregate is unchanged, only the delta's own rows
+   change output.
+4. **The offset operator next, on the same store.** Chunk row counts give positions, so
+   LAG/LEAD read only the neighbourhood of the change.
+
+**Checkpoint and restore** keep §3.13's shape: incremental writes carry the pending changes, a
+full write decodes the chunks, and a faulted partition's rows are sorted once into chunks.
+**Gate:** batch-1 drain no worse than `all` (+3%), restart first drain and restore no worse than
+`all`, batch 3 no worse. Then `window` joins `all`.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
