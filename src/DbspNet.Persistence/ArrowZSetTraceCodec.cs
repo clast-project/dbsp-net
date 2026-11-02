@@ -147,8 +147,10 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
     public void DecodeBlock(RecordBatch batch, ZSetBuilder<StructuralRow, Z64> into) => AddBatch(batch, into);
 
     /// <inheritdoc/>
+    /// <remarks>A cold read: the rows of one hash (a row, or a partition), retained together, so its
+    /// strings share one arena (and, opted in, equal cells share one box: <see cref="CellInterner"/>).</remarks>
     public void DecodeRange(RecordBatch batch, int from, int count, ZSetBuilder<StructuralRow, Z64> into) =>
-        AddRange(batch, from, count, into, StringDecoding.Copy);
+        AddRange(batch, from, count, into, ShippingStrings, intern: true);
 
     /// <inheritdoc/>
     public (StructuralRow Row, long Weight)[] DecodeEntries(RecordBatch batch)
@@ -427,7 +429,7 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
     private void AddBatch(RecordBatch batch, ZSetBuilder<StructuralRow, Z64> b) =>
         AddRange(batch, 0, batch.Length, b, ShippingStrings);
 
-    private void AddRange(RecordBatch batch, int from, int rowCount, ZSetBuilder<StructuralRow, Z64> b, StringDecoding strings)
+    private void AddRange(RecordBatch batch, int from, int rowCount, ZSetBuilder<StructuralRow, Z64> b, StringDecoding strings, bool intern = false)
     {
         var columnCount = _rowSchema.Count;
         var perColumn = new object?[columnCount][];
@@ -435,6 +437,10 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
         {
             perColumn[c] = ArrowColumns.Extract(
                 batch.Column(c), _rowSchema[c].Type, from, rowCount, strings);
+            if (intern)
+            {
+                CellInterner.Intern(perColumn[c]);
+            }
         }
 
         var weightArray = (Int64Array)batch.Column(columnCount);

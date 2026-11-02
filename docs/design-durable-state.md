@@ -1263,6 +1263,38 @@ runtime suspensions with no GC and their reason. Fresh-process restart, SF=3, W=
   direction), not a setting. The larger first-batch gap is now the output write after a lazy
   restore — 3.4–3.5 s vs 2.1 s after an eager restore — of which GC is under a tenth.
 
+### Giant groups decoded without sharing (2026-11-01, branch arc/giant-group-arena)
+
+The flat-trace-state census (`IVM_STATE_CENSUS=1`, docs/design-flat-trace-state.md) attributed
+what the first batch after a fresh restart retains: **97.7% of it (1.88 GB, 53.2M objects) was
+the giant groups of three inner-join left traces**, decoded in the background at restore and taken
+by the first probes. They were decoded with `StringDecoding.Copy` and one box per cell: **28 objects
+and 980 B per row, against 3.3 objects and 216 B for the same trace built by batch 1**, whose rows
+share their cells' boxes with the projections that made them.
+
+Fix: giant groups (`DecodeSingleGroup`) and cold range reads (`DecodeRange`, both codecs) decode
+strings into one arena per column per chunk, like the eager restore already did — their rows are
+retained together, so the arena pins nothing extra. Optionally (`DBSPNET_DECODE_INTERN=1`,
+`CellInterner`), equal cells in a decoded column of ≥ 256 rows share one box, using
+representation-exact equality (doubles by bits, decimals never).
+
+Fresh-process restart, SF=3, W=12, 5 alternating runs per arm from one batch-1 snapshot:
+
+| arm | retained by the drain (census) | drain median (range) | drain GC pause median |
+|---|---|---|---|
+| main (`Copy`) | 1.88 GB / 53.2M objects | 985 ms (651–1075) | 210 ms |
+| arena (**default**) | 1.55 GB / 41.0M | 877 ms (689–973) | 192 ms |
+| arena + interning | 0.75 GB / 11.8M (5.9 objects, 381 B per row) | 1223 ms (1031–1618) | 264 ms |
+
+- **Arena strings ship by default:** −18% bytes and −23% objects retained, drain within noise of main
+  (slightly ahead). Output write unchanged (~3.3–3.5 s).
+- **Interning stays opt-in.** It halves retained bytes again, but hashing every cell slows the
+  background giant decode enough that the drain blocks on it (cold-read time 1.6–1.7 s in 3 of 5
+  runs), and the GC pause does not shrink with the object count — consistent with
+  design-row-representation §27.3 (young pauses are card-scanning bound, not copy bound).
+  Interning on every small cold read was worse still (drain median 1387 ms before the ≥ 256-row
+  threshold).
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

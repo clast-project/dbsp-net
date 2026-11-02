@@ -122,8 +122,10 @@ internal sealed class ArrowIndexedZSetTraceCodec
     public void DecodeBlock(RecordBatch batch, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) => AddBatch(batch, into);
 
     /// <inheritdoc/>
+    /// <remarks>A cold read: one key's rows, which live and die together, so its strings share one
+    /// arena (and, opted in, equal cells share one box: <see cref="CellInterner"/>).</remarks>
     public void DecodeRange(RecordBatch batch, int from, int count, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> into) =>
-        AddRange(batch, from, count, into, StringDecoding.Copy);
+        AddRange(batch, from, count, into, ShippingStrings, intern: true);
 
     /// <inheritdoc/>
     public (StructuralRow Key, ZSet<StructuralRow, Z64> Group) DecodeSingleGroup(RecordBatch batch)
@@ -134,9 +136,12 @@ internal sealed class ArrowIndexedZSetTraceCodec
         var key = new object?[keyCount];
         for (var c = 0; c < keyCount; c++)
         {
-            key[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, 0, 1, StringDecoding.Copy)[0];
+            key[c] = ArrowColumns.Extract(batch.Column(c), _keySchema[c].Type, 0, 1, ShippingStrings)[0];
         }
 
+        // Every row of the group is retained together, so each chunk's strings share one arena per
+        // column instead of a byte[] per cell (docs/design-durable-state.md, "Giant groups decoded
+        // without sharing"); CellInterner, opted in, also shares equal boxes.
         // A giant group is one long decode: extract and materialize its rows in parallel over row
         // ranges (each StructuralRow computes its hash as it is built), then insert them in one
         // pass into a map sized up front.
@@ -149,7 +154,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
             var columns = new object?[valueCount][];
             for (var c = 0; c < valueCount; c++)
             {
-                columns[c] = ArrowColumns.Extract(batch.Column(keyCount + c), _valueSchema[c].Type, from, n, StringDecoding.Copy);
+                columns[c] = ArrowColumns.Extract(batch.Column(keyCount + c), _valueSchema[c].Type, from, n, ShippingStrings);
+                CellInterner.Intern(columns[c]);
             }
 
             for (var i = 0; i < n; i++)
@@ -519,7 +525,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
         AddRange(batch, 0, batch.Length, b, ShippingStrings);
 
     private void AddRange(
-        RecordBatch batch, int from, int rowCount, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b, StringDecoding strings)
+        RecordBatch batch, int from, int rowCount, IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> b, StringDecoding strings,
+        bool intern = false)
     {
         var keyCount = _keySchema.Count;
         var valueCount = _valueSchema.Count;
@@ -529,6 +536,10 @@ internal sealed class ArrowIndexedZSetTraceCodec
         {
             keyColumns[c] = ArrowColumns.Extract(
                 batch.Column(c), _keySchema[c].Type, from, rowCount, strings);
+            if (intern)
+            {
+                CellInterner.Intern(keyColumns[c]);
+            }
         }
 
         var valueColumns = new object?[valueCount][];
@@ -536,6 +547,10 @@ internal sealed class ArrowIndexedZSetTraceCodec
         {
             valueColumns[c] = ArrowColumns.Extract(
                 batch.Column(keyCount + c), _valueSchema[c].Type, from, rowCount, strings);
+            if (intern)
+            {
+                CellInterner.Intern(valueColumns[c]);
+            }
         }
 
         var weightArray = (Int64Array)batch.Column(keyCount + valueCount);
