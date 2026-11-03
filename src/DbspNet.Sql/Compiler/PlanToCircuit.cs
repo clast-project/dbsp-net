@@ -2927,8 +2927,30 @@ public static partial class PlanToCircuit
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
+
+        // The ordered store (§3.19) routes by a numeric prefix of the first ORDER BY key that agrees
+        // with the total order: the key's monotone value (bit-flipped for DESC), NULLs at the end
+        // NULLS FIRST/LAST puts them. Only for integer and temporal first keys.
+        Func<StructuralRow, long>? prefix = null;
+        if (TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine && plan.OrderKeys.Count > 0
+            && plan.OrderKeys[0].Expression.Type is SqlIntegerType or SqlBigintType or SqlDateType or SqlTimeType or SqlTimestampType)
+        {
+            var first = ExpressionCompiler.CompileScalar(plan.OrderKeys[0].Expression);
+            var firstDesc = plan.OrderKeys[0].Descending;
+            var firstNullsFirst = plan.OrderKeys[0].NullsFirst;
+            prefix = row => first(row) is { } v
+                ? (firstDesc ? ~MonotoneKey.Extract(v) : MonotoneKey.Extract(v))
+                : (firstNullsFirst ? long.MinValue : long.MaxValue);
+        }
+
+        var chunkFormat = prefix is null ? null : TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema);
         return MarkGathered(ctx, plan.PartitionKeys,
-            Recorded(builder, ctx, () => builder.PartitionedOffset<StructuralRow>(input, PartitionOf, order, specs, null, codec), Z("trace.arrows", reshardPlace, codec)));
+            Recorded(
+                builder,
+                ctx,
+                () => builder.PartitionedOffset<StructuralRow>(
+                    input, PartitionOf, order, specs, null, codec, chunkFormat, chunkFormat is null ? null : prefix),
+                Z("trace.arrows", reshardPlace, codec)));
     }
 
     // ---- Projection ----

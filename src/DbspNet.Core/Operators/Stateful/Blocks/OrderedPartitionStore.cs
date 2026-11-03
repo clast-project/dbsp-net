@@ -102,6 +102,9 @@ internal sealed class OrderedPartitionStore
 
     private long ValueOf(StructuralRow row) => _valueOf?.Invoke(row) ?? 0L;
 
+    /// <summary>The order value the store routes a row by.</summary>
+    public Func<StructuralRow, long> ValueOfRow => ValueOf;
+
     // Compare as a delegate built once (a method group would allocate one per sort).
     private Comparison<(StructuralRow Row, long Weight, long Value)> _compare => _compareCache ??= Compare;
 
@@ -310,6 +313,54 @@ internal sealed class OrderedPartitionStore
         }
 
         return all;
+    }
+
+    /// <summary>
+    /// For positional (offset) windows: a partition's rows in order, consolidated. Of a large
+    /// partition, the chunks overlapping [<paramref name="from"/>, <paramref name="to"/>] widened by
+    /// whole chunks until at least <paramref name="marginRows"/> rows lie on each side, or the
+    /// partition ends; of a small one, every row. <paramref name="atStart"/> and
+    /// <paramref name="atEnd"/> say whether the rows read begin and end the partition.
+    /// </summary>
+    public List<(StructuralRow Row, long Weight, long Value)> ReadAround(
+        StructuralRow key, long from, long to, long marginRows, out bool atStart, out bool atEnd)
+    {
+        if (!_large.TryGetValue(key, out var chunks))
+        {
+            atStart = atEnd = true;
+            return Read(key, long.MinValue, long.MaxValue, needPrefix: false, out _);
+        }
+
+        var first = FirstChunkReaching(chunks, from);
+        var last = first;
+        while (last + 1 < chunks.Count && chunks[last + 1].First <= to)
+        {
+            last++;
+        }
+
+        for (long margin = 0; first > 0 && margin < marginRows;)
+        {
+            margin += chunks[--first].Count;
+        }
+
+        for (long margin = 0; last + 1 < chunks.Count && margin < marginRows;)
+        {
+            margin += chunks[++last].Count;
+        }
+
+        atStart = first == 0;
+        atEnd = last == chunks.Count - 1;
+        var rows = new List<(StructuralRow Row, long Weight, long Value)>();
+        for (var c = first; c <= last; c++)
+        {
+            var chunk = chunks[c];
+            for (var i = 0; i < chunk.Count; i++)
+            {
+                rows.Add((chunk.Block.Value(i), chunk.Block.Weight(i), chunk.Values[i]));
+            }
+        }
+
+        return rows;
     }
 
     // The first chunk whose last value is not below `from` (the chunk a change at `from` lands in).
