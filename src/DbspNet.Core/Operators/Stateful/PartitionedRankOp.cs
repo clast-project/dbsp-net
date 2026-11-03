@@ -76,6 +76,16 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     public object? OrderFor(string fileName) =>
         fileName == "trace.arrows" ? LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf) : null;
 
+    // The widened output last emitted, for large partitions only (§3.29): when most of a large
+    // partition's ranks shift (a global rank over a value that changes every batch), recreating the
+    // old widened rows to retract them costs more than keeping them. A small partition's old output
+    // is recomputed from its rows before the delta.
+    private readonly Dictionary<TKey, Dictionary<TOutRow, long>> _window;
+
+    // Rows past which a partition keeps its emitted output: the window store's large-partition
+    // threshold (TraceBlocksMode.PromoteRows, 512 unless a test shrinks it).
+    private readonly int _storedOutputRows = Blocks.TraceBlocksMode.PromoteRows;
+
     // Previous tick's output size — pre-sizes this tick's delta builder to avoid
     // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
     private int _lastOutputSize;
@@ -110,6 +120,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         _snapshotCodec = snapshotCodec;
         _partitionComparer = partitionComparer;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
+        _window = new Dictionary<TKey, Dictionary<TOutRow, long>>(partitionComparer);
         if (chunkFormat is not null)
         {
             if (typeof(TInRow) != typeof(StructuralRow) || typeof(TKey) != typeof(StructuralRow))
@@ -189,7 +200,8 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
             if (!touched.ContainsKey(key))
             {
-                touched[key] = Current(key);
+                // A partition with a stored output needs no copy of its old rows.
+                touched[key] = _window.ContainsKey(key) ? null! : Current(key);
             }
         }
 
@@ -228,7 +240,26 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
         foreach (var (key, before) in touched)
         {
-            EmitDiff(builder, before, Current(key));
+            var after = Current(key);
+            if (before is not null && before.Count <= _storedOutputRows && after.Count <= _storedOutputRows)
+            {
+                EmitDiff(builder, before, after);
+                continue;
+            }
+
+            // Large (or was): diff the whole widened partition against the stored output, or
+            // against the old rows' output when there is none yet.
+            var newWindow = ComputeWindow(after);
+            if (!_window.Remove(key, out var oldWindow))
+            {
+                oldWindow = ComputeWindow(before!);
+            }
+
+            EmitWindowDiff(builder, newWindow, oldWindow);
+            if (after.Count > _storedOutputRows)
+            {
+                _window[key] = newWindow;
+            }
         }
 
         _store?.EndTick();
@@ -402,6 +433,62 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
     }
 
+    /// <summary>Emit the +/- weights moving <paramref name="oldWindow"/> to <paramref name="newWindow"/>.</summary>
+    private static void EmitWindowDiff(
+        ZSetBuilder<TOutRow, Z64> builder,
+        Dictionary<TOutRow, long> newWindow,
+        Dictionary<TOutRow, long> oldWindow)
+    {
+        foreach (var (row, weight) in newWindow)
+        {
+            oldWindow.TryGetValue(row, out var old);
+            if (weight != old)
+            {
+                builder.Add(row, new Z64(weight - old));
+            }
+        }
+
+        foreach (var (row, old) in oldWindow)
+        {
+            if (!newWindow.ContainsKey(row))
+            {
+                builder.Add(row, new Z64(-old));
+            }
+        }
+    }
+
+    /// <summary>A partition's widened output: every row with its rank, keyed by the widened row
+    /// (ROW_NUMBER: one row of weight 1 per copy; RANK / DENSE_RANK: the row's whole weight).</summary>
+    private Dictionary<TOutRow, long> ComputeWindow(List<(TInRow Row, long Weight)> rows)
+    {
+        var result = new Dictionary<TOutRow, long>(rows.Count);
+        var ranker = default(Ranker);
+        foreach (var (row, weight) in rows)
+        {
+            if (weight <= 0)
+            {
+                continue;
+            }
+
+            var starts = _function != RankFunction.RowNumber
+                && (ranker.Previous is null || _sortKeyOnly.Compare(ranker.Previous, row) != 0);
+            var rank = ranker.Next(_function, row, weight, starts);
+            if (_function == RankFunction.RowNumber)
+            {
+                for (long k = 1; k <= weight; k++)
+                {
+                    result[_widen(row, rank + k)] = 1;
+                }
+            }
+            else
+            {
+                result[_widen(row, rank)] = weight;
+            }
+        }
+
+        return result;
+    }
+
     // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.
     private ZSet<TInRow, Z64> SnapshotNow() =>
         _store is not null
@@ -514,6 +601,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         {
             // Lazily restored: partitions are read as deltas touch them (Fault).
             _accum.Clear();
+            _window.Clear();
             _store?.Clear();
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
@@ -524,6 +612,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         _changes.Restored(loaded);
         _accum.Clear();
+        _window.Clear();
         if (_store is not null)
         {
             _store.Clear();

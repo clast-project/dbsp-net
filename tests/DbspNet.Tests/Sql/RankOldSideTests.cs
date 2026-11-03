@@ -29,14 +29,18 @@ public sealed class RankOldSideTests
         "DENSE_RANK() OVER (PARTITION BY p, s ORDER BY t)",
     ];
 
-    public static TheoryData<string, bool, bool> Cases()
+    // large: partitions past 3 rows keep their emitted output (§3.29), so they cross the
+    // threshold both ways as rows come and go.
+    public static TheoryData<string, bool, bool, bool> Cases()
     {
-        var data = new TheoryData<string, bool, bool>();
+        var data = new TheoryData<string, bool, bool, bool>();
         foreach (var r in RankSql)
         {
-            data.Add(r, false, false);
-            data.Add(r, true, false);
-            data.Add(r, true, true);
+            data.Add(r, false, false, false);
+            data.Add(r, true, false, false);
+            data.Add(r, true, true, false);
+            data.Add(r, false, false, true);
+            data.Add(r, true, true, true);
         }
 
         return data;
@@ -44,7 +48,7 @@ public sealed class RankOldSideTests
 
     [Theory]
     [MemberData(nameof(Cases))]
-    public async Task IntegratedView_EqualsAFreshRun_EveryTick(string rank, bool blocks, bool restore)
+    public async Task IntegratedView_EqualsAFreshRun_EveryTick(string rank, bool blocks, bool restore, bool large)
     {
         string[] sql =
         [
@@ -55,6 +59,7 @@ public sealed class RankOldSideTests
         CompiledProgram Compile()
         {
             using (TraceBlocksMode.Use(join: false, freezeEntries: 3, blockEntries: 2, window: blocks))
+            using (large ? TraceBlocksMode.UseChunks(promoteRows: 3, chunkRows: 2) : null)
             {
                 return SqlProgram.Compile(sql, views, ArrowSqlSnapshotCodecs.Instance);
             }
@@ -64,7 +69,7 @@ public sealed class RankOldSideTests
         Assert.Equal(
             blocks,
             program.Circuit.Operators.OfType<PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>>().Single().IsBlocked);
-        var rnd = new Random(rank.Length * 7 + (blocks ? 1 : 0) + (restore ? 2 : 0));
+        var rnd = new Random(rank.Length * 7 + (blocks ? 1 : 0) + (restore ? 2 : 0) + (large ? 4 : 0));
         var live = new List<object?[]>();
         var next = 0;
         string?[] strings = [null, "a", "bb"];
