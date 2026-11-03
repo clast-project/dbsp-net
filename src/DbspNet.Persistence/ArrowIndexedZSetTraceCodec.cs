@@ -84,6 +84,21 @@ internal sealed class ArrowIndexedZSetTraceCodec
         Blocks.BlockedTraceCheckpoint.SaveAsync(this, writer, fileName, trace, cancellationToken);
 
     /// <inheritdoc/>
+    public ValueTask SaveBackingAsync(
+        ISnapshotWriter writer, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        Runs.StateLayout.Runs && writer is TableFileSystemSnapshotContext { Session: not null }
+            ? Blocks.BlockedTraceCheckpoint.SaveAsync(this, writer, fileName, trace, cancellationToken)
+            : ValueTask.CompletedTask;
+
+    /// <inheritdoc/>
+    public ValueTask SaveBackingBlocksAsync(
+        ISnapshotWriter writer, string fileName, IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock> blocks,
+        Action<DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
+        Runs.StateLayout.Runs && writer is TableFileSystemSnapshotContext { Session: not null }
+            ? Blocks.BlockedTraceCheckpoint.SaveBackingBlocksAsync(this, writer, fileName, blocks, onCommit, cancellationToken)
+            : ValueTask.CompletedTask;
+
+    /// <inheritdoc/>
     public ValueTask LoadBlockedAsync(
         ISnapshotReader reader, string fileName, DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
         Blocks.BlockedTraceCheckpoint.LoadAsync(this, reader, fileName, trace, cancellationToken);

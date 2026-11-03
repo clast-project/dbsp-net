@@ -221,7 +221,9 @@ public static class ParallelReshard
 
             foreach (var name in names)
             {
-                if (!named.Contains(name))
+                // A *.backing file is an eviction aid, never state (docs/design-bounded-memory.md
+                // §3.7): dropped, the next checkpoint writes it again.
+                if (!named.Contains(name) && !name.EndsWith(".backing", StringComparison.Ordinal))
                 {
                     throw new InvalidOperationException(
                         $"operator {op} ({spec.OperatorType}) persisted '{name}', for which the compiler stated no placement");

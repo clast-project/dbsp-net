@@ -42,6 +42,7 @@ internal sealed class OrderedPartitionStore
     // is dropped (a checkpoint, or past a cap). Writing the trace every tick made its merges decode
     // and re-encode the growing state again and again. Without a cold format, _small is the record.
     private readonly BlockedIndexedTrace? _cold;
+    private readonly ITraceBlockFormat? _coldFormat;
     private readonly Dictionary<StructuralRow, List<(StructuralRow Row, long Weight)>> _pending = new();
 
     // Keys the cold trace has ever held (a Bloom filter: no false negatives), so a partition new
@@ -71,6 +72,7 @@ internal sealed class OrderedPartitionStore
         _partial = partial is { IsExactPartial: true } ? partial : null;
         _promoteAt = valueOf is null ? int.MaxValue : promoteAt;
         _chunkRows = Math.Max(1, chunkRows);
+        _coldFormat = coldFormat;
         _cold = coldFormat is null ? null : new BlockedIndexedTrace(coldFormat, TraceBlocksMode.FreezeEntries, blockEntries: TraceBlocksMode.BlockEntries);
         _rowOrder = Comparer<StructuralRow>.Create((a, b) =>
         {
@@ -90,6 +92,48 @@ internal sealed class OrderedPartitionStore
             foreach (var c in chunks)
             {
                 yield return c.Block;
+            }
+        }
+    }
+
+    /// <summary>
+    /// With a block cache that can evict (docs/design-bounded-memory.md §3.7): write the small
+    /// partitions' record as run files the cache reads back, so its blocks can leave memory. Only
+    /// the cache reads it: the operator's own snapshot stays the state restore reads. Call after
+    /// <see cref="DropCache"/>, which flushes the record.
+    /// </summary>
+    public async ValueTask SaveBackingAsync(Circuit.ISnapshotWriter writer, string fileName, CancellationToken cancellationToken)
+    {
+        if (!BlockAccess.Evicting)
+        {
+            return;
+        }
+
+        if (_cold is { IsEmpty: false } cold && _coldFormat?.BackingCodec is { } codec)
+        {
+            await codec.SaveBackingAsync(writer, fileName, cold, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Large partitions' chunks not yet backed: one file of their blocks this checkpoint; each
+        // chunk takes its block's file-backed twin when the checkpoint commits.
+        if (_chunkFormat.BackingCodec is { } chunkCodec)
+        {
+            var pending = _large.Values.SelectMany(cs => cs).Where(c => !c.Backed).ToList();
+            if (pending.Count > 0)
+            {
+                await chunkCodec.SaveBackingBlocksAsync(
+                    writer,
+                    "chunks.backing",
+                    [.. pending.Select(c => c.Block)],
+                    backed =>
+                    {
+                        for (var k = 0; k < pending.Count; k++)
+                        {
+                            pending[k].Block = backed[k];
+                            pending[k].Backed = true;
+                        }
+                    },
+                    cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -123,7 +167,9 @@ internal sealed class OrderedPartitionStore
 
     private sealed class Chunk(ITraceBlock block, long[] values, object? partial)
     {
-        public readonly ITraceBlock Block = block;
+        // Replaced once, by the block's file-backed twin, when a checkpoint that wrote it commits (§3.7).
+        public ITraceBlock Block = block;
+        public bool Backed;
         public readonly long[] Values = values;
         public readonly object? Partial = partial;
 
@@ -382,9 +428,10 @@ internal sealed class OrderedPartitionStore
         {
             foreach (var c in chunks)
             {
+                var body = c.Block.Body;
                 for (var i = 0; i < c.Count; i++)
                 {
-                    yield return (c.Block.Value(i), c.Block.Weight(i));
+                    yield return (body.Value(i), body.Weight(i));
                 }
             }
         }
@@ -430,9 +477,10 @@ internal sealed class OrderedPartitionStore
             for (var c = first; c < chunks.Count && chunks[c].First <= to; c++)
             {
                 var chunk = chunks[c];
+                var body = chunk.Block.Body;
                 for (var i = 0; i < chunk.Count; i++)
                 {
-                    rows.Add((chunk.Block.Value(i), chunk.Block.Weight(i), chunk.Values[i]));
+                    rows.Add((body.Value(i), body.Weight(i), chunk.Values[i]));
                 }
             }
 
@@ -553,9 +601,10 @@ internal sealed class OrderedPartitionStore
         for (var c = first; c <= last; c++)
         {
             var chunk = chunks[c];
+            var body = chunk.Block.Body;
             for (var i = 0; i < chunk.Count; i++)
             {
-                rows.Add((chunk.Block.Value(i), chunk.Block.Weight(i), chunk.Values[i]));
+                rows.Add((body.Value(i), body.Weight(i), chunk.Values[i]));
             }
         }
 
@@ -698,10 +747,11 @@ internal sealed class OrderedPartitionStore
         {
             var chunk = chunks[c];
             var merged = new List<(StructuralRow Row, long Weight, long Value)>(chunk.Count + share.Count);
+            var body = chunk.Block.Body;
             int i = 0, j = 0;
             while (i < chunk.Count || j < share.Count)
             {
-                var a = i < chunk.Count ? (chunk.Block.Value(i), chunk.Block.Weight(i), chunk.Values[i]) : default;
+                var a = i < chunk.Count ? (body.Value(i), body.Weight(i), chunk.Values[i]) : default;
                 var cmp = i >= chunk.Count ? 1 : j >= share.Count ? -1 : Compare(a, share[j]);
                 if (cmp < 0)
                 {

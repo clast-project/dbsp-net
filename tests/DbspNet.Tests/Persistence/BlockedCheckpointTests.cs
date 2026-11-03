@@ -248,3 +248,10 @@ public class BlockedCheckpointTests
         }
     }
 }
+
+/// <summary>The block cache's budget (and the span alignment and backing writes it switches) is
+/// process-wide: tests that set it must not run beside any other test.</summary>
+[CollectionDefinition(nameof(BlockedCheckpointTests), DisableParallelization = true)]
+public sealed class BlockedCheckpointCollection
+{
+}

@@ -97,6 +97,11 @@ internal static class BlockAccess
         _ => long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_MIB"), out var mib) && mib > 0,
     };
 
+    /// <summary>Whether a block cache can evict (set by the cache's budget): state with no run file
+    /// then writes a backing one at checkpoints (§3.7).</summary>
+    public static bool Evicting { get; set; } =
+        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_MIB"), out var budget) && budget > 0;
+
     /// <summary>The bits a read now records: <see cref="Maintenance"/> alone on a merging thread,
     /// else the phase.</summary>
     public static int CurrentBits => _maintenance ? Maintenance : Phase;

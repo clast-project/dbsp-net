@@ -83,6 +83,9 @@ internal sealed class BlockSchema : ITraceBlockFormat
     public int ValueColumns => ValueKinds.Length;
 
     /// <inheritdoc/>
+    Core.Operators.Stateful.Blocks.IBlockedTraceCodec? ITraceBlockFormat.BackingCodec => Codec;
+
+    /// <inheritdoc/>
     public int EntryBytes(StructuralRow key, StructuralRow value)
     {
         ArgumentNullException.ThrowIfNull(key);

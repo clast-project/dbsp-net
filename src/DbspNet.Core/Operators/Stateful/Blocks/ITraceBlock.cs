@@ -80,6 +80,10 @@ internal interface ITraceBlockFormat
     /// <summary>Columns in a value row.</summary>
     int ValueColumns { get; }
 
+    /// <summary>Writes a trace of this format as a run chain only a block cache reads back
+    /// (docs/design-bounded-memory.md §3.7); null if the format cannot.</summary>
+    IBlockedTraceCodec? BackingCodec => null;
+
     /// <summary>About how many bytes one entry adds to a block (fixed widths plus string bytes), so
     /// blocks can be cut below the large-object-heap threshold.</summary>
     int EntryBytes(StructuralRow key, StructuralRow value);
@@ -97,4 +101,16 @@ internal interface IBlockedTraceCodec
     ValueTask SaveBlockedAsync(Circuit.ISnapshotWriter writer, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken);
 
     ValueTask LoadBlockedAsync(Circuit.ISnapshotReader reader, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken);
+
+    /// <summary>Write <paramref name="trace"/> as run files a block cache can evict to, and nothing
+    /// else: a no-op unless the snapshot layout is runs. Restore never reads it.</summary>
+    ValueTask SaveBackingAsync(Circuit.ISnapshotWriter writer, string fileName, BlockedIndexedTrace trace, CancellationToken cancellationToken) =>
+        ValueTask.CompletedTask;
+
+    /// <summary>Write <paramref name="blocks"/> (in any hash order) to one backing file; once the
+    /// checkpoint commits, <paramref name="onCommit"/> receives their file-backed twins, in order. A
+    /// no-op unless the snapshot layout is runs.</summary>
+    ValueTask SaveBackingBlocksAsync(
+        Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks, Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
+        ValueTask.CompletedTask;
 }

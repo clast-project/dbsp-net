@@ -668,7 +668,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
                 LazyPartitions<TKey, TInRow>.PartitionOrder(_partitionOf),
                 () => { PromoteAll(); return SnapshotNow(); },
                 _store.Entries + (_lazy?.ColdCount ?? 0));
-            return _snapshotCodec.SaveAsync(writer, "trace.arrows", empty, cancellationToken);
+            return SaveStoreAsync(writer, empty, cancellationToken);
         }
 
         var snapshot = SnapshotNow();
@@ -678,6 +678,13 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             _lazy is null ? null : () => { PromoteAll(); return SnapshotNow(); },
             _lazy is null ? null : snapshot.Count + _lazy.ColdCount);
         return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
+    }
+
+    // The store's snapshot, and with an evicting block cache its record's backing runs (§3.7).
+    private async ValueTask SaveStoreAsync(ISnapshotWriter writer, ZSet<TInRow, Z64> empty, CancellationToken cancellationToken)
+    {
+        await _store!.SaveBackingAsync(writer, "record.backing", cancellationToken).ConfigureAwait(false);
+        await _snapshotCodec!.SaveAsync(writer, "trace.arrows", empty, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)

@@ -28,7 +28,17 @@ internal static class BlockCache
     private static long _bytes;
 
     /// <summary>The budget in bytes; 0: unbounded (the cache is off).</summary>
-    public static long Budget { get; set; } = ParseBudget(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_MIB"));
+    public static long Budget
+    {
+        get => _budget;
+        set
+        {
+            _budget = value;
+            Core.Operators.Stateful.Blocks.BlockAccess.Evicting = value > 0;
+        }
+    }
+
+    private static long _budget = ParseBudget(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_MIB"));
 
     /// <summary>Whether bodies are admitted and evicted.</summary>
     public static bool Enabled => Budget > 0;

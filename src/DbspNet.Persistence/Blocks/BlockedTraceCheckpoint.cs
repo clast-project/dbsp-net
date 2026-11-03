@@ -180,6 +180,51 @@ internal static class BlockedTraceCheckpoint
         }
     }
 
+    /// <summary>
+    /// Blocks in no hash order (a window partition's chunks, docs/design-bounded-memory.md §3.7) as
+    /// one backing file, raw. The file's index lists each block under its ordinal in place of a hash
+    /// range: nothing finds these blocks by hash. On commit each becomes a file-backed block that
+    /// keeps its body, pinned so the sweep keeps the file while the block lives.
+    /// </summary>
+    public static async ValueTask SaveBackingBlocksAsync(
+        ILayout codec, Core.Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks,
+        Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken)
+    {
+        if (writer is not TableFileSystemSnapshotContext { Session: { } session } ctx || blocks.Count == 0)
+        {
+            return;
+        }
+
+        var schema = codec.Blocks!;
+        var path = "runs/" + ctx.Prefix + fileName;
+        var bodies = new List<(RunBlock Index, TraceBlock Body)>(blocks.Count);
+        await using (var file = await RunStreamWriter.CreateAsync(
+            ctx.FileSystem, path, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false))
+        {
+            for (var b = 0; b < blocks.Count; b++)
+            {
+                var body = Materialized(blocks[b]);
+                await file.AppendRawAsync(body.Message.ToArray(), [(uint)b], body.Count, 1, cancellationToken).ConfigureAwait(false);
+                bodies.Add((file.Index[^1], body));
+            }
+
+            await file.FinishAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        session.OnCommit(() =>
+        {
+            var backed = new ITraceBlock[bodies.Count];
+            for (var b = 0; b < backed.Length; b++)
+            {
+                var lazy = new LazyTraceBlock(schema, ctx.FileSystem, path, bodies[b].Index, bodies[b].Body);
+                RunPins.Add(lazy, ctx.FileSystem, [path]);
+                backed[b] = lazy;
+            }
+
+            onCommit(backed);
+        });
+    }
+
     // One run file from a run's blocks, raw. A hash spanning blocks in memory becomes one block.
     // Returns each file block's index and, where it is byte for byte one in-memory block, that block.
     private static async ValueTask<List<(RunBlock Index, TraceBlock? Body)>> WriteRunAsync(

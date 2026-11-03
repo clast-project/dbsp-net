@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6).** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7).** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -334,6 +334,70 @@ main:
 
 The cache-off default is level with main. With the cache on, the remaining cost is batch 3's ~600
 genuine misses. Some of them are serial, on the driver thread's output-view probes.
+
+### 3.7 Increment 2: window state backed by files (2026-11-03)
+
+Window state was the one large holder with no run file (§1.2): the small-partition record and the
+large partitions' chunks, 839 MB. Each window operator's snapshot is its input rows as a Z-set
+change chain, which restore reads. The store's blocks are a second, in-memory copy that nothing
+on disk mirrors.
+
+**Design.** With an evicting cache only (`BlockAccess.Evicting`, which follows the budget), each
+checkpoint also writes **backing files** that only the cache reads back. Restore ignores them;
+it keeps reading `trace.arrows`.
+- **The record** (`record.backing`). The store's `BlockedIndexedTrace` is written through the
+  ordinary blocked-run path (`IBlockedTraceCodec.SaveBackingAsync`). It is incremental: unchanged
+  runs are named again. On commit it rebinds exactly like a join trace.
+- **The chunks** (`runs/<snapshot>/<op>/chunks.backing`). The chunks not yet backed go into one
+  block file per checkpoint (`SaveBackingBlocksAsync`). The file index lists each block under its
+  ordinal, since chunks have no key hash and nothing looks them up by hash. On commit each chunk's
+  block becomes a `LazyTraceBlock` that keeps its body, pinned per block (`RunPins`). The file
+  isn't in the run index, so the pin is what keeps it from the sweep. A test mutant without the
+  pin fails with `FileNotFoundException` after the sweep.
+- **Chunk reads** take `Block.Body` once per chunk.
+- **Re-shard** ignores `*.backing` files: they are never state, and the next checkpoint writes
+  them again.
+- The tests that set the process-wide budget now run in a collection with parallelism disabled.
+  Flipping the budget beside another test made `IncrementalCheckpointTests` flaky.
+
+**Tests.** `WindowBackingTests` runs SUM OVER, LAG and RANK by partition, with both small and large
+partitions, at budgets of 1 byte and 4 KiB, checkpointing every 3 ticks with retain 1 and the
+sweep awaited. It checks that the record runs and the chunks are file-backed after every
+checkpoint, that outputs equal an uncheckpointed twin every tick, and that the checkpoint
+restores exactly. Mutants (no backing, no chunk rebind, no pin) all fail it.
+
+**Memory, SF=3 W=12.** Live heap after a full GC, after each batch's checkpoint, flat over batches
+1–3. Views identical in every run.
+
+| budget | inc 1 | + record | + chunks |
+|---|---|---|---|
+| 512 MiB | 2.27 GB | – | **1.42 GB** |
+| 128 MiB | 1.89 GB | 1.34 GB | **1.04 GB** |
+
+At 128 MiB the resident block bytes equal the budget (118 MB), and every block is persisted. The
+remaining ~0.9 GB is managed state outside blocks. A restarted process is unchanged (0.85 GB at
+128 MiB), because its window state is faulted from the restore chain, not rebuilt.
+
+**Time.**
+
+Run16, 5 runs per arm, medians against main:
+
+| | main | 512 MiB |
+|---|---|---|
+| b1 checkpoint | 2,499 ms | +13.4% (it now also writes ~0.8 GB of window backing) |
+| b1 drain | 16,450 ms | +2.6% |
+| b2 drain | 91 ms | +8% (overlapping) |
+| b3 drain | 116 ms | +15% (+17 ms; window misses add to the join and view misses) |
+
+Run17, cache off against main, 6 runs per arm:
+
+| | main | cache off |
+|---|---|---|
+| b1 checkpoint | 2,699 ms | −0.1% |
+| b1 drain | 17,564 ms | +3.8% (ranges overlap: 16.6–18.6 vs 16.9–18.8 s) |
+| b2/b3 drain | 98/119 ms | +5% / −7% |
+
+The cache-off path is level.
 
 ### 3.4 Gates
 
