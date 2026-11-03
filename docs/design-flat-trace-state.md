@@ -1209,6 +1209,37 @@ in and cut into chunks (a sort and an encode), where the managed store only inse
 A/B confirms it, the lever is to adopt the faulted partition's cold rows as chunks directly,
 since they arrive already in partition order.
 
+### 3.20 Aggregate caches: plan — small exact groups keep none (2026-11-02, branch `arc/flat-trace-agg-caches`)
+
+**Census after §3.19:** IncrementalAggregate holds 23.5M references. Its input traces are blocks
+(0.1M); the rest are two per-group caches:
+- `_aggCache`, the last emitted aggregate per group (13.5M);
+- `_stateCache`, the aggregator's incremental state per group (9.8M), mostly hybrid MIN/MAX
+  `Compact` states and their boxed best values.
+
+One operator, `watches` (a GROUP BY over six columns with MIN/MAX of timestamps, about half a
+million groups of around two rows each), holds 14M of them.
+
+**The caches are derivable.** A lazy restore already rebuilds a group's caches by folding its
+rows through the aggregator (`EnsureCaches`). For an exact aggregator, folding the group gives the
+same value and state as the incremental update that produced the emitted output. "Exact" here means
+`CanPersistState` is false: no floating-point accumulator.
+
+**Design.** On a blocked trace, an exact aggregator keeps no caches for a small group. A group is
+small when its entries across levels (counted from the group view's ranges, an upper bound,
+without decoding) are at most `SmallGroup` = 8.
+- **A touch of an uncached group:** decode the before-group (a few rows), fold it to recover the
+  old value and state, apply the delta, and emit the change.
+- **Caching after the change:** the group is cached only if it has grown past the threshold.
+- **A cached group that shrinks** to the threshold drops its caches.
+- **Unchanged:** float aggregates, large groups, and managed traces.
+- **The lazy-restore rebuild** stores nothing for small groups either.
+
+**Cost:** a small decode per touched small group. In batch 1 the groups are new (nothing before).
+
+**Gate:** batch-1 drain no worse than main (+3%), restart and batch 3 no worse, identical
+outputs, census. 5 alternating runs against a main build.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
