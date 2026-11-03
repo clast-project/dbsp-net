@@ -34,6 +34,27 @@ internal sealed class BlockedGroupView : IMultiset<StructuralRow, Z64>, ILazyGro
 
     public bool IsEmpty => _decoded is { } d ? d.IsEmpty : !AnyNonZero(null);
 
+    /// <summary>Entries the group can hold, across levels, counted without decoding (an upper bound:
+    /// a range may hold another key with the same hash, and entries in separate levels may cancel).</summary>
+    public int EntryBound
+    {
+        get
+        {
+            var n = 0;
+            foreach (var group in _managed)
+            {
+                n += group.Count;
+            }
+
+            foreach (var (_, from, to) in _ranges)
+            {
+                n += to - from;
+            }
+
+            return n;
+        }
+    }
+
     /// <inheritdoc/>
     public bool AnyNonZero(Func<StructuralRow, Z64>? adjust)
     {
