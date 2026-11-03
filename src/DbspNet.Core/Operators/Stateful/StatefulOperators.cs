@@ -839,7 +839,8 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(builder);
         var output = new Stream<ZSet<(StructuralRow, StructuralRow), Z64>>(ZSet<(StructuralRow, StructuralRow), Z64>.Empty);
         builder.AddRawOperator(new IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>(
-            input, output, aggregator, snapshotCodec, frontier, monotoneKey, new Blocks.BlockedGroupTrace(format)));
+            input, output, aggregator, snapshotCodec, frontier, monotoneKey, new Blocks.BlockedGroupTrace(format),
+            canonicalOrder: StructuralRowComparer.Instance));
         return output;
     }
 

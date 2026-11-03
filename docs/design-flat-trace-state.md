@@ -1455,6 +1455,61 @@ Two of the new arm's batch-1 outputs took 3.4–3.5 s. That tail appears about o
 across both arms in earlier runs (the Delta write; the output phase touches no join), so it is
 noise, not this change.
 
+### 3.27 Aggregate caches, round 2: plan — float slots and large groups (2026-11-03, branch `arc/agg-float-caches`)
+
+**Census after §3.26:** IncrementalAggregate holds 9.5M of the checkpoint heap's 18.8M references,
+almost all in the two per-group caches (`_stateCache` 5.8M, `_aggCache` 3.5M); the traces are
+blocks. Seven operators hold them, and **every one mixes float aggregates (SUM, AVG or STDDEV over
+DOUBLE) with exact ones**, so the composite reports `CanPersistState` and §3.20's refold is off for
+all its groups. A histogram at the checkpoint (SF=3, all workers):
+
+| Group size (entries) | Groups | Entries |
+|:--|--:|--:|
+| 1 | 235K | 235K |
+| 2–8 | 60K | 124K |
+| 9–64 | 2.7K | 81K |
+| 65–512 | 1.9K | 253K |
+| 513–4096 | 2.5K | 2.56M |
+
+98% of groups are small; `_aggCache` is mostly theirs. The 7.1K large groups (date- and
+low-cardinality-keyed reports) hold COUNT(DISTINCT) value multisets of `Utf8String`/`Date32`:
+most of `_stateCache`. The persisted float-slot state averages about 31 bytes a group.
+
+**Why floats keep caches.** The value emitted for a group must be retracted exactly later. An
+incremental float fold (deltas in arrival order) can differ in the last bits from a refold of the
+current rows, so a refold cannot recover the emitted value; the state is persisted for the same
+reason (§7.2 of the persistence design).
+
+**Part 1 — small groups refold canonically, floats included.** If a group that keeps no caches
+always *emits* the fold of its rows in a canonical order (sorted by `StructuralRowComparer`), its
+emitted value is a pure function of its rows, and the next touch's canonical refold reproduces it
+bit for bit. So, on a blocked trace, with or without float slots:
+- **A touch of an uncached group:** the old value is the canonical refold of the before-group.
+- **The new value** of a group that will not keep caches is the canonical refold of the
+  after-group (not the incremental update), so the next touch recovers it. A cached group that
+  shrinks to the threshold emits this too, retracting its cached value.
+- **A small group that grows past the threshold** starts caching from the refolded state; from
+  then on it is incremental, as today, and persists its float state.
+- **Small groups persist no state blob**: a restore refolds them.
+- Exact aggregators already refold; for them the canonical order changes nothing but the cost of
+  a sort of at most 8 rows.
+
+**Part 2 — large groups drop their caches at the checkpoint.** After a checkpoint has written
+their state blobs, a large group's caches go, as a lazy restore leaves them (§1f of the durable
+design): the next touch refolds the group and overlays its float blob (`EnsureCaches`), then caches
+until the next checkpoint. The blobs (7.1K, ~31 bytes each) stay in the existing managed
+`_pendingBlobs`. Cost: one refold of each large group the next batch touches.
+
+**Unchanged:** LATENESS (frontier GC) aggregates, managed traces, the spine family.
+
+**Tests:** extend `AggregateCacheFreeTests` with mixed float + exact composites (SUM DOUBLE with
+COUNT(DISTINCT), MIN, AVG), groups growing past the threshold and shrinking back, and a
+checkpoint-and-restore mid-stream; each group must keep exactly one row in the integrated view,
+and exact columns must match a fresh run. Persistence conformance covers restore.
+
+**Gate:** batch-1 drain no worse than main (+3%), restart and batch 3 no worse, identical
+outputs, census. 5 alternating runs against a main build.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

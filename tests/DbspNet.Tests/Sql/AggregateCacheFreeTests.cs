@@ -1,6 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.IO;
 using DbspNet.Core.Operators.Stateful.Blocks;
+using DbspNet.Persistence;
+using DbspNet.Persistence.IO;
 using DbspNet.Sql.Compiler;
 using Xunit;
 
@@ -103,6 +106,88 @@ public sealed class AggregateCacheFreeTests
             static IEnumerable<(object?, object?, long)> KeysAndCounts(DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> view) =>
                 view.Select(e => (e.Key[0], e.Key[2], e.Value.Value)).OrderBy(e => (int)e.Item1!);
             Assert.Equal(KeysAndCounts(fresh.Outputs["a"].CurrentView), KeysAndCounts(program.Outputs["a"].CurrentView));
+        }
+    }
+
+    // §3.27: a composite mixing float and exact slots. Uncached groups emit the canonical fold of
+    // their rows; large ones drop their caches at each checkpoint and rebuild from their persisted
+    // float state. A retraction that misses the emitted value leaves a second row for its group.
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(3, true)]
+    [InlineData(4, true)]
+    public async Task FloatComposite_OneRowPerGroup_ExactColumnsMatch_AcrossCheckpoints(int seed, bool restore)
+    {
+        string[] sql =
+        [
+            "CREATE TABLE t (id INT NOT NULL, g INT NOT NULL, v INT, s VARCHAR, d DOUBLE NOT NULL)",
+            "CREATE VIEW a AS SELECT g, SUM(d) AS sd, COUNT(DISTINCT s) AS cds, MIN(v) AS lo, AVG(d) AS ad, COUNT(*) AS n FROM t GROUP BY g",
+        ];
+        var views = new HashSet<string>(["a"], StringComparer.Ordinal);
+        CompiledProgram Compile()
+        {
+            using (TraceBlocksMode.Use(join: true, freezeEntries: 3, blockEntries: 2))
+            {
+                return SqlProgram.Compile(sql, views, ArrowSqlSnapshotCodecs.Instance);
+            }
+        }
+
+        var program = Compile();
+        var rnd = new Random(seed);
+        var live = new List<object?[]>();
+        var next = 0;
+        for (var tick = 0; tick < 60; tick++)
+        {
+            var input = program.Table("t");
+            var filling = tick % 12 < 7;
+            for (var d = rnd.Next(filling ? 0 : 4, filling ? 3 : 12); d > 0 && live.Count > 0; d--)
+            {
+                var victim = live[rnd.Next(live.Count)];
+                live.Remove(victim);
+                input.Delete(victim);
+            }
+
+            for (var n = rnd.Next(filling ? 4 : 0, filling ? 14 : 3); n > 0; n--)
+            {
+                var row = live.Count > 0 && rnd.Next(6) == 0
+                    ? live[rnd.Next(live.Count)]
+                    : new object?[]
+                    {
+                        next++,
+                        rnd.Next(4),
+                        rnd.Next(4) == 0 ? null : rnd.Next(-5, 50),
+                        rnd.Next(4) == 0 ? null : "s" + rnd.Next(6),
+                        rnd.Next(3) switch { 0 => 1e16, 1 => -1e16, _ => rnd.NextDouble() },
+                    };
+                live.Add(row);
+                input.Insert(row);
+            }
+
+            program.Step();
+
+            if (rnd.Next(4) == 0)
+            {
+                var fs = new InMemoryTableFileSystem();
+                await Snapshot.WriteAsync(program.Circuit, fs);
+                if (restore && rnd.Next(2) == 0)
+                {
+                    var restored = Compile();
+                    await Snapshot.ReadAsync(restored.Circuit, fs);
+                    program = restored;
+                }
+            }
+
+            var fresh = SqlProgram.Compile(sql, views);
+            foreach (var row in live)
+            {
+                fresh.Table("t").Insert(row);
+            }
+
+            fresh.Step();
+            static IEnumerable<string> Exact(DbspNet.Core.Collections.ZSet<DbspNet.Core.Collections.StructuralRow, DbspNet.Core.Algebra.Z64> view) =>
+                view.Select(e => FormattableString.Invariant($"{e.Key[0]}|{e.Key[2]}|{e.Key[3]}|{e.Key[5]}#{e.Value.Value}")).Order(StringComparer.Ordinal);
+            Assert.Equal(Exact(fresh.Outputs["a"].CurrentView), Exact(program.Outputs["a"].CurrentView));
         }
     }
 }
