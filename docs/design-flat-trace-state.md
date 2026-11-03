@@ -1777,6 +1777,46 @@ branch's mostly in the fast one (16.8–18.3 s). Nothing else moved outside nois
 Largest holders now: inner joins 0.34M, WindowAggregate 0.29M, PartitionedRank 0.21M,
 IncrementalAggregate 0.14M, views 0.09M, the runner 0.09M.
 
+### 3.33 Slimmer codecs, one offset array per block (2026-11-03, branch `arc/slim-schemas`)
+
+**After §3.32** (1.32M references), what remained per row shape was each codec's Arrow schemas —
+three per row codec, two per indexed codec, each with its own field lookups — and the block
+structure: 76K blocks, each a `TraceBlock`, its `byte[]`, three per-column offset arrays and a
+value-hash array (372K `int[]` in all).
+
+**Change.**
+- **Lazy legacy schemas.** Only the run schema is read with the run layout and with blocks; the
+  data schema and schema-with-weight serve the single-stream snapshot layout, and are now built
+  on its first use (the run schema is built from them without keeping them). The single-stream
+  layout is still the default (`DBSPNET_STATE_LAYOUT=runs` opts into runs), so there they appear
+  on the first checkpoint, as before.
+- **One offset array per block.** A `TraceBlock` keeps its validity, values and data offsets in
+  one `int[3·columns]` instead of three arrays.
+
+**Tests.** The suite passes with the default layout, the run layout, and blocks off. Reading
+data offsets from the values slot fails 171 tests.
+
+**Measured.** SF=3 W=12, five alternating runs against main (medians; views byte-identical in
+every run):
+
+| | main | slimmer |
+|---|--:|--:|
+| References at the checkpoint | 1.32M | **1.01M** (−24%) |
+| Objects | 0.91M | 0.69M |
+| batch-1 drain (ms; both bimodal, §3.31) | 16,769 | 16,899 |
+| batch-1 checkpoint | 2,462 (2,392–2,554) | 2,611 (2,381–2,704) |
+| restart: restore | 166 | 167 |
+| restart: first drain | 445 | 451 |
+| restart: first output | 3,507 (3,267–3,586) | 3,751 (3,507–3,856) |
+| batch 3 drain / checkpoint | 233 / 253 | 240 / 244 |
+
+The checkpoint and restart-output medians are higher but their ranges overlap main's, and earlier
+A/Bs on identical code ranged 3.4–3.8 s for the restart's first output; neither change touches
+that path's work. Read as noise, not proven from five runs.
+
+Largest holders now: inner joins 0.25M, PartitionedRank 0.20M, WindowAggregate 0.19M,
+IncrementalAggregate 0.12M, the runner 0.07M, views 0.06M, WindowOffset 0.06M.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
