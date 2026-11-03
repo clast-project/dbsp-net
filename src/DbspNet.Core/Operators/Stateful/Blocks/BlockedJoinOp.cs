@@ -6,6 +6,20 @@ using DbspNet.Core.Collections;
 
 namespace DbspNet.Core.Operators.Stateful.Blocks;
 
+/// <summary>What a <see cref="BlockedJoinOp"/> emits for a matching pair.</summary>
+internal enum BlockedJoinOutput
+{
+    /// <summary>The left value's cells, then the right value's (an inner join).</summary>
+    Concat,
+
+    /// <summary>The left value alone (a semi-join: the right side only witnesses a match).</summary>
+    Left,
+
+    /// <summary>The key alone (a semi-join on whole rows, whose rows are the keys and whose values
+    /// are empty, so each row is stored once).</summary>
+    Key,
+}
+
 /// <summary>
 /// The structural inner equi-join of <see cref="IncrementalJoinOp{TKey,TLeft,TRight,TOut,TWeight}"/>
 /// with both traces held as <see cref="BlockedIndexedTrace"/>s (docs/design-flat-trace-state.md §3):
@@ -45,6 +59,7 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
     private readonly bool _cloneDeltas = DeltaPoolMode.Enabled;
     private readonly Func<IReadOnlyList<object?>, bool>? _residual;
     private readonly Candidate? _candidate;
+    private readonly BlockedJoinOutput _outputMode;
     private long _lastGcFrontier = long.MinValue;
     private int _lastOutputSize;
 
@@ -59,7 +74,8 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightCodec,
         IFrontier? frontier,
         Func<StructuralRow, long>? monotoneKey,
-        Func<IReadOnlyList<object?>, bool>? residual = null)
+        Func<IReadOnlyList<object?>, bool>? residual = null,
+        BlockedJoinOutput outputMode = BlockedJoinOutput.Concat)
     {
         _leftIn = leftIn;
         _rightIn = rightIn;
@@ -75,6 +91,7 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         _monotoneKey = monotoneKey;
         _residual = residual;
         _candidate = residual is null ? null : new Candidate(_leftColumns, _rightColumns);
+        _outputMode = outputMode;
     }
 
     /// <summary>Total keys retained across both traces (materialises them). For GC-bound tests.</summary>
@@ -106,13 +123,13 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         var builder = new ZSetBuilder<StructuralRow, Z64>(_lastOutputSize);
         foreach (var (key, leftGroup) in dl)
         {
-            var visitor = new DeltaOnLeft(this, leftGroup, builder);
+            var visitor = new DeltaOnLeft(this, key, leftGroup, builder);
             _right.Probe(key, ref visitor);
         }
 
         foreach (var (key, rightGroup) in dr)
         {
-            var visitor = new DeltaOnRight(this, rightGroup, builder);
+            var visitor = new DeltaOnRight(this, key, rightGroup, builder);
             _left.Probe(key, ref visitor);
         }
 
@@ -170,9 +187,53 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         }
     }
 
+    // A pair's output row when the left value is a managed row.
+    private StructuralRow Emit(StructuralRow key, StructuralRow left, StructuralRow? right, ITraceBlock? rightBlock, int rightIndex)
+    {
+        switch (_outputMode)
+        {
+            case BlockedJoinOutput.Key:
+                return key;
+            case BlockedJoinOutput.Left:
+                return left;
+            default:
+                var cells = new object?[_leftColumns + _rightColumns];
+                Copy(left, cells, 0);
+                if (right is not null)
+                {
+                    Copy(right, cells, _leftColumns);
+                }
+                else
+                {
+                    rightBlock!.ValueCellsInto(rightIndex, cells, _leftColumns);
+                }
+
+                return _row(cells);
+        }
+    }
+
+    // A pair's output row when the left value is a block entry.
+    private StructuralRow Emit(StructuralRow key, ITraceBlock leftBlock, int leftIndex, StructuralRow right)
+    {
+        switch (_outputMode)
+        {
+            case BlockedJoinOutput.Key:
+                return key;
+            case BlockedJoinOutput.Left:
+                var left = new object?[_leftColumns];
+                leftBlock.ValueCellsInto(leftIndex, left, 0);
+                return _row(left);
+            default:
+                var cells = new object?[_leftColumns + _rightColumns];
+                leftBlock.ValueCellsInto(leftIndex, cells, 0);
+                Copy(right, cells, _leftColumns);
+                return _row(cells);
+        }
+    }
+
     // dl ⋈ R_t: the delta's rows on the left of the output, the trace's on the right. A residual
     // is evaluated on the candidate view first, so a rejected pair builds nothing.
-    private readonly struct DeltaOnLeft(BlockedJoinOp op, ZSet<StructuralRow, Z64> delta, ZSetBuilder<StructuralRow, Z64> output)
+    private readonly struct DeltaOnLeft(BlockedJoinOp op, StructuralRow key, ZSet<StructuralRow, Z64> delta, ZSetBuilder<StructuralRow, Z64> output)
         : ITraceVisitor
     {
         public void Row(StructuralRow value, Z64 weight)
@@ -185,10 +246,7 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
                     continue;
                 }
 
-                var cells = new object?[op._leftColumns + op._rightColumns];
-                Copy(left, cells, 0);
-                Copy(value, cells, op._leftColumns);
-                output.Add(op._row(cells), Z64.Multiply(leftWeight, weight));
+                output.Add(op.Emit(key, left, value, null, 0), Z64.Multiply(leftWeight, weight));
             }
         }
 
@@ -202,16 +260,13 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
                     continue;
                 }
 
-                var cells = new object?[op._leftColumns + op._rightColumns];
-                Copy(left, cells, 0);
-                block.ValueCellsInto(index, cells, op._leftColumns);
-                output.Add(op._row(cells), Z64.Multiply(leftWeight, weight));
+                output.Add(op.Emit(key, left, null, block, index), Z64.Multiply(leftWeight, weight));
             }
         }
     }
 
     // L_{t-1} ⋈ dr: the trace's rows on the left, the delta's on the right.
-    private readonly struct DeltaOnRight(BlockedJoinOp op, ZSet<StructuralRow, Z64> delta, ZSetBuilder<StructuralRow, Z64> output)
+    private readonly struct DeltaOnRight(BlockedJoinOp op, StructuralRow key, ZSet<StructuralRow, Z64> delta, ZSetBuilder<StructuralRow, Z64> output)
         : ITraceVisitor
     {
         public void Row(StructuralRow value, Z64 weight)
@@ -224,15 +279,30 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
                     continue;
                 }
 
-                var cells = new object?[op._leftColumns + op._rightColumns];
-                Copy(value, cells, 0);
-                Copy(right, cells, op._leftColumns);
-                output.Add(op._row(cells), Z64.Multiply(weight, rightWeight));
+                output.Add(op.Emit(key, value, right, null, 0), Z64.Multiply(weight, rightWeight));
             }
         }
 
         public void Entry(ITraceBlock block, int index, Z64 weight)
         {
+            if (op._outputMode != BlockedJoinOutput.Concat && op._residual is null)
+            {
+                // The left row is the same for every right row: build it once.
+                var row = op.Emit(key, block, index, null!);
+                var total = Z64.Zero;
+                foreach (var (_, rightWeight) in delta)
+                {
+                    total = Z64.Add(total, Z64.Multiply(weight, rightWeight));
+                }
+
+                if (!Z64.IsZero(total))
+                {
+                    output.Add(row, total);
+                }
+
+                return;
+            }
+
             op._candidate?.Left(block, index);
             foreach (var (right, rightWeight) in delta)
             {
@@ -241,10 +311,7 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
                     continue;
                 }
 
-                var cells = new object?[op._leftColumns + op._rightColumns];
-                block.ValueCellsInto(index, cells, 0);
-                Copy(right, cells, op._leftColumns);
-                output.Add(op._row(cells), Z64.Multiply(weight, rightWeight));
+                output.Add(op.Emit(key, block, index, right), Z64.Multiply(weight, rightWeight));
             }
         }
     }

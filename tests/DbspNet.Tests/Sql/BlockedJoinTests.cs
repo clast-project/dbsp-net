@@ -108,6 +108,37 @@ public class BlockedJoinTests
         return false;
     }
 
+    // Semi-joins (IN / EXISTS, plain and anti) and outer joins with a residual: their inner joins
+    // are blocked too, the semi-joins storing each row once (docs/design-flat-trace-state.md §3.26).
+    private static readonly string[] SemiAndResidualQueries =
+    [
+        "SELECT k, v FROM t WHERE v IN (SELECT v FROM u)",
+        "SELECT k, v FROM n WHERE v IN (SELECT v FROM t)",
+        "SELECT k, v FROM t WHERE v NOT IN (SELECT v FROM u)",
+        "SELECT k, v FROM t WHERE v IN (SELECT v FROM u WHERE u.k = t.k)",
+        "SELECT k, v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        "SELECT k, v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v > 2)",
+        "SELECT a.k, a.v, b.v FROM t a LEFT JOIN u b ON a.k = b.k AND a.v > b.v",
+        "SELECT a.k, a.v, b.v FROM n a LEFT JOIN t b ON a.k = b.k AND b.v BETWEEN a.v AND a.v + 2",
+        "SELECT a.k, a.v, b.v FROM t a RIGHT JOIN n b ON a.k = b.k AND a.v <> b.v",
+        "SELECT a.k, a.v, b.k, b.v FROM t a FULL JOIN u b ON a.k = b.k AND a.v > b.v + 1",
+    ];
+
+    [Fact]
+    public void SemiJoinsAndResidualOuterJoins_BlockedEqualsBatch()
+    {
+        Gen.Select(Gen.Int[0, SemiAndResidualQueries.Length - 1], RandomQuery.GenTicks, Gen.Int[1, 6], Gen.Int[1, 4], Gen.Bool)
+            .Sample((q, ticks, freeze, block, emitted) =>
+            {
+                using (TraceBlocksMode.Use(join: true, freezeEntries: freeze, blockEntries: block))
+                {
+                    Assert.True(Blocked(Compile(RandomQuery.FixedDdl, SemiAndResidualQueries[q], emitted)) > 0, SemiAndResidualQueries[q]);
+                }
+
+                return CheckOne(SemiAndResidualQueries[q], ticks, freeze, block, emitted);
+            }, iter: 600, threads: 1);
+    }
+
     private static readonly string[] WideDdl =
     [
         "CREATE TABLE a (k INT NOT NULL, s VARCHAR, d DOUBLE, dt DATE, x BIGINT)",
