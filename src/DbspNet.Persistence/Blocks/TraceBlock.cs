@@ -31,9 +31,11 @@ namespace DbspNet.Persistence.Blocks;
 internal sealed class TraceBlock : ITraceBlock
 {
     private readonly byte[] _bytes;
-    private readonly int[] _validity;
-    private readonly int[] _values;
-    private readonly int[] _data;
+
+    // Each column's buffer offsets into _bytes (−1: absent), as one array: validity for every column,
+    // then values, then data (docs/design-flat-trace-state.md §3.33: one object per block, not three).
+    private readonly int[] _offsets;
+    private readonly int _columns;
 
     private int[]? _valueHashes;
 
@@ -43,9 +45,11 @@ internal sealed class TraceBlock : ITraceBlock
         Schema = schema;
         _bytes = bytes;
         Count = count;
-        _validity = validity;
-        _values = values;
-        _data = data;
+        _columns = validity.Length;
+        _offsets = new int[_columns * 3];
+        validity.CopyTo(_offsets, 0);
+        values.CopyTo(_offsets, _columns);
+        data.CopyTo(_offsets, _columns * 2);
         var hashes = Hashes;
         FirstHash = count == 0 ? 0 : hashes[0];
         LastHash = count == 0 ? 0 : hashes[^1];
@@ -54,11 +58,11 @@ internal sealed class TraceBlock : ITraceBlock
     // Raw layout, for BlockWriter.Concat: offsets into Bytes (−1: absent).
     internal byte[] Bytes => _bytes;
 
-    internal int ValidityAt(int column) => _validity[column];
+    internal int ValidityAt(int column) => _offsets[column];
 
-    internal int ValuesAt(int column) => _values[column];
+    internal int ValuesAt(int column) => _offsets[_columns + column];
 
-    internal int DataAt(int column) => _data[column];
+    internal int DataAt(int column) => _offsets[(_columns * 2) + column];
 
     /// <summary>The trace's block layout.</summary>
     public BlockSchema Schema { get; }
@@ -78,10 +82,10 @@ internal sealed class TraceBlock : ITraceBlock
     /// <summary>Each entry's key hash, ascending as unsigned.</summary>
     public ReadOnlySpan<uint> Hashes => Count == 0
         ? default
-        : MemoryMarshal.Cast<byte, uint>(_bytes.AsSpan(_values[Schema.HashColumn], Count * 4));
+        : MemoryMarshal.Cast<byte, uint>(_bytes.AsSpan(ValuesAt(Schema.HashColumn), Count * 4));
 
     /// <summary>Entry <paramref name="i"/>'s weight.</summary>
-    public long Weight(int i) => BinaryPrimitives.ReadInt64LittleEndian(_bytes.AsSpan(_values[Schema.WeightColumn] + (i * 8)));
+    public long Weight(int i) => BinaryPrimitives.ReadInt64LittleEndian(_bytes.AsSpan(ValuesAt(Schema.WeightColumn) + (i * 8)));
 
     /// <summary>The first entry whose key hash is not below <paramref name="hash"/>
     /// (<see cref="Count"/> if none).</summary>
@@ -247,19 +251,19 @@ internal sealed class TraceBlock : ITraceBlock
 
     private bool IsNull(int column, int i)
     {
-        var v = _validity[column];
+        var v = ValidityAt(column);
         return v >= 0 && (_bytes[v + (i >> 3)] & (1 << (i & 7))) == 0;
     }
 
-    private ReadOnlySpan<byte> At(int column, int i, int width) => _bytes.AsSpan(_values[column] + (i * width), width);
+    private ReadOnlySpan<byte> At(int column, int i, int width) => _bytes.AsSpan(ValuesAt(column) + (i * width), width);
 
     private (int Start, int Length) StringRange(int column, int i)
     {
-        var offsets = _values[column];
+        var offsets = ValuesAt(column);
         var start = BinaryPrimitives.ReadInt32LittleEndian(_bytes.AsSpan(offsets + (i * 4)));
         var end = BinaryPrimitives.ReadInt32LittleEndian(_bytes.AsSpan(offsets + ((i + 1) * 4)));
         // An all-empty column's heap is absent (offset −1), and every range in it is empty.
-        return end == start ? (0, 0) : (_data[column] + start, end - start);
+        return end == start ? (0, 0) : (DataAt(column) + start, end - start);
     }
 
     private object? Cell(int column, CellKind kind, int i, bool aliasStrings)
@@ -275,7 +279,7 @@ internal sealed class TraceBlock : ITraceBlock
             case CellKind.Int64: return BinaryPrimitives.ReadInt64LittleEndian(At(column, i, 8));
             case CellKind.Float32: return BinaryPrimitives.ReadSingleLittleEndian(At(column, i, 4));
             case CellKind.Float64: return BinaryPrimitives.ReadDoubleLittleEndian(At(column, i, 8));
-            case CellKind.Bool: return (_bytes[_values[column] + (i >> 3)] & (1 << (i & 7))) != 0;
+            case CellKind.Bool: return (_bytes[ValuesAt(column) + (i >> 3)] & (1 << (i & 7))) != 0;
             case CellKind.Date32: return new Date32(BinaryPrimitives.ReadInt32LittleEndian(At(column, i, 4)));
             case CellKind.Time64: return new Time64(BinaryPrimitives.ReadInt64LittleEndian(At(column, i, 8)));
             case CellKind.Timestamp: return new Timestamp(BinaryPrimitives.ReadInt64LittleEndian(At(column, i, 8)));
@@ -301,7 +305,7 @@ internal sealed class TraceBlock : ITraceBlock
             CellKind.Int64 => probe is long v && v == BinaryPrimitives.ReadInt64LittleEndian(At(column, i, 8)),
             CellKind.Float32 => probe is float v && v.Equals(BinaryPrimitives.ReadSingleLittleEndian(At(column, i, 4))),
             CellKind.Float64 => probe is double v && v.Equals(BinaryPrimitives.ReadDoubleLittleEndian(At(column, i, 8))),
-            CellKind.Bool => probe is bool v && v == ((_bytes[_values[column] + (i >> 3)] & (1 << (i & 7))) != 0),
+            CellKind.Bool => probe is bool v && v == ((_bytes[ValuesAt(column) + (i >> 3)] & (1 << (i & 7))) != 0),
             CellKind.Date32 => probe is Date32 v && v.Days == BinaryPrimitives.ReadInt32LittleEndian(At(column, i, 4)),
             CellKind.Time64 => probe is Time64 v && v.Microseconds == BinaryPrimitives.ReadInt64LittleEndian(At(column, i, 8)),
             CellKind.Timestamp => probe is Timestamp v && v.Microseconds == BinaryPrimitives.ReadInt64LittleEndian(At(column, i, 8)),

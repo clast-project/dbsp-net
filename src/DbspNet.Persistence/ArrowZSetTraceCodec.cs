@@ -33,17 +33,24 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
     DbspNet.Core.Operators.Stateful.Blocks.IBlockedTraceCodec, Blocks.BlockedTraceCheckpoint.ILayout
 {
     private readonly SqlSchema _rowSchema;
-    private readonly ArrowSchema _arrowDataSchema;
-    private readonly ArrowSchema _arrowSchemaWithWeight;
+    // The single-stream snapshot layout's schemas, built on its first use (docs/design-flat-trace-state.md
+    // §3.33): with runs (and blocks), only the run schema is ever read, and each Arrow schema keeps its
+    // own field lookups. A race builds equal values.
+    private ArrowSchema? _arrowDataSchema;
+    private ArrowSchema? _arrowSchemaWithWeight;
+
+    private ArrowSchema ArrowDataSchema => _arrowDataSchema ??= ArrowSchemaBridge.ToArrow(_rowSchema);
+
+    private ArrowSchema ArrowSchemaWithWeight => _arrowSchemaWithWeight ??= ArrowIpcExtensions.AppendWeightField(ArrowDataSchema);
 
     public ArrowZSetTraceCodec(SqlSchema rowSchema)
     {
         ArgumentNullException.ThrowIfNull(rowSchema);
         _rowSchema = rowSchema;
-        _arrowDataSchema = ArrowSchemaBridge.ToArrow(rowSchema);
-        _arrowSchemaWithWeight = ArrowIpcExtensions.AppendWeightField(_arrowDataSchema);
+        // The run schema is the data schema, __weight, then __hash; the intermediate schemas are
+        // not kept.
         _runSchema = new ArrowSchema(
-            [.. _arrowSchemaWithWeight.FieldsList, new Field("__hash", Apache.Arrow.Types.Int32Type.Default, nullable: false)], metadata: null);
+            [.. ArrowIpcExtensions.AppendWeightField(ArrowSchemaBridge.ToArrow(rowSchema)).FieldsList, new Field("__hash", Apache.Arrow.Types.Int32Type.Default, nullable: false)], metadata: null);
         SchemaFingerprint = Persistence.SchemaFingerprint.Of(rowSchema);
     }
 
@@ -247,12 +254,12 @@ internal sealed class ArrowZSetTraceCodec : IZSetTraceCodec<StructuralRow, Z64>,
             arrays[c] = ArrowColumns.Build(_rowSchema[c].Type, perColumn[c]);
         }
 
-        using var batch = new RecordBatch(_arrowDataSchema, arrays, rowCount);
+        using var batch = new RecordBatch(ArrowDataSchema, arrays, rowCount);
         var delta = new ArrowDelta(batch, weights);
 
         await using var file = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false);
         await using var stream = file.AsStream();
-        using var deltaWriter = new ArrowDeltaWriter(stream, _arrowSchemaWithWeight, leaveOpen: true);
+        using var deltaWriter = new ArrowDeltaWriter(stream, ArrowSchemaWithWeight, leaveOpen: true);
         deltaWriter.WriteDelta(delta);
     }
 
