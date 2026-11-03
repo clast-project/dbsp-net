@@ -265,6 +265,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 RecomputePartition(builder, key, pd);
             }
 
+            _store?.EndTick();
             if (Blocks.BlockTraceProfile.Enabled)
             {
                 Blocks.BlockTraceProfile.Section(9, tRecompute, touched.Count);

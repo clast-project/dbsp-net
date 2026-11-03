@@ -240,6 +240,10 @@ internal sealed class OrderedPartitionStore
         }
     }
 
+    /// <summary>The tick's reads are done: drop its new partitions' rows, which would otherwise
+    /// stay alive (and in the heap) until the next change.</summary>
+    public void EndTick() => _fresh = null;
+
     /// <summary>Move the shared trace's managed levels into runs (an idle tick).</summary>
     public void Freeze() => _small.Freeze();
 
