@@ -1163,6 +1163,52 @@ small partitions hold more of the window rows than the row counts suggested.
 aggregates, DISTINCT, views and the window aggregate. The offset operator (LAG/LEAD) and the
 remaining managed window state are next.
 
+### 3.19 LAG/LEAD on the ordered store (2026-11-02, branch `arc/flat-trace-offset`)
+
+**Design and build (3626ab2).** The offset operator uses the same store as the window aggregate:
+small partitions managed, large ones as ordered chunks.
+- **Routing.** The offset operator has no numeric order value, so the store routes by a prefix of
+  the first ORDER BY key that agrees with the total order: the key's monotone value, bit-flipped
+  (`~x`, no overflow) for DESC. NULLs go to `long.MinValue` or `long.MaxValue` as NULLS FIRST/LAST
+  says (the comparer places NULLs absolutely). Ties fall to the total order. This applies only to
+  integer and temporal first keys. Other keys keep the managed path.
+- **A touch.** It reads the chunks overlapping the change's prefix range, widened by whole chunks
+  until 2 × the largest offset + 1 rows lie on each side (`ReadAround`), with flags for whether
+  the read reaches the partition's start and end. It builds the old and new slot sequences
+  (a weight-w row fills w slots), marks the rows within reach of a changed row on either side, and
+  emits their old outputs retracted and new ones inserted. FIRST_VALUE/LAST_VALUE read the whole
+  partition.
+
+**Tests:** the bit-exact window test gained LEAD by 2, DESC, FIRST/LAST_VALUE, a nullable first
+key under NULLS FIRST and NULLS LAST, and duplicate rows (weights above one). The suite passes
+3,193 tests in three arms. 8 mutations were tried:
+- **Caught (5):** no margin, the prefix ignoring DESC, NULLs always first, the old side ignoring
+  the delta, and both neighbour-marking loops cut short together.
+- **Not caught alone (2):** cutting either marking loop short on its own. The two loops overlap,
+  each covers the other.
+- **No change (1):** a read always claiming to start the partition. With a correct margin, the
+  start flag only guards the "reached past the rows read" exception.
+
+**Wall clock against main** (5 alternating runs, two binaries, outputs identical, medians, ms):
+
+| | main | + offset store |
+|---|---|---|
+| batch-1 drain | 16,527 | 16,411 (−0.7%) |
+| batch-1 checkpoint | 2,475 | 2,184 (−12%) |
+| batch-1 output write | 2,195 | 2,332 (ranges overlap) |
+| restart: restore | 247 | 268 |
+| restart: first drain | 474 | 515 (ranges overlap: 446–525 vs 458–538) |
+| batch 3 drain | 271 | 258 (−5%) |
+
+**Census:** references 130.6M → 113.3M (−13%), bytes 8.42 → 8.14 GB, WindowOffset references
+58.9M → 41.1M. What remains is in small (managed) partitions.
+
+**Merged; restart flagged.** The restart medians are about 40 ms higher, but within the overlap
+of the two arms' runs. One cost is real: after a restart, each touched large partition is faulted
+in and cut into chunks (a sort and an encode), where the managed store only inserts. If a later
+A/B confirms it, the lever is to adopt the faulted partition's cold rows as chunks directly,
+since they arrive already in partition order.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
