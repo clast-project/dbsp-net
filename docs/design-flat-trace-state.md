@@ -1397,6 +1397,64 @@ off. An explicit list of kinds still selects just those.
 **Unchanged:** the spine trace family, typed (non-structural) operators, and columns with no block
 encoding keep their managed state. The suite passes with blocks unset, `off` and `all`.
 
+### 3.26 Semi-joins and residual outer joins on blocks (2026-11-03, branch `arc/semi-join-blocks`)
+
+**Finding.** After §3.25, inner joins still held 6.7M managed references at the SF=3 checkpoint.
+None were typed or unencodable. All 32 ordinary inner joins in ivm-bench were blocked. The
+managed ones came from three compiler sites that never asked for blocks:
+
+| Site | Census ops | Managed refs | What |
+|:--|:--|--:|:--|
+| `UnmatchedPreservedRows` | #520, #501 | 4.4M | the anti-join half of an outer join with a residual (temporal SCD `LEFT JOIN … AND ts BETWEEN lo AND hi`) |
+| `CompileOuterJoinWithResidual` | #491, #510 | 0.7M | the matched half of the same joins |
+| `CompileSemiJoin` | #418 | 0.6M | IN / EXISTS subqueries |
+
+The program has 13 such joins in all (4 + 4 + 5); the census lists the five largest.
+
+The anti-join half is wasteful by construction: `unmatched = side − semi(side, distinct(π_side(matched)))`,
+with the semi-join keyed on the whole preserved row *and* valued with it again. Each preserved row
+was stored twice in that one trace (key and value), and each matched row twice in its right trace.
+
+**Change.**
+- `BlockedJoinOp` gains an output mode: `Concat` (the inner join, unchanged), `Left` (the left
+  value alone) or `Key` (the key alone). In the non-`Concat` modes with no residual, a left block
+  entry is boxed once for the whole right delta group, with the group's weights summed.
+- The residual outer join's matched half uses the ordinary blocked join with its residual on the
+  candidate view (§3.2).
+- Both semi-joins index the side that only witnesses a match with an **empty value**: the row is
+  the key. The whole-row semi-join empties both sides and emits the key. The IN-subquery semi-join
+  empties the subquery side and emits the left row. This applies with blocks off too, and the
+  snapshot schemas of those traces change accordingly (a recompile starts fresh state, §2).
+
+**Tests.** `BlockedJoinTests.SemiJoinsAndResidualOuterJoins_BlockedEqualsBatch` runs IN, NOT IN,
+correlated IN, EXISTS, NOT EXISTS and residual LEFT/RIGHT/FULL joins under tiny freeze and block
+sizes, both row codecs, against the batch evaluator, and asserts a blocked join was compiled.
+Three mutations (the summed-weight fast path, the residual, the `Key` output) each fail it. The
+suite passes with blocks on and off.
+
+**Measured.** SF=3 W=12, five alternating runs against main (medians; views byte-identical in
+every run, batch 1 and restart):
+
+| | main | semi-join blocks |
+|:--|--:|--:|
+| References at the checkpoint | 25.2M | **18.8M** (−26%) |
+| of which inner joins | 7.9M | 1.4M |
+| Heap bytes at the checkpoint | 6.58 GB | 6.51 GB |
+| Snapshot | 4887 MiB | 4840 MiB |
+| Batch-1 drain | 16.66 s | 16.20 s |
+| Batch-1 GC pause | 6.22 s | 6.10 s |
+| Batch-1 checkpoint | 2.72 s | 2.55 s |
+| Batch-1 output | 2.37 s | 2.42 s |
+| Restore | 244 ms | 266 ms |
+| Restart first drain | 526 ms | 470 ms |
+| Restart first output | 3.50 s | 3.50 s |
+
+All five managed inner joins are gone; the largest remaining inner-join holder is 74K references.
+The drain and checkpoint differences are within noise (±2.5 s on drain, §9 of the state arc).
+Two of the new arm's batch-1 outputs took 3.4–3.5 s. That tail appears about one run in five
+across both arms in earlier runs (the Delta write; the output phase touches no join), so it is
+noise, not this change.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
