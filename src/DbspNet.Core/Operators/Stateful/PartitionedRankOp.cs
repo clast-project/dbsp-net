@@ -83,8 +83,10 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     private readonly Dictionary<TKey, Dictionary<TOutRow, long>> _window;
 
     // Rows past which a partition keeps its emitted output: the window store's large-partition
-    // threshold (TraceBlocksMode.PromoteRows, 512 unless a test shrinks it).
-    private readonly int _storedOutputRows = Blocks.TraceBlocksMode.PromoteRows;
+    // threshold (TraceBlocksMode.PromoteRows, 512 unless a test shrinks it). Managed state only:
+    // a blocked operator is a partitioned rank whose point is to hold no managed rows, and the
+    // stored output measured faster only for the hot global ranks, which stay managed.
+    private readonly int _storedOutputRows;
 
     // Previous tick's output size — pre-sizes this tick's delta builder to avoid
     // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
@@ -135,6 +137,8 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
                 partial: null,
                 coldFormat: blockFormat);
         }
+
+        _storedOutputRows = _store is null ? Blocks.TraceBlocksMode.PromoteRows : int.MaxValue;
     }
 
     private static StructuralRow S<T>(T value) => (StructuralRow)(object)value!;
