@@ -409,7 +409,7 @@ public static class StatefulOperators
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null)
         where TKey : notnull =>
-        PartitionedOffset(builder, input, partitionOf, order, specs, partitionComparer, snapshotCodec, chunkFormat: null, orderPrefix: null);
+        PartitionedOffset(builder, input, partitionOf, order, specs, partitionComparer, snapshotCodec, chunkFormat: null, orderPrefix: null, coldFormat: null);
 
     /// <summary>As the public overload, with the per-partition input in the ordered store when
     /// <paramref name="chunkFormat"/> is set, routed by <paramref name="orderPrefix"/> (a numeric
@@ -423,7 +423,8 @@ public static class StatefulOperators
         IEqualityComparer<TKey>? partitionComparer,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
         Blocks.ITraceBlockFormat? chunkFormat,
-        Func<StructuralRow, long>? orderPrefix)
+        Func<StructuralRow, long>? orderPrefix,
+        Blocks.ITraceBlockFormat? coldFormat = null)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -455,7 +456,7 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(input);
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
         builder.AddRawOperator(new PartitionedOffsetOp<StructuralRow, StructuralRow, TKey>(
-            input, output, partitionOf, order, specs, Widen, partitionComparer, snapshotCodec, chunkFormat, orderPrefix));
+            input, output, partitionOf, order, specs, Widen, partitionComparer, snapshotCodec, chunkFormat, orderPrefix, coldFormat));
         return output;
     }
 

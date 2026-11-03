@@ -127,7 +127,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
-        _ = blockFormat; // unused since §3.18: small partitions are managed, large ones chunks
         if (chunkFormat is not null)
         {
             if (typeof(TInRow) != typeof(StructuralRow) || typeof(TKey) != typeof(StructuralRow))
@@ -146,7 +145,8 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 (IComparer<StructuralRow>)(object)_order,
                 aggregator as Aggregators.IPartialAggregator<StructuralRow, StructuralRow>,
                 promoteAt: Blocks.TraceBlocksMode.PromoteRows,
-                chunkRows: Blocks.TraceBlocksMode.ChunkRows);
+                chunkRows: Blocks.TraceBlocksMode.ChunkRows,
+                coldFormat: blockFormat); // small partitions' record as blocks, when keys encode (§3.22)
         }
     }
 
@@ -846,6 +846,8 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         // memory, and FullState reads the rest for a write that needs every row.
         if (_store is not null)
         {
+            _store.DropCache();
+
             // Blocks are not decoded for a checkpoint that writes only the changes since the last:
             // nothing is "in memory" as rows, and FullState decodes everything for a whole write.
             var empty = ZSet<TInRow, Z64>.NewMutable();

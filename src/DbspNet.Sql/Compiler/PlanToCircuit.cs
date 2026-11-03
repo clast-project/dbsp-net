@@ -2802,7 +2802,7 @@ public static partial class PlanToCircuit
             partitionComparer: null,
             snapshotCodec: codec,
             frontier: frontier,
-            blockFormat: null,
+            blockFormat: chunkFormat is null ? null : TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema),
             chunkFormat: chunkFormat), Z("trace.arrows", reshardPlace, codec)));
     }
 
@@ -2949,7 +2949,15 @@ public static partial class PlanToCircuit
                 builder,
                 ctx,
                 () => builder.PartitionedOffset<StructuralRow>(
-                    input, PartitionOf, order, specs, null, codec, chunkFormat, chunkFormat is null ? null : prefix),
+                    input,
+                    PartitionOf,
+                    order,
+                    specs,
+                    null,
+                    codec,
+                    chunkFormat,
+                    chunkFormat is null ? null : prefix,
+                    chunkFormat is null ? null : TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema)),
                 Z("trace.arrows", reshardPlace, codec)));
     }
 

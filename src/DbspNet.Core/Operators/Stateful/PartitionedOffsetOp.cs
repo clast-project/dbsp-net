@@ -114,7 +114,8 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<TInRow, Z64>? snapshotCodec = null,
         Blocks.ITraceBlockFormat? chunkFormat = null,
-        Func<TInRow, long>? orderPrefix = null)
+        Func<TInRow, long>? orderPrefix = null,
+        Blocks.ITraceBlockFormat? coldFormat = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -157,7 +158,8 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
                 (IComparer<StructuralRow>)(object)_order,
                 partial: null,
                 promoteAt: Blocks.TraceBlocksMode.PromoteRows,
-                chunkRows: Blocks.TraceBlocksMode.ChunkRows);
+                chunkRows: Blocks.TraceBlocksMode.ChunkRows,
+                coldFormat: coldFormat);
         }
     }
 
@@ -415,6 +417,10 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             {
                 StepStore(delta, storeBuilder);
             }
+            else
+            {
+                _store.Freeze(); // an idle tick: drop the read cache, freeze the record (§3.22)
+            }
 
             var storeResult = storeBuilder.Build();
             _lastOutputSize = storeResult.Count;
@@ -652,6 +658,8 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         // memory, and FullState reads the rest for a write that needs every row.
         if (_store is not null)
         {
+            _store.DropCache();
+
             // Chunks are not decoded for a checkpoint that writes only the changes since the last
             // (as the window aggregate's, §3.13); FullState decodes everything for a whole write.
             var empty = ZSet<TInRow, Z64>.NewMutable();
