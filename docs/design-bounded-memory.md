@@ -534,6 +534,55 @@ suspect (freeze's `ArrayPool` scratch arrays) did not move it either.
 Process RSS also needs the GC told: `GCHeapHardLimit` or `GCConserveMemory`, once the peak is
 bounded.
 
+## 3b. Releasing consumed stream values (2026-11-03)
+
+**Feldera** (`crates/dbsp/src/circuit/circuit_builder.rs`, `StreamValue`) counts each stream's
+consumers when the circuit is built. Every consumer gives back a token after its evaluation, and
+the last consumer takes or drops the value, so a delta lives only until its last reader has run.
+
+**Ours** (`StreamRelease`, `DBSPNET_STREAM_RELEASE=1`, opt-in). Operators declare no inputs, so:
+- **Readers:** a conservative reflection scan of each operator's fields, through wrappers,
+  closures and small arrays, but never into another operator or a collection's contents. A
+  superset of readers only releases later.
+- **Producers:** observed on the first tick (`Stream.SetCurrent` records the stepping operator).
+- **Plan:** built after the first tick. After operator *i* steps, the values of the streams whose
+  last reader is *i* are set to null, so a missed reader fails loudly.
+- **Only forward edges are released** (producer before every reader). Not released: feedback
+  through delays, input-handle streams (written outside the step), streams no other operator
+  reads, and **pinned** streams. Output handles pin their stream, and an integrated view's handle
+  pins the integrate operator's input, because `LastDelta` reads it after the step. That last one
+  was the only post-step reader the suite found: 14 failures, all with a loud
+  `NullReferenceException`.
+- Introspection's `LastOutputRows` reads are null-safe.
+
+**Tests.** The full suite passes with release on (3,279).
+
+**ivm-bench SF=3 W=12, batch 1.** Live after each tick, from the `IVM_TICK_LIVE` census runs:
+
+| tick | off | release on |
+|---|---|---|
+| 1 | 4.33 GB | 1.56 GB |
+| 14 | 5.18 GB | 2.80 GB |
+| **18 (the peak)** | **14.06 GB** | **8.47 GB** |
+| 19 | 7.04 GB | 7.06 GB |
+
+**A/B**, 5 runs per arm, views identical in all of them.
+
+Default GC (run24):
+- b1 drain −13%, GC pause −25%, checkpoint −9%; batches 2 and 3 level.
+- b1 output +28%, bimodal: over run23 and run24, 6 of 10 release runs sit at ~2.9 s against 1 of
+  10 without.
+
+With `DOTNET_gcConcurrent=0` (run25):
+- b1 output −1%: the bimodality is background-GC timing, as in §3.31 of the flat-trace doc.
+- b1 drain −2%, GC pause −18%.
+
+**Peak RSS** (a testhost `ps` sampler, run25): 19.2 → 17.3 GB, only −10%. RSS is driven by
+garbage, not live data. Tick 18 allocates 18.6 GB, and server GC's per-heap gen0 budgets let it
+pile up between collections. Bounding the process needs the GC told: `GCHeapHardLimit`,
+`GCConserveMemory`, or a DATAS/heap-count setting. With live data at the peak now 8.5 GB, that
+is the next experiment.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven
