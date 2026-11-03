@@ -1817,6 +1817,19 @@ that path's work. Read as noise, not proven from five runs.
 Largest holders now: inner joins 0.25M, PartitionedRank 0.20M, WindowAggregate 0.19M,
 IncrementalAggregate 0.12M, the runner 0.07M, views 0.06M, WindowOffset 0.06M.
 
+### 3.34 Reference work closed (2026-11-03)
+
+References at the SF=3 W=12 checkpoint, start of the arc to now: 333.5M → 25.2M (blocks on by
+default, §3.25) → **1.01M** (§3.26–§3.33), objects 0.69M, views byte-identical at every step.
+What remains is a few objects per operator and per ~60 KB block, not per row: inner joins 0.25M
+(4 objects per block over 2.65 GB of blocks), PartitionedRank 0.20M, WindowAggregate 0.19M,
+aggregates 0.12M. The heap is now bytes: 5.8 GB, of which inner-join traces are 2.65 GB. The next
+lever is residency (§4.2), not references; it is its own arc.
+
+Left open from this arc: background GC (§3.31: `DOTNET_gcConcurrent=0` made batch 1 ≈0.8 s faster
+and unimodal on main, unmeasured elsewhere); freezes and merges on the step thread (§4.1); value
+hashes folded into a block's offset array (−1 object per block).
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
