@@ -2721,8 +2721,13 @@ public static partial class PlanToCircuit
         // The snapshot codec is over the base (input) rows; the operator recovers
         // the widened output from them on load.
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
+        // DBSPNET_TRACE_BLOCKS=window: the partitions as blocks (docs/design-flat-trace-state.md §3.29).
+        var chunkFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine
+            ? TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema)
+            : null;
+        var blockFormat = chunkFormat is null ? null : TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema);
         return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedRank<StructuralRow>(
-            input, PartitionOf, order, sortKeyOnly, plan.Function, null, codec), Z("trace.arrows", reshardPlace, codec)));
+            input, PartitionOf, order, sortKeyOnly, plan.Function, null, codec, chunkFormat, blockFormat), Z("trace.arrows", reshardPlace, codec)));
     }
 
     // ---- Window aggregates (agg(x) OVER (PARTITION BY p [ORDER BY o RANGE …])) ----
