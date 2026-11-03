@@ -1458,7 +1458,37 @@ public static partial class PlanToCircuit
 
     // A structural inner join whose traces are held as blocks: both formats and the output row's builder.
     private sealed record BlockedJoinSpec(
-        ITraceBlockFormat LeftFormat, ITraceBlockFormat RightFormat, Func<object?[], StructuralRow> Row, Func<IReadOnlyList<object?>, bool>? Residual);
+        ITraceBlockFormat LeftFormat,
+        ITraceBlockFormat RightFormat,
+        Func<object?[], StructuralRow> Row,
+        Func<IReadOnlyList<object?>, bool>? Residual,
+        BlockedJoinOutput Output = BlockedJoinOutput.Concat);
+
+    // The block formats of a join's two traces, when blocks are on for joins and both encode.
+    private static BlockedJoinSpec? BlockedJoin(
+        CompileContext ctx,
+        (Schema Key, Schema Value) left,
+        (Schema Key, Schema Value) right,
+        Schema outputSchema,
+        Func<IReadOnlyList<object?>, bool>? residual = null,
+        BlockedJoinOutput output = BlockedJoinOutput.Concat)
+    {
+        if (!TraceBlocksMode.Join || ctx.Options.TraceFamily == TraceFamily.Spine
+            || TraceBlockFormats.Create(left.Key, left.Value) is not { } leftFormat
+            || TraceBlockFormats.Create(right.Key, right.Value) is not { } rightFormat)
+        {
+            return null;
+        }
+
+        var codec = ctx.Codec;
+        Func<object?[], StructuralRow> row = ReferenceEquals(codec, StructuralRowCodec.Instance)
+            ? static cells => new StructuralRow(cells)
+            : cells => codec.BuildRow(outputSchema, cells);
+        return new BlockedJoinSpec(leftFormat, rightFormat, row, residual, output);
+    }
+
+    // A semi-join's trace value: empty, when the row it would hold is the key itself.
+    private static readonly StructuralRow s_noValue = new(Array.Empty<object?>());
 
     private static Stream<ZSet<StructuralRow, Z64>> EmitInnerJoin(
         CircuitBuilder builder,
@@ -1478,7 +1508,7 @@ public static partial class PlanToCircuit
         return Recorded(
             builder, ctx,
             () => blocked is { } b
-                ? builder.BlockedInnerJoin(left, right, b.LeftFormat, b.RightFormat, b.Row, leftCodec, rightCodec, frontier, monotoneKey, b.Residual)
+                ? builder.BlockedInnerJoin(left, right, b.LeftFormat, b.RightFormat, b.Row, leftCodec, rightCodec, frontier, monotoneKey, b.Residual, b.Output)
                 : EmitInnerJoinCore(builder, ctx, left, right, combine, leftCodec, rightCodec, frontier, monotoneKey, residual),
             IZ("left.arrows", leftReshard, leftCodec),
             IZ("right.arrows", rightReshard, rightCodec));
@@ -3756,6 +3786,11 @@ public static partial class PlanToCircuit
         // building it). On the spine path EmitInnerJoin falls back to a post-join
         // filter internally.
         var residualScalar = ExpressionCompiler.CompileScalar(plan.Residual!);
+        // DBSPNET_TRACE_BLOCKS=join: both traces as blocks, the residual read off the candidate
+        // pair's cells (docs/design-flat-trace-state.md §3.26).
+        var matchedBlocks = BlockedJoin(
+            ctx, (leftKeySchema, plan.Left.Schema), (rightKeySchema, plan.Right.Schema), joinedSchema,
+            residual: cells => residualScalar(cells) is true);
         var matched = EmitInnerJoin(
             builder, ctx,
             leftIndexed,
@@ -3765,7 +3800,8 @@ public static partial class PlanToCircuit
             ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema),
             residual: row => residualScalar(row) is true,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
-            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null);
+            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
+            blocked: matchedBlocks);
 
         // Matched rows sit on the worker their (left = right) equi-key hashes to; the left
         // columns lead the joined row.
@@ -3903,10 +3939,12 @@ public static partial class PlanToCircuit
             snapshotCodec: ctx.SnapshotCodecs?.CreateZSetTraceCodec(sideSchema),
             reshard: sidePlace);
 
-        var sideIndexed = builder.ExchangeIndex<StructuralRow, StructuralRow, Z64>(
-            side, WholeRowPart, static row => row);
+        // Both sides are keyed by the whole row with an empty value: the row is the key, so each
+        // trace holds it once (docs/design-flat-trace-state.md §3.26).
+        var sideIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
+            builder.Exchange(side, WholeRowPart), static row => row, static _ => s_noValue);
         var distinctIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
-            distinct, row => row, row => row);
+            distinct, static row => row, static _ => s_noValue);
 
         // Semi-join on row identity: emits each matched preserved row carrying
         // its ORIGINAL weight (distinct side contributes weight 1), so the
@@ -3915,11 +3953,12 @@ public static partial class PlanToCircuit
             builder, ctx,
             sideIndexed,
             distinctIndexed,
-            (_, sideRow, _) => sideRow,
-            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema),
-            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, sideSchema),
+            static (sideRow, _, _) => sideRow,
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, Schema.Empty),
+            ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(sideSchema, Schema.Empty),
             leftReshard: sidePlace,
-            rightReshard: sidePlace);
+            rightReshard: sidePlace,
+            blocked: BlockedJoin(ctx, (sideSchema, Schema.Empty), (sideSchema, Schema.Empty), sideSchema, output: BlockedJoinOutput.Key));
 
         return builder.Difference(side, semi);
     }
@@ -4398,13 +4437,15 @@ public static partial class PlanToCircuit
 
         var outerIndexed = builder.ExchangeIndex<StructuralRow, StructuralRow, Z64>(
             outerNonNull, row => KeyPart(ProbeKeyOf(row)), ProbeKeyOf);
+        // The subquery's distinct key tuples are the keys; the value would repeat them, so it is
+        // empty (docs/design-flat-trace-state.md §3.26).
         var subqIndexed = builder.GroupProject<StructuralRow, StructuralRow, StructuralRow, Z64>(
             subqNonNull,
-            row => row,
-            row => row);
+            static row => row,
+            static _ => s_noValue);
 
         var leftJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, plan.Input.Schema);
-        var rightJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, keySchema);
+        var rightJoinCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(keySchema, Schema.Empty);
 
         // Combine emits ONLY the outer row — semi-join semantics.
         var matched = EmitInnerJoin(
@@ -4414,7 +4455,8 @@ public static partial class PlanToCircuit
             (_, outerRow, _) => outerRow,
             leftJoinCodec, rightJoinCodec,
             leftReshard: keyPlace,
-            rightReshard: keyPlace);
+            rightReshard: keyPlace,
+            blocked: BlockedJoin(ctx, (keySchema, plan.Input.Schema), (keySchema, Schema.Empty), plan.Input.Schema, output: BlockedJoinOutput.Left));
 
         if (plan.IsAnti)
         {
