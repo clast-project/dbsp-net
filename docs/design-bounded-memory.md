@@ -399,6 +399,35 @@ Run17, cache off against main, 6 runs per arm:
 
 The cache-off path is level.
 
+### 3.8 What a 128 MiB budget leaves in memory (2026-11-03)
+
+Object census (`IVM_STATE_CENSUS=1` with `IVM_LIVE_EACH_BATCH=1`), warm, after batch 3's checkpoint
+at 128 MiB. Live heap is 846 MB, flat over batches 1–3; the census reaches 794 MB of it.
+
+| holder | bytes | what it is |
+|---|---|---|
+| runner `_outputs` | **546 MB** | the incremental Delta connector's `OutputRowIndex` (§3.9–§3.10 of the flat-trace doc): a `BlockedIndexedTrace` of view rows → file positions |
+| views' `_runs` | 95 MB | view blocks resident in the cache (within the budget), serving the output view's `WeightOf` probes |
+| window `_large` | 34 MB | chunk order values (`long[]`, 8 B per row) and partials, resident by design |
+| codecs, schemas, other per-op metadata | ~60 MB | thousands of small objects over ops × 12 workers |
+| joins, aggregates, DISTINCT, rank | ~30 MB | run headers, caches |
+
+**The output row index is two-thirds of what is left.** It has no file behind it, so the cache
+cannot drop it. A restart rebuilds it, which is the 474 MB read in a resumed batch 2's output
+write (§1.3). Feldera keeps no such index: its output is append-only, with no deletion vectors.
+
+The options:
+- **(a)** A backing file written at each checkpoint, as §3.7 does for window state. This makes
+  it evictable without changing any semantics.
+- **(b)** Persisting it as state. It would then also save the rebuild after a restart, but it
+  must stay aligned with the Delta table's contents at the checkpoint.
+- **(c)** An append-only output mode, as Feldera has. That is a connector-semantics change.
+
+**RSS is not the live heap.** RSS stays at 7–8.7 GB at a 128 MiB budget against ~1 GB live.
+Server GC keeps the heap it committed, and batch 1's peak sets it (§1.4: batch 1 is not bounded).
+Bounding the process needs that peak bounded (spilling) and the GC told
+(`GCHeapHardLimit`/`GCConserveMemory`). Neither is measured yet.
+
 ### 3.4 Gates
 
 These are the usual ones:
