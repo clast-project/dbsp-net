@@ -37,16 +37,17 @@ internal sealed class OrderedPartitionStore
     private long _smallRows;
 
     // With a cold format (§3.22): small partitions' record is this shared trace (partition key →
-    // row), always current, and _small is only a read cache of the partitions touched since the
-    // last idle tick, dropped then (EndBatch). Without one, _small is the record.
+    // row), and _small a write-back cache. A touched partition is loaded into the cache once and
+    // changed there; its changes queue in _pending and reach the trace in one run when the cache
+    // is dropped (a checkpoint, or past a cap). Writing the trace every tick made its merges decode
+    // and re-encode the growing state again and again. Without a cold format, _small is the record.
     private readonly BlockedIndexedTrace? _cold;
+    private readonly Dictionary<StructuralRow, List<(StructuralRow Row, long Weight)>> _pending = new();
 
     // Keys the cold trace has ever held (a Bloom filter: no false negatives), so a partition new
     // this tick is read from the tick's own rows instead of probed for (§3.17).
     private KeyFilter _keys = new();
 
-    // This tick's new partitions (the filter had never seen them): their whole content.
-    private Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>? _fresh;
 
     private static readonly StructuralRow NoKey = new([]);
 
@@ -89,7 +90,7 @@ internal sealed class OrderedPartitionStore
     {
         get
         {
-            var n = _cold?.Entries ?? _smallRows;
+            var n = _cold is null ? _smallRows : _cold.Entries + _pending.Values.Sum(p => (long)p.Count);
             foreach (var chunks in _large.Values)
             {
                 foreach (var c in chunks)
@@ -150,9 +151,6 @@ internal sealed class OrderedPartitionStore
             list.Add((row, weight, ValueOf(row)));
         }
 
-        _fresh = null;
-        IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>? cold = null;
-        List<StructuralRow>? seen = null;
         foreach (var (key, change) in byKey)
         {
             if (_large.ContainsKey(key))
@@ -171,35 +169,93 @@ internal sealed class OrderedPartitionStore
             }
             else
             {
-                // The record takes the change; a cached copy follows it; a partition the filter has
-                // never seen is all in this change.
-                cold ??= new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+                // Into the cache (loaded once: nothing for a key the filter has never seen), and
+                // queued for the record.
+                if (!_small.ContainsKey(key))
+                {
+                    Load(key);
+                }
+
+                ApplySmall(key, change);
+                if (!_pending.TryGetValue(key, out var queued))
+                {
+                    _pending[key] = queued = new();
+                }
+
                 foreach (var (row, weight, _) in change)
                 {
-                    cold.Add(key, row, new Z64(weight));
+                    queued.Add((row, weight));
                 }
 
-                if (_small.ContainsKey(key))
-                {
-                    ApplySmall(key, change);
-                }
-                else if (!_keys.MayContain(key))
-                {
-                    (_fresh ??= new())[key] = change;
-                }
-
-                (seen ??= new()).Add(key);
-            }
-        }
-
-        if (cold is not null)
-        {
-            _cold!.Integrate(cold.Build());
-            foreach (var key in seen!)
-            {
                 _keys.Add(key);
             }
         }
+    }
+
+    // A partition's raw content: the record's entries for it plus its queued changes (a cached
+    // partition that emptied leaves the cache with its changes still queued).
+    private List<(StructuralRow Row, long Weight, long Value)> RecordOf(StructuralRow key)
+    {
+        var raw = new List<(StructuralRow Row, long Weight, long Value)>();
+        if (_keys.MayContain(key))
+        {
+            var visitor = new Collect(raw, this);
+            _cold!.Probe(key, ref visitor);
+        }
+
+        if (_pending.TryGetValue(key, out var queued))
+        {
+            foreach (var (row, weight) in queued)
+            {
+                raw.Add((row, weight, ValueOf(row)));
+            }
+        }
+
+        return raw;
+    }
+
+    // A partition's content into the cache.
+    private void Load(StructuralRow key)
+    {
+        var rows = new SortedDictionary<StructuralRow, long>(_rowOrder);
+        {
+            var raw = RecordOf(key);
+            foreach (var (row, weight, _) in raw)
+            {
+                rows.TryGetValue(row, out var current);
+                if (current + weight == 0)
+                {
+                    rows.Remove(row);
+                }
+                else
+                {
+                    rows[row] = current + weight;
+                }
+            }
+        }
+
+        _small[key] = rows;
+    }
+
+    // The queued changes into the record, as one run.
+    private void Flush()
+    {
+        if (_pending.Count == 0)
+        {
+            return;
+        }
+
+        var entries = new List<(StructuralRow Key, StructuralRow Row, long Weight)>();
+        foreach (var (key, rows) in _pending)
+        {
+            foreach (var (row, weight) in rows)
+            {
+                entries.Add((key, row, weight));
+            }
+        }
+
+        _pending.Clear();
+        _cold!.IntegrateEntries(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
     }
 
     private void ApplySmall(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> change)
@@ -243,14 +299,9 @@ internal sealed class OrderedPartitionStore
     /// (<see cref="DropCache"/>).</summary>
     public void Freeze()
     {
-        if (_cold is not null)
+        if (_cold is not null && _small.Count > CacheCap)
         {
-            if (_small.Count > CacheCap)
-            {
-                _small.Clear();
-            }
-
-            _cold.Freeze();
+            DropCache();
         }
     }
 
@@ -262,12 +313,16 @@ internal sealed class OrderedPartitionStore
     {
         if (_cold is not null)
         {
+            Flush();
             _small.Clear();
+            _cold.Freeze();
         }
     }
 
     /// <summary>The tick's reads are done: drop its new partitions' rows.</summary>
-    public void EndTick() => _fresh = null;
+    public void EndTick()
+    {
+    }
 
     /// <summary>Forget everything (a restore replaces the state).</summary>
     public void Clear()
@@ -277,7 +332,7 @@ internal sealed class OrderedPartitionStore
         _smallRows = 0;
         _cold?.Clear();
         _keys = new KeyFilter();
-        _fresh = null;
+        _pending.Clear();
     }
 
     /// <summary>Every row and weight (a whole-state write).</summary>
@@ -285,6 +340,7 @@ internal sealed class OrderedPartitionStore
     {
         if (_cold is not null)
         {
+            Flush();
             foreach (var (_, group) in _cold.MaterializeUncached())
             {
                 foreach (var (row, weight) in group)
@@ -383,17 +439,8 @@ internal sealed class OrderedPartitionStore
         }
         else if (_cold is not null)
         {
-            List<(StructuralRow Row, long Weight, long Value)> raw;
-            if (_fresh is not null && _fresh.TryGetValue(key, out var own))
-            {
-                raw = own;
-            }
-            else
-            {
-                raw = new List<(StructuralRow Row, long Weight, long Value)>();
-                var visitor = new Collect(raw, this);
-                _cold.Probe(key, ref visitor);
-            }
+            // Not cached: not touched since the cache was dropped, or emptied since.
+            var raw = RecordOf(key);
 
             raw.Sort(_compare);
             foreach (var e in raw)
@@ -431,7 +478,7 @@ internal sealed class OrderedPartitionStore
             var tPromote = BlockTraceProfile.Now();
             if (_cold is not null)
             {
-                RetractCold(key, all);
+                RetractColdKey(key);
             }
             else
             {
@@ -497,16 +544,31 @@ internal sealed class OrderedPartitionStore
         return rows;
     }
 
-    // Take a partition's rows (as read, any form) out of the cold trace: it is moving to chunks.
-    private void RetractCold(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> rows)
+    // A partition is moving to chunks: take what the record holds for it out (its raw entries,
+    // negated), and drop its queued changes (the chunks hold its whole content).
+    private void RetractColdKey(StructuralRow key)
     {
+        _pending.Remove(key);
+        if (!_keys.MayContain(key))
+        {
+            return;
+        }
+
+        var raw = new List<(StructuralRow Row, long Weight, long Value)>();
+        var visitor = new Collect(raw, this);
+        _cold!.Probe(key, ref visitor);
+        if (raw.Count == 0)
+        {
+            return;
+        }
+
         var retract = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-        foreach (var (row, weight, _) in rows)
+        foreach (var (row, weight, _) in raw)
         {
             retract.Add(key, row, new Z64(-weight));
         }
 
-        _cold!.Integrate(retract.Build());
+        _cold.Integrate(retract.Build());
     }
 
     private readonly struct Collect(List<(StructuralRow Row, long Weight, long Value)> into, OrderedPartitionStore store) : ITraceVisitor
@@ -546,21 +608,21 @@ internal sealed class OrderedPartitionStore
     {
         if (_cold is not null)
         {
-            // The partition's rows so far leave the record (the cache, if it holds them, is the same).
-            _small.Remove(key);
-            var before = new List<(StructuralRow Row, long Weight, long Value)>();
-            if (_keys.MayContain(key))
+            // The partition's rows so far (the cache's, which include queued changes, or else the
+            // record's) join the change, and leave the record.
+            if (_small.Remove(key, out var cached))
             {
-                var visitor = new Collect(before, this);
-                _cold.Probe(key, ref visitor);
+                foreach (var (row, weight) in cached)
+                {
+                    change.Add((row, weight, ValueOf(row)));
+                }
+            }
+            else
+            {
+                change.AddRange(RecordOf(key));
             }
 
-            if (before.Count > 0)
-            {
-                RetractCold(key, before);
-                change.AddRange(before);
-            }
-
+            RetractColdKey(key);
             _keys.Add(key);
         }
         else if (_small.Remove(key, out var existing))
