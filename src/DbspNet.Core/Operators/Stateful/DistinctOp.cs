@@ -144,7 +144,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
 
     public long RetainedRows => _trace.RetainedRows;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

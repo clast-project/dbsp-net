@@ -173,7 +173,7 @@ internal sealed class SpineDistinctOp<TKey, TWeight> : IOperator, ISnapshotable,
 
     public long RetainedRows => _trace.KeyCount;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

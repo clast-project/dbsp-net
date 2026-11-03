@@ -86,11 +86,15 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     /// <summary>The delta the most recent step integrated.</summary>
     public ZSet<TRow, Z64> LastDelta => _input.Current;
 
+    /// <summary>Keep the input's value after the step: a view handle reads it as the tick's delta
+    /// (docs/design-bounded-memory.md §3b).</summary>
+    internal void PinInput() => ((IReleasableStream)_input).Pinned = true;
+
     public string MetricName => "IntegratedView";
 
     public long RetainedRows => _view.RetainedRows;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => null;
 

@@ -208,7 +208,7 @@ internal sealed class SpineIncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWei
 
     public long RetainedRows => _leftTrace.GroupCount + _rightTrace.GroupCount;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

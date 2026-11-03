@@ -7,9 +7,15 @@ namespace DbspNet.Core.Circuit;
 /// Every step of the circuit writes a new current value; consumers read it
 /// in topological order during the same step.
 /// </summary>
-public sealed class Stream<T>
+public sealed class Stream<T> : IReleasableStream
 {
     internal T Current = default!;
+
+    int IReleasableStream.Producer { get; set; } = -2;
+
+    bool IReleasableStream.Pinned { get; set; }
+
+    void IReleasableStream.Release() => Current = default!;
 
     internal Stream()
     {
@@ -20,7 +26,14 @@ public sealed class Stream<T>
         Current = initial;
     }
 
-    internal void SetCurrent(T value) => Current = value;
+    internal void SetCurrent(T value)
+    {
+        Current = value;
+        if (StreamRelease.Enabled && ((IReleasableStream)this).Producer == -2)
+        {
+            ((IReleasableStream)this).Producer = StreamRelease.CurrentOp;
+        }
+    }
 
     /// <summary>
     /// Reads the most recently emitted value on this stream. Typically only

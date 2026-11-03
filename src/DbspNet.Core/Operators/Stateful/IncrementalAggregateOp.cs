@@ -623,7 +623,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
     public long RetainedRows => _trace.GroupCount;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

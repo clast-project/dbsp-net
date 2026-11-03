@@ -182,7 +182,7 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
 
     public long RetainedRows => _leftTrace.Current.GroupCount + _rightTrace.Current.GroupCount;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

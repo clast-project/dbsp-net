@@ -95,7 +95,7 @@ internal sealed class SpineIncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOu
     // operator only retains the left side.
     public long RetainedRows => _leftTrace.GroupCount;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => null;
 

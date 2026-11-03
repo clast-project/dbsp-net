@@ -98,7 +98,7 @@ internal sealed class SemiNaiveFixpointOperator<TRow> : IOperator, ISnapshotable
 
     public long RetainedRows => _r.Count;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => null;
 

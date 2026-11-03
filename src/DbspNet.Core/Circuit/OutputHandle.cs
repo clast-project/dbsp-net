@@ -14,6 +14,7 @@ public sealed class OutputHandle<T>
     internal OutputHandle(Stream<T> stream)
     {
         _stream = stream;
+        ((IReleasableStream)stream).Pinned = true; // read after the step
     }
 
     /// <summary>The value emitted on this output during the most recent step.</summary>

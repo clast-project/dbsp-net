@@ -263,7 +263,7 @@ internal sealed class LinearAggregateOp<TKey, TValue, TOut> : IOperator, ISnapsh
 
     public long RetainedRows => _groups.Count;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

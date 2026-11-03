@@ -95,7 +95,7 @@ internal sealed class IncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOut, TW
     // operator only retains the left side.
     public long RetainedRows => _leftTrace.Current.GroupCount;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => null;
 

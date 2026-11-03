@@ -24,6 +24,7 @@ public sealed class IntegratedViewHandle<TRow>
     internal IntegratedViewHandle(IntegrateOp<TRow> op)
     {
         _op = op;
+        op.PinInput(); // LastDelta reads the input after the step
     }
 
     /// <summary>The full view contents after the most recent step.</summary>

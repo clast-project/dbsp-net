@@ -80,7 +80,7 @@ internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntros
 
     public long RetainedRows => 0;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

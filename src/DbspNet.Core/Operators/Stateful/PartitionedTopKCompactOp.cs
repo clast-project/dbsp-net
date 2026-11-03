@@ -105,7 +105,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         }
     }
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => null;
 

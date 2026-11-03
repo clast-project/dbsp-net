@@ -266,14 +266,56 @@ public sealed class RootCircuit
             }
             else
             {
-                foreach (var op in _operators)
-                {
-                    op.Step();
-                }
+                StepOperators();
             }
 
             Interlocked.Exchange(ref _lastStepTicks, System.Diagnostics.Stopwatch.GetTimestamp() - start);
             Interlocked.Increment(ref _tickCount);
+        }
+    }
+
+    // The release plan (docs/design-bounded-memory.md §3b): built after the first tick, once the
+    // first tick's writes have named every stream's producer.
+    private List<IReleasableStream>[]? _release;
+    private bool _learning;
+
+    private void StepOperators()
+    {
+        if (!StreamRelease.Enabled)
+        {
+            foreach (var op in _operators)
+            {
+                op.Step();
+            }
+
+            return;
+        }
+
+        var plan = _release;
+        try
+        {
+            for (var i = 0; i < _operators.Count; i++)
+            {
+                StreamRelease.CurrentOp = i;
+                _operators[i].Step();
+                if (plan is not null)
+                {
+                    foreach (var s in plan[i])
+                    {
+                        s.Release();
+                    }
+                }
+            }
+        }
+        finally
+        {
+            StreamRelease.CurrentOp = -1;
+        }
+
+        if (plan is null && !_learning)
+        {
+            _learning = true;
+            _release = StreamRelease.Plan(_operators);
         }
     }
 

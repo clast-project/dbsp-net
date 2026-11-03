@@ -71,7 +71,7 @@ internal sealed class TopKOp<TRow> : IOperator, ISnapshotable, IIntrospectable
 
     public long RetainedRows => _accum.Count;
 
-    public long LastOutputRows => _output.Current.Count;
+    public long LastOutputRows => (_output.Current?.Count ?? 0);
 
     public long? GcFrontier => null;
 
