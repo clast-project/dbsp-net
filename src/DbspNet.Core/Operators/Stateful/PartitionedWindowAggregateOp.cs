@@ -365,6 +365,13 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     {
         var current = _store!.Read(key, from, to, needPrefix, out before);
 
+        // The common shape of a bulk load: a one-row partition whose row the delta brought.
+        if (current.Count == 1 && pd.Rows.Count == 1 && As<TInRow>(current[0].Row).Equals(pd.Rows[0].Row))
+        {
+            var (row, weight, value) = current[0];
+            return [new Entry(As<TInRow>(row), weight - pd.Rows[0].Dw, weight, value)];
+        }
+
         // One lookup per row read: the delta's weight, and whether the row was found — a delta row
         // never found was taken out entirely.
         var dws = new Dictionary<TInRow, (long Dw, bool Seen)>(pd.Rows.Count);
@@ -397,7 +404,11 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             }
         }
 
-        gone.Sort(CompareEntries);
+        if (gone.Count > 1)
+        {
+            gone.Sort(CompareEntries);
+        }
+
         var rows = new List<Entry>(current.Count + gone.Count);
         var g = 0;
         for (var i = 0; i < current.Count; i++)

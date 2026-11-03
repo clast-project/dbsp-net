@@ -108,6 +108,11 @@ internal sealed class OrderedPartitionStore
 
     private long ValueOf(StructuralRow row) => _valueOf?.Invoke(row) ?? 0L;
 
+    // Compare as a delegate built once (a method group would allocate one per sort).
+    private Comparison<(StructuralRow Row, long Weight, long Value)> _compare => _compareCache ??= Compare;
+
+    private Comparison<(StructuralRow Row, long Weight, long Value)>? _compareCache;
+
     private int Compare((StructuralRow Row, long Weight, long Value) a, (StructuralRow Row, long Weight, long Value) b)
     {
         var c = a.Value.CompareTo(b.Value);
@@ -344,7 +349,12 @@ internal sealed class OrderedPartitionStore
         }
 
         var tSort = BlockTraceProfile.Now();
-        raw.Sort(Compare);
+        if (raw.Count == 1 && raw[0].Weight != 0)
+        {
+            return raw; // one row: nothing to order or consolidate
+        }
+
+        raw.Sort(_compare);
         var all = new List<(StructuralRow Row, long Weight, long Value)>(raw.Count);
         foreach (var e in raw)
         {
