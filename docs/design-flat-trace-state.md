@@ -1273,6 +1273,37 @@ for bit. The suite passes in three arms. Mutations:
 **Census:** references 113.3M → 99.3M (−12%), bytes 8.14 → 7.74 GB, objects 67.1M → 57.8M.
 IncrementalAggregate references 23.5M → 9.5M. Merged.
 
+### 3.22 Small window partitions: blocks as the record, a per-batch read cache (2026-11-02, branch `arc/flat-trace-window-cold`)
+
+**Census after §3.21:** most of what is left is the window operators' small managed partitions:
+the offset operator holds about 41M references, and `trades`' window (MIN/MAX over
+`PARTITION BY trade_id`, a few rows per trade) about 23M.
+
+**Why §3.17 failed and what to keep from it.** On blocks, every touch decoded the partition.
+dim_customer's wide partitions were touched in many ticks of a batch and paid the decode each
+time. Holding small partitions as blocks was never the cost; the repeated decode was.
+
+**Design.**
+- **The record:** a shared `BlockedIndexedTrace` (partition key → row), as §3.17. It receives every
+  tick's change to small partitions, so it is always current. Its managed levels freeze at the
+  usual threshold.
+- **A read cache:** the managed sorted map of §3.18, holding only partitions touched since the
+  last idle tick. A miss reads the partition once. A partition the key filter has never seen (new
+  this tick) is read from the tick's own rows; any other is probed and consolidated by sort. A
+  cached partition is kept current by applying each tick's change to it, so later touches in the
+  batch decode nothing.
+- **Clearing:** on an idle tick and before a checkpoint, the cache is dropped and the trace
+  freezes. What a checkpoint (and the heap between batches) holds is then blocks.
+- **Large partitions** (over 512 rows) are chunks, as before. Promotion retracts the partition from
+  the trace. A bulk change past the threshold goes straight to chunks.
+- **Fallback:** a partition key with no block encoding keeps today's managed small side.
+
+**Cost:** each tick's small changes are integrated twice (trace and cache), and the trace freezes
+(encodes) them once. A partition is decoded at most once per batch.
+
+**Gate:** batch-1 drain, restart and batch 3 no worse than main (+3%), identical outputs, census.
+5 alternating runs against a main build.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
