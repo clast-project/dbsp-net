@@ -166,6 +166,7 @@ public class OrderedPartitionStoreTests
 
                 foreach (var (row, weight, value) in rows)
                 {
+                    Assert.NotEqual(0, weight); // consolidated: nothing held at zero
                     Assert.Equal(model[p].GetValueOrDefault(row), weight);
                     Assert.Equal((long)row[0]!, value);
                 }
