@@ -1354,6 +1354,32 @@ and are read). Both only cost memory.
 them. The cost is about 0.4 s on batch 1, mostly the flush in the checkpoint (one encode of every
 small partition touched since the last one). Follow-up: flush in the background between batches.
 
+### 3.24 Flushing the window record in the background: measured, no net gain (2026-11-02, branch `arc/flat-trace-bg-flush`)
+
+**Built (3b81bac).** When a drain ends, the runner tells the circuit it is idle (`IIdleWork`). The
+window operators then start writing their queued small-partition changes into the record on a
+background task, while outputs are written. Every store access waits for it first, and the
+checkpoint only drops the cache. The suite passes in both arms; the store oracle and the window
+test start flushes at random.
+
+**Wall clock against main** (5 alternating runs, two binaries, outputs identical, medians, ms):
+
+| | main | background flush |
+|---|---|---|
+| batch-1 checkpoint | 2,738 | 2,465 (−273) |
+| batch-1 output write | 2,340 | 2,609 (+269) |
+| batch-1 drain | 16,248 | 16,394 (noise) |
+| batch 1 total | 21,326 | 21,468 (+0.7%, noise) |
+
+Census unchanged (25.2M references).
+
+**Reading.** The flush is CPU work: an encode of every small partition touched since the last
+checkpoint. On a machine whose cores the output write already keeps busy, overlapping it moves
+the cost from the checkpoint into the output write and saves nothing. It would pay only where the
+engine has idle time between batches, which ivm-bench does not have (the next batch follows the
+checkpoint at once). **Not merged.** The real lever is a cheaper flush: encode only what changed,
+not every touched partition whole.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
