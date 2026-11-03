@@ -47,6 +47,15 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     private readonly Dictionary<TKey, Optional<TOut>> _aggCache = new();
     private readonly Dictionary<TKey, object?> _stateCache = new();
 
+    // On a blocked trace, an exact aggregator (no floating-point state: refolding a group reproduces
+    // the incremental value bit for bit) keeps no caches for a group of at most this many entries:
+    // a touch refolds its few rows instead (docs/design-flat-trace-state.md §3.20).
+    internal const int SmallGroup = 8;
+
+    // Not under frontier GC: LATENESS already bounds that state, and a blocked trace learns which
+    // groups GC dropped from the caches.
+    private bool RefoldsSmallGroups => !_aggregator.CanPersistState && _frontier is null;
+
     // Lazy restore (docs/design-durable-state.md §1f, increment 4): when the trace comes back cold,
     // the per-group caches are rebuilt one key at a time, the first time a delta touches it, instead
     // of from a scan of the whole trace at load. _cachesBuilt holds the keys already rebuilt (null:
@@ -292,7 +301,19 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             {
                 // A blocked trace (docs/design-flat-trace-state.md §3.5): the aggregator sees the
                 // before-group as a view that decodes only if it walks the group.
-                if (_cachesBuilt is not null)
+                var bound = (beforeView as Blocks.BlockedGroupView)?.EntryBound ?? int.MaxValue;
+                ZSet<TValue, Z64>? refold = null;
+                if (RefoldsSmallGroups && !_aggCache.ContainsKey(key))
+                {
+                    // An exact group without caches (small, new, or not yet touched since a lazy
+                    // restore; §3.20): its old value and state come from refolding its rows, which
+                    // is what a lazy restore's rebuild does. Its size only decides whether the
+                    // caches are kept after this change — a bound can rise without the group
+                    // being touched (another key sharing its hash), so absence, not size, routes here.
+                    refold = Decode(beforeView);
+                    _cachesBuilt?.Add(key);
+                }
+                else if (_cachesBuilt is not null)
                 {
                     EnsureCaches(key, Decode(beforeView));
                 }
@@ -303,7 +324,9 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
                     FlatAggregateMode.ForceEagerRebuild
                         ? Decode(beforeView) + groupDelta
                         : new LazyViewMergeMultiset<TValue>(beforeView, groupDelta),
-                    builder);
+                    builder,
+                    refold,
+                    keepCaches: !RefoldsSmallGroups || (long)bound + groupDelta.Count > SmallGroup);
                 continue;
             }
 
@@ -356,12 +379,24 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         TKey key,
         ZSet<TValue, Z64> groupDelta,
         IMultiset<TValue, Z64> afterGroup,
-        ZSetBuilder<(TKey, TOut), Z64> builder)
+        ZSetBuilder<(TKey, TOut), Z64> builder,
+        ZSet<TValue, Z64>? refold = null,
+        bool keepCaches = true)
     {
-        var oldAgg = _aggCache.TryGetValue(key, out var cached)
-            ? cached
-            : Optional<TOut>.None;
-        _stateCache.TryGetValue(key, out var state);
+        Optional<TOut> oldAgg;
+        object? state = null;
+        if (refold is not null)
+        {
+            // An uncached small group: the value and state its rows fold to (§3.20).
+            oldAgg = refold.IsEmpty ? Optional<TOut>.None : _aggregator.Update(ref state, Optional<TOut>.None, refold, refold);
+        }
+        else
+        {
+            oldAgg = _aggCache.TryGetValue(key, out var cached)
+                ? cached
+                : Optional<TOut>.None;
+            _stateCache.TryGetValue(key, out state);
+        }
 
         var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
 
@@ -374,8 +409,9 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         // entries but the sum is zero. The emission decision
         // (retract vs emit) is handled separately by the
         // oldAgg/newAgg comparison below.
-        if (afterGroup.IsEmpty)
+        if (afterGroup.IsEmpty || !keepCaches)
         {
+            // Empty, or small and exact (§3.20): the next touch refolds the group.
             _aggCache.Remove(key);
             _stateCache.Remove(key);
         }
