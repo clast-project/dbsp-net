@@ -38,7 +38,7 @@ again, to bound drift.
 | q2 | 9.54M | 11.98M | **1.26×** | 1.27× | 11.69M | 12.04M | 0.97 |
 | q3 | 6.32M | 12.68M | **2.01×** | 2.14× | 12.26M | 12.22M | 0.98 |
 | q4 | 3.29M | 4.65M | **1.41×** | 1.42× | 3.85M | 3.84M | 0.91 (A and C differ by 17%) |
-| q9 | 1.64M | 4.63M | **2.83×** | 2.82× | 3.66M | 4.53M | **0.80** |
+| q9 | 1.64M | 4.63M | **2.83×** | 2.82× | 3.66M | 4.53M | 0.80 (one slow run; 1.00 re-measured) |
 | q15 | 0.38M | 4.11M | **10.79×** | 13.33× | 5.06M | 4.08M | **1.24** |
 | q16 | 0.27M | 5.44M | **20.32×** | 20.90× | 5.36M | 5.19M | 1.01 |
 | q17 | 0.66M | 8.35M | **12.59×** | 12.53× | 7.97M | 7.40M | 1.01 |
@@ -51,12 +51,13 @@ again, to bound drift.
   ratios match 10-31 within this box's noise (only differences beyond ~1.5× are readable at W=14;
   q15's 13.3× → 10.8× is within it, and A and C agree on q15). The arc changed the default path
   only in the window operators (no stored output), which Nexmark does not use.
-- **With blocks on (`all`), most queries are at parity.** One loss: **q9 −20%** at W=14 (B is below
-  both A and C; at W=1 the three agree, 2.58–2.63M), so it is a parallel-only cost of the blocked
-  join or TOP-K path. One gain: **q15 +24%** (blocked DISTINCT/aggregate). q4's B matches C, and it
-  is A that differs (drift).
-- **What this means for `all` as a default:** Nexmark is neutral except for q9. Before turning
-  blocks on by default, q9 at W=14 needs a look.
+- **With blocks on (`all`), the queries are at parity, with one gain: q15 +24%** (blocked
+  DISTINCT/aggregate). q4's B matches C, and it is A that differs (drift).
+- **q9's apparent −20% in B was one slow run, not a cost of blocks.** Re-measured alone
+  (`NEXMARK_QUERIES=q9`, 10M events, 5 rounds alternating off / `all` / join / window, 5 runs each),
+  W=14 medians are 4.34M (off), 4.32M (`all`), 4.38M (join), 4.37M (window). Single runs at W=14 dip
+  to about 3.6–3.7M in either arm (the off arm included). W=1 is 2.51M off, 2.61M `all`.
+- **What this means for `all` as a default:** Nexmark is neutral or better with blocks on.
 
 ## Nexmark head-to-head vs Feldera — M4 Pro, 2026-10-31 (UTF-8 string cells)
 
