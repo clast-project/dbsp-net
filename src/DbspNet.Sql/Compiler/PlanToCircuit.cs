@@ -2722,7 +2722,9 @@ public static partial class PlanToCircuit
         // the widened output from them on load.
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
         // DBSPNET_TRACE_BLOCKS=window: the partitions as blocks (docs/design-flat-trace-state.md §3.29).
-        var chunkFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine
+        // Not a global rank: its one partition is touched every tick on worker 0, where reading it
+        // out of the store costs more than the few references it would save.
+        var chunkFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine && plan.PartitionKeys.Count > 0
             ? TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema)
             : null;
         var blockFormat = chunkFormat is null ? null : TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema);

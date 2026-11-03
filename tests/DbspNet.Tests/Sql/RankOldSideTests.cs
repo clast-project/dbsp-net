@@ -66,8 +66,9 @@ public sealed class RankOldSideTests
         }
 
         var program = Compile();
+        // A global rank (no PARTITION BY) stays managed (§3.29).
         Assert.Equal(
-            blocks,
+            blocks && rank.Contains("PARTITION BY", StringComparison.Ordinal),
             program.Circuit.Operators.OfType<PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>>().Single().IsBlocked);
         var rnd = new Random(rank.Length * 7 + (blocks ? 1 : 0) + (restore ? 2 : 0) + (large ? 4 : 0));
         var live = new List<object?[]>();
