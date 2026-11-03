@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6).** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -275,6 +275,65 @@ In the earlier run6 (128 MiB), the restarted process's batch 2 was level and its
   - keep value hashes resident,
   - prefer recently read blocks at rebind,
   - read ahead.
+
+### 3.6 What a miss costs, and the fixes (2026-11-03)
+
+**Profile.** `DBSPNET_BLOCK_CACHE_PROFILE=1` prints a `FAULTS` line per batch phase. With
+`DBSPNET_BLOCK_ACCESS=1 DBSPNET_BLOCK_ACCESS_STACKS=-1` it also records the caller of each
+fault.
+
+**Batch 2 at 512 MiB, summed over the 12 workers:** 7,450 faults, 426 MB.
+
+| part | time |
+|---|---|
+| file open | 319–855 ms (a handle opened per fault) |
+| read | 39 ms (page cache) |
+| adopt | 290 ms, of which 278 was the Arrow reader parsing the schema and building arrays, and 12 the extra copy |
+| value-hash recompute | 0 (never needed) |
+| merges | 13 faults |
+
+**Where the faults come from.** About 6,500 of batch 2's faults are a full view scan:
+`ParallelProgramOutput.FormView`, reached through `ViewRowCounts` (the server's `/wait` row
+count), right after the rebind. That is outside `drain_ms`. The drain's own faults are about 65 MB:
+the output view's `WeightOf` on the driver thread, left joins, aggregates and joins.
+
+**Tried and reverted: admitting scans cold.** Batch 3's faults went up 615 → 823, because the
+scanned view blocks serve the output view's `WeightOf` probes. A scan here is not junk.
+
+**Fixes.**
+1. **The block header read directly** (`TraceBlock.TryParseHeader`). The record-batch flatbuffer
+   gives the field nodes (null counts) and buffer offsets. A VARCHAR column has 3 buffers, every
+   other kind 2. Anything unusual (compression, another header type) falls back to the Arrow
+   reader, and `DBSPNET_BLOCK_PARSE=arrow` forces that reader. `TraceBlockTests` holds the two
+   equal over 40 random schemas and both encoders; the test is mutation-checked.
+2. **Kept-open read handles** (`LocalReadHandles`). An LRU of 512 (`DBSPNET_READ_HANDLES`), with
+   leases so an evicted handle closes only after its read. Every create, rename, write and delete
+   through `LocalTableFileSystem` invalidates its path, which the test's mutant confirms. If
+   descriptors run out ("too many open files"), the idle handles close and the open is retried.
+
+**After:** batch 2's faults cost open 41 + read 38 + adopt 19 ms summed (13 µs per fault, from
+~84).
+
+**The default path.** The span alignment of §3.5 makes ~10% more blocks (92,254 vs 83,675), and
+cost the first checkpoint +8.7%. Slicing at write time instead cost +35%. Both pay only when
+blocks can be evicted. `BlockAccess.AlignSpans` therefore follows the cache: on with
+`DBSPNET_BLOCK_CACHE_MIB`, overridden by `DBSPNET_SPAN_ALIGN=on|off`. Without the cache, the writer
+concatenates spans whole, as before.
+
+**Final A/B** (run13, 5 runs per arm, rotated, views identical in all 15 runs). Medians against
+main:
+
+| | main | cache off | 512 MiB |
+|---|---|---|---|
+| b1 drain | 17,108 ms | +0.8% | +3.8% (ranges overlap) |
+| b1 checkpoint | 2,647 ms | −4.6% | +4.3% (ranges overlap) |
+| b1 output | 2,389 ms | +0.5% | −13% |
+| b2 drain | 112 ms | −5% | −10% |
+| b3 drain | 117 ms | +2.6% | **+7.7% (+9 ms)** |
+| b2/b3 checkpoint | 208/255 ms | level | +5% / +2% |
+
+The cache-off default is level with main. With the cache on, the remaining cost is batch 3's ~600
+genuine misses. Some of them are serial, on the driver thread's output-view probes.
 
 ### 3.4 Gates
 

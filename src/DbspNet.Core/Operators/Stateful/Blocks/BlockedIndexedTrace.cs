@@ -1185,12 +1185,14 @@ internal sealed class BlockedIndexedTrace
         // Whether the buffered block continues a hash from the previous block (a giant group).
         private bool _spanning;
 
+        private static bool NoSpanAlign => !BlockAccess.AlignSpans;
+
         public void Add(uint hash, StructuralRow key, StructuralRow value, long weight)
         {
             if (_count > 0)
             {
                 var last = (uint)_hashes[_count - 1];
-                if (_spanning && last != hash)
+                if (_spanning && last != hash && !NoSpanAlign)
                 {
                     // A spanning hash's last block holds only it (docs/design-bounded-memory.md §3.5).
                     Flush();
@@ -1203,7 +1205,7 @@ internal sealed class BlockedIndexedTrace
                         start--;
                     }
 
-                    if (last == hash && start > 0)
+                    if (last == hash && start > 0 && !NoSpanAlign)
                     {
                         // The hash is about to span blocks: the entries before it make a block of
                         // their own, so the hash's blocks hold only it and a probe for a neighbour

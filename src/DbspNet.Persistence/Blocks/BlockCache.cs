@@ -42,6 +42,59 @@ internal static class BlockCache
     /// <summary>Bodies admitted since start (each read from a file, or bound after a checkpoint).</summary>
     public static long Admissions { get; private set; }
 
+    /// <summary><c>DBSPNET_BLOCK_CACHE_PROFILE=1</c>: where a fault's time goes (§3.6).</summary>
+    public static readonly bool Profile = Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_PROFILE") == "1";
+
+    private static long _mergeFaults, _mergeFaultBytes;
+    private static long _faults, _faultBytes, _openTicks, _readTicks, _adoptTicks, _hashBlocks, _hashEntries, _hashTicks;
+
+    internal static void RecordFault(long bytes, long open, long read, long adopt)
+    {
+        Interlocked.Increment(ref _faults);
+        Interlocked.Add(ref _faultBytes, bytes);
+        if (Core.Operators.Stateful.Blocks.BlockAccess.InMaintenance)
+        {
+            Interlocked.Increment(ref _mergeFaults);
+            Interlocked.Add(ref _mergeFaultBytes, bytes);
+        }
+        Interlocked.Add(ref _openTicks, open);
+        Interlocked.Add(ref _readTicks, read);
+        Interlocked.Add(ref _adoptTicks, adopt);
+    }
+
+    private static long _parseTicks, _copyTicks;
+
+    internal static void RecordParse(long ticks) => Interlocked.Add(ref _parseTicks, ticks);
+
+    internal static void RecordCopy(long ticks) => Interlocked.Add(ref _copyTicks, ticks);
+
+    internal static void RecordValueHashes(int entries, long ticks)
+    {
+        Interlocked.Increment(ref _hashBlocks);
+        Interlocked.Add(ref _hashEntries, entries);
+        Interlocked.Add(ref _hashTicks, ticks);
+    }
+
+    /// <summary>The fault profile since the last call, as one line; resets it.</summary>
+    public static string TakeProfile()
+    {
+        static double Ms(ref long ticks) => Interlocked.Exchange(ref ticks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        var faults = Interlocked.Exchange(ref _faults, 0);
+        var mergeFaults = Interlocked.Exchange(ref _mergeFaults, 0);
+        var mergeMb = Interlocked.Exchange(ref _mergeFaultBytes, 0) / 1048576.0;
+        var mb = Interlocked.Exchange(ref _faultBytes, 0) / 1048576.0;
+        var open = Ms(ref _openTicks);
+        var read = Ms(ref _readTicks);
+        var adopt = Ms(ref _adoptTicks);
+        var hb = Interlocked.Exchange(ref _hashBlocks, 0);
+        var he = Interlocked.Exchange(ref _hashEntries, 0);
+        var hash = Ms(ref _hashTicks);
+        var parse = Ms(ref _parseTicks);
+        var copy = Ms(ref _copyTicks);
+        return string.Create(CultureInfo.InvariantCulture,
+            $"faults={faults} fault_mb={mb:F1} merge_faults={mergeFaults} merge_fault_mb={mergeMb:F1} open_ms={open:F1} read_ms={read:F1} adopt_ms={adopt:F1} (parse_ms={parse:F1} of which copy_ms={copy:F1}) vhash_blocks={hb} vhash_entries={he} vhash_ms={hash:F1}");
+    }
+
     internal static long ParseBudget(string? setting) =>
         long.TryParse(setting, NumberStyles.Integer, CultureInfo.InvariantCulture, out var mib) && mib > 0 ? mib << 20 : 0;
 

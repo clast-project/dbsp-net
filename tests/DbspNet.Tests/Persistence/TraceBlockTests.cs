@@ -171,6 +171,22 @@ public class TraceBlockTests
         var adopted = schema.Adopt(block.Message.Span);
         var viaArrow = schema.EncodeViaArrow([.. ks], [.. vs], [.. ws], [.. hs], ks.Count);
 
+        // The header reader a fault adopts with (docs/design-bounded-memory.md §3.6) finds exactly
+        // the buffers the Arrow reader finds, for blocks from either encoder.
+        foreach (var source in new[] { block, viaArrow })
+        {
+            var reference = schema.Adopt(source.Message.Span);
+            var header = TraceBlock.TryParseHeader(schema, source.Message.ToArray());
+            Assert.NotNull(header);
+            Assert.Equal(reference.Count, header.Count);
+            for (var c = 0; c <= schema.HashColumn; c++)
+            {
+                Assert.Equal(reference.ValidityAt(c), header.ValidityAt(c));
+                Assert.Equal(reference.ValuesAt(c), header.ValuesAt(c));
+                Assert.Equal(reference.DataAt(c), header.DataAt(c));
+            }
+        }
+
         // The same entries encoded in 1–4 consecutive pieces and concatenated byte-wise.
         var cuts = Enumerable.Range(0, rnd.Next(0, 4)).Select(_ => rnd.Next(ks.Count + 1)).Append(0).Append(ks.Count).Distinct().Order().ToArray();
         var pieces = new List<TraceBlock>();
@@ -287,6 +303,7 @@ public class TraceBlockTests
             new Schema([new SchemaColumn("s", new SqlVarcharType(null, true))]))!;
         var empty = schema.Encode([], [], [], [], 0);
         Assert.Equal(0, empty.Count);
+        Assert.Equal(0, TraceBlock.TryParseHeader(schema, empty.Message.ToArray())!.Count);
         Assert.Equal(0, empty.LowerBound(5));
 
         var key = new StructuralRow(Utf8String.Of(""));

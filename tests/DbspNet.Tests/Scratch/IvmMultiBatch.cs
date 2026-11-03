@@ -307,6 +307,11 @@ public class IvmMultiBatch
                     MeasureLive(batch, runner);
                 }
 
+                if (DbspNet.Persistence.Blocks.BlockCache.Profile)
+                {
+                    _out.WriteLine($"FAULTS batch={batch} phase=drain " + DbspNet.Persistence.Blocks.BlockCache.TakeProfile());
+                }
+
                 ResidencyAt($"drain{batch}", batch);
                 DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Write;
                 await runner.WriteOutputsAsync();
@@ -466,6 +471,11 @@ public class IvmMultiBatch
                     snapshotMb = (dirBytes + referenced) / (1024.0 * 1024.0);
                     writtenMb = (dirBytes + written) / (1024.0 * 1024.0);
                 }
+            }
+
+            if (DbspNet.Persistence.Blocks.BlockCache.Profile)
+            {
+                _out.WriteLine($"FAULTS batch={batch} phase=write+ckpt " + DbspNet.Persistence.Blocks.BlockCache.TakeProfile());
             }
 
             ResidencyAt($"batch{batch}", batch);

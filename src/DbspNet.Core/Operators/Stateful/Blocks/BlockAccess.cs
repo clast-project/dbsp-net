@@ -83,6 +83,20 @@ internal static class BlockAccess
         }
     }
 
+    /// <summary>
+    /// Whether a hash spanning blocks gets blocks of its own, its neighbours cut off
+    /// (docs/design-bounded-memory.md §3.5–§3.6). It only pays when blocks can be evicted — a probe
+    /// for a neighbour would otherwise fault in the giant group — and costs the first checkpoint
+    /// ~5–9% (more, smaller blocks), so it follows the block cache: on with
+    /// <c>DBSPNET_BLOCK_CACHE_MIB</c>; <c>DBSPNET_SPAN_ALIGN=on|off</c> overrides.
+    /// </summary>
+    public static bool AlignSpans { get; set; } = Environment.GetEnvironmentVariable("DBSPNET_SPAN_ALIGN") switch
+    {
+        "on" => true,
+        "off" => false,
+        _ => long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_MIB"), out var mib) && mib > 0,
+    };
+
     /// <summary>The bits a read now records: <see cref="Maintenance"/> alone on a merging thread,
     /// else the phase.</summary>
     public static int CurrentBits => _maintenance ? Maintenance : Phase;

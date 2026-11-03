@@ -177,6 +177,22 @@ internal sealed class TraceBlock : ITraceBlock
     // only the hashes. Two threads may both compute; the arrays are equal.
     private int[] ComputeValueHashes()
     {
+        var t0 = BlockCache.Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        try
+        {
+            return ComputeValueHashesCore();
+        }
+        finally
+        {
+            if (BlockCache.Profile)
+            {
+                BlockCache.RecordValueHashes(Count, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+            }
+        }
+    }
+
+    private int[] ComputeValueHashesCore()
+    {
         var hashes = new int[Count];
         for (var i = 0; i < Count; i++)
         {
@@ -361,7 +377,133 @@ internal sealed class TraceBlock : ITraceBlock
     // Read column buffer offsets out of an IPC stream — schema message, then one record batch over
     // [messageStart, end) — and keep only that record-batch message. Arrow's reader over a
     // ReadOnlyMemory aliases a managed array, so its buffers are offsets into `stream`.
+    /// <summary>
+    /// Adopt a record-batch <paramref name="message"/> (as a run file stores a block: no schema in
+    /// front) by reading its flatbuffer header directly — field nodes and buffer offsets — instead of
+    /// building an Arrow reader, schema and arrays (docs/design-bounded-memory.md §3.6: that was 95%
+    /// of a fault's parse). Null when the header is not the plain layout every block is written in
+    /// (compression, another header type); the caller then takes the Arrow path.
+    /// </summary>
+    internal static TraceBlock? TryParseHeader(BlockSchema schema, byte[] message)
+    {
+        var m = message.AsSpan();
+        if (m.Length < 8)
+        {
+            return null;
+        }
+
+        int pos = 0;
+        if (BinaryPrimitives.ReadInt32LittleEndian(m) == -1)
+        {
+            pos = 4; // continuation marker
+        }
+
+        var metaSize = BinaryPrimitives.ReadInt32LittleEndian(m[pos..]);
+        var fb = pos + 4;
+        var bodyStart = fb + metaSize;
+        if (metaSize <= 0 || bodyStart > m.Length)
+        {
+            return null;
+        }
+
+        // Flatbuffer: the root table, then fields by vtable slot.
+        static int Field(ReadOnlySpan<byte> m, int table, int slot)
+        {
+            var vtable = table - BinaryPrimitives.ReadInt32LittleEndian(m[table..]);
+            var vtSize = BinaryPrimitives.ReadUInt16LittleEndian(m[vtable..]);
+            var entry = 4 + (slot * 2);
+            if (entry >= vtSize)
+            {
+                return 0;
+            }
+
+            var off = BinaryPrimitives.ReadUInt16LittleEndian(m[(vtable + entry)..]);
+            return off == 0 ? 0 : table + off;
+        }
+
+        static int Deref(ReadOnlySpan<byte> m, int at) => at + (int)BinaryPrimitives.ReadUInt32LittleEndian(m[at..]);
+
+        var root = Deref(m, fb);
+        var headerType = Field(m, root, 1);
+        var header = Field(m, root, 2);
+        if (headerType == 0 || m[headerType] != 3 || header == 0)
+        {
+            return null; // not a RecordBatch
+        }
+
+        var batch = Deref(m, header);
+        if (Field(m, batch, 3) != 0)
+        {
+            return null; // compressed
+        }
+
+        var lengthAt = Field(m, batch, 0);
+        var count = lengthAt == 0 ? 0L : BinaryPrimitives.ReadInt64LittleEndian(m[lengthAt..]);
+        var nodesAt = Field(m, batch, 1);
+        var buffersAt = Field(m, batch, 2);
+        if (nodesAt == 0 || buffersAt == 0 || count > int.MaxValue)
+        {
+            return null;
+        }
+
+        var nodes = Deref(m, nodesAt);
+        var buffers = Deref(m, buffersAt);
+        var n = schema.HashColumn + 1;
+        if (BinaryPrimitives.ReadInt32LittleEndian(m[nodes..]) != n)
+        {
+            return null;
+        }
+
+        var bufferCount = BinaryPrimitives.ReadInt32LittleEndian(m[buffers..]);
+        var validity = new int[n];
+        var values = new int[n];
+        var data = new int[n];
+        var b = 0;
+        static int Next(ReadOnlySpan<byte> m, int buffers, int bufferCount, int bodyStart, ref int b)
+        {
+            if (b >= bufferCount)
+            {
+                throw new InvalidDataException("block header lists too few buffers");
+            }
+
+            var at = buffers + 4 + (b++ * 16);
+            var offset = BinaryPrimitives.ReadInt64LittleEndian(m[at..]);
+            var length = BinaryPrimitives.ReadInt64LittleEndian(m[(at + 8)..]);
+            return length == 0 ? -1 : checked((int)(bodyStart + offset));
+        }
+
+        for (var c = 0; c < n; c++)
+        {
+            var nullCount = BinaryPrimitives.ReadInt64LittleEndian(m[(nodes + 4 + (c * 16) + 8)..]);
+            var kind = c < schema.KeyKinds.Length ? schema.KeyKinds[c]
+                : c < schema.WeightColumn ? schema.ValueKinds[c - schema.KeyKinds.Length]
+                : CellKind.Int64; // weight, hash: fixed width
+            var v = Next(m, buffers, bufferCount, bodyStart, ref b);
+            validity[c] = nullCount == 0 ? -1 : v;
+            values[c] = Next(m, buffers, bufferCount, bodyStart, ref b);
+            data[c] = kind == CellKind.Utf8 ? Next(m, buffers, bufferCount, bodyStart, ref b) : -1;
+        }
+
+        return b == bufferCount ? new TraceBlock(schema, message, (int)count, validity, values, data) : null;
+    }
+
     internal static TraceBlock Parse(BlockSchema schema, byte[] stream, int messageStart, int end)
+    {
+        var p0 = BlockCache.Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        try
+        {
+            return ParseCore(schema, stream, messageStart, end);
+        }
+        finally
+        {
+            if (BlockCache.Profile)
+            {
+                BlockCache.RecordParse(System.Diagnostics.Stopwatch.GetTimestamp() - p0);
+            }
+        }
+    }
+
+    private static TraceBlock ParseCore(BlockSchema schema, byte[] stream, int messageStart, int end)
     {
         using var reader = new ArrowStreamReader(new ReadOnlyMemory<byte>(stream, 0, end));
         using var batch = reader.ReadNextRecordBatch()
@@ -403,7 +545,13 @@ internal sealed class TraceBlock : ITraceBlock
             data[c] = Offset(2);
         }
 
+        var c0 = BlockCache.Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var message = messageStart == 0 && end == stream.Length ? stream : stream.AsSpan(messageStart, end - messageStart).ToArray();
+        if (BlockCache.Profile)
+        {
+            BlockCache.RecordCopy(System.Diagnostics.Stopwatch.GetTimestamp() - c0);
+        }
+
         return new TraceBlock(schema, message, batch.Length, validity, values, data);
     }
 }

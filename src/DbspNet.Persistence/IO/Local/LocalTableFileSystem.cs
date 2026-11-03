@@ -85,6 +85,7 @@ public sealed class LocalTableFileSystem : IDurableTableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         string fullPath = ResolvePath(path);
+        LocalReadHandles.Invalidate(fullPath);
 
         if (!overwrite && File.Exists(fullPath))
             throw new IOException($"File already exists: {path}");
@@ -104,6 +105,8 @@ public sealed class LocalTableFileSystem : IDurableTableFileSystem
         cancellationToken.ThrowIfCancellationRequested();
         string fullSource = ResolvePath(sourcePath);
         string fullTarget = ResolvePath(targetPath);
+        LocalReadHandles.Invalidate(fullSource);
+        LocalReadHandles.Invalidate(fullTarget);
 
         if (File.Exists(fullTarget))
             return new ValueTask<bool>(false);
@@ -122,6 +125,7 @@ public sealed class LocalTableFileSystem : IDurableTableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         string fullPath = ResolvePath(path);
+        LocalReadHandles.Invalidate(fullPath);
 
         if (File.Exists(fullPath))
             File.Delete(fullPath);
@@ -152,6 +156,7 @@ public sealed class LocalTableFileSystem : IDurableTableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         string fullPath = ResolvePath(path);
+        LocalReadHandles.Invalidate(fullPath);
 
         string? directory = Path.GetDirectoryName(fullPath);
         if (directory is not null)
@@ -223,6 +228,7 @@ public sealed class LocalTableFileSystem : IDurableTableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         string fullPath = ResolvePath(path);
+        LocalReadHandles.Invalidate(fullPath);
         string directory = Path.GetDirectoryName(fullPath) ?? _rootPath;
         Directory.CreateDirectory(directory);
 
@@ -262,6 +268,9 @@ public sealed class LocalTableFileSystem : IDurableTableFileSystem
         {
         }
     }
+
+    /// <summary>The full path of <paramref name="relativePath"/> under the root.</summary>
+    internal string FullPath(string relativePath) => ResolvePath(relativePath);
 
     private string ResolvePath(string relativePath) =>
         Path.GetFullPath(Path.Combine(_rootPath, relativePath.Replace('/', Path.DirectorySeparatorChar)));

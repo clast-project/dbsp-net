@@ -199,7 +199,11 @@ internal static class BlockedTraceCheckpoint
             }
 
             var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
-            var pieces = end == b + 1 ? [(Materialized(blocks[b]), false)] : Pieces(schema, blocks, b, end);
+            // Without eviction a span is written whole (neighbours and all): nothing faults it in for
+            // a neighbour, and slicing would cost the checkpoint (§3.6).
+            var pieces = end == b + 1 ? [(Materialized(blocks[b]), false)]
+                : BlockCache.Enabled ? Pieces(schema, blocks, b, end)
+                : [(BlockWriter.Concat(schema, [.. blocks[b..end].Select(Materialized)]), true)];
             if (end > b + 1 && Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
             {
                 Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Block.Count));
@@ -357,6 +361,7 @@ internal sealed class LazyTraceBlock : ITraceBlock
     private readonly string _path;
     private readonly RunBlock _index;
     private TraceBlock? _loaded;
+    private string? _fullPath;
 
     /// <param name="loaded">The body already in memory (a block a checkpoint just wrote, byte for
     /// byte the file's); admitted to the <see cref="BlockCache"/>.</param>
@@ -456,13 +461,53 @@ internal sealed class LazyTraceBlock : ITraceBlock
     // blocks they build are identical, and either may win.
     private TraceBlock Load()
     {
+        var prof = BlockCache.Profile;
+        var t0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_store is IO.Local.LocalTableFileSystem localFs)
+        {
+            // A local run file: a kept-open handle (§3.6), the block read straight into place.
+            using var lease = IO.Local.LocalReadHandles.Rent(_fullPath ??= localFs.FullPath(_path));
+            var o1 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            long r = 0;
+            var local = lease.File;
+            var adopted = _schema.Adopt(_index.Length, m =>
+            {
+                var r0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                local.ReadExactly(_index.Offset, m.Span);
+                if (prof)
+                {
+                    r = System.Diagnostics.Stopwatch.GetTimestamp() - r0;
+                }
+            });
+            if (prof)
+            {
+                BlockCache.RecordFault(_index.Length, o1 - t0, r, System.Diagnostics.Stopwatch.GetTimestamp() - o1 - r);
+                if (Core.Operators.Stateful.Blocks.BlockAccess.Enabled && Core.Operators.Stateful.Blocks.BlockAccess.StackPhases < 0)
+                {
+                    Core.Operators.Stateful.Blocks.BlockAccess.RecordStack(_index.Length);
+                }
+            }
+
+            return Install(adopted);
+        }
+
         var file = _store.OpenReadAsync(_path).AsTask().GetAwaiter().GetResult();
+        var t1 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long readTicks = 0;
         try
         {
             TraceBlock block;
             if (file is IO.Local.LocalRandomAccessFile local)
             {
-                block = _schema.Adopt(_index.Length, m => local.ReadExactly(_index.Offset, m.Span));
+                block = _schema.Adopt(_index.Length, m =>
+                {
+                    var r0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                    local.ReadExactly(_index.Offset, m.Span);
+                    if (prof)
+                    {
+                        readTicks = System.Diagnostics.Stopwatch.GetTimestamp() - r0;
+                    }
+                });
             }
             else
             {
@@ -470,22 +515,39 @@ internal sealed class LazyTraceBlock : ITraceBlock
                 block = _schema.Adopt(bytes.Memory.Span[.._index.Length]);
             }
 
-            if (Interlocked.CompareExchange(ref _loaded, block, null) is { } other)
+            if (prof)
             {
-                return other;
+                var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                BlockCache.RecordFault(_index.Length, t1 - t0, readTicks, t2 - t1 - readTicks);
+                if (Core.Operators.Stateful.Blocks.BlockAccess.Enabled && Core.Operators.Stateful.Blocks.BlockAccess.StackPhases < 0)
+                {
+                    // DBSPNET_BLOCK_ACCESS_STACKS=-1: who faults blocks in (not who reads them).
+                    Core.Operators.Stateful.Blocks.BlockAccess.RecordStack(_index.Length);
+                }
             }
 
-            if (BlockCache.Enabled)
-            {
-                // A merge's read is a scan: admitted cold, dropped first.
-                BlockCache.Admit(this, block.ResidentBytes, referenced: !Core.Operators.Stateful.Blocks.BlockAccess.InMaintenance);
-            }
-
-            return block;
+            return Install(block);
         }
         finally
         {
             file.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
+    }
+
+    // Publish a loaded body (another thread may have won) and admit it to the cache.
+    private TraceBlock Install(TraceBlock block)
+    {
+        if (Interlocked.CompareExchange(ref _loaded, block, null) is { } other)
+        {
+            return other;
+        }
+
+        if (BlockCache.Enabled)
+        {
+            // A merge's read is a scan: admitted cold, dropped first.
+            BlockCache.Admit(this, block.ResidentBytes, referenced: !Core.Operators.Stateful.Blocks.BlockAccess.InMaintenance);
+        }
+
+        return block;
     }
 }

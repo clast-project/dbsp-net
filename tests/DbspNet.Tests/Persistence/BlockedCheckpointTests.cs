@@ -177,7 +177,9 @@ public class BlockedCheckpointTests
     {
         using var layout = StateLayout.Use(true);
         var saved = BlockCache.Budget;
+        var savedAlign = BlockAccess.AlignSpans;
         BlockCache.Budget = budget;
+        BlockAccess.AlignSpans = true; // follows the cache (env) in production
         try
         {
             var fs = new InMemoryTableFileSystem();
@@ -241,6 +243,7 @@ public class BlockedCheckpointTests
         finally
         {
             BlockCache.Budget = saved;
+            BlockAccess.AlignSpans = savedAlign;
             BlockCache.Clear();
         }
     }

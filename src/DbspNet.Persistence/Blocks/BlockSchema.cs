@@ -202,11 +202,24 @@ internal sealed class BlockSchema : ITraceBlockFormat
     public TraceBlock Adopt(int length, Action<Memory<byte>> read)
     {
         ArgumentNullException.ThrowIfNull(read);
+        if (!LegacyParse)
+        {
+            // The message alone, its header read directly (§3.6); the Arrow path if it is unusual.
+            var message = new byte[length];
+            read(message);
+            return TraceBlock.TryParseHeader(this, message) ?? Adopt(message);
+        }
+
         var stream = new byte[SchemaMessage.Length + length];
         SchemaMessage.CopyTo(stream, 0);
         read(stream.AsMemory(SchemaMessage.Length, length));
         return TraceBlock.Parse(this, stream, SchemaMessage.Length, stream.Length);
     }
+
+    /// <summary><c>DBSPNET_BLOCK_PARSE=arrow</c>: adopt every block through an Arrow reader (the
+    /// path before §3.6; tests compare the two).</summary>
+    internal static bool LegacyParse { get; set; } =
+        string.Equals(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_PARSE"), "arrow", StringComparison.OrdinalIgnoreCase);
 
     public TraceBlock Adopt(ReadOnlySpan<byte> message)
     {
