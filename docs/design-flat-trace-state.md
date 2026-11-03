@@ -1755,7 +1755,27 @@ stays without a format; a shared format encodes and decodes correctly from 12 th
 shape key without types fails it and 60 persistence tests. The suite passes with blocks on, off,
 and interning off.
 
-**Measured.** SF=3 W=12, five alternating runs against main: PENDING.
+**Measured.** SF=3 W=12, five alternating runs against main (medians; views byte-identical in
+every run, batch 1 and restart):
+
+| | main | one codec per shape |
+|---|--:|--:|
+| References at the checkpoint | 4.95M | **1.32M** (−73%) |
+| Objects | 2.35M | 0.91M |
+| Heap bytes | 5.87 GB | 5.79 GB |
+| WindowAggregate references | 2.04M | 0.29M |
+| batch-1 drain (ms) | 18,716 | 17,573 |
+| batch-1 GC pause | 6,155 | 6,107 |
+| batch-1 checkpoint | 2,541 | 2,578 |
+| restart: restore | 183 | 165 (−10%) |
+| restart: first drain | 477 | 470 |
+| batch 3 drain / checkpoint | 241 / 247 | 233 / 249 |
+
+Main's batch-1 runs here sat mostly in the slow background-GC state of §3.31 (18.2–19.0 s); the
+branch's mostly in the fast one (16.8–18.3 s). Nothing else moved outside noise.
+
+Largest holders now: inner joins 0.34M, WindowAggregate 0.29M, PartitionedRank 0.21M,
+IncrementalAggregate 0.14M, views 0.09M, the runner 0.09M.
 
 ## 4. Open questions for review
 
