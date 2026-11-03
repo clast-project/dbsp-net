@@ -23,9 +23,9 @@ public sealed class ArrowSqlSnapshotCodecs : ISqlSnapshotCodecs
     public static ArrowSqlSnapshotCodecs Instance { get; } = new();
 
     public IZSetTraceCodec<StructuralRow, Z64> CreateZSetTraceCodec(Schema rowSchema) =>
-        new ArrowZSetTraceCodec(rowSchema);
+        CodecInterning.RowCodec(rowSchema);
 
     public IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> CreateIndexedZSetTraceCodec(
         Schema keySchema, Schema valueSchema) =>
-        new ArrowIndexedZSetTraceCodec(keySchema, valueSchema);
+        CodecInterning.IndexedCodec(keySchema, valueSchema);
 }

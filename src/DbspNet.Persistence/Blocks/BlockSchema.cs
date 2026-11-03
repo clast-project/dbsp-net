@@ -56,7 +56,7 @@ internal sealed class BlockSchema : ITraceBlockFormat
     {
         KeyKinds = keyKinds;
         ValueKinds = valueKinds;
-        Codec = new ArrowIndexedZSetTraceCodec(keySchema, valueSchema);
+        Codec = CodecInterning.IndexedCodec(keySchema, valueSchema);
         using var ms = new MemoryStream();
         using (var writer = new ArrowStreamWriter(ms, Codec.RunSchema, leaveOpen: true))
         {
@@ -136,9 +136,12 @@ internal sealed class BlockSchema : ITraceBlockFormat
     {
         ArgumentNullException.ThrowIfNull(keySchema);
         ArgumentNullException.ThrowIfNull(valueSchema);
-        var keys = Kinds(keySchema);
-        var values = Kinds(valueSchema);
-        return keys is null || values is null ? null : new BlockSchema(keySchema, valueSchema, keys, values);
+        return CodecInterning.Format(keySchema, valueSchema, static (k, v) =>
+        {
+            var keys = Kinds(k);
+            var values = Kinds(v);
+            return keys is null || values is null ? null : new BlockSchema(k, v, keys, values);
+        });
     }
 
     private static CellKind[]? Kinds(Schema schema)
