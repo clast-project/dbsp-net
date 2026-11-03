@@ -1610,7 +1610,36 @@ With both, batch-3 rank time is 41.9 ms against main's 43.7, allocation 3.7 agai
 without restores); treating a missing stored output as empty fails them, and keeping a stored
 output for a partition below the threshold still passes (correct, only less frugal).
 
-**Measured.** SF=3 W=12, five alternating runs against main: PENDING.
+**Second measurement:** with stored output for every partition past 512 rows, blocked or not,
+timings were level with main throughout (batch-3 drain 242 vs 234 ms), but #532's few large
+partitions kept 0.96M references of stored output: rank 4.28M → 1.24M, total 9.5M → 6.5M. The
+profile had put the regression only on the global ranks, so stored output is now for managed rank
+state only (the global ranks, and everything with blocks off); a blocked partitioned rank always
+recomputes.
+
+**Measured (final).** SF=3 W=12, five alternating runs against main (medians, ms; views
+byte-identical in every run, batch 1 and restart):
+
+| | main | rank on blocks |
+|---|--:|--:|
+| References at the checkpoint | 9.5M | **5.57M** (−41%) |
+| of which PartitionedRank | 4.28M | 0.33M |
+| Heap bytes | 6.08 GB | 6.01 GB |
+| batch-1 drain | 16,590 | 16,947 (+2.1%) |
+| batch-1 GC pause | 6,103 | 6,027 |
+| batch-1 checkpoint | 2,719 | 2,584 |
+| batch-1 output | 2,289 | 2,229 |
+| restart: restore | 231 | 231 |
+| restart: first drain | 470 | 499 (+6%) |
+| restart: first output | 3,523 | 3,641 (+3%) |
+| batch 3 drain | 237 | 247 (+4%) |
+
+Batch-1 drain is inside the +3% gate. The restart first drain and batch 3 are slightly slower
+(+29 and +10 ms medians; the ranges overlap: batch 3 is 232–244 against 235–266). That is what a
+blocked partitioned rank costs when a batch touches its partitions: each one is read back from its
+blocked record after a checkpoint has dropped the cache, and its old ranking recomputed. The first
+version's +16% on batch 3 came from the global ranks and is gone.
+
 
 ## 4. Open questions for review
 
