@@ -1574,7 +1574,7 @@ widened row (2.1M), whose only use is diffing the next recompute against it. Abo
   weight changed. ROW_NUMBER emits only the positions that differ between a row's old and new
   ranges. This replaces "recompute the whole widened partition and diff two dictionaries", so a
   touched partition no longer re-widens every row.
-- **Partitions in `OrderedPartitionStore`** (with blocks for windows on). Rank reads whole
+- **Partitions in `OrderedPartitionStore`** (with blocks for windows on, partitioned ranks only; see below). Rank reads whole
   partitions, so the store runs with no order value: every partition is small, its record a
   blocked trace and its managed map a write-back cache dropped at each checkpoint (§3.22).
   A restore faults partitions straight into the store.
@@ -1587,6 +1587,28 @@ integrated view must equal a fresh run every tick. Mutations caught: skipping a 
 unchanged but whose rank moved, ranking the old version with the new weights, an unsorted delta,
 ties by the total order instead of the ORDER BY keys. Not dropping the cache at a checkpoint still
 passes (an optimization). The suite passes with blocks on and off.
+
+**First measurement and two corrections.** The first A/B (as above) cut references at the
+checkpoint from 9.5M to 5.6M (PartitionedRank 4.28M → 0.31M) with views identical, but batch-3
+drain rose 236 → 273 ms (+16%, every run). The operator profile put it all on worker 0: the
+global ranks of `market_volatility` (`RANK() OVER (ORDER BY return_volatility DESC, symb)`, about
+1.8K rows) and `daily_market_pulse` (0.7K), gathered to one worker, touched every tick, rank time
+43.7 → 72.2 ms and allocation 2.7×. Every row's volatility changes each batch, so every rank
+shifts, and recomputing the old side recreates every old widened row to retract it.
+- **Large partitions keep their emitted output.** A partition past `PromoteRows` (512) rows diffs
+  its widened output against a stored copy, as before; a smaller one recomputes. The old rows are
+  always at hand (read before the delta), so a missing stored output is recomputed: crossing the
+  threshold either way, and a restore, need nothing special. (Also tried first: reading the old
+  rows before the delta and walking both versions in lockstep, with no delta sort and no
+  comparisons for rows unchanged by the tick. Kept, but it moved rank time only 72 → 67 ms.)
+- **Global ranks stay managed.** One partition, touched every tick on the serial worker: reading
+  it out of the store and reloading it after each checkpoint cost more than its few references.
+  Blocks are for partitioned ranks, where the references are (#532 held 4.0M).
+
+With both, batch-3 rank time is 41.9 ms against main's 43.7, allocation 3.7 against 3.8 MiB.
+`RankOldSideTests` gained arms with a tiny threshold (partitions crossing it both ways, with and
+without restores); treating a missing stored output as empty fails them, and keeping a stored
+output for a partition below the threshold still passes (correct, only less frugal).
 
 **Measured.** SF=3 W=12, five alternating runs against main: PENDING.
 
