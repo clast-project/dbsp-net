@@ -82,6 +82,24 @@ internal sealed class OrderedPartitionStore
     /// <summary>Whether chunks carry partial aggregates (the aggregate combines exactly).</summary>
     public bool HasPartials => _partial is not null;
 
+    /// <summary>The large partitions' chunk blocks (the residency census).</summary>
+    internal IEnumerable<ITraceBlock> ChunkBlocks()
+    {
+        foreach (var chunks in _large.Values)
+        {
+            foreach (var c in chunks)
+            {
+                yield return c.Block;
+            }
+        }
+    }
+
+    /// <summary>The small partitions' shared record, if blocked (the residency census).</summary>
+    internal BlockedIndexedTrace? ColdRecord => _cold;
+
+    /// <summary>Partitions and rows in the managed small-partition map or cache (the residency census).</summary>
+    internal (int Partitions, long Rows) SmallManaged => (_small.Count, _small.Values.Sum(p => (long)p.Count));
+
     /// <summary>Large partitions (tests).</summary>
     internal int LargePartitions => _large.Count;
 

@@ -50,9 +50,14 @@ internal sealed class TraceBlock : ITraceBlock
         validity.CopyTo(_offsets, 0);
         values.CopyTo(_offsets, _columns);
         data.CopyTo(_offsets, _columns * 2);
-        var hashes = Hashes;
+        // Not through Hashes: building a block is not reading it (the access census).
+        var hashes = count == 0 ? default : MemoryMarshal.Cast<byte, uint>(bytes.AsSpan(values[schema.HashColumn], count * 4));
         FirstHash = count == 0 ? 0 : hashes[0];
         LastHash = count == 0 ? 0 : hashes[^1];
+        if (BlockAccess.Enabled)
+        {
+            _stamp.Born();
+        }
     }
 
     // Raw layout, for BlockWriter.Concat: offsets into Bytes (−1: absent).
@@ -80,12 +85,39 @@ internal sealed class TraceBlock : ITraceBlock
     public ReadOnlyMemory<byte> Message => _bytes;
 
     /// <summary>Each entry's key hash, ascending as unsigned.</summary>
-    public ReadOnlySpan<uint> Hashes => Count == 0
-        ? default
-        : MemoryMarshal.Cast<byte, uint>(_bytes.AsSpan(ValuesAt(Schema.HashColumn), Count * 4));
+    public ReadOnlySpan<uint> Hashes
+    {
+        get
+        {
+            Touch();
+            return Count == 0
+                ? default
+                : MemoryMarshal.Cast<byte, uint>(_bytes.AsSpan(ValuesAt(Schema.HashColumn), Count * 4));
+        }
+    }
 
     /// <summary>Entry <paramref name="i"/>'s weight.</summary>
-    public long Weight(int i) => BinaryPrimitives.ReadInt64LittleEndian(_bytes.AsSpan(ValuesAt(Schema.WeightColumn) + (i * 8)));
+    public long Weight(int i)
+    {
+        Touch();
+        return BinaryPrimitives.ReadInt64LittleEndian(_bytes.AsSpan(ValuesAt(Schema.WeightColumn) + (i * 8)));
+    }
+
+    // The access census (DBSPNET_BLOCK_ACCESS=1, docs/design-bounded-memory.md §1).
+    private BlockStamp _stamp;
+
+    internal BlockStamp Stamp => _stamp;
+
+    /// <summary>The block's bytes as held in memory: the message and the offsets.</summary>
+    internal long ResidentBytes => _bytes.Length + ((long)_offsets.Length * 4) + ((long)(_valueHashes?.Length ?? 0) * 4);
+
+    private void Touch()
+    {
+        if (BlockAccess.Enabled)
+        {
+            _stamp.Touch();
+        }
+    }
 
     /// <summary>The first entry whose key hash is not below <paramref name="hash"/>
     /// (<see cref="Count"/> if none).</summary>
@@ -135,7 +167,11 @@ internal sealed class TraceBlock : ITraceBlock
     internal int[]? KnownValueHashes => _valueHashes;
 
     /// <inheritdoc/>
-    public int ValueHash(int i) => (_valueHashes ?? ComputeValueHashes())[i];
+    public int ValueHash(int i)
+    {
+        Touch();
+        return (_valueHashes ?? ComputeValueHashes())[i];
+    }
 
     // A block adopted from a file: decode each value once (strings aliased: only hashed) and keep
     // only the hashes. Two threads may both compute; the arrays are equal.
@@ -268,6 +304,7 @@ internal sealed class TraceBlock : ITraceBlock
 
     private object? Cell(int column, CellKind kind, int i, bool aliasStrings)
     {
+        Touch();
         if (IsNull(column, i))
         {
             return null;
@@ -294,6 +331,7 @@ internal sealed class TraceBlock : ITraceBlock
 
     private bool CellEquals(int column, CellKind kind, int i, object? probe)
     {
+        Touch();
         if (IsNull(column, i))
         {
             return probe is null;

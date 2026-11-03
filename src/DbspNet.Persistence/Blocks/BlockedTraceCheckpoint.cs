@@ -271,6 +271,12 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     public uint LastHash => _index.LastHash;
 
+    /// <summary>The block's bytes if read (the residency census).</summary>
+    internal TraceBlock? Resident => _loaded;
+
+    /// <summary>The block's encoded length in the run file.</summary>
+    internal int FileLength => _index.Length;
+
     /// <summary>The block's bytes, read on first use.</summary>
     internal TraceBlock Loaded => _loaded ?? Load();
 

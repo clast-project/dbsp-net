@@ -188,6 +188,27 @@ public class IvmMultiBatch
             return res.Seen;
         }
 
+        // IVM_BLOCK_RESIDENCY=1 (with DBSPNET_BLOCK_ACCESS=1 for read stamps): block bytes by
+        // operator and evictability, and what each batch read (BlockResidency).
+        var blockResidency = Environment.GetEnvironmentVariable("IVM_BLOCK_RESIDENCY") == "1";
+        void ResidencyAt(string tag, int epoch)
+        {
+            if (!blockResidency)
+            {
+                return;
+            }
+
+            IReadOnlyList<DbspNet.Core.Circuit.RootCircuit> replicas = parallel is not null ? parallel.Circuit.Replicas : [serial!.Circuit];
+            var sw0 = Stopwatch.StartNew();
+            var rows = BlockResidency.Walk(replicas, runner, epoch);
+            foreach (var line in BlockResidency.Report(tag, rows))
+            {
+                _out.WriteLine(line);
+            }
+
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"RESID {tag} took_ms={sw0.ElapsedMilliseconds} gc_heap_gib={GC.GetTotalMemory(false) / (double)(1L << 30):F2}"));
+        }
+
         var restartAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_AFTER"), out var ra) ? ra : 0;
         var restarted = false;
         var firstBatch = 1;
@@ -201,6 +222,8 @@ public class IvmMultiBatch
             var jitMethodsBefore = System.Runtime.JitInfo.GetCompiledMethodCount();
             var heapStart = GC.GetTotalMemory(false);
             var rs = Stopwatch.GetTimestamp();
+            DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Epoch = 1;
+            DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Restore;
             var tick = await runner.RestoreAsync();
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"RESUME tick={tick} restore_ms={Stopwatch.GetElapsedTime(rs).TotalMilliseconds:F0} " +
@@ -216,6 +239,7 @@ public class IvmMultiBatch
             {
                 censusBaseline = StateCensusAt("restore", null);
             }
+            ResidencyAt("restore", 1);
             restoreEndUtc = DateTime.UtcNow;
         }
 
@@ -235,6 +259,8 @@ public class IvmMultiBatch
                 PromotePendingCommits(stagingRoot, batch - 1);
             }
 
+            DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Epoch = batch;
+            DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Drain;
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
             var pause0 = GC.GetTotalPauseDuration();
             var gen2Before = GC.CollectionCount(2);
@@ -276,6 +302,8 @@ public class IvmMultiBatch
                     MeasureLive(batch, runner);
                 }
 
+                ResidencyAt($"drain{batch}", batch);
+                DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Write;
                 await runner.WriteOutputsAsync();
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
                 outputEndUtc = DateTime.UtcNow;
@@ -374,6 +402,7 @@ public class IvmMultiBatch
                     GC.WaitForPendingFinalizers();
                 }
 
+                DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Checkpoint;
                 checkpointMs = await ProfileCheckpoint($"batch{batch}", async () =>
                 {
                     if (policy is null)
@@ -433,6 +462,8 @@ public class IvmMultiBatch
                     writtenMb = (dirBytes + written) / (1024.0 * 1024.0);
                 }
             }
+
+            ResidencyAt($"batch{batch}", batch);
 
             // What the server's /wait reports after every batch.
             var c0 = Stopwatch.GetTimestamp();

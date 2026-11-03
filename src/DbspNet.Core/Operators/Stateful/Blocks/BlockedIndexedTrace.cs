@@ -454,6 +454,9 @@ internal sealed class BlockedIndexedTrace
         }
     }
 
+    /// <summary>Entries in managed levels, waiting to freeze (the residency census).</summary>
+    internal long ManagedEntries => _managedEntries;
+
     /// <summary>Runs, newest first (checkpoints).</summary>
     internal IReadOnlyList<Run> Runs => _runs;
 
@@ -982,12 +985,15 @@ internal sealed class BlockedIndexedTrace
     private Run? Merge(Run newer, Run older)
     {
         var t0 = BlockTraceProfile.Now();
+        var maintenance = BlockAccess.InMaintenance;
+        BlockAccess.InMaintenance = true;
         try
         {
             return MergeCore(newer, older);
         }
         finally
         {
+            BlockAccess.InMaintenance = maintenance;
             if (BlockTraceProfile.Enabled)
             {
                 BlockTraceProfile.Merge(t0, newer.Entries + older.Entries);
