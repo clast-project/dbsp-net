@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 next.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -207,6 +207,74 @@ store, keyed by partition hash. Estimated gain: 0.84 GB.
 - **Concurrency.** Workers own their traces. Eviction runs on the owning worker's thread, at tick
   boundaries or when the budget is crossed, so a block is never dropped mid-probe. The only
   shared mutation is `_loaded`, which already tolerates racing loads.
+
+### 3.5 Increment 1 built and measured (2026-11-03)
+
+**What was built.**
+- **Rebind on commit.** Each run a checkpoint wrote is swapped (`BlockedIndexedTrace.Rebind`)
+  for one whose blocks are `LazyTraceBlock`s over the run file. A block that is byte for byte a
+  file block keeps its body. The run file is pinned (`RunPins`).
+- **`BlockCache`.** A single process-wide cache with a byte budget (`DBSPNET_BLOCK_CACHE_MIB`;
+  unset means off) and CLOCK eviction. A merge's reads are admitted unreferenced.
+- **`ITraceBlock.Body`.** Probes, scans and merge cursors hold a block's body while they read
+  it, so an eviction can't force one file read per entry.
+
+**Two findings fixed along the way.**
+1. **Re-read blocks went through `ArrayPool.Shared`, and the pool kept them.** Live heap grew
+   about 200 MB per batch under a budget, outside any operator: the pool held a large buffer per
+   size per core. Lazy blocks now read straight into their own array
+   (`LocalRandomAccessFile.ReadExactly`), with no pool and no copy. This fixes today's lazy
+   restore too.
+2. **Giant hashes shared blocks with their neighbours.** Blocks are cut at the byte budget
+   regardless of hash. A giant hash's first and last blocks therefore held neighbours, and on
+   disk the whole span became one multi-MB block. A probe for a neighbour faulted in the giant:
+   joins read 59 MB per batch instead of 5.8.
+   - First fix: re-encode the edges at write time. That cost +470 ms (+17.5%) on batch 1's
+     checkpoint.
+   - Final fix: the block builder cuts the neighbours off. When the byte cut falls inside a hash,
+     the entries before it are flushed as their own block, and a span's last block closes when
+     the hash changes. Spans are pure in memory, and the writer only concatenates.
+     `BlockedTraceCheckpoint.Pieces` still slices runs from older layouts.
+   - Tests: the bounded-cache test (64-entry blocks) checks purity in memory and in the file.
+     Each check was verified by its mutant.
+
+**Memory, SF=3 W=12.** Live bytes after a full compacting GC, after each batch's checkpoint:
+
+| | unbounded | 512 MiB | 128 MiB |
+|---|---|---|---|
+| after batch 1, warm | 5,775 MB | 2,277 | 1,889 |
+| after batch 3, warm | 5,778 | 2,274 (flat) | 1,886 (flat) |
+| after batch 3, restarted process | 2,024 | 1,236 | 846 |
+
+What remains at 128 MiB (1.89 GB) is window state with no run file (0.84 GB, increment 2), the
+cache, and managed state.
+
+**Time, 5 runs per arm, rotated** (run8). Medians against main (60aa369), with views identical in
+all 15 runs:
+
+| | main | cache off | 512 MiB |
+|---|---|---|---|
+| b1 drain | 17,023 ms | +3.1% (ranges overlap) | +6.3% (ranges overlap) |
+| b1 checkpoint | 2,580 ms | +6.6% (ranges overlap) | +6.8% |
+| b1 output | 2,294 ms | −5% | −8% |
+| b2 drain | 93 ms | +5% | **+13% (+12 ms)** |
+| b3 drain | 113 ms | −2% | **+21% (+24 ms)** |
+| b2/b3 checkpoint | 212/258 ms | level | level |
+
+In the earlier run6 (128 MiB), the restarted process's batch 2 was level and its batch 3 was
++26 ms.
+
+**The remaining cost is misses after eviction.**
+- Rebind admits ~4 GB unreferenced, and the hand keeps whatever it reaches last. Batches 2 and 3
+  then fault in their working set (~40–90 MB).
+- A fault costs a read (page cache), the `Adopt` copy, and, for traces compared by value
+  (aggregates, views, DISTINCT), recomputing the block's value hashes by decoding every value.
+  Value hashes are not stored in the run file.
+- None of this is apportioned yet. Measure it before choosing a lever:
+  - store value hashes in the block (run file v4),
+  - keep value hashes resident,
+  - prefer recently read blocks at rebind,
+  - read ahead.
 
 ### 3.4 Gates
 

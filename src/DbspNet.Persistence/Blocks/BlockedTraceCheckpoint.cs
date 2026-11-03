@@ -67,7 +67,7 @@ internal static class BlockedTraceCheckpoint
         }
 
         var paths = new List<string>(runs.Count);
-        var written = new List<(BlockedIndexedTrace.Run Run, string Path)>();
+        var written = new List<(BlockedIndexedTrace.Run Run, string Path, List<(RunBlock Index, TraceBlock? Body)> Bodies)>();
         long baseEntries = 0, deltaEntries = 0;
 
         // Chain order is base first: the oldest (largest) run.
@@ -82,8 +82,8 @@ internal static class BlockedTraceCheckpoint
             else
             {
                 path = "runs/" + ctx.Prefix + fileName + (written.Count == 0 ? string.Empty : "." + written.Count);
-                await WriteRunAsync(ctx.FileSystem, path, codec, run, cancellationToken).ConfigureAwait(false);
-                written.Add((run, path));
+                var bodies = await WriteRunAsync(ctx.FileSystem, path, codec, run, cancellationToken).ConfigureAwait(false);
+                written.Add((run, path, bodies));
             }
 
             paths.Add(path);
@@ -119,9 +119,27 @@ internal static class BlockedTraceCheckpoint
         session.Record(ctx.Prefix + fileName, chain);
         session.OnCommit(() =>
         {
-            foreach (var (run, path) in written)
+            var schema = codec.Blocks!;
+            foreach (var (run, path, bodies) in written)
             {
                 run.Persisted = (ctx.FileSystem, path);
+
+                // With a block budget (docs/design-bounded-memory.md §3.1): the run's blocks now
+                // have a durable copy, so they become file blocks the cache may drop. A hash that
+                // spanned blocks in memory is one block on disk, read back only when needed.
+                if (BlockCache.Enabled)
+                {
+                    var blocks = new ITraceBlock[bodies.Count];
+                    for (var b = 0; b < blocks.Length; b++)
+                    {
+                        blocks[b] = new LazyTraceBlock(schema, ctx.FileSystem, path, bodies[b].Index, bodies[b].Body);
+                    }
+
+                    if (trace.Rebind(run, blocks) is { } rebound)
+                    {
+                        RunPins.Add(rebound, ctx.FileSystem, [path]);
+                    }
+                }
             }
         });
 
@@ -163,10 +181,12 @@ internal static class BlockedTraceCheckpoint
     }
 
     // One run file from a run's blocks, raw. A hash spanning blocks in memory becomes one block.
-    private static async ValueTask WriteRunAsync(
+    // Returns each file block's index and, where it is byte for byte one in-memory block, that block.
+    private static async ValueTask<List<(RunBlock Index, TraceBlock? Body)>> WriteRunAsync(
         ITableFileSystem fs, string path, ILayout codec, BlockedIndexedTrace.Run run, CancellationToken cancellationToken)
     {
         var schema = codec.Blocks!;
+        var bodies = new List<(RunBlock Index, TraceBlock? Body)>();
         await using var writer = await RunStreamWriter.CreateAsync(
             fs, path, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
         var blocks = run.Blocks;
@@ -179,18 +199,24 @@ internal static class BlockedTraceCheckpoint
             }
 
             var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
-            var block = end == b + 1 ? Materialized(blocks[b]) : Join(schema, blocks, b, end);
+            var pieces = end == b + 1 ? [(Materialized(blocks[b]), false)] : Pieces(schema, blocks, b, end);
             if (end > b + 1 && Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
             {
-                Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, block.Count);
+                Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Block.Count));
             }
 
-            var hashes = Distinct(block.Hashes);
-            await writer.AppendRawAsync(block.Message.ToArray(), hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+            foreach (var (block, giant) in pieces)
+            {
+                var hashes = Distinct(block.Hashes);
+                await writer.AppendRawAsync(block.Message.ToArray(), hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+                bodies.Add((writer.Index[^1], giant ? null : block));
+            }
+
             b = end;
         }
 
         await writer.FinishAsync(cancellationToken).ConfigureAwait(false);
+        return bodies;
     }
 
     private static TraceBlock Materialized(ITraceBlock block) => block switch
@@ -200,9 +226,84 @@ internal static class BlockedTraceCheckpoint
         _ => throw new InvalidOperationException($"unexpected block type {block.GetType().Name}"),
     };
 
-    // A hash spanning blocks in memory, as one block: concatenated byte-wise, not decoded.
-    private static TraceBlock Join(BlockSchema schema, ITraceBlock[] blocks, int from, int to) =>
-        BlockWriter.Concat(schema, [.. blocks[from..to].Select(Materialized)]);
+    // Blocks [from, to) chained by hashes that span them, as file blocks: each spanning hash alone in
+    // one block (its parts concatenated byte-wise, not decoded), and the entries around it in blocks
+    // of their own (docs/design-bounded-memory.md §3.5) — so a probe for a neighbouring key reads a
+    // small block, not the giant group. Giant: a spanning hash's block.
+    private static List<(TraceBlock Block, bool Giant)> Pieces(BlockSchema schema, ITraceBlock[] blocks, int from, int to)
+    {
+        var pieces = new List<(TraceBlock, bool)>();
+        var pending = new List<TraceBlock>();
+        uint pendingHash = 0;
+        for (var k = from; k < to; k++)
+        {
+            var block = Materialized(blocks[k]);
+            var hashes = block.Hashes;
+            var lo = 0;
+            if (pending.Count > 0)
+            {
+                while (lo < hashes.Length && hashes[lo] == pendingHash)
+                {
+                    lo++;
+                }
+
+                if (lo == hashes.Length)
+                {
+                    pending.Add(block); // wholly the spanning hash: it continues
+                    continue;
+                }
+
+                pending.Add(Slice(schema, block, 0, lo));
+                pieces.Add((pending.Count == 1 ? pending[0] : BlockWriter.Concat(schema, pending), true));
+                pending.Clear();
+            }
+
+            // The tail that the next block continues.
+            var hi = k + 1 < to ? block.LowerBound(block.LastHash) : hashes.Length;
+            if (hi > lo)
+            {
+                pieces.Add((lo == 0 && hi == hashes.Length ? block : Slice(schema, block, lo, hi), false));
+            }
+
+            if (hi < hashes.Length)
+            {
+                pending.Add(Slice(schema, block, hi, hashes.Length));
+                pendingHash = block.LastHash;
+            }
+        }
+
+        if (pending.Count > 0)
+        {
+            pieces.Add((pending.Count == 1 ? pending[0] : BlockWriter.Concat(schema, pending), true));
+        }
+
+        return pieces;
+    }
+
+    // Entries [from, to) of a block, re-encoded (or the block itself when that is all of it).
+    private static TraceBlock Slice(BlockSchema schema, TraceBlock block, int from, int to)
+    {
+        if (from == 0 && to == block.Count)
+        {
+            return block;
+        }
+
+        var n = to - from;
+        var keys = new StructuralRow[n];
+        var values = new StructuralRow[n];
+        var weights = new long[n];
+        var hashes = new int[n];
+        var source = block.Hashes;
+        for (var i = 0; i < n; i++)
+        {
+            keys[i] = block.Key(from + i);
+            values[i] = block.Value(from + i);
+            weights[i] = block.Weight(from + i);
+            hashes[i] = (int)source[from + i];
+        }
+
+        return schema.Encode(keys, values, weights, hashes, n);
+    }
 
     private static List<uint> Distinct(ReadOnlySpan<uint> hashes)
     {
@@ -257,15 +358,43 @@ internal sealed class LazyTraceBlock : ITraceBlock
     private readonly RunBlock _index;
     private TraceBlock? _loaded;
 
-    public LazyTraceBlock(BlockSchema schema, ITableFileSystem store, string path, RunBlock index)
+    /// <param name="loaded">The body already in memory (a block a checkpoint just wrote, byte for
+    /// byte the file's); admitted to the <see cref="BlockCache"/>.</param>
+    public LazyTraceBlock(BlockSchema schema, ITableFileSystem store, string path, RunBlock index, TraceBlock? loaded = null)
     {
         _schema = schema;
         _store = store;
         _path = path;
         _index = index;
+        if (loaded is not null)
+        {
+            _loaded = loaded;
+            if (BlockCache.Enabled)
+            {
+                BlockCache.Admit(this, loaded.ResidentBytes, referenced: false);
+            }
+        }
+    }
+
+    // The block cache's bookkeeping (guarded by its lock, but for the reference bit).
+    internal long CacheSize { get; set; }
+
+    internal volatile bool Referenced;
+
+    /// <summary>Forget the body (the cache evicted it); the next read loads it again.</summary>
+    internal void DropBody()
+    {
+        if (Core.Operators.Stateful.Blocks.BlockAccess.Enabled && _loaded is { } body)
+        {
+            BlockCache.TrackDropped(body);
+        }
+
+        Volatile.Write(ref _loaded, null);
     }
 
     public int Count => _index.Entries;
+
+    public ITraceBlock Body => Loaded;
 
     public uint FirstHash => _index.FirstHash;
 
@@ -274,11 +403,30 @@ internal sealed class LazyTraceBlock : ITraceBlock
     /// <summary>The block's bytes if read (the residency census).</summary>
     internal TraceBlock? Resident => _loaded;
 
+    /// <summary>Distinct key hashes in the block, per the run file's index.</summary>
+    internal int Groups => _index.Groups;
+
     /// <summary>The block's encoded length in the run file.</summary>
     internal int FileLength => _index.Length;
 
     /// <summary>The block's bytes, read on first use.</summary>
-    internal TraceBlock Loaded => _loaded ?? Load();
+    internal TraceBlock Loaded
+    {
+        get
+        {
+            if (Volatile.Read(ref _loaded) is { } body)
+            {
+                if (BlockCache.Enabled && !Referenced)
+                {
+                    Referenced = true;
+                }
+
+                return body;
+            }
+
+            return Load();
+        }
+    }
 
     public ReadOnlySpan<uint> Hashes => Loaded.Hashes;
 
@@ -311,10 +459,29 @@ internal sealed class LazyTraceBlock : ITraceBlock
         var file = _store.OpenReadAsync(_path).AsTask().GetAwaiter().GetResult();
         try
         {
-            using var bytes = file.ReadAsync(new FileRange(_index.Offset, _index.Length)).AsTask().GetAwaiter().GetResult();
-            var block = _schema.Adopt(bytes.Memory.Span[.._index.Length]);
-            Interlocked.CompareExchange(ref _loaded, block, null);
-            return _loaded!;
+            TraceBlock block;
+            if (file is IO.Local.LocalRandomAccessFile local)
+            {
+                block = _schema.Adopt(_index.Length, m => local.ReadExactly(_index.Offset, m.Span));
+            }
+            else
+            {
+                using var bytes = file.ReadAsync(new FileRange(_index.Offset, _index.Length)).AsTask().GetAwaiter().GetResult();
+                block = _schema.Adopt(bytes.Memory.Span[.._index.Length]);
+            }
+
+            if (Interlocked.CompareExchange(ref _loaded, block, null) is { } other)
+            {
+                return other;
+            }
+
+            if (BlockCache.Enabled)
+            {
+                // A merge's read is a scan: admitted cold, dropped first.
+                BlockCache.Admit(this, block.ResidentBytes, referenced: !Core.Operators.Stateful.Blocks.BlockAccess.InMaintenance);
+            }
+
+            return block;
         }
         finally
         {

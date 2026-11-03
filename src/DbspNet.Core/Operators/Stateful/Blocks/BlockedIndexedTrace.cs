@@ -423,7 +423,7 @@ internal sealed class BlockedIndexedTrace
         {
             var seen = new HashSet<(StructuralRow, StructuralRow)>();
             uint? previous = null;
-            foreach (var block in run.Blocks)
+            foreach (var block in Bodies(run.Blocks))
             {
                 var hashes = block.Hashes;
                 if (previous is { } p && hashes.Length > 0 && hashes[0] < p)
@@ -500,6 +500,33 @@ internal sealed class BlockedIndexedTrace
         _runs.Insert(0, new Run(blocks, entries) { Persisted = persisted });
     }
 
+    private static IEnumerable<ITraceBlock> Bodies(ITraceBlock[] blocks)
+    {
+        foreach (var b in blocks)
+        {
+            yield return b.Body;
+        }
+    }
+
+    /// <summary>Replace <paramref name="run"/> by the same entries read from its run file
+    /// (docs/design-bounded-memory.md §3.1): <paramref name="blocks"/> are the file's blocks, which
+    /// can drop their bytes and read them again. False if the run is no longer a level (merged
+    /// away since the checkpoint wrote it). Called between steps, like a checkpoint.</summary>
+    internal Run? Rebind(Run run, ITraceBlock[] blocks)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+        ArgumentNullException.ThrowIfNull(blocks);
+        var at = _runs.IndexOf(run);
+        if (at < 0 || blocks.Length == 0)
+        {
+            return null;
+        }
+
+        var rebound = new Run(blocks, run.Entries) { Floor = run.Floor, Persisted = run.Persisted };
+        _runs[at] = rebound;
+        return rebound;
+    }
+
     /// <summary>Visit every entry of <paramref name="key"/> in every level (unconsolidated).</summary>
     public void Probe<TVisitor>(StructuralRow key, ref TVisitor visitor)
         where TVisitor : struct, ITraceVisitor
@@ -560,7 +587,7 @@ internal sealed class BlockedIndexedTrace
 
             for (; b < run.Blocks.Length && run.FirstOf(b) <= hash; b++)
             {
-                var block = run.Blocks[b];
+                var block = run.Blocks[b].Body;
                 var hashes = block.Hashes;
                 for (var i = block.LowerBound(hash); i < hashes.Length && hashes[i] == hash; i++)
                 {
@@ -601,7 +628,7 @@ internal sealed class BlockedIndexedTrace
 
                 for (; b < run.Blocks.Length && run.FirstOf(b) <= hash; b++)
                 {
-                    var block = run.Blocks[b];
+                    var block = run.Blocks[b].Body;
                     var hashes = block.Hashes;
                     var from = block.LowerBound(hash);
                     var to = from;
@@ -668,7 +695,7 @@ internal sealed class BlockedIndexedTrace
 
         foreach (var run in _runs)
         {
-            foreach (var block in run.Blocks)
+            foreach (var block in Bodies(run.Blocks))
             {
                 StructuralRow? key = null;
                 for (var i = 0; i < block.Count; i++)
@@ -703,7 +730,7 @@ internal sealed class BlockedIndexedTrace
 
         foreach (var run in _runs)
         {
-            foreach (var block in run.Blocks)
+            foreach (var block in Bodies(run.Blocks))
             {
                 for (var i = 0; i < block.Count; i++)
                 {
@@ -1099,7 +1126,23 @@ internal sealed class BlockedIndexedTrace
 
         public bool Done => _block >= Run.Blocks.Length;
 
-        public ITraceBlock Block => Run.Blocks[_block];
+        // The current block's body, held while the cursor is on it.
+        private ITraceBlock? _body;
+        private int _bodyOf = -1;
+
+        public ITraceBlock Block
+        {
+            get
+            {
+                if (_bodyOf != _block)
+                {
+                    _body = Run.Blocks[_block].Body;
+                    _bodyOf = _block;
+                }
+
+                return _body!;
+            }
+        }
 
         public int Index { get; private set; }
 
@@ -1139,11 +1182,44 @@ internal sealed class BlockedIndexedTrace
         private int _count;
         private long _entries;
 
+        // Whether the buffered block continues a hash from the previous block (a giant group).
+        private bool _spanning;
+
         public void Add(uint hash, StructuralRow key, StructuralRow value, long weight)
         {
-            if (_count > 0 && (_bytes >= trace._blockBytes || (_count >= trace._blockEntries && (uint)_hashes[_count - 1] != hash)))
+            if (_count > 0)
             {
-                Flush();
+                var last = (uint)_hashes[_count - 1];
+                if (_spanning && last != hash)
+                {
+                    // A spanning hash's last block holds only it (docs/design-bounded-memory.md §3.5).
+                    Flush();
+                }
+                else if (_bytes >= trace._blockBytes)
+                {
+                    var start = _count;
+                    while (last == hash && start > 0 && (uint)_hashes[start - 1] == hash)
+                    {
+                        start--;
+                    }
+
+                    if (last == hash && start > 0)
+                    {
+                        // The hash is about to span blocks: the entries before it make a block of
+                        // their own, so the hash's blocks hold only it and a probe for a neighbour
+                        // never reads the giant group (in memory, nor once written as one file block).
+                        FlushPrefix(start);
+                    }
+                    else
+                    {
+                        Flush();
+                        _spanning = last == hash;
+                    }
+                }
+                else if (_count >= trace._blockEntries && last != hash)
+                {
+                    Flush();
+                }
             }
 
             _bytes += trace._format.EntryBytes(key, value);
@@ -1170,8 +1246,30 @@ internal sealed class BlockedIndexedTrace
             return _blocks.Count == 0 ? null : new Run([.. _blocks], _entries);
         }
 
+        // Flush entries [0, n) as a block and keep the rest buffered, at the front.
+        private void FlushPrefix(int n)
+        {
+            var rest = _count - n;
+            var keys = _keys[n.._count];
+            var values = _values[n.._count];
+            var weights = _weights[n.._count];
+            var hashes = _hashes[n.._count];
+            _count = n;
+            Flush();
+            Array.Copy(keys, _keys, rest);
+            Array.Copy(values, _values, rest);
+            Array.Copy(weights, _weights, rest);
+            Array.Copy(hashes, _hashes, rest);
+            _count = rest;
+            for (var i = 0; i < rest; i++)
+            {
+                _bytes += trace._format.EntryBytes(_keys[i], _values[i]);
+            }
+        }
+
         private void Flush()
         {
+            _spanning = false;
             if (_count == 0)
             {
                 return;

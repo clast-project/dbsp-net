@@ -32,9 +32,9 @@ public class BlockedCheckpointTests
 
     public BlockedCheckpointTests() => RunCheckpoint.Verify = true;
 
-    private static CompiledProgram Compile(bool blocked)
+    private static CompiledProgram Compile(bool blocked, int blockEntries = 8)
     {
-        using var mode = TraceBlocksMode.Use(join: blocked, freezeEntries: 16, blockEntries: 8);
+        using var mode = TraceBlocksMode.Use(join: blocked, freezeEntries: 16, blockEntries: blockEntries);
         return SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
     }
 
@@ -163,5 +163,85 @@ public class BlockedCheckpointTests
         var restored = Compile(blocked: true);
         await Snapshot.ReadAsync(restored.Circuit, fs);
         Assert.Equal(Digest(p), Digest(restored));
+    }
+
+    // docs/design-bounded-memory.md §3.1: with a block budget, a committed checkpoint rebinds each
+    // run it wrote to the run file, and the cache drops bodies past the budget. Probes, merges and
+    // later checkpoints read them back — across checkpoints that retire older snapshots — and the
+    // program stays exactly its uncheckpointed twin. Budget 1 byte: every body is dropped as soon
+    // as another is read.
+    [Theory]
+    [InlineData(1L)]
+    [InlineData(4096L)]
+    public async Task BoundedCache_EvictsPersistedBlocks_AndStaysExact(long budget)
+    {
+        using var layout = StateLayout.Use(true);
+        var saved = BlockCache.Budget;
+        BlockCache.Budget = budget;
+        try
+        {
+            var fs = new InMemoryTableFileSystem();
+            // 64-entry blocks: a giant hash shares its first and last blocks with its neighbours
+            // (as with ivm-bench's 1,024), so isolating it in the file is observable.
+            var p = Compile(blocked: true, blockEntries: 64);
+            var twin = Compile(blocked: true, blockEntries: 64);
+            var evictions = BlockCache.Evictions;
+            for (var tick = 0; tick < 30; tick++)
+            {
+                Tick(p, tick);
+                Tick(twin, tick);
+                if (tick % 3 == 2)
+                {
+                    // A hash spanning blocks in memory holds them alone (§3.5): the block builder
+                    // cuts its neighbours off, so the write concatenates without re-encoding.
+                    foreach (var r in Op(p).LeftTrace.Runs)
+                    {
+                        for (var b = 1; b < r.Blocks.Length; b++)
+                        {
+                            if (r.Blocks[b].FirstHash == r.Blocks[b - 1].LastHash)
+                            {
+                                Assert.Equal(r.Blocks[b - 1].FirstHash, r.Blocks[b - 1].LastHash);
+                                Assert.Equal(r.Blocks[b].FirstHash, r.Blocks[b].LastHash);
+                            }
+                        }
+                    }
+
+                    await Snapshot.WriteAsync(p.Circuit, fs, retainCount: 1);
+                    Assert.Contains(Op(p).LeftTrace.Runs, r => r.Blocks.Length > 0 && r.Blocks.All(b => b is LazyTraceBlock));
+
+                    // A hash spanning blocks in memory is a file block of its own; its neighbours
+                    // stay in ordinary-sized blocks (§3.5), so probing them never reads the giant.
+                    var giant = (uint)new DbspNet.Core.Collections.StructuralRow([0]).GetHashCode();
+                    var giantBlocks = 0;
+                    foreach (var r in Op(p).LeftTrace.Runs)
+                    {
+                        var holding = r.Blocks.OfType<LazyTraceBlock>().Where(b => b.FirstHash <= giant && giant <= b.LastHash).ToList();
+                        Assert.True(holding.Count <= 1, "a hash is in one file block of a run");
+                        if (holding is [{ Count: > 100 } big])
+                        {
+                            Assert.True(big.Groups == 1, $"key 0 block: {big.Count} entries {big.Groups} hashes; run blocks {string.Join(",", r.Blocks.Select(x => x.Count + "/" + ((LazyTraceBlock)x).Groups))}");
+                            giantBlocks++;
+                        }
+                    }
+
+                    Assert.True(giantBlocks > 0, "key 0 should be a giant group in some run");
+                }
+
+                Assert.Equal(Digest(twin), Digest(p));
+            }
+
+            Assert.True(BlockCache.Evictions > evictions, "the budget should have evicted bodies");
+
+            // And the checkpoint it last wrote restores exactly.
+            await Snapshot.WriteAsync(p.Circuit, fs, retainCount: 1);
+            var restored = Compile(blocked: true, blockEntries: 64);
+            await Snapshot.ReadAsync(restored.Circuit, fs);
+            Assert.Equal(Digest(p), Digest(restored));
+        }
+        finally
+        {
+            BlockCache.Budget = saved;
+            BlockCache.Clear();
+        }
     }
 }

@@ -469,6 +469,19 @@ public class IvmMultiBatch
             }
 
             ResidencyAt($"batch{batch}", batch);
+            if (Environment.GetEnvironmentVariable("IVM_LIVE_EACH_BATCH") == "1")
+            {
+                // Live bytes after this batch's checkpoint (a full compacting GC: census runs only).
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                var live = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+                _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"LIVEBATCH batch={batch} promoted_mib={live.PromotedBytes / 1048576.0:F0} rss_mib={Environment.WorkingSet / 1048576.0:F0} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} dropped_alive={DbspNet.Persistence.Blocks.BlockCache.DroppedAlive().Count} dropped_alive_mib={DbspNet.Persistence.Blocks.BlockCache.DroppedAlive().Bytes / 1048576.0:F0}"));
+                if (stateCensus)
+                {
+                    StateCensusAt($"after{batch}", null);
+                }
+            }
 
             // What the server's /wait reports after every batch.
             var c0 = Stopwatch.GetTimestamp();
@@ -479,7 +492,10 @@ public class IvmMultiBatch
                 CultureInfo.InvariantCulture,
                 $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2} gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gen2={GC.CollectionCount(2) - gen2Before} jit_ms={(System.Runtime.JitInfo.GetCompilationTime() - jit0).TotalMilliseconds:F0}")
                 + (store is null ? "" : string.Create(CultureInfo.InvariantCulture, $" checkpoint_ms={checkpointMs:F0} snapshot_mib={snapshotMb:F1} written_mib={writtenMb:F1}"))
-                + (restarted ? " resumed=1" : ""));
+                + (restarted ? " resumed=1" : "")
+                + (DbspNet.Persistence.Blocks.BlockCache.Enabled
+                    ? string.Create(CultureInfo.InvariantCulture, $" cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} cache_admits={DbspNet.Persistence.Blocks.BlockCache.Admissions} cache_evicts={DbspNet.Persistence.Blocks.BlockCache.Evictions}")
+                    : ""));
             if (restarted)
             {
                 _out.WriteLine(string.Create(CultureInfo.InvariantCulture,

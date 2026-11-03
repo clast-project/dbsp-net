@@ -24,6 +24,24 @@ public sealed class LocalRandomAccessFile : IRandomAccessFile
             FileShare.Read);
     }
 
+    /// <summary>Fill <paramref name="destination"/> from <paramref name="offset"/>, synchronously and
+    /// straight into the caller's memory: no pooled buffer (a block read on the step thread keeps
+    /// what it reads, and ArrayPool.Shared would retain one large buffer per size per core).</summary>
+    internal void ReadExactly(long offset, Span<byte> destination)
+    {
+        while (destination.Length > 0)
+        {
+            var n = RandomAccess.Read(_handle, destination, offset);
+            if (n <= 0)
+            {
+                throw new EndOfStreamException($"read past the end of the file at {offset}");
+            }
+
+            destination = destination[n..];
+            offset += n;
+        }
+    }
+
     public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();

@@ -89,6 +89,9 @@ internal sealed class RunStreamWriter : IAsyncDisposable
         _lastHash = last;
     }
 
+    /// <summary>The blocks written so far: offsets, lengths and hash ranges.</summary>
+    internal IReadOnlyList<RunBlock> Index => _index;
+
     internal async ValueTask<RunInfo> FinishAsync(CancellationToken cancellationToken)
     {
         await _ipc.WriteEndAsync(cancellationToken).ConfigureAwait(false);

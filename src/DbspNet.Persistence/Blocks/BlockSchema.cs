@@ -197,6 +197,17 @@ internal sealed class BlockSchema : ITraceBlockFormat
 
     /// <summary>Adopt a block's record-batch message as stored in a run file (it follows this
     /// schema's message), without decoding a cell.</summary>
+    /// <summary>Adopt a block read straight into place: <paramref name="read"/> fills the message's
+    /// <paramref name="length"/> bytes.</summary>
+    public TraceBlock Adopt(int length, Action<Memory<byte>> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        var stream = new byte[SchemaMessage.Length + length];
+        SchemaMessage.CopyTo(stream, 0);
+        read(stream.AsMemory(SchemaMessage.Length, length));
+        return TraceBlock.Parse(this, stream, SchemaMessage.Length, stream.Length);
+    }
+
     public TraceBlock Adopt(ReadOnlySpan<byte> message)
     {
         var stream = new byte[SchemaMessage.Length + message.Length];

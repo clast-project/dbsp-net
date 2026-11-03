@@ -13,6 +13,11 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 /// </summary>
 internal interface ITraceBlock
 {
+    /// <summary>The block with its bytes in memory, to read many times: itself, or a file-backed
+    /// block's loaded body (docs/design-bounded-memory.md §3.1) — which a cache may otherwise drop
+    /// between two reads.</summary>
+    ITraceBlock Body => this;
+
     /// <summary>Entries in the block.</summary>
     int Count { get; }
 
