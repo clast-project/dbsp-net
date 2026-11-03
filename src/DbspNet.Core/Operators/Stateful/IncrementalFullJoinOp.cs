@@ -68,6 +68,11 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     private readonly IIndexedZSetTraceCodec<TKey, TRight, TWeight>? _rightSnapshotCodec;
     private readonly IFrontier? _frontier;
     private readonly Func<TKey, long>? _monotoneKey;
+
+    // A non-equi ON conjunct (docs/design-flat-trace-state.md §3.30): match-presence per
+    // (key, preserved row), on each side.
+    private readonly Func<TKey, TLeft, TRight, bool>? _residual;
+    private readonly Func<TKey, TRight, TLeft, bool>? _residualFromRight;
     private long _lastGcFrontier = long.MinValue;
     private long _gcDropped;
 
@@ -87,8 +92,11 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         IFrontier? frontier = null,
         Func<TKey, long>? monotoneKey = null,
         IGroupTrace<TKey, TLeft, TWeight>? leftTrace = null,
-        IGroupTrace<TKey, TRight, TWeight>? rightTrace = null)
+        IGroupTrace<TKey, TRight, TWeight>? rightTrace = null,
+        Func<TKey, TLeft, TRight, bool>? residual = null)
     {
+        _residual = residual;
+        _residualFromRight = residual is null ? null : (k, r, l) => residual(k, l, r);
         _leftTrace = leftTrace ?? new ManagedGroupTrace<TKey, TLeft, TWeight>();
         _rightTrace = rightTrace ?? new ManagedGroupTrace<TKey, TRight, TWeight>();
         _leftIn = leftIn;
@@ -170,6 +178,14 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             var drK = dr.GroupFor(key);
             var newL = oldL + dlK;
             var newR = oldR + drK;
+
+            if (_residual is { } residual)
+            {
+                ResidualOuterJoin.JoinInto(builder, key, oldL, dlK, drK, newR, residual, _joinCombine);
+                ResidualOuterJoin.PadInto(builder, key, oldL, dlK, oldR, drK, newR, residual, _nullPadRightCombine);
+                ResidualOuterJoin.PadInto(builder, key, oldR, drK, oldL, dlK, newL, _residualFromRight!, _nullPadLeftCombine);
+                continue;
+            }
 
             var oldRMatched = !oldR.IsEmpty;
             var newRMatched = !newR.IsEmpty;

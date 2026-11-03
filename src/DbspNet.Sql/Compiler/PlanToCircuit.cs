@@ -1572,13 +1572,16 @@ public static partial class PlanToCircuit
         ReshardPlacement? leftReshard = null,
         ReshardPlacement? rightReshard = null,
         (Schema Key, Schema Value)? leftShape = null,
-        (Schema Key, Schema Value)? rightShape = null)
+        (Schema Key, Schema Value)? rightShape = null,
+        Func<StructuralRow, StructuralRow, StructuralRow, bool>? residual = null)
     {
         var blocks = OuterBlockFormats(ctx, leftShape, rightShape);
         return Recorded(
             builder, ctx,
             () => blocks is ({ } lf, { } rf)
-                ? builder.BlockedLeftJoin(left, right, joinCombine, nullPadCombine, lf, rf, leftCodec, rightCodec, frontier, monotoneKey)
+                ? builder.BlockedLeftJoin(left, right, joinCombine, nullPadCombine, lf, rf, leftCodec, rightCodec, frontier, monotoneKey, residual)
+                : residual is not null
+                ? builder.ResidualLeftJoin(left, right, joinCombine, nullPadCombine, leftCodec, rightCodec, frontier, monotoneKey, residual)
                 : ctx.Options.TraceFamily == TraceFamily.Spine
                 ? builder.SpineIncrementalLeftJoin(
                     left, right, joinCombine, nullPadCombine, leftCodec, rightCodec,
@@ -1609,14 +1612,18 @@ public static partial class PlanToCircuit
         ReshardPlacement? leftReshard = null,
         ReshardPlacement? rightReshard = null,
         (Schema Key, Schema Value)? leftShape = null,
-        (Schema Key, Schema Value)? rightShape = null)
+        (Schema Key, Schema Value)? rightShape = null,
+        Func<StructuralRow, StructuralRow, StructuralRow, bool>? residual = null)
     {
         var blocks = OuterBlockFormats(ctx, leftShape, rightShape);
         return Recorded(
             builder, ctx,
             () => blocks is ({ } lf, { } rf)
                 ? builder.BlockedFullJoin(
-                    left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, lf, rf, leftCodec, rightCodec, frontier, monotoneKey)
+                    left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, lf, rf, leftCodec, rightCodec, frontier, monotoneKey, residual)
+                : residual is not null
+                ? builder.ResidualFullJoin(
+                    left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftCodec, rightCodec, frontier, monotoneKey, residual)
                 : ctx.Options.TraceFamily == TraceFamily.Spine
                 ? builder.SpineIncrementalFullJoin(
                     left, right, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftCodec, rightCodec,
@@ -3638,14 +3645,14 @@ public static partial class PlanToCircuit
         JoinPlan plan,
         CompileContext ctx)
     {
-        // A residual on an outer join isn't expressible in IncrementalLeftJoin:
-        // its match-presence is a per-KEY emptiness test, but a residual can
-        // reference left columns, so two left rows under one key can disagree
-        // about whether the key is matched. Lower to the anti-join rewrite.
-        if (plan.Residual is not null)
+        // A residual makes match-presence per (key, left row); the operator handles it (§3.30)
+        // except where ResidualInOperator says the anti-join rewrite must.
+        if (!ResidualInOperator(plan, ctx))
         {
             return CompileOuterJoinWithResidual(builder, plan, ctx);
         }
+
+        var pairResidual = PairResidual(plan);
 
         var left = CompilePlan(builder, plan.Left, ctx);
         var right = CompilePlan(builder, plan.Right, ctx);
@@ -3698,7 +3705,8 @@ public static partial class PlanToCircuit
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
             rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
-            leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema));
+            leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema),
+            residual: pairResidual is null ? null : (_, l, r) => pairResidual(l, r));
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
@@ -3980,10 +3988,12 @@ public static partial class PlanToCircuit
         // Output rows are re-assembled in the user's written column order
         // (left columns first, then right) — for unmatched right rows the
         // left columns are NULL-padded.
-        if (plan.Residual is not null)
+        if (!ResidualInOperator(plan, ctx))
         {
             return CompileOuterJoinWithResidual(builder, plan, ctx);
         }
+
+        var pairResidual = PairResidual(plan);
 
         var left = CompilePlan(builder, plan.Left, ctx);
         var right = CompilePlan(builder, plan.Right, ctx);
@@ -4036,7 +4046,8 @@ public static partial class PlanToCircuit
             preservedCodec, probedCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
             rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
-            leftShape: (rightKeySchema, plan.Right.Schema), rightShape: (leftKeySchema, plan.Left.Schema));
+            leftShape: (rightKeySchema, plan.Right.Schema), rightShape: (leftKeySchema, plan.Left.Schema),
+            residual: pairResidual is null ? null : (_, r, l) => pairResidual(l, r)); // the operator's left is the user's right
 
         var nullKeyPadded = builder.MapRows(
             nullKeyRight,
@@ -4065,14 +4076,14 @@ public static partial class PlanToCircuit
         JoinPlan plan,
         CompileContext ctx)
     {
-        // A residual is not encodable in the operator (same reason as LEFT /
-        // RIGHT — a failing residual must retain the preserved rows NULL-padded,
-        // and match-presence there is per-key). Lower to the anti-join rewrite,
-        // which preserves both sides.
-        if (plan.Residual is not null)
+        // A residual makes match-presence per (key, preserved row) on each side; the operator
+        // handles it (§3.30) except where ResidualInOperator says the anti-join rewrite must.
+        if (!ResidualInOperator(plan, ctx))
         {
             return CompileOuterJoinWithResidual(builder, plan, ctx);
         }
+
+        var pairResidual = PairResidual(plan);
 
         var left = CompilePlan(builder, plan.Left, ctx);
         var right = CompilePlan(builder, plan.Right, ctx);
@@ -4121,7 +4132,8 @@ public static partial class PlanToCircuit
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
             rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
-            leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema));
+            leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema),
+            residual: pairResidual is null ? null : (_, l, r) => pairResidual(l, r));
 
         var nullKeyLeftPadded = builder.MapRows(
             nullKeyLeft,
@@ -4713,6 +4725,42 @@ public static partial class PlanToCircuit
 
         vs[row.Count] = value;
         return codec.BuildRow(schema, vs);
+    }
+
+    // An outer join's residual goes to the outer-join operator (docs/design-flat-trace-state.md
+    // §3.30) unless the trace family has no residual hook (spine) or there is no equi-key (a unit-key
+    // cross product, whose padding scans would be quadratic): those keep the anti-join rewrite.
+    private static bool ResidualInOperator(JoinPlan plan, CompileContext ctx) =>
+        plan.Residual is null || (ctx.Options.TraceFamily != TraceFamily.Spine && plan.EquiKeys.Count > 0);
+
+    // The residual over a (user's left row, user's right row) pair, read as the joined row it would
+    // make (left columns, then right) without building it.
+    private static Func<StructuralRow, StructuralRow, bool>? PairResidual(JoinPlan plan)
+    {
+        if (plan.Residual is null)
+        {
+            return null;
+        }
+
+        var predicate = ExpressionCompiler.CompilePredicate(plan.Residual);
+        return (l, r) => predicate(new PairRowView(l, r));
+    }
+
+    private sealed class PairRowView(StructuralRow left, StructuralRow right) : IReadOnlyList<object?>
+    {
+        public int Count => left.Count + right.Count;
+
+        public object? this[int index] => index < left.Count ? left[index] : right[index - left.Count];
+
+        public IEnumerator<object?> GetEnumerator()
+        {
+            for (var i = 0; i < Count; i++)
+            {
+                yield return this[i];
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     private static (int[] LeftIndices, int[] RightIndices) ExtractEquiKeyIndices(JoinPlan plan)

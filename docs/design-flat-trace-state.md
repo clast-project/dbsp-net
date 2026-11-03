@@ -1641,6 +1641,46 @@ blocked record after a checkpoint has dropped the cache, and its old ranking rec
 version's +16% on batch 3 came from the global ranks and is gone.
 
 
+### 3.30 Outer joins with a residual in the outer-join operator: plan (2026-11-03, branch `arc/outer-residual`)
+
+**Today** (§3.26): an outer join whose ON clause has a non-equi conjunct is lowered to
+`matched = σ_res(L ⋈ R)`, `unmatched = S − semi(S, distinct(π_S(nonzero(matched))))` per
+preserved side. Each preserved row is held three times (the matched join's trace, both sides of
+the semi-join) plus the Distinct, and every tick runs NonZeroSet, a projection, an exchange, a
+Distinct, a semi-join and a Difference on top of the join. ivm-bench has four such joins (the
+temporal SCD `LEFT JOIN … ON k = k AND ts BETWEEN lo AND hi`).
+
+**Why the operator refused residuals.** `IncrementalLeftJoinOp` pads per key: a key is matched while
+its right group is non-empty. With a residual, match-presence belongs to the (key, preserved row)
+pair: a preserved row `l` is matched iff some right row `r` in its key's group (non-zero weight)
+satisfies `res(l, r)` — exactly the rewrite's semantics.
+
+**Per key, it is still local.** For a touched key with old groups `L, R` and deltas `dL, dR`:
+- **Joined rows:** the inner-join bilinear delta with the residual applied, `dL ⋈ R' + L ⋈ dR`
+  (`R' = R + dR`), as the inner join does.
+- **Padding:** a row's padding is `pad(l)·w(l)` when unmatched. It can change only for rows in `dL`
+  (their weight changes) and rows of `L` that some `r ∈ dR` satisfies (a right row they depend on
+  changed): for any other `l`, the set of right rows satisfying `res(l, ·)` is unchanged. The
+  join's second pass, `L ⋈ dR`, evaluates exactly those pairs, so it finds the candidates for
+  free. For each candidate, old and new match-presence are a scan of `R` and `R'`. Emit
+  `pad(l)·(w'(l)·[¬m'(l)] − w(l)·[¬m(l)])`.
+- **FULL:** the same per preserved side; RIGHT is LEFT with the sides swapped, as now.
+
+Cost per touched key: the inner join's own work, plus a scan of the group for each candidate. For
+an SCD join that is a few versions per key. Keyless outer joins with a residual (a unit-key cross
+product) stay on the rewrite.
+
+**State:** the two traces the operator already keeps (blocks on: both `BlockedGroupTrace`). The
+Distinct, the semi-join's two traces and the matched join's traces go.
+
+**Tests:** the random-query generator already has residual LEFT/RIGHT/FULL joins (incremental ≡
+batch with tiny blocks, `BlockedJoinTests`, and the managed suites); add a targeted property test
+with several left rows per key that disagree about matching, right rows changing under them,
+multiplicities, NULL keys and NULL residual inputs, deletes, both block modes, and restores.
+
+**Gate:** views identical, batch-1 drain no worse than main (+3%), restart and batch 3 no worse,
+census. 5 alternating runs against a main build.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

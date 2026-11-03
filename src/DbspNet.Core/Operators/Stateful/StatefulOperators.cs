@@ -874,14 +874,38 @@ public static class StatefulOperators
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec,
         IFrontier? frontier,
-        Func<StructuralRow, long>? monotoneKey)
+        Func<StructuralRow, long>? monotoneKey,
+        Func<StructuralRow, StructuralRow, StructuralRow, bool>? residual = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
         builder.AddRawOperator(
             new IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
                 left, right, output, joinCombine, nullPadCombine, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey,
-                new Blocks.BlockedGroupTrace(leftFormat), new Blocks.BlockedGroupTrace(rightFormat)));
+                new Blocks.BlockedGroupTrace(leftFormat), new Blocks.BlockedGroupTrace(rightFormat), residual));
+        return output;
+    }
+
+    /// <summary>The structural LEFT OUTER join with a residual ON conjunct, managed traces
+    /// (docs/design-flat-trace-state.md §3.30).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> ResidualLeftJoin(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadCombine,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey,
+        Func<StructuralRow, StructuralRow, StructuralRow, bool> residual)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(
+            new IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                left, right, output, joinCombine, nullPadCombine, leftSnapshotCodec, rightSnapshotCodec, frontier, monotoneKey,
+                residual: residual));
         return output;
     }
 
@@ -898,14 +922,39 @@ public static class StatefulOperators
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec,
         IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec,
         IFrontier? frontier,
-        Func<StructuralRow, long>? monotoneKey)
+        Func<StructuralRow, long>? monotoneKey,
+        Func<StructuralRow, StructuralRow, StructuralRow, bool>? residual = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
         builder.AddRawOperator(
             new IncrementalFullJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
                 left, right, output, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftSnapshotCodec, rightSnapshotCodec,
-                frontier, monotoneKey, new Blocks.BlockedGroupTrace(leftFormat), new Blocks.BlockedGroupTrace(rightFormat)));
+                frontier, monotoneKey, new Blocks.BlockedGroupTrace(leftFormat), new Blocks.BlockedGroupTrace(rightFormat), residual));
+        return output;
+    }
+
+    /// <summary>The structural FULL OUTER join with a residual ON conjunct, managed traces
+    /// (docs/design-flat-trace-state.md §3.30).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> ResidualFullJoin(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> left,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> right,
+        Func<StructuralRow, StructuralRow, StructuralRow, StructuralRow> joinCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadRightCombine,
+        Func<StructuralRow, StructuralRow, StructuralRow> nullPadLeftCombine,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? leftSnapshotCodec,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? rightSnapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey,
+        Func<StructuralRow, StructuralRow, StructuralRow, bool> residual)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(
+            new IncrementalFullJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                left, right, output, joinCombine, nullPadRightCombine, nullPadLeftCombine, leftSnapshotCodec, rightSnapshotCodec,
+                frontier, monotoneKey, residual: residual));
         return output;
     }
 
