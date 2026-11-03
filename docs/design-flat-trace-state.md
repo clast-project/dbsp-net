@@ -1350,9 +1350,9 @@ and are read). Both only cost memory.
 | restart: first drain | 523 | 470 (−10%) |
 | batch 3 drain | 240 | 256 (noise) |
 
-**Decision pending.** Three quarters of the remaining references go, and 1.16 GB with them. The cost is
-about 0.4 s on batch 1, mostly the flush in the checkpoint (one encode of every small partition
-touched since the last one). The next lever would be flushing in the background between batches.
+**Merged (Curt, 2026-11-02).** Three quarters of the remaining references go, and 1.16 GB with
+them. The cost is about 0.4 s on batch 1, mostly the flush in the checkpoint (one encode of every
+small partition touched since the last one). Follow-up: flush in the background between batches.
 
 ## 4. Open questions for review
 
