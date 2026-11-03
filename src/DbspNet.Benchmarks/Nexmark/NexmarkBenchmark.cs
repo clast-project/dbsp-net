@@ -77,8 +77,17 @@ internal static class NexmarkBenchmark
             output.AppendLine("|:------|:------------|----------------------:|------------:|:-------|");
         }
 
+        // NEXMARK_QUERIES="q9 q18" runs only those (a single-query investigation).
+        var only = Environment.GetEnvironmentVariable("NEXMARK_QUERIES")?
+            .Split(' ', ',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var query in NexmarkQueries.All)
         {
+            if (only is { Count: > 0 } && !only.Contains(query.Id))
+            {
+                continue;
+            }
+
             RunOne(output, query, events, batchSize, runs, workers);
         }
 
