@@ -171,7 +171,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             if (_store is not null)
             {
-                return _store.All().Count();
+                // Entries held (an upper bound): counting rows exactly would decode the state, and a
+                // profiling run reads this every tick.
+                return (int)Math.Min(int.MaxValue, _store.Entries);
             }
 
             var n = 0;

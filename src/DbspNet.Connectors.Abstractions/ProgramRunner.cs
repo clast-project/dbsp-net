@@ -712,7 +712,9 @@ public sealed class ProgramRunner
 
             sb.AppendLine();
             sb.AppendLine("-- top operators by cumulative step time --");
-            foreach (var op in operators.OrderByDescending(o => o.CumulativeMs).Take(30))
+            // DBSPNET_PROFILE_TOP=<n> lists more (every operator of a many-operator view).
+            var top = int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_PROFILE_TOP"), out var n) && n > 0 ? n : 30;
+            foreach (var op in operators.OrderByDescending(o => o.CumulativeMs).Take(top))
             {
                 var share = stepMs > 0 ? op.CumulativeMs / stepMs * 100.0 : 0.0;
                 sb.AppendLine(FormattableString.Invariant(
