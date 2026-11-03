@@ -206,6 +206,11 @@ public class IvmMultiBatch
                 _out.WriteLine(line);
             }
 
+            foreach (var (stack, n, b) in DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.TakeStacks().Take(25))
+            {
+                _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"RESIDSTACK {tag} mb={b / 1048576.0:F1} blocks={n} {stack}"));
+            }
+
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"RESID {tag} took_ms={sw0.ElapsedMilliseconds} gc_heap_gib={GC.GetTotalMemory(false) / (double)(1L << 30):F2}"));
         }
 

@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03; design proposed, not built.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 next.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -62,11 +62,50 @@ What the census shows:
 3. **Window state is the one big holder with no block-level durable copy** (839 MB). The
    small-partition record (`_cold`, a `BlockedIndexedTrace`) and the large-partition chunks are
    checkpointed through the window operator's own snapshot, not as run files.
-4. **Batch 1's checkpoint reads 2.0 GB of blocks** (views 583, window 838, joins 295, aggregates
-   220, DISTINCT 63). Batch 2's and 3's checkpoints read 0.6–0.8 MB. The likely sources are
-   one-time work in the first checkpoint: the window write-back flush, dropping aggregate caches
-   and refolding them, and the view or output-index setup. This is not explained yet, and a
-   bounded cache must not let it refault everything (§3.3).
+4. **Batch 1's checkpoint reads 2.0 GB of blocks.** Batch 2's and 3's checkpoints read 0.6–0.8 MB.
+   This is explained in §1.4. It is not a problem for a cache.
+
+### 1.4 Who reads at batch 1's write and checkpoint (2026-11-03)
+
+`DBSPNET_BLOCK_ACCESS_STACKS=6` records the caller of each block's first read in the write and
+checkpoint phases, grouped by the innermost DbspNet frames (raw output: `run2/stacks.txt`).
+
+**(a) Writing the runs.** About 3.97 GB, matching the 4.02 GB persisted afterwards:
+
+| holder | read |
+|---|---|
+| joins | 2,487 MB |
+| aggregates | 684 + 155 MB |
+| views | 583 MB |
+| DISTINCT | 63 MB |
+
+- `BlockedTraceCheckpoint.WriteRunAsync` reads `block.Hashes` to build each run's index. The
+  bytes are resident because they are unpersisted, and the checkpoint has to read them to
+  persist them. No cache problem.
+- The §1.2 per-kind figure was smaller for joins (295 MB) because most join blocks belong to
+  **giant hashes that span blocks in memory**. The writer `Concat`s each span into one temporary
+  block raw, so the read lands on that temporary block, not on the trace's blocks.
+- Two consequences:
+  - The first checkpoint copies ~2.5 GB of join bytes into temporary large-object-heap blocks.
+    These are 7,229 written blocks averaging 344 KB, against 43,221 in memory.
+  - On disk, a join run's block is often far larger than its in-memory blocks. Increment 1's
+    fault-in unit is the file block, so see §3.3.
+
+**(b) Window state snapshotted whole: 854 MB.** These are `PartitionedWindowAggregateOp`,
+`PartitionedOffsetOp` and `PartitionedRankOp` `.SnapshotNow`. Each one materialises its record
+(`MaterializeUncached`) and its chunks into a Z-set, then the codec re-encodes it. This is
+increment 2's target. Later checkpoints write only changes, which is why batches 2 and 3 read
+under 1 MB.
+
+**(c) Output write: 485 MB in the write phase.** `ParallelProgramOutput.FormView` streams the
+whole view for batch 1's full write. The resumed batch 2's 474 MB is the same path, rebuilding
+after a restart.
+
+**Batch 1 conclusion.** Batch 1's peak is the 4.3 GB of blocks built during the drain, and none of
+it is persisted until the checkpoint. The checkpoint's reads are of bytes that are resident
+anyway. Bounding batch 1 therefore needs spilling (runs written mid-drain, Feldera's
+moderate-pressure mode), not a fix to the checkpoint. **Deferred**, as agreed. Increment 1 bounds
+the state from the first checkpoint on.
 
 ### 1.3 Fresh process (restore at batch 1, then batches 2–3)
 
@@ -150,9 +189,13 @@ store, keyed by partition hash. Estimated gain: 0.84 GB.
 
 ### 3.3 Things the cache must survive
 
-- **Batch 1's checkpoint read sweep (2 GB).** Explain it first (§1.2 item 4). Anything that has
-  to read everything should read through the cache without promoting into it, as a scan, or
-  should not happen at all.
+- **Scans: the full view write (`FormView`), the window snapshot, and verify.** These should read
+  through the cache without promoting what they read into it.
+- **Giant file blocks.** Restore already faults in file blocks whole. A join's giant hash is one
+  file block, averaging 344 KB, with some much larger. An evicted giant block faults back as a
+  large-object-heap allocation. Increment 1 accepts this as restore does today, and charges the
+  cache the block's real size. If it shows up in GC pauses, a later run-file version can let a
+  hash span file blocks, as memory already does.
 - **Merges.** A merge reads both input runs. Its inputs should be read as a scan that does not
   pollute the cache. Its output is unpersisted and stays resident until the next checkpoint.
   With geometric merging, the base run is rewritten rarely. Measure how often it happens in

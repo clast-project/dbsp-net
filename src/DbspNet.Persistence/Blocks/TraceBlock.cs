@@ -113,9 +113,9 @@ internal sealed class TraceBlock : ITraceBlock
 
     private void Touch()
     {
-        if (BlockAccess.Enabled)
+        if (BlockAccess.Enabled && _stamp.Touch())
         {
-            _stamp.Touch();
+            BlockAccess.RecordStack(ResidentBytes);
         }
     }
 
