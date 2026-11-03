@@ -408,6 +408,22 @@ public static class StatefulOperators
         OffsetSpec<StructuralRow>[] specs,
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null)
+        where TKey : notnull =>
+        PartitionedOffset(builder, input, partitionOf, order, specs, partitionComparer, snapshotCodec, chunkFormat: null, orderPrefix: null);
+
+    /// <summary>As the public overload, with the per-partition input in the ordered store when
+    /// <paramref name="chunkFormat"/> is set, routed by <paramref name="orderPrefix"/> (a numeric
+    /// prefix of the first ORDER BY key, consistent with <paramref name="order"/>; §3.19).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> PartitionedOffset<TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, TKey> partitionOf,
+        IComparer<StructuralRow> order,
+        OffsetSpec<StructuralRow>[] specs,
+        IEqualityComparer<TKey>? partitionComparer,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
+        Blocks.ITraceBlockFormat? chunkFormat,
+        Func<StructuralRow, long>? orderPrefix)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -435,8 +451,12 @@ public static class StatefulOperators
             return new StructuralRow(vs);
         }
 
-        return builder.PartitionedOffset<StructuralRow, StructuralRow, TKey>(
-            input, partitionOf, order, specs, Widen, partitionComparer, snapshotCodec);
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(input);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new PartitionedOffsetOp<StructuralRow, StructuralRow, TKey>(
+            input, output, partitionOf, order, specs, Widen, partitionComparer, snapshotCodec, chunkFormat, orderPrefix));
+        return output;
     }
 
     /// <summary>

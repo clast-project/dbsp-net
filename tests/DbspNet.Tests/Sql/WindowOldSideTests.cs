@@ -31,6 +31,13 @@ public sealed class WindowOldSideTests
         "COUNT(x) OVER (PARTITION BY p ORDER BY t RANGE BETWEEN 3 PRECEDING AND CURRENT ROW)",
         "MAX(x) OVER (PARTITION BY p ORDER BY t DESC)",
         "COUNT(CASE WHEN x > 1 THEN x END) OVER (PARTITION BY p ORDER BY t)",
+        // Offsets: on blocks, large partitions read only the neighbourhood of a change (§3.19).
+        "LEAD(x, 2) OVER (PARTITION BY p ORDER BY t, id)",
+        "LAG(id, 1) OVER (PARTITION BY p ORDER BY t DESC, id)",
+        "FIRST_VALUE(x) OVER (PARTITION BY p ORDER BY t)",
+        "LAST_VALUE(id) OVER (PARTITION BY p ORDER BY t DESC)",
+        "LAG(x) OVER (PARTITION BY p ORDER BY CASE WHEN t > 5 THEN t END NULLS FIRST, id)",
+        "LEAD(id, 3, -1) OVER (PARTITION BY p ORDER BY CASE WHEN t < 4 THEN t END DESC NULLS LAST, id)",
     ];
 
     // blocks: the window's input held as blocks (§3.13), with tiny runs so freezes and merges
@@ -82,7 +89,10 @@ public sealed class WindowOldSideTests
 
             for (var n = rnd.Next(1, 6); n > 0; n--)
             {
-                var row = new object?[] { next++, rnd.Next(2), rnd.Next(blocks ? 12 : 3), Values[rnd.Next(Values.Length)] };
+                // Sometimes a second copy of a live row: weights above one fill several slots.
+                var row = live.Count > 0 && rnd.Next(5) == 0
+                    ? live[rnd.Next(live.Count)]
+                    : new object?[] { next++, rnd.Next(2), rnd.Next(blocks ? 12 : 3), Values[rnd.Next(Values.Length)] };
                 live.Add(row);
                 input.Insert(row);
             }
