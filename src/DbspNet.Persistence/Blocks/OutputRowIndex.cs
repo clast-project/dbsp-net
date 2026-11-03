@@ -74,6 +74,9 @@ public abstract class OutputRowIndex
     /// <summary>The live addresses of <paramref name="row"/> as of the last commit (tests).</summary>
     public abstract IReadOnlyCollection<long> AddressesOf(object row);
 
+    /// <summary>The blocked index's trace and its spill files (tests).</summary>
+    internal virtual (BlockedIndexedTrace Trace, int SpillFiles)? Blocks => null;
+
     private static InvalidOperationException TooFew(long count, long live) =>
         new($"asked to delete {count} copies of a row it holds {live} of.");
 
@@ -136,6 +139,10 @@ public abstract class OutputRowIndex
         private readonly int _blockEntries;
         private BlockedIndexedTrace _trace;
 
+        // With an evicting block cache, the index's runs are written to scratch files after each
+        // batch so the cache can drop them (docs/design-bounded-memory.md §3.9).
+        private readonly BlockSpill? _spill = BlockSpill.Create();
+
         // The batch's entries, flat: integrated as one run at commit (sorted and encoded once; §3.10).
         private List<StructuralRow> _keys = new();
         private List<long> _addresses = new();
@@ -154,6 +161,8 @@ public abstract class OutputRowIndex
         }
 
         public override bool IsBlocked => true;
+
+        internal override (BlockedIndexedTrace Trace, int SpillFiles)? Blocks => (_trace, _spill?.Files ?? 0);
 
         private BlockedIndexedTrace NewTrace() => new(_format, _freezeEntries, blockEntries: _blockEntries);
 
@@ -222,6 +231,7 @@ public abstract class OutputRowIndex
             var addresses = _addresses;
             var weights = _weights;
             _trace.IntegrateEntries(keys.Count, i => keys[i], i => new StructuralRow(addresses[i]), i => weights[i]);
+            _spill?.Spill(_trace, _format);
             ResetBatch();
         }
 
@@ -247,6 +257,7 @@ public abstract class OutputRowIndex
         public override void Clear()
         {
             _trace = NewTrace();
+            _spill?.Clear();
             ResetBatch();
             Count = 0;
         }

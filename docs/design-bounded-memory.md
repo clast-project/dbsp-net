@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7).** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -427,6 +427,56 @@ The options:
 Server GC keeps the heap it committed, and batch 1's peak sets it (§1.4: batch 1 is not bounded).
 Bounding the process needs that peak bounded (spilling) and the GC told
 (`GCHeapHardLimit`/`GCConserveMemory`). Neither is measured yet.
+
+### 3.9 The output row index, spilled (2026-11-03)
+
+Option (a) of §3.8. The incremental Delta connector's `OutputRowIndex` is part of no checkpoint,
+so it gets its own **spill** (`BlockSpill`).
+- **Where:** a private scratch directory, `DBSPNET_BLOCK_SPILL_DIR` (default the temp directory),
+  one subdirectory per index, removed at process exit.
+- **When:** after each batch's `Commit`, synchronously, every run without a file is written
+  there (`BlockedTraceCheckpoint.SpillRun`) and rebound at once. The files are a cache, not
+  state, so there is no commit point to wait for.
+- **Cleanup:** files whose runs merges have retired are deleted, and `Clear` deletes them all.
+- **Gating:** only with an evicting cache. With the cache off, no spill is created.
+
+**Tests.** `OutputRowIndexSpillTests` runs the model test at a 1-byte budget, with every block
+evicted, and checks that runs are file-backed with one file per live run. A mutant that never
+deletes stale files fails it.
+
+**Memory, 128 MiB**, views identical:
+
+| | before | with spill |
+|---|---|---|
+| warm, after batches 1–3 (flat) | 1.04 GB | **0.51 GB** |
+| restarted process | 0.85 GB | **0.33 GB** |
+
+From the start of the arc, a 128 MiB budget takes the warm live heap 5.78 GB → 0.51 GB.
+
+**Time.**
+
+Run20, 5 runs per arm, medians against main:
+
+| | main | 512 MiB |
+|---|---|---|
+| b1 output | 1,946 ms | **+36% (≈+700 ms)**: the index's ~0.5 GB written synchronously in the output phase |
+| b1 checkpoint | 2,552 ms | +4% |
+| b2 drain | 93 ms | +12% (+11 ms) |
+| b3 drain | 118 ms | +5% |
+| b3 checkpoint | 247 ms | +13% (overlapping) |
+
+Run21, cache off against main, 6 runs per arm (run20's cache-off +22% on b1 output was drift; it
+did not reproduce):
+
+| | main | cache off |
+|---|---|---|
+| b1 output | 2,126 ms | +3% (overlapping) |
+| b1 checkpoint | 2,666 ms | −4% |
+| drains | | within noise |
+
+**Not built:** moving the spill write off the output path, into the background, rebinding at the
+next commit. §3.24 of the flat-trace doc found that a background write between batches only
+moves the cost when there is no idle time, and ivm-bench has none.
 
 ### 3.4 Gates
 
