@@ -1731,6 +1731,52 @@ across 12 workers.
 17.0 s with background GC: worth measuring on its own (restart, checkpoint, output, Nexmark)
 before considering it as a default.
 
+### 3.32 Codec and format metadata: one per row shape (2026-11-03, branch `arc/codec-intern`)
+
+**Census after §3.31** (4.95M references at the SF=3 checkpoint): WindowAggregate's 2.0M were
+almost all *metadata*: its snapshot codec (0.79M) and the two block formats of its partition store
+(1.1M, each holding its own codec). Row state (blocks, the chunk map) was about 0.2M. Across all
+operators, the snapshot-codec fields alone held 2.06M references, and the formats nested in block
+traces and stores more: each `ArrowZSetTraceCodec` / `ArrowIndexedZSetTraceCodec` builds three
+Arrow `Schema`s, each with its own field lookups (`Grouping<String, …>`, `Field[]`, dictionaries),
+and every stateful operator on every one of the 12 workers built its own, for the same few row
+shapes.
+
+**Change.** `CodecInterning`: a process-wide cache of codecs and block formats keyed by row shape
+(each column's name and full SQL type). `ArrowSqlSnapshotCodecs` and `BlockSchema.TryCreate` (and
+the codec inside a `BlockSchema`) go through it. Sound because codecs and formats are immutable
+after construction (a codec's lazily built format is a benign race between equal values), read
+nothing of a schema but names and types (not qualifiers or lateness), and nothing keys state on
+their identity. `DBSPNET_CODEC_INTERN=off` restores one per request.
+
+**Tests.** `CodecInterningTests`: equal shapes share whatever their qualifiers and lateness;
+nullability, precision, name or the key/value split give another instance; an unencodable shape
+stays without a format; a shared format encodes and decodes correctly from 12 threads at once. A
+shape key without types fails it and 60 persistence tests. The suite passes with blocks on, off,
+and interning off.
+
+**Measured.** SF=3 W=12, five alternating runs against main (medians; views byte-identical in
+every run, batch 1 and restart):
+
+| | main | one codec per shape |
+|---|--:|--:|
+| References at the checkpoint | 4.95M | **1.32M** (−73%) |
+| Objects | 2.35M | 0.91M |
+| Heap bytes | 5.87 GB | 5.79 GB |
+| WindowAggregate references | 2.04M | 0.29M |
+| batch-1 drain (ms) | 18,716 | 17,573 |
+| batch-1 GC pause | 6,155 | 6,107 |
+| batch-1 checkpoint | 2,541 | 2,578 |
+| restart: restore | 183 | 165 (−10%) |
+| restart: first drain | 477 | 470 |
+| batch 3 drain / checkpoint | 241 / 247 | 233 / 249 |
+
+Main's batch-1 runs here sat mostly in the slow background-GC state of §3.31 (18.2–19.0 s); the
+branch's mostly in the fast one (16.8–18.3 s). Nothing else moved outside noise.
+
+Largest holders now: inner joins 0.34M, WindowAggregate 0.29M, PartitionedRank 0.21M,
+IncrementalAggregate 0.14M, views 0.09M, the runner 0.09M.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
