@@ -53,8 +53,15 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     internal const int SmallGroup = 8;
 
     // Not under frontier GC: LATENESS already bounds that state, and a blocked trace learns which
-    // groups GC dropped from the caches.
-    private bool RefoldsSmallGroups => !_aggregator.CanPersistState && _frontier is null;
+    // groups GC dropped from the caches. A float aggregate (CanPersistState) refolds too when its
+    // rows can be put in a canonical order (§3.27): an uncached group then always emits the fold
+    // of its rows in that order, which the next touch reproduces bit for bit.
+    private bool RefoldsSmallGroups => _frontier is null && (!_aggregator.CanPersistState || _canonical is not null);
+
+    // The canonical row order for float refolds (blocked traces only; null: floats keep caches).
+    private readonly IComparer<TValue>? _canonical;
+
+    private bool CanonicalFolds => _canonical is not null && _aggregator.CanPersistState;
 
     // Lazy restore (docs/design-durable-state.md §1f, increment 4): when the trace comes back cold,
     // the per-group caches are rebuilt one key at a time, the first time a delta touches it, instead
@@ -75,9 +82,11 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec = null,
         IFrontier? frontier = null,
         Func<TKey, long>? monotoneKey = null,
-        IGroupTrace<TKey, TValue, Z64>? trace = null)
+        IGroupTrace<TKey, TValue, Z64>? trace = null,
+        IComparer<TValue>? canonicalOrder = null)
     {
         _trace = trace ?? new ManagedGroupTrace<TKey, TValue, Z64>();
+        _canonical = canonicalOrder;
         _input = input;
         _output = output;
         _aggregator = aggregator;
@@ -117,6 +126,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         if (!_aggregator.CanPersistState || !_snapshotCodec!.SupportsKeyedBlobs)
         {
+            DemoteCaches(null);
             return;
         }
 
@@ -140,6 +150,42 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         await _snapshotCodec.SaveKeyedBlobsAsync(writer, "aggstate.arrows", entries, cancellationToken)
             .ConfigureAwait(false);
+        DemoteCaches(entries);
+    }
+
+    /// <summary>
+    /// After a checkpoint (§3.27): a refolding operator on a blocked trace drops its remaining
+    /// caches — its large groups' — as a lazy restore leaves them. The next touch of such a group
+    /// refolds it and overlays its persisted float state (<paramref name="blobs"/>, the checkpoint's
+    /// own); an exact one just refolds.
+    /// </summary>
+    private void DemoteCaches(List<(TKey Key, byte[] Blob)>? blobs)
+    {
+        // Only on a blocked trace (the one that is given a canonical order), whose touches route
+        // uncached groups to the refold above; a managed trace's go through EnsureCaches.
+        if (!RefoldsSmallGroups || _canonical is null || _aggCache.Count == 0)
+        {
+            return;
+        }
+
+        if (_aggregator.CanPersistState)
+        {
+            if (blobs is null)
+            {
+                return; // no persisted state to rebuild float slots from: keep the caches
+            }
+
+            _pendingBlobs ??= new Dictionary<TKey, byte[]>();
+            foreach (var (key, blob) in blobs)
+            {
+                _pendingBlobs[key] = blob;
+            }
+        }
+
+        _aggCache.Clear();
+        _stateCache.Clear();
+        _aggCache.TrimExcess();
+        _stateCache.TrimExcess();
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -246,7 +292,51 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         }
     }
 
-    private static ZSet<TValue, Z64> Decode(IMultiset<TValue, Z64> view)
+    // A group's rows, consolidated, inserted in canonical order into a fresh builder: its
+    // iteration order, and so a fold over it, is a function of the rows alone (§3.27).
+    private ZSet<TValue, Z64> Canonical(IEnumerable<KeyValuePair<TValue, Z64>> rows)
+    {
+        var sorted = new List<KeyValuePair<TValue, Z64>>();
+        foreach (var (value, weight) in Decode(rows))
+        {
+            sorted.Add(new(value, weight));
+        }
+
+        if (sorted.Count == 0)
+        {
+            return ZSet<TValue, Z64>.Empty;
+        }
+
+        var order = _canonical!;
+        sorted.Sort((a, b) => order.Compare(a.Key, b.Key));
+        var builder = new ZSetBuilder<TValue, Z64>();
+        foreach (var (value, weight) in sorted)
+        {
+            builder.Add(value, weight);
+        }
+
+        return builder.Build();
+    }
+
+    // A group with a persisted state and no caches: fold its rows, overlay the state (the float
+    // slots' incremental accumulators), and cache the value that state gives — the one emitted.
+    // False when the trace no longer holds the group (its state is moot).
+    private bool RebuildFromBlob(TKey key, ZSet<TValue, Z64> group, byte[] blob)
+    {
+        if (group.IsEmpty)
+        {
+            return false;
+        }
+
+        object? state = null;
+        _aggregator.Update(ref state, Optional<TOut>.None, group, group);
+        _aggregator.MergePersistedState(ref state, blob);
+        _aggCache[key] = _aggregator.Update(ref state, Optional<TOut>.None, ZSet<TValue, Z64>.Empty, group);
+        _stateCache[key] = state;
+        return true;
+    }
+
+    private static ZSet<TValue, Z64> Decode(IEnumerable<KeyValuePair<TValue, Z64>> view)
     {
         var builder = new ZSetBuilder<TValue, Z64>();
         foreach (var (value, weight) in view)
@@ -303,15 +393,20 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
                 // before-group as a view that decodes only if it walks the group.
                 var bound = (beforeView as Blocks.BlockedGroupView)?.EntryBound ?? int.MaxValue;
                 ZSet<TValue, Z64>? refold = null;
-                if (RefoldsSmallGroups && !_aggCache.ContainsKey(key))
+                if (RefoldsSmallGroups)
                 {
-                    // An exact group without caches (small, new, or not yet touched since a lazy
-                    // restore; §3.20): its old value and state come from refolding its rows, which
-                    // is what a lazy restore's rebuild does. Its size only decides whether the
-                    // caches are kept after this change — a bound can rise without the group
-                    // being touched (another key sharing its hash), so absence, not size, routes here.
-                    refold = Decode(beforeView);
-                    _cachesBuilt?.Add(key);
+                    // A group without caches (small, new, or not touched since a lazy restore or a
+                    // checkpoint; §3.20, §3.27): with a persisted state (a large group, or a small one
+                    // from an older snapshot) its caches are rebuilt from its rows and that state;
+                    // otherwise its old value and state come from refolding its rows (canonically,
+                    // for floats). Its size only decides whether the caches are kept after this
+                    // change — a bound can rise without the group being touched (another key
+                    // sharing its hash), so absence, not size, routes here.
+                    if (!_aggCache.ContainsKey(key)
+                        && !(_pendingBlobs is not null && _pendingBlobs.Remove(key, out var blob) && RebuildFromBlob(key, Decode(beforeView), blob)))
+                    {
+                        refold = CanonicalFolds ? Canonical(beforeView) : Decode(beforeView);
+                    }
                 }
                 else if (_cachesBuilt is not null)
                 {
@@ -326,7 +421,8 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
                         : new LazyViewMergeMultiset<TValue>(beforeView, groupDelta),
                     builder,
                     refold,
-                    keepCaches: !RefoldsSmallGroups || (long)bound + groupDelta.Count > SmallGroup);
+                    keepCaches: !RefoldsSmallGroups || (long)bound + groupDelta.Count > SmallGroup,
+                    beforeView: beforeView);
                 continue;
             }
 
@@ -381,7 +477,8 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         IMultiset<TValue, Z64> afterGroup,
         ZSetBuilder<(TKey, TOut), Z64> builder,
         ZSet<TValue, Z64>? refold = null,
-        bool keepCaches = true)
+        bool keepCaches = true,
+        IMultiset<TValue, Z64>? beforeView = null)
     {
         Optional<TOut> oldAgg;
         object? state = null;
@@ -398,7 +495,20 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             _stateCache.TryGetValue(key, out state);
         }
 
-        var newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
+        Optional<TOut> newAgg;
+        if (CanonicalFolds && beforeView is not null && (refold is not null || !keepCaches))
+        {
+            // A float group that is (or was) uncached, or that drops its caches now, emits the
+            // canonical fold of its rows, so the next touch's refold recovers it (§3.27). One that
+            // keeps caches from here on starts from this fold's state.
+            var after = Canonical((refold ?? Decode(beforeView)) + groupDelta);
+            state = null;
+            newAgg = after.IsEmpty ? Optional<TOut>.None : _aggregator.Update(ref state, Optional<TOut>.None, after, after);
+        }
+        else
+        {
+            newAgg = _aggregator.Update(ref state, oldAgg, groupDelta, afterGroup);
+        }
 
         // Cache-pruning is keyed on "is there literally no trace
         // entry?" (dict-shape IsEmpty), not on the aggregator's

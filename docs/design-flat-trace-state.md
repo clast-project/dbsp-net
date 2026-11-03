@@ -1455,6 +1455,109 @@ Two of the new arm's batch-1 outputs took 3.4–3.5 s. That tail appears about o
 across both arms in earlier runs (the Delta write; the output phase touches no join), so it is
 noise, not this change.
 
+### 3.27 Aggregate caches, round 2: plan — float slots and large groups (2026-11-03, branch `arc/agg-float-caches`)
+
+**Census after §3.26:** IncrementalAggregate holds 9.5M of the checkpoint heap's 18.8M references,
+almost all in the two per-group caches (`_stateCache` 5.8M, `_aggCache` 3.5M); the traces are
+blocks. Seven operators hold them, and **every one mixes float aggregates (SUM, AVG or STDDEV over
+DOUBLE) with exact ones**, so the composite reports `CanPersistState` and §3.20's refold is off for
+all its groups. A histogram at the checkpoint (SF=3, all workers):
+
+| Group size (entries) | Groups | Entries |
+|:--|--:|--:|
+| 1 | 235K | 235K |
+| 2–8 | 60K | 124K |
+| 9–64 | 2.7K | 81K |
+| 65–512 | 1.9K | 253K |
+| 513–4096 | 2.5K | 2.56M |
+
+98% of groups are small; `_aggCache` is mostly theirs. The 7.1K large groups (date- and
+low-cardinality-keyed reports) hold COUNT(DISTINCT) value multisets of `Utf8String`/`Date32`:
+most of `_stateCache`. The persisted float-slot state averages about 31 bytes a group.
+
+**Why floats keep caches.** The value emitted for a group must be retracted exactly later. An
+incremental float fold (deltas in arrival order) can differ in the last bits from a refold of the
+current rows, so a refold cannot recover the emitted value; the state is persisted for the same
+reason (§7.2 of the persistence design).
+
+**Part 1 — small groups refold canonically, floats included.** If a group that keeps no caches
+always *emits* the fold of its rows in a canonical order (sorted by `StructuralRowComparer`), its
+emitted value is a pure function of its rows, and the next touch's canonical refold reproduces it
+bit for bit. So, on a blocked trace, with or without float slots:
+- **A touch of an uncached group:** the old value is the canonical refold of the before-group.
+- **The new value** of a group that will not keep caches is the canonical refold of the
+  after-group (not the incremental update), so the next touch recovers it. A cached group that
+  shrinks to the threshold emits this too, retracting its cached value.
+- **A small group that grows past the threshold** starts caching from the refolded state; from
+  then on it is incremental, as today, and persists its float state.
+- **Small groups persist no state blob**: a restore refolds them.
+- Exact aggregators already refold; for them the canonical order changes nothing but the cost of
+  a sort of at most 8 rows.
+
+**Part 2 — large groups drop their caches at the checkpoint.** After a checkpoint has written
+their state blobs, a large group's caches go, as a lazy restore leaves them (§1f of the durable
+design): the next touch refolds the group and overlays its float blob (`EnsureCaches`), then caches
+until the next checkpoint. The blobs (7.1K, ~31 bytes each) stay in the existing managed
+`_pendingBlobs`. Cost: one refold of each large group the next batch touches.
+
+**Unchanged:** LATENESS (frontier GC) aggregates, managed traces, the spine family.
+
+**Tests:** extend `AggregateCacheFreeTests` with mixed float + exact composites (SUM DOUBLE with
+COUNT(DISTINCT), MIN, AVG), groups growing past the threshold and shrinking back, and a
+checkpoint-and-restore mid-stream; each group must keep exactly one row in the integrated view,
+and exact columns must match a fresh run. Persistence conformance covers restore.
+
+**Gate:** batch-1 drain no worse than main (+3%), restart and batch 3 no worse, identical
+outputs, census. 5 alternating runs against a main build.
+
+### 3.28 Aggregate caches, round 2: built and measured (2026-11-03, branch `arc/agg-float-caches`)
+
+**Built as planned (§3.27).** The blocked aggregate takes `StructuralRowComparer` as its canonical
+order. "Canonical" is the group's consolidated rows inserted in sorted order into a fresh builder,
+whose iteration order is then a function of the rows alone (row hashes are deterministic). A
+touched group without caches that has a pending state blob (a large group after a checkpoint or
+restore, or a small one from an older snapshot) is rebuilt from its rows and the blob; otherwise
+it is refolded. Demotion runs only on a blocked trace, after the checkpoint has computed the blobs.
+
+**Tests:** `AggregateCacheFreeTests.FloatComposite_OneRowPerGroup_ExactColumnsMatch_AcrossCheckpoints`
+(SUM and AVG over DOUBLE with COUNT(DISTINCT), MIN and COUNT(*); groups growing past the threshold
+and back; checkpoints mid-stream, half the seeds continuing from a restored copy). Exact columns
+must match a fresh run, and a missed retraction would leave a second row for its group.
+Mutations caught: emitting the incremental float value, folding without the sort, demotion
+dropping the blobs, a rebuild that ignores the blob. Skipping demotion still passes (it is an
+optimization, not a correctness condition). The suite passes with blocks on and off.
+
+**Census at the SF=3 checkpoint:**
+
+| | main | round 2 |
+|:--|--:|--:|
+| References | 18.8M | **9.5M** (−49%) |
+| Objects | 12.9M | 4.7M |
+| Heap bytes | 6.51 GB | 6.08 GB |
+| IncrementalAggregate references | 9.52M | 0.27M |
+
+The two caches are empty at the checkpoint; what remains is the pending blobs of the large groups
+(49K references) and the blocked traces.
+
+**Wall clock against main** (5 alternating runs, two binaries, medians, ms). Views are
+byte-identical in every run, batch 1 and restart: in ivm-bench the canonical fold changed no
+float output.
+
+| | main | round 2 |
+|---|--:|--:|
+| batch-1 drain | 16,430 | 16,634 (+1.2%) |
+| batch-1 GC pause | 6,204 | 5,923 (−4.5%) |
+| batch-1 checkpoint | 2,574 | 2,628 |
+| batch-1 output | 2,469 | 2,275 |
+| restart: restore | 240 | 232 |
+| restart: first drain | 517 | 480 (−7%) |
+| restart: first output | 3,451 | 3,540 |
+| batch 3 drain | 242 | 238 |
+
+The gate holds. Batch-1 drain is within +3% and inside run-to-run noise (±2.5 s), and the restart
+and batch 3 are level or better. The first drain after the checkpoint, which pays one refold per
+touched large group, is not slower.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
