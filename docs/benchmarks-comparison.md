@@ -23,6 +23,41 @@ Stream: 1,000,000 events (20,000 person, 60,000 auction, 920,000 bid). Host: .NE
 >
 > Queries q5 / q7 / q8 (tumbling / sliding event-time windows) are omitted: they require TUMBLE / HOP windowing table functions that DbspNet does not yet expose. q9 uses `ROW_NUMBER() OVER (PARTITION … ORDER …)` which compiles to a partitioned incremental TOP-K.
 
+## Nexmark head-to-head vs Feldera — M4 Pro, 2026-11-02 (after the flat-trace-state arc)
+
+DbspNet at `1e3a232`, Feldera at `78afc9077` (unchanged). The same settings as 10-31: 10M events,
+14 cores, batch 10,000, the same 13 queries; DbspNet median of 3 after a warm-up, Feldera one run.
+Three passes, run one after another: (A) the full comparison with blocks off (the shipped
+default), (B) DbspNet only with `DBSPNET_TRACE_BLOCKS=all`, (C) DbspNet only with blocks off
+again, to bound drift.
+
+| Query | Feldera (14c) | A: W=14 off | **A ÷ Feldera** | 10-31 ÷ Feldera | B: W=14 `all` | C: W=14 off | B ÷ mean(A, C) |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| q0 | 9.86M | 12.58M | **1.28×** | 1.28× | 11.91M | 12.64M | 0.94 |
+| q1 | 8.20M | 10.87M | **1.33×** | 1.25× | 10.47M | 10.82M | 0.97 |
+| q2 | 9.54M | 11.98M | **1.26×** | 1.27× | 11.69M | 12.04M | 0.97 |
+| q3 | 6.32M | 12.68M | **2.01×** | 2.14× | 12.26M | 12.22M | 0.98 |
+| q4 | 3.29M | 4.65M | **1.41×** | 1.42× | 3.85M | 3.84M | 0.91 (A and C differ by 17%) |
+| q9 | 1.64M | 4.63M | **2.83×** | 2.82× | 3.66M | 4.53M | **0.80** |
+| q15 | 0.38M | 4.11M | **10.79×** | 13.33× | 5.06M | 4.08M | **1.24** |
+| q16 | 0.27M | 5.44M | **20.32×** | 20.90× | 5.36M | 5.19M | 1.01 |
+| q17 | 0.66M | 8.35M | **12.59×** | 12.53× | 7.97M | 7.40M | 1.01 |
+| q18 | 3.43M | 5.77M | **1.68×** | 1.77× | 5.64M | 5.73M | 0.98 |
+| q19 | 2.57M | 5.55M | **2.16×** | 2.19× | 5.55M | 5.51M | 1.00 |
+| q20 | 2.83M | 4.75M | **1.68×** | 1.72× | 4.76M | 4.86M | 0.99 |
+| q22 | 8.23M | 9.19M | **1.12×** | 1.14× | 8.96M | 9.18M | 0.98 |
+
+- **No regression on the shipped path.** DbspNet still beats Feldera on all 13 queries, and the
+  ratios match 10-31 within this box's noise (only differences beyond ~1.5× are readable at W=14;
+  q15's 13.3× → 10.8× is within it, and A and C agree on q15). The arc changed the default path
+  only in the window operators (no stored output), which Nexmark does not use.
+- **With blocks on (`all`), most queries are at parity.** One loss: **q9 −20%** at W=14 (B is below
+  both A and C; at W=1 the three agree, 2.58–2.63M), so it is a parallel-only cost of the blocked
+  join or TOP-K path. One gain: **q15 +24%** (blocked DISTINCT/aggregate). q4's B matches C, and it
+  is A that differs (drift).
+- **What this means for `all` as a default:** Nexmark is neutral except for q9. Before turning
+  blocks on by default, q9 at W=14 needs a look.
+
 ## Nexmark head-to-head vs Feldera — M4 Pro, 2026-10-31 (UTF-8 string cells)
 
 The generator now hands DbspNet VARCHAR cells as `Utf8String` (UTF-8, as Feldera's generator builds
