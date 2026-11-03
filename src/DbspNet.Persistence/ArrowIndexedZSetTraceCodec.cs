@@ -37,7 +37,11 @@ internal sealed class ArrowIndexedZSetTraceCodec
 {
     private readonly SqlSchema _keySchema;
     private readonly SqlSchema _valueSchema;
-    private readonly ArrowSchema _arrowSchemaWithWeight;
+    // The single-stream snapshot layout's schema, built on its first use (§3.33): with runs, only
+    // the run schema is read. A race builds equal values.
+    private ArrowSchema? _arrowSchemaWithWeight;
+
+    private ArrowSchema ArrowSchemaWithWeight => _arrowSchemaWithWeight ??= BuildArrowSchema(_keySchema, _valueSchema);
 
     public ArrowIndexedZSetTraceCodec(SqlSchema keySchema, SqlSchema valueSchema)
     {
@@ -45,9 +49,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
         ArgumentNullException.ThrowIfNull(valueSchema);
         _keySchema = keySchema;
         _valueSchema = valueSchema;
-        _arrowSchemaWithWeight = BuildArrowSchema(keySchema, valueSchema);
         _runSchema = new ArrowSchema(
-            [.. _arrowSchemaWithWeight.FieldsList, new Field("__hash", Int32Type.Default, nullable: false)], metadata: null);
+            [.. BuildArrowSchema(keySchema, valueSchema).FieldsList, new Field("__hash", Int32Type.Default, nullable: false)], metadata: null);
         SchemaFingerprint = Persistence.SchemaFingerprint.Of(keySchema, valueSchema);
     }
 
@@ -323,10 +326,10 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
         arrays[keyCount + valueCount] = weightBuilder.Build();
 
-        using var batch = new RecordBatch(_arrowSchemaWithWeight, arrays, rowCount);
+        using var batch = new RecordBatch(ArrowSchemaWithWeight, arrays, rowCount);
         await using var file = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false);
         await using var stream = file.AsStream();
-        using var ipcWriter = new ArrowStreamWriter(stream, _arrowSchemaWithWeight, leaveOpen: true);
+        using var ipcWriter = new ArrowStreamWriter(stream, ArrowSchemaWithWeight, leaveOpen: true);
         ipcWriter.WriteRecordBatch(batch);
         ipcWriter.WriteEnd();
     }
