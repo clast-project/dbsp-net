@@ -1558,6 +1558,38 @@ The gate holds. Batch-1 drain is within +3% and inside run-to-run noise (±2.5 s
 and batch 3 are level or better. The first drain after the checkpoint, which pays one refold per
 touched large group, is not slower.
 
+### 3.29 Rank on blocks: no stored output, partitions in the ordered store (2026-11-03, branch `arc/rank-blocks`)
+
+**Census after §3.28:** PartitionedRank holds 4.3M of the checkpoint heap's 9.5M references, one
+operator (#532) 4.0M of them. It keeps every partition twice: `_accum`, the integrated input as a
+sorted dictionary per partition (2.0M), and `_window`, the widened output last emitted, keyed by
+widened row (2.1M), whose only use is diffing the next recompute against it. About 105K rows in
+1.1K partitions (≈100 rows each), wide rows with many boxed `Double` cells.
+
+**Change.** As the window operators did (§3.12, §3.22):
+- **No stored output.** Rank is positional and a function of the partition's rows, so the old
+  ranking is the ranking of the rows before the delta: the partition now, minus its share of the
+  delta. The operator walks the two versions together in order (a merge of the current rows with
+  the sorted delta), ranking each with its own tracker, and widens only the rows whose rank or
+  weight changed. ROW_NUMBER emits only the positions that differ between a row's old and new
+  ranges. This replaces "recompute the whole widened partition and diff two dictionaries", so a
+  touched partition no longer re-widens every row.
+- **Partitions in `OrderedPartitionStore`** (with blocks for windows on). Rank reads whole
+  partitions, so the store runs with no order value: every partition is small, its record a
+  blocked trace and its managed map a write-back cache dropped at each checkpoint (§3.22).
+  A restore faults partitions straight into the store.
+- With blocks off, the managed partitions remain but `_window` is gone too.
+
+**Tests.** `RankOldSideTests`: ROW_NUMBER, RANK, DENSE_RANK; partitioned, global and multi-key
+partitions; ties; second copies of live rows; several deletes a tick; checkpoints (which drop the
+cache) and, in one arm, restores into a fresh program; managed, blocked, blocked with restore. The
+integrated view must equal a fresh run every tick. Mutations caught: skipping a row whose weight is
+unchanged but whose rank moved, ranking the old version with the new weights, an unsorted delta,
+ties by the total order instead of the ORDER BY keys. Not dropping the cache at a checkpoint still
+passes (an optimization). The suite passes with blocks on and off.
+
+**Measured.** SF=3 W=12, five alternating runs against main: PENDING.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

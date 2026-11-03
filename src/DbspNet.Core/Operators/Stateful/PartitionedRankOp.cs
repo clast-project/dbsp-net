@@ -176,9 +176,10 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             return;
         }
 
-        // Only the partitions a tick touches can change their ranking: their share of the delta.
+        // Only the partitions a tick touches can change their ranking: each one's rows before the
+        // delta, read now (in order, as the next read after the delta will be).
         var touched = new Dictionary<TKey, List<(TInRow Row, long Weight)>>(_partitionComparer);
-        foreach (var (row, dw) in delta)
+        foreach (var (row, _) in delta)
         {
             var key = _partitionOf(row);
             if (_lazy is not null)
@@ -186,12 +187,10 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
                 Fault(key);
             }
 
-            if (!touched.TryGetValue(key, out var rows))
+            if (!touched.ContainsKey(key))
             {
-                touched[key] = rows = new();
+                touched[key] = Current(key);
             }
-
-            rows.Add((row, dw.Value));
         }
 
         if (_store is not null)
@@ -227,9 +226,9 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
 
         var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
-        foreach (var (key, change) in touched)
+        foreach (var (key, before) in touched)
         {
-            EmitDiff(builder, Current(key), change);
+            EmitDiff(builder, before, Current(key));
         }
 
         _store?.EndTick();
@@ -261,32 +260,32 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     }
 
     // Rank assignment over one version of a partition, a row at a time in order. ROW_NUMBER gives a
-    // weight-w row the w positions after Position; RANK / DENSE_RANK give every row of a tie group
-    // (equal ORDER BY keys, contiguous in the total order) one shared rank.
+    // weight-w row the w positions after the one returned; RANK / DENSE_RANK give every row of a tie
+    // group (equal ORDER BY keys, contiguous in the total order) one shared rank. A group starts
+    // where a row's ORDER BY keys differ from the previous row's (the caller decides, so the old and
+    // new versions can share one comparison when their previous rows are the same).
     private struct Ranker
     {
         private long _rowsBefore;
         private long _dense;
         private long _groupRank;
-        private TInRow? _groupKey;
-        private bool _inGroup;
 
-        // The row's rank (RANK / DENSE_RANK) or the position before its first copy (ROW_NUMBER).
-        public long Next(PartitionedRankOp<TInRow, TOutRow, TKey> op, TInRow row, long weight)
+        public TInRow? Previous;
+
+        public long Next(RankFunction function, TInRow row, long weight, bool startsGroup)
         {
-            if (op._function == RankFunction.RowNumber)
+            Previous = row;
+            if (function == RankFunction.RowNumber)
             {
                 var start = _rowsBefore;
                 _rowsBefore += weight;
                 return start;
             }
 
-            if (!_inGroup || op._sortKeyOnly.Compare(_groupKey!, row) != 0)
+            if (startsGroup)
             {
                 _dense++;
-                _groupRank = op._function == RankFunction.DenseRank ? _dense : _rowsBefore + 1;
-                _groupKey = row;
-                _inGroup = true;
+                _groupRank = function == RankFunction.DenseRank ? _dense : _rowsBefore + 1;
             }
 
             _rowsBefore += weight;
@@ -295,57 +294,88 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     }
 
     /// <summary>
-    /// Emit the change in one partition's widened output: its rows now (<paramref name="current"/>,
-    /// ordered) against its rows before the tick (<paramref name="current"/> minus
-    /// <paramref name="change"/>), walked together. A row whose rank and weight are unchanged emits
-    /// nothing and is never widened.
+    /// Emit the change in one partition's widened output: its rows before the tick
+    /// (<paramref name="before"/>) against its rows now (<paramref name="after"/>), both in order,
+    /// walked together. Rows unchanged by the tick are the same objects in both, so most steps need no
+    /// comparison. A row whose rank and weight are unchanged emits nothing and is never widened.
     /// </summary>
-    private void EmitDiff(ZSetBuilder<TOutRow, Z64> builder, List<(TInRow Row, long Weight)> current, List<(TInRow Row, long Weight)> change)
+    private void EmitDiff(ZSetBuilder<TOutRow, Z64> builder, List<(TInRow Row, long Weight)> before, List<(TInRow Row, long Weight)> after)
     {
-        change.Sort((a, b) => _order.Compare(a.Row, b.Row));
-        var before = default(Ranker);
-        var after = default(Ranker);
+        var old = default(Ranker);
+        var now = default(Ranker);
+        var ranks = _function != RankFunction.RowNumber;
         int i = 0, j = 0;
-        while (i < current.Count || j < change.Count)
+        while (i < before.Count || j < after.Count)
         {
+            int c;
+            if (i >= before.Count)
+            {
+                c = 1;
+            }
+            else if (j >= after.Count)
+            {
+                c = -1;
+            }
+            else
+            {
+                c = ReferenceEquals(before[i].Row, after[j].Row) ? 0 : _order.Compare(before[i].Row, after[j].Row);
+            }
+
             TInRow row;
-            long now = 0, dw = 0;
-            var c = i >= current.Count ? 1 : j >= change.Count ? -1 : _order.Compare(current[i].Row, change[j].Row);
+            long was = 0, isNow = 0;
             if (c <= 0)
             {
-                (row, now) = current[i++];
+                (row, was) = before[i++];
                 if (c == 0)
                 {
-                    dw = change[j++].Weight;
+                    isNow = after[j++].Weight;
                 }
             }
             else
             {
-                (row, dw) = change[j++];
+                (row, isNow) = after[j++];
             }
 
-            var was = now - dw;
-            var oldRank = was > 0 ? before.Next(this, row, was) : 0;
-            var newRank = now > 0 ? after.Next(this, row, now) : 0;
-            if (was == now && oldRank == newRank)
+            // Tie-group boundaries, one comparison per version unless both versions' previous rows
+            // are the same row.
+            bool oldStarts = false, newStarts = false;
+            if (ranks)
+            {
+                if (was > 0)
+                {
+                    oldStarts = old.Previous is null || _sortKeyOnly.Compare(old.Previous, row) != 0;
+                }
+
+                if (isNow > 0)
+                {
+                    newStarts = was > 0 && ReferenceEquals(old.Previous, now.Previous) && old.Previous is not null
+                        ? oldStarts
+                        : now.Previous is null || _sortKeyOnly.Compare(now.Previous, row) != 0;
+                }
+            }
+
+            // (Previous is read above before Next moves it on.)
+            var oldRank = was > 0 ? old.Next(_function, row, was, oldStarts) : 0;
+            var newRank = isNow > 0 ? now.Next(_function, row, isNow, newStarts) : 0;
+            if (was == isNow && oldRank == newRank)
             {
                 continue;
             }
 
-            if (_function == RankFunction.RowNumber)
+            if (!ranks)
             {
-                // Positions (oldRank, oldRank + was] become (newRank, newRank + now]; the overlap stays.
-                for (var p = oldRank + 1; p <= oldRank + Math.Max(was, 0); p++)
+                // Positions (oldRank, oldRank + was] become (newRank, newRank + isNow]; the overlap stays.
+                for (var p = oldRank + 1; p <= oldRank + was; p++)
                 {
-                    if (!(p > newRank && p <= newRank + Math.Max(now, 0)))
+                    if (p <= newRank || p > newRank + isNow)
                     {
                         builder.Add(_widen(row, p), new Z64(-1));
                     }
                 }
 
-                for (var p = newRank + 1; p <= newRank + Math.Max(now, 0); p++)
+                for (var p = newRank + 1; p <= newRank + isNow; p++)
                 {
-                    if (!(p > oldRank && p <= oldRank + Math.Max(was, 0)))
+                    if (p <= oldRank || p > oldRank + was)
                     {
                         builder.Add(_widen(row, p), new Z64(1));
                     }
@@ -354,9 +384,9 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
                 continue;
             }
 
-            if (was > 0 && now > 0 && oldRank == newRank)
+            if (was > 0 && isNow > 0 && oldRank == newRank)
             {
-                builder.Add(_widen(row, newRank), new Z64(now - was));
+                builder.Add(_widen(row, newRank), new Z64(isNow - was));
                 continue;
             }
 
@@ -365,9 +395,9 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
                 builder.Add(_widen(row, oldRank), new Z64(-was));
             }
 
-            if (now > 0)
+            if (isNow > 0)
             {
-                builder.Add(_widen(row, newRank), new Z64(now));
+                builder.Add(_widen(row, newRank), new Z64(isNow));
             }
         }
     }
