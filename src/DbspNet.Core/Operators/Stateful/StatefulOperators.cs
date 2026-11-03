@@ -221,6 +221,23 @@ public static class StatefulOperators
         RankFunction function,
         IEqualityComparer<TKey>? partitionComparer = null,
         IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec = null)
+        where TKey : notnull =>
+        PartitionedRank(builder, input, partitionOf, order, sortKeyOnly, function, partitionComparer, snapshotCodec, null, null);
+
+    /// <summary><see cref="PartitionedRank{TKey}(CircuitBuilder, Stream{ZSet{StructuralRow, Z64}}, Func{StructuralRow, TKey}, IComparer{StructuralRow}, IComparer{StructuralRow}, RankFunction, IEqualityComparer{TKey}?, IZSetTraceCodec{StructuralRow, Z64}?)"/>
+    /// with its partitions held as blocks (docs/design-flat-trace-state.md §3.29): <paramref name="chunkFormat"/>
+    /// (no key, the row) and <paramref name="blockFormat"/> (partition key, the row).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> PartitionedRank<TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, TKey> partitionOf,
+        IComparer<StructuralRow> order,
+        IComparer<StructuralRow> sortKeyOnly,
+        RankFunction function,
+        IEqualityComparer<TKey>? partitionComparer,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
+        Blocks.ITraceBlockFormat? chunkFormat,
+        Blocks.ITraceBlockFormat? blockFormat)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -245,7 +262,7 @@ public static class StatefulOperators
 
         var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
         builder.AddRawOperator(new PartitionedRankOp<StructuralRow, StructuralRow, TKey>(
-            input, output, partitionOf, order, sortKeyOnly, function, Widen, partitionComparer, snapshotCodec));
+            input, output, partitionOf, order, sortKeyOnly, function, Widen, partitionComparer, snapshotCodec, chunkFormat, blockFormat));
         return output;
     }
 

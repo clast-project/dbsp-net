@@ -1558,6 +1558,89 @@ The gate holds. Batch-1 drain is within +3% and inside run-to-run noise (±2.5 s
 and batch 3 are level or better. The first drain after the checkpoint, which pays one refold per
 touched large group, is not slower.
 
+### 3.29 Rank on blocks: no stored output, partitions in the ordered store (2026-11-03, branch `arc/rank-blocks`)
+
+**Census after §3.28:** PartitionedRank holds 4.3M of the checkpoint heap's 9.5M references, one
+operator (#532) 4.0M of them. It keeps every partition twice: `_accum`, the integrated input as a
+sorted dictionary per partition (2.0M), and `_window`, the widened output last emitted, keyed by
+widened row (2.1M), whose only use is diffing the next recompute against it. About 105K rows in
+1.1K partitions (≈100 rows each), wide rows with many boxed `Double` cells.
+
+**Change.** As the window operators did (§3.12, §3.22):
+- **No stored output.** Rank is positional and a function of the partition's rows, so the old
+  ranking is the ranking of the rows before the delta: the partition now, minus its share of the
+  delta. The operator walks the two versions together in order (a merge of the current rows with
+  the sorted delta), ranking each with its own tracker, and widens only the rows whose rank or
+  weight changed. ROW_NUMBER emits only the positions that differ between a row's old and new
+  ranges. This replaces "recompute the whole widened partition and diff two dictionaries", so a
+  touched partition no longer re-widens every row.
+- **Partitions in `OrderedPartitionStore`** (with blocks for windows on, partitioned ranks only; see below). Rank reads whole
+  partitions, so the store runs with no order value: every partition is small, its record a
+  blocked trace and its managed map a write-back cache dropped at each checkpoint (§3.22).
+  A restore faults partitions straight into the store.
+- With blocks off, the managed partitions remain but `_window` is gone too.
+
+**Tests.** `RankOldSideTests`: ROW_NUMBER, RANK, DENSE_RANK; partitioned, global and multi-key
+partitions; ties; second copies of live rows; several deletes a tick; checkpoints (which drop the
+cache) and, in one arm, restores into a fresh program; managed, blocked, blocked with restore. The
+integrated view must equal a fresh run every tick. Mutations caught: skipping a row whose weight is
+unchanged but whose rank moved, ranking the old version with the new weights, an unsorted delta,
+ties by the total order instead of the ORDER BY keys. Not dropping the cache at a checkpoint still
+passes (an optimization). The suite passes with blocks on and off.
+
+**First measurement and two corrections.** The first A/B (as above) cut references at the
+checkpoint from 9.5M to 5.6M (PartitionedRank 4.28M → 0.31M) with views identical, but batch-3
+drain rose 236 → 273 ms (+16%, every run). The operator profile put it all on worker 0: the
+global ranks of `market_volatility` (`RANK() OVER (ORDER BY return_volatility DESC, symb)`, about
+1.8K rows) and `daily_market_pulse` (0.7K), gathered to one worker, touched every tick, rank time
+43.7 → 72.2 ms and allocation 2.7×. Every row's volatility changes each batch, so every rank
+shifts, and recomputing the old side recreates every old widened row to retract it.
+- **Large partitions keep their emitted output.** A partition past `PromoteRows` (512) rows diffs
+  its widened output against a stored copy, as before; a smaller one recomputes. The old rows are
+  always at hand (read before the delta), so a missing stored output is recomputed: crossing the
+  threshold either way, and a restore, need nothing special. (Also tried first: reading the old
+  rows before the delta and walking both versions in lockstep, with no delta sort and no
+  comparisons for rows unchanged by the tick. Kept, but it moved rank time only 72 → 67 ms.)
+- **Global ranks stay managed.** One partition, touched every tick on the serial worker: reading
+  it out of the store and reloading it after each checkpoint cost more than its few references.
+  Blocks are for partitioned ranks, where the references are (#532 held 4.0M).
+
+With both, batch-3 rank time is 41.9 ms against main's 43.7, allocation 3.7 against 3.8 MiB.
+`RankOldSideTests` gained arms with a tiny threshold (partitions crossing it both ways, with and
+without restores); treating a missing stored output as empty fails them, and keeping a stored
+output for a partition below the threshold still passes (correct, only less frugal).
+
+**Second measurement:** with stored output for every partition past 512 rows, blocked or not,
+timings were level with main throughout (batch-3 drain 242 vs 234 ms), but #532's few large
+partitions kept 0.96M references of stored output: rank 4.28M → 1.24M, total 9.5M → 6.5M. The
+profile had put the regression only on the global ranks, so stored output is now for managed rank
+state only (the global ranks, and everything with blocks off); a blocked partitioned rank always
+recomputes.
+
+**Measured (final).** SF=3 W=12, five alternating runs against main (medians, ms; views
+byte-identical in every run, batch 1 and restart):
+
+| | main | rank on blocks |
+|---|--:|--:|
+| References at the checkpoint | 9.5M | **5.57M** (−41%) |
+| of which PartitionedRank | 4.28M | 0.33M |
+| Heap bytes | 6.08 GB | 6.01 GB |
+| batch-1 drain | 16,590 | 16,947 (+2.1%) |
+| batch-1 GC pause | 6,103 | 6,027 |
+| batch-1 checkpoint | 2,719 | 2,584 |
+| batch-1 output | 2,289 | 2,229 |
+| restart: restore | 231 | 231 |
+| restart: first drain | 470 | 499 (+6%) |
+| restart: first output | 3,523 | 3,641 (+3%) |
+| batch 3 drain | 237 | 247 (+4%) |
+
+Batch-1 drain is inside the +3% gate. The restart first drain and batch 3 are slightly slower
+(+29 and +10 ms medians; the ranges overlap: batch 3 is 232–244 against 235–266). That is what a
+blocked partitioned rank costs when a batch touches its partitions: each one is read back from its
+blocked record after a checkpoint has dropped the cache, and its old ranking recomputed. The first
+version's +16% on batch 3 came from the global ranks and is gone.
+
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
