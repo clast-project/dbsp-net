@@ -1,23 +1,25 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
-using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Aggregators;
 
 namespace DbspNet.Core.Operators.Stateful.Blocks;
 
 /// <summary>
-/// A window operator's per-partition input, reference-free, read in order and only as far as a
-/// change reaches (docs/design-flat-trace-state.md §3.15).
+/// A window operator's per-partition input, read in order and only as far as a change reaches
+/// (docs/design-flat-trace-state.md §3.15, §3.18).
 /// </summary>
 /// <remarks>
-/// <para>Two homes. A <b>small</b> partition lives in a shared <see cref="BlockedIndexedTrace"/>
-/// (partition key → row), where reading it whole is cheap: one block's header serves many small
-/// partitions. A partition read with more than <c>promoteAt</c> rows becomes <b>large</b>: a list of
+/// <para>A partition's representation follows its size. A <b>small</b> partition is managed: a
+/// sorted dictionary of its rows, so touching it decodes nothing (on blocks every touch decoded
+/// the partition, and small partitions are touched often relative to their size, §3.17). A
+/// partition that grows past <c>promoteAt</c> rows becomes <b>large</b>: a list of reference-free
 /// chunks, each one block of rows sorted by (order value, total order), with its first and last
-/// order value, its rows' order values, and — when the window's aggregate combines exactly — its
+/// order value, its rows' order values, and, when the window's aggregate combines exactly, its
 /// partial aggregate. A peer group (equal order value) never spans chunks, so a value routes to one
-/// chunk. A change rewrites only the chunks it lands in; appends touch only the last.</para>
+/// chunk. A change rewrites only the chunks it lands in; appends touch only the last. A large
+/// partition stays large as it shrinks, since its chunks shrink with it, and leaves the store when
+/// empty.</para>
 /// <para>Reads see the state as of the last <see cref="Integrate"/>, consolidated, in order.</para>
 /// </remarks>
 internal sealed class OrderedPartitionStore
@@ -28,25 +30,23 @@ internal sealed class OrderedPartitionStore
     private readonly IPartialAggregator<StructuralRow, StructuralRow>? _partial;
     private readonly int _promoteAt;
     private readonly int _chunkRows;
-    private readonly BlockedIndexedTrace _small;
+    private readonly IComparer<StructuralRow> _rowOrder;
+    private readonly Dictionary<StructuralRow, SortedDictionary<StructuralRow, long>> _small = new();
     private readonly Dictionary<StructuralRow, List<Chunk>> _large = new();
+    private long _smallRows;
 
     private static readonly StructuralRow NoKey = new([]);
 
-    /// <param name="smallFormat">Blocks of the shared trace: the partition key, then the row.</param>
     /// <param name="chunkFormat">Blocks of a large partition's chunks: no key, the row.</param>
     /// <param name="valueOf">The ORDER BY value; null for a whole-partition frame, whose partitions
     /// stay small (with every row one peer group there is nothing to cut at).</param>
     /// <param name="order">The total order (ORDER BY, then the whole row).</param>
     /// <param name="partial">The window's aggregate when it combines exactly: chunks then carry partials.</param>
     public OrderedPartitionStore(
-        ITraceBlockFormat smallFormat,
         ITraceBlockFormat chunkFormat,
         Func<StructuralRow, long>? valueOf,
         IComparer<StructuralRow> order,
         IPartialAggregator<StructuralRow, StructuralRow>? partial,
-        int freezeEntries,
-        int blockEntries,
         int promoteAt = 512,
         int chunkRows = 512)
     {
@@ -56,7 +56,11 @@ internal sealed class OrderedPartitionStore
         _partial = partial is { IsExactPartial: true } ? partial : null;
         _promoteAt = valueOf is null ? int.MaxValue : promoteAt;
         _chunkRows = Math.Max(1, chunkRows);
-        _small = new BlockedIndexedTrace(smallFormat, freezeEntries, blockEntries: blockEntries);
+        _rowOrder = Comparer<StructuralRow>.Create((a, b) =>
+        {
+            var c = ValueOf(a).CompareTo(ValueOf(b));
+            return c != 0 ? c : _order.Compare(a, b);
+        });
     }
 
     /// <summary>Whether chunks carry partial aggregates (the aggregate combines exactly).</summary>
@@ -65,12 +69,12 @@ internal sealed class OrderedPartitionStore
     /// <summary>Large partitions (tests).</summary>
     internal int LargePartitions => _large.Count;
 
-    /// <summary>Entries held, an upper bound on the rows (cancelling small entries both count).</summary>
+    /// <summary>Rows held.</summary>
     public long Entries
     {
         get
         {
-            var n = _small.Entries;
+            var n = _smallRows;
             foreach (var chunks in _large.Values)
             {
                 foreach (var c in chunks)
@@ -98,6 +102,11 @@ internal sealed class OrderedPartitionStore
 
     private long ValueOf(StructuralRow row) => _valueOf?.Invoke(row) ?? 0L;
 
+    // Compare as a delegate built once (a method group would allocate one per sort).
+    private Comparison<(StructuralRow Row, long Weight, long Value)> _compare => _compareCache ??= Compare;
+
+    private Comparison<(StructuralRow Row, long Weight, long Value)>? _compareCache;
+
     private int Compare((StructuralRow Row, long Weight, long Value) a, (StructuralRow Row, long Weight, long Value) b)
     {
         var c = a.Value.CompareTo(b.Value);
@@ -112,107 +121,97 @@ internal sealed class OrderedPartitionStore
             return;
         }
 
-        List<(StructuralRow Key, StructuralRow Row, long Weight)>? small = null;
-        Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>? large = null;
-        foreach (var e in rows)
+        var byKey = new Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>();
+        foreach (var (key, row, weight) in rows)
         {
-            if (_large.ContainsKey(e.Key))
+            if (!byKey.TryGetValue(key, out var list))
             {
-                large ??= new();
-                if (!large.TryGetValue(e.Key, out var list))
-                {
-                    large[e.Key] = list = new();
-                }
+                byKey[key] = list = new();
+            }
 
-                list.Add((e.Row, e.Weight, ValueOf(e.Row)));
+            list.Add((row, weight, ValueOf(row)));
+        }
+
+        foreach (var (key, change) in byKey)
+        {
+            if (_large.ContainsKey(key))
+            {
+                ApplyLarge(key, change);
+            }
+            else if (change.Count > _promoteAt)
+            {
+                // A bulk change alone past the threshold (a load, a restored partition): straight to
+                // chunks, never built as a sorted dictionary first.
+                PromoteWith(key, change);
             }
             else
             {
-                (small ??= new()).Add(e);
-            }
-        }
-
-        // A partition whose share of this change alone passes the threshold (a bulk load, a restored
-        // partition) goes to chunks directly: through the shared trace it would be written, read
-        // back and retracted again — a large partition crossing the shared trace's merges twice.
-        if (small is not null && small.Count > _promoteAt)
-        {
-            var byKey = new Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>();
-            foreach (var (key, row, weight) in small)
-            {
-                if (!byKey.TryGetValue(key, out var list))
-                {
-                    byKey[key] = list = new();
-                }
-
-                list.Add((row, weight, ValueOf(row)));
-            }
-
-            List<(StructuralRow Key, StructuralRow Row, long Weight)>? rest = null;
-            foreach (var (key, list) in byKey)
-            {
-                if (list.Count > _promoteAt)
-                {
-                    PromoteWith(key, list);
-                }
-                else
-                {
-                    rest ??= new(small.Count);
-                    foreach (var (row, weight, _) in list)
-                    {
-                        rest.Add((key, row, weight));
-                    }
-                }
-            }
-
-            small = rest;
-        }
-
-        if (small is not null)
-        {
-            if (small.Count >= TraceBlocksMode.FreezeEntries)
-            {
-                _small.IntegrateEntries(small.Count, i => small[i].Key, i => small[i].Row, i => small[i].Weight);
-            }
-            else
-            {
-                var indexed = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-                foreach (var (key, row, weight) in small)
-                {
-                    indexed.Add(key, row, new Z64(weight));
-                }
-
-                _small.Integrate(indexed.Build());
-            }
-        }
-
-        if (large is not null)
-        {
-            foreach (var (key, delta) in large)
-            {
-                ApplyLarge(key, delta);
+                ApplySmall(key, change);
             }
         }
     }
 
-    /// <summary>Move the shared trace's managed levels into runs (an idle tick).</summary>
-    public void Freeze() => _small.Freeze();
+    private void ApplySmall(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> change)
+    {
+        if (!_small.TryGetValue(key, out var rows))
+        {
+            _small[key] = rows = new SortedDictionary<StructuralRow, long>(_rowOrder);
+        }
+
+        foreach (var (row, weight, _) in change)
+        {
+            rows.TryGetValue(row, out var current);
+            var next = current + weight;
+            if (next == 0)
+            {
+                if (rows.Remove(row))
+                {
+                    _smallRows--;
+                }
+            }
+            else
+            {
+                if (current == 0)
+                {
+                    _smallRows++;
+                }
+
+                rows[row] = next;
+            }
+        }
+
+        if (rows.Count == 0)
+        {
+            _small.Remove(key);
+        }
+    }
+
+    /// <summary>Kept for the operator's idle tick; managed and chunked state need no freezing.</summary>
+    public void Freeze()
+    {
+    }
+
+    /// <summary>Kept for the operator's step end; nothing is held across reads.</summary>
+    public void EndTick()
+    {
+    }
 
     /// <summary>Forget everything (a restore replaces the state).</summary>
     public void Clear()
     {
         _small.Clear();
         _large.Clear();
+        _smallRows = 0;
     }
 
     /// <summary>Every row and weight (a whole-state write).</summary>
     public IEnumerable<(StructuralRow Row, long Weight)> All()
     {
-        foreach (var (_, group) in _small.MaterializeUncached())
+        foreach (var rows in _small.Values)
         {
-            foreach (var (row, weight) in group)
+            foreach (var (row, weight) in rows)
             {
-                yield return (row, weight.Value);
+                yield return (row, weight);
             }
         }
 
@@ -282,37 +281,28 @@ internal sealed class OrderedPartitionStore
             return rows;
         }
 
-        // A small partition: its raw entries across levels, consolidated by the sort (equal rows
-        // meet) rather than by hashing every decoded row.
-        var raw = new List<(StructuralRow Row, long Weight, long Value)>();
-        var visitor = new Collect(raw, this);
-        _small.Probe(key, ref visitor);
-        var tSort = BlockTraceProfile.Now();
-        raw.Sort(Compare);
-        var all = new List<(StructuralRow Row, long Weight, long Value)>(raw.Count);
-        foreach (var e in raw)
+        // A small partition: already ordered and consolidated.
+        var all = new List<(StructuralRow Row, long Weight, long Value)>();
+        if (_small.TryGetValue(key, out var small))
         {
-            if (all.Count > 0 && Compare(all[^1], e) == 0)
+            all.Capacity = small.Count;
+            foreach (var (row, weight) in small)
             {
-                all[^1] = (all[^1].Row, all[^1].Weight + e.Weight, e.Value);
-            }
-            else
-            {
-                all.Add(e);
+                all.Add((row, weight, ValueOf(row)));
             }
         }
 
-        all.RemoveAll(e => e.Weight == 0);
         if (BlockTraceProfile.Enabled)
         {
             BlockTraceProfile.Section(12, t0, all.Count);
-            BlockTraceProfile.Section(15, tSort, all.Count);
         }
 
         if (all.Count > _promoteAt)
         {
             var tPromote = BlockTraceProfile.Now();
-            Promote(key, all);
+            _small.Remove(key);
+            _smallRows -= all.Count;
+            _large[key] = Cut(all);
             if (BlockTraceProfile.Enabled)
             {
                 BlockTraceProfile.Section(13, tPromote, all.Count);
@@ -320,17 +310,6 @@ internal sealed class OrderedPartitionStore
         }
 
         return all;
-    }
-
-    private readonly struct Collect(List<(StructuralRow Row, long Weight, long Value)> into, OrderedPartitionStore store) : ITraceVisitor
-    {
-        public void Row(StructuralRow value, Z64 weight) => into.Add((value, weight.Value, store.ValueOf(value)));
-
-        public void Entry(ITraceBlock block, int index, Z64 weight)
-        {
-            var row = block.Value(index);
-            into.Add((row, weight.Value, store.ValueOf(row)));
-        }
     }
 
     // The first chunk whose last value is not below `from` (the chunk a change at `from` lands in).
@@ -353,24 +332,20 @@ internal sealed class OrderedPartitionStore
         return Math.Min(lo, chunks.Count - 1);
     }
 
-    // A small partition and a change to it, together past the threshold: the partition's rows (if
-    // any) leave the shared trace, and the sum becomes chunks.
+    // A small partition (if any) and a change to it, together past the threshold: the partition
+    // leaves the managed map, and the sum becomes chunks.
     private void PromoteWith(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> change)
     {
-        var existing = _small.GroupView(key).Decoded();
-        if (!existing.IsEmpty)
+        if (_small.Remove(key, out var existing))
         {
-            var retract = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            _smallRows -= existing.Count;
             foreach (var (row, weight) in existing)
             {
-                retract.Add(key, row, Z64.Negate(weight));
-                change.Add((row, weight.Value, ValueOf(row)));
+                change.Add((row, weight, ValueOf(row)));
             }
-
-            _small.Integrate(retract.Build());
         }
 
-        change.Sort(Compare);
+        change.Sort(_compare);
         var merged = new List<(StructuralRow Row, long Weight, long Value)>(change.Count);
         foreach (var e in change)
         {
@@ -389,19 +364,6 @@ internal sealed class OrderedPartitionStore
         {
             _large[key] = Cut(merged);
         }
-    }
-
-    // A small partition's sorted rows become chunks; the shared trace forgets them.
-    private void Promote(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> sorted)
-    {
-        var retract = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
-        foreach (var (row, weight, _) in sorted)
-        {
-            retract.Add(key, row, new Z64(-weight));
-        }
-
-        _small.Integrate(retract.Build());
-        _large[key] = Cut(sorted);
     }
 
     // A large partition's change: each touched chunk is decoded, merged with its share of the
@@ -517,4 +479,5 @@ internal sealed class OrderedPartitionStore
 
         return new Chunk(_chunkFormat.Encode(keys, rows, weights, hashes, n), values, partial);
     }
+
 }

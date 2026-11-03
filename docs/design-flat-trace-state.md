@@ -1086,6 +1086,83 @@ fold is cheaper than the incremental one, 7.8 s).
 **Left opt-in, pending a decision.** The remaining batch-1 levers: one-row partitions need no
 window state at all (a row's frame is itself), and the bulk encode could move off the step thread.
 
+### 3.17 Batch 1's remaining window cost (2026-11-02, branch `arc/flat-trace-window-fresh`)
+
+**Built:**
+- **A key filter** (a scalable Bloom filter over partition keys, plain bit arrays). A partition
+  the filter has never seen is read from the tick's own rows instead of probed for in every run.
+  Small-partition reads went from 5.2 to 3.1 s CPU in batch 1. The last tick's rows are dropped
+  when the step ends. Holding them until the next change had cost 22M references at the
+  checkpoint, caught by the census.
+- **One-row fast paths** in the union and the read. The union fell from 9.5 to 5.9 s.
+- **Mutable slot holders** for the exact partials: folding a row allocates nothing.
+- **`RetainedRows` reads the entry count.** It had decoded the whole state, every tick, in
+  profiling runs.
+
+**Mutations:** a key wrongly treated as new is caught. Three others change no result: forgetting
+keys after a lazy restore (cold partitions are faulted in before the delta, so the filter is
+never wrong), not recording a promoted key, and stale keys after a clear (false positives only
+cost a probe).
+
+**Wall clock against `all`** (5 alternating runs, outputs identical): batch-1 drain +3.2% and
++4.7% in two A/Bs (16.6 → 17.4 s in the second), restart first drain +3–5%, restore +3–5%,
+batch 3 −16% and +3% (noisy). References are −37% (155.4M → 97.3M).
+
+**Where the remaining batch-1 cost is:** small partitions. The full operator profile
+(`DBSPNET_PROFILE_TOP`) shows every small window operator slower on blocks (dim_customer's
+22 operators: about 110 → 200 ms and 40 → 140 MiB each; accounts' and securities' alike). These
+are mostly whole-partition MAX windows over wide rows (about 35 columns), touched in many ticks.
+Each touch decodes the partition's rows from blocks, while the managed store already holds them
+as objects. That is the price of holding small partitions as blocks, and no constant-factor fix
+removes it. The big operators (daily_market) are faster on chunks than managed.
+
+**Options (decision pending):**
+1. **Small partitions managed, large ones as chunks.** The decode churn goes, and so do the
+   references the blocked small partitions save (about 1.1M of the 3.7M window rows: trades' one-row
+   partitions and the customer windows), so references would be about −26% instead of −37%.
+   Batch 1 should come in at or under `all`, because the large windows are faster on chunks.
+2. **Keep everything blocked:** −37% references, batch 1 +3–5%.
+3. **Decode cheaper:** strings aliasing the block bytes. But output rows carry the cells
+   downstream, so aliased strings would pin blocks. Not recommended.
+
+### 3.18 Small partitions managed, large ones chunked: `window` joins `all` (2026-11-02)
+
+**Decided (§3.17 option 1, agreed with Curt):** a partition's representation follows its size.
+- **Small partitions are managed:** a sorted dictionary per partition, ordered by (order value,
+  total order), so a read is already ordered and consolidated and decodes nothing.
+- **Large partitions:** one that grows past 512 rows (at a read, or at integrate time when one
+  change alone takes it past) becomes ordered chunks with exact partials (§3.15). A chunked
+  partition that shrinks keeps its (smaller) chunks and leaves the store when empty. If it
+  returns, it starts small again.
+- **The key filter (§3.17) is gone:** a managed lookup is already cheap.
+
+c91b00f; tests unchanged, plus a check that a read never holds a zero weight (a mutation that
+kept zeros was invisible to results but leaked). Four mutations of the small side: all caught.
+
+**Wall clock against `all` before the change** (5 alternating runs, outputs identical, medians, ms):
+
+| | all | all + window |
+|---|---|---|
+| batch-1 drain | 16,760 | 16,741 (−0.1%) |
+| batch-1 GC pause | 5,938 | 5,641 (−5%) |
+| batch-1 output write | 2,398 | 2,178 (−9%) |
+| batch-1 checkpoint | 2,529 | 2,355 (−7%) |
+| restart: restore | 244 | 261 (ranges overlap; a lazy restore never touches the store) |
+| restart: first drain | 521 | 532 (+2%) |
+| batch 3 drain | 293 | 270 (−8%) |
+
+A profiled run shows why batch 1 is now neutral. The large windows (daily_market) are faster on
+chunks than managed, window-aggregate CPU fell from 32.1 to 22.4 s, and the engine step went
+from 15.7 to 14.4 s.
+
+**Census after the checkpoint:** references 155.4M → 130.6M (−16%), bytes 8.57 → 8.42 GB,
+WindowAggregate references 60.9M → 35.4M. That is less than the −26% estimated: the managed
+small partitions hold more of the window rows than the row counts suggested.
+
+**Decided by §3.15's rule:** `window` joins `all`. `DBSPNET_TRACE_BLOCKS=all` is now joins,
+aggregates, DISTINCT, views and the window aggregate. The offset operator (LAG/LEAD) and the
+remaining managed window state are next.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and

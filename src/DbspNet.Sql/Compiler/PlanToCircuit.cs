@@ -2783,19 +2783,12 @@ public static partial class PlanToCircuit
 
         var frontier = ResolveWindowFrontier(plan, ctx);
 
-        // The per-partition input as blocks (§3.13): partition key → row, when every column has a
-        // block encoding and no frontier GC drops rows inside partitions.
+        // Frontier GC drops rows inside partitions, which the chunked store does not do.
         var gc = frontier is not null && orderValueOf is not null && plan.Frame?.Preceding is not null && !descending;
-        var blockFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine && !gc
-            ? TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema)
+        // A large partition's ordered chunks (§3.15, §3.18): no key, the row; small partitions stay managed.
+        var chunkFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine && !gc
+            ? TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema)
             : null;
-
-        // A large partition's ordered chunks (§3.15): no key, the row.
-        var chunkFormat = blockFormat is null ? null : TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema);
-        if (chunkFormat is null)
-        {
-            blockFormat = null;
-        }
 
         return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedWindowAggregate<StructuralRow>(
             input,
@@ -2809,7 +2802,7 @@ public static partial class PlanToCircuit
             partitionComparer: null,
             snapshotCodec: codec,
             frontier: frontier,
-            blockFormat: blockFormat,
+            blockFormat: null,
             chunkFormat: chunkFormat), Z("trace.arrows", reshardPlace, codec)));
     }
 

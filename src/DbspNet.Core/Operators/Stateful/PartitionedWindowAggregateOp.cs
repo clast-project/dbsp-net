@@ -127,26 +127,24 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
-        if (blockFormat is not null)
+        _ = blockFormat; // unused since §3.18: small partitions are managed, large ones chunks
+        if (chunkFormat is not null)
         {
             if (typeof(TInRow) != typeof(StructuralRow) || typeof(TKey) != typeof(StructuralRow))
             {
-                throw new ArgumentException("Blocked window state needs structural rows and partition keys.", nameof(blockFormat));
+                throw new ArgumentException("Blocked window state needs structural rows and partition keys.", nameof(chunkFormat));
             }
 
             if (GcApplies)
             {
-                throw new ArgumentException("Blocked window state does not support frontier GC.", nameof(blockFormat));
+                throw new ArgumentException("Blocked window state does not support frontier GC.", nameof(chunkFormat));
             }
 
             _store = new Blocks.OrderedPartitionStore(
-                blockFormat,
                 chunkFormat ?? throw new ArgumentNullException(nameof(chunkFormat)),
                 _orderValueOf is null ? null : row => _orderValueOf(As<TInRow>(row)),
                 (IComparer<StructuralRow>)(object)_order,
                 aggregator as Aggregators.IPartialAggregator<StructuralRow, StructuralRow>,
-                Blocks.TraceBlocksMode.FreezeEntries,
-                Blocks.TraceBlocksMode.BlockEntries,
                 promoteAt: Blocks.TraceBlocksMode.PromoteRows,
                 chunkRows: Blocks.TraceBlocksMode.ChunkRows);
         }
@@ -171,7 +169,9 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         {
             if (_store is not null)
             {
-                return _store.All().Count();
+                // Entries held (an upper bound): counting rows exactly would decode the state, and a
+                // profiling run reads this every tick.
+                return (int)Math.Min(int.MaxValue, _store.Entries);
             }
 
             var n = 0;
@@ -265,6 +265,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 RecomputePartition(builder, key, pd);
             }
 
+            _store?.EndTick();
             if (Blocks.BlockTraceProfile.Enabled)
             {
                 Blocks.BlockTraceProfile.Section(9, tRecompute, touched.Count);
@@ -365,6 +366,13 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     {
         var current = _store!.Read(key, from, to, needPrefix, out before);
 
+        // The common shape of a bulk load: a one-row partition whose row the delta brought.
+        if (current.Count == 1 && pd.Rows.Count == 1 && As<TInRow>(current[0].Row).Equals(pd.Rows[0].Row))
+        {
+            var (row, weight, value) = current[0];
+            return [new Entry(As<TInRow>(row), weight - pd.Rows[0].Dw, weight, value)];
+        }
+
         // One lookup per row read: the delta's weight, and whether the row was found — a delta row
         // never found was taken out entirely.
         var dws = new Dictionary<TInRow, (long Dw, bool Seen)>(pd.Rows.Count);
@@ -397,7 +405,11 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             }
         }
 
-        gone.Sort(CompareEntries);
+        if (gone.Count > 1)
+        {
+            gone.Sort(CompareEntries);
+        }
+
         var rows = new List<Entry>(current.Count + gone.Count);
         var g = 0;
         for (var i = 0; i < current.Count; i++)

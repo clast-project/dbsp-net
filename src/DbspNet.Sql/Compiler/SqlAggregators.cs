@@ -57,21 +57,21 @@ internal abstract class SqlAggregator
         => throw new NotSupportedException($"{GetType().Name} does not persist state.");
 
     /// <summary>Whether this aggregate combines exactly from partial results (§3.15): COUNT, MIN
-    /// and MAX. The slot accumulator is an immutable value (a boxed count, the best value so far).</summary>
+    /// and MAX. The slot accumulator is a mutable holder, so folding a row allocates nothing.</summary>
     public virtual bool IsExactPartial => false;
 
-    /// <summary>The slot accumulator of the empty multiset.</summary>
-    public virtual object? PartialEmpty() => throw new NotSupportedException(GetType().Name);
+    /// <summary>A new slot accumulator, of the empty multiset.</summary>
+    public virtual PartialSlot PartialNew() => throw new NotSupportedException(GetType().Name);
 
-    /// <summary><paramref name="acc"/> with <paramref name="row"/> at <paramref name="weight"/> folded in.</summary>
-    public virtual object? PartialAdd(object? acc, StructuralRow row, long weight) => throw new NotSupportedException(GetType().Name);
+    /// <summary>Fold <paramref name="row"/> at <paramref name="weight"/> into <paramref name="acc"/>.</summary>
+    public virtual void PartialAdd(PartialSlot acc, StructuralRow row, long weight) => throw new NotSupportedException(GetType().Name);
 
-    /// <summary><paramref name="earlier"/> and <paramref name="later"/> combined, ties going to the
+    /// <summary>Fold <paramref name="later"/> into <paramref name="earlier"/>, ties going to the
     /// earlier in fold order (as the fold and <see cref="Compute"/> keep the first best value).</summary>
-    public virtual object? PartialCombine(object? earlier, object? later) => throw new NotSupportedException(GetType().Name);
+    public virtual void PartialCombine(PartialSlot earlier, PartialSlot later) => throw new NotSupportedException(GetType().Name);
 
     /// <summary>The slot's value, equal to <see cref="Compute"/> over the same rows.</summary>
-    public virtual object? PartialResult(object? acc) => acc;
+    public virtual object? PartialResult(PartialSlot acc) => throw new NotSupportedException(GetType().Name);
 
     /// <summary>Writes a <c>double</c> then a <c>long</c> — the shape every persisted
     /// accumulator here starts with.</summary>
@@ -84,6 +84,15 @@ internal abstract class SqlAggregator
     }
 }
 
+/// <summary>One aggregate's partial accumulator (§3.15): a count, or the best value so far.</summary>
+internal sealed class PartialSlot
+{
+    public long Count;
+    public object? Best;
+
+    public PartialSlot Clone() => new() { Count = Count, Best = Best };
+}
+
 internal sealed class SqlCountStarAggregator : SqlAggregator
 {
     private sealed class CountState
@@ -93,11 +102,13 @@ internal sealed class SqlCountStarAggregator : SqlAggregator
 
     public override bool IsExactPartial => true;
 
-    public override object? PartialEmpty() => 0L;
+    public override PartialSlot PartialNew() => new();
 
-    public override object? PartialAdd(object? acc, StructuralRow row, long weight) => (long)acc! + weight;
+    public override void PartialAdd(PartialSlot acc, StructuralRow row, long weight) => acc.Count += weight;
 
-    public override object? PartialCombine(object? earlier, object? later) => (long)earlier! + (long)later!;
+    public override void PartialCombine(PartialSlot earlier, PartialSlot later) => earlier.Count += later.Count;
+
+    public override object? PartialResult(PartialSlot acc) => acc.Count;
 
     public override object? Compute(IMultiset<StructuralRow, Z64> rows)
     {
@@ -138,12 +149,19 @@ internal sealed class SqlCountAggregator : SqlAggregator
 
     public override bool IsExactPartial => true;
 
-    public override object? PartialEmpty() => 0L;
+    public override PartialSlot PartialNew() => new();
 
-    public override object? PartialAdd(object? acc, StructuralRow row, long weight) =>
-        _argExtract(row) is null ? acc : (long)acc! + weight;
+    public override void PartialAdd(PartialSlot acc, StructuralRow row, long weight)
+    {
+        if (_argExtract(row) is not null)
+        {
+            acc.Count += weight;
+        }
+    }
 
-    public override object? PartialCombine(object? earlier, object? later) => (long)earlier! + (long)later!;
+    public override void PartialCombine(PartialSlot earlier, PartialSlot later) => earlier.Count += later.Count;
+
+    public override object? PartialResult(PartialSlot acc) => acc.Count;
 
     private sealed class CountState
     {
@@ -433,25 +451,40 @@ internal sealed class SqlMinMaxAggregator : SqlAggregator
 
     // The best value so far (null for none): Compute's rule, rows of non-positive weight and NULL
     // values ignored, a later value replacing only a strictly better one.
-    public override object? PartialEmpty() => null;
+    public override PartialSlot PartialNew() => new();
 
-    public override object? PartialAdd(object? acc, StructuralRow row, long weight) =>
-        weight <= 0 || _argExtract(row) is not { } v ? acc : PartialCombine(acc, v);
-
-    public override object? PartialCombine(object? earlier, object? later)
+    public override void PartialAdd(PartialSlot acc, StructuralRow row, long weight)
     {
-        if (later is null)
+        if (weight > 0 && _argExtract(row) is { } v)
         {
-            return earlier;
+            Offer(acc, v);
+        }
+    }
+
+    public override void PartialCombine(PartialSlot earlier, PartialSlot later)
+    {
+        if (later.Best is { } v)
+        {
+            Offer(earlier, v);
+        }
+    }
+
+    public override object? PartialResult(PartialSlot acc) => acc.Best;
+
+    // A later value replaces the best only when strictly better.
+    private void Offer(PartialSlot acc, object v)
+    {
+        if (acc.Best is null)
+        {
+            acc.Best = v;
+            return;
         }
 
-        if (earlier is null)
+        var cmp = ((IComparable)v).CompareTo(acc.Best);
+        if (_wantMin ? cmp < 0 : cmp > 0)
         {
-            return later;
+            acc.Best = v;
         }
-
-        var cmp = ((IComparable)later).CompareTo(earlier);
-        return (_wantMin ? cmp < 0 : cmp > 0) ? later : earlier;
     }
 
     /// <summary>
@@ -1130,9 +1163,9 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
 {
     // The partial accumulator (§3.15): one slot accumulator per aggregate, plus the total weight
     // for the emission gate (None when the multiset's weights sum to zero).
-    private sealed class Partial(object?[] slots, long total)
+    private sealed class Partial(PartialSlot[] slots, long total)
     {
-        public readonly object?[] Slots = slots;
+        public readonly PartialSlot[] Slots = slots;
         public long Total = total;
     }
 
@@ -1156,10 +1189,10 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
 
     object IPartialAggregator<StructuralRow, StructuralRow>.NewAccumulator()
     {
-        var slots = new object?[_aggs.Count];
+        var slots = new PartialSlot[_aggs.Count];
         for (var i = 0; i < slots.Length; i++)
         {
-            slots[i] = _aggs[i].PartialEmpty();
+            slots[i] = _aggs[i].PartialNew();
         }
 
         return new Partial(slots, 0);
@@ -1170,7 +1203,7 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
         var p = (Partial)accumulator;
         for (var i = 0; i < _aggs.Count; i++)
         {
-            p.Slots[i] = _aggs[i].PartialAdd(p.Slots[i], row, weight);
+            _aggs[i].PartialAdd(p.Slots[i], row, weight);
         }
 
         p.Total += weight;
@@ -1182,7 +1215,7 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
         var o = (Partial)other;
         for (var i = 0; i < _aggs.Count; i++)
         {
-            p.Slots[i] = _aggs[i].PartialCombine(p.Slots[i], o.Slots[i]);
+            _aggs[i].PartialCombine(p.Slots[i], o.Slots[i]);
         }
 
         p.Total += o.Total;
@@ -1191,7 +1224,13 @@ internal sealed class CompositeAggregator : IAggregator<StructuralRow, Structura
     object IPartialAggregator<StructuralRow, StructuralRow>.Clone(object accumulator)
     {
         var p = (Partial)accumulator;
-        return new Partial((object?[])p.Slots.Clone(), p.Total);
+        var slots = new PartialSlot[p.Slots.Length];
+        for (var i = 0; i < slots.Length; i++)
+        {
+            slots[i] = p.Slots[i].Clone();
+        }
+
+        return new Partial(slots, p.Total);
     }
 
     Optional<StructuralRow> IPartialAggregator<StructuralRow, StructuralRow>.Result(object accumulator)
