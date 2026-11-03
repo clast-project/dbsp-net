@@ -1240,6 +1240,39 @@ without decoding) are at most `SmallGroup` = 8.
 **Gate:** batch-1 drain no worse than main (+3%), restart and batch 3 no worse, identical
 outputs, census. 5 alternating runs against a main build.
 
+### 3.21 Aggregate caches: built and measured (2026-11-02)
+
+**Built as planned (§3.20), with one correction (7286ff6).** Any exact group without caches is
+refolded, whatever its size. Size only decides whether the caches are kept after the change. A
+group's entry bound can rise without the group being touched (another key sharing its hash adds
+entries to the same block range), so routing small groups by size alone could have taken the
+cached path with no cache. Two exclusions:
+- **Frontier GC (LATENESS)** keeps the caches: that state is already bounded, and a blocked trace
+  learns which groups GC dropped from them (an operator metric test caught this).
+- **Float aggregates** (`CanPersistState`) keep their caches.
+
+**Tests:** a new test drives groups past the threshold and back, with repeated rows and several
+deletes per tick, comparing with a fresh managed run every tick. A DOUBLE SUM case checks only
+that each group keeps exactly one row, since its incremental fold need not match a fresh one bit
+for bit. The suite passes in three arms. Mutations:
+- **Caught:** letting float aggregates refold, and a refold that ignores the group.
+- **Equivalence check:** no caching at all for exact aggregators still passes every aggregate,
+  persistence and random-query test. Refolding is exact for all of them, COUNT(DISTINCT) included.
+
+**Wall clock against main** (5 alternating runs, two binaries, outputs identical, medians, ms):
+
+| | main | small groups uncached |
+|---|---|---|
+| batch-1 drain | 16,510 | 16,217 (−1.8%) |
+| batch-1 GC pause | 6,149 | 5,671 (−8%) |
+| batch-1 checkpoint | 2,408 | 2,123 (−12%) |
+| restart: restore | 252 | 251 |
+| restart: first drain | 515 | 457 (−11%) |
+| batch 3 drain | 245 | 251 (noise) |
+
+**Census:** references 113.3M → 99.3M (−12%), bytes 8.14 → 7.74 GB, objects 67.1M → 57.8M.
+IncrementalAggregate references 23.5M → 9.5M. Merged.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
