@@ -108,8 +108,9 @@ public class BlockedJoinTests
         return false;
     }
 
-    // Semi-joins (IN / EXISTS, plain and anti) and outer joins with a residual: their inner joins
-    // are blocked too, the semi-joins storing each row once (docs/design-flat-trace-state.md §3.26).
+    // Semi-joins (IN / EXISTS, plain and anti) and outer joins with a residual: blocked too, the
+    // semi-joins storing each row once (docs/design-flat-trace-state.md §3.26), the outer joins in
+    // the outer-join operator (§3.30).
     private static readonly string[] SemiAndResidualQueries =
     [
         "SELECT k, v FROM t WHERE v IN (SELECT v FROM u)",
@@ -132,7 +133,9 @@ public class BlockedJoinTests
             {
                 using (TraceBlocksMode.Use(join: true, freezeEntries: freeze, blockEntries: block))
                 {
-                    Assert.True(Blocked(Compile(RandomQuery.FixedDdl, SemiAndResidualQueries[q], emitted)) > 0, SemiAndResidualQueries[q]);
+                    // Semi-joins compile a blocked inner join; residual outer joins a blocked outer join (§3.30).
+                    var compiled = Compile(RandomQuery.FixedDdl, SemiAndResidualQueries[q], emitted);
+                    Assert.True(Blocked(compiled) + BlockedOuter(compiled) > 0, SemiAndResidualQueries[q]);
                 }
 
                 return CheckOne(SemiAndResidualQueries[q], ticks, freeze, block, emitted);

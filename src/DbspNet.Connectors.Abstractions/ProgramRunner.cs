@@ -368,6 +368,10 @@ public sealed class ProgramRunner
     /// <summary>Ingest every source version currently available (one engine tick per
     /// version, round-robin across sources) without writing outputs. Returns the number of
     /// ticks processed.</summary>
+    // DBSPNET_TICK_TIMES=1: one stderr line per tick (source, ingest and step wall, GC pause and
+    // collections during it) — where a slow drain loses its time. Diagnostic; off by default.
+    private static readonly bool TickTimes = Environment.GetEnvironmentVariable("DBSPNET_TICK_TIMES") == "1";
+
     public async ValueTask<long> DrainAsync(CancellationToken cancellationToken = default)
     {
         long ticks = 0;
@@ -377,7 +381,14 @@ public sealed class ProgramRunner
             progressed = false;
             foreach (var b in _inputs)
             {
-                var readStart = _profile is null ? 0 : Stopwatch.GetTimestamp();
+                var readStart = _profile is null && !TickTimes ? 0 : Stopwatch.GetTimestamp();
+                var pause0 = TickTimes ? GC.GetTotalPauseDuration() : TimeSpan.Zero;
+                int g0 = 0, g1 = 0, g2 = 0;
+                if (TickTimes)
+                {
+                    (g0, g1, g2) = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
+                }
+
                 var latest = await b.Connector.LatestOffsetAsync(cancellationToken).ConfigureAwait(false);
                 if (latest is null || latest.CompareTo(b.Cursor) <= 0)
                 {
@@ -414,11 +425,19 @@ public sealed class ProgramRunner
                     _profile.Source(b.Connector.Name).Add(ingestTicks - pushTicks, pushTicks, rows);
                 }
 
-                var stepStart = _profile is null ? 0 : Stopwatch.GetTimestamp();
+                var stepStart = _profile is null && !TickTimes ? 0 : Stopwatch.GetTimestamp();
                 _program.Step();
                 if (_profile is not null)
                 {
                     _profile.StepTicks += Stopwatch.GetTimestamp() - stepStart;
+                }
+
+                if (TickTimes)
+                {
+                    var end = Stopwatch.GetTimestamp();
+                    Console.Error.WriteLine(string.Create(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        $"TICK {ticks} source={b.Connector.Name} ingest_ms={(stepStart - readStart) * 1000.0 / Stopwatch.Frequency:F0} step_ms={(end - stepStart) * 1000.0 / Stopwatch.Frequency:F0} gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gc={GC.CollectionCount(0) - g0}/{GC.CollectionCount(1) - g1}/{GC.CollectionCount(2) - g2}"));
                 }
 
                 AccumulateIncrementalChanges();
