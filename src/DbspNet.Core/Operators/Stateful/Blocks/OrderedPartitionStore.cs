@@ -237,16 +237,25 @@ internal sealed class OrderedPartitionStore
         }
     }
 
-    /// <summary>An idle tick, or a checkpoint: drop the read cache and freeze the cold trace, so
-    /// what stays between batches is blocks (§3.22).</summary>
+    /// <summary>An idle tick: freeze the cold trace. The read cache stays, since an operator's idle
+    /// tick is not the end of a batch (an empty delta between two that touch the same partitions),
+    /// unless it has grown past <see cref="CacheCap"/> partitions. A checkpoint drops it
+    /// (<see cref="DropCache"/>).</summary>
     public void Freeze()
     {
         if (_cold is not null)
         {
-            _small.Clear();
+            if (_small.Count > CacheCap)
+            {
+                _small.Clear();
+            }
+
             _cold.Freeze();
         }
     }
+
+    /// <summary>Partitions the read cache may hold past an idle tick (a run without checkpoints).</summary>
+    internal const int CacheCap = 1 << 18;
 
     /// <summary>Drop the read cache (a checkpoint: the heap it leaves holds only the record).</summary>
     public void DropCache()
