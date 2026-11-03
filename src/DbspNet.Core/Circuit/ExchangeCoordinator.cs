@@ -28,7 +28,8 @@ internal interface IExchangeCoordinator : IDisposable
 /// any column is read. The grid is fully overwritten each tick (a worker
 /// publishes all <c>W</c> cells of its row, empty buckets included), and
 /// <see cref="ParallelCircuit"/>'s end-of-tick barrier separates a tick's
-/// reads from the next tick's writes — so no per-cell clearing is needed.
+/// reads from the next tick's writes — so a reader may clear its column as it
+/// gathers (<see cref="Take"/>), which frees the buckets at once.
 /// </remarks>
 internal sealed class ExchangeCoordinator<T> : IExchangeCoordinator
 {
@@ -58,6 +59,16 @@ internal sealed class ExchangeCoordinator<T> : IExchangeCoordinator
 
     /// <summary>Read the bucket worker <paramref name="from"/> sent to worker <paramref name="to"/>.</summary>
     internal T Read(int from, int to) => _mailbox[from, to];
+
+    /// <summary>Read the bucket and drop the grid's reference to it: the reader has its column to
+    /// itself until the end-of-tick barrier, and a bucket kept in the grid stayed alive for a whole
+    /// tick after its gather — 4.2 GB after ivm-bench's largest tick (docs/design-bounded-memory.md §4).</summary>
+    internal T Take(int from, int to)
+    {
+        var payload = _mailbox[from, to];
+        _mailbox[from, to] = default!;
+        return payload;
+    }
 
     public void Dispose() => _barrier.Dispose();
 }

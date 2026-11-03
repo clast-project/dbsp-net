@@ -488,6 +488,52 @@ These are the usual ones:
 - Peak RSS and the census.
 - Nexmark W=14: no regression with no budget.
 
+## 3a. Batch 1: where its peak is (2026-11-03)
+
+**Instrument.** `IVM_TICK_LIVE=1` (census only) samples after every batch-1 tick, through
+`ProgramRunner.AfterTick`. It forces a full compacting GC, then reports the heap before, the live
+bytes after, block bytes, unfrozen managed entries and window write-back rows.
+`IVM_TICK_CENSUS=<tick>` adds an object census at that tick. `IVM_TICK_DROPSTREAMS=<tick>` clears
+every operator stream's current value there and measures live again (an experiment, not a fix).
+
+**Batch 1 is one huge tick, not a climb.** Ticks 0–17 stay at 1.2–5.2 GB live. Tick 18
+(`trade_type`: a 4.8 s step, 18.6 GB allocated in that tick alone) peaks at **14.1 GB live and
+16.6 GB RSS**. Tick 19 (`audit`, small) falls back to 7.1 GB, of which 4.3 GB is blocks. RSS then
+stays at the high-water mark: server GC keeps what it committed.
+
+**What is live after tick 18** (14.1 GB):
+
+| part | bytes | lever |
+|---|---|---|
+| the tick's deltas, still referenced by operator streams (`Stream.Current` until the next tick overwrites it) | **6.3 GB** (clearing every stream value: 14.06 → 7.73 GB) | release a value once its consumers have read it. Not spilling. |
+| block state | 3.8 GB | spill runs mid-batch (Feldera's moderate-pressure mode) |
+| window write-back caches and chunks | ~2.4 GB (2.65 GB, 47M objects, at the drain's end) | flush by a byte cap as well as at checkpoint |
+| aggregate state caches, unfrozen levels, other | ~1.5 GB | — |
+
+**A false start: the exchange mailbox.** The tick-18 object census put 4.2 GB in the exchange
+coordinators' mailboxes. Buckets stayed in the W×W grid until the next tick overwrote them.
+Readers now `Take` their cell, clearing it as they gather. That is correct, and the suite passes,
+but live did not move (14.32 → 14.06 GB). The same rows stay reachable through the operators'
+output streams, which the census charges elsewhere or not at all. Clearing a pooled-array
+suspect (freeze's `ArrayPool` scratch arrays) did not move it either.
+
+**Order proposed.**
+1. **Release consumed stream values.** It targets 6.3 GB, and helps every batch's transient
+   peak, not only batch 1's. Two cuts:
+   - (a) clear every stream at the end of each tick, after the runner has read the outputs. This
+     is simple, and bounds what one tick keeps into the next.
+   - (b) release each value after its last consumer within the tick. This also lowers the in-tick
+     peak. It needs consumer counts and care with the output handles and exchanges that read
+     streams after `Step`.
+   - Check how Feldera's scheduler drops consumed values before choosing.
+2. **Window write-back caches:** flush to the record once they pass a byte budget.
+3. **Spill block runs mid-batch.** Write runs to the spill directory during the drain and rebind
+   them (§3.9's mechanism). A checkpoint can then link or copy them instead of re-encoding. This
+   is the Feldera-style lever, and it is the last 3.8 GB.
+
+Process RSS also needs the GC told: `GCHeapHardLimit` or `GCConserveMemory`, once the peak is
+bounded.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven

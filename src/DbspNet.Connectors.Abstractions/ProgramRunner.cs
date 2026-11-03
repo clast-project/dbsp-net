@@ -372,6 +372,10 @@ public sealed class ProgramRunner
     // collections during it) — where a slow drain loses its time. Diagnostic; off by default.
     private static readonly bool TickTimes = Environment.GetEnvironmentVariable("DBSPNET_TICK_TIMES") == "1";
 
+    /// <summary>Diagnostic: called after every drained tick with the tick's ordinal in the drain
+    /// (a harness samples live memory there; docs/design-bounded-memory.md §4). Null: nothing.</summary>
+    public static Action<long>? AfterTick { get; set; }
+
     public async ValueTask<long> DrainAsync(CancellationToken cancellationToken = default)
     {
         long ticks = 0;
@@ -441,6 +445,7 @@ public sealed class ProgramRunner
                 }
 
                 AccumulateIncrementalChanges();
+                AfterTick?.Invoke(ticks);
                 ticks++;
                 b.Cursor = batch.Offset;
                 if (_policy.Journal && _checkpoint is not null)

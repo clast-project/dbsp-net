@@ -266,6 +266,67 @@ public class IvmMultiBatch
 
             DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Epoch = batch;
             DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Drain;
+
+            // IVM_TICK_LIVE=1 (census only: a full compacting GC per tick): batch 1's memory over its
+            // ticks — heap before the GC (garbage included), live after, and the block state in it.
+            if (Environment.GetEnvironmentVariable("IVM_TICK_LIVE") == "1" && batch == firstBatch)
+            {
+                IReadOnlyList<DbspNet.Core.Circuit.RootCircuit> tickReplicas = parallel is not null ? parallel.Circuit.Replicas : [serial!.Circuit];
+                var tickRunner = runner;
+                DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = t =>
+                {
+                    var before = GC.GetGCMemoryInfo(GCKind.Any).HeapSizeBytes;
+                    var committed = GC.GetGCMemoryInfo(GCKind.Any).TotalCommittedBytes;
+                    var allocated = GC.GetTotalAllocatedBytes(precise: false);
+                    System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    var live = GC.GetGCMemoryInfo(GCKind.FullBlocking).PromotedBytes;
+                    var rows = BlockResidency.Walk(tickReplicas, tickRunner, -1);
+                    long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
+                    if (int.TryParse(Environment.GetEnvironmentVariable("IVM_TICK_CENSUS"), out var censusTick) && censusTick == t)
+                    {
+                        foreach (var line in StateCensus.Report($"tick{t}", StateCensus.Walk(tickReplicas, tickRunner, null, 3)))
+                        {
+                            _out.WriteLine(line);
+                        }
+                    }
+
+                    if (int.TryParse(Environment.GetEnvironmentVariable("IVM_TICK_DROPSTREAMS"), out var dropTick) && dropTick == t)
+                    {
+                        // Experiment: what the operators' current deltas (stream values) keep alive.
+                        var cleared = 0;
+                        foreach (var rep in tickReplicas)
+                        {
+                            foreach (var op in rep.Operators)
+                            {
+                                for (var ty = op.GetType(); ty is not null && ty != typeof(object); ty = ty.BaseType)
+                                {
+                                    foreach (var f in ty.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly))
+                                    {
+                                        if (f.GetValue(op) is { } v && v.GetType().IsGenericType && v.GetType().GetGenericTypeDefinition() == typeof(DbspNet.Core.Circuit.Stream<>))
+                                        {
+                                            var cur = v.GetType().GetField("Current", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+                                            cur.SetValue(v, null);
+                                            cleared++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                        _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"DROPSTREAMS tick={t} cleared={cleared} live_after_mib={GC.GetGCMemoryInfo(GCKind.FullBlocking).PromotedBytes / 1048576.0:F0}"));
+                    }
+
+                    _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"TICKLIVE tick={t} heap_before_mib={before / 1048576.0:F0} committed_mib={committed / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0}"));
+                };
+            }
+            else
+            {
+                DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = null;
+            }
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
             var pause0 = GC.GetTotalPauseDuration();
             var gen2Before = GC.CollectionCount(2);

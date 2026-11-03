@@ -139,7 +139,7 @@ internal sealed class ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight> : 
         long gatherRows = 0;
         for (var src = 0; src < workers; src++)
         {
-            var pair = _coordinator.Read(src, _worker);
+            var pair = _coordinator.Take(src, _worker);
             if (pair.Left is not null)
             {
                 foreach (var (row, weight) in ExchangeBuckets.Items(pair.Left))

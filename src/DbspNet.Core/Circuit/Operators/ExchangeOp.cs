@@ -114,7 +114,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         var gathered = new ZSetBuilder<TKey, TWeight>((int)Math.Min(gatherRows, int.MaxValue));
         for (var src = 0; src < workers; src++)
         {
-            var bucket = _coordinator.Read(src, _worker);
+            var bucket = _coordinator.Take(src, _worker);
             if (bucket is not null)
             {
                 gathered.AddRange(bucket);

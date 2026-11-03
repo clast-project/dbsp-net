@@ -102,7 +102,7 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
         long gatherRows = 0;
         for (var src = 0; src < workers; src++)
         {
-            var bucket = _coordinator.Read(src, _worker);
+            var bucket = _coordinator.Take(src, _worker);
             if (bucket is not null)
             {
                 foreach (var (row, weight) in ExchangeBuckets.Items(bucket))
