@@ -1377,8 +1377,9 @@ Census unchanged (25.2M references).
 checkpoint. On a machine whose cores the output write already keeps busy, overlapping it moves
 the cost from the checkpoint into the output write and saves nothing. It would pay only where the
 engine has idle time between batches, which ivm-bench does not have (the next batch follows the
-checkpoint at once). **Not merged.** The real lever is a cheaper flush: encode only what changed,
-not every touched partition whole.
+checkpoint at once). **Not merged** (kept on its branch). The flush already writes only the queued
+changes; in batch 1 those are the whole state, so its encode is the cost of holding that state as
+blocks at all, the same cost any blocked trace pays when it freezes.
 
 ## 4. Open questions for review
 
