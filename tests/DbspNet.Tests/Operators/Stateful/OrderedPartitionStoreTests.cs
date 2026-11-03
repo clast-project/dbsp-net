@@ -61,13 +61,21 @@ public class OrderedPartitionStoreTests
     private static int Compare(StructuralRow a, StructuralRow b) => StructuralRowComparer.Instance.Compare(a, b);
 
     [Theory]
-    [InlineData(1, 3, 2)]
-    [InlineData(2, 3, 1)]
-    [InlineData(3, 6, 4)]
-    [InlineData(4, 1, 1)]
-    [InlineData(5, 50, 8)]
-    public void Reads_MatchTheModel(int seed, int promoteAt, int chunkRows)
+    [InlineData(1, 3, 2, false)]
+    [InlineData(2, 3, 1, false)]
+    [InlineData(3, 6, 4, false)]
+    [InlineData(4, 1, 1, false)]
+    [InlineData(5, 50, 8, false)]
+    [InlineData(1, 3, 2, true)]
+    [InlineData(2, 3, 1, true)]
+    [InlineData(3, 6, 4, true)]
+    [InlineData(4, 1, 1, true)]
+    [InlineData(5, 50, 8, true)]
+    public void Reads_MatchTheModel(int seed, int promoteAt, int chunkRows, bool cold)
     {
+        // cold: small partitions' record is a blocked trace, the managed map a per-batch read
+        // cache (§3.22); Freeze below drops the cache.
+        using var tiny = TraceBlocksMode.Use(join: true, freezeEntries: 3, blockEntries: 2);
         var rnd = new Random(seed);
         var partial = new CountSum();
         var store = new OrderedPartitionStore(
@@ -76,7 +84,8 @@ public class OrderedPartitionStoreTests
             StructuralRowComparer.Instance,
             partial,
             promoteAt: promoteAt,
-            chunkRows: chunkRows);
+            chunkRows: chunkRows,
+            coldFormat: cold ? BlockSchema.TryCreate(KeySchema, RowSchema) : null);
         // Enough partitions that new ones keep arriving (read from the tick's own rows, §3.17).
         var partitions = 3 + (seed * 7);
         var model = new Dictionary<int, Dictionary<StructuralRow, long>>();
@@ -144,6 +153,10 @@ public class OrderedPartitionStoreTests
             if (rnd.Next(4) == 0)
             {
                 store.Freeze();
+            }
+            else if (rnd.Next(6) == 0)
+            {
+                store.DropCache();
             }
 
             for (var p = 0; p < partitions; p++)

@@ -1,5 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Aggregators;
 
@@ -35,6 +36,18 @@ internal sealed class OrderedPartitionStore
     private readonly Dictionary<StructuralRow, List<Chunk>> _large = new();
     private long _smallRows;
 
+    // With a cold format (§3.22): small partitions' record is this shared trace (partition key →
+    // row), always current, and _small is only a read cache of the partitions touched since the
+    // last idle tick, dropped then (EndBatch). Without one, _small is the record.
+    private readonly BlockedIndexedTrace? _cold;
+
+    // Keys the cold trace has ever held (a Bloom filter: no false negatives), so a partition new
+    // this tick is read from the tick's own rows instead of probed for (§3.17).
+    private KeyFilter _keys = new();
+
+    // This tick's new partitions (the filter had never seen them): their whole content.
+    private Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>? _fresh;
+
     private static readonly StructuralRow NoKey = new([]);
 
     /// <param name="chunkFormat">Blocks of a large partition's chunks: no key, the row.</param>
@@ -48,7 +61,8 @@ internal sealed class OrderedPartitionStore
         IComparer<StructuralRow> order,
         IPartialAggregator<StructuralRow, StructuralRow>? partial,
         int promoteAt = 512,
-        int chunkRows = 512)
+        int chunkRows = 512,
+        ITraceBlockFormat? coldFormat = null)
     {
         _chunkFormat = chunkFormat;
         _valueOf = valueOf;
@@ -56,6 +70,7 @@ internal sealed class OrderedPartitionStore
         _partial = partial is { IsExactPartial: true } ? partial : null;
         _promoteAt = valueOf is null ? int.MaxValue : promoteAt;
         _chunkRows = Math.Max(1, chunkRows);
+        _cold = coldFormat is null ? null : new BlockedIndexedTrace(coldFormat, TraceBlocksMode.FreezeEntries, blockEntries: TraceBlocksMode.BlockEntries);
         _rowOrder = Comparer<StructuralRow>.Create((a, b) =>
         {
             var c = ValueOf(a).CompareTo(ValueOf(b));
@@ -74,7 +89,7 @@ internal sealed class OrderedPartitionStore
     {
         get
         {
-            var n = _smallRows;
+            var n = _cold?.Entries ?? _smallRows;
             foreach (var chunks in _large.Values)
             {
                 foreach (var c in chunks)
@@ -135,6 +150,9 @@ internal sealed class OrderedPartitionStore
             list.Add((row, weight, ValueOf(row)));
         }
 
+        _fresh = null;
+        IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>? cold = null;
+        List<StructuralRow>? seen = null;
         foreach (var (key, change) in byKey)
         {
             if (_large.ContainsKey(key))
@@ -147,9 +165,39 @@ internal sealed class OrderedPartitionStore
                 // chunks, never built as a sorted dictionary first.
                 PromoteWith(key, change);
             }
-            else
+            else if (_cold is null)
             {
                 ApplySmall(key, change);
+            }
+            else
+            {
+                // The record takes the change; a cached copy follows it; a partition the filter has
+                // never seen is all in this change.
+                cold ??= new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+                foreach (var (row, weight, _) in change)
+                {
+                    cold.Add(key, row, new Z64(weight));
+                }
+
+                if (_small.ContainsKey(key))
+                {
+                    ApplySmall(key, change);
+                }
+                else if (!_keys.MayContain(key))
+                {
+                    (_fresh ??= new())[key] = change;
+                }
+
+                (seen ??= new()).Add(key);
+            }
+        }
+
+        if (cold is not null)
+        {
+            _cold!.Integrate(cold.Build());
+            foreach (var key in seen!)
+            {
+                _keys.Add(key);
             }
         }
     }
@@ -189,15 +237,28 @@ internal sealed class OrderedPartitionStore
         }
     }
 
-    /// <summary>Kept for the operator's idle tick; managed and chunked state need no freezing.</summary>
+    /// <summary>An idle tick, or a checkpoint: drop the read cache and freeze the cold trace, so
+    /// what stays between batches is blocks (§3.22).</summary>
     public void Freeze()
     {
+        if (_cold is not null)
+        {
+            _small.Clear();
+            _cold.Freeze();
+        }
     }
 
-    /// <summary>Kept for the operator's step end; nothing is held across reads.</summary>
-    public void EndTick()
+    /// <summary>Drop the read cache (a checkpoint: the heap it leaves holds only the record).</summary>
+    public void DropCache()
     {
+        if (_cold is not null)
+        {
+            _small.Clear();
+        }
     }
+
+    /// <summary>The tick's reads are done: drop its new partitions' rows.</summary>
+    public void EndTick() => _fresh = null;
 
     /// <summary>Forget everything (a restore replaces the state).</summary>
     public void Clear()
@@ -205,16 +266,32 @@ internal sealed class OrderedPartitionStore
         _small.Clear();
         _large.Clear();
         _smallRows = 0;
+        _cold?.Clear();
+        _keys = new KeyFilter();
+        _fresh = null;
     }
 
     /// <summary>Every row and weight (a whole-state write).</summary>
     public IEnumerable<(StructuralRow Row, long Weight)> All()
     {
-        foreach (var rows in _small.Values)
+        if (_cold is not null)
         {
-            foreach (var (row, weight) in rows)
+            foreach (var (_, group) in _cold.MaterializeUncached())
             {
-                yield return (row, weight);
+                foreach (var (row, weight) in group)
+                {
+                    yield return (row, weight.Value);
+                }
+            }
+        }
+        else
+        {
+            foreach (var rows in _small.Values)
+            {
+                foreach (var (row, weight) in rows)
+                {
+                    yield return (row, weight);
+                }
             }
         }
 
@@ -284,7 +361,8 @@ internal sealed class OrderedPartitionStore
             return rows;
         }
 
-        // A small partition: already ordered and consolidated.
+        // A small partition: already ordered and consolidated — from the cache, or (on blocks) read
+        // once into it: the tick's own rows when new, otherwise probed and consolidated by sort.
         var all = new List<(StructuralRow Row, long Weight, long Value)>();
         if (_small.TryGetValue(key, out var small))
         {
@@ -292,6 +370,45 @@ internal sealed class OrderedPartitionStore
             foreach (var (row, weight) in small)
             {
                 all.Add((row, weight, ValueOf(row)));
+            }
+        }
+        else if (_cold is not null)
+        {
+            List<(StructuralRow Row, long Weight, long Value)> raw;
+            if (_fresh is not null && _fresh.TryGetValue(key, out var own))
+            {
+                raw = own;
+            }
+            else
+            {
+                raw = new List<(StructuralRow Row, long Weight, long Value)>();
+                var visitor = new Collect(raw, this);
+                _cold.Probe(key, ref visitor);
+            }
+
+            raw.Sort(_compare);
+            foreach (var e in raw)
+            {
+                if (all.Count > 0 && Compare(all[^1], e) == 0)
+                {
+                    all[^1] = (all[^1].Row, all[^1].Weight + e.Weight, e.Value);
+                }
+                else
+                {
+                    all.Add(e);
+                }
+            }
+
+            all.RemoveAll(e => e.Weight == 0);
+            if (all.Count > 0 && all.Count <= _promoteAt)
+            {
+                var cached = new SortedDictionary<StructuralRow, long>(_rowOrder);
+                foreach (var (row, weight, _) in all)
+                {
+                    cached[row] = weight;
+                }
+
+                _small[key] = cached;
             }
         }
 
@@ -303,8 +420,16 @@ internal sealed class OrderedPartitionStore
         if (all.Count > _promoteAt)
         {
             var tPromote = BlockTraceProfile.Now();
+            if (_cold is not null)
+            {
+                RetractCold(key, all);
+            }
+            else
+            {
+                _smallRows -= all.Count;
+            }
+
             _small.Remove(key);
-            _smallRows -= all.Count;
             _large[key] = Cut(all);
             if (BlockTraceProfile.Enabled)
             {
@@ -363,6 +488,29 @@ internal sealed class OrderedPartitionStore
         return rows;
     }
 
+    // Take a partition's rows (as read, any form) out of the cold trace: it is moving to chunks.
+    private void RetractCold(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> rows)
+    {
+        var retract = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        foreach (var (row, weight, _) in rows)
+        {
+            retract.Add(key, row, new Z64(-weight));
+        }
+
+        _cold!.Integrate(retract.Build());
+    }
+
+    private readonly struct Collect(List<(StructuralRow Row, long Weight, long Value)> into, OrderedPartitionStore store) : ITraceVisitor
+    {
+        public void Row(StructuralRow value, Z64 weight) => into.Add((value, weight.Value, store.ValueOf(value)));
+
+        public void Entry(ITraceBlock block, int index, Z64 weight)
+        {
+            var row = block.Value(index);
+            into.Add((row, weight.Value, store.ValueOf(row)));
+        }
+    }
+
     // The first chunk whose last value is not below `from` (the chunk a change at `from` lands in).
     private static int FirstChunkReaching(List<Chunk> chunks, long from)
     {
@@ -387,7 +535,26 @@ internal sealed class OrderedPartitionStore
     // leaves the managed map, and the sum becomes chunks.
     private void PromoteWith(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> change)
     {
-        if (_small.Remove(key, out var existing))
+        if (_cold is not null)
+        {
+            // The partition's rows so far leave the record (the cache, if it holds them, is the same).
+            _small.Remove(key);
+            var before = new List<(StructuralRow Row, long Weight, long Value)>();
+            if (_keys.MayContain(key))
+            {
+                var visitor = new Collect(before, this);
+                _cold.Probe(key, ref visitor);
+            }
+
+            if (before.Count > 0)
+            {
+                RetractCold(key, before);
+                change.AddRange(before);
+            }
+
+            _keys.Add(key);
+        }
+        else if (_small.Remove(key, out var existing))
         {
             _smallRows -= existing.Count;
             foreach (var (row, weight) in existing)
@@ -531,4 +698,64 @@ internal sealed class OrderedPartitionStore
         return new Chunk(_chunkFormat.Encode(keys, rows, weights, hashes, n), values, partial);
     }
 
+    // A scalable Bloom filter over partition-key hashes: reference-free bit arrays, a new one twice
+    // as large once the newest is full; a key is absent only if every filter says so.
+    private sealed class KeyFilter
+    {
+        private const int BitsPerKey = 10;
+        private const int Probes = 4;
+        private readonly List<(ulong[] Bits, long Capacity)> _filters = [(new ulong[(1024 * BitsPerKey + 63) / 64], 1024)];
+        private long _inNewest;
+
+        public void Add(StructuralRow key)
+        {
+            var (bits, capacity) = _filters[^1];
+            if (_inNewest >= capacity)
+            {
+                capacity *= 2;
+                bits = new ulong[(capacity * BitsPerKey + 63) / 64];
+                _filters.Add((bits, capacity));
+                _inNewest = 0;
+            }
+
+            var m = (ulong)bits.Length * 64;
+            var (h1, h2) = Hashes(key);
+            for (var i = 0UL; i < Probes; i++)
+            {
+                var bit = (h1 + (i * h2)) % m;
+                bits[bit >> 6] |= 1UL << (int)(bit & 63);
+            }
+
+            _inNewest++;
+        }
+
+        public bool MayContain(StructuralRow key)
+        {
+            var (h1, h2) = Hashes(key);
+            foreach (var (bits, _) in _filters)
+            {
+                var m = (ulong)bits.Length * 64;
+                var all = true;
+                for (var i = 0UL; i < Probes && all; i++)
+                {
+                    var bit = (h1 + (i * h2)) % m;
+                    all = (bits[bit >> 6] & (1UL << (int)(bit & 63))) != 0;
+                }
+
+                if (all)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static (ulong, ulong) Hashes(StructuralRow key)
+        {
+            var x = (ulong)(uint)key.GetHashCode() * 0x9E3779B97F4A7C15UL;
+            x ^= x >> 29;
+            return (x, (x >> 32) | 1);
+        }
+    }
 }
