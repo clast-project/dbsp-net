@@ -1681,6 +1681,56 @@ multiplicities, NULL keys and NULL residual inputs, deletes, both block modes, a
 **Gate:** views identical, batch-1 drain no worse than main (+3%), restart and batch 3 no worse,
 census. 5 alternating runs against a main build.
 
+### 3.31 Outer joins with a residual: built and measured (2026-11-03, branch `arc/outer-residual`)
+
+**Built as planned (§3.30).** `ResidualOuterJoin` holds the two per-key routines (the residual
+join delta and one preserved side's padding delta); `IncrementalLeftJoinOp` and
+`IncrementalFullJoinOp` take an optional residual and use them per touched key. The compiler sends
+LEFT, RIGHT (sides swapped) and FULL joins with a residual to the operator, managed or blocked,
+except on the spine family or without an equi-key (`ResidualInOperator`); the residual is read off
+a view of the (left, right) pair as the joined row, without building it.
+
+**Tests.** `OuterJoinResidualTests`: five residual shapes (SCD ranges, a second equi-key, LEFT,
+RIGHT, FULL) against the spine family, which still lowers them to the anti-join rewrite: several
+rows per key disagreeing about matching, ranges whose bounds move, second copies of rows, NULL
+keys and NULL residual inputs, deletes, checkpoints and restores, blocks on and off; the circuit
+must hold the outer-join operator and no DISTINCT. Mutations caught: no candidates from the other
+side's delta, a match test that ignores the residual, the join's second pass ignoring it, FULL
+dropping its right padding, old match-presence read from the new side. The suite passes with
+blocks on and off.
+
+**Census** (SF=3 checkpoint): references 5.57M → 4.95M, heap 6.01 → 5.87 GB, snapshot
+4793 → 4676 MiB. The four residual outer joins' Distincts (0.47M references), semi-joins and
+matched joins are gone; the outer-join operators hold 0.43M (was 0.24M).
+
+**Wall clock against main** (medians, ms; views byte-identical in every run):
+
+| | main | outer-join residual |
+|---|--:|--:|
+| batch-1 drain (10 runs each) | 17,040 | ≈18,400 (bimodal) |
+| batch-1 drain, `DOTNET_gcConcurrent=0` (4 each) | ≈16,280 | ≈16,150 |
+| batch-1 checkpoint | 2,783 | 2,627 |
+| restart: restore | 227 | 176 (−22%) |
+| restart: first drain | 505 | 485 |
+| batch 3 drain | 233 | 232 |
+| batch 3 checkpoint | 283 | 244 (−14%) |
+
+**The batch-1 regression is GC timing, not work.** The branch's batch-1 drains were bimodal: half
+at main's time or better, half 1.5–2 s slower. Per-tick timing (`DBSPNET_TICK_TIMES=1`, added for
+this) put all of the difference in one tick, tick 18 (the large `trade_type` step): 6.7–7.3 s in
+a slow run against 4.8–5.3 s, every other tick level. Main has the same slow state, less often:
+across all runs, 9 of 16 on the branch and 1 of 16 on main. The extra time is mostly not pause
+time; slow runs differ in when the background gen2 runs against the tick's allocation burst
+(more blocking gen1 collections, fewer gen0s during a background GC). The branch's smaller heap
+shifts that trigger. With background GC off, both arms are unimodal and level (branch 15.70–16.33,
+main 15.95–16.59), and tick 18 is 5.0–5.9 s in every run. Allocation is lower on the branch
+(53.40 vs 53.64 GiB); the per-operator profile showed the residual outer joins at about 2 s of CPU
+across 12 workers.
+
+**Side finding:** with `DOTNET_gcConcurrent=0`, batch-1 drain on main is ≈16.3 s against
+17.0 s with background GC: worth measuring on its own (restart, checkpoint, output, Nexmark)
+before considering it as a default.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
