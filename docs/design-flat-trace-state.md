@@ -1304,6 +1304,56 @@ time. Holding small partitions as blocks was never the cost; the repeated decode
 **Gate:** batch-1 drain, restart and batch 3 no worse than main (+3%), identical outputs, census.
 5 alternating runs against a main build.
 
+### 3.23 Small window partitions on blocks: built and measured (2026-11-02, branch `arc/flat-trace-window-cold`)
+
+**What was built (aec12a4, 0c0256a), after two failed variants found by profiling:**
+1. **Cache dropped on idle ticks.** dim_customer and trades got slower: an operator's idle tick is
+   not the end of a batch, so partitions were decoded again between data-carrying ticks.
+2. **Cache kept, record written every tick.** Still slower: each tick's small changes became a
+   level of the record, and its merges decoded and re-encoded the growing state of wide,
+   often-touched partitions again and again.
+3. **Built: a write-back cache.** A touched partition is loaded once into the managed cache (from
+   the record plus its queued changes, or empty for a key the filter has never seen) and changed
+   there. Its changes queue per partition and reach the record in one sorted run
+   (`IntegrateEntries`) when the cache is dropped: before a checkpoint, or on an idle tick once it
+   holds more than 2^18 partitions. A partition's content is always the record plus its queued
+   changes. A cached partition that empties leaves the cache with its changes still queued, which
+   was the one bug the store oracle found.
+
+**Tests:** the store oracle gained a cold arm (cache drops and freezes at random). The suite passes
+3,204 tests in three arms. Mutations: a cached partition not kept current, every uncached key
+treated as new, both promotions leaving rows in the record, a reload ignoring queued changes, a
+whole-state read missing them, and promotion keeping them: all caught. Two change nothing
+visible: an idle tick keeping the cache, and a drop that does not flush (the changes stay queued
+and are read). Both only cost memory.
+
+**Census after the checkpoint** (SF=3, W=12, one run each):
+
+| | main | write-back cache |
+|---|---|---|
+| objects | 57.8M | 15.7M (−73%) |
+| references | 99.3M | 25.2M (−75%) |
+| bytes | 7.74 GB | 6.58 GB (−1.16 GB) |
+| WindowOffset references | 41.1M | 0.3M |
+| WindowAggregate references | 35.4M | 2.0M |
+
+**Wall clock against main** (5 alternating runs, two binaries, outputs identical, medians, ms):
+
+| | main | write-back cache |
+|---|---|---|
+| batch-1 drain | 16,048 | 16,618 (+3.6%; ranges overlap, one 18.3 s outlier) |
+| batch-1 checkpoint | 1,989 | 2,668 (+34%: the flush) |
+| batch-1 output write | 3,208 | 2,362 |
+| batch-1 GC pause | 5,667 | 6,136 (+8%) |
+| batch 1 total (drain + output + checkpoint) | 21,245 | 21,648 (+1.9%) |
+| restart: restore | 253 | 263 |
+| restart: first drain | 523 | 470 (−10%) |
+| batch 3 drain | 240 | 256 (noise) |
+
+**Decision pending.** Three quarters of the remaining references go, and 1.16 GB with them. The cost is
+about 0.4 s on batch 1, mostly the flush in the checkpoint (one encode of every small partition
+touched since the last one). The next lever would be flushing in the background between batches.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
