@@ -1125,6 +1125,44 @@ removes it. The big operators (daily_market) are faster on chunks than managed.
 3. **Decode cheaper:** strings aliasing the block bytes. But output rows carry the cells
    downstream, so aliased strings would pin blocks. Not recommended.
 
+### 3.18 Small partitions managed, large ones chunked: `window` joins `all` (2026-11-02)
+
+**Decided (§3.17 option 1, agreed with Curt):** a partition's representation follows its size.
+- **Small partitions are managed:** a sorted dictionary per partition, ordered by (order value,
+  total order), so a read is already ordered and consolidated and decodes nothing.
+- **Large partitions:** one that grows past 512 rows (at a read, or at integrate time when one
+  change alone takes it past) becomes ordered chunks with exact partials (§3.15). A chunked
+  partition that shrinks keeps its (smaller) chunks and leaves the store when empty. If it
+  returns, it starts small again.
+- **The key filter (§3.17) is gone:** a managed lookup is already cheap.
+
+c91b00f; tests unchanged, plus a check that a read never holds a zero weight (a mutation that
+kept zeros was invisible to results but leaked). Four mutations of the small side: all caught.
+
+**Wall clock against `all` before the change** (5 alternating runs, outputs identical, medians, ms):
+
+| | all | all + window |
+|---|---|---|
+| batch-1 drain | 16,760 | 16,741 (−0.1%) |
+| batch-1 GC pause | 5,938 | 5,641 (−5%) |
+| batch-1 output write | 2,398 | 2,178 (−9%) |
+| batch-1 checkpoint | 2,529 | 2,355 (−7%) |
+| restart: restore | 244 | 261 (ranges overlap; a lazy restore never touches the store) |
+| restart: first drain | 521 | 532 (+2%) |
+| batch 3 drain | 293 | 270 (−8%) |
+
+A profiled run shows why batch 1 is now neutral. The large windows (daily_market) are faster on
+chunks than managed, window-aggregate CPU fell from 32.1 to 22.4 s, and the engine step went
+from 15.7 to 14.4 s.
+
+**Census after the checkpoint:** references 155.4M → 130.6M (−16%), bytes 8.57 → 8.42 GB,
+WindowAggregate references 60.9M → 35.4M. That is less than the −26% estimated: the managed
+small partitions hold more of the window rows than the row counts suggested.
+
+**Decided by §3.15's rule:** `window` joins `all`. `DBSPNET_TRACE_BLOCKS=all` is now joins,
+aggregates, DISTINCT, views and the window aggregate. The offset operator (LAG/LEAD) and the
+remaining managed window state are next.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
