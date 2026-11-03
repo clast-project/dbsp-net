@@ -1510,6 +1510,54 @@ and exact columns must match a fresh run. Persistence conformance covers restore
 **Gate:** batch-1 drain no worse than main (+3%), restart and batch 3 no worse, identical
 outputs, census. 5 alternating runs against a main build.
 
+### 3.28 Aggregate caches, round 2: built and measured (2026-11-03, branch `arc/agg-float-caches`)
+
+**Built as planned (§3.27).** The blocked aggregate takes `StructuralRowComparer` as its canonical
+order. "Canonical" is the group's consolidated rows inserted in sorted order into a fresh builder,
+whose iteration order is then a function of the rows alone (row hashes are deterministic). A
+touched group without caches that has a pending state blob (a large group after a checkpoint or
+restore, or a small one from an older snapshot) is rebuilt from its rows and the blob; otherwise
+it is refolded. Demotion runs only on a blocked trace, after the checkpoint has computed the blobs.
+
+**Tests:** `AggregateCacheFreeTests.FloatComposite_OneRowPerGroup_ExactColumnsMatch_AcrossCheckpoints`
+(SUM and AVG over DOUBLE with COUNT(DISTINCT), MIN and COUNT(*); groups growing past the threshold
+and back; checkpoints mid-stream, half the seeds continuing from a restored copy). Exact columns
+must match a fresh run, and a missed retraction would leave a second row for its group.
+Mutations caught: emitting the incremental float value, folding without the sort, demotion
+dropping the blobs, a rebuild that ignores the blob. Skipping demotion still passes (it is an
+optimization, not a correctness condition). The suite passes with blocks on and off.
+
+**Census at the SF=3 checkpoint:**
+
+| | main | round 2 |
+|:--|--:|--:|
+| References | 18.8M | **9.5M** (−49%) |
+| Objects | 12.9M | 4.7M |
+| Heap bytes | 6.51 GB | 6.08 GB |
+| IncrementalAggregate references | 9.52M | 0.27M |
+
+The two caches are empty at the checkpoint; what remains is the pending blobs of the large groups
+(49K references) and the blocked traces.
+
+**Wall clock against main** (5 alternating runs, two binaries, medians, ms). Views are
+byte-identical in every run, batch 1 and restart: in ivm-bench the canonical fold changed no
+float output.
+
+| | main | round 2 |
+|---|--:|--:|
+| batch-1 drain | 16,430 | 16,634 (+1.2%) |
+| batch-1 GC pause | 6,204 | 5,923 (−4.5%) |
+| batch-1 checkpoint | 2,574 | 2,628 |
+| batch-1 output | 2,469 | 2,275 |
+| restart: restore | 240 | 232 |
+| restart: first drain | 517 | 480 (−7%) |
+| restart: first output | 3,451 | 3,540 |
+| batch 3 drain | 242 | 238 |
+
+The gate holds. Batch-1 drain is within +3% and inside run-to-run noise (±2.5 s), and the restart
+and batch 3 are level or better. The first drain after the checkpoint, which pays one refold per
+touched large group, is not slower.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
