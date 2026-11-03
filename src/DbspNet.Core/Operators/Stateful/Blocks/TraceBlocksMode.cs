@@ -8,16 +8,24 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 /// <c>agg</c> (incremental aggregates' input traces), <c>distinct</c> (DISTINCT's trace),
 /// <c>view</c> (stored output views, and with them an incremental output connector's row index, §3.9–§3.10),
 /// <c>window</c> (the window aggregate's large partitions as ordered chunks, §3.15–§3.18),
-/// or <c>all</c> (all five); flat trace family and block-encodable columns only; off by default.
+/// or <c>all</c> (all five); flat trace family and block-encodable columns only. <b>Unset means
+/// <c>all</c></b> (default-on since 2026-11-02: ivm-bench and Nexmark neutral or better, the retained
+/// heap about −90%, docs/design-flat-trace-state.md §3.25); <c>off</c> (or <c>none</c>) turns blocks off.
 /// <c>DBSPNET_TRACE_BLOCKS_FREEZE</c> and <c>DBSPNET_TRACE_BLOCKS_BLOCK</c> set the freeze threshold and
 /// block size (defaults 65,536 and 1,024; small values make a test suite exercise runs and merges).
 /// <see cref="Use"/> overrides all three in an async context (tests). Read at compile time.
 /// </summary>
 internal static class TraceBlocksMode
 {
-    private static readonly string[] Kinds =
-        (Environment.GetEnvironmentVariable("DBSPNET_TRACE_BLOCKS") ?? string.Empty).ToLowerInvariant()
+    private static readonly string[] Kinds = ParseKinds(Environment.GetEnvironmentVariable("DBSPNET_TRACE_BLOCKS"));
+
+    // Unset or empty: everything (the default); "off"/"none": nothing; otherwise the listed kinds.
+    internal static string[] ParseKinds(string? setting)
+    {
+        var kinds = (setting ?? string.Empty).ToLowerInvariant()
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return kinds.Length == 0 ? ["all"] : kinds.Contains("off") || kinds.Contains("none") ? [] : kinds;
+    }
 
     private static readonly bool Default = Kinds.Contains("join") || Kinds.Contains("all");
 

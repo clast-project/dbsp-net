@@ -1381,6 +1381,22 @@ checkpoint at once). **Not merged** (kept on its branch). The flush already writ
 changes; in batch 1 those are the whole state, so its encode is the cost of holding that state as
 blocks at all, the same cost any blocked trace pays when it freezes.
 
+### 3.25 Blocks on by default (2026-11-02)
+
+`DBSPNET_TRACE_BLOCKS` unset now means `all`: joins, aggregates, DISTINCT, stored views (with the
+output connector's row index), and the window operators' state. `off` (or `none`) turns blocks
+off. An explicit list of kinds still selects just those.
+
+**Evidence:**
+- **ivm-bench** (SF=3, W=12, against blocks off at the start of the arc): the checkpoint heap
+  held 333.5M references and 10.7 GB, and now holds 25.2M and 6.6 GB. Batch-1 drain is level, and
+  restart's first drain and checkpoints are faster (§3.10–§3.23).
+- **Nexmark** (10M events, W=14, docs/benchmarks-comparison.md, 2026-11-02): neutral or better
+  with blocks on. q15 is +24%. q9's apparent −20% was one slow run; re-measured, it is at parity.
+
+**Unchanged:** the spine trace family, typed (non-structural) operators, and columns with no block
+encoding keep their managed state. The suite passes with blocks unset, `off` and `all`.
+
 ## 4. Open questions for review
 
 1. **Freeze on the step thread vs background.** The design defers it (managed levels pile up and
