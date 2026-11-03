@@ -127,26 +127,24 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
         _accum = new Dictionary<TKey, SortedDictionary<TInRow, long>>(partitionComparer);
-        if (blockFormat is not null)
+        _ = blockFormat; // unused since §3.18: small partitions are managed, large ones chunks
+        if (chunkFormat is not null)
         {
             if (typeof(TInRow) != typeof(StructuralRow) || typeof(TKey) != typeof(StructuralRow))
             {
-                throw new ArgumentException("Blocked window state needs structural rows and partition keys.", nameof(blockFormat));
+                throw new ArgumentException("Blocked window state needs structural rows and partition keys.", nameof(chunkFormat));
             }
 
             if (GcApplies)
             {
-                throw new ArgumentException("Blocked window state does not support frontier GC.", nameof(blockFormat));
+                throw new ArgumentException("Blocked window state does not support frontier GC.", nameof(chunkFormat));
             }
 
             _store = new Blocks.OrderedPartitionStore(
-                blockFormat,
                 chunkFormat ?? throw new ArgumentNullException(nameof(chunkFormat)),
                 _orderValueOf is null ? null : row => _orderValueOf(As<TInRow>(row)),
                 (IComparer<StructuralRow>)(object)_order,
                 aggregator as Aggregators.IPartialAggregator<StructuralRow, StructuralRow>,
-                Blocks.TraceBlocksMode.FreezeEntries,
-                Blocks.TraceBlocksMode.BlockEntries,
                 promoteAt: Blocks.TraceBlocksMode.PromoteRows,
                 chunkRows: Blocks.TraceBlocksMode.ChunkRows);
         }
@@ -883,7 +881,6 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
             // Lazily restored: partitions are read as deltas touch them (Fault).
             _accum.Clear();
             _store?.Clear();
-            _store?.ForgetKeys(); // cold partitions never pass through the store
             _lazy = new LazyPartitions<TKey, TInRow>(cold, _partitionOf, _accum.Comparer);
             _changes.Restored(cold, cold.Count);
             return;

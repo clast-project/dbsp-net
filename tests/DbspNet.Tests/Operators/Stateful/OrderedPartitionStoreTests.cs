@@ -71,13 +71,10 @@ public class OrderedPartitionStoreTests
         var rnd = new Random(seed);
         var partial = new CountSum();
         var store = new OrderedPartitionStore(
-            BlockSchema.TryCreate(KeySchema, RowSchema)!,
             BlockSchema.TryCreate(Schema.Empty, RowSchema)!,
             row => (long)row[0]!,
             StructuralRowComparer.Instance,
             partial,
-            freezeEntries: 3,
-            blockEntries: 2,
             promoteAt: promoteAt,
             chunkRows: chunkRows);
         // Enough partitions that new ones keep arriving (read from the tick's own rows, §3.17).
@@ -98,10 +95,6 @@ public class OrderedPartitionStoreTests
                 {
                     m.Clear();
                 }
-            }
-            else if (rnd.Next(40) == 0)
-            {
-                store.ForgetKeys(); // as after a lazy restore: always probe
             }
 
             var delta = new Dictionary<(int P, StructuralRow Row), long>();
