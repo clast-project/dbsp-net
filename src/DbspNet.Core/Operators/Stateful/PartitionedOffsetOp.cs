@@ -649,8 +649,6 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
     // A store as this operator builds one (a scratch one, for a re-shard to read files into).
     private readonly Func<Blocks.OrderedPartitionStore>? _newStore;
 
-    IReadOnlyList<string> IStoreSnapshot.StoreFileNames => [StoreFiles + ".chunks"];
-
     async ValueTask<ZSet<StructuralRow, Z64>?> IStoreSnapshot.ReadStoreRowsAsync(ISnapshotReader reader, CancellationToken cancellationToken)
     {
         if (_newStore is null)

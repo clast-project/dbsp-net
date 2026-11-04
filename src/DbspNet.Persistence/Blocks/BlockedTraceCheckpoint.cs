@@ -234,20 +234,23 @@ internal static class BlockedTraceCheckpoint
     /// a checkpoint ever wrote.</summary>
     internal const int MaxBlockSetFiles = 16;
 
-    /// <summary>The run-index name of a block set's files: its manifest's name plus this.</summary>
-    internal const string BlockSetRunsSuffix = ".runs";
+    // Each owner's last committed block set: a checkpoint that would write the same manifest to the
+    // same store names that chain again and writes nothing.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, Tuple<ITableFileSystem, RunChain, byte[]>> LastBlockSet = new();
 
     /// <summary>
     /// A set of blocks in no hash order, with the caller's metadata, as checkpoint state
     /// (docs/design-bounded-memory.md §3g): a window store's large-partition chunks. Blocks a
     /// checkpoint already wrote (durable file blocks in this store) are named again; the rest go raw
-    /// to one new run file. The manifest (<paramref name="fileName"/> in the operator's directory)
-    /// holds the metadata and each block's file and index entry; the files are recorded as a chain
-    /// so the sweep and retention keep them. On commit, <paramref name="onCommit"/> receives each
-    /// block's durable twin, in order (the same block when it was already durable).
+    /// to one new run file. The manifest (the caller's metadata, then each block's file and index
+    /// entry) is a file under runs/ too, and the chain recorded as <paramref name="fileName"/> names
+    /// it first, then the block files: nothing is written in the operator's directory, and a set
+    /// whose manifest is unchanged since <paramref name="owner"/>'s last commit writes nothing at all.
+    /// On commit, <paramref name="onCommit"/> receives each block's durable twin, in order (the same
+    /// block when it was already durable).
     /// </summary>
     public static async ValueTask SaveBlockSetAsync(
-        ILayout codec, Core.Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks,
+        ILayout codec, Core.Circuit.ISnapshotWriter writer, string fileName, object owner, IReadOnlyList<ITraceBlock> blocks,
         ReadOnlyMemory<byte> meta, Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken)
     {
         if (writer is not TableFileSystemSnapshotContext { Session: { } session } ctx)
@@ -292,14 +295,13 @@ internal static class BlockedTraceCheckpoint
             }
         }
 
-        string? newPath = null;
+        var dataPath = "runs/" + ctx.Prefix + fileName;
         if (fresh.Count > 0)
         {
-            newPath = "runs/" + ctx.Prefix + fileName;
             var file = paths.Count;
-            paths.Add(newPath);
+            paths.Add(dataPath);
             await using var run = await RunStreamWriter.CreateAsync(
-                fs, newPath, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
+                fs, dataPath, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
             for (var k = 0; k < fresh.Count; k++)
             {
                 var body = fresh[k].Body;
@@ -310,7 +312,7 @@ internal static class BlockedTraceCheckpoint
             await run.FinishAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        // The manifest: magic, version, metadata, paths, then each block's (file, index entry).
+        // The manifest: magic, version, metadata, block files, then each block's (file, index entry).
         var buffer = new System.IO.MemoryStream();
         using (var w = new System.IO.BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
         {
@@ -337,26 +339,30 @@ internal static class BlockedTraceCheckpoint
             }
         }
 
-        await using (var manifest = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false))
+        var manifest = buffer.ToArray();
+        RunChain chain;
+        if (fresh.Count == 0 && LastBlockSet.TryGetValue(owner, out var last)
+            && ReferenceEquals(last.Item1, fs) && manifest.AsSpan().SequenceEqual(last.Item3))
         {
-            await manifest.WriteAsync(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), cancellationToken).ConfigureAwait(false);
-            await manifest.FlushAsync(cancellationToken).ConfigureAwait(false);
+            chain = last.Item2; // unchanged: name it again
+        }
+        else
+        {
+            var manifestPath = dataPath + ".manifest";
+            await fs.WriteAllBytesAsync(manifestPath, manifest, cancellationToken).ConfigureAwait(false);
+            long entries = 0;
+            foreach (var (_, ix) in refs)
+            {
+                entries += ix.Entries;
+            }
+
+            chain = new RunChain(fs, [manifestPath, .. paths], entries, 0);
         }
 
-        long entries = 0;
-        foreach (var (_, ix) in refs)
-        {
-            entries += ix.Entries;
-        }
-
-        if (paths.Count > 0)
-        {
-            // Under its own name: the manifest is the file, the chain only keeps its runs alive.
-            session.Record(ctx.Prefix + fileName + BlockSetRunsSuffix, new RunChain(fs, paths, entries, 0));
-        }
-
+        session.Record(ctx.Prefix + fileName, chain);
         session.OnCommit(() =>
         {
+            LastBlockSet.AddOrUpdate(owner, Tuple.Create(fs, chain, manifest));
             var twins = new ITraceBlock[blocks.Count];
             for (var i = 0; i < twins.Length; i++)
             {
@@ -380,23 +386,17 @@ internal static class BlockedTraceCheckpoint
     public static async ValueTask<(byte[] Meta, ITraceBlock[] Blocks)?> LoadBlockSetAsync(
         ILayout codec, Core.Circuit.ISnapshotReader reader, string fileName, CancellationToken cancellationToken)
     {
-        if (reader is not TableFileSystemSnapshotContext ctx || !await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
+        if (await RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is not { Paths.Count: > 0 } chain)
         {
             return null;
         }
 
-        byte[] bytes;
-        await using (var file = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false))
-        {
-            var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
-            using var owner = await file.ReadAsync(new FileRange(0, length), cancellationToken).ConfigureAwait(false);
-            bytes = owner.Memory.Span[..(int)length].ToArray();
-        }
-
+        var fs = chain.Store;
+        var bytes = await fs.ReadAllBytesAsync(chain.Paths[0], cancellationToken).ConfigureAwait(false);
         using var r = new System.IO.BinaryReader(new System.IO.MemoryStream(bytes), System.Text.Encoding.UTF8);
         if (r.ReadUInt32() != BlockSetMagic || r.ReadInt32() is var version && version != BlockSetVersion)
         {
-            throw new InvalidDataException($"'{fileName}' is not a block set this version reads");
+            throw new InvalidDataException($"'{chain.Paths[0]}' is not a block set this version reads");
         }
 
         var meta = r.ReadBytes(r.ReadInt32());
@@ -407,7 +407,6 @@ internal static class BlockedTraceCheckpoint
         }
 
         var schema = codec.Blocks ?? throw new InvalidOperationException("a block set's schema has no block encoding");
-        var fs = ctx.FileSystem;
         var blocks = new ITraceBlock[r.ReadInt32()];
         for (var i = 0; i < blocks.Length; i++)
         {

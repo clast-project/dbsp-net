@@ -2,12 +2,14 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 // A window operator's block store checkpointed as its own files (docs/design-bounded-memory.md §3g):
 // small partitions' record as the blocked trace's run chain, large partitions' chunks as a block set
-// (a manifest naming each chunk's file and index entry). Nothing is decoded to write it. Required,
+// (a manifest naming each chunk's file and index entry, first in its chain under runs/). Nothing is
+// decoded to write it, and an unchanged store writes nothing. Required,
 // for LAG, RANK and a framed SUM OVER, with large partitions (chunks) and small ones (the record):
 //
 //   1. a restore adopts the files lazily (no block read, large partitions untouched), outputs match
 //      an uninterrupted twin, and go on matching as ticks touch partitions;
-//   2. a later checkpoint names chunks an earlier one wrote, writing only new ones;
+//   2. a later checkpoint names chunks an earlier one wrote, writing only new ones, and a store
+//      with no change names its whole chain again;
 //   3. a block set past its file cap is rewritten whole, so files do not pile up;
 //   4. a checkpoint into another store copies every chunk, and restores exactly from there.
 using System.Reflection;
@@ -91,7 +93,7 @@ public class WindowStoreCheckpointTests
             .Select(o => o.GetType().GetField("_store", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(o) as OrderedPartitionStore)
             .OfType<OrderedPartitionStore>()];
 
-    // The current snapshot's block-set chains: operator directory -> the runs it names.
+    // The current snapshot's block-set chains: operator directory -> its manifest and chunk files.
     private static async Task<Dictionary<string, string[]>> ChunkChainsAsync(InMemoryTableFileSystem fs)
     {
         await CheckpointCleanup.WaitAsync(fs);
@@ -107,7 +109,7 @@ public class WindowStoreCheckpointTests
             foreach (var line in Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(f.Path)).Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
                 var parts = line.Split('\t');
-                if (parts[0].EndsWith("store.chunks" + BlockedTraceCheckpoint.BlockSetRunsSuffix, StringComparison.Ordinal))
+                if (parts[0].EndsWith("store.chunks", StringComparison.Ordinal))
                 {
                     chains[parts[0]] = parts[5..];
                 }
@@ -129,14 +131,7 @@ public class WindowStoreCheckpointTests
         await Snapshot.WriteAsync(producer.Circuit, fs);
 
         // No operator wrote its rows: each store wrote its own files.
-        var current = Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("current.txt"));
-        var files = new List<string>();
-        await foreach (var f in fs.ListAsync(current + "/"))
-        {
-            files.Add(f.Path);
-        }
-
-        Assert.Equal(4, files.Count(f => f.EndsWith("/store.chunks", StringComparison.Ordinal)));
+        Assert.Equal(4, (await ChunkChainsAsync(fs)).Count);
 
         var restored = Compile();
         await Snapshot.ReadAsync(restored.Circuit, fs);
@@ -180,23 +175,28 @@ public class WindowStoreCheckpointTests
         Load(twin);
         await Snapshot.WriteAsync(p.Circuit, fs);
         var first = await ChunkChainsAsync(fs);
-        Assert.Equal(3, first.Count); // RANK's store has no chunks, so no files to keep
-        Assert.All(first.Values, runs => Assert.Single(runs));
+        Assert.Equal(4, first.Count);
+        Assert.Equal(3, first.Values.Count(runs => runs.Length == 2)); // manifest + one chunk file
+        Assert.Single(first.Values, runs => runs.Length == 1);       // RANK: a manifest, no chunks
 
-        // Only small partitions change: every chunk is named again, nothing new written.
+        // Nothing changed: every chain is named again as it was, manifest included.
+        await Snapshot.WriteAsync(p.Circuit, fs);
+        var same = await ChunkChainsAsync(fs);
+        Assert.Equal(first.Values.SelectMany(r => r).Order(), same.Values.SelectMany(r => r).Order());
+
+        // Only small partitions change: every chunk file is named again, no new one written.
         Touch(p, 1, 150, 160);
         Touch(twin, 1, 150, 160);
         await Snapshot.WriteAsync(p.Circuit, fs);
         var second = await ChunkChainsAsync(fs);
-        Assert.Equal(first.Values.Select(r => r[0]).Order(), second.Values.Select(r => r[0]).Order());
-        Assert.All(second.Values, runs => Assert.Single(runs));
+        Assert.Equal(first.Values.SelectMany(r => r.Skip(1)).Order(), second.Values.SelectMany(r => r.Skip(1)).Order());
 
         // A large partition changes: its new chunks go to one new file beside the old.
         Touch(p, 2, 3);
         Touch(twin, 2, 3);
         await Snapshot.WriteAsync(p.Circuit, fs);
         var third = await ChunkChainsAsync(fs);
-        Assert.All(third.Values, runs => Assert.Equal(2, runs.Length));
+        Assert.Equal(3, third.Values.Count(runs => runs.Length == 3));
 
         var restored = Compile();
         await Snapshot.ReadAsync(restored.Circuit, fs);
@@ -226,7 +226,7 @@ public class WindowStoreCheckpointTests
             Touch(p, 10 + k, k);
             Touch(twin, 10 + k, k);
             await Snapshot.WriteAsync(p.Circuit, fs);
-            var lengths = (await ChunkChainsAsync(fs)).Values.Select(r => r.Length).ToList();
+            var lengths = (await ChunkChainsAsync(fs)).Values.Where(r => r.Length > 1).Select(r => r.Length - 1).ToList();
             longest = Math.Max(longest, lengths.Max());
             restarted |= k > 0 && lengths.Any(n => n == 1);
         }

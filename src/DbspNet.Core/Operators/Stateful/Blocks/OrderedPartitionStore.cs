@@ -619,6 +619,7 @@ internal sealed class OrderedPartitionStore
         await _chunkFormat.BackingCodec!.SaveBlockSetAsync(
             writer,
             name + ".chunks",
+            this,
             blocks,
             meta.GetBuffer().AsMemory(0, (int)meta.Length),
             twins =>

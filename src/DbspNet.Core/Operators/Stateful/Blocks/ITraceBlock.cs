@@ -123,9 +123,10 @@ internal interface IBlockedTraceCodec
 
     /// <summary>Write <paramref name="blocks"/> (in no hash order) and <paramref name="meta"/> as
     /// checkpoint state: blocks already written by an earlier checkpoint are named again, the rest
-    /// copied raw. On commit <paramref name="onCommit"/> receives each block's durable twin, in order.</summary>
+    /// copied raw; a set unchanged since <paramref name="owner"/>'s last commit writes nothing. On commit
+    /// <paramref name="onCommit"/> receives each block's durable twin, in order.</summary>
     ValueTask SaveBlockSetAsync(
-        Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks, ReadOnlyMemory<byte> meta,
+        Circuit.ISnapshotWriter writer, string fileName, object owner, IReadOnlyList<ITraceBlock> blocks, ReadOnlyMemory<byte> meta,
         Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
         throw new NotSupportedException("this codec writes no block sets");
 

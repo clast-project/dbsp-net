@@ -103,7 +103,7 @@ public static class ParallelReshard
                 throw new NotSupportedException($"operator {i} ({spec.OperatorType}): {why}");
             }
 
-            CheckFilesCovered(persisted, oldW, i, spec, replica0.Operators[i] as IStoreSnapshot);
+            CheckFilesCovered(persisted, oldW, i, spec);
             specs.Add((i, spec));
         }
 
@@ -210,11 +210,9 @@ public static class ParallelReshard
     // Every file the operator wrote must be one its spec names, or the rewrite would silently
     // drop it.
     private static void CheckFilesCovered(
-        Dictionary<(int Worker, int Op), List<string>> persisted, int oldW, int op, ReshardSpec spec, IStoreSnapshot? store)
+        Dictionary<(int Worker, int Op), List<string>> persisted, int oldW, int op, ReshardSpec spec)
     {
-        // A window store's own files (docs/design-bounded-memory.md §3g) hold the state of the
-        // operator's trace file, and are read in its place.
-        var named = spec.Files.Select(f => f.Name).Concat(store?.StoreFileNames ?? []).ToHashSet(StringComparer.Ordinal);
+        var named = spec.Files.Select(f => f.Name).ToHashSet(StringComparer.Ordinal);
         for (var w = 0; w < oldW; w++)
         {
             if (!persisted.TryGetValue((w, op), out var names))

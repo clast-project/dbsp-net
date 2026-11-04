@@ -223,9 +223,9 @@ public class ParallelReshardTests
         }
 
         var storeFiles = 0;
-        await foreach (var f in fs.ListAsync("snap-"))
+        await foreach (var f in fs.ListAsync(DbspNet.Persistence.Runs.RunSweep.RunsPrefix))
         {
-            storeFiles += f.Path.EndsWith("/store.chunks", StringComparison.Ordinal) ? 1 : 0;
+            storeFiles += f.Path.EndsWith("/store.chunks.manifest", StringComparison.Ordinal) ? 1 : 0;
         }
 
         Assert.True(storeFiles >= 3 * oldW, $"{storeFiles} window store files at W={oldW}");

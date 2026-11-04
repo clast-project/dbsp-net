@@ -105,9 +105,9 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
     /// <inheritdoc/>
     public ValueTask SaveBlockSetAsync(
-        ISnapshotWriter writer, string fileName, IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock> blocks, ReadOnlyMemory<byte> meta,
+        ISnapshotWriter writer, string fileName, object owner, IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock> blocks, ReadOnlyMemory<byte> meta,
         Action<DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
-        Blocks.BlockedTraceCheckpoint.SaveBlockSetAsync(this, writer, fileName, blocks, meta, onCommit, cancellationToken);
+        Blocks.BlockedTraceCheckpoint.SaveBlockSetAsync(this, writer, fileName, owner, blocks, meta, onCommit, cancellationToken);
 
     /// <inheritdoc/>
     public ValueTask<(byte[] Meta, DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock[] Blocks)?> LoadBlockSetAsync(
