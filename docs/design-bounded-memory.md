@@ -540,7 +540,7 @@ bounded.
 consumers when the circuit is built. Every consumer gives back a token after its evaluation, and
 the last consumer takes or drops the value, so a delta lives only until its last reader has run.
 
-**Ours** (`StreamRelease`, `DBSPNET_STREAM_RELEASE=1`, opt-in). Operators declare no inputs, so:
+**Ours** (`StreamRelease`; opt-in when built, on by default since §3e, `DBSPNET_STREAM_RELEASE=0` turns it off). Operators declare no inputs, so:
 - **Readers:** a conservative reflection scan of each operator's fields, through wrappers,
   closures and small arrays, but never into another operator or a collection's contents. A
   superset of readers only releases later.
@@ -643,6 +643,45 @@ So the peak RSS that §3b and §3c measured was partly the checkpoint's concaten
 drain's garbage. A 12 GiB limit now holds: drain level, GC pause +32%, output +37%, checkpoint
 +18%. At 10 GiB the failures are spread out (the output's Arrow build, a window store materialised
 as a Z-set for its checkpoint, a run file's Z-set write): the live floor after the drain is near.
+
+## 3e. Defaults: stream release on; GC settings are the host's (2026-11-03)
+
+**Stream release is on by default** (`DBSPNET_STREAM_RELEASE=0` turns it off). Before that, the
+reader scan had to be made safe for operators it did not write:
+- The §3b scan stopped at depth 8, at collections other than small lists, and at System types. A
+  reader behind any of those would see its input released early. A first fix marked such an
+  operator *opaque* (read every stream), but 386 operators per worker on ivm-bench came out opaque
+  (deep SQL plan objects past depth 8) and peak RSS went back to 21–22 GB.
+- **Now the scan walks the real object graph**, bounded by a visited set, and enters only objects
+  whose type can hold a stream. Types that cannot (cached per type): primitives, strings, Z-set
+  rows (`DbspNet.Core.Collections`), non-generic System types, System generics whose arguments
+  cannot, and types from assemblies that do not reference DbspNet.Core (Arrow), except through
+  their type arguments. Object, interfaces, unsealed classes and delegates may hold anything.
+- Collections are walked element by element. A lazy sequence is not enumerated: its fields are
+  walked, since what it yields comes from them. It stops at root operators and the circuit.
+- **Opaque** is left for a collection of more than 65,536 elements or nesting past depth 200. It
+  extends every later stream's life to that operator and keeps any stream produced after it.
+- On ivm-bench: 0 opaque operators, 549 streams released per worker, plan built once in ~214 ms.
+- Tests: release after the last reader, and readers through a dictionary, a lazy sequence and a
+  70,000-element list (opaque). Removing the opaque rule or the release fails them. Suite: 3,283.
+
+**A/B** (run30; 3 runs per arm; `gcServer=1`, `gcConcurrent=0`; §3d's streaming in all arms; views
+identical in all runs):
+
+| arm | peak RSS | b1 drain | b1 GC pause | b1 output | b1 checkpoint |
+|---|---|---|---|---|---|
+| release off | 19.5 GB | 16.4 s | 5.8 s | 2.32 s | 2.16 s |
+| §3b scan (opt-in) | 18.0 GB | 15.9 s | 4.9 s | 2.37 s | 2.43 s |
+| **default (new scan)** | **17.1 GB** | **15.2 s** | **4.8 s** | 2.35 s | 2.50 s |
+
+Default against off: peak RSS −12%, drain −7%, GC pause −18%; batches 2–3 level.
+
+**GC settings cannot be library defaults.** The runtime reads them once at process start, from the
+host's `runtimeconfig.json` (`System.GC.ConserveMemory`, `System.GC.HeapHardLimit`) or `DOTNET_`
+variables. Recommended for a host bounding memory:
+- `GCConserveMemory=7`: about −1 GB peak RSS at level time (§3c, §3d).
+- `GCHeapHardLimit` at 12 GiB holds on ivm-bench SF=3 W=12 (§3d), at the cost of GC pause +32% and
+  output +37%. The floor is set by the places that build a whole result before writing it (§3d).
 
 ## 4. Open questions
 
