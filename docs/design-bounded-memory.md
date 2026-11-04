@@ -853,6 +853,54 @@ The block write never runs the row-to-Arrow builders (`ToArrowChanges`, `ArrowCo
 Per stage on the probe (one batch per view): forming 1.39 GB → 0, index 0.99 → 0.66 GB. The Arrow
 build's 0.8 GB is the output's own bytes.
 
+## 3i. The GC heap hard limit, again (2026-11-04)
+
+With release on by default, window store files (§3g) and output from blocks (§3h), on
+ivm-bench SF=3 W=12 (`gcServer=1`, `gcConcurrent=0`, 3 runs per arm, peak RSS from the testhost
+sampler, views identical in every completed run):
+
+**At first it got worse** (run37):
+- 12 GiB failed 1 of 3 (§3d: 3 of 3 passed), and 10 and 9 GiB failed every run.
+- Nearly every failure was in engineered-wood's Parquet row-group encoding during the output.
+- run38 isolated the cause: the row output path passed 12 GiB 3 of 3, and the block path failed 2
+  of 3 with either engineered-wood. The block path built its Arrow buffers as managed `byte[]`,
+  so under the limit the heap had to hold the output. Apache.Arrow's builders, which the row path
+  uses, allocate native memory, outside the limit.
+
+**Now `ViewArrow` allocates from Arrow's native allocator when a heap hard limit is set**
+(`DOTNET_GCHeapHardLimit[Percent]` or runtimeconfig; `DBSPNET_OUTPUT_NATIVE=on|off` overrides).
+The buffers are freed as soon as the sink has written the view. Without a limit they stay managed,
+since managed garbage reuses heap the GC already holds. The harness prints `native_output`.
+
+| batch 1 (run39, run40, run42) | default | 10 GiB | 10 GiB + conserve | 9 GiB | 8 GiB |
+|---|---|---|---|---|---|
+| outcome | pass | **pass 9/9** | pass | OOM 3/3 | OOM 3/3 |
+| peak RSS | 14–15.5 GB | **10.76 GB** | 10.8 GB | | |
+| drain | 15.1 s | 16.0 s (+6%) | 15.7 s | | |
+| output | 1.57 s | 2.2 s (+40%) | 3.0 s | | |
+| GC pause | 3.9 s | 5.3 s (+36%) | 6.1 s | | |
+
+At 10 GiB the block path beats the row path (run39): output 2.36 against 3.47 s, GC pause 5.1
+against 6.5 s, and 3/3 passes against 2/3. 9 and 8 GiB fail in the drain: its live peak
+(~8.5 GB in tick 18, §3a) is the floor until state spills mid-batch.
+
+**Output batch size** (run41, engineered-wood 02c97cb, which joins strings into exactly-sized
+buffers, #668): 64K-row batches against 1M did not lower peak RSS, were slower (output 1.79
+against 1.62 s), and failed once in 3 at 10 GiB. Batches stay at up to 1M rows.
+
+**Peak RSS without a limit is noisy, and unexplained** (run43, one session, managed buffers
+unless noted):
+
+| | peak RSS | b1 output |
+|---|---|---|
+| engineered-wood 9e4ce64 | 13.5 / 14.1 / 13.9 GB | 1.64 s |
+| engineered-wood 02c97cb | 15.8 / 15.6 / 13.2 GB | 1.52 s |
+| 02c97cb, native buffers | 15.4 / 15.5 / 15.8 GB | 1.61 s |
+
+The newer engineered-wood's runs are bimodal, and its change only touches concatenation, which
+1M-row batches rarely reach. With 3 runs per arm this does not separate engineered-wood from GC
+timing. Native buffers cost ~0.6 GB at most here, so they stay conditional.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven
