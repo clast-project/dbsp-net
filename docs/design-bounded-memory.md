@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB); S1 and S3 not built.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K is extended TPC-DS's holder now (§5.11); S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -1250,3 +1250,108 @@ The tick-18 census (run51, budget off against on):
 - **On TPC-DS it is ~0.64× low:** 630 B/row estimated against ~980 B/row from the census.
 - So the knob holds to within a factor of about 2.5. Making the estimate decrease on removal is
   a possible refinement, if the budget's meaning needs to be tighter.
+
+### 5.9 S1a: spill on build, to scratch (2026-11-04, 9f91ebd)
+
+**What changed.**
+- **Every run change hands the trace to a spiller.** `BlockedIndexedTrace.Compact` (every freeze
+  and merge ends there) calls `BlockAccess.Spiller`.
+- **`RunSpiller`** writes each run with no file and at least `DBSPNET_SPILL_MIN_MIB` (default 10,
+  Feldera's `min_spill_size`) of in-memory blocks to a scratch run file, then rebinds it there
+  (`SpillRun`). The scratch directory is `DBSPNET_BLOCK_SPILL_DIR`, default temp, under `runs/`.
+  The blocks become `LazyTraceBlock`s, admitted to the cache unreferenced, so they leave first.
+- **Files are deleted once their runs are collected**: merged away, or replaced by a checkpoint's
+  rebind. They are tracked by weak reference and swept every 64 spills.
+- **Opt-in** (`DBSPNET_SPILL=on`), and only when the block cache can evict. Without eviction a
+  spill only adds a write.
+
+**Not S1b yet.** A checkpoint still writes its own copy of a spilled run, so it faults each block
+back from the scratch file. Naming the spilled file instead needs two things. One is the
+checkpoint's exact store instance: the reuse test compares by reference, and some paths build a
+new `LocalTableFileSystem` per call. The other is the run layout: Z-set traces (views, DISTINCT)
+checkpoint as `Kind.ZSet`, and indexed ones as `Kind.Indexed`.
+
+**Tests.**
+- The suite passes with every run spilled and a 1 MiB cache (3,452).
+- Three assertions about in-memory block shape are skipped under a spiller: a giant spanning
+  blocks in memory, an index-spill file count, a residency bound. Their output and restore checks
+  still run.
+- `RunSpillerTests`, on a join with a giant group: outputs equal a twin's every tick; runs are
+  file-backed; a checkpoint restores exactly and goes on matching; files go with their runs and
+  none remain after the program; runs below the threshold stay in memory.
+- Four mutants each fail a test: no hook; never delete; ignore the threshold; delete live files.
+
+**Extended TPC-DS SF1, W=1, 48 GiB, 1 GiB cache** (xt49):
+- **The run gets much further**: all of ticks 0–17 complete. Before, it died in tick 8.
+- **Block residency stays at the cache, ~1 GB**, against 25–32 GB before. 123 GB was spilled in
+  448 runs.
+- **The OOM is now in tick 18, inside a join** (`DeltaOnLeft` decoding cells for its output delta):
+  the in-step peak.
+
+**TPC-DI SF=3 W=12** (run54, 4 runs per arm, views identical in every run; "current" is S1a plus
+§5.10's input release):
+
+| | S2 | current, spill off | current, spill on, 512 MiB cache |
+|---|---|---|---|
+| b1 drain | 15.50 s | 15.40 s | 16.18 s (+4.4%) |
+| b1 output | 1.56 s | 1.48 s | 1.72 s |
+| b1 checkpoint | 1.12 s | 1.26 s | 1.05 s |
+| b2 drain | 103 ms | 100 ms | 138 ms (cache misses) |
+| peak RSS | 13.01 GB | 14.05 GB (overlaps; bimodal) | **11.87 GB** |
+
+**Under a heap hard limit, spill on** (run55):
+- **9 GiB: the drain completes 3 of 3**; S2 alone completed 1 of 3. But batch 1's checkpoint then
+  fails 3 of 3, in `LazyTraceBlock.Load` → `BlockSchema.Adopt` under `WriteRunAsync`. That is
+  S1a's copy, faulting spilled runs back in, which S1b removes. ivm-bench takes no checkpoints, so
+  its batch 1 at 9 GiB is now the drain alone.
+- **8 GiB: 2 failures are the same checkpoint reads, and 1 is in the drain.**
+
+### 5.10 Inputs released after their last reader (2026-11-04, be88d2d)
+
+**What was holding memory.**
+- **The census showed something tick-scoped.** After S1a, extended TPC-DS ended tick 0 with
+  16.7 GB live but only 1 GB of blocks. The heap split showed 13.1 GB of small objects (gen2), and
+  0 evicted bodies alive. One 38 ms tick later, live was 2.4 GB.
+- **The view-delta pin was ruled out by experiment** (xt50: releasing all 96 views' pinned
+  `IntegrateOp` inputs freed nothing).
+- **`dotnet-gcdump` could not show it.** On .NET 10 it falls back to lossy buffering and stopped at
+  10M objects.
+- **The culprit: input-handle streams were never released** (written outside the step), so a tick's
+  whole input lived until the next commit. In-step sampling had shown live at 10.3 GB right after
+  op 0, with no state.
+
+**The fix.**
+- **An `InputHandle` commits its stream before every step**, with its zero when nothing was pushed.
+  Such a stream is marked `CommittedEveryTick` and released after its last reader, in the first
+  tick too (`FirstTick.QueueInputs`).
+- **Other streams written outside the step are kept.** Example: a value set once and read every
+  tick.
+
+**Tests.** An input is released, and a quiet tick reads its zero, not null. A stream written outside
+the step only once is kept. Four mutants each fail a test; the last of them (releasing any
+outside-written stream) needed that second test.
+
+**Extended TPC-DS** (xt53 against xt49): live at the end of tick 0 went 16.7 → 11.2 GB, and at ticks
+6–7 9.4 → 5.4 GB. It still fails in tick 18, inside the join.
+
+### 5.11 What extended TPC-DS holds now: TOP-K (2026-11-04)
+
+From tick 8 on, ticks end with 10–17 GB in gen2 plus 4–5 GB of large arrays, and it persists
+across tiny ticks. The census at the end of tick 12 (xt54: 15.6 GB live, 0.75 GB of blocks) found:
+
+| holder | bytes | |
+|---|---|---|
+| `PartitionedTopK._parts` | **9.82 GB** | 201M objects. TOP-K state is entirely managed: it was never moved to blocks |
+| `PartitionedTopK._touched` | 0.92 GB | per-tick scratch that survives the tick |
+| `PartitionedRank` (store 1.76, `_accum` 0.60, `_window` 0.33) | 2.69 GB | |
+| window aggregates | 0.41 GB | |
+| every join, aggregate and view trace | < 1.1 GB | spilled |
+
+**Next, for extended TPC-DS:**
+1. TOP-K state as blocks. The same shape as §3.15's window store: ordered per-partition state with a
+   cold record, and S2's byte budget.
+2. Clear `_touched` at the end of the tick.
+3. Then the in-step peak of tick 18's join.
+
+**Next, for TPC-DI under a limit:** S1b, so the checkpoint names spilled files instead of reading
+them back.
