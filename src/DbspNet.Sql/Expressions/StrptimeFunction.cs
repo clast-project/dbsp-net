@@ -30,7 +30,25 @@ internal sealed class StrptimeFunction(string name, bool safe) : IScalarFunction
         Expression.Call(typeof(StrptimeFunction).GetMethod(nameof(Parse))!,
             buildArg(fn.Arguments[0]), Expression.Constant(safe));
 
-    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t)
+    {
+        if (TypedExpressionCompiler.UnderlyingType(t[0].Type) != typeof(Utf8String))
+        {
+            return null;
+        }
+
+        var input = Expression.Convert(t[0], typeof(Utf8String?));
+
+        return fn.Type.Nullable
+            ? Expression.Call(typeof(StrptimeFunction).GetMethod(nameof(ParseNullable))!, input, Expression.Constant(safe))
+            : Expression.Call(typeof(StrptimeFunction).GetMethod(nameof(ParseStrict))!, input);
+    }
+
+    /// <summary>The typed path's nullable result: NULL input, or (when safe) an unparsable one, is NULL.</summary>
+    public static Timestamp? ParseNullable(Utf8String? value, bool safe) => Parse(value, safe) is Timestamp ts ? ts : null;
+
+    /// <summary>The typed path's strict, non-null result.</summary>
+    public static Timestamp ParseStrict(Utf8String? value) => (Timestamp)Parse(value, safe: false)!;
 
     public static object? Parse(object? value, bool safe)
     {

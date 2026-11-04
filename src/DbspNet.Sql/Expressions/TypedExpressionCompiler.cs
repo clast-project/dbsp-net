@@ -659,9 +659,30 @@ public static class TypedExpressionCompiler
 
     private static Expression BuildCast(ResolvedCast cast, ParameterExpression row, Type rowType)
     {
-        // The structural compiler preserves conversion failures as SQL NULL.
-        if (cast.Safe) throw Unsupported();
         var operand = Build(cast.Operand, row, rowType);
+        if (!cast.Safe)
+        {
+            return BuildStrictCast(cast, operand);
+        }
+
+        // TRY_CAST: the operand is evaluated once, outside the handler, so an error raised
+        // inside it (a nested strict CAST) propagates; only this conversion's own failures
+        // become NULL, as in the structural compiler.
+        var input = Expression.Variable(operand.Type, "castInput");
+        var converted = LiftToNullable(BuildStrictCast(cast, input));
+        var nullResult = Expression.Default(converted.Type);
+        return Expression.Block(
+            [input],
+            Expression.Assign(input, operand),
+            Expression.TryCatch(
+                converted,
+                Expression.Catch(typeof(FormatException), nullResult),
+                Expression.Catch(typeof(OverflowException), nullResult),
+                Expression.Catch(typeof(ArgumentException), nullResult)));
+    }
+
+    private static Expression BuildStrictCast(ResolvedCast cast, Expression operand)
+    {
         var srcType = cast.Operand.Type;
         var dstType = cast.Type;
 
@@ -846,6 +867,14 @@ public static class TypedExpressionCompiler
             var value = Expression.New(typeof(Decimal128).GetConstructor([typeof(Int128)])!, Expression.Convert(unboxed, typeof(Int128)));
             return Expression.Call(typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
                 value, Expression.Constant(0), Expression.Constant(targetType));
+        }
+
+        if (srcType is SqlDoubleType or SqlRealType)
+        {
+            // Scale by 10^scale and round half away from zero, as the structural compiler does.
+            return Expression.Call(typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.FromDouble))!,
+                operand.Type == typeof(double) ? operand : Expression.Convert(operand, typeof(double)),
+                Expression.Constant(targetType));
         }
 
         if (srcType is SqlVarcharType)

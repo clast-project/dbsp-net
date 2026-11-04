@@ -45,7 +45,21 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
             buildArg(fn.Arguments[0]), Expression.Constant(path));
     }
 
-    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t) => null;
+    public Expression? BuildTyped(ResolvedFunctionCall fn, IReadOnlyList<ResolvedExpression> a, Expression[] t)
+    {
+        if (TypedExpressionCompiler.UnderlyingType(t[0].Type) != typeof(Utf8String))
+        {
+            return null;
+        }
+
+        var input = Expression.Convert(t[0], typeof(Utf8String?));
+
+        var path = ((Utf8String)((ResolvedLiteral)fn.Arguments[1]).Value!).ToStringDecoded()[2..].Split('.');
+        return Expression.Call(typeof(JsonExtractStringFunction).GetMethod(nameof(ExtractTyped))!, input, Expression.Constant(path));
+    }
+
+    /// <summary>The typed path's form of <see cref="Extract"/>.</summary>
+    public static Utf8String? ExtractTyped(Utf8String? source, string[] path) => (Utf8String?)Extract(source, path);
 
     public static object? Extract(object? source, string[] path)
     {
