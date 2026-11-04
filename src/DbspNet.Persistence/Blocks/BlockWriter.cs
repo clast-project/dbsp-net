@@ -176,85 +176,12 @@ internal static class BlockWriter
     /// </summary>
     public static TraceBlock Concat(BlockSchema schema, IReadOnlyList<TraceBlock> parts)
     {
-        var columns = schema.HashColumn + 1;
-        var n = 0;
-        foreach (var part in parts)
-        {
-            n = checked(n + part.Count);
-        }
-
-        var nulls = new int[columns];
-        var heap = new long[columns];
-        var bufferCount = 0;
-        for (var c = 0; c < columns; c++)
-        {
-            var kind = KindOf(schema, c);
-            bufferCount += kind == CellKind.Utf8 ? 3 : 2;
-            foreach (var part in parts)
-            {
-                var v = part.ValidityAt(c);
-                if (v >= 0)
-                {
-                    for (var i = 0; i < part.Count; i++)
-                    {
-                        nulls[c] += (part.Bytes[v + (i >> 3)] >> (i & 7)) & 1 ^ 1;
-                    }
-                }
-
-                if (kind == CellKind.Utf8 && part.Count > 0)
-                {
-                    heap[c] += Offset(part, c, part.Count);
-                }
-            }
-        }
-
-        var buffers = new (long Offset, long Length)[bufferCount];
-        var validity = new int[columns];
-        var valueAt = new int[columns];
-        var dataAt = new int[columns];
-        long body = 0;
-        var b = 0;
-        (long, long) Next(long length)
-        {
-            var at = body;
-            body += Pad8(length);
-            return (at, length);
-        }
-
-        for (var c = 0; c < columns; c++)
-        {
-            var kind = KindOf(schema, c);
-            buffers[b] = Next(nulls[c] > 0 ? (n + 7) / 8 : 0);
-            validity[c] = nulls[c] > 0 ? (int)buffers[b].Offset : -1;
-            b++;
-            buffers[b] = Next(kind switch
-            {
-                CellKind.Bool => (n + 7) / 8,
-                CellKind.Utf8 => (n + 1) * 4L,
-                _ => (long)Width(kind) * n,
-            });
-            valueAt[c] = n == 0 ? -1 : (int)buffers[b].Offset;
-            b++;
-            if (kind == CellKind.Utf8)
-            {
-                buffers[b] = Next(heap[c]);
-                dataAt[c] = heap[c] > 0 ? (int)buffers[b].Offset : -1;
-                b++;
-            }
-            else
-            {
-                dataAt[c] = -1;
-            }
-        }
-
-        var buffersVector = NodesVector + 4 + (16 * columns) + 4;
-        var metadata = (int)Pad8(buffersVector + 4 + (16 * bufferCount));
-        var bodyStart = Prefix + metadata;
-        var message = new byte[checked(bodyStart + body)];
+        var layout = ConcatLayout.Of(schema, parts);
+        var (columns, n, validity, valueAt, dataAt) = (layout.Columns, layout.N, layout.Validity, layout.ValueAt, layout.DataAt);
+        var bodyStart = layout.BodyStart;
+        var message = new byte[checked(bodyStart + layout.Body)];
         var span = message.AsSpan();
-        BinaryPrimitives.WriteUInt32LittleEndian(span, 0xFFFFFFFF);
-        BinaryPrimitives.WriteInt32LittleEndian(span[4..], metadata);
-        WriteHeader(span.Slice(Prefix, metadata), n, nulls, buffers, buffersVector, body);
+        layout.WriteHead(span);
         var out_ = span[bodyStart..];
 
         for (var c = 0; c < columns && n > 0; c++)
@@ -347,10 +274,265 @@ internal static class BlockWriter
         }
 
         return new TraceBlock(schema, message, n, validity, valueAt, dataAt, valueHashes);
+    }
 
-        // A string column's int32 offset i (i = Count: its heap length).
-        static int Offset(TraceBlock part, int column, int i) =>
-            BinaryPrimitives.ReadInt32LittleEndian(part.Bytes.AsSpan(part.ValuesAt(column) + (i * 4)));
+    /// <summary>
+    /// Write <paramref name="parts"/> as one block straight to <paramref name="file"/>, byte for byte
+    /// the message <see cref="Concat"/> builds, without building it (docs/design-bounded-memory.md
+    /// §3d): fixed widths and string heaps are written from the parts' own bytes, and only bitmaps and
+    /// rebased string offsets pass through a scratch buffer of at most one part's size. A giant group
+    /// of 175 MB costs its checkpoint ~1 MB instead. Returns the bytes written.
+    /// </summary>
+    public static async ValueTask<long> ConcatToAsync(
+        BlockSchema schema, IReadOnlyList<TraceBlock> parts, Core.IO.ISequentialFile file, CancellationToken cancellationToken)
+    {
+        var layout = ConcatLayout.Of(schema, parts);
+        var n = layout.N;
+        var head = new byte[layout.BodyStart];
+        layout.WriteHead(head);
+        await file.WriteAsync(head, cancellationToken).ConfigureAwait(false);
+        if (n == 0)
+        {
+            await file.WriteAsync(new byte[layout.Body], cancellationToken).ConfigureAwait(false);
+            return layout.BodyStart + layout.Body;
+        }
+
+        var largest = 0;
+        foreach (var part in parts)
+        {
+            largest = Math.Max(largest, part.Count);
+        }
+
+        var scratch = new byte[Math.Max((n + 7) / 8, (largest * 4) + 4)];
+        var padding = new byte[8];
+        var b = 0;
+        long written = 0;
+        for (var c = 0; c < layout.Columns; c++)
+        {
+            var kind = KindOf(schema, c);
+
+            // Validity: empty unless the column has a null somewhere.
+            if (layout.Buffers[b].Length > 0)
+            {
+                await Bits(c, valid: true).ConfigureAwait(false);
+            }
+
+            await Pad(layout.Buffers[b++].Length).ConfigureAwait(false);
+
+            // Values.
+            switch (kind)
+            {
+                case CellKind.Bool:
+                    await Bits(c, valid: false).ConfigureAwait(false);
+                    break;
+                case CellKind.Utf8:
+                    BinaryPrimitives.WriteInt32LittleEndian(scratch, 0);
+                    await Write(scratch.AsMemory(0, 4)).ConfigureAwait(false);
+                    var heapAt = 0;
+                    foreach (var part in parts)
+                    {
+                        if (part.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        for (var i = 1; i <= part.Count; i++)
+                        {
+                            BinaryPrimitives.WriteInt32LittleEndian(scratch.AsSpan((i - 1) * 4), heapAt + Offset(part, c, i));
+                        }
+
+                        await Write(scratch.AsMemory(0, part.Count * 4)).ConfigureAwait(false);
+                        heapAt += Offset(part, c, part.Count);
+                    }
+
+                    break;
+                default:
+                    var width = c == schema.WeightColumn ? 8 : c == schema.HashColumn ? 4 : Width(kind);
+                    foreach (var part in parts)
+                    {
+                        if (part.Count > 0)
+                        {
+                            await Write(part.Bytes.AsMemory(part.ValuesAt(c), part.Count * width)).ConfigureAwait(false);
+                        }
+                    }
+
+                    break;
+            }
+
+            await Pad(layout.Buffers[b++].Length).ConfigureAwait(false);
+
+            // A string column's heap.
+            if (kind == CellKind.Utf8)
+            {
+                foreach (var part in parts)
+                {
+                    var length = part.Count == 0 ? 0 : Offset(part, c, part.Count);
+                    if (length > 0)
+                    {
+                        await Write(part.Bytes.AsMemory(part.DataAt(c), length)).ConfigureAwait(false);
+                    }
+                }
+
+                await Pad(layout.Buffers[b++].Length).ConfigureAwait(false);
+            }
+        }
+
+        if (written != layout.Body)
+        {
+            throw new InvalidOperationException($"streamed block body is {written} bytes, its layout {layout.Body}");
+        }
+
+        return layout.BodyStart + written;
+
+        ValueTask Write(ReadOnlyMemory<byte> data)
+        {
+            written += data.Length;
+            return file.WriteAsync(data, cancellationToken);
+        }
+
+        // The buffer just written was `length` bytes: bring the body to the next 8-byte boundary.
+        ValueTask Pad(long length)
+        {
+            var pad = (int)(Pad8(length) - length);
+            return pad == 0 ? ValueTask.CompletedTask : Write(padding.AsMemory(0, pad));
+        }
+
+        // A validity bitmap (valid) or BOOLEAN values over all parts, through the scratch buffer.
+        ValueTask Bits(int c, bool valid)
+        {
+            var bytes = (n + 7) / 8;
+            var out_ = scratch.AsSpan(0, bytes);
+            out_.Clear();
+            var at = 0;
+            foreach (var part in parts)
+            {
+                var src = part.Bytes;
+                var at0 = valid ? part.ValidityAt(c) : part.ValuesAt(c);
+                for (var i = 0; i < part.Count; i++)
+                {
+                    if (valid ? at0 < 0 || ((src[at0 + (i >> 3)] >> (i & 7)) & 1) != 0 : ((src[at0 + (i >> 3)] >> (i & 7)) & 1) != 0)
+                    {
+                        var bit = at + i;
+                        out_[bit >> 3] |= (byte)(1 << (bit & 7));
+                    }
+                }
+
+                at += part.Count;
+            }
+
+            return Write(scratch.AsMemory(0, bytes));
+        }
+    }
+
+    // A string column's int32 offset i (i = Count: its heap length).
+    private static int Offset(TraceBlock part, int column, int i) =>
+        BinaryPrimitives.ReadInt32LittleEndian(part.Bytes.AsSpan(part.ValuesAt(column) + (i * 4)));
+
+    /// <summary>Where each buffer of <see cref="Concat"/>'s message goes, from the parts alone.</summary>
+    private sealed class ConcatLayout
+    {
+        public int Columns, N, Metadata, BuffersVector;
+        public long Body;
+        public int[] Nulls = [], Validity = [], ValueAt = [], DataAt = [];
+        public (long Offset, long Length)[] Buffers = [];
+
+        public int BodyStart => Prefix + Metadata;
+
+        public void WriteHead(Span<byte> span)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(span, 0xFFFFFFFF);
+            BinaryPrimitives.WriteInt32LittleEndian(span[4..], Metadata);
+            WriteHeader(span.Slice(Prefix, Metadata), N, Nulls, Buffers, BuffersVector, Body);
+        }
+
+        public static ConcatLayout Of(BlockSchema schema, IReadOnlyList<TraceBlock> parts)
+        {
+            var columns = schema.HashColumn + 1;
+            var n = 0;
+            foreach (var part in parts)
+            {
+                n = checked(n + part.Count);
+            }
+
+            var nulls = new int[columns];
+            var heap = new long[columns];
+            var bufferCount = 0;
+            for (var c = 0; c < columns; c++)
+            {
+                var kind = KindOf(schema, c);
+                bufferCount += kind == CellKind.Utf8 ? 3 : 2;
+                foreach (var part in parts)
+                {
+                    var v = part.ValidityAt(c);
+                    if (v >= 0)
+                    {
+                        for (var i = 0; i < part.Count; i++)
+                        {
+                            nulls[c] += (part.Bytes[v + (i >> 3)] >> (i & 7)) & 1 ^ 1;
+                        }
+                    }
+
+                    if (kind == CellKind.Utf8 && part.Count > 0)
+                    {
+                        heap[c] += Offset(part, c, part.Count);
+                    }
+                }
+            }
+
+            var buffers = new (long Offset, long Length)[bufferCount];
+            var validity = new int[columns];
+            var valueAt = new int[columns];
+            var dataAt = new int[columns];
+            long body = 0;
+            var b = 0;
+            (long, long) Next(long length)
+            {
+                var at = body;
+                body += Pad8(length);
+                return (at, length);
+            }
+
+            for (var c = 0; c < columns; c++)
+            {
+                var kind = KindOf(schema, c);
+                buffers[b] = Next(nulls[c] > 0 ? (n + 7) / 8 : 0);
+                validity[c] = nulls[c] > 0 ? (int)buffers[b].Offset : -1;
+                b++;
+                buffers[b] = Next(kind switch
+                {
+                    CellKind.Bool => (n + 7) / 8,
+                    CellKind.Utf8 => (n + 1) * 4L,
+                    _ => (long)Width(kind) * n,
+                });
+                valueAt[c] = n == 0 ? -1 : (int)buffers[b].Offset;
+                b++;
+                if (kind == CellKind.Utf8)
+                {
+                    buffers[b] = Next(heap[c]);
+                    dataAt[c] = heap[c] > 0 ? (int)buffers[b].Offset : -1;
+                    b++;
+                }
+                else
+                {
+                    dataAt[c] = -1;
+                }
+            }
+
+            var buffersVector = NodesVector + 4 + (16 * columns) + 4;
+            return new ConcatLayout
+            {
+                Columns = columns,
+                N = n,
+                Nulls = nulls,
+                Buffers = buffers,
+                Validity = validity,
+                ValueAt = valueAt,
+                DataAt = dataAt,
+                Body = body,
+                BuffersVector = buffersVector,
+                Metadata = (int)Pad8(buffersVector + 4 + (16 * bufferCount)),
+            };
+        }
     }
 
     private static CellKind KindOf(BlockSchema schema, int c) =>

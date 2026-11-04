@@ -261,20 +261,31 @@ internal static class BlockedTraceCheckpoint
 
             var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
             // Without eviction a span is written whole (neighbours and all): nothing faults it in for
-            // a neighbour, and slicing would cost the checkpoint (§3.6).
-            var pieces = end == b + 1 ? [(Materialized(blocks[b]), false)]
+            // a neighbour, and slicing would cost the checkpoint (§3.6). A giant's parts are streamed
+            // to the file, never concatenated in memory (§3d).
+            var pieces = end == b + 1 ? [new Piece(Materialized(blocks[b]), null)]
                 : BlockCache.Enabled ? Pieces(schema, blocks, b, end)
-                : [(BlockWriter.Concat(schema, [.. blocks[b..end].Select(Materialized)]), true)];
+                : [new Piece(null, [.. blocks[b..end].Select(Materialized)])];
             if (end > b + 1 && Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
             {
-                Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Block.Count));
+                Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Count));
             }
 
-            foreach (var (block, giant) in pieces)
+            foreach (var piece in pieces)
             {
-                var hashes = Distinct(block.Hashes);
-                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
-                bodies.Add((writer.Index[^1], giant ? null : block));
+                if (piece.Parts is { } parts)
+                {
+                    var hashes = Distinct(parts);
+                    await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+                    bodies.Add((writer.Index[^1], null));
+                }
+                else
+                {
+                    var block = piece.Block!;
+                    var hashes = Distinct(block.Hashes);
+                    await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+                    bodies.Add((writer.Index[^1], block));
+                }
             }
 
             b = end;
@@ -294,10 +305,10 @@ internal static class BlockedTraceCheckpoint
     // Blocks [from, to) chained by hashes that span them, as file blocks: each spanning hash alone in
     // one block (its parts concatenated byte-wise, not decoded), and the entries around it in blocks
     // of their own (docs/design-bounded-memory.md §3.5) — so a probe for a neighbouring key reads a
-    // small block, not the giant group. Giant: a spanning hash's block.
-    private static List<(TraceBlock Block, bool Giant)> Pieces(BlockSchema schema, ITraceBlock[] blocks, int from, int to)
+    // small block, not the giant group. A spanning hash comes back as its parts, to be streamed.
+    private static List<Piece> Pieces(BlockSchema schema, ITraceBlock[] blocks, int from, int to)
     {
-        var pieces = new List<(TraceBlock, bool)>();
+        var pieces = new List<Piece>();
         var pending = new List<TraceBlock>();
         uint pendingHash = 0;
         for (var k = from; k < to; k++)
@@ -319,7 +330,7 @@ internal static class BlockedTraceCheckpoint
                 }
 
                 pending.Add(Slice(schema, block, 0, lo));
-                pieces.Add((pending.Count == 1 ? pending[0] : BlockWriter.Concat(schema, pending), true));
+                pieces.Add(new Piece(null, [.. pending]));
                 pending.Clear();
             }
 
@@ -327,7 +338,7 @@ internal static class BlockedTraceCheckpoint
             var hi = k + 1 < to ? block.LowerBound(block.LastHash) : hashes.Length;
             if (hi > lo)
             {
-                pieces.Add((lo == 0 && hi == hashes.Length ? block : Slice(schema, block, lo, hi), false));
+                pieces.Add(new Piece(lo == 0 && hi == hashes.Length ? block : Slice(schema, block, lo, hi), null));
             }
 
             if (hi < hashes.Length)
@@ -339,7 +350,7 @@ internal static class BlockedTraceCheckpoint
 
         if (pending.Count > 0)
         {
-            pieces.Add((pending.Count == 1 ? pending[0] : BlockWriter.Concat(schema, pending), true));
+            pieces.Add(new Piece(null, [.. pending]));
         }
 
         return pieces;
@@ -368,6 +379,30 @@ internal static class BlockedTraceCheckpoint
         }
 
         return schema.Encode(keys, values, weights, hashes, n);
+    }
+
+    // One file block: a block written as it is (and kept as the file block's body), or a giant
+    // group's parts, streamed as one block and not kept.
+    private sealed record Piece(TraceBlock? Block, IReadOnlyList<TraceBlock>? Parts)
+    {
+        public int Count => Block?.Count ?? Parts!.Sum(p => p.Count);
+    }
+
+    private static List<uint> Distinct(IReadOnlyList<TraceBlock> parts)
+    {
+        var distinct = new List<uint>();
+        foreach (var part in parts)
+        {
+            foreach (var h in part.Hashes)
+            {
+                if (distinct.Count == 0 || distinct[^1] != h)
+                {
+                    distinct.Add(h);
+                }
+            }
+        }
+
+        return distinct;
     }
 
     private static List<uint> Distinct(ReadOnlySpan<uint> hashes)

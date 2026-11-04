@@ -129,7 +129,7 @@ public class TraceBlockTests
 
     [Theory]
     [MemberData(nameof(Seeds))]
-    public void Block_DecodesLikeTheRunCodec_AndKeyEqualityAgreesWithEquals(int seed)
+    public async Task Block_DecodesLikeTheRunCodec_AndKeyEqualityAgreesWithEquals(int seed)
     {
         var rnd = new Random(seed);
         var keyKinds = Enumerable.Range(0, rnd.Next(1, 4)).Select(_ => AllKinds[rnd.Next(AllKinds.Length)]).ToArray();
@@ -198,6 +198,13 @@ public class TraceBlockTests
 
         var concatenated = BlockWriter.Concat(schema, pieces);
         Assert.Equal(ks.Count, Oracle(schema, concatenated).Length);
+
+        // Streamed to a file from the pieces, it is the same message byte for byte
+        // (docs/design-bounded-memory.md §3d).
+        var streamed = new CapturingFile();
+        var length = await BlockWriter.ConcatToAsync(schema, pieces, streamed, default);
+        Assert.Equal(concatenated.Message.Length, length);
+        Assert.True(concatenated.Message.Span.SequenceEqual(streamed.Bytes.ToArray()), "streamed concatenation differs from Concat");
         var oracle = Oracle(schema, block);
         Assert.Equal(ks.Count, block.Count);
         Assert.Equal(ks.Count, oracle.Length);
@@ -319,4 +326,26 @@ public class TraceBlockTests
         Assert.Null(BlockSchema.TryCreate(
             new Schema([new SchemaColumn("k", new SqlIntegerType(false))]),
             new Schema([new SchemaColumn("i", new SqlIntervalType(IntervalQualifier.Year, true))])));
+
+    // An ISequentialFile into memory.
+    private sealed class CapturingFile : DbspNet.Core.IO.ISequentialFile
+    {
+        public MemoryStream Bytes { get; } = new();
+
+        public long Position => Bytes.Length;
+
+        public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            Bytes.Write(data.Span);
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask FlushAsync(CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        public void Dispose()
+        {
+        }
+    }
 }

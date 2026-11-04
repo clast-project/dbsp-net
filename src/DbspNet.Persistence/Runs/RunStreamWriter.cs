@@ -89,6 +89,27 @@ internal sealed class RunStreamWriter : IAsyncDisposable
         _lastHash = last;
     }
 
+    /// <summary>Append <paramref name="parts"/> as one block, streamed from their bytes
+    /// (<see cref="Blocks.BlockWriter.ConcatToAsync"/>): a giant group is never built in memory.</summary>
+    internal async ValueTask AppendConcatAsync(
+        Blocks.BlockSchema schema, IReadOnlyList<Blocks.TraceBlock> parts, IReadOnlyList<uint> keyHashes, int entries, int groups, CancellationToken cancellationToken)
+    {
+        var first = keyHashes[0];
+        var last = keyHashes[^1];
+        if (_lastHash is { } previous && first <= previous)
+        {
+            throw new InvalidOperationException("run blocks must arrive in ascending, non-overlapping hash order");
+        }
+
+        var offset = _file.Position;
+        await Blocks.BlockWriter.ConcatToAsync(schema, parts, _file, cancellationToken).ConfigureAwait(false);
+        _index.Add(new RunBlock(first, last, offset, checked((int)(_file.Position - offset)), entries, groups));
+        _keyHashes.AddRange(keyHashes);
+        _entries += entries;
+        _groups += groups;
+        _lastHash = last;
+    }
+
     /// <summary>The blocks written so far: offsets, lengths and hash ranges.</summary>
     internal IReadOnlyList<RunBlock> Index => _index;
 
