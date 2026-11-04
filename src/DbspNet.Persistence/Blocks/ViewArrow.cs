@@ -105,16 +105,67 @@ internal static class ViewArrow
     }
 
     /// <summary>
-    /// Buffers from Arrow's native allocator, as Arrow's own builders allocate them, so the output's
-    /// bytes are not on the managed heap (under a GC heap limit, a write would otherwise need room
-    /// for them there: run38). Freed together, as soon as the sink has written the batches.
+    /// Whether output buffers come from Arrow's native allocator (docs/design-bounded-memory.md §3h).
+    /// Under a GC heap hard limit native memory is outside the limit, as Arrow's own builders'
+    /// buffers are, and a 10 GiB limit holds only so (run39). Without one, managed buffers reuse the
+    /// heap the GC already holds, and native ones cost ~1 GB of peak RSS (run40, run41). So: native
+    /// when a heap hard limit is set; <c>DBSPNET_OUTPUT_NATIVE=on|off</c> overrides.
+    /// </summary>
+    internal static bool Native => NativeOverride.Value ?? DefaultNative;
+
+    private static readonly bool DefaultNative = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_NATIVE") switch
+    {
+        "on" => true,
+        "off" => false,
+        _ => HeapHardLimitSet(),
+    };
+
+    private static readonly AsyncLocal<bool?> NativeOverride = new();
+
+    /// <summary><see cref="Native"/> in the current async context until disposed (tests).</summary>
+    internal static IDisposable UseNative(bool native)
+    {
+        var previous = NativeOverride.Value;
+        NativeOverride.Value = native;
+        return new Restore(() => NativeOverride.Value = previous);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
+    }
+
+    // A GC heap hard limit, as the runtime takes it: DOTNET_ variables or runtimeconfig settings.
+    private static bool HeapHardLimitSet()
+    {
+        foreach (var name in (string[])["GCHeapHardLimit", "GCHeapHardLimitPercent"])
+        {
+            if (Environment.GetEnvironmentVariable("DOTNET_" + name) is { Length: > 0 } || Environment.GetEnvironmentVariable("COMPlus_" + name) is { Length: > 0 })
+            {
+                return true;
+            }
+        }
+
+        return AppContext.GetData("GCHeapHardLimit") is not null || AppContext.GetData("System.GC.HeapHardLimit") is not null
+            || AppContext.GetData("GCHeapHardLimitPercent") is not null || AppContext.GetData("System.GC.HeapHardLimitPercent") is not null;
+    }
+
+    /// <summary>
+    /// The output's buffers: from Arrow's native allocator when <see cref="Native"/> (freed together
+    /// as soon as the sink has written the batches), otherwise managed arrays.
     /// </summary>
     internal sealed class NativeBuffers : IDisposable
     {
         private readonly List<System.Buffers.IMemoryOwner<byte>> _owners = [];
+        private readonly bool _native = Native;
 
         public Memory<byte> Allocate(long length)
         {
+            if (!_native)
+            {
+                return new byte[length];
+            }
+
             var owner = Apache.Arrow.Memory.MemoryAllocator.Default.Value.Allocate(checked((int)length));
             _owners.Add(owner);
             var memory = owner.Memory[..(int)length];

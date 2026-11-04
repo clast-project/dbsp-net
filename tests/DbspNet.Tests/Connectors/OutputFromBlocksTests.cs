@@ -92,14 +92,16 @@ public sealed class OutputFromBlocksTests : IDisposable
         return dir;
     }
 
+    // native: the batches' buffers from Arrow's native allocator (as under a GC heap limit) or managed.
     [Theory]
-    [InlineData(1, 1)]
-    [InlineData(2, 1)]
-    [InlineData(1, 3)]
-    [InlineData(2, 3)]
-    public async Task AFullWriteFromBlocks_LeavesTheSameTableAsTheRowPath_AndIncrementalBatchesCarryOn(int seed, int workers)
+    [InlineData(1, 1, false)]
+    [InlineData(2, 1, true)]
+    [InlineData(1, 3, true)]
+    [InlineData(2, 3, false)]
+    public async Task AFullWriteFromBlocks_LeavesTheSameTableAsTheRowPath_AndIncrementalBatchesCarryOn(int seed, int workers, bool native)
     {
         using var mode = TraceBlocksMode.Use(join: true, freezeEntries: 8, blockEntries: 4, view: true);
+        using var buffers = DbspNet.Persistence.Blocks.ViewArrow.UseNative(native);
         var versions = new List<IReadOnlyList<(object?[] Row, long Weight)>>();
         var live = new List<object?[]>();
         var rng = new Random(seed);
