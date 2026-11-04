@@ -466,8 +466,12 @@ public sealed class ProgramRunner
     // Diagnostic: DBSPNET_OUTPUT_TRACE=<file> also gets each incremental write's runner-side times.
     private static readonly string? OutputTrace = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_TRACE");
 
-    /// <summary>Full writes from a view's blocks (§3h); <c>DBSPNET_OUTPUT_BLOCKS=0</c> turns it off.</summary>
-    internal static bool ViewBlocks { get; set; } = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_BLOCKS") != "0";
+    /// <summary>Full writes from a view's blocks (docs/design-bounded-memory.md §3h); on unless
+    /// <c>DBSPNET_OUTPUT_BLOCKS=0</c>.</summary>
+    internal bool ViewBlocks { get; set; } = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_BLOCKS") != "0";
+
+    /// <summary>Full writes made from a view's blocks so far (tests).</summary>
+    internal int ViewBlockWrites { get; private set; }
 
     public async ValueTask WriteOutputsAsync(CancellationToken cancellationToken = default)
     {
@@ -543,6 +547,7 @@ public sealed class ProgramRunner
 
                 incremental.Pending = new ZSetBuilder<StructuralRow, Z64>();
                 incremental.Written = true;
+                ViewBlockWrites++;
                 _profile?.Output(connector.ViewName).Add(buildTicks, Stopwatch.GetTimestamp() - bw0, built.Entries.Count);
                 return;
             }

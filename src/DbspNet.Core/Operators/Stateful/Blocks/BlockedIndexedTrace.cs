@@ -818,8 +818,39 @@ internal sealed class BlockedIndexedTrace
     /// first of each set of equals stands for them. Zero sums are dropped. Null when a managed level
     /// waits or a run carries a GC floor (rows to drop are found by decoding): read rows instead.
     /// </summary>
-    internal IEnumerable<(ITraceBlock Block, int Index, long Weight)>? StreamEntries() =>
-        _managed.Count > 0 || _runs.Any(r => r.Floor != long.MinValue) ? null : StreamEntriesCore([.. _runs]);
+    internal IEnumerable<(ITraceBlock Block, int Index, long Weight)>? StreamEntries()
+    {
+        if (_runs.Any(r => r.Floor != long.MinValue) || _managed.Any(l => l.Floor != long.MinValue || l.Rows is null))
+        {
+            return null;
+        }
+
+        // Rows not yet frozen are encoded into one scratch run, as a freeze would, but the trace is
+        // left as it is: a reader must not change what the next tick or checkpoint sees.
+        if (_managed.Count == 0)
+        {
+            return StreamEntriesCore([.. _runs]);
+        }
+
+        var pending = new ZSetBuilder<StructuralRow, Z64>();
+        foreach (var level in _managed)
+        {
+            foreach (var (row, weight) in level.Rows!)
+            {
+                pending.Add(row, weight);
+            }
+        }
+
+        var rows = pending.Build().Where(e => e.Value.Value != 0).Select(e => (Hash: (uint)_hash(e.Key), e.Key, e.Value.Value)).ToArray();
+        Array.Sort(rows, static (a, b) => a.Hash.CompareTo(b.Hash));
+        var builder = new RunBuilder(this);
+        foreach (var (hash, row, weight) in rows)
+        {
+            builder.Add(hash, row, NoValue, weight);
+        }
+
+        return builder.Finish() is { } scratch ? StreamEntriesCore([scratch, .. _runs]) : StreamEntriesCore([.. _runs]);
+    }
 
     private static IEnumerable<(ITraceBlock Block, int Index, long Weight)> StreamEntriesCore(Run[] runs)
     {
