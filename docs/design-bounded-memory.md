@@ -1451,3 +1451,57 @@ Option 1 is the only one that bounds the peak by a knob, and it is the cheapest.
 `DBSPNET_MAX_TICK_ROWS` (unset: today's one tick per version) would join §5.5.
 Separately, the 45.6 s blocked TOP-K step on a ~2M-row delta needs a look. The managed operator's
 time on the same delta is unmeasured.
+
+### 5.14 Spilling in-step deltas: the pieces (2026-11-04, estimate)
+
+Curt prefers §5.13's option 2, spilling in-step deltas, as the long-term fix. This section breaks it
+into increments and sizes each one.
+
+**What exists.**
+- **Deltas are `ZSet<StructuralRow, Z64>`** (816 lines; three backings behind `object _store`:
+  dictionary, `ChunkedMap`, inline) **or `IndexedZSet`** (578 lines; a dictionary of key → group
+  `ZSet`). Join and aggregate inputs are `IndexedZSet`: 16 operator files take one, 8 of them spine
+  variants.
+- **Consumers mostly enumerate.** 15 operators load `_input.Current` into a local and loop over it.
+  `WeightOf`/`Contains` are used almost only on state.
+- **Producers consolidate in a hash map** (`ZSetBuilder`): 52 construction sites in 32 Core operator
+  files, and 28 in the SQL layer's compiled row functions (`MapFilterRows` and friends).
+- **What a step allocates is O(|delta|), beyond the delta itself.** Tick 18's OOM site was
+  `IncrementalLeftJoinOp`'s `HashSet` of touched keys, sized to its inputs' group counts. Rank, TOP-K
+  and window operators keep touched maps and old windows the same way.
+- **Most of the machinery is already built.** `BlockedIndexedTrace` turns managed levels into
+  consolidated, hash-ordered block runs and merges them; S1 spills them; the cache evicts them. A
+  delta that outgrows memory needs exactly that, just for one step.
+
+**Increments.** Production code only; tests add roughly as much again. Each increment is about one
+session of work plus a measured A/B, and each lands behind a threshold knob.
+
+| # | piece | where | size | alone it buys |
+|---|---|---|---|---|
+| D1 | **Block-backed `ZSet`:** a fourth backing, hash-ordered runs of `ITraceBlock`s (lazy or spilled). Enumeration decodes block by block; `Count`/`IsEmpty` are O(1); `WeightOf`/`Contains` probe by hash; set algebra materializes, as a fallback | `ZSet.cs`, the enumerator struct | ~350 lines | nothing yet: nobody builds one |
+| D2 | **Spilling builder:** `ZSetBuilder` consolidates in memory up to a threshold, then freezes a sorted run to blocks (reusing `BlockedIndexedTrace`'s freeze and `RunBuilder`). `Build` returns a D1 set over the runs, merged lazily, and spills them through S1 above `min_step_spill` | `ZSetBuilder.cs`, the blocks code | ~300 lines | a producer's peak is bounded by the threshold, not by its output |
+| D3 | **Format plumbing:** the compiler passes each structural stream's block format to the operators that can emit big deltas: compiled row functions (Apply), joins, union/difference (Apply2), aggregate, rank/TOP-K/window outputs, exchange gather. Typed path excluded | `PlanToCircuit`, ~10–12 operators, of the 32 + 28 builder sites | ~300 lines, mechanical | **D1–D3 bound every `ZSet` edge.** In tick 18 the 21.7M-row join output and the Apply chain after it become blocks (~4× smaller) and spillable |
+| D4 | **Block-backed `IndexedZSet` deltas:** entries in key-hash order (the trace run layout), groups found by hash probe (as `BlockedGroupView`), produced by index and exchange-index operators | `IndexedZSet.cs`, index ops, ~8 flat consumers | ~500 lines | join and aggregate inputs bounded too |
+| D5 | **Consumers in key-hash slices:** an operator whose own per-step structures are O(\|delta\|) processes a sorted block delta one hash range at a time, feeding D2's builder, so its working set is one slice. It is bounded ticks *inside* the operator: joins are bilinear, and aggregate, rank, TOP-K, window and DISTINCT update per key | left, full and inner joins; aggregate; DISTINCT; rank/TOP-K/window | ~6 operators × 80–150 ≈ 700 lines | **the step's peak is bounded by knobs.** Tick 18's left-join `HashSet` is a slice's size |
+| D6 | **Cross-cutting:** exchange (W>1) splitting a block delta by key hash and gathering; view handles' `LastDelta`; `LastCount` and introspection; stream release over block bodies | exchange ops, handles | ~250 lines | the parallel path |
+| D7 | **Verification:** a forced mode (threshold 0: every delta blocked and spilled) run over the whole suite, as for S1. PBTs against the managed path. Nexmark and TPC-DI A/B for the hot enumerator: below the threshold nothing changes, but the enumerator's switch grows | tests, bench | ~600 lines | the default-on decision |
+
+**Total:** about 2,400 lines of production code plus about 1,500 of tests, in 6–7 measured increments.
+For scale: S1a was ~250 lines, blocked TOP-K ~250, and the flat-trace-state arc several times this.
+
+**Order and risk.**
+- **Order:** D1 → D2 → D3 ship together as the first measurable step, since they bound `ZSet` edges.
+  D4 and D5 are the larger half, and D5 is what bounds a step by knobs. D6 then follows the parallel
+  path.
+- **Biggest risk: D1's enumerator.** It is the hottest loop in the engine. The de-boxed enumerators
+  (b5f90aa) were worth −13.5% on many-ticks workloads, so a fourth arm must cost nothing below the
+  threshold. Nexmark is the gate.
+- **Second risk: D5's per-operator slicing.** Each operator's retraction and old-window logic has to
+  be right across slice boundaries. The twin PBTs cover it.
+
+**How Feldera does it.** Its batches are always sorted and key-indexed; there is no separate Z-set and
+indexed Z-set. Builders fall back from `Vec` to `File` partway through, and consumers walk cursors.
+D1–D5 adopt that shape only for deltas past the threshold, and leave the small-delta path as it is.
+
+**Bounded ticks (§5.13 option 1) still has a role.** At ~150 lines plus journal care, it is a cheap
+interim. D5 makes it redundant for memory, though it may still matter for latency.
