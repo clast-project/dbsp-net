@@ -155,6 +155,29 @@ public static class StatefulOperators
         bool orderDescending = false,
         bool orderNullsFirst = false)
         where TRow : notnull
+        where TKey : notnull =>
+        PartitionedTopK(builder, input, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec,
+            orderKey, orderDescending, orderNullsFirst, chunkFormat: null, blockFormat: null);
+
+    /// <summary>As the public overload, with the compact operator's state held as blocks when
+    /// <paramref name="chunkFormat"/> (no key, the row) and <paramref name="blockFormat"/> (partition
+    /// key, the row) are set (docs/design-bounded-memory.md §5.12).</summary>
+    internal static Stream<ZSet<TRow, Z64>> PartitionedTopK<TRow, TKey>(
+        this CircuitBuilder builder,
+        Stream<ZSet<TRow, Z64>> input,
+        Func<TRow, TKey> partitionOf,
+        IComparer<TRow> order,
+        IComparer<TRow> sortKeyOnly,
+        RankFunction function,
+        long limit,
+        IEqualityComparer<TKey>? partitionComparer,
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec,
+        Func<TRow, object?>? orderKey,
+        bool orderDescending,
+        bool orderNullsFirst,
+        Blocks.ITraceBlockFormat? chunkFormat,
+        Blocks.ITraceBlockFormat? blockFormat)
+        where TRow : notnull
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -176,7 +199,7 @@ public static class StatefulOperators
                 ? typeof(PartitionedTopKNarrowOp<TRow, StructuralRow>)
                 : typeof(PartitionedTopKOp<TRow, StructuralRow>);
             builder.AddRawOperator(new PartitionedTopKCompactOp<TRow, TKey>(
-                input, output, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec)
+                input, output, partitionOf, order, sortKeyOnly, function, limit, partitionComparer, snapshotCodec, chunkFormat, blockFormat)
             {
                 FingerprintAliasType = legacy,
             });

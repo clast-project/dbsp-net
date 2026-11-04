@@ -112,6 +112,74 @@ public class PartitionedTopKCompactPbtTests
     }
 
     [Fact]
+    public void RandomQuery_BlockedCompactEqualsLegacy_EveryTick_ZeroWriteBackBudget()
+    {
+        // docs/design-bounded-memory.md §5.12: the structural compact operator's state as a blocked
+        // store — tiny freezes and blocks so its record has runs and merges, and a zero write-back
+        // budget so every step drops the cache and the next reloads partitions from the record.
+        Gen.Select(GenWideSpec, GenWideTicks).Sample(CheckBlocked, iter: 250);
+    }
+
+    // A single query compiles typed when it can; sharing arrangements pins the structural compile,
+    // which multi-view programs (ivm-bench's path) use by default.
+    private static readonly CompileOptions Structural = CompileOptions.Default with { ShareArrangements = true };
+
+    private static bool CheckBlocked(WideSpec spec, IReadOnlyList<IReadOnlyList<InputEvent>> ticks)
+    {
+        // The block format is installed by the persistence assembly's module initializer; run alone,
+        // nothing else here loads that assembly.
+        System.Runtime.CompilerServices.RuntimeHelpers.RunModuleConstructor(typeof(DbspNet.Persistence.Snapshot).Module.ModuleHandle);
+        var plan = Plan(WideDdl, spec.Sql);
+        var legacy = WithState(PartitionedTopKState.Legacy, () => PlanToCircuit.Compile(plan));
+        CompiledQuery blocked, managed;
+        using (DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: true, freezeEntries: 3, blockEntries: 2, window: true))
+        using (DbspNet.Core.Operators.Stateful.Blocks.SpillSettings.UseWindowWriteBack(0))
+        {
+            blocked = WithState(PartitionedTopKState.Compact, () => PlanToCircuit.Compile(plan, options: Structural));
+        }
+
+        using (DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: false, window: false))
+        {
+            managed = WithState(PartitionedTopKState.Compact, () => PlanToCircuit.Compile(plan, options: Structural));
+        }
+
+        var op = blocked.Circuit.Operators.Single(o => o.GetType().Name.StartsWith("PartitionedTopKCompactOp", StringComparison.Ordinal));
+        Assert.True((bool)op.GetType().GetProperty("IsBlocked", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(op)!);
+        var tickNo = 0;
+        foreach (var tick in ticks)
+        {
+            tickNo++;
+            foreach (var ev in tick)
+            {
+                Push(legacy.Table(ev.Table).Insert, legacy.Table(ev.Table).Delete, ev);
+                Push(blocked.Table(ev.Table).Insert, blocked.Table(ev.Table).Delete, ev);
+                Push(managed.Table(ev.Table).Insert, managed.Table(ev.Table).Delete, ev);
+            }
+
+            legacy.Step();
+            blocked.Step();
+            managed.Step();
+            var expected = Canon(legacy.Current.Select(kv => (kv.Key.ToArray(), kv.Value.Value)));
+            foreach (var (name, got) in new[]
+            {
+                ("blocked compact", Canon(blocked.Current.Select(kv => (kv.Key.ToArray(), kv.Value.Value)))),
+                ("managed compact", Canon(managed.Current.Select(kv => (kv.Key.ToArray(), kv.Value.Value)))),
+            })
+            {
+                if (!DictEquals(expected, got))
+                {
+                    Console.Error.WriteLine($"SQL: {spec.Sql}  tick {tickNo}  arm {name}");
+                    Console.Error.WriteLine("legacy: " + string.Join(", ", expected.OrderBy(e => e.Key).Select(e => $"{e.Key}:{e.Value}")));
+                    Console.Error.WriteLine("got:    " + string.Join(", ", got.OrderBy(e => e.Key).Select(e => $"{e.Key}:{e.Value}")));
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    [Fact]
     public void TypedPath_UsesUnboxedPartitionKey()
     {
         var plan = Plan(WideDdl, new WideSpec("ROW_NUMBER", 1, "g, h", "v DESC").Sql);

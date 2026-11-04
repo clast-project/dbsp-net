@@ -2653,9 +2653,17 @@ public static partial class PlanToCircuit
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
+
+        // The compact operator's state as blocks (docs/design-bounded-memory.md §5.12), on the same
+        // terms as the rank operator's: a window kind, the flat family, and a PARTITION BY (a global
+        // TOP-K's one partition is touched every tick on worker 0).
+        var chunkFormat = TraceBlocksMode.Window && ctx.Options.TraceFamily != TraceFamily.Spine && plan.PartitionKeys.Count > 0
+            ? TraceBlockFormats.Create(Schema.Empty, plan.Input.Schema)
+            : null;
+        var blockFormat = chunkFormat is null ? null : TraceBlockFormats.Create(SyntheticKeySchema(plan.PartitionKeys), plan.Input.Schema);
         return MarkGathered(ctx, plan.PartitionKeys, Recorded(builder, ctx, () => builder.PartitionedTopK<StructuralRow, StructuralRow>(
             input, PartitionOf, order, sortKeyOnly, plan.Function, plan.Limit, null, codec,
-            orderKey, orderDescending, orderNullsFirst), Z("trace.arrows", reshardPlace, codec)));
+            orderKey, orderDescending, orderNullsFirst, chunkFormat, blockFormat), Z("trace.arrows", reshardPlace, codec)));
     }
 
     // ---- Rank-in-output (ROW_NUMBER / RANK / DENSE_RANK as an output column) ----

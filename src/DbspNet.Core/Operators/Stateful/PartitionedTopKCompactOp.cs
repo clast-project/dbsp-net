@@ -31,7 +31,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// <c>SortedDictionary</c>); both windows are sorted by it, which makes the merge diff
 /// exact. Snapshot format is byte-compatible with the legacy operator.
 /// </summary>
-internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapshotable, IIntrospectable, IFingerprintAlias
+internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapshotable, IIntrospectable, IFingerprintAlias, IStoreSnapshot
     where TRow : notnull
     where TKey : notnull
 {
@@ -54,11 +54,22 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
 
     // Per-tick scratch, reused: touched partition -> its pre-delta window's range in
     // _oldWindows; and the post-delta window of the partition being diffed.
-    private readonly Dictionary<TKey, (int Start, int Length)> _touched;
-    private readonly List<Entry> _oldWindows = new();
-    private readonly List<Entry> _newWindow = new();
+    private Dictionary<TKey, (int Start, int Length)> _touched;
+    private List<Entry> _oldWindows = new();
+    private List<Entry> _newWindow = new();
 
     private int _lastOutputSize;
+
+    // With block formats (docs/design-bounded-memory.md §5.12): the whole state is a blocked
+    // OrderedPartitionStore instead of _parts — partitions ordered by the total order and read whole
+    // (valueOf null: they never move to chunks), the managed write-back cache bounded by S2's budget
+    // and the record spilled by S1. A partition's window is read from it before and after the delta.
+    private readonly Blocks.OrderedPartitionStore? _store;
+    private readonly Func<Blocks.OrderedPartitionStore>? _newStore;
+
+    // Scratch past this many touched partitions is dropped after the tick: Clear keeps a dictionary's
+    // capacity, and one bulk tick otherwise left ~0.9 GB of empty entries behind (§5.11).
+    private const int ScratchKeep = 1 << 16;
 
     public PartitionedTopKCompactOp(
         Stream<ZSet<TRow, Z64>> input,
@@ -69,7 +80,9 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         RankFunction function,
         long limit,
         IEqualityComparer<TKey>? partitionComparer = null,
-        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null)
+        IZSetTraceCodec<TRow, Z64>? snapshotCodec = null,
+        Blocks.ITraceBlockFormat? chunkFormat = null,
+        Blocks.ITraceBlockFormat? blockFormat = null)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -87,7 +100,33 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         _snapshotCodec = snapshotCodec;
         _parts = new Dictionary<TKey, Partition>(partitionComparer);
         _touched = new Dictionary<TKey, (int, int)>(partitionComparer);
+        _partitionComparer = partitionComparer;
+        if (chunkFormat is not null)
+        {
+            if (typeof(TRow) != typeof(StructuralRow) || typeof(TKey) != typeof(StructuralRow))
+            {
+                throw new ArgumentException("Blocked TOP-K state needs structural rows and partition keys.", nameof(chunkFormat));
+            }
+
+            _newStore = () => new Blocks.OrderedPartitionStore(
+                chunkFormat,
+                valueOf: null,
+                (IComparer<StructuralRow>)(object)_order,
+                partial: null,
+                coldFormat: blockFormat,
+                keyOf: row => S(_partitionOf(As<TRow>(row))));
+            _store = _newStore();
+        }
     }
+
+    private readonly IEqualityComparer<TKey>? _partitionComparer;
+
+    private static StructuralRow S<T>(T value) => (StructuralRow)(object)value!;
+
+    private static T As<T>(StructuralRow row) => (T)(object)row;
+
+    /// <summary>Whether the state is held as blocks (tests).</summary>
+    internal bool IsBlocked => _store is not null;
 
     public string MetricName => "PartitionedTopK";
 
@@ -95,6 +134,11 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
     {
         get
         {
+            if (_store is not null)
+            {
+                return _store.Entries;
+            }
+
             long n = 0;
             foreach (var p in _parts.Values)
             {
@@ -121,6 +165,12 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         {
             _lastOutputSize = 0;
             _output.SetCurrent(new ZSetBuilder<TRow, Z64>(0).Build());
+            return;
+        }
+
+        if (_store is not null)
+        {
+            StepBlocked(delta);
             return;
         }
 
@@ -163,6 +213,91 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         var result = builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
+        TrimScratch();
+    }
+
+    // The blocked step: each touched partition's window read from the store before the delta and
+    // after it, then diffed.
+    private void StepBlocked(ZSet<TRow, Z64> delta)
+    {
+        _touched.Clear();
+        _oldWindows.Clear();
+        var changes = new List<(StructuralRow Key, StructuralRow Row, long Weight)>(delta.Count);
+        foreach (var (row, dw) in delta)
+        {
+            var key = _partitionOf(row);
+            ref var range = ref CollectionsMarshal.GetValueRefOrAddDefault(_touched, key, out var seen);
+            if (!seen)
+            {
+                var start = _oldWindows.Count;
+                StoreWindow(key, _oldWindows);
+                range = (start, _oldWindows.Count - start);
+            }
+
+            changes.Add((S(key), S(row), dw.Value));
+        }
+
+        _store!.Integrate(changes);
+        var builder = new ZSetBuilder<TRow, Z64>(_lastOutputSize);
+        var oldAll = CollectionsMarshal.AsSpan(_oldWindows);
+        foreach (var (key, range) in _touched)
+        {
+            _newWindow.Clear();
+            StoreWindow(key, _newWindow);
+            EmitDiff(builder, oldAll.Slice(range.Start, range.Length), CollectionsMarshal.AsSpan(_newWindow));
+        }
+
+        _store.EndTick();
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
+        TrimScratch();
+    }
+
+    // A partition's window from the store: its rows in order, cut by the rank function.
+    private void StoreWindow(TKey key, List<Entry> dst)
+    {
+        if (_limit <= 0)
+        {
+            return;
+        }
+
+        var acc = new WindowCut(_function, _limit, _sortKeyOnly, dst);
+        foreach (var (row, weight, _) in _store!.Read(S(key), long.MinValue, long.MaxValue, needPrefix: false, out _))
+        {
+            if (!acc.Offer(As<TRow>(row), weight))
+            {
+                break;
+            }
+        }
+    }
+
+    // The tick's scratch: kept for reuse unless a bulk tick grew it (Clear keeps capacity).
+    private void TrimScratch()
+    {
+        if (_touched.Count > ScratchKeep)
+        {
+            _touched = new Dictionary<TKey, (int Start, int Length)>(_partitionComparer);
+        }
+        else
+        {
+            _touched.Clear();
+        }
+
+        if (_oldWindows.Count > ScratchKeep)
+        {
+            _oldWindows = new List<Entry>();
+        }
+        else
+        {
+            _oldWindows.Clear();
+        }
+
+        _newWindow.Clear();
+        if (_newWindow.Capacity > ScratchKeep)
+        {
+            _newWindow = new List<Entry>();
+        }
     }
 
     /// <summary>Sorted-merge diff of two windows (both ascending by <see cref="_order"/>).</summary>
@@ -448,10 +583,46 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
                 "CircuitBuilder.PartitionedTopK to enable Snapshot.WriteAsync/ReadAsync.");
         }
 
+        if (_store is not null && _store.CanSave(writer))
+        {
+            // The store's own files, nothing decoded (as the rank operator, §3g).
+            return _store.SaveAsync(writer, StoreFiles, cancellationToken);
+        }
+
+        if (_store is not null)
+        {
+            _store.DropCache();
+            var rows = ZSet.FromEntries(_store.All().Select(e => (As<TRow>(e.Row), new Z64(e.Weight))));
+            return SaveStoreAsync(writer, rows, cancellationToken);
+        }
+
         // Byte-compatible with PartitionedTopKOp: one flattened Z-set; the partition
         // key is recovered from each row on load.
         var snapshot = ZSet.FromEntries(AllEntries().Select(e => (e.Row, new Z64(e.Weight))));
         return _snapshotCodec.SaveAsync(writer, "trace.arrows", snapshot, cancellationToken);
+    }
+
+    /// <summary>The store's checkpoint files' base name (§3g).</summary>
+    internal const string StoreFiles = "store";
+
+    // The whole state, and with an evicting block cache the record's backing runs (§3.7).
+    private async ValueTask SaveStoreAsync(ISnapshotWriter writer, ZSet<TRow, Z64> rows, CancellationToken cancellationToken)
+    {
+        await _store!.SaveBackingAsync(writer, "record.backing", cancellationToken).ConfigureAwait(false);
+        await _snapshotCodec!.SaveAsync(writer, "trace.arrows", rows, cancellationToken).ConfigureAwait(false);
+    }
+
+    async ValueTask<ZSet<StructuralRow, Z64>?> IStoreSnapshot.ReadStoreRowsAsync(ISnapshotReader reader, CancellationToken cancellationToken)
+    {
+        if (_newStore is null)
+        {
+            return null;
+        }
+
+        var scratch = _newStore();
+        return await scratch.TryLoadAsync(reader, StoreFiles, cancellationToken).ConfigureAwait(false)
+            ? ZSet.FromEntries(scratch.All().Select(e => (e.Row, new Z64(e.Weight))))
+            : null;
     }
 
     public async ValueTask LoadAsync(ISnapshotReader reader, CancellationToken cancellationToken = default)
@@ -461,8 +632,20 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
             throw new NotSupportedException("PartitionedTopKCompactOp was constructed without a snapshot codec.");
         }
 
+        if (_store is not null && await _store.TryLoadAsync(reader, StoreFiles, cancellationToken).ConfigureAwait(false))
+        {
+            return; // the store's own files (§3g), adopted lazily
+        }
+
         var loaded = await _snapshotCodec.LoadAsync(reader, "trace.arrows", cancellationToken).ConfigureAwait(false);
         _parts.Clear();
+        if (_store is not null)
+        {
+            _store.Clear();
+            _store.Integrate([.. loaded.Where(kv => kv.Value.Value != 0).Select(kv => (S(_partitionOf(kv.Key)), S(kv.Key), kv.Value.Value))]);
+            return;
+        }
+
         foreach (var (row, weight) in loaded)
         {
             if (weight.Value == 0)
