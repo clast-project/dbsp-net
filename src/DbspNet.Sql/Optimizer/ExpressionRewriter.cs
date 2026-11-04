@@ -215,7 +215,7 @@ internal static class ExpressionRewriter
             ResolvedIsNull isn => new ResolvedIsNull(
                 ShiftColumnIndices(isn.Operand, delta), isn.Negated, isn.Type),
             ResolvedCast cast => new ResolvedCast(
-                ShiftColumnIndices(cast.Operand, delta), cast.Type),
+                ShiftColumnIndices(cast.Operand, delta), cast.Type, cast.Safe),
             ResolvedFunctionCall fn => new ResolvedFunctionCall(
                 fn.FunctionName,
                 ShiftArgs(fn.Arguments, delta),
@@ -287,7 +287,7 @@ internal static class ExpressionRewriter
             ResolvedIsNull isn => new ResolvedIsNull(
                 RemapColumnIndices(isn.Operand, remap), isn.Negated, isn.Type),
             ResolvedCast cast => new ResolvedCast(
-                RemapColumnIndices(cast.Operand, remap), cast.Type),
+                RemapColumnIndices(cast.Operand, remap), cast.Type, cast.Safe),
             ResolvedFunctionCall fn => new ResolvedFunctionCall(
                 fn.FunctionName,
                 RemapArgs(fn.Arguments, remap),
@@ -354,7 +354,7 @@ internal static class ExpressionRewriter
             ResolvedIsNull isn => new ResolvedIsNull(
                 SubstituteViaProjection(isn.Operand, projection), isn.Negated, isn.Type),
             ResolvedCast cast => new ResolvedCast(
-                SubstituteViaProjection(cast.Operand, projection), cast.Type),
+                SubstituteViaProjection(cast.Operand, projection), cast.Type, cast.Safe),
             ResolvedFunctionCall fn => new ResolvedFunctionCall(
                 fn.FunctionName,
                 SubstituteArgs(fn.Arguments, projection),

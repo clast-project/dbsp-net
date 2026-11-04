@@ -2,7 +2,9 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using Clast.DatabaseDecimal;
 using Clast.DatabaseDecimal.Arithmetic;
+using Clast.DatabaseDecimal.Text;
 using Clast.DatabaseDecimal.Values;
+using DbspNet.Sql.TypeSystem;
 
 namespace DbspNet.Sql.Expressions;
 
@@ -61,19 +63,24 @@ internal static class DecimalRuntime
     /// <summary>
     /// Convert a floating-point value to <see cref="Decimal128"/> at
     /// <paramref name="type"/>'s scale — <c>CAST(DOUBLE/REAL AS DECIMAL(p, s))</c>.
-    /// Scales by <c>10^s</c> and rounds half-to-even to the mantissa. Only the source
+    /// Scales by <c>10^s</c> and rounds half away from zero to the mantissa. Only the source
     /// double's ~15–16 significant digits are preserved (a double never held more), the
     /// same lossy contract as Spark / DuckDB / Feldera. NaN / Infinity throw.
     /// </summary>
     public static Decimal128 FromDouble(double value, DecimalType type)
     {
-        if (double.IsNaN(value) || double.IsInfinity(value))
-        {
-            throw new OverflowException($"cannot cast {value} to DECIMAL");
-        }
+        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.AwayFromZero);
+        var result = new Decimal128(checked((Int128)scaled));
+        DecimalRange.Validate(result.Mantissa, type);
+        return result;
+    }
 
-        var scaled = Math.Round(value * Math.Pow(10, type.Scale), MidpointRounding.ToEven);
-        return new Decimal128((Int128)scaled);
+    public static Decimal128 RescaleChecked(Decimal128 value, int sourceScale, DecimalType target)
+    {
+        // Widen before scaling so overflow cannot wrap into a valid mantissa.
+        var wide = ScaleHelper.Widen128To256(value.Mantissa, sourceScale, target.Scale, DecimalRounding.HalfUp);
+        DecimalRange.Validate(wide, target);
+        return NarrowToDecimal128(wide);
     }
 
     /// <summary>
@@ -87,6 +94,15 @@ internal static class DecimalRuntime
     /// </summary>
     public static double ToDouble(Decimal128 value, int scale) =>
         (double)value.Mantissa / Math.Pow(10, scale);
+
+    public static Utf8String ToUtf8(Decimal128 value, DecimalType type) =>
+        Utf8String.Of(DecimalText.Format(value, type));
+
+    public static int ToInt32(Decimal128 value, int scale) =>
+        checked((int)ScaleHelper.Rescale128(value.Mantissa, scale, 0, DecimalRounding.HalfUp));
+
+    public static long ToInt64(Decimal128 value, int scale) =>
+        checked((long)ScaleHelper.Rescale128(value.Mantissa, scale, 0, DecimalRounding.HalfUp));
 
     /// <summary>
     /// Narrow a <see cref="Int256"/> SUM accumulator back to <see cref="Decimal128"/>.

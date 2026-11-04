@@ -493,6 +493,23 @@ public static class ExpressionCompiler
     private static Expression BuildCast(ResolvedCast cast, ParameterExpression row)
     {
         var operand = Build(cast.Operand, row);
+        if (!cast.Safe) return BuildCastValue(cast, operand);
+
+        // Evaluate the operand once, outside the conversion's error handler.
+        var input = Expression.Variable(typeof(object), "castInput");
+        return Expression.Block([input], Expression.Assign(input, operand),
+            Expression.TryCatch(BuildCastValue(cast, input),
+                Expression.Catch(typeof(FormatException), NullObject),
+                Expression.Catch(typeof(OverflowException), NullObject),
+                Expression.Catch(typeof(ArgumentException), NullObject)));
+    }
+
+    private static Expression BuildCastValue(ResolvedCast cast, Expression operand)
+    {
+        if (cast.Operand.Type is SqlNullType)
+        {
+            return NullObject;
+        }
         var srcClr = ClrOf(cast.Operand.Type);
         var dstClr = ClrOf(cast.Type);
 
@@ -520,9 +537,13 @@ public static class ExpressionCompiler
         if (IsNumeric(srcClr) && IsNumeric(dstClr))
         {
             var unboxed = Expression.Convert(operand, srcClr);
-            // Explicit narrowing between numeric CLR types; exceptions surface as runtime errors.
-            var widened = Expression.Convert(unboxed, dstClr);
+            var widened = SqlCasts.ConvertNumeric(unboxed, dstClr);
             converted = Expression.Convert(widened, typeof(object));
+        }
+        else if (IsNumeric(srcClr) && dstClr == typeof(bool))
+        {
+            converted = Expression.Convert(Expression.NotEqual(
+                Expression.Convert(operand, srcClr), Expression.Default(srcClr)), typeof(object));
         }
         else if (srcClr == typeof(bool) && dstClr == typeof(Utf8String))
         {
@@ -661,41 +682,23 @@ public static class ExpressionCompiler
         Expression converted;
         if (srcType is SqlDecimalType srcDec)
         {
-            // Cross-scale rescale via ScaleHelper.Rescale128.
-            if (srcDec.Scale == target.Scale)
-            {
-                return operand;
-            }
-
-            var unboxed = Expression.Convert(operand, typeof(Clast.DatabaseDecimal.Values.Decimal128));
-            var mantissa = Expression.Field(unboxed, nameof(Clast.DatabaseDecimal.Values.Decimal128.Mantissa));
-            var rescale = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
-                mantissa,
-                Expression.Constant(srcDec.Scale),
-                Expression.Constant(target.Scale),
-                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
-            var ctor = typeof(Clast.DatabaseDecimal.Values.Decimal128).GetConstructor([typeof(Int128)])!;
-            converted = Expression.Convert(Expression.New(ctor, rescale), typeof(object));
+            converted = Expression.Convert(Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
+                Expression.Convert(operand, typeof(Clast.DatabaseDecimal.Values.Decimal128)),
+                Expression.Constant(srcDec.Scale), Expression.Constant(targetType)), typeof(object));
         }
         else if (srcType is SqlIntegerType or SqlBigintType)
         {
-            // FromInteger(value, scale): wraps the integer × 10^scale as
-            // a Decimal128 mantissa. Handles INT/BIGINT to any scale.
-            var srcClr = ClrOf(srcType);
-            var unboxed = Expression.Convert(operand, srcClr);
+            var unboxed = Expression.Convert(operand, ClrOf(srcType));
             var asInt128 = Expression.Convert(unboxed, typeof(Int128));
-            var fromInt = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Values.Decimal128).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Values.Decimal128.FromInteger))!,
-                asInt128,
-                Expression.Constant((byte)target.Scale));
-            converted = Expression.Convert(fromInt, typeof(object));
+            converted = Expression.Convert(Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.RescaleChecked))!,
+                Expression.New(typeof(Clast.DatabaseDecimal.Values.Decimal128).GetConstructor([typeof(Int128)])!, asInt128),
+                Expression.Constant(0), Expression.Constant(targetType)), typeof(object));
         }
         else if (srcType is SqlDoubleType or SqlRealType)
         {
-            // Scale by 10^scale and round half-to-even (DecimalRuntime.FromDouble).
+            // Scale by 10^scale and round half away from zero.
             var unboxed = Expression.Convert(operand, ClrOf(srcType));
             var asDouble = srcType is SqlRealType
                 ? (Expression)Expression.Convert(unboxed, typeof(double))
@@ -726,7 +729,7 @@ public static class ExpressionCompiler
                     typeof(MemoryExtensions).GetMethod(nameof(MemoryExtensions.AsSpan), [typeof(string)])!,
                     asString),
                 Expression.Constant(targetType),
-                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
+                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfUp));
             converted = Expression.Convert(parse, typeof(object));
         }
         else
@@ -740,8 +743,8 @@ public static class ExpressionCompiler
 
     /// <summary>
     /// Cast a <see cref="SqlDecimalType"/> source to a non-decimal target.
-    /// Decimal → string formats via <c>DecimalText</c>; decimal → integer /
-    /// float / double rescales the mantissa to scale 0 then casts.
+    /// Decimal → string preserves the source scale; integer targets round
+    /// half away from zero, while floating-point targets preserve the fraction.
     /// </summary>
     private static Expression BuildCastFromDecimal(
         Expression operand, SqlDecimalType src, SqlType dstType, Type dstClr)
@@ -753,16 +756,11 @@ public static class ExpressionCompiler
         Expression converted;
         if (dstType is SqlVarcharType)
         {
-            var format = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Text.DecimalText.Format),
-                    [typeof(Clast.DatabaseDecimal.Values.Decimal128), typeof(Clast.DatabaseDecimal.DecimalType)])!,
+            var text = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(nameof(DecimalRuntime.ToUtf8))!,
                 unboxed,
                 Expression.Constant(sourceType));
-            var toUtf8 = Expression.Call(
-                typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
-                format);
-            converted = Expression.Convert(toUtf8, typeof(object));
+            converted = Expression.Convert(text, typeof(object));
         }
         else if (dstClr == typeof(float) || dstClr == typeof(double))
         {
@@ -780,16 +778,11 @@ public static class ExpressionCompiler
         }
         else if (dstClr == typeof(int) || dstClr == typeof(long))
         {
-            // Integer targets drop the fraction (rescale to scale 0), then cast.
-            var mantissa = Expression.Field(unboxed, nameof(Clast.DatabaseDecimal.Values.Decimal128.Mantissa));
-            var rescaled = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Arithmetic.ScaleHelper.Rescale128))!,
-                mantissa,
-                Expression.Constant(src.Scale),
-                Expression.Constant(0),
-                Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfEven));
-            var cast = Expression.Convert(rescaled, dstClr);
+            var cast = Expression.Call(
+                typeof(DecimalRuntime).GetMethod(dstClr == typeof(int)
+                    ? nameof(DecimalRuntime.ToInt32) : nameof(DecimalRuntime.ToInt64))!,
+                unboxed,
+                Expression.Constant(src.Scale));
             converted = Expression.Convert(cast, typeof(object));
         }
         else
@@ -830,12 +823,84 @@ public static class ExpressionCompiler
         t is SqlDateType or SqlTimeType or SqlTimestampType or SqlIntervalType;
 }
 
-/// <summary>Thin helpers invoked from compiled Expression trees for CAST operations.</summary>
+/// <summary>SQL CAST helpers shared by the structural and typed expression compilers.</summary>
 internal static class SqlCasts
 {
-    public static int ParseInt32(string s) => int.Parse(s, CultureInfo.InvariantCulture);
+    public static Expression ConvertNumeric(Expression operand, Type target)
+    {
+        if ((operand.Type == typeof(float) || operand.Type == typeof(double))
+            && (target == typeof(int) || target == typeof(long)))
+        {
+            operand = Expression.Call(typeof(SqlCasts).GetMethod(nameof(RoundIntegralCast), [operand.Type])!, operand);
+        }
+        if (operand.Type == typeof(double) && target == typeof(float))
+        {
+            return Expression.Call(typeof(SqlCasts).GetMethod(nameof(DoubleToSingleChecked))!, operand);
+        }
+        return Expression.ConvertChecked(operand, target);
+    }
 
-    public static long ParseInt64(string s) => long.Parse(s, CultureInfo.InvariantCulture);
+    public static double RoundIntegralCast(double value) => Math.Round(value, MidpointRounding.ToEven);
+
+    public static float RoundIntegralCast(float value) => MathF.Round(value, MidpointRounding.ToEven);
+
+    public static float DoubleToSingleChecked(double value)
+    {
+        var result = (float)value;
+        if (double.IsFinite(value) && float.IsInfinity(result))
+        {
+            throw new OverflowException("finite DOUBLE exceeds REAL range");
+        }
+        return result;
+    }
+
+    public static int ParseInt32(string s) =>
+        int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value : checked((int)ParseRoundedInteger(s));
+
+    public static long ParseInt64(string s) =>
+        long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value : checked((long)ParseRoundedInteger(s));
+
+    private static Int128 ParseRoundedInteger(string source)
+    {
+        var text = source.Trim();
+        if (text.Length == 0) throw new FormatException("empty integer input");
+        var negative = text[0] == '-';
+        if (text[0] is '-' or '+') text = text[1..];
+        var exponent = 0;
+        var e = text.IndexOfAny(['e', 'E']);
+        if (e >= 0)
+        {
+            // Match the reference integer parser's signed 16-bit exponent.
+            if (!short.TryParse(text.AsSpan(e + 1), NumberStyles.AllowLeadingSign,
+                    CultureInfo.InvariantCulture, out var parsedExponent))
+                throw new FormatException("invalid or excessive integer exponent");
+            exponent = parsedExponent;
+            text = text[..e];
+        }
+        var dot = text.IndexOf('.');
+        if (dot != text.LastIndexOf('.')) throw new FormatException("invalid integer input");
+        var digits = text.Replace(".", "");
+        if (digits.Length == 0 || digits.Any(c => c is < '0' or > '9'))
+            throw new FormatException("invalid integer input");
+        // The reference accumulates the integer part in BIGINT before applying an exponent.
+        var integerPart = dot < 0 ? text : text[..dot];
+        if (integerPart.Length != 0 && !long.TryParse((negative ? "-" : "") + integerPart,
+                NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
+            throw new OverflowException("integer significand exceeds BIGINT range");
+        var significant = digits.TrimStart('0');
+        var point = (long)(dot < 0 ? text.Length : dot) + exponent - (digits.Length - significant.Length);
+        if (significant.Length == 0 || point < 0) return 0;
+        if (point > 19) throw new OverflowException("integer input exceeds BIGINT range");
+        // Round the exact decimal digits, avoiding DOUBLE/DECIMAL precision loss.
+        var whole = point == 0 ? "0" : point >= significant.Length
+            ? significant + new string('0', (int)point - significant.Length)
+            : significant[..(int)point];
+        var value = Int128.Parse(whole, CultureInfo.InvariantCulture);
+        if (point < significant.Length && significant[(int)point] >= '5') value++;
+        return negative ? -value : value;
+    }
 
     public static float ParseSingle(string s) => float.Parse(s, CultureInfo.InvariantCulture);
 

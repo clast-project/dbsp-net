@@ -450,7 +450,7 @@ public static class PlanCse
             case (ResolvedIsNull x, ResolvedIsNull y):
                 return x.Negated == y.Negated && ExprEqual(x.Operand, y.Operand);
             case (ResolvedCast x, ResolvedCast y):
-                return ExprEqual(x.Operand, y.Operand);
+                return x.Safe == y.Safe && ExprEqual(x.Operand, y.Operand);
             case (ResolvedFunctionCall x, ResolvedFunctionCall y):
                 return string.Equals(x.FunctionName, y.FunctionName, StringComparison.Ordinal)
                     && ExprListEqual(x.Arguments, y.Arguments);
@@ -524,6 +524,7 @@ public static class PlanCse
                 h.Add(ExprHash(un.Operand));
                 break;
             case ResolvedCast cast:
+                h.Add(cast.Safe);
                 h.Add(ExprHash(cast.Operand));
                 break;
             case ResolvedFunctionCall fc:

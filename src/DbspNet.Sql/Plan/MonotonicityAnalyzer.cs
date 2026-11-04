@@ -286,7 +286,7 @@ public static class MonotonicityAnalyzer
                 return null;
             }
 
-            case ResolvedCast { Operand: var inner } cast
+            case ResolvedCast { Safe: false, Operand: var inner } cast
                 when TemporalCastFrontier(inner.Type, cast.Type) is { } transform
                     && FromExpr(inner, input) is { FrontierTransform: null } carrier:
                 // A monotone temporal cast (e.g. CAST(ts AS DATE)) lowers the
@@ -326,7 +326,7 @@ public static class MonotonicityAnalyzer
     internal static TemporalKeySourceInfo? TemporalKeySource(ResolvedExpression key) => key switch
     {
         ResolvedColumn rc => new TemporalKeySourceInfo(rc.Index, false),
-        ResolvedCast { Operand: ResolvedColumn rc } cast
+        ResolvedCast { Safe: false, Operand: ResolvedColumn rc } cast
             when cast.Type is SqlDateType && rc.Type is SqlTimestampType
             => new TemporalKeySourceInfo(rc.Index, true),
         _ => null,
@@ -336,7 +336,7 @@ public static class MonotonicityAnalyzer
     {
         // See through a numeric-widening cast the resolver inserts on a mixed-type
         // literal (e.g. BIGINT ts + INT 5 ⇒ ts + CAST(5 AS BIGINT)).
-        while (e is ResolvedCast c)
+        while (e is ResolvedCast { Safe: false } c)
         {
             e = c.Operand;
         }

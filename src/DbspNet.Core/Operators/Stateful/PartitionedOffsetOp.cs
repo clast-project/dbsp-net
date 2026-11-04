@@ -20,6 +20,12 @@ public enum OffsetKind
 
     /// <summary><c>LAST_VALUE</c>: the last row of the partition (UNLIMITED RANGE).</summary>
     LastValue,
+
+    /// <summary>First non-NULL value across the whole partition.</summary>
+    FirstNonNull,
+
+    /// <summary>Last non-NULL value across the whole partition.</summary>
+    LastNonNull,
 }
 
 /// <summary>
@@ -559,6 +565,23 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             }
         }
 
+        object?[]? nonNullValues = null;
+        for (var s = 0; s < _specs.Length; s++)
+        {
+            var spec = _specs[s];
+            if (spec.Kind is not (OffsetKind.FirstNonNull or OffsetKind.LastNonNull)) continue;
+            nonNullValues ??= new object?[_specs.Length];
+            var step = spec.Kind == OffsetKind.FirstNonNull ? 1 : -1;
+            for (var i = step == 1 ? 0 : slots.Count - 1; i >= 0 && i < slots.Count; i += step)
+            {
+                if (spec.Value(slots[i]) is { } value)
+                {
+                    nonNullValues[s] = value;
+                    break;
+                }
+            }
+        }
+
         var result = new Dictionary<TOutRow, long>();
         for (var j = 0; j < slots.Count; j++)
         {
@@ -567,6 +590,11 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             for (var s = 0; s < _specs.Length; s++)
             {
                 var spec = _specs[s];
+                if (spec.Kind is OffsetKind.FirstNonNull or OffsetKind.LastNonNull)
+                {
+                    vs[s] = nonNullValues![s];
+                    continue;
+                }
                 var src = spec.Kind switch
                 {
                     OffsetKind.Lag => j - spec.Offset,

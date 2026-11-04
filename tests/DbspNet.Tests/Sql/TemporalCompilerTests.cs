@@ -150,7 +150,7 @@ public class TemporalCompilerTests
         q.Table("t").Insert(Timestamp.Parse("2026-04-27 12:00:00"));
         q.Step();
 
-        Assert.Equal(1, WeightOf(q.Current, "2026-04-27 12:00:00.000000"));
+        Assert.Equal(1, WeightOf(q.Current, "2026-04-27 12:00:00"));
     }
 
     // ---- CAST between DATE and TIMESTAMP ----

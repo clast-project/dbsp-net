@@ -560,8 +560,7 @@ public class TypedExpressionCompilerTests
     [Fact]
     public void Cast_DecimalToInt()
     {
-        // Rescale uses banker's rounding (round-half-to-even), same
-        // as the structural compiler.
+        // Decimal casts round half away from zero in both compiler paths.
         var (rowType, factory) = RowFor(("a", new SqlDecimalType(10, 2, false)));
         var expr = ResolveSelectExpression(
             ["CREATE TABLE t (a DECIMAL(10, 2) NOT NULL)"],
@@ -570,8 +569,8 @@ public class TypedExpressionCompilerTests
         var del = TypedExpressionCompiler.TryCompile(expr, rowType);
         Assert.NotNull(del);
         Assert.Equal(1, Invoke(del!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(149) })));  // 1.49 → 1
-        Assert.Equal(2, Invoke(del!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(150) })));  // 1.50 → 2 (banker's)
-        Assert.Equal(2, Invoke(del!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(250) })));  // 2.50 → 2 (banker's)
+        Assert.Equal(2, Invoke(del!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(150) })));  // 1.50 → 2
+        Assert.Equal(3, Invoke(del!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(250) })));  // 2.50 → 3
     }
 
     [Fact]
@@ -730,4 +729,41 @@ public class TypedExpressionCompilerTests
         Assert.NotNull(del);
         Assert.Equal(Utf8String.Of("42"), Invoke(del!, factory(new object?[] { 42 })));
     }
+    [Theory]
+    [InlineData(2.9, 3)]
+    [InlineData(-2.9, -3)]
+    [InlineData(2.5, 2)]
+    public void TypedFloatingIntegerCastsUseReferenceRounding(double value, int expected)
+    {
+        var (rowType, factory) = RowFor(("v", new SqlDoubleType(false)));
+        var expression = ResolveOnDdl("CREATE TABLE t (v DOUBLE NOT NULL)", "CAST(v AS INTEGER)");
+        var compiled = TypedExpressionCompiler.TryCompile(expression, rowType);
+        Assert.NotNull(compiled);
+        Assert.Equal(expected, Invoke(compiled!, factory(new object?[] { value })));
+    }
+
+    [Fact]
+    public void TypedStrictCastChecksOverflowAfterRounding()
+    {
+        var (rowType, factory) = RowFor(("v", new SqlDoubleType(false)));
+        var expression = ResolveOnDdl("CREATE TABLE t (v DOUBLE NOT NULL)", "CAST(v AS INTEGER)");
+        var compiled = TypedExpressionCompiler.TryCompile(expression, rowType);
+        Assert.NotNull(compiled);
+        var error = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+            Invoke(compiled!, factory(new object?[] { 2147483647.6 })));
+        Assert.IsType<OverflowException>(error.InnerException);
+    }
+
+    [Fact]
+    public void TypedDecimalCastChecksNarrowedPrecision()
+    {
+        var (rowType, factory) = RowFor(("v", new SqlDecimalType(12, 0, false)));
+        var expression = ResolveOnDdl("CREATE TABLE t (v DECIMAL(12,0) NOT NULL)", "CAST(v AS DECIMAL(3,0))");
+        var compiled = TypedExpressionCompiler.TryCompile(expression, rowType);
+        Assert.NotNull(compiled);
+        var error = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+            Invoke(compiled!, factory(new object?[] { new Clast.DatabaseDecimal.Values.Decimal128(1000) })));
+        Assert.IsType<OverflowException>(error.InnerException);
+    }
+
 }
