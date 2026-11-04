@@ -835,8 +835,10 @@ in all 10):
 | b1 drain, checkpoint | level | level |
 | b2 / b3 output | 19 / 16 ms | 23 / 14 ms |
 
-The b2 output's +4 ms is probes into the gathered index run. Its blocks are cut by entry count,
-not bytes, so for wide rows they are larger than the row path's. Cutting by bytes would close it.
+The b2 output is +4 ms. Gathered index blocks are now cut by bytes as well as entries, as a
+freeze cuts rows (`ITraceBlockFormat.GatheredEntryBytes`, `GatheredRunTests`), but that did not
+close the gap (run35, 5 runs against the count-cut build: b2 output 22.0 → 22.4 ms, b3 13.8 →
+16.2). Block size was not the cause; the +4 ms is unexplained.
 
 Per stage on the probe (one batch per view): forming 1.39 GB → 0, index 0.99 → 0.66 GB. The Arrow
 build's 0.8 GB is the output's own bytes.
