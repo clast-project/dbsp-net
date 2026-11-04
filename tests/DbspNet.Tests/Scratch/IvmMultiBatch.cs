@@ -191,6 +191,46 @@ public class IvmMultiBatch
         // IVM_BLOCK_RESIDENCY=1 (with DBSPNET_BLOCK_ACCESS=1 for read stamps): block bytes by
         // operator and evictability, and what each batch read (BlockResidency).
         var blockResidency = Environment.GetEnvironmentVariable("IVM_BLOCK_RESIDENCY") == "1";
+        // IVM_PHASE_LIVE=1 (census only): live bytes at a phase boundary, after a full compacting GC,
+        // and the bytes allocated since the previous boundary.
+        long phaseAlloc = GC.GetTotalAllocatedBytes(precise: true);
+        using var allocTypes = Environment.GetEnvironmentVariable("IVM_ALLOC_TYPES") == "1" ? new AllocTypeSampler() : null;
+        AllocTypeSampler.Phase = "drain1";
+        void PhaseLive(string label)
+        {
+            if (allocTypes is not null)
+            {
+                foreach (var line in allocTypes.Report(label))
+                {
+                    _out.WriteLine(line);
+                }
+
+                var m = System.Text.RegularExpressions.Regex.Match(label, @"^([a-z]+)(\d+)$");
+                var n = int.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture);
+                AllocTypeSampler.Phase = m.Groups[1].Value switch
+                {
+                    "drain" => "output" + n,
+                    "output" => "ckpt" + n,
+                    _ => "drain" + (n + 1),
+                };
+            }
+
+            if (Environment.GetEnvironmentVariable("IVM_PHASE_LIVE") != "1")
+            {
+                return;
+            }
+
+            var allocated = GC.GetTotalAllocatedBytes(precise: true);
+            var sinceMib = (allocated - phaseAlloc) / 1048576.0;
+            var before = GC.GetGCMemoryInfo(GCKind.Any);
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            var live = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+            phaseAlloc = GC.GetTotalAllocatedBytes(precise: true);
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"PHASELIVE {label} alloc_since_mib={sinceMib:F0} live_mib={live.PromotedBytes / 1048576.0:F0} committed_before_mib={before.TotalCommittedBytes / 1048576.0:F0} rss_mib={Environment.WorkingSet / 1048576.0:F0}"));
+        }
+
         void ResidencyAt(string tag, int epoch)
         {
             if (!blockResidency)
@@ -375,12 +415,14 @@ public class IvmMultiBatch
                 }
 
                 ResidencyAt($"drain{batch}", batch);
+                PhaseLive($"drain{batch}");
                 DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Phase = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Write;
                 var outputPause0 = GC.GetTotalPauseDuration();
                 await runner.WriteOutputsAsync();
                 outputGcMs = (GC.GetTotalPauseDuration() - outputPause0).TotalMilliseconds;
                 outputMs = sw.Elapsed.TotalMilliseconds - drainMs;
                 outputEndUtc = DateTime.UtcNow;
+                PhaseLive($"output{batch}");
                 if (stateCensus && batch == firstBatch)
                 {
                     StateCensusAt("write", censusBaseline);
@@ -543,6 +585,7 @@ public class IvmMultiBatch
             }
 
             ResidencyAt($"batch{batch}", batch);
+            PhaseLive($"ckpt{batch}");
             if (Environment.GetEnvironmentVariable("IVM_LIVE_EACH_BATCH") == "1")
             {
                 // Live bytes after this batch's checkpoint (a full compacting GC: census runs only).
@@ -1071,6 +1114,52 @@ public class IvmMultiBatch
                         : "")))
                     + string.Create(CultureInfo.InvariantCulture, $"; total {pauses.Sum(p => p.Ms):F0} ms")
                     + string.Create(CultureInfo.InvariantCulture, $"; young {pauses.Where(p => !p.Kind.Contains("background", StringComparison.Ordinal)).Sum(p => p.Ms):F0} ms promoted {pauses.Sum(p => p.P0) / 1e9:F2}/{pauses.Sum(p => p.P1) / 1e9:F2} GB");
+            }
+        }
+    }
+}
+
+// IVM_ALLOC_TYPES=1: allocation by type, by phase (GCAllocationTick: one sample per ~100 KB).
+internal sealed class AllocTypeSampler : System.Diagnostics.Tracing.EventListener
+{
+    public static volatile string Phase = "before";
+    private readonly object _gate = new();
+    private readonly Dictionary<(string Phase, string Type), long> _bytes = new();
+
+    protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+    {
+        if (source.Name == "Microsoft-Windows-DotNETRuntime")
+        {
+            EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Verbose, (System.Diagnostics.Tracing.EventKeywords)0x1);
+        }
+    }
+
+    protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+    {
+        if (e.EventName is not ("GCAllocationTick_V4" or "GCAllocationTick_V3"))
+        {
+            return;
+        }
+
+        var type = e.Payload![e.PayloadNames!.IndexOf("TypeName")] as string ?? "?";
+        var amount = Convert.ToInt64(e.Payload![e.PayloadNames!.IndexOf("AllocationAmount64")], CultureInfo.InvariantCulture);
+        lock (_gate)
+        {
+            var k = (Phase, type);
+            _bytes[k] = _bytes.GetValueOrDefault(k) + amount;
+        }
+    }
+
+    public IEnumerable<string> Report(string phase, int top = 15)
+    {
+        lock (_gate)
+        {
+            var rows = _bytes.Where(kv => kv.Key.Phase == phase).OrderByDescending(kv => kv.Value).Take(top).ToList();
+            var total = _bytes.Where(kv => kv.Key.Phase == phase).Sum(kv => kv.Value);
+            yield return string.Create(CultureInfo.InvariantCulture, $"ALLOC {phase} total_mib={total / 1048576.0:F0}");
+            foreach (var kv in rows)
+            {
+                yield return string.Create(CultureInfo.InvariantCulture, $"ALLOC {phase} {kv.Value / 1048576.0,8:F0} MiB  {kv.Key.Type}");
             }
         }
     }
