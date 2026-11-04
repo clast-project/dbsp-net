@@ -196,6 +196,53 @@ public class ParallelReshardTests
         }
     }
 
+    // Window operators as block stores checkpoint as their own files (docs/design-bounded-memory.md
+    // §3g): the rewrite reads those back as rows and writes the rows at the new W, which restore
+    // reads as before. Partitions past 4 rows are chunked, so both the record and chunks move.
+    [Theory]
+    [InlineData(3, 2)]
+    [InlineData(2, 4)]
+    public async Task Reshard_FromWindowStoreFiles_ThenContinue_MatchesAnUninterruptedRun(int oldW, int newW)
+    {
+        using var layout = DbspNet.Persistence.Runs.StateLayout.Use(true);
+        using var windows = DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(join: true, window: true);
+        using var chunks = DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.UseChunks(promoteRows: 4, chunkRows: 2);
+        var fs = new DbspNet.Persistence.IO.InMemoryTableFileSystem();
+        var reference = SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
+        var refFeed = new Feed(23);
+        var feed = new Feed(23);
+        using (var producer = Compile(oldW))
+        {
+            for (var tick = 0; tick < 6; tick++)
+            {
+                Tick(producer, feed);
+                Tick(reference, refFeed);
+            }
+
+            await ParallelSnapshot.WriteAsync(producer.Circuit, fs);
+        }
+
+        var storeFiles = 0;
+        await foreach (var f in fs.ListAsync("snap-"))
+        {
+            storeFiles += f.Path.EndsWith("/store.chunks", StringComparison.Ordinal) ? 1 : 0;
+        }
+
+        Assert.True(storeFiles >= 3 * oldW, $"{storeFiles} window store files at W={oldW}");
+
+        using var restored = Compile(newW);
+        Assert.Equal(oldW, await ParallelReshard.RewriteAsync(fs, restored));
+        await ParallelSnapshot.ReadAsync(restored.Circuit, fs);
+        Assert.Equal(Digest(reference), Digest(restored));
+
+        for (var tick = 6; tick < 11; tick++)
+        {
+            Tick(reference, refFeed);
+            Tick(restored, feed);
+            Assert.True(Digest(reference) == Digest(restored), $"tick {tick}: the re-sharded run differs");
+        }
+    }
+
     [Fact]
     public async Task Rewrite_IsANoOp_AtTheSameWorkerCount_OrWithoutASnapshot()
     {

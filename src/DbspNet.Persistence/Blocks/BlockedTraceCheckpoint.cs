@@ -225,6 +225,202 @@ internal static class BlockedTraceCheckpoint
         });
     }
 
+    /// <summary>A block set's manifest: magic, version.</summary>
+    private const uint BlockSetMagic = 0x53424244; // "DBBS"
+    private const int BlockSetVersion = 1;
+
+    /// <summary>A block set naming more files than this is written whole (raw) to one new file:
+    /// a file stays alive while any block in it does, so without this a set would pin every file
+    /// a checkpoint ever wrote.</summary>
+    internal const int MaxBlockSetFiles = 16;
+
+    /// <summary>The run-index name of a block set's files: its manifest's name plus this.</summary>
+    internal const string BlockSetRunsSuffix = ".runs";
+
+    /// <summary>
+    /// A set of blocks in no hash order, with the caller's metadata, as checkpoint state
+    /// (docs/design-bounded-memory.md §3g): a window store's large-partition chunks. Blocks a
+    /// checkpoint already wrote (durable file blocks in this store) are named again; the rest go raw
+    /// to one new run file. The manifest (<paramref name="fileName"/> in the operator's directory)
+    /// holds the metadata and each block's file and index entry; the files are recorded as a chain
+    /// so the sweep and retention keep them. On commit, <paramref name="onCommit"/> receives each
+    /// block's durable twin, in order (the same block when it was already durable).
+    /// </summary>
+    public static async ValueTask SaveBlockSetAsync(
+        ILayout codec, Core.Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks,
+        ReadOnlyMemory<byte> meta, Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken)
+    {
+        if (writer is not TableFileSystemSnapshotContext { Session: { } session } ctx)
+        {
+            throw new InvalidOperationException("a block set is written only inside a runs-layout checkpoint");
+        }
+
+        var schema = codec.Blocks!;
+        var fs = ctx.FileSystem;
+        static bool Durable(ITraceBlock b, ITableFileSystem fs) =>
+            b is LazyTraceBlock { Durable: true } l && ReferenceEquals(l.Location.Store, fs);
+
+        var paths = new List<string>();
+        var pathIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var b in blocks)
+        {
+            if (Durable(b, fs) && pathIndex.TryAdd(((LazyTraceBlock)b).Location.Path, paths.Count))
+            {
+                paths.Add(((LazyTraceBlock)b).Location.Path);
+            }
+        }
+
+        var rewriteAll = paths.Count > MaxBlockSetFiles;
+        if (rewriteAll)
+        {
+            paths.Clear();
+            pathIndex.Clear();
+        }
+
+        var refs = new (int File, RunBlock Index)[blocks.Count];
+        var fresh = new List<(int At, TraceBlock Body)>();
+        for (var i = 0; i < blocks.Count; i++)
+        {
+            if (!rewriteAll && Durable(blocks[i], fs))
+            {
+                var (_, path, index) = ((LazyTraceBlock)blocks[i]).Location;
+                refs[i] = (pathIndex[path], index);
+            }
+            else
+            {
+                fresh.Add((i, Materialized(blocks[i])));
+            }
+        }
+
+        string? newPath = null;
+        if (fresh.Count > 0)
+        {
+            newPath = "runs/" + ctx.Prefix + fileName;
+            var file = paths.Count;
+            paths.Add(newPath);
+            await using var run = await RunStreamWriter.CreateAsync(
+                fs, newPath, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
+            for (var k = 0; k < fresh.Count; k++)
+            {
+                var body = fresh[k].Body;
+                await run.AppendRawAsync(body.Message, [(uint)k], body.Count, 1, cancellationToken).ConfigureAwait(false);
+                refs[fresh[k].At] = (file, run.Index[^1]);
+            }
+
+            await run.FinishAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // The manifest: magic, version, metadata, paths, then each block's (file, index entry).
+        var buffer = new System.IO.MemoryStream();
+        using (var w = new System.IO.BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            w.Write(BlockSetMagic);
+            w.Write(BlockSetVersion);
+            w.Write(meta.Length);
+            w.Write(meta.Span);
+            w.Write(paths.Count);
+            foreach (var p in paths)
+            {
+                w.Write(p);
+            }
+
+            w.Write(refs.Length);
+            foreach (var (f, ix) in refs)
+            {
+                w.Write(f);
+                w.Write(ix.FirstHash);
+                w.Write(ix.LastHash);
+                w.Write(ix.Offset);
+                w.Write(ix.Length);
+                w.Write(ix.Entries);
+                w.Write(ix.Groups);
+            }
+        }
+
+        await using (var manifest = await writer.CreateAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            await manifest.WriteAsync(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), cancellationToken).ConfigureAwait(false);
+            await manifest.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        long entries = 0;
+        foreach (var (_, ix) in refs)
+        {
+            entries += ix.Entries;
+        }
+
+        if (paths.Count > 0)
+        {
+            // Under its own name: the manifest is the file, the chain only keeps its runs alive.
+            session.Record(ctx.Prefix + fileName + BlockSetRunsSuffix, new RunChain(fs, paths, entries, 0));
+        }
+
+        session.OnCommit(() =>
+        {
+            var twins = new ITraceBlock[blocks.Count];
+            for (var i = 0; i < twins.Length; i++)
+            {
+                twins[i] = blocks[i];
+            }
+
+            foreach (var (at, body) in fresh)
+            {
+                var (f, index) = refs[at];
+                var lazy = new LazyTraceBlock(schema, fs, paths[f], index, body) { Durable = true };
+                RunPins.Add(lazy, fs, [paths[f]]);
+                twins[at] = lazy;
+            }
+
+            onCommit(twins);
+        });
+    }
+
+    /// <summary>A block set written by <see cref="SaveBlockSetAsync"/>: its metadata and its
+    /// blocks, adopted lazily (each read on first use); null when the snapshot has none.</summary>
+    public static async ValueTask<(byte[] Meta, ITraceBlock[] Blocks)?> LoadBlockSetAsync(
+        ILayout codec, Core.Circuit.ISnapshotReader reader, string fileName, CancellationToken cancellationToken)
+    {
+        if (reader is not TableFileSystemSnapshotContext ctx || !await reader.ExistsAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        byte[] bytes;
+        await using (var file = await reader.OpenReadAsync(fileName, cancellationToken).ConfigureAwait(false))
+        {
+            var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+            using var owner = await file.ReadAsync(new FileRange(0, length), cancellationToken).ConfigureAwait(false);
+            bytes = owner.Memory.Span[..(int)length].ToArray();
+        }
+
+        using var r = new System.IO.BinaryReader(new System.IO.MemoryStream(bytes), System.Text.Encoding.UTF8);
+        if (r.ReadUInt32() != BlockSetMagic || r.ReadInt32() is var version && version != BlockSetVersion)
+        {
+            throw new InvalidDataException($"'{fileName}' is not a block set this version reads");
+        }
+
+        var meta = r.ReadBytes(r.ReadInt32());
+        var paths = new string[r.ReadInt32()];
+        for (var p = 0; p < paths.Length; p++)
+        {
+            paths[p] = r.ReadString();
+        }
+
+        var schema = codec.Blocks ?? throw new InvalidOperationException("a block set's schema has no block encoding");
+        var fs = ctx.FileSystem;
+        var blocks = new ITraceBlock[r.ReadInt32()];
+        for (var i = 0; i < blocks.Length; i++)
+        {
+            var f = r.ReadInt32();
+            var index = new RunBlock(r.ReadUInt32(), r.ReadUInt32(), r.ReadInt64(), r.ReadInt32(), r.ReadInt32(), r.ReadInt32());
+            var lazy = new LazyTraceBlock(schema, fs, paths[f], index) { Durable = true };
+            RunPins.Add(lazy, fs, [paths[f]]);
+            blocks[i] = lazy;
+        }
+
+        return (meta, blocks);
+    }
+
     /// <summary>Write <paramref name="run"/> to <paramref name="path"/> outside any checkpoint and
     /// rebind it there at once (a <see cref="BlockSpill"/>: the file is a cache, not state).</summary>
     internal static void SpillRun(ITableFileSystem fs, string path, ILayout codec, BlockedIndexedTrace trace, BlockedIndexedTrace.Run run)
@@ -497,6 +693,8 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     public ITraceBlock Body => Loaded;
 
+    bool ITraceBlock.Resident => Volatile.Read(ref _loaded) is not null;
+
     public uint FirstHash => _index.FirstHash;
 
     public uint LastHash => _index.LastHash;
@@ -509,6 +707,13 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     /// <summary>The block's encoded length in the run file.</summary>
     internal int FileLength => _index.Length;
+
+    /// <summary>Where the block lives: its store, run file and index entry.</summary>
+    internal (ITableFileSystem Store, string Path, RunBlock Index) Location => (_store, _path, _index);
+
+    /// <summary>The file is checkpoint state a snapshot's run index names (a block set's, §3g), not
+    /// a cache's spill or backing file: a later checkpoint may name it again instead of copying it.</summary>
+    internal bool Durable { get; init; }
 
     /// <summary>The block's bytes, read on first use.</summary>
     internal TraceBlock Loaded

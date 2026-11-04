@@ -78,17 +78,29 @@ public class LazyPartitionTests
             p.Outputs[v].CurrentView.Select(e => string.Join("|", Enumerable.Range(0, p.Outputs[v].Schema.Count).Select(i => FormattableString.Invariant($"{e.Key[i]}"))) + "#" + e.Value.Value)
                 .Order(StringComparer.Ordinal))));
 
-    // Every partitioned operator with a lazy path, and its cold partitions (null when everything is
-    // in memory). The TOP-K variants that narrow or compact rows (PartitionedTopKNarrowOp, the
-    // ROW_NUMBER view here; PartitionedTopKCompactOp) restore eagerly — not yet covered.
+    // Every partitioned operator with a lazy path, and its cold state (null when everything is in
+    // memory). A window operator holding its input as a block store restores as the store's own
+    // files (docs/design-bounded-memory.md §3g): its laziness is the store's, file blocks unread
+    // until a partition is touched. The TOP-K variants that narrow or compact rows
+    // (PartitionedTopKNarrowOp, the ROW_NUMBER view here; PartitionedTopKCompactOp) restore
+    // eagerly — not yet covered.
     private static List<(string Op, object? Lazy)> LazyStates(CompiledProgram p) =>
         p.Circuit.Operators
-            .Select(o => (Op: o, Field: o.GetType().GetField("_lazy", BindingFlags.NonPublic | BindingFlags.Instance)))
+            .Select(o => (Op: o, Field: o.GetType().GetField("_lazy", BindingFlags.NonPublic | BindingFlags.Instance),
+                Store: o.GetType().GetField("_store", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(o) as DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore))
             .Where(x => x.Field is not null)
-            .Select(x => (x.Op.GetType().Name, x.Field!.GetValue(x.Op)))
+            .Select(x => (x.Op.GetType().Name, x.Store is { Laziness.Blocks: > 0 } store ? store : x.Field!.GetValue(x.Op)))
             .ToList();
 
-    private static int Resolved(object lazy) => (int)lazy.GetType().GetProperty("Resolved")!.GetValue(lazy)!;
+    // Partitions (a lazy partition set) or file blocks (a store) read since the restore.
+    private static int Resolved(object lazy) => lazy is DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore store
+        ? store.Laziness.Read
+        : (int)lazy.GetType().GetProperty("Resolved")!.GetValue(lazy)!;
+
+    // How many reads still count as lazy: of a store, a small share of its blocks.
+    private static int LazyBound(object lazy) => lazy is DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore store
+        ? Math.Max(20, store.Laziness.Blocks / 4)
+        : 20;
 
     [Theory]
     [InlineData(false)]
@@ -110,6 +122,8 @@ public class LazyPartitionTests
             ["PartitionedOffsetOp`3", "PartitionedRankOp`3", "PartitionedWindowAggregateOp`4"],
             states.Select(s => s.Op).Distinct().Order(StringComparer.Ordinal));
         Assert.All(states, s => Assert.True(s.Lazy is not null, $"{s.Op} restored eagerly"));
+        // Restored from the stores' own files (§3g), nothing read yet.
+        Assert.All(states, s => Assert.Equal(0, Assert.IsType<DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore>(s.Lazy).Laziness.Read));
         Assert.Equal(Digest(twin), Digest(restored));
 
         for (var tick = 1; tick <= 4; tick++)
@@ -122,7 +136,7 @@ public class LazyPartitionTests
         Assert.All(LazyStates(restored), s =>
         {
             Assert.True(s.Lazy is not null, $"{s.Op} was promoted by small ticks");
-            Assert.InRange(Resolved(s.Lazy!), 1, 20);
+            Assert.InRange(Resolved(s.Lazy!), 1, LazyBound(s.Lazy!));
         });
 
         // A delta checkpoint while partitions are cold, a second restore, then every partition.

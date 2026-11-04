@@ -42,7 +42,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// <typeparam name="TInRow">The input (base) row type.</typeparam>
 /// <typeparam name="TOutRow">The widened output row type (base ⧺ rank column).</typeparam>
 /// <typeparam name="TKey">The PARTITION BY key type.</typeparam>
-internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder
+internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder, IStoreSnapshot
     where TInRow : notnull
     where TOutRow : notnull
     where TKey : notnull
@@ -130,12 +130,14 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
                 throw new ArgumentException("Blocked rank state needs structural rows and partition keys.", nameof(chunkFormat));
             }
 
-            _store = new Blocks.OrderedPartitionStore(
+            _newStore = () => new Blocks.OrderedPartitionStore(
                 chunkFormat,
                 valueOf: null, // whole-partition reads: partitions stay small
                 (IComparer<StructuralRow>)(object)_order,
                 partial: null,
-                coldFormat: blockFormat);
+                coldFormat: blockFormat,
+                keyOf: row => S(_partitionOf(As<TInRow>(row))));
+            _store = _newStore();
         }
 
         _storedOutputRows = _store is null ? Blocks.TraceBlocksMode.PromoteRows : int.MaxValue;
@@ -554,6 +556,27 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         _lazy = null;
     }
 
+    // A store as this operator builds one (a scratch one, for a re-shard to read files into).
+    private readonly Func<Blocks.OrderedPartitionStore>? _newStore;
+
+    IReadOnlyList<string> IStoreSnapshot.StoreFileNames => [StoreFiles + ".chunks"];
+
+    async ValueTask<ZSet<StructuralRow, Z64>?> IStoreSnapshot.ReadStoreRowsAsync(ISnapshotReader reader, CancellationToken cancellationToken)
+    {
+        if (_newStore is null)
+        {
+            return null;
+        }
+
+        var scratch = _newStore();
+        return await scratch.TryLoadAsync(reader, StoreFiles, cancellationToken).ConfigureAwait(false)
+            ? ZSet.FromEntries(scratch.All().Select(e => (e.Row, new Z64(e.Weight))))
+            : null;
+    }
+
+    /// <summary>The store's checkpoint files' base name (§3g).</summary>
+    internal const string StoreFiles = "store";
+
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
@@ -568,6 +591,13 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         // Saved in partition order (when the partition hash is stable), so a lazy restore reads a
         // partition as one block. While partitions are still cold, the snapshot holds only those in
         // memory, and FullState reads the rest for a write that needs every row.
+        if (_store is not null && _store.CanSave(writer))
+        {
+            // The store's own files, nothing decoded (docs/design-bounded-memory.md §3g).
+            PromoteAll();
+            return _store.SaveAsync(writer, StoreFiles, cancellationToken);
+        }
+
         if (_store is not null)
         {
             _store.DropCache();
@@ -604,6 +634,15 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         if (_snapshotCodec is null)
         {
             throw new NotSupportedException("PartitionedRankOp was constructed without a snapshot codec.");
+        }
+
+        if (_store is not null && await _store.TryLoadAsync(reader, StoreFiles, cancellationToken).ConfigureAwait(false))
+        {
+            // The store's own files (§3g), adopted lazily.
+            _accum.Clear();
+            _window.Clear();
+            _lazy = null;
+            return;
         }
 
         if (_snapshotCodec is IColdRowLoader<TInRow> coldLoader

@@ -52,6 +52,14 @@ internal sealed class OrderedPartitionStore
 
     private static readonly StructuralRow NoKey = new([]);
 
+    // A row's partition key: what a restored large partition, known by hash only, is matched by.
+    private readonly Func<StructuralRow, StructuralRow>? _keyOf;
+
+    // Large partitions restored from a checkpoint's block set and not touched since (§3g): by the
+    // partition key's hash, each its chunks' blocks (read lazily) and row counts. Touching a key
+    // with that hash reads them into _large.
+    private readonly Dictionary<uint, List<List<(ITraceBlock Block, int Rows)>>> _unloaded = new();
+
     /// <param name="chunkFormat">Blocks of a large partition's chunks: no key, the row.</param>
     /// <param name="valueOf">The ORDER BY value; null for a whole-partition frame, whose partitions
     /// stay small (with every row one peer group there is nothing to cut at).</param>
@@ -64,8 +72,10 @@ internal sealed class OrderedPartitionStore
         IPartialAggregator<StructuralRow, StructuralRow>? partial,
         int promoteAt = 512,
         int chunkRows = 512,
-        ITraceBlockFormat? coldFormat = null)
+        ITraceBlockFormat? coldFormat = null,
+        Func<StructuralRow, StructuralRow>? keyOf = null)
     {
+        _keyOf = keyOf;
         _chunkFormat = chunkFormat;
         _valueOf = valueOf;
         _order = order;
@@ -92,6 +102,17 @@ internal sealed class OrderedPartitionStore
             foreach (var c in chunks)
             {
                 yield return c.Block;
+            }
+        }
+
+        foreach (var parts in _unloaded.Values)
+        {
+            foreach (var part in parts)
+            {
+                foreach (var (block, _) in part)
+                {
+                    yield return block;
+                }
             }
         }
     }
@@ -144,8 +165,39 @@ internal sealed class OrderedPartitionStore
     /// <summary>Partitions and rows in the managed small-partition map or cache (the residency census).</summary>
     internal (int Partitions, long Rows) SmallManaged => (_small.Count, _small.Values.Sum(p => (long)p.Count));
 
+    /// <summary>After a restore from the store's own files (§3g, tests): file blocks of the record and
+    /// of large partitions, how many of them have been read, and large partitions not yet touched.</summary>
+    internal (int Blocks, int Read, int Untouched) Laziness
+    {
+        get
+        {
+            var blocks = 0;
+            var read = 0;
+            void Count(ITraceBlock b)
+            {
+                blocks++;
+                read += b.Resident ? 1 : 0;
+            }
+
+            foreach (var run in _cold?.Runs ?? [])
+            {
+                foreach (var b in run.Blocks)
+                {
+                    Count(b);
+                }
+            }
+
+            foreach (var b in ChunkBlocks())
+            {
+                Count(b);
+            }
+
+            return (blocks, read, _unloaded.Values.Sum(p => p.Count));
+        }
+    }
+
     /// <summary>Large partitions (tests).</summary>
-    internal int LargePartitions => _large.Count;
+    internal int LargePartitions => _large.Count + _unloaded.Values.Sum(p => p.Count);
 
     /// <summary>Rows held.</summary>
     public long Entries
@@ -158,6 +210,17 @@ internal sealed class OrderedPartitionStore
                 foreach (var c in chunks)
                 {
                     n += c.Count;
+                }
+            }
+
+            foreach (var parts in _unloaded.Values)
+            {
+                foreach (var part in parts)
+                {
+                    foreach (var (_, rows) in part)
+                    {
+                        n += rows;
+                    }
                 }
             }
 
@@ -217,6 +280,7 @@ internal sealed class OrderedPartitionStore
 
         foreach (var (key, change) in byKey)
         {
+            EnsureLoaded(key);
             if (_large.ContainsKey(key))
             {
                 ApplyLarge(key, change);
@@ -393,6 +457,7 @@ internal sealed class OrderedPartitionStore
     {
         _small.Clear();
         _large.Clear();
+        _unloaded.Clear();
         _smallRows = 0;
         _cold?.Clear();
         _keys = new KeyFilter();
@@ -435,6 +500,183 @@ internal sealed class OrderedPartitionStore
                 }
             }
         }
+
+        foreach (var parts in _unloaded.Values)
+        {
+            foreach (var part in parts)
+            {
+                foreach (var (block, rows) in part)
+                {
+                    var body = block.Body;
+                    for (var i = 0; i < rows; i++)
+                    {
+                        yield return (body.Value(i), body.Weight(i));
+                    }
+                }
+            }
+        }
+    }
+
+    // Read the restored large partitions whose key hashes as `key`'s into _large (§3g): each
+    // chunk's rows are decoded once, for its order values and partial; its block stays as it is,
+    // so the next checkpoint names it again instead of writing it.
+    private void EnsureLoaded(StructuralRow key)
+    {
+        if (_unloaded.Count == 0 || !_unloaded.Remove((uint)key.GetHashCode(), out var parts))
+        {
+            return;
+        }
+
+        foreach (var part in parts)
+        {
+            var chunks = new List<Chunk>(part.Count);
+            StructuralRow? partitionKey = null;
+            foreach (var (block, rows) in part)
+            {
+                var body = block.Body;
+                var values = new long[rows];
+                object? partial = _partial?.NewAccumulator();
+                for (var i = 0; i < rows; i++)
+                {
+                    var row = body.Value(i);
+                    partitionKey ??= _keyOf!(row);
+                    values[i] = ValueOf(row);
+                    if (partial is not null)
+                    {
+                        _partial!.Add(partial, row, body.Weight(i));
+                    }
+                }
+
+                chunks.Add(new Chunk(block, values, partial) { Backed = true });
+            }
+
+            if (partitionKey is not null)
+            {
+                _large[partitionKey] = chunks;
+            }
+        }
+    }
+
+    private const int StoreVersion = 1;
+
+    /// <summary>Whether the store can checkpoint as its own files here (§3g): small partitions'
+    /// record as a run chain, large partitions' chunks as a block set. Otherwise the operator writes
+    /// its rows.</summary>
+    public bool CanSave(Circuit.ISnapshotWriter writer) =>
+        _cold is not null && _keyOf is not null
+        && _coldFormat!.BackingCodec is { } cold && cold.SupportsBlockSets(writer)
+        && _chunkFormat.BackingCodec is { } chunks && chunks.SupportsBlockSets(writer);
+
+    /// <summary>
+    /// Checkpoint the store as its own files (docs/design-bounded-memory.md §3g), nothing decoded:
+    /// the small partitions' record (<paramref name="name"/>.record) as the run chain a blocked
+    /// trace writes, and the large partitions' chunks as a block set (<paramref name="name"/>.chunks)
+    /// whose metadata holds each partition's key hash and chunk sizes and the record's key filter.
+    /// A chunk an earlier checkpoint wrote is named, not copied. Requires <see cref="CanSave"/>.
+    /// </summary>
+    public async ValueTask SaveAsync(Circuit.ISnapshotWriter writer, string name, CancellationToken cancellationToken)
+    {
+        DropCache();
+        await _coldFormat!.BackingCodec!.SaveBlockedAsync(writer, name + ".record", _cold!, cancellationToken).ConfigureAwait(false);
+
+        var blocks = new List<ITraceBlock>();
+        var rebind = new List<Action<ITraceBlock>>();
+        var meta = new System.IO.MemoryStream();
+        using (var w = new System.IO.BinaryWriter(meta, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            w.Write(StoreVersion);
+            _keys.Write(w);
+            w.Write(_large.Count + _unloaded.Values.Sum(p => p.Count));
+            foreach (var (key, chunks) in _large)
+            {
+                w.Write((uint)key.GetHashCode());
+                w.Write(chunks.Count);
+                foreach (var c in chunks)
+                {
+                    w.Write(c.Count);
+                    blocks.Add(c.Block);
+                    rebind.Add(twin => { c.Block = twin; c.Backed = true; });
+                }
+            }
+
+            foreach (var (hash, parts) in _unloaded)
+            {
+                foreach (var part in parts)
+                {
+                    w.Write(hash);
+                    w.Write(part.Count);
+                    for (var j = 0; j < part.Count; j++)
+                    {
+                        w.Write(part[j].Rows);
+                        blocks.Add(part[j].Block);
+                        var (list, at) = (part, j);
+                        rebind.Add(twin => list[at] = (twin, list[at].Rows));
+                    }
+                }
+            }
+        }
+
+        await _chunkFormat.BackingCodec!.SaveBlockSetAsync(
+            writer,
+            name + ".chunks",
+            blocks,
+            meta.GetBuffer().AsMemory(0, (int)meta.Length),
+            twins =>
+            {
+                for (var i = 0; i < twins.Length; i++)
+                {
+                    rebind[i](twins[i]);
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Restore what <see cref="SaveAsync"/> wrote, lazily: the record's runs are adopted
+    /// (blocks read on first probe), and large partitions stay unread until a key touches them.
+    /// False (nothing changed) when the snapshot holds no such files.</summary>
+    public async ValueTask<bool> TryLoadAsync(Circuit.ISnapshotReader reader, string name, CancellationToken cancellationToken)
+    {
+        if (_cold is null || _keyOf is null || _coldFormat!.BackingCodec is not { } coldCodec || _chunkFormat.BackingCodec is not { } chunkCodec
+            || await chunkCodec.LoadBlockSetAsync(reader, name + ".chunks", cancellationToken).ConfigureAwait(false) is not { } set)
+        {
+            return false;
+        }
+
+        Clear();
+        await coldCodec.LoadBlockedAsync(reader, name + ".record", _cold, cancellationToken).ConfigureAwait(false);
+        using var r = new System.IO.BinaryReader(new System.IO.MemoryStream(set.Meta), System.Text.Encoding.UTF8);
+        if (r.ReadInt32() != StoreVersion)
+        {
+            throw new InvalidDataException($"'{name}.chunks' is a window store of another version");
+        }
+
+        _keys = KeyFilter.Read(r);
+        var partitions = r.ReadInt32();
+        var b = 0;
+        for (var p = 0; p < partitions; p++)
+        {
+            var hash = r.ReadUInt32();
+            var count = r.ReadInt32();
+            var part = new List<(ITraceBlock Block, int Rows)>(count);
+            for (var j = 0; j < count; j++)
+            {
+                part.Add((set.Blocks[b++], r.ReadInt32()));
+            }
+
+            if (!_unloaded.TryGetValue(hash, out var parts))
+            {
+                _unloaded[hash] = parts = [];
+            }
+
+            parts.Add(part);
+        }
+
+        if (b != set.Blocks.Length)
+        {
+            throw new InvalidDataException($"'{name}.chunks' names {set.Blocks.Length} blocks, its partitions {b}");
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -451,6 +693,7 @@ internal sealed class OrderedPartitionStore
     {
         before = null;
         var t0 = BlockTraceProfile.Now();
+        EnsureLoaded(key);
         if (_large.TryGetValue(key, out var chunks))
         {
             var first = FirstChunkReaching(chunks, from);
@@ -572,6 +815,7 @@ internal sealed class OrderedPartitionStore
     public List<(StructuralRow Row, long Weight, long Value)> ReadAround(
         StructuralRow key, long from, long to, long marginRows, out bool atStart, out bool atEnd)
     {
+        EnsureLoaded(key);
         if (!_large.TryGetValue(key, out var chunks))
         {
             atStart = atEnd = true;
@@ -888,6 +1132,35 @@ internal sealed class OrderedPartitionStore
             }
 
             return false;
+        }
+
+        public void Write(System.IO.BinaryWriter w)
+        {
+            w.Write(_inNewest);
+            w.Write(_filters.Count);
+            foreach (var (bits, capacity) in _filters)
+            {
+                w.Write(capacity);
+                w.Write(bits.Length);
+                w.Write(System.Runtime.InteropServices.MemoryMarshal.AsBytes(bits.AsSpan()));
+            }
+        }
+
+        public static KeyFilter Read(System.IO.BinaryReader r)
+        {
+            var f = new KeyFilter();
+            f._filters.Clear();
+            f._inNewest = r.ReadInt64();
+            var n = r.ReadInt32();
+            for (var i = 0; i < n; i++)
+            {
+                var capacity = r.ReadInt64();
+                var bits = new ulong[r.ReadInt32()];
+                r.ReadExactly(System.Runtime.InteropServices.MemoryMarshal.AsBytes(bits.AsSpan()));
+                f._filters.Add((bits, capacity));
+            }
+
+            return f;
         }
 
         private static (ulong, ulong) Hashes(StructuralRow key)

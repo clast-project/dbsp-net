@@ -88,6 +88,17 @@ public class IncrementalCheckpointTests
 
     private static CompiledProgram Compile() => SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
 
+    // The window operators as managed state, writing their rows as Z-set chains: with every other
+    // trace blocked, they are what exercises chain extension and background compaction here. As
+    // block stores they checkpoint as their own files instead (docs/design-bounded-memory.md §3g,
+    // WindowStoreCheckpointTests).
+    private static IDisposable ManagedWindows() => DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Use(
+        join: DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Join,
+        aggregate: DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Aggregate,
+        view: DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.View,
+        distinct: DbspNet.Core.Operators.Stateful.Blocks.TraceBlocksMode.Distinct,
+        window: false);
+
     // Every run-index line of every directory under a snapshot prefix: (trace file path relative
     // to the snapshot, base entries, delta entries, runs).
     private static async Task<List<(string File, long Base, long Delta, string[] Runs)>> IndexLinesAsync(ITableFileSystem fs, string prefix)
@@ -162,6 +173,7 @@ public class IncrementalCheckpointTests
     [Fact]
     public async Task ChainsGrowByDeltas_AndEveryCheckpointRestoresExactly()
     {
+        using var windows = ManagedWindows();
         using var layout = StateLayout.Use(true);
         var fs = new InMemoryTableFileSystem();
         var p = Compile();
@@ -250,6 +262,7 @@ public class IncrementalCheckpointTests
     [InlineData(3)]
     public async Task LongChains_AreCompactedOffTheStepThread_AndRestoreExactly(int retain)
     {
+        using var windows = ManagedWindows();
         // Increment 7: once a chain has RunChain.CompactAt runs after a commit, a background merge
         // folds them into one run, and a later checkpoint adopts it — chains stay short without a
         // whole rewrite on the checkpoint path. Verify (on for this class) reads each chain back
@@ -280,6 +293,7 @@ public class IncrementalCheckpointTests
     [Fact]
     public async Task AdoptedCompactions_SurvivePowerLoss()
     {
+        using var windows = ManagedWindows();
         // A merged run must be durable before any checkpoint names it: lose power after several
         // adoptions and the last checkpoint still restores exactly.
         using var layout = StateLayout.Use(true);

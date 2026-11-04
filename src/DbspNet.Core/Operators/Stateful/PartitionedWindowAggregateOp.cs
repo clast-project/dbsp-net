@@ -44,7 +44,7 @@ namespace DbspNet.Core.Operators.Stateful;
 /// <typeparam name="TOutRow">The widened output row type (base ⧺ aggregate columns).</typeparam>
 /// <typeparam name="TKey">The PARTITION BY key type.</typeparam>
 internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
-    : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder
+    : IOperator, ISnapshotable, IIntrospectable, ISnapshotOrder, IStoreSnapshot
     where TInRow : notnull
     where TAgg : notnull
     where TOutRow : notnull
@@ -139,14 +139,16 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
                 throw new ArgumentException("Blocked window state does not support frontier GC.", nameof(chunkFormat));
             }
 
-            _store = new Blocks.OrderedPartitionStore(
+            _newStore = () => new Blocks.OrderedPartitionStore(
                 chunkFormat ?? throw new ArgumentNullException(nameof(chunkFormat)),
                 _orderValueOf is null ? null : row => _orderValueOf(As<TInRow>(row)),
                 (IComparer<StructuralRow>)(object)_order,
                 aggregator as Aggregators.IPartialAggregator<StructuralRow, StructuralRow>,
                 promoteAt: Blocks.TraceBlocksMode.PromoteRows,
                 chunkRows: Blocks.TraceBlocksMode.ChunkRows,
-                coldFormat: blockFormat); // small partitions' record as blocks, when keys encode (§3.22)
+                coldFormat: blockFormat,
+                keyOf: row => S(_partitionOf(As<TInRow>(row))));
+            _store = _newStore(); // small partitions' record as blocks, when keys encode (§3.22)
         }
     }
 
@@ -832,6 +834,27 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         _lazy = null;
     }
 
+    // A store as this operator builds one (a scratch one, for a re-shard to read files into).
+    private readonly Func<Blocks.OrderedPartitionStore>? _newStore;
+
+    IReadOnlyList<string> IStoreSnapshot.StoreFileNames => [StoreFiles + ".chunks"];
+
+    async ValueTask<ZSet<StructuralRow, Z64>?> IStoreSnapshot.ReadStoreRowsAsync(ISnapshotReader reader, CancellationToken cancellationToken)
+    {
+        if (_newStore is null)
+        {
+            return null;
+        }
+
+        var scratch = _newStore();
+        return await scratch.TryLoadAsync(reader, StoreFiles, cancellationToken).ConfigureAwait(false)
+            ? ZSet.FromEntries(scratch.All().Select(e => (e.Row, new Z64(e.Weight))))
+            : null;
+    }
+
+    /// <summary>The store's checkpoint files' base name (§3g).</summary>
+    internal const string StoreFiles = "store";
+
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)
     {
         if (_snapshotCodec is null)
@@ -844,6 +867,13 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         // Saved in partition order (when the partition hash is stable), so a lazy restore reads a
         // partition as one block. While partitions are still cold, the snapshot holds only those in
         // memory, and FullState reads the rest for a write that needs every row.
+        if (_store is not null && _store.CanSave(writer))
+        {
+            // The store's own files, nothing decoded (docs/design-bounded-memory.md §3g).
+            PromoteAll();
+            return _store.SaveAsync(writer, StoreFiles, cancellationToken);
+        }
+
         if (_store is not null)
         {
             _store.DropCache();
@@ -880,6 +910,14 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
         if (_snapshotCodec is null)
         {
             throw new NotSupportedException("PartitionedWindowAggregateOp was constructed without a snapshot codec.");
+        }
+
+        if (_store is not null && await _store.TryLoadAsync(reader, StoreFiles, cancellationToken).ConfigureAwait(false))
+        {
+            // The store's own files (§3g), adopted lazily.
+            _accum.Clear();
+            _lazy = null;
+            return;
         }
 
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();

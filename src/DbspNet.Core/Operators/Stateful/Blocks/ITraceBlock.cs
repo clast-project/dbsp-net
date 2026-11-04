@@ -18,6 +18,9 @@ internal interface ITraceBlock
     /// between two reads.</summary>
     ITraceBlock Body => this;
 
+    /// <summary>Whether the block's bytes are in memory (a file block may not have read them yet).</summary>
+    bool Resident => true;
+
     /// <summary>Entries in the block.</summary>
     int Count { get; }
 
@@ -113,4 +116,21 @@ internal interface IBlockedTraceCodec
     ValueTask SaveBackingBlocksAsync(
         Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks, Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
         ValueTask.CompletedTask;
+
+    /// <summary>Whether <paramref name="writer"/> can take a block set (a runs-layout checkpoint,
+    /// docs/design-bounded-memory.md §3g).</summary>
+    bool SupportsBlockSets(Circuit.ISnapshotWriter writer) => false;
+
+    /// <summary>Write <paramref name="blocks"/> (in no hash order) and <paramref name="meta"/> as
+    /// checkpoint state: blocks already written by an earlier checkpoint are named again, the rest
+    /// copied raw. On commit <paramref name="onCommit"/> receives each block's durable twin, in order.</summary>
+    ValueTask SaveBlockSetAsync(
+        Circuit.ISnapshotWriter writer, string fileName, IReadOnlyList<ITraceBlock> blocks, ReadOnlyMemory<byte> meta,
+        Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("this codec writes no block sets");
+
+    /// <summary>A block set's metadata and lazily read blocks; null when the snapshot has none.</summary>
+    ValueTask<(byte[] Meta, ITraceBlock[] Blocks)?> LoadBlockSetAsync(
+        Circuit.ISnapshotReader reader, string fileName, CancellationToken cancellationToken) =>
+        ValueTask.FromResult<(byte[], ITraceBlock[])?>(null);
 }

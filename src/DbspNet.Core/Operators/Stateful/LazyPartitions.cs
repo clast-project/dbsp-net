@@ -61,6 +61,18 @@ internal interface IColdRowLoader<TRow>
 /// partitioned operator: its partition key's). Re-shard asks, so the files it rewrites keep that
 /// order and the restore after it can stay lazy (docs/design-durable-state.md §1f, increment 7).
 /// </summary>
+/// <summary>An operator that may checkpoint as its window store's own files
+/// (docs/design-bounded-memory.md §3g) rather than as rows: a re-shard reads those back as rows.</summary>
+internal interface IStoreSnapshot
+{
+    /// <summary>Files the store writes in the operator's directory.</summary>
+    IReadOnlyList<string> StoreFileNames { get; }
+
+    /// <summary>The rows a snapshot's store files hold, read into a scratch store (the operator is
+    /// untouched); null when the snapshot holds none.</summary>
+    ValueTask<ZSet<StructuralRow, Z64>?> ReadStoreRowsAsync(Circuit.ISnapshotReader reader, CancellationToken cancellationToken);
+}
+
 internal interface ISnapshotOrder
 {
     /// <summary>The order hash for <paramref name="fileName"/> — a <c>Func&lt;TRow, int&gt;</c> over the

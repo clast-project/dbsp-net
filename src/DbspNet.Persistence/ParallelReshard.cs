@@ -103,7 +103,7 @@ public static class ParallelReshard
                 throw new NotSupportedException($"operator {i} ({spec.OperatorType}): {why}");
             }
 
-            CheckFilesCovered(persisted, oldW, i, spec);
+            CheckFilesCovered(persisted, oldW, i, spec, replica0.Operators[i] as IStoreSnapshot);
             specs.Add((i, spec));
         }
 
@@ -125,7 +125,8 @@ public static class ParallelReshard
                 {
                     await RewriteFileAsync(
                         fs, current, snapName, oldW, newW, entry.Index, file, session,
-                        (replica0.Operators[entry.Index] as ISnapshotOrder)?.OrderFor(file.Name) as Func<StructuralRow, int>, ct)
+                        (replica0.Operators[entry.Index] as ISnapshotOrder)?.OrderFor(file.Name) as Func<StructuralRow, int>,
+                        replica0.Operators[entry.Index] as IStoreSnapshot, ct)
                         .ConfigureAwait(false);
                 }
             }).ConfigureAwait(false);
@@ -209,9 +210,11 @@ public static class ParallelReshard
     // Every file the operator wrote must be one its spec names, or the rewrite would silently
     // drop it.
     private static void CheckFilesCovered(
-        Dictionary<(int Worker, int Op), List<string>> persisted, int oldW, int op, ReshardSpec spec)
+        Dictionary<(int Worker, int Op), List<string>> persisted, int oldW, int op, ReshardSpec spec, IStoreSnapshot? store)
     {
-        var named = spec.Files.Select(f => f.Name).ToHashSet(StringComparer.Ordinal);
+        // A window store's own files (docs/design-bounded-memory.md §3g) hold the state of the
+        // operator's trace file, and are read in its place.
+        var named = spec.Files.Select(f => f.Name).Concat(store?.StoreFileNames ?? []).ToHashSet(StringComparer.Ordinal);
         for (var w = 0; w < oldW; w++)
         {
             if (!persisted.TryGetValue((w, op), out var names))
@@ -235,6 +238,7 @@ public static class ParallelReshard
     private static async ValueTask RewriteFileAsync(
         ITableFileSystem fs, string current, string snapName, int oldW, int newW, int op, ReshardFile file, Runs.CheckpointSession? session,
         Func<StructuralRow, int>? order,
+        IStoreSnapshot? store,
         CancellationToken cancellationToken)
     {
         switch (file)
@@ -247,13 +251,22 @@ public static class ParallelReshard
                     for (var w = 0; w < oldW; w++)
                     {
                         var reader = new TableFileSystemSnapshotContext(fs, OpDir(current, w, op));
-                        if (!await reader.ExistsAsync(z.Name, cancellationToken).ConfigureAwait(false))
+
+                        // A window store saved as its own files (§3g): its rows stand for the trace
+                        // file, which the re-shard writes at the new W (restore reads either form).
+                        ZSet<StructuralRow, Z64>? set = null;
+                        if (store is not null && z.Name == "trace.arrows")
+                        {
+                            set = await store.ReadStoreRowsAsync(reader, cancellationToken).ConfigureAwait(false);
+                        }
+
+                        if (set is null && !await reader.ExistsAsync(z.Name, cancellationToken).ConfigureAwait(false))
                         {
                             continue;
                         }
 
                         present = true;
-                        var set = await z.Codec.LoadAsync(reader, z.Name, cancellationToken).ConfigureAwait(false);
+                        set ??= await z.Codec.LoadAsync(reader, z.Name, cancellationToken).ConfigureAwait(false);
                         if (Skip(z, w, set.Count, ref replicatedCount, op))
                         {
                             continue;
