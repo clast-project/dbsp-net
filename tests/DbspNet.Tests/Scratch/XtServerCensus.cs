@@ -167,12 +167,39 @@ public class XtServerCensus
         var nextOpCensus = stepGib;
         var lastOp = Stopwatch.GetTimestamp();
         var gate = new object();
+        var opTick = long.TryParse(Environment.GetEnvironmentVariable("XT_OP_TICK"), out var ot) ? ot : -1;
         RootCircuit.AfterOperatorStep = (circuit, i) =>
         {
             lock (gate)
             {
                 var now = Stopwatch.GetTimestamp();
                 var op = circuit.Operators[i];
+                if (opTick >= 0 && circuit.TickCount != opTick)
+                {
+                    lastOp = now; // XT_OP_TICK: sample inside that tick only
+                    return;
+                }
+
+                {
+                    // The step's output delta size: introspection, else the operator's _output stream.
+                    long outRows = -1;
+                    if (op is DbspNet.Core.Circuit.IIntrospectable intro)
+                    {
+                        outRows = intro.LastOutputRows;
+                    }
+                    else if (op.GetType().GetField("_output", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(op) is { } stream
+                        && stream.GetType().GetProperty("LastCount", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(stream) is long c)
+                    {
+                        outRows = c;
+                    }
+
+                    if (outRows >= 1_000_000)
+                    {
+                        log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"OPROWS tick={circuit.TickCount} op={i} type={op.GetType().Name} out_rows={outRows} op_ms={(now - lastOp) * 1000.0 / Stopwatch.Frequency:F0} heap_mib={GC.GetTotalMemory(false) / 1048576.0:F0} t_s={sw.Elapsed.TotalSeconds:F0}"));
+                    }
+                }
+
                 var opMs = (now - lastOp) * 1000.0 / Stopwatch.Frequency;
                 var heap = GC.GetTotalMemory(forceFullCollection: false);
                 if (opMs > 2000)

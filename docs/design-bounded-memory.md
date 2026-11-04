@@ -1408,3 +1408,46 @@ in-step census of tick 18.
 | b1 drain | 15.47 s (15.12–15.79) | 15.67 s (15.01–16.00), ranges overlap fully |
 | b2 / b3 drain | 106 / 126 ms | 102 / 118 ms |
 | peak RSS | 13.5 GB | 14.2 GB (bimodal) |
+
+### 5.13 Tick 18's in-step peak (2026-11-04)
+
+**Instrument.** `XT_OP_TICK=18` samples inside that tick only: forced-GC live every 4 GiB of heap
+growth, and `OPROWS` for every operator whose output delta has at least 1M rows. The output size comes
+from introspection, or else from the operator's `_output` stream's `LastCount`.
+
+The run (xt56: spill on, 1 GiB cache, blocked TOP-K, 48 GiB) ended in an OOM inside the instrument
+itself. The full object census started walking the heap at ~37 GB live. The samples before that point
+stand:
+
+| ops | live | what flows |
+|---|---|---|
+| 0–1280 | 10–12 GB | ~2.0M-row deltas through chains of `IncrementalLeftJoinOp` → `Apply2Op` → `ApplyOp` (18 left joins); also a rank, an aggregate and a DISTINCT |
+| 1281 (`IntegrateOp`) | 23 GB | |
+| 1377 (`PartitionedTopKCompactOp`, blocked) | 25 GB | the step took **45.6 s**: blocked TOP-K is slow on a delta this size |
+| 1380 (`BlockedJoinOp`) | **34 GB** | **21.7M-row output** from a ~2M-row input |
+| 1381–1391 (`ApplyOp`, `IncrementalLeftJoinOp`, `Apply2Op`, `ApplyOp`) | 37 GB | each another 21.7M-row delta. Blocks are 1.4 GB of it |
+
+**So the peak is not state.** One join fans a delta out about 10×, and the operators after it each
+hold a delta that size at the same time, as managed rows (~400 B per row). Stream release frees each
+after its last reader, but a chain of one-reader operators still has an input and an output alive
+together, plus whatever readers further down still need. This is Feldera's Critical case (§5.1: a
+step's transient batches).
+
+**Options.**
+1. **Bounded ticks.** The runner splits a big input version into ticks of at most N rows. An
+   incremental circuit accepts its input in any number of ticks, and views are read at the end of a
+   batch, so outputs are unchanged. Per-tick deltas then shrink in proportion, here about 2M → 2.2M
+   per join output for ten chunks.
+   - Cost: more ticks (per-tick overhead and more merges).
+   - Care: the tick journal (§2 of the durable-state design) records a tick per input version and
+     offset, and a split version must journal and replay correctly.
+   - Feldera feeds steps in input chunks too.
+2. **Spill in-step deltas.** Encode a delta past a threshold as blocks (Feldera's `min_step_spill_size`).
+   This needs a block-backed delta representation that every consumer can read: a large change.
+3. **Make the deltas smaller.** Narrower rows from projection pushdown, or the join's output kept as
+   blocks. These help, but don't bound anything.
+
+Option 1 is the only one that bounds the peak by a knob, and it is the cheapest. A knob
+`DBSPNET_MAX_TICK_ROWS` (unset: today's one tick per version) would join §5.5.
+Separately, the 45.6 s blocked TOP-K step on a ~2M-row delta needs a look. The managed operator's
+time on the same delta is unmeasured.
