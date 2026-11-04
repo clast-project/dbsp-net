@@ -1119,3 +1119,53 @@ without). Peak RSS was 42–43 GB.
 then S1 (spill on build), then S3 (pressure). Re-run this census after each one. W=12 has not
 been measured. Its state is the same in total, but it is split 12 ways, and in-flight deltas are
 per worker.
+
+### 5.7 R0: stream release in the first tick (2026-11-04, c778499)
+
+**What changed.**
+- **Readers are scanned before tick 0**, not after it, as before.
+- **Each stream's release point is decided at its first write.** That is when its producer
+  becomes known. `StreamRelease.Readers.ReleasePoint` is the rule `Plan` already used, now
+  shared by both. A forward edge's producer writes before any of its readers runs, so the point
+  is always still ahead.
+- **The plan for later ticks reuses the first tick's scan**, so it is still one scan per circuit.
+- `DBSPNET_STREAM_RELEASE_FIRST_TICK=0` opts out.
+
+**A bug it exposed.** Every operator's `LastOutputRows` read `_output.Current?.Count` after the
+step. Release had already nulled that, so introspection reported 0 from the second tick on. Three
+single-step tests now failed under R0. `Stream` now records the released value's `Count`
+(`Stream.LastCount`, a compiled per-type accessor), and the 25 operators read that.
+
+**Tests.** First-tick release, plus feedback in every tick. The feedback test needs a reader on
+*each* side of the producer: a reader only before it is safe to release after, which is why the
+first version of the test missed a mutant. A third test checks the count after release. Five
+mutants (skip the first-tick releases; drop the feedback rule; drop the opaque extension; drop
+the count; an empty first-tick scan) each fail a test. Suite: 3,449 pass.
+
+**Extended TPC-DS SF1, W=1, 48 GiB** (xt47 against xt46):
+
+| after op | before | R0 |
+|---|---|---|
+| 144 | 30.4 GB live | **23.3 GB** |
+| 172/173 | 35.7 GB | **26.1 GB** (state 21.6 GB, so ~4.5 GB in flight, down from ~10.4) |
+| OOM at | op 172 | **op 389** of 1,868 (live 34.2 GB: run blocks 14.9 GB, rank write-back ~14.5 GB) |
+
+It still OOMs, and what remains is S2's target (the rank write-back) and S1's (blocks).
+
+**TPC-DI SF=3 W=12.** Three sessions (run48–50, 14 runs per arm pooled); views identical in
+every run.
+
+| | main | R0 |
+|---|---|---|
+| batch 1 drain, pooled median | 15.38 s | 15.72 s (+2.2%) |
+| session medians, main / R0 | 15.10 / 15.48, 15.43 / 16.16, 15.54 / 15.26 | |
+| tick 0 step (run50) | ~365 ms | ~465 ms |
+| batch 1 checkpoint | 1.35 s | 1.13 s (run48) |
+| peak RSS | level | |
+
+- **Drain:** the session-to-session spread (±0.7 s) is larger than the difference, and run50 had
+  R0 faster. R0 with the opt-out set measured 15.13 s.
+- **Tick 0 is the one consistent cost: +~100 ms.** The scan itself is unchanged (~205 ms in every
+  arm). It used to overlap the wait for the slowest worker at the end of tick 0, and now runs
+  before the tick. A one-off per process. TPC-DI's tick 0 is small (267 MB live), so R0 has
+  nothing to release there.
