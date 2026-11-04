@@ -530,6 +530,9 @@ internal sealed class BlockedIndexedTrace
     /// <summary>Runs, newest first (checkpoints).</summary>
     internal IReadOnlyList<Run> Runs => _runs;
 
+    /// <summary>The block format of this trace's runs.</summary>
+    internal ITraceBlockFormat Format => _format;
+
     /// <summary>Get the trace ready to be written as runs (docs/design-flat-trace-state.md §2.7):
     /// freeze the managed levels, and rewrite any run with a GC floor so that what it holds is what
     /// the trace holds. Returns the runs, newest first.</summary>
@@ -1196,6 +1199,9 @@ internal sealed class BlockedIndexedTrace
                 _runs.Insert(0, merged);
             }
         }
+
+        // Mid-batch spilling (docs/design-bounded-memory.md §5.9): large runs to files, evictable.
+        BlockAccess.Spiller?.AfterCompact(this);
     }
 
     // A two-way merge in hash order. Entries of one hash from both runs are consolidated by key and

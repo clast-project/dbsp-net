@@ -19,19 +19,12 @@ internal sealed class BlockSpill
 
     private static int _registered;
 
-    private readonly LocalTableFileSystem _fs;
-    private readonly HashSet<string> _files = new(StringComparer.Ordinal);
+    /// <summary>This process's spill root.</summary>
+    internal static string RootPath => Root;
 
-    private BlockSpill(string dir) => _fs = new LocalTableFileSystem(dir);
-
-    /// <summary>A spill for one trace, or null when no cache can evict.</summary>
-    public static BlockSpill? Create()
+    /// <summary>Delete the spill root at process exit (once).</summary>
+    internal static void RegisterCleanup()
     {
-        if (!BlockCache.Enabled)
-        {
-            return null;
-        }
-
         if (Interlocked.Exchange(ref _registered, 1) == 0)
         {
             AppDomain.CurrentDomain.ProcessExit += (_, _) =>
@@ -48,7 +41,22 @@ internal sealed class BlockSpill
                 }
             };
         }
+    }
 
+    private readonly LocalTableFileSystem _fs;
+    private readonly HashSet<string> _files = new(StringComparer.Ordinal);
+
+    private BlockSpill(string dir) => _fs = new LocalTableFileSystem(dir);
+
+    /// <summary>A spill for one trace, or null when no cache can evict.</summary>
+    public static BlockSpill? Create()
+    {
+        if (!BlockCache.Enabled)
+        {
+            return null;
+        }
+
+        RegisterCleanup();
         var dir = Path.Combine(Root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         return new BlockSpill(dir);
@@ -60,9 +68,9 @@ internal sealed class BlockSpill
     {
         foreach (var run in trace.Runs.ToList())
         {
-            if (run.Persisted is { } p && ReferenceEquals(p.Store, _fs))
+            if (run.Persisted is not null)
             {
-                continue;
+                continue; // a file already (here, a checkpoint's, or a mid-batch spill's, §5.9)
             }
 
             var path = Guid.NewGuid().ToString("N") + ".run";

@@ -103,7 +103,11 @@ public class BlockedCheckpointTests
         {
             // The giant group spans blocks in memory, so the write joined it back into one block.
             Op(p).LeftTrace.PrepareCheckpoint();
-            Assert.Contains(Op(p).LeftTrace.Runs, r => Enumerable.Range(1, r.Blocks.Length - 1).Any(b => r.Blocks[b].FirstHash == r.Blocks[b - 1].LastHash));
+            // (Unless a mid-batch spill, §5.9, already wrote the run: its file holds the giant whole.)
+            if (DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Spiller is null)
+            {
+                Assert.Contains(Op(p).LeftTrace.Runs, r => Enumerable.Range(1, r.Blocks.Length - 1).Any(b => r.Blocks[b].FirstHash == r.Blocks[b - 1].LastHash));
+            }
         }
 
         await Snapshot.WriteAsync(p.Circuit, fs);

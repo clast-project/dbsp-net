@@ -14,5 +14,14 @@ internal static class BlockFormatRegistration
 #pragma warning disable CA2255
     [ModuleInitializer]
 #pragma warning restore CA2255
-    internal static void Register() => TraceBlockFormats.Factory = static (key, value) => BlockSchema.TryCreate(key, value);
+    internal static void Register()
+    {
+        TraceBlockFormats.Factory = static (key, value) => BlockSchema.TryCreate(key, value);
+
+        // Mid-batch spilling (docs/design-bounded-memory.md §5.9), opt-in: DBSPNET_SPILL=on.
+        if (Core.Operators.Stateful.Blocks.SpillSettings.Spill)
+        {
+            Core.Operators.Stateful.Blocks.BlockAccess.Spiller = RunSpiller.CreateDefault();
+        }
+    }
 }

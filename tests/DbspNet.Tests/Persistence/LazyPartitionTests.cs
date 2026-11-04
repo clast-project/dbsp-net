@@ -136,7 +136,12 @@ public class LazyPartitionTests
         Assert.All(LazyStates(restored), s =>
         {
             Assert.True(s.Lazy is not null, $"{s.Op} was promoted by small ticks");
-            Assert.InRange(Resolved(s.Lazy!), 1, LazyBound(s.Lazy!));
+            // Mid-batch spilling (§5.9) makes newly frozen record runs file blocks too, so residency
+            // no longer counts reads; the outputs below are still checked against the twin.
+            if (DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Spiller is null)
+            {
+                Assert.InRange(Resolved(s.Lazy!), 1, LazyBound(s.Lazy!));
+            }
         });
 
         // A delta checkpoint while partitions are cold, a second restore, then every partition.

@@ -11,6 +11,11 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 /// write-back caches may hold together before a store that ends a step over it drops its cache
 /// into its blocked record. Default 1024; <c>off</c> leaves the caches unbounded (dropped only on an
 /// idle tick past <c>CacheCap</c> partitions, or at a checkpoint), as before.</item>
+/// <item><c>DBSPNET_SPILL</c> = <c>on</c>/<c>off</c> (§5.9): write a blocked trace's runs to files as
+/// freezes and merges make them, so the block cache (<c>DBSPNET_BLOCK_CACHE_MIB</c>, which spilling
+/// needs) can evict them mid-batch. Off by default until measured.</item>
+/// <item><c>DBSPNET_SPILL_MIN_MIB</c> (§5.9): the smallest run spilled, in MiB of blocks (Feldera's
+/// <c>min_spill_size</c>). Default 10; 0 spills every run.</item>
 /// </list>
 /// </summary>
 internal static class SpillSettings
@@ -29,6 +34,12 @@ internal static class SpillSettings
         WindowWriteBackOverride.Value = bytes;
         return new Restore(() => WindowWriteBackOverride.Value = previous);
     }
+
+    /// <summary>Whether runs spill (<c>DBSPNET_SPILL</c>).</summary>
+    public static bool Spill { get; } = string.Equals(Environment.GetEnvironmentVariable("DBSPNET_SPILL"), "on", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The smallest run spilled, in bytes (<c>DBSPNET_SPILL_MIN_MIB</c>; <c>off</c> never).</summary>
+    public static long SpillMinBytes { get; } = ParseMib(Environment.GetEnvironmentVariable("DBSPNET_SPILL_MIN_MIB"), 10);
 
     /// <summary>A MiB setting: unset or unparsable is <paramref name="defaultMib"/>; <c>off</c> (or
     /// <c>none</c>) is unbounded; otherwise that many MiB (0 allowed).</summary>

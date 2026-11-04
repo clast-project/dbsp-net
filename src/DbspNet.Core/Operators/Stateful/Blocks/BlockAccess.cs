@@ -102,6 +102,11 @@ internal static class BlockAccess
     public static bool Evicting { get; set; } =
         long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_BLOCK_CACHE_MIB"), out var budget) && budget > 0;
 
+    /// <summary>Spills a blocked trace's large unpersisted runs to files once its runs change (mid-batch
+    /// spilling, docs/design-bounded-memory.md §5.9); null: nothing spills. Installed by the persistence
+    /// layer (<c>DBSPNET_SPILL</c>).</summary>
+    public static IRunSpiller? Spiller { get; set; }
+
     /// <summary>The bits a read now records: <see cref="Maintenance"/> alone on a merging thread,
     /// else the phase.</summary>
     public static int CurrentBits => _maintenance ? Maintenance : Phase;
@@ -139,4 +144,12 @@ internal struct BlockStamp
 
     /// <summary>The phase bits read in <paramref name="epoch"/> (0: not read in it).</summary>
     public readonly int BitsIn(int epoch) => _epoch == epoch ? _bits : 0;
+}
+
+/// <summary>Writes a blocked trace's runs to files so a block cache can evict them (§5.9).</summary>
+internal interface IRunSpiller
+{
+    /// <summary>The trace's runs have just changed (a freeze or merge, on the trace's own thread):
+    /// spill the large ones that have no file.</summary>
+    void AfterCompact(BlockedIndexedTrace trace);
 }

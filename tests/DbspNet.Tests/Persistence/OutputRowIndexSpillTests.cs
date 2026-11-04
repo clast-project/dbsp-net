@@ -64,7 +64,10 @@ public class OutputRowIndexSpillTests
             index.Commit();
             var (trace, files) = index.Blocks!.Value;
             Assert.All(trace.Runs.SelectMany(r => r.Blocks), b => Assert.IsType<LazyTraceBlock>(b));
-            Assert.Equal(trace.Runs.Count, files);
+            if (DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Spiller is null)
+            {
+                Assert.Equal(trace.Runs.Count, files); // (a mid-batch spill, §5.9, files some runs first)
+            }
         }
 
         Assert.Equal((40 * 7) - 39, index.Count);

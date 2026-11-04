@@ -425,7 +425,7 @@ internal static class BlockedTraceCheckpoint
 
     /// <summary>Write <paramref name="run"/> to <paramref name="path"/> outside any checkpoint and
     /// rebind it there at once (a <see cref="BlockSpill"/>: the file is a cache, not state).</summary>
-    internal static void SpillRun(ITableFileSystem fs, string path, ILayout codec, BlockedIndexedTrace trace, BlockedIndexedTrace.Run run)
+    internal static BlockedIndexedTrace.Run? SpillRun(ITableFileSystem fs, string path, ILayout codec, BlockedIndexedTrace trace, BlockedIndexedTrace.Run run)
     {
         var bodies = WriteRunAsync(fs, path, codec, run, CancellationToken.None).AsTask().GetAwaiter().GetResult();
         var schema = codec.Blocks!;
@@ -436,7 +436,7 @@ internal static class BlockedTraceCheckpoint
         }
 
         run.Persisted = (fs, path);
-        trace.Rebind(run, blocks);
+        return trace.Rebind(run, blocks);
     }
 
     // One run file from a run's blocks, raw. A hash spanning blocks in memory becomes one block.
