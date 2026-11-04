@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5), not built.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. Not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -1040,3 +1040,82 @@ completes TPC-DI batch 1, and extended TPC-DS SF1 completes in CI's container.
 3. **Spill location with a snapshot directory.** Into its `runs/`, so checkpoints reuse the files,
    or always into scratch, keeping state and spill strictly apart, at the cost of rewriting them
    at the checkpoint?
+
+**Decided (Curt, 2026-11-04):**
+- A fixed 10 MiB threshold.
+- Default-on, once measured, with an opt-out.
+- Spill into `runs/` when there is a snapshot directory.
+- Start with step 0.
+- Every policy number must be a well-defined knob, for later tuning.
+
+### 5.5 Knobs
+
+One settings type (`SpillSettings`) holds the knobs, with an environment variable for each
+(the hosts' path) and a programmatic override (tests, embedders), the same pattern as
+`TraceBlocksMode`. A host reads it once at start and logs the effective values. Feldera's
+equivalent is in brackets.
+
+| knob | default | what it sets |
+|---|---|---|
+| `DBSPNET_SPILL` = `on`/`off` | on (S1 lands opt-in, flips once measured) | spill on build at all |
+| `DBSPNET_SPILL_MIN_MIB` | 10 [`min_spill_size`] | the smallest freeze or merge output built on storage; 0 = all |
+| `DBSPNET_BLOCK_SPILL_DIR` (exists, §3.9) | temp | scratch directory when there is no snapshot directory |
+| `DBSPNET_BLOCK_CACHE_MIB` (exists) | off today; S1 needs a default [`cache_mib`, 256 MiB per thread] | the evicting cache that makes a spill free memory. Its default is measured in S1 |
+| `DBSPNET_WINDOW_WRITEBACK_MIB` (S2) | to be measured | the byte cap on a window store's write-back partitions |
+| `DBSPNET_MEMORY_LIMIT_MIB` (S3) | GC's `TotalAvailableMemoryBytes` [`max_rss`, capped by available memory] | the limit pressure is measured against |
+| `DBSPNET_PRESSURE_LEVELS` (S3) | `85,90,95` [Feldera's constants] | Moderate, High and Critical, as % of the limit |
+| `DBSPNET_PRESSURE` = `on`/`off` (S3) | on with S3 | pressure tiers at all. Off leaves the fixed threshold only |
+
+### 5.6 Step 0: extended TPC-DS SF1 at W=1 (2026-11-04)
+
+**Instrument.** `Scratch/XtServerCensus` hosts the server's endpoints in-process around an engine
+the test owns, and runs ivm-bench's own `run_batch('dbspnet', …)` driver against it. The census
+goes to a file, flushed per line, so an OOM loses nothing. Batch 1 never finishes a tick, so a
+per-tick census sees nothing. A new diagnostic hook, `RootCircuit.AfterOperatorStep` (one null
+check per operator), samples **inside** the step:
+- `OPLIVE`: a forced compacting GC each time the heap grows another 4 GiB.
+- A full object census each time live crosses another 8 GiB.
+- `OPSLOW`: any operator over 2 s.
+
+The run used `gcServer=1`, `gcConcurrent=0`, a 48 GiB `GCHeapHardLimit` and W=1, as CI does.
+
+**Batch 1 OOMs inside tick 0**, at operator 172 of 1,868, after ~600 s with the instrument (~186 s
+without). Peak RSS was 42–43 GB.
+
+| after op | live | run blocks | window rows | what stepped |
+|---|---|---|---|---|
+| 0 (`ApplyOp`, 29 s) | 10.3 GB | 0 | 0 | the input, as the first operator's output |
+| 29 (`PartitionedRankOp`, 25 s) | 17.9 GB | 0 | 14.8M | one rank over the biggest input |
+| 143 | 27.8 GB | 2.7 GB | 15.0M | |
+| 144 (`BlockedJoinOp`) | 30.4 GB | 5.3 GB | | |
+| 172 (`IncrementalAggregateOp`) | 35.7 GB | 6.7 GB | | the OOM followed |
+
+**The object census after op 143** (27.8 GB live) found 17.4 GB of operator state:
+
+| holder | bytes | |
+|---|---|---|
+| **one `PartitionedRank` store's write-back** (`_small` 12.9 GB + `_pending` 1.5 GB) | **14.55 GB** | 14.8M rows as 307M objects: ~980 B and ~21 objects per row |
+| integrated views (run blocks) | 2.83 GB | already reference-free |
+| everything else | < 0.1 GB | |
+| **not operator state: stream values** | **~10.4 GB** (live minus state) | the tick's deltas in flight. After op 0 alone, live was 10.3 GB with 4 MB of state |
+
+**Three findings change the order of §5.3.**
+1. **The window write-back cap only applies between ticks.** `OrderedPartitionStore.Freeze`
+   drops the cache past `CacheCap` partitions on an *idle* tick, and a checkpoint does too. One
+   step can therefore put a whole input into `_small` as managed objects. Here that is 14.8M rows
+   and 14.5 GB, 52% of live. **S2 (flush by bytes, checked during the step) is the biggest lever
+   on this workload**, and it moves ahead of S1. The rows flushed into the cold record become
+   blocks, roughly 3–5× smaller (§5.2's managed-to-block ratio), and S1 then spills them.
+2. **Stream release does nothing in the first tick.** The plan is built *after* tick 0, from the
+   producers that tick observed (§3b), and here tick 0 is the whole batch. TPC-DI's big tick is
+   18, so §3b's measurement never saw this. A forward edge's producer always writes before its
+   readers run, so tick 0 can release a stream at its last reader once its producer has been
+   seen in this tick. Readers come from the reflection scan, which can run before tick 0.
+   **New lever R0**, about 10 GB in flight here, cheap, and no spilling.
+3. **Run blocks are the smallest of the three here.** S1 matters for the join traces that the
+   OOM was in. It does not get this workload under a cap alone.
+
+**Revised order:** R0 (release in tick 0), then S2 (window write-back by bytes, during the step),
+then S1 (spill on build), then S3 (pressure). Re-run this census after each one. W=12 has not
+been measured. Its state is the same in total, but it is split 12 ways, and in-flight deltas are
+per worker.

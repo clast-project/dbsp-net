@@ -274,6 +274,11 @@ public sealed class RootCircuit
         }
     }
 
+    /// <summary>Diagnostics only (docs/design-bounded-memory.md §5.3 step 0): called after each
+    /// operator of an unprofiled step, and after its consumed streams are released, with the
+    /// operator's index in <see cref="Operators"/>. A census inside one huge tick needs it.</summary>
+    internal static Action<RootCircuit, int>? AfterOperatorStep { get; set; }
+
     // The release plan (docs/design-bounded-memory.md §3b): built after the first tick, once the
     // first tick's writes have named every stream's producer.
     private List<IReleasableStream>[]? _release;
@@ -283,9 +288,10 @@ public sealed class RootCircuit
     {
         if (!StreamRelease.Enabled)
         {
-            foreach (var op in _operators)
+            for (var i = 0; i < _operators.Count; i++)
             {
-                op.Step();
+                _operators[i].Step();
+                AfterOperatorStep?.Invoke(this, i);
             }
 
             return;
@@ -305,6 +311,8 @@ public sealed class RootCircuit
                         s.Release();
                     }
                 }
+
+                AfterOperatorStep?.Invoke(this, i);
             }
         }
         finally
