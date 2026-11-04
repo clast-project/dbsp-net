@@ -1505,3 +1505,104 @@ D1–D5 adopt that shape only for deltas past the threshold, and leave the small
 
 **Bounded ticks (§5.13 option 1) still has a role.** At ~150 lines plus journal care, it is a cheap
 interim. D5 makes it redundant for memory, though it may still matter for latency.
+
+### 5.15 D1–D3 built: block-backed deltas behind a threshold (2026-11-04)
+
+**What changed** (all behind `DBSPNET_STEP_SPILL_ROWS`, off by default; structural path only).
+- **D1, a fourth `ZSet` backing.** `ZSetExternalStore` is the abstraction; `BlockedRows` is the one
+  implementation: a consolidated, hash-ordered run of blocks. `Count` is exact (one run), `WeightOf`
+  probes by hash, enumeration decodes a block at a time with strings copied, so a row a consumer keeps
+  does not pin a block. Set algebra on a block-backed set builds through a builder of the same kind;
+  a sum with one merges the runs instead of re-hashing; in-place mutation (state, never a builder's
+  output in practice) moves it into a managed map first.
+  - **The enumerator's hot arms are unchanged.** The external store rides the inline arm: its one
+    `object` field holds either the inline set or the external store's enumerator, told apart by a
+    bool. The dictionary and chunked arms test exactly what they did.
+- **D2, a spilling builder.** `ZSetBuilder` takes a `SpillingRows` store in its one field. It
+  consolidates in a managed `ZSetBuilder` up to the threshold, then freezes that chunk into a run of a
+  private Z-set `BlockedIndexedTrace` (its ordinary freeze and geometric merge, so S1's spiller writes
+  runs past `DBSPNET_SPILL_MIN_MIB` to files and the cache can evict them). `Build` merges every run into
+  one (`MergeAllRuns`), so the set's count is exact. Below the threshold it builds the managed set it
+  always did. A capacity hint is capped at the threshold, or pre-sizing would allocate the map this
+  bounds.
+- **D3, formats on streams.** `Stream.DeltaFormat` carries the stream's Z-set block format. The compiler
+  sets it in `CompilePlan` (every structural plan node's stream, from `plan.Schema`) and on the outer
+  joins' internal join streams, only while the knob is on. Operators build their output through
+  `DeltaSpill.Rows/For(_output.DeltaFormat, …)`: map / filter / map-filter / flat-map, inner, shared-right,
+  left and full joins (managed and blocked), DISTINCT, rank, TOP-K (both), window aggregate, offset.
+  Union and difference need nothing: `+` and `-` follow a block-backed operand.
+- **The knob.** `DBSPNET_STEP_SPILL_ROWS=N` freezes a builder's map every N rows; `0` is the forced mode
+  (every delta with a format built as blocks, chunks of `DBSPNET_STEP_SPILL_FORCED_CHUNK`, default 4096,
+  a test knob). `SpillSettings.UseStepSpill` overrides it in an async context.
+
+**Tests.**
+- The suite passes knob off (3,459), forced (546,857 deltas built as blocks, 3.6M rows; a stats dump,
+  `DBSPNET_STEP_SPILL_STATS`, proves it is not vacuous), forced at chunk 2, and forced at chunk 2 with S1
+  spilling every run into a 1 MiB cache (3,465 each).
+- **That last run found a real bug.** `BlockedRows.Plus` adopts the source runs' blocks into a new trace,
+  as new `Run` objects. A spilled file lives as long as its *original* run (the spiller tracks it
+  weakly), and after the adopt loop neither source was reachable (the JIT ends their lifetime, and stream
+  release had dropped the inputs). A sweep then deleted a file mid-merge. Fixed with `GC.KeepAlive` on
+  both sources. No unit test reaches it: it needs a GC inside the merge. The forced+S1 suite run is its
+  gate.
+- `BlockedDeltaTests`: a property test that a block-backed set reads and derives as the managed one
+  (400 cases: chunk 1–9, forced and thresholded, every operation above both ways); count and
+  cancellation across chunks; knob off is the plain builder; a 600-row fan-out join emits blocks past a
+  100-row threshold and a managed delta below it (blocked and managed traces); 600 random-query twins,
+  forced at chunk 1–3, equal every tick.
+- Four mutants each fail a test: no spilling builder; the enumerator skipping an entry; no final merge;
+  the compiler attaching no format.
+
+**Nexmark (`w1profile`, B/ev).** Byte-identical on all ten queries, main against the branch with the
+knob off and with it on at 1M rows.
+
+**TPC-DI SF=3 W=12** (di1/di2; gcServer, gcConcurrent=0; views identical in every run, bc345419):
+
+| arm | runs | b1 drain | b1 GC pause | b2 / b3 drain | peak RSS | deltas blocked (rows) |
+|---|---|---|---|---|---|---|
+| main | 5 | 15.54 s | 3.38 s | 103 / 122 ms | 13.57 GB | — |
+| branch, knob off | 5 | 15.48 s | 3.55 s | 90 / 121 ms | 13.30 GB | 0 |
+| S1 (spill on, 512 MiB cache) | 5+3 | 16.38 s | 3.9–4.0 s | 132–135 ms | 11.8–12.0 GB | 0 |
+| S1 + 1M rows | 5 | 16.75 s | 4.00 s | 147 / 130 ms | 11.44 GB | **0** |
+| S1 + 64K rows | 3 | **35.23 s** | 8.38 s | 112 / 132 ms | **14.02 GB** | 606 (61.6M) |
+| S1 + forced | 3 | 55.24 s | 11.70 s | 116 / 136 ms | 15.32 GB | 3,974 (82.8M) |
+
+- **Knob off is level with main.**
+- **At 1M rows nothing engages at W=12:** no worker's delta reaches 1M rows (the 1M arm is the S1 arm).
+- **Where it engages, D1–D3 alone cost time AND memory on TPC-DI:** 64K doubles batch 1's drain and
+  raises peak RSS 18%. Not measured yet, so candidates only: every consumer decodes the blocks into
+  fresh rows (a chain of N readers decodes N times, and that garbage is what server GC's peak tracks);
+  `MergeAllRuns` rewrites every multi-chunk delta once more; and the index operators that consume these
+  deltas (D4, not built) still build managed `IndexedZSet`s of the same rows, so the managed copy is
+  made anyway, one hop later.
+
+**Extended TPC-DS SF1, W=1, 48 GiB heap cap, S1 on, 1 GiB cache, 1M-row threshold** (xt57; xt56 is the
+same run before D1–D3):
+
+| | xt56 (before) | xt57 (D1–D3) |
+|---|---|---|
+| ticks 0–17 | complete, ~2,235 s | complete, 3,308 s |
+| deltas built as blocks by tick 17 | — | 437 (1.25 billion rows) |
+| live at tick 18, op 1377 (blocked TOP-K) | 25 GB | **11.2 GB** |
+| live after the 21.7M-row fan-out (ops 1380–1391) | 34–37 GB, then the census walk OOMs | not sampled (no 4 GiB step crossed live) |
+| furthest op | 1391 | past 1404 |
+| peak RSS | 40 GB | 37 GB |
+| how it ended | OOM | `IncrementalLeftJoin: oversized per-key cross product 7,222,266 × 1` |
+
+- **Tick 18's fan-out chain now fits.** The 21.7M-row deltas after `BlockedJoinOp` are block runs, and live
+  memory before the chain is less than half what it was.
+- **It ends on a guard, not memory.** `IncrementalLeftJoinOp.CrossProductGuardRows` (5M) refuses any one
+  key's cross product past 5M rows, because materializing it used to OOM. With a spilling output builder
+  that reason no longer holds. Whether to lift the guard when the output spills (Feldera has none) is
+  open, and so is whether this tick finishes once it is lifted.
+- **The chain is much slower:** the left join at op 1397 took 141.8 s (xt56's equivalent took 26.8 s) and
+  the Apply ops after it 70–95 s (xt56: 6.6–7.8 s). Ticks 0–17 took 48% longer. The cost is the same as
+  TPC-DI's 64K arm (decode per consumer, final merge, managed index copies) and is the next thing to
+  apportion.
+- **Disk:** S1 wrote 626 GB of spill files by tick 17, with ~92 GB live at once. Spill directories of
+  killed processes are not cleaned up: 364 GB of them had piled up in temp from earlier runs.
+
+**Next.** (1) Apportion the in-step cost (decode, `MergeAllRuns`, index copies); the obvious levers are a
+k-way-merge enumeration without the final rewrite, and D4 so index ops stop rebuilding managed copies.
+(2) Decide on the cross-product guard under spilling. (3) Sweep stale `dbspnet-spill-<pid>` directories
+at start.
