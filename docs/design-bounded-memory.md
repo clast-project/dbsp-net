@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K is extended TPC-DS's holder now (§5.11); S1b, S3 not built.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -1355,3 +1355,56 @@ across tiny ticks. The census at the end of tick 12 (xt54: 15.6 GB live, 0.75 GB
 
 **Next, for TPC-DI under a limit:** S1b, so the checkpoint names spilled files instead of reading
 them back.
+
+### 5.12 Partitioned TOP-K state as blocks (2026-11-04, 5155382)
+
+**What changed.**
+- **State.** `PartitionedTopKCompactOp` kept every partition's whole integrated multiset as managed
+  objects. With block formats it now keeps an `OrderedPartitionStore` instead:
+  - partitions ordered by the total order and read whole (`valueOf: null`, so no chunks);
+  - a blocked cold record, spilled by S1;
+  - the write-back cache bounded by S2's budget.
+- **When.** On the rank operator's terms: a window kind, the flat family, a PARTITION BY.
+- **Step.** Each touched partition's window is read from the store before the delta and after it,
+  then diffed as before.
+- **Checkpoints.** In the runs layout the store writes its own files; otherwise the whole state goes
+  to `trace.arrows`. Re-shard reads the store through `IStoreSnapshot`.
+- **Scratch.** The per-tick touched set and window buffers are replaced after a bulk tick instead
+  of cleared, since `Clear` keeps capacity. That was §5.11's 0.92 GB, in both modes.
+
+**A test trap found on the way.** `PlanToCircuit.Compile` on a single query takes the typed fast path
+whenever it can, so the existing compact TOP-K PBTs' "structural compact" arm was typed all along.
+Multi-view programs, ivm-bench's path, compile structurally by default. The new PBT pins the
+structural compile (`ShareArrangements = true`) and asserts the operator is blocked.
+
+**Tests.**
+- **Blocked against legacy, every tick, 250 cases.** Wide domain: NULL and VARCHAR partition
+  columns, growth past `SmallMax`, ROW_NUMBER, RANK and DENSE_RANK. Tiny freezes and blocks, and a
+  zero write-back budget.
+- **Checkpoint and restore on the program path in both layouts**, then continued ticks, equal to a
+  twin.
+- **Four mutants each fail a test:** no old window; ignore the store files on load; an empty whole
+  write; no rank cut.
+- **The suite passes** (3,459), and again with everything spilled and a zero budget.
+
+**Extended TPC-DS SF1, W=1, 48 GiB, spill on, 1 GiB cache** (xt55 against xt53). Live at the end of
+each tick:
+
+| tick | before | blocked TOP-K |
+|---|---|---|
+| 8 | 17.8 GB | 13.8 GB |
+| 12 | 15.6 GB | **7.3 GB** |
+| 13 | 22.7 GB | 14.7 GB |
+| 17 | 19.3 GB | **10.0 GB** |
+
+It still OOMs in tick 18, now in `IncrementalLeftJoinOp` allocating a `HashSet` sized to its delta.
+That is the in-step peak: tick 18's step needs more than ~38 GB above a ~10 GB baseline. Next: an
+in-step census of tick 18.
+
+**TPC-DI SF=3 W=12** (run56, 5 runs per arm, spill off, views identical):
+
+| | before | blocked TOP-K |
+|---|---|---|
+| b1 drain | 15.47 s (15.12–15.79) | 15.67 s (15.01–16.00), ranges overlap fully |
+| b2 / b3 drain | 106 / 126 ms | 102 / 118 ms |
+| peak RSS | 13.5 GB | 14.2 GB (bimodal) |
