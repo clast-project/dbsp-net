@@ -27,8 +27,10 @@ internal sealed class ViewEntries(TraceBlock[] blocks, int[] indexes)
 /// </summary>
 internal static class ViewArrow
 {
-    /// <summary>Rows per batch.</summary>
-    internal const int BatchRows = 1 << 16;
+    /// <summary>Rows per batch (<c>DBSPNET_OUTPUT_BATCH_ROWS</c>). Large: engineered-wood writes
+    /// one big batch with less than half the allocation of the same rows in 64K-row batches (§3h).</summary>
+    internal static readonly int BatchRows =
+        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_BATCH_ROWS"), out var rows) && rows > 0 ? rows : 1 << 20;
 
     /// <summary>
     /// The batches and their entries, or null when the view cannot be read this way: a worker's
@@ -37,7 +39,7 @@ internal static class ViewArrow
     /// summed, which takes rows).
     /// </summary>
     public static (List<RecordBatch> Batches, ViewEntries Entries)? TryBuild(
-        Schema schema, IReadOnlyList<BlockedIndexedTrace> shards, int batchRows = BatchRows)
+        Schema schema, IReadOnlyList<BlockedIndexedTrace> shards, int batchRows = 0)
     {
         var blocks = new List<TraceBlock>();
         var indexes = new List<int>();
@@ -63,6 +65,7 @@ internal static class ViewArrow
             }
         }
 
+        batchRows = batchRows > 0 ? batchRows : BatchRows;
         var all = new ViewEntries([.. blocks], [.. indexes]);
         blocks.Clear();
         indexes.Clear();
