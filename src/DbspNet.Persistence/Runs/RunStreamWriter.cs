@@ -69,7 +69,7 @@ internal sealed class RunStreamWriter : IAsyncDisposable
     /// <summary>Append a block copied unchanged from another run of the same schema (its stored
     /// record-batch message), with its distinct order hashes and counts.</summary>
     internal async ValueTask AppendRawAsync(
-        byte[] message, IReadOnlyList<uint> keyHashes, int entries, int groups, CancellationToken cancellationToken)
+        ReadOnlyMemory<byte> message, IReadOnlyList<uint> keyHashes, int entries, int groups, CancellationToken cancellationToken)
     {
         var first = keyHashes[0];
         var last = keyHashes[^1];

@@ -583,6 +583,37 @@ pile up between collections. Bounding the process needs the GC told: `GCHeapHard
 `GCConserveMemory`, or a DATAS/heap-count setting. With live data at the peak now 8.5 GB, that
 is the next experiment.
 
+## 3c. Telling the GC: limits on peak RSS (2026-11-03)
+
+All arms below have stream release on, `DOTNET_gcServer=1` and `DOTNET_gcConcurrent=0`, 3 runs
+each, with peak RSS from the testhost `ps` sampler. Views are identical in every completed run
+(run26, run27).
+
+| arm | peak RSS | b1 drain | b1 GC pause | b1 checkpoint | outcome |
+|---|---|---|---|---|---|
+| default | 16.8–18.0 GB | 15.0–16.2 s | 4.6–5.1 s | 2.2–2.8 s | |
+| `GCConserveMemory=7` | **14.7–15.8 GB** | 15.3–16.0 s | 4.6–5.3 s | 2.2–2.9 s | level on time |
+| `GCgen0size=64 MB` | 17.1–17.8 GB | level | level | level | no effect |
+| `GCDynamicAdaptationMode=0` (DATAS off) | 17.7–18.4 GB | level | −6% | −8% | slightly more RSS |
+| `GCHeapHardLimit=12 GiB` | 12.9 GB | 15.6 s | 7.3 s | 4.2 s | **OOM in 5 of 6 runs** |
+| `GCHeapHardLimit=10 GiB` | 10.8 GB | — | — | — | **OOM in 3 of 3** |
+
+**The drain fits.** Under either hard limit batch 1's drain completes; every OOM is in batch
+1's *checkpoint*, in `BlockWriter.Concat`. Without the block cache, a hash spanning blocks is
+written as one file block, concatenated in memory first (§3.6). On ivm-bench that is 2,497
+concatenations per checkpoint, **2.7 GB in total**, the largest 175 MB (930k entries over 2,914
+blocks, a join trace). All of it is transient: the giant's body is not kept.
+
+**A copy removed.** The writer copied every block's message (`ReadOnlyMemory.ToArray()`) before
+writing it: the whole state, once more, at every checkpoint. `AppendRawAsync` now takes the
+memory. Checkpoint −7% (2.55 → 2.38 s, within noise); peak RSS unchanged, since the peak is the
+drain. It moved the 12 GiB arm from 0 of 3 completions to 1 of 3.
+
+**Reading.** Conserve-memory buys ~2.3 GB (−13%) for free. A hard limit is the real bound, and
+the obstacle to it is now the checkpoint's giant concatenations, not batch 1's data. Writing a
+giant straight to the file from its parts (the layout `Concat` computes, streamed through a
+small buffer) would remove the 2.7 GB.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven

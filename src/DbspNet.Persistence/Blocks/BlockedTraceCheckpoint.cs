@@ -204,7 +204,7 @@ internal static class BlockedTraceCheckpoint
             for (var b = 0; b < blocks.Count; b++)
             {
                 var body = Materialized(blocks[b]);
-                await file.AppendRawAsync(body.Message.ToArray(), [(uint)b], body.Count, 1, cancellationToken).ConfigureAwait(false);
+                await file.AppendRawAsync(body.Message, [(uint)b], body.Count, 1, cancellationToken).ConfigureAwait(false);
                 bodies.Add((file.Index[^1], body));
             }
 
@@ -273,7 +273,7 @@ internal static class BlockedTraceCheckpoint
             foreach (var (block, giant) in pieces)
             {
                 var hashes = Distinct(block.Hashes);
-                await writer.AppendRawAsync(block.Message.ToArray(), hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
                 bodies.Add((writer.Index[^1], giant ? null : block));
             }
 
