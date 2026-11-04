@@ -773,6 +773,72 @@ Two earlier versions measured worse on the later batches:
 The remaining +15–25 ms on later checkpoints is manifests of stores that did change, which are
 rewritten whole.
 
+## 3h. Full output writes from the view's blocks (2026-11-03)
+
+Batch 1's output allocated 4.7 GB to write 3.6M rows (`DBSPNET_OUTPUT_TRACE` now records bytes per
+stage):
+
+| stage | allocated |
+|---|---|
+| form the view: decode every block row, sum the W shards into one Z-set | 1.39 GB |
+| Arrow from those rows | 0.85 GB |
+| engineered-wood's Parquet write (0.9 GB of it per-cell strings for stats) | 1.46 GB |
+| the connector's row index: every row added as a key, encoded again | 0.99 GB |
+
+**engineered-wood** fixed the stats (#661, 9e4ce64: compare UTF-8 bytes, decode only the bounds);
+the submodule is at that commit. Parquet write: 1.46 → 0.64 GB, 941 → 616 ms.
+
+**The rest is built from the blocks now.** Stored blocks already hold every column in its Arrow
+layout (INT, BIGINT, REAL, DOUBLE, BOOLEAN, VARCHAR, DATE, TIME, TIMESTAMP(us), DECIMAL128).
+- `BlockedIndexedTrace.StreamEntries` yields each consolidated entry as (block, index, weight) in
+  hash order:
+  - an entry whose hash only one run holds passes through;
+  - entries of a hash several runs hold are decoded only to sum equal rows;
+  - rows not yet frozen are encoded into a scratch run, and the trace is left unchanged;
+  - null (fall back to rows) when a run or level carries a GC floor.
+- `ViewArrow.TryBuild` reads every shard's entries (a row with count n is written n times) and
+  copies each column from the blocks, a run of consecutive entries at a time. It returns null
+  when a count is negative on some shard (then the shards must be summed) or a type does not match.
+  The shards' integrals are not summed: with no negative counts, writing each shard's rows is the
+  same multiset.
+- The row index takes the same entries (`OutputRowIndex.AddEntries`):
+  - The blocked index sorts them by the hash their blocks carry.
+  - `BlockWriter.Gather` copies each entry's key columns and writes the address as the value
+    column, one run per write (`BlockedIndexedTrace.IntegrateGathered`).
+  - A managed index decodes.
+- The connector side is internal: `IBlockOutputConnector.ApplyViewAsync(batches, entries)`, which
+  `DeltaOutputConnector` implements. `IOutputConnector` is unchanged, and other connectors keep the
+  row path. Only a connector's first (full) write in a process takes it; incremental batches carry
+  deltas as before. `DBSPNET_OUTPUT_BLOCKS=0` turns it off.
+- **Batch size.** Batches are up to 1M rows (`DBSPNET_OUTPUT_BATCH_ROWS`). engineered-wood
+  allocated 1.47 GB writing the same rows in 64K-row batches against 0.64 GB in one batch per view.
+
+**Tests** (`OutputFromBlocksTests`): the same input written by two runners, block writes on and
+off, must leave identical Delta tables after every batch:
+- every column kind, nulls, multiplicities above one, tiny blocks (several runs and an unfrozen
+  level at write time), W = 1 and 3;
+- four incremental batches after the full write, their deletes found through the gathered index.
+
+Mutations (string offsets, validity, multiplicity, gathered addresses, unfrozen rows ignored,
+multi-run sums, boolean bits) each fail them. Suite: 3,293.
+
+**A/B** (run34; 5 runs per arm, same binary, `DBSPNET_OUTPUT_BLOCKS=0` vs default; views identical
+in all 10):
+
+| | row path | blocks |
+|---|---|---|
+| b1 output | 2.18 s | **1.78 s (−18%)** |
+| b1 GC pause | 4.09 s | 3.98 s |
+| peak RSS | 15.9 GB | **14.3 GB (−10%)** |
+| b1 drain, checkpoint | level | level |
+| b2 / b3 output | 19 / 16 ms | 23 / 14 ms |
+
+The b2 output's +4 ms is probes into the gathered index run. Its blocks are cut by entry count,
+not bytes, so for wide rows they are larger than the row path's. Cutting by bytes would close it.
+
+Per stage on the probe (one batch per view): forming 1.39 GB → 0, index 0.99 → 0.66 GB. The Arrow
+build's 0.8 GB is the output's own bytes.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven
