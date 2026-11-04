@@ -712,6 +712,67 @@ checkpoint +18%). By type:
 So the lever is not streaming but **not decoding**: block → Arrow for the output, and window chunks
 written as blocks for the checkpoint. Both cut time as well as memory.
 
+## 3g. Window stores checkpoint as their own files (2026-11-03)
+
+§3f's per-operator profile (`IVM_CHECKPOINT_PROFILE=alloc`, one worker, exact): the window
+operators were 6.6 of the batch-1 checkpoint's 6.9 GB allocated and 5.0 of its 6.3 s (aggregates
+3.7 GB, LAG/LEAD 2.9). They kept their state as blocks and wrote it as rows: `SnapshotNow` decoded
+every row into a Z-set, which `RunFile.WriteZSetAsync` sorted by partition hash and encoded again.
+
+**Now an `OrderedPartitionStore` checkpoints as its own files**, nothing decoded:
+- **Small partitions:** the shared record (a `BlockedIndexedTrace`, partition key → row) as the run
+  chain a blocked trace writes (`store.record`): runs an earlier checkpoint wrote are named again.
+- **Large partitions:** their chunks as a **block set** (`store.chunks`). Blocks an earlier
+  checkpoint wrote (durable `LazyTraceBlock`s in the same store) are named, the rest copied raw to
+  one new file. Past 16 files the set is rewritten into one, so a set cannot pin every file ever
+  written.
+- **Manifest:** the store's metadata (each large partition's key hash and chunk sizes, and the
+  record's key filter), then each block's file and index entry. It is a file under `runs/`, first
+  in the chain the snapshot's run index records, so nothing is written in the operator's directory.
+  A store whose manifest is unchanged since its last commit, or since the restore that read it,
+  re-records that chain and writes nothing.
+- **Restore** adopts all of it lazily: the record's blocks are read on probe, and a large
+  partition (known by key hash) is decoded on first touch, which recomputes its chunks' order
+  values and partials. The key filter is restored with it.
+- **Re-shard** (`IStoreSnapshot`) reads a worker's store files into a scratch store, takes its rows,
+  and writes them in the old `trace.arrows` form at the new W. Restore reads either form, so
+  snapshots from before this change still restore.
+- **Fallback:** without the runs layout, or without block formats, the operator writes its rows as
+  before.
+
+**Tests.** `WindowStoreCheckpointTests`:
+- a lazy restore (nothing read, large partitions untouched) that carries on exactly;
+- an untouched restore re-checkpoints with no writes;
+- unchanged chunks named again;
+- the file cap;
+- a checkpoint into another store.
+
+`ParallelReshardTests` re-shards from store files (3→2, 2→4). The lazy-partition test now checks
+the store's laziness, and three chain tests that used window operators to exercise Z-set chains run
+with window stores off. Mutations (no fault-in, filter lost, never reuse, no cap, re-shard ignores
+the store, no unchanged skip, no restore seed) each fail a test. Suite: 3,289.
+
+**A/B** (run33; 3 runs per arm; release on, `gcServer=1`, `gcConcurrent=0`; views identical in
+every run; previous = dcd9c29):
+
+| | previous | store files |
+|---|---|---|
+| b1 checkpoint | 2.24 s | **1.14 s (−49%)** |
+| b1 checkpoint allocated | 8.0 GB | **1.7 GB (−79%)** |
+| b1 GC pause | 4.8 s | 4.1 s (−16%) |
+| peak RSS | 16.1 GB | 14.9 GB (−8%) |
+| b2 / b3 checkpoint | 0.22 / 0.25 s | 0.23 / 0.27 s (+6%) |
+| fresh-process restore | 162 ms | 180 ms |
+| b2 / b3 checkpoint after restore | 0.24 / 0.25 s | 0.27 / 0.28 s (+10%) |
+
+Two earlier versions measured worse on the later batches:
+- **First version:** a manifest file per store in the operator's directory on every checkpoint
+  (468 per checkpoint) made b2/b3 +43%.
+- **Second version:** after a restore, stores did not know their manifests were already on disk.
+
+The remaining +15–25 ms on later checkpoints is manifests of stores that did change, which are
+rewritten whole.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven
