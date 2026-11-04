@@ -811,7 +811,9 @@ layout (INT, BIGINT, REAL, DOUBLE, BOOLEAN, VARCHAR, DATE, TIME, TIMESTAMP(us), 
   row path. Only a connector's first (full) write in a process takes it; incremental batches carry
   deltas as before. `DBSPNET_OUTPUT_BLOCKS=0` turns it off.
 - **Batch size.** Batches are up to 1M rows (`DBSPNET_OUTPUT_BATCH_ROWS`). engineered-wood
-  allocated 1.47 GB writing the same rows in 64K-row batches against 0.64 GB in one batch per view.
+  allocated 1.47 GB writing the same rows in 64K-row batches against 0.64 GB in one batch per view:
+  its rolling file writer concatenates (copies) a row group's batches before encoding it
+  (engineered-wood#667).
 
 **Tests** (`OutputFromBlocksTests`): the same input written by two runners, block writes on and
 off, must leave identical Delta tables after every batch:
