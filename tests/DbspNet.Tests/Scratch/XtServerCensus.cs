@@ -113,6 +113,16 @@ public class XtServerCensus
                     $"GENS tick={t} {gens} (g3=LOH g4=POH) evicted_alive={deadCount} evicted_alive_mib={deadBytes / 1048576.0:F0}"));
             }
 
+            if (int.TryParse(Environment.GetEnvironmentVariable("XT_STATE_CENSUS_TICK"), out var censusTick) && censusTick == t)
+            {
+                foreach (var line in StateCensus.Report($"end{t}", StateCensus.Walk(replicas, runner, null, 3), 60))
+                {
+                    log.WriteLine(line);
+                }
+
+                log.WriteLine($"CENSUS-DONE tick={t}");
+            }
+
             if (int.TryParse(Environment.GetEnvironmentVariable("XT_PAUSE_AT_TICK"), out var pauseTick) && pauseTick == t)
             {
                 // Hold here (after the forced GC) for a heap dump: until XT_PAUSE_AT_TICK's resume file
