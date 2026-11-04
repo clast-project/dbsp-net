@@ -611,8 +611,38 @@ drain. It moved the 12 GiB arm from 0 of 3 completions to 1 of 3.
 
 **Reading.** Conserve-memory buys ~2.3 GB (−13%) for free. A hard limit is the real bound, and
 the obstacle to it is now the checkpoint's giant concatenations, not batch 1's data. Writing a
-giant straight to the file from its parts (the layout `Concat` computes, streamed through a
-small buffer) would remove the 2.7 GB.
+giant straight to the file from its parts removes the 2.7 GB: §3d.
+
+## 3d. Giant groups streamed to the file (2026-11-03)
+
+A hash spanning blocks is one file block (§3.2). It was built in memory by `BlockWriter.Concat`
+and then written: 2.7 GB of transient copies per batch-1 checkpoint on ivm-bench (§3c), and the
+cause of every OOM under a hard heap limit. Now `BlockWriter.ConcatToAsync` writes the same message
+(header from the layout `Concat` computes, which is now shared) straight to the run file:
+- fixed widths and string heaps from the parts' own bytes;
+- validity and BOOLEAN bitmaps, and rebased string offsets, through one scratch buffer of at most
+  `max(n/8, 4 × largest part)` bytes.
+
+`RunStreamWriter.AppendConcatAsync` takes the parts; `Pieces` (with the cache) and the whole-span
+path (without it) hand giants over as parts. Their bodies were never kept, so nothing else changes.
+A test checks the streamed bytes equal `Concat`'s for every cell kind with nulls, over 1–4 parts.
+Mutating the offset rebase, the validity rule or the padding fails it.
+
+**A/B** (run28; 3 runs per arm; release on, `gcServer=1`, `gcConcurrent=0`; views identical in all
+completed runs):
+
+| arm | peak RSS | b1 drain | b1 output | b1 GC pause | b1 checkpoint | outcome |
+|---|---|---|---|---|---|---|
+| previous (5e9970a) | 17.4–18.7 GB (avg 18.0) | 15.4 s | 2.29 s | 4.76 s | 2.33 s | |
+| streamed | 15.7–16.7 GB (avg 16.1) | 15.2 s | 2.35 s | 4.67 s | 2.26 s | **−10% RSS, level time** |
+| streamed + `GCConserveMemory=7` | 14.9–15.5 GB | 15.5 s | 2.21 s | 5.10 s | 2.42 s | |
+| streamed + `GCHeapHardLimit=12 GiB` | **12.9 GB** | 15.4 s | 3.13 s | 6.30 s | 2.75 s | **3 of 3 complete** (was 1 of 3) |
+| streamed + `GCHeapHardLimit=10 GiB` | 10.8 GB | — | — | — | — | OOM 3 of 3 |
+
+So the peak RSS that §3b and §3c measured was partly the checkpoint's concatenations, not only the
+drain's garbage. A 12 GiB limit now holds: drain level, GC pause +32%, output +37%, checkpoint
++18%. At 10 GiB the failures are spread out (the output's Arrow build, a window store materialised
+as a Z-set for its checkpoint, a run file's Z-set write): the live floor after the drain is near.
 
 ## 4. Open questions
 
