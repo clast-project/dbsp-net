@@ -97,6 +97,7 @@ public class BlockedDeltaTests
     [Fact]
     public void Block_backed_sets_read_and_derive_as_managed_ones()
     {
+        var multiRun = false;
         Gen.Select(GenAdds, GenAdds, Gen.Int[1, 9], Gen.Bool).Sample((a, b, chunk, forced) =>
         {
             var rows = forced ? 0L : chunk;
@@ -115,6 +116,12 @@ public class BlockedDeltaTests
             if (!forced && a.Length < chunk)
             {
                 Assert.False(sa.IsExternal);
+            }
+
+            // Multi-chunk sets keep their chunks as separate runs (§5.17: never merged).
+            if (sa.External is BlockedRows br && a.Length > 2 * chunk && chunk < 4)
+            {
+                multiRun |= br.RunCount > 1;
             }
 
             using var _ = SpillSettings.UseStepSpill(rows, chunk);
@@ -144,6 +151,7 @@ public class BlockedDeltaTests
             dropped.RemoveKeysBelow(6, r => (int)r[0]!);
             AssertSame(ma.Filter(r => (int)r[0]! >= 6), dropped);
         }, iter: 400);
+        Assert.True(multiRun, "no case built a set of several runs");
     }
 
     [Fact]

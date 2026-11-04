@@ -17,7 +17,7 @@ internal static class StepSpillProfile
 
     public const int ChunkAdd = 0;      // adds into a spilling builder's managed chunk
     public const int ChunkFreeze = 1;   // a chunk frozen into a run (sort, encode, geometric merges)
-    public const int FinalMerge = 2;    // Build's merge of every run into one
+    public const int BuildCount = 2;    // a built set's exact count: the hash-only walk over its runs (§5.17)
     public const int Enumerate = 3;     // decoding a block-backed set's rows for a reader
     public const int Probe = 4;         // WeightOf / Contains on a block-backed set
     public const int PlusMerge = 5;     // a sum with a block-backed set (run merge)
@@ -25,7 +25,7 @@ internal static class StepSpillProfile
     public const int Spill = 7;         // S1 writing runs to files (any trace)
     public const int RunMerge = 8;      // a two-way run merge (any trace; nested in freeze / final merge)
 
-    private static readonly string[] Names = ["chunk_add", "chunk_freeze", "final_merge", "enumerate", "probe", "plus_merge", "copy", "spill", "run_merge"];
+    private static readonly string[] Names = ["chunk_add", "chunk_freeze", "build_count", "enumerate", "probe", "plus_merge", "copy", "spill", "run_merge"];
 
     private static readonly long[] Ticks = new long[Names.Length];
     private static readonly long[] Bytes = new long[Names.Length];

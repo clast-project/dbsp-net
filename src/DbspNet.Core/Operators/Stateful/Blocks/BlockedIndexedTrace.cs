@@ -132,6 +132,10 @@ internal sealed class BlockedIndexedTrace
     private readonly int _maxManaged;
     private readonly int _blockEntries;
     private readonly int _blockBytes;
+
+    // False for a spilling delta builder's trace (docs/design-bounded-memory.md §5.17): its runs are
+    // kept as frozen, never merged — a reader merges them by hash instead.
+    private readonly bool _compact;
     private readonly List<Managed> _managed = new();
     private readonly List<Run> _runs = new();
     private long _managedEntries;
@@ -152,9 +156,11 @@ internal sealed class BlockedIndexedTrace
         int maxManaged = 8,
         int blockEntries = 1024,
         Func<StructuralRow, int>? hash = null,
-        int blockBytes = BlockBytes)
+        int blockBytes = BlockBytes,
+        bool compact = true)
     {
         _blockBytes = blockBytes;
+        _compact = compact;
         ArgumentNullException.ThrowIfNull(format);
         ArgumentOutOfRangeException.ThrowIfLessThan(blockEntries, 1);
         _format = format;
@@ -1187,35 +1193,10 @@ internal sealed class BlockedIndexedTrace
     private bool Dropped(StructuralRow key, long floor) =>
         floor != long.MinValue && _monotoneKey!(key) < floor;
 
-    /// <summary>Freeze, then merge every run into one (a spilling delta builder's last step, §5.14):
-    /// the trace is then one consolidated run, so its entry count is exact. The spiller sees the
-    /// result.</summary>
-    internal void MergeAllRuns()
-    {
-        Freeze();
-        if (_runs.Count < 2)
-        {
-            return;
-        }
-
-        while (_runs.Count >= 2)
-        {
-            var merged = Merge(_runs[0], _runs[1]);
-            _runs.RemoveRange(0, 2);
-            if (merged is not null)
-            {
-                _runs.Insert(0, merged);
-            }
-        }
-
-        _materialized = null;
-        BlockAccess.Spiller?.AfterCompact(this);
-    }
-
     // Merge while the newest run is at least a quarter of the next: about log4 levels.
     private void Compact()
     {
-        while (_runs.Count >= 2 && _runs[0].Entries * 4 >= _runs[1].Entries)
+        while (_compact && _runs.Count >= 2 && _runs[0].Entries * 4 >= _runs[1].Entries)
         {
             var merged = Merge(_runs[0], _runs[1]);
             _runs.RemoveRange(0, 2);
