@@ -418,7 +418,7 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
 
     public long RetainedRows => RetainedKeyCount;
 
-    public long LastOutputRows => (_output.Current?.Count ?? 0);
+    public long LastOutputRows => _output.LastCount;
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

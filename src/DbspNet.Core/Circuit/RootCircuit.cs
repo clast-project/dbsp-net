@@ -298,6 +298,11 @@ public sealed class RootCircuit
         }
 
         var plan = _release;
+        var first = plan is null && !_learning && StreamRelease.FirstTickEnabled
+            ? new StreamRelease.FirstTick(StreamRelease.ScanReaders(_operators), _operators.Count)
+            : null;
+        var outerFirst = StreamRelease.CurrentFirstTick;
+        StreamRelease.CurrentFirstTick = first;
         try
         {
             for (var i = 0; i < _operators.Count; i++)
@@ -311,6 +316,10 @@ public sealed class RootCircuit
                         s.Release();
                     }
                 }
+                else
+                {
+                    first?.After(i);
+                }
 
                 AfterOperatorStep?.Invoke(this, i);
             }
@@ -318,12 +327,18 @@ public sealed class RootCircuit
         finally
         {
             StreamRelease.CurrentOp = -1;
+            StreamRelease.CurrentFirstTick = outerFirst;
+        }
+
+        if (first is not null)
+        {
+            StreamRelease.ReleasedInFirstTick = first.Released;
         }
 
         if (plan is null && !_learning)
         {
             _learning = true;
-            _release = StreamRelease.Plan(_operators);
+            _release = StreamRelease.Plan(_operators, first?.Readers);
         }
     }
 

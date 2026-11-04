@@ -87,7 +87,7 @@ internal sealed class TemporalFilterOp<TRow> : IOperator, ISnapshotable, IIntros
 
     public long RetainedRows => _accum.Count;
 
-    public long LastOutputRows => (_output.Current?.Count ?? 0);
+    public long LastOutputRows => _output.LastCount;
 
     public long? GcFrontier => Metric.Frontier(_clock);
 

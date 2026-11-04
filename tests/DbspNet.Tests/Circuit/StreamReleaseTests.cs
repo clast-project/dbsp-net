@@ -82,7 +82,7 @@ public class StreamReleaseTests
         }
 
         Assert.Equal([1, 2, 3], r.Seen.Cast<int>());
-        Assert.Null(p.Out.Current); // released once r had read it (the plan applies from tick 2)
+        Assert.Null(p.Out.Current); // released once r had read it
     }
 
     [Fact]
@@ -147,5 +147,87 @@ public class StreamReleaseTests
         // Without the opaque rule the value is released after r, and the huge list's reader reads null.
         Assert.Equal([1, 2, 3], huge.Seen.Cast<int>());
         Assert.Null(p.Out.Current); // still released, after it
+    }
+
+    // Emits a list of tick-many items: a value with a Count.
+    private sealed class ListProducer : IOperator
+    {
+        public readonly Stream<List<int>> Out = new();
+        private int _tick;
+
+        public void Step() => Out.SetCurrent([.. Enumerable.Range(0, ++_tick)]);
+    }
+
+    private sealed class ListReader(Stream<List<int>> input) : IOperator
+    {
+        public readonly List<int> Counts = [];
+
+        public void Step() => Counts.Add(input.Current.Count);
+    }
+
+    [Fact]
+    public void The_first_tick_releases_too()
+    {
+        if (!StreamRelease.Enabled || !StreamRelease.FirstTickEnabled)
+        {
+            return; // DBSPNET_STREAM_RELEASE=0 or DBSPNET_STREAM_RELEASE_FIRST_TICK=0
+        }
+
+        // §5.6 (R0): a batch that is one tick held every value to its end.
+        var p = new Producer();
+        var r = new FieldReader(p.Out);
+        var circuit = Build(p, r);
+        circuit.Step();
+
+        Assert.Equal([1], r.Seen.Cast<int>());
+        Assert.Null(p.Out.Current);
+    }
+
+    [Fact]
+    public void A_reader_before_its_producer_keeps_the_value_in_every_tick()
+    {
+        if (!StreamRelease.Enabled)
+        {
+            return; // DBSPNET_STREAM_RELEASE=0
+        }
+
+        // Feedback: before reads the previous tick's value, so releasing after the reader that
+        // follows the producer would hand it null next tick. The value is never released — in the
+        // first tick either, where the producer is only known once it writes.
+        var p = new Producer();
+        var before = new FieldReader(p.Out);
+        var after = new FieldReader(p.Out);
+        var circuit = Build(before, p, after);
+        for (var i = 0; i < 3; i++)
+        {
+            circuit.Step();
+        }
+
+        Assert.Equal([null, 1, 2], before.Seen);
+        Assert.Equal([1, 2, 3], after.Seen.Cast<int>());
+        Assert.Equal(3, p.Out.Current);
+    }
+
+    [Fact]
+    public void A_released_value_keeps_its_count()
+    {
+        if (!StreamRelease.Enabled)
+        {
+            return; // DBSPNET_STREAM_RELEASE=0
+        }
+
+        // Introspection (LastOutputRows) reads the count after the step, when release has dropped
+        // the value: it read 0 from the second tick on (and, with R0, from the first).
+        var p = new ListProducer();
+        var r = new ListReader(p.Out);
+        var circuit = Build(p, r);
+        for (var i = 1; i <= 3; i++)
+        {
+            circuit.Step();
+            Assert.Null(p.Out.Current);
+            Assert.Equal(i, p.Out.LastCount);
+        }
+
+        Assert.Equal([1, 2, 3], r.Counts);
     }
 }

@@ -43,8 +43,55 @@ internal static class StreamRelease
         set => _currentOp = value + 1;
     }
 
-    /// <summary>For each operator index, the streams to release right after it steps.</summary>
-    public static List<IReleasableStream>[] Plan(IReadOnlyList<IOperator> operators)
+    /// <summary>Who reads each stream: the operator indexes whose fields reach it, and the
+    /// operators taken to read every stream (opaque).</summary>
+    internal sealed class Readers(Dictionary<IReleasableStream, List<int>> byStream, List<int> opaque)
+    {
+        public Dictionary<IReleasableStream, List<int>> ByStream { get; } = byStream;
+
+        public List<int> Opaque { get; } = opaque;
+
+        private readonly int _opaqueMax = opaque.Count == 0 ? -1 : opaque.Max();
+
+        /// <summary>The operator after which <paramref name="stream"/>, written by operator
+        /// <paramref name="producer"/>, can be released; −1 to keep it (unread, pinned, written
+        /// outside a step, or read before it is written: feedback). An opaque operator may read any
+        /// stream: after the producer it extends the stream's life to it; before the producer it may
+        /// read it as feedback, so the stream is kept.</summary>
+        public int ReleasePoint(IReleasableStream stream, int producer)
+        {
+            if (producer < 0 || stream.Pinned || !ByStream.TryGetValue(stream, out var refs))
+            {
+                return -1;
+            }
+
+            var last = -1;
+            foreach (var r in refs)
+            {
+                if (r == producer)
+                {
+                    continue;
+                }
+
+                if (r < producer)
+                {
+                    return -1;
+                }
+
+                last = Math.Max(last, r);
+            }
+
+            if (last < 0 || Opaque.Any(o => o < producer))
+            {
+                return -1;
+            }
+
+            return Math.Max(last, _opaqueMax);
+        }
+    }
+
+    /// <summary>Scan every operator's fields for the streams it reads.</summary>
+    public static Readers ScanReaders(IReadOnlyList<IOperator> operators)
     {
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var readers = new Dictionary<IReleasableStream, List<int>>(ReferenceEqualityComparer.Instance);
@@ -68,7 +115,16 @@ internal static class StreamRelease
 
         OpaqueOperators = opaque.Count;
         PlanTime = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+        return new Readers(readers, opaque);
+    }
 
+    /// <summary>For each operator index, the streams to release right after it steps, from the
+    /// producers the first tick observed.</summary>
+    /// <param name="operators">The circuit's operators, in step order.</param>
+    /// <param name="readers">The first tick's scan, if it ran one; scanned again otherwise.</param>
+    public static List<IReleasableStream>[] Plan(IReadOnlyList<IOperator> operators, Readers? readers = null)
+    {
+        readers ??= ScanReaders(operators);
         var released = 0;
         var plan = new List<IReleasableStream>[operators.Count];
         for (var i = 0; i < plan.Length; i++)
@@ -76,29 +132,83 @@ internal static class StreamRelease
             plan[i] = [];
         }
 
-        foreach (var (stream, refs) in readers)
+        foreach (var stream in readers.ByStream.Keys)
         {
-            var p = stream.Producer;
-            if (p < 0 || stream.Pinned)
+            var at = readers.ReleasePoint(stream, stream.Producer);
+            if (at >= 0)
             {
-                continue;
+                plan[at].Add(stream);
+                released++;
             }
-
-            // An opaque operator may read any stream: after the producer it extends the stream's
-            // life to it; before the producer it may read it as feedback, so it is kept.
-            var others = refs.Where(r => r != p).ToList();
-            if (others.Count == 0 || others.Any(r => r < p) || opaque.Any(o => o < p))
-            {
-                continue; // read by nobody we can see, or feedback (read before written)
-            }
-
-            plan[Math.Max(others.Max(), opaque.Count == 0 ? -1 : opaque.Max())].Add(stream);
-            released++;
         }
 
         Released = released;
         return plan;
     }
+
+    /// <summary>
+    /// Release during the first tick (docs/design-bounded-memory.md §5.6, R0). The plan needs each
+    /// stream's producer, which only the first tick shows, so before this the first tick released
+    /// nothing — and when that tick is the whole batch (extended TPC-DS: one tick per input version,
+    /// the first holding everything) every delta lived to its end, ~10 GB. A forward edge's producer
+    /// writes before any of its readers runs, so the release point can be decided at that first
+    /// write, with readers scanned before the tick, and it is always still ahead.
+    /// </summary>
+    internal sealed class FirstTick(Readers readers, int operators)
+    {
+        /// <summary>The scan this tick released by, which the plan for later ticks reuses.</summary>
+        public Readers Readers { get; } = readers;
+
+        private readonly List<IReleasableStream>?[] _pending = new List<IReleasableStream>?[operators];
+
+        /// <summary>Streams released in this tick so far (diagnostics).</summary>
+        public int Released { get; private set; }
+
+        /// <summary>A stream's first write, by operator <paramref name="producer"/>.</summary>
+        public void Written(IReleasableStream stream, int producer)
+        {
+            var at = Readers.ReleasePoint(stream, producer);
+            if (at > producer && at < _pending.Length)
+            {
+                (_pending[at] ??= []).Add(stream);
+            }
+        }
+
+        /// <summary>Release what is due after operator <paramref name="op"/>.</summary>
+        public void After(int op)
+        {
+            if (_pending[op] is { } due)
+            {
+                foreach (var s in due)
+                {
+                    if (!s.Pinned)
+                    {
+                        s.Release();
+                        Released++;
+                    }
+                }
+
+                _pending[op] = null;
+            }
+        }
+    }
+
+    [ThreadStatic]
+    private static FirstTick? _firstTick;
+
+    /// <summary>The first tick being stepped on this thread, if any.</summary>
+    internal static FirstTick? CurrentFirstTick
+    {
+        get => _firstTick;
+        set => _firstTick = value;
+    }
+
+    /// <summary>Streams released during the last first tick (diagnostics).</summary>
+    public static int ReleasedInFirstTick { get; internal set; }
+
+    /// <summary><c>DBSPNET_STREAM_RELEASE_FIRST_TICK=0</c> keeps the first tick's values to its end,
+    /// as before §5.6.</summary>
+    public static bool FirstTickEnabled { get; set; } = Environment.GetEnvironmentVariable("DBSPNET_STREAM_RELEASE_FIRST_TICK") != "0";
 
     /// <summary>Operators in the last plan whose fields lead somewhere the scan does not walk (a
     /// dictionary or large collection that could hold a stream, or wiring deeper than the scan
