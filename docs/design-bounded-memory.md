@@ -1606,3 +1606,45 @@ same run before D1–D3):
 k-way-merge enumeration without the final rewrite, and D4 so index ops stop rebuilding managed copies.
 (2) Decide on the cross-product guard under spilling. (3) Sweep stale `dbspnet-spill-<pid>` directories
 at start.
+
+### 5.16 Where in-step spilling's cost goes, and the cross-product guard (2026-11-04)
+
+**Instrument.** `DBSPNET_STEP_SPILL_PROFILE=1` (`StepSpillProfile`) charges each phase its wall time and the
+bytes its thread allocated, exclusive of nested phases; `IvmMultiBatch` prints a `STEPPROF` line per batch.
+Times below are summed over the 12 worker threads.
+
+**TPC-DI SF=3 W=12, batch 1, 64K rows** (di3; views identical, bc345419). Knob off allocates 54.9 GiB in the
+drain; 64K allocates 174.8 GiB without S1 and 188.9 with it:
+
+| phase | thread-time | allocated | share of the extra 120 GiB |
+|---|---|---|---|
+| **run merges** (the builder trace's geometric merges + the final merge into one run; less 2.2 GiB of ordinary state merges) | 48 s | **76.6 GiB** | **64%** |
+| enumeration (decoding rows for readers) | 26.7 s | 35.3 GiB | 29% |
+| chunk freeze (sort + encode) | 25.7 s | 8.4 GiB | 7% |
+| chunk adds (the managed map) | 10.2 s | 2.4 GiB | 2% |
+| S1 spill writes | 11.4 s | 2.1 GiB | — |
+
+- **Merging is most of it.** `MergeCore` decodes every entry to a `StructuralRow` (key and value) and encodes
+  it again. A builder's chunks are equal-sized, so the trace's quarter rule merges them like a binary
+  counter: about log2(chunks) passes per row, then one more to make a single run.
+- **Re-reading is not the cost:** 68.1M rows decoded for 61.6M built (1.1×). Decoding costs ~540 B/row
+  (fresh rows, cells, copied strings).
+- **Disk is not the cost:** without S1 the drain is 34.4 s, against 35.2 s with it.
+
+**Lever, in order.**
+1. **No merges.** Keep a built delta as its k chunk runs: no geometric compaction in a builder's trace
+   and no final merge. Enumeration k-way merges by hash and sums equal rows only on a hash shared by two
+   runs, compared with `KeyEquals` (no decode). The count is one pass over the hashes alone. A probe
+   checks every run. That removes ~64% of the extra allocation and ~48 s of thread time.
+2. **Cheaper decode:** column-wise `KeysAliased` instead of a row-wise copy. It is cheaper, but a row a
+   consumer keeps then pins its 60 KB block. Measure the retention first.
+3. D4: the index operators downstream.
+
+**The cross-product guard.** `IncrementalLeftJoinOp` threw when one key's left × right exceeded 5M rows
+(7739eb8, July: a diagnostic for a TPC-DI OOM, with no test). TPC-DS tick 18 tripped it at **7,222,266 × 1**:
+a dimension lookup, whose output is no larger than its input (already in memory), not the coarse-key
+cross product the guard was written for. Feldera has no such guard. **Decided:** it trips only on a
+*blowup*, a product past the limit and more than 4× the two groups together, and never when the output
+builder spills (its memory is bounded by the threshold). The limit is now an internal test seam. A test
+covers each case (a 300 × 1 lookup passes, 20 × 20 throws, 20 × 20 into a spilling builder emits 400 block
+rows), and dropping either new condition fails it.

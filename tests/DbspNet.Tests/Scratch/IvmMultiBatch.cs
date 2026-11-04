@@ -606,6 +606,11 @@ public class IvmMultiBatch
             var countsMs = Stopwatch.GetElapsedTime(c0).TotalMilliseconds;
             var bytes = Directory.EnumerateFiles(outRoot, "*.parquet", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
         foreach (var kv in DbspNet.Core.Circuit.StreamRelease.OpaqueReasons.OrderByDescending(kv => kv.Value).Take(10)) { Console.WriteLine($"OPAQUE {kv.Value} {kv.Key}"); }
+            if (DbspNet.Core.Operators.Stateful.Blocks.StepSpillProfile.Enabled)
+            {
+                _out.WriteLine($"{DbspNet.Core.Operators.Stateful.Blocks.StepSpillProfile.TakeReport()} batch={batch}");
+            }
+
             _out.WriteLine(string.Create(
                 CultureInfo.InvariantCulture,
                 $"RESULT batch={batch} ticks={ticks} drain_ms={drainMs:F0} output_ms={outputMs:F0} counts_ms={countsMs:F0} view_rows={viewRows} parquet_mb={bytes / 1e6:F1} drain_alloc_gib={drainAllocGib:F2} gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gen2={GC.CollectionCount(2) - gen2Before} native_output={DbspNet.Persistence.Blocks.ViewArrow.Native} opaque_ops={DbspNet.Core.Circuit.StreamRelease.OpaqueOperators} release_plan_ms={DbspNet.Core.Circuit.StreamRelease.PlanTime.TotalMilliseconds:F0} released={DbspNet.Core.Circuit.StreamRelease.Released} jit_ms={(System.Runtime.JitInfo.GetCompilationTime() - jit0).TotalMilliseconds:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_rows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs}")

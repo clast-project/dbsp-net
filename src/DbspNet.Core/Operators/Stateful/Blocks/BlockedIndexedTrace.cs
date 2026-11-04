@@ -1236,12 +1236,18 @@ internal sealed class BlockedIndexedTrace
         var t0 = BlockTraceProfile.Now();
         var maintenance = BlockAccess.InMaintenance;
         BlockAccess.InMaintenance = true;
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         try
         {
             return MergeCore(newer, older);
         }
         finally
         {
+            if (StepSpillProfile.Enabled)
+            {
+                StepSpillProfile.End(StepSpillProfile.RunMerge, m);
+            }
+
             BlockAccess.InMaintenance = maintenance;
             if (BlockTraceProfile.Enabled)
             {

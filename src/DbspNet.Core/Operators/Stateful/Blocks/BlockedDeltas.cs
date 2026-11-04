@@ -82,14 +82,30 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
 
     public override void Add(StructuralRow key, Z64 weight)
     {
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         _chunk.Add(key, weight);
         if (_chunk.Count >= _chunkRows)
         {
             FreezeChunk();
         }
+
+        if (StepSpillProfile.Enabled)
+        {
+            StepSpillProfile.End(StepSpillProfile.ChunkAdd, m);
+        }
     }
 
     private void FreezeChunk()
+    {
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
+        FreezeChunkCore();
+        if (StepSpillProfile.Enabled)
+        {
+            StepSpillProfile.End(StepSpillProfile.ChunkFreeze, m);
+        }
+    }
+
+    private void FreezeChunkCore()
     {
         var part = _chunk.Build();
         _chunk = new ZSetBuilder<StructuralRow, Z64>(_capacity);
@@ -120,7 +136,13 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
             return ZSet<StructuralRow, Z64>.Empty;
         }
 
+        var mm = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         trace.MergeAllRuns();
+        if (StepSpillProfile.Enabled)
+        {
+            StepSpillProfile.End(StepSpillProfile.FinalMerge, mm);
+        }
+
         if (trace.Runs.Count == 0)
         {
             return ZSet<StructuralRow, Z64>.Empty; // every entry cancelled
@@ -183,19 +205,45 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
 
     public override bool TryGetWeight(StructuralRow key, out Z64 weight)
     {
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         var sum = new Sum();
         _trace.Probe(key, ref sum);
         weight = new Z64(sum.Weight);
+        if (StepSpillProfile.Enabled)
+        {
+            StepSpillProfile.End(StepSpillProfile.Probe, m);
+        }
+
         return sum.Found && sum.Weight != 0;
     }
 
-    public override IEnumerator<KeyValuePair<StructuralRow, Z64>> GetEnumerator() => new Cursor(_trace.Runs);
+    public override IEnumerator<KeyValuePair<StructuralRow, Z64>> GetEnumerator()
+    {
+        if (StepSpillProfile.Enabled)
+        {
+            Interlocked.Increment(ref StepSpillProfile.Enumerations);
+        }
+
+        return new Cursor(_trace.Runs);
+    }
 
     public override ZSetBuilder<StructuralRow, Z64> NewBuilder(int capacity) => DeltaSpill.Rows(_format, capacity);
 
     /// <summary>A sum with a block-backed set is a merge of the two runs: the other side, if managed,
     /// is frozen into a run first (it is the small one in practice: a union's null-padded side).</summary>
     public override ZSet<StructuralRow, Z64>? Plus(ZSet<StructuralRow, Z64> other)
+    {
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
+        var result = PlusCore(other);
+        if (StepSpillProfile.Enabled)
+        {
+            StepSpillProfile.End(StepSpillProfile.PlusMerge, m);
+        }
+
+        return result;
+    }
+
+    private ZSet<StructuralRow, Z64>? PlusCore(ZSet<StructuralRow, Z64> other)
     {
         if (other.IsEmpty)
         {
@@ -288,6 +336,24 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
         object IEnumerator.Current => _current;
 
         public bool MoveNext()
+        {
+            if (!StepSpillProfile.Enabled)
+            {
+                return MoveNextCore();
+            }
+
+            var m = StepSpillProfile.Begin();
+            var more = MoveNextCore();
+            StepSpillProfile.End(StepSpillProfile.Enumerate, m);
+            if (more)
+            {
+                Interlocked.Increment(ref StepSpillProfile.RowsDecoded);
+            }
+
+            return more;
+        }
+
+        private bool MoveNextCore()
         {
             while (true)
             {

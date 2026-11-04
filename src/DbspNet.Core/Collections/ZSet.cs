@@ -247,10 +247,16 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
 
         if (External is { } x)
         {
+            var m = Operators.Stateful.Blocks.StepSpillProfile.Enabled ? Operators.Stateful.Blocks.StepSpillProfile.Begin() : default;
             var copy = x.NewBuilder(Count + extra);
             foreach (var (k, w) in Entries())
             {
                 copy.Add(k, w);
+            }
+
+            if (Operators.Stateful.Blocks.StepSpillProfile.Enabled)
+            {
+                Operators.Stateful.Blocks.StepSpillProfile.End(Operators.Stateful.Blocks.StepSpillProfile.Copy, m);
             }
 
             return copy;
@@ -298,10 +304,16 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     // spills like it).
     private ZSetBuilder<TKey, TWeight> ExternalCopy(ZSetExternalStore<TKey, TWeight> like, int extra)
     {
+        var m = Operators.Stateful.Blocks.StepSpillProfile.Enabled ? Operators.Stateful.Blocks.StepSpillProfile.Begin() : default;
         var b = like.NewBuilder(Count + extra);
         foreach (var (k, w) in Entries())
         {
             b.Add(k, w);
+        }
+
+        if (Operators.Stateful.Blocks.StepSpillProfile.Enabled)
+        {
+            Operators.Stateful.Blocks.StepSpillProfile.End(Operators.Stateful.Blocks.StepSpillProfile.Copy, m);
         }
 
         return b;
@@ -563,6 +575,16 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             return;
         }
 
+        var mark = Operators.Stateful.Blocks.StepSpillProfile.Enabled ? Operators.Stateful.Blocks.StepSpillProfile.Begin() : default;
+        InternalizeCore(x);
+        if (Operators.Stateful.Blocks.StepSpillProfile.Enabled)
+        {
+            Operators.Stateful.Blocks.StepSpillProfile.End(Operators.Stateful.Blocks.StepSpillProfile.Copy, mark);
+        }
+    }
+
+    private void InternalizeCore(ZSetExternalStore<TKey, TWeight> x)
+    {
         if (ZSetMapMode.Chunked)
         {
             var m = new ChunkedMap<TKey, TWeight>(x.Count);

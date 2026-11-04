@@ -45,6 +45,16 @@ internal sealed class RunSpiller : IRunSpiller
 
     public void AfterCompact(BlockedIndexedTrace trace)
     {
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
+        AfterCompactCore(trace);
+        if (StepSpillProfile.Enabled)
+        {
+            StepSpillProfile.End(StepSpillProfile.Spill, m);
+        }
+    }
+
+    private void AfterCompactCore(BlockedIndexedTrace trace)
+    {
         if (!BlockCache.Enabled || trace.Format is not BlockSchema schema)
         {
             return; // without eviction a spill only adds a write

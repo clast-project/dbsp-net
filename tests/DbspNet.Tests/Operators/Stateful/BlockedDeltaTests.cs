@@ -8,7 +8,9 @@
 //      always, forced), consolidating across frozen chunks, cancellations included;
 //   3. with the knob on, compiled circuits (D3) give the same output every tick as a twin with it off,
 //      across the random-query generator, and actually build block-backed deltas;
-//   4. a fan-out join past the threshold emits a block-backed delta; below it, a managed one.
+//   4. a fan-out join past the threshold emits a block-backed delta; below it, a managed one;
+//   5. the left join's cross-product guard trips only on a blowup (output far past both groups) into a
+//      managed builder: not on a big 1:N lookup, and not when the output spills (§5.16).
 using CsCheck;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
@@ -17,12 +19,15 @@ using DbspNet.Sql.Compiler;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
 using DbspNet.Sql.TypeSystem;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Tests.EndToEnd;
+using DbspNet.Tests.Persistence;
 using DbspNet.Tests.Sql;
 using Xunit;
 
 namespace DbspNet.Tests.Operators.Stateful;
 
+[Collection(nameof(BlockedCheckpointTests))] // the guard tests set a process-wide limit
 public class BlockedDeltaTests
 {
     private static readonly Schema RowSchema = new(
@@ -242,6 +247,72 @@ public class BlockedDeltaTests
         Assert.Equal(600, actual[1].Count);
         Assert.True(actual[1].IsExternal, "the 600-row tick is past the threshold");
         Assert.False(actual[2].IsExternal, "a 30-row tick is below it");
+    }
+
+    private const string LeftJoinSql = "SELECT f.k, f.x, d.y FROM f LEFT JOIN d ON f.k = d.k";
+
+    private static CompiledQuery CompileLeftJoin()
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        foreach (var ddl in JoinDdl)
+        {
+            resolver.Resolve(Parser.ParseStatement(ddl));
+        }
+
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(LeftJoinSql))).Query;
+        return PlanToCircuit.Compile(plan, Structural, StructuralRowCodec.Instance);
+    }
+
+    // One key with `left` fact rows and `right` dimension rows, in one tick.
+    private static ZSet<StructuralRow, Z64> LeftJoinOneKey(int left, int right)
+    {
+        var q = CompileLeftJoin();
+        for (var i = 0; i < left; i++)
+        {
+            q.Table("f").Insert(1, (long)i, "s");
+        }
+
+        for (var i = 0; i < right; i++)
+        {
+            q.Table("d").Insert(1, (long)i);
+        }
+
+        q.Step();
+        return q.Current;
+    }
+
+    [Fact]
+    public void Cross_product_guard_trips_only_on_a_blowup_into_a_managed_builder()
+    {
+        var saved = IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>.CrossProductGuardRows;
+        IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>.CrossProductGuardRows = 100;
+        try
+        {
+            // Managed output for the first two cases, whatever the environment (a forced suite run spills).
+            using var managed = SpillSettings.UseStepSpill(null);
+
+            // A 1:N lookup past the limit: no more output than input.
+            Assert.Equal(300, LeftJoinOneKey(300, 1).Count);
+
+            // A real blowup (400 rows from 40) trips it ...
+            var ex = Assert.Throws<InvalidOperationException>(() => LeftJoinOneKey(20, 20));
+            Assert.Contains("oversized per-key cross product", ex.Message, StringComparison.Ordinal);
+
+            // ... unless the output spills.
+            ZSet<StructuralRow, Z64> spilled;
+            using (SpillSettings.UseStepSpill(50, 1))
+            {
+                spilled = LeftJoinOneKey(20, 20);
+            }
+
+            Assert.Equal(400, spilled.Count);
+            Assert.True(spilled.IsExternal);
+        }
+        finally
+        {
+            IncrementalLeftJoinOp<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>.CrossProductGuardRows = saved;
+        }
     }
 
     private static void AssertSameRows(ZSet<StructuralRow, Z64> expected, ZSet<StructuralRow, Z64> actual)

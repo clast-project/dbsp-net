@@ -273,8 +273,12 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         // rows on both sides means the key is far too coarse (a low-cardinality or placeholder
         // value), and materialising left×right would exhaust memory. Fail fast with the key and
         // both side counts instead of an opaque OutOfMemoryException deep in the allocator.
+        // Only a BLOWUP trips it (docs/design-bounded-memory.md §5.16): an output far larger than
+        // the two groups, which are already in memory — a 7M × 1 dimension lookup emits no more
+        // than its input. And never when the output builder spills: its memory is bounded by the
+        // spill threshold, not the product (Feldera has no such guard).
         var product = (long)left.Count * right.Count;
-        if (product > CrossProductGuardRows)
+        if (product > CrossProductGuardRows && product > 4 * ((long)left.Count + right.Count) && !output.IsSpilling)
         {
             throw new InvalidOperationException(
                 $"IncrementalLeftJoin: oversized per-key cross product left={left.Count} × " +
@@ -294,7 +298,8 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     // A single key producing more than this many joined rows is pathological for an incremental
     // join (the whole point is bounded per-key work). Big enough not to trip legitimate fan-out,
     // small enough to fail before a 24 GB+ working set OOMs.
-    private const long CrossProductGuardRows = 5_000_000;
+    // A test seam (internal, not a knob).
+    internal static long CrossProductGuardRows = 5_000_000;
 
     private void NullPadInto(
         ZSetBuilder<TOut, TWeight> output,

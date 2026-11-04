@@ -75,6 +75,10 @@ public sealed class ZSetBuilder<TKey, TWeight>
     // The spilling store, or null; tested only after the chunked map (the default) misses.
     private ZSetSpillingStore<TKey, TWeight>? Spilling => _store as ZSetSpillingStore<TKey, TWeight>;
 
+    /// <summary>Whether this builder freezes into block runs past a threshold (§5.14): its memory is
+    /// bounded by the threshold, not by what is added.</summary>
+    internal bool IsSpilling => _store is ZSetSpillingStore<TKey, TWeight>;
+
     /// <summary>Entries held: exact in memory; for a builder that has frozen part of its entries
     /// into blocks, an upper bound (entries in separate chunks can cancel).</summary>
     public int Count => _chunked?.Count ?? Spilling?.Count ?? Entries.Count;
