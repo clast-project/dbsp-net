@@ -522,19 +522,24 @@ public sealed class ProgramRunner
         // The first write in this process carries the whole view (the connector truncates
         // the sink first); later writes carry the net change since the previous one.
         var m0 = Stopwatch.GetTimestamp();
+        var a0 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
         // The first write streams the view (a lazily restored view is never read into memory).
+        var source = incremental.Written ? incremental.Pending.Build() : output.EnumerateView();
+        var a1 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
         var changes = incremental.Written
-            ? ArrowExtensions.ToArrowChanges(output.Schema, incremental.Pending.Build())
-            : ArrowExtensions.ToArrowChanges(output.Schema, output.EnumerateView());
+            ? ArrowExtensions.ToArrowChanges(output.Schema, (ZSet<StructuralRow, Z64>)source)
+            : ArrowExtensions.ToArrowChanges(output.Schema, source);
         incremental.Pending = new ZSetBuilder<StructuralRow, Z64>();
         var matTicks = Stopwatch.GetTimestamp() - m0;
+        var a2 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
 
         var w0 = Stopwatch.GetTimestamp();
         await connector.ApplyChangesAsync(changes.Inserts, changes.InsertKeys, changes.Deletes, tick, cancellationToken)
             .ConfigureAwait(false);
         if (OutputTrace is { } outputTrace)
         {
-            File.AppendAllText(outputTrace, $"RUNNER-SPLIT {connector.ViewName} mat={matTicks * 1000.0 / Stopwatch.Frequency:F0} apply={Stopwatch.GetElapsedTime(w0).TotalMilliseconds:F0}\n");
+            var a3 = GC.GetTotalAllocatedBytes(precise: true);
+            File.AppendAllText(outputTrace, $"RUNNER-SPLIT {connector.ViewName} mat={matTicks * 1000.0 / Stopwatch.Frequency:F0} apply={Stopwatch.GetElapsedTime(w0).TotalMilliseconds:F0} rows={changes.Inserts.Length} form_mib={(a1 - a0) / 1048576.0:F0} arrow_mib={(a2 - a1) / 1048576.0:F0} apply_mib={(a3 - a2) / 1048576.0:F0}\n");
         }
         incremental.Written = true;
         _profile?.Output(connector.ViewName).Add(

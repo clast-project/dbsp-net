@@ -188,11 +188,14 @@ public sealed class DeltaOutputConnector : IOutputConnector
         var table = Table();
         var phase = PhaseTrace is null ? null : System.Diagnostics.Stopwatch.StartNew();
         var phases = new List<string>();
+        var allocated = PhaseTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
         void Mark(string name)
         {
             if (phase is not null)
             {
-                phases.Add(name + "=" + phase.ElapsedMilliseconds);
+                var now = GC.GetTotalAllocatedBytes(precise: true);
+                phases.Add(name + "=" + phase.ElapsedMilliseconds + "ms/" + ((now - allocated) >> 20) + "MiB");
+                allocated = now;
                 phase.Restart();
             }
         }
