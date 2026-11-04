@@ -838,7 +838,17 @@ in all 10):
 The b2 output is +4 ms. Gathered index blocks are now cut by bytes as well as entries, as a
 freeze cuts rows (`ITraceBlockFormat.GatheredEntryBytes`, `GatheredRunTests`), but that did not
 close the gap (run35, 5 runs against the count-cut build: b2 output 22.0 → 22.4 ms, b3 13.8 →
-16.2). Block size was not the cause; the +4 ms is unexplained.
+16.2). Block size was not the cause.
+
+**The +4 ms is JIT** (run36, `DBSPNET_OUTPUT_TRACE`, 3 runs per arm):
+- All of the difference is the runner's `mat` stage, the delta's rows to Arrow: 6.0 ms with
+  blocks against 2.3 ms without. Index lookups, Parquet and commit are equal.
+- It falls on the first views written (`dim_account`, `dim_customer`, ...).
+- Batch 2's JIT time is higher by the same order: median 54.5 against 40.5 ms.
+- By batch 3 `mat` is 3.0 against 2.0 ms.
+
+The block write never runs the row-to-Arrow builders (`ToArrowChanges`, `ArrowColumns`) in batch
+1, so batch 2 compiles them. It is a one-time cost per process, not a steady-state regression.
 
 Per stage on the probe (one batch per view): forming 1.39 GB → 0, index 0.99 → 0.66 GB. The Arrow
 build's 0.8 GB is the output's own bytes.
