@@ -19,6 +19,18 @@ internal sealed class ViewEntries(TraceBlock[] blocks, int[] indexes)
     public int Count => Indexes.Length;
 }
 
+/// <summary>A full write's Arrow batches, their entries, and the native memory their buffers live in:
+/// dispose once the sink has written them (docs/design-bounded-memory.md §3h).</summary>
+internal sealed class ViewBatches(List<RecordBatch> batches, ViewEntries entries, ViewArrow.NativeBuffers memory) : IDisposable
+{
+    public List<RecordBatch> Batches { get; } = batches;
+
+    public ViewEntries Entries { get; } = entries;
+
+    /// <summary>Free the buffers. The batches must not be read after.</summary>
+    public void Dispose() => memory.Dispose();
+}
+
 /// <summary>
 /// A stored view's full contents as Arrow batches built from its blocks (docs/design-bounded-memory.md
 /// §3h): a block's columns already are Arrow buffers, so each output column is copied from them, a
@@ -38,7 +50,7 @@ internal static class ViewArrow
     /// layout, or a row's count is negative on some worker (the workers' integrals must then be
     /// summed, which takes rows).
     /// </summary>
-    public static (List<RecordBatch> Batches, ViewEntries Entries)? TryBuild(
+    public static ViewBatches? TryBuild(
         Schema schema, IReadOnlyList<BlockedIndexedTrace> shards, int batchRows = 0)
     {
         var blocks = new List<TraceBlock>();
@@ -70,14 +82,16 @@ internal static class ViewArrow
         blocks.Clear();
         indexes.Clear();
         var batches = new List<RecordBatch>();
+        var memory = new NativeBuffers();
         for (var from = 0; from < all.Count; from += batchRows)
         {
             var to = Math.Min(all.Count, from + batchRows);
             var arrays = new IArrowArray[schema.FieldsList.Count];
             for (var c = 0; c < arrays.Length; c++)
             {
-                if (Column(schema.FieldsList[c].DataType, all, c, from, to) is not { } array)
+                if (Column(schema.FieldsList[c].DataType, all, c, from, to, memory) is not { } array)
                 {
+                    memory.Dispose();
                     return null;
                 }
 
@@ -87,11 +101,40 @@ internal static class ViewArrow
             batches.Add(new RecordBatch(schema, arrays, to - from));
         }
 
-        return (batches, all);
+        return new ViewBatches(batches, all, memory);
+    }
+
+    /// <summary>
+    /// Buffers from Arrow's native allocator, as Arrow's own builders allocate them, so the output's
+    /// bytes are not on the managed heap (under a GC heap limit, a write would otherwise need room
+    /// for them there: run38). Freed together, as soon as the sink has written the batches.
+    /// </summary>
+    internal sealed class NativeBuffers : IDisposable
+    {
+        private readonly List<System.Buffers.IMemoryOwner<byte>> _owners = [];
+
+        public Memory<byte> Allocate(long length)
+        {
+            var owner = Apache.Arrow.Memory.MemoryAllocator.Default.Value.Allocate(checked((int)length));
+            _owners.Add(owner);
+            var memory = owner.Memory[..(int)length];
+            memory.Span.Clear();
+            return memory;
+        }
+
+        public void Dispose()
+        {
+            foreach (var owner in _owners)
+            {
+                owner.Dispose();
+            }
+
+            _owners.Clear();
+        }
     }
 
     // Column c of entries [from, to), or null when its type is not the block's kind.
-    private static IArrowArray? Column(IArrowType type, ViewEntries entries, int c, int from, int to)
+    private static IArrowArray? Column(IArrowType type, ViewEntries entries, int c, int from, int to, NativeBuffers memory)
     {
         var n = to - from;
         var kind = entries.Blocks[from].Schema.KeyKinds[c];
@@ -109,25 +152,26 @@ internal static class ViewArrow
             return null;
         }
 
-        var (validity, nulls) = Validity(entries, c, from, to);
+        var (validity, nulls) = Validity(entries, c, from, to, memory);
         ArrowBuffer[] buffers;
         if (width > 0)
         {
-            var values = new byte[(long)n * width];
+            var values = memory.Allocate((long)n * width);
             ForRuns(entries, from, to, (block, first, count, at) =>
-                block.Bytes.AsSpan(block.ValuesAt(c) + (first * width), count * width).CopyTo(values.AsSpan(at * width)));
+                block.Bytes.AsSpan(block.ValuesAt(c) + (first * width), count * width).CopyTo(values.Span[(at * width)..]));
             buffers = [validity, new ArrowBuffer(values)];
         }
         else if (width < 0)
         {
-            var bits = new byte[(n + 7) / 8];
+            var bits = memory.Allocate((n + 7) / 8);
+            var span = bits.Span;
             for (var i = 0; i < n; i++)
             {
                 var block = entries.Blocks[from + i];
                 var j = entries.Indexes[from + i];
                 if ((block.Bytes[block.ValuesAt(c) + (j >> 3)] & (1 << (j & 7))) != 0)
                 {
-                    bits[i >> 3] |= (byte)(1 << (i & 7));
+                    span[i >> 3] |= (byte)(1 << (i & 7));
                 }
             }
 
@@ -135,7 +179,7 @@ internal static class ViewArrow
         }
         else
         {
-            var offsets = new byte[(n + 1) * 4];
+            var offsets = memory.Allocate((n + 1) * 4L);
             long heap = 0;
             for (var i = 0; i < n; i++)
             {
@@ -144,7 +188,7 @@ internal static class ViewArrow
                 heap += Offset(block, c, j + 1) - Offset(block, c, j);
             }
 
-            var data = new byte[checked((int)heap)];
+            var data = memory.Allocate(heap);
             var position = 0;
             ForRuns(entries, from, to, (block, first, count, at) =>
             {
@@ -152,12 +196,12 @@ internal static class ViewArrow
                 var length = Offset(block, c, first + count) - start;
                 if (length > 0)
                 {
-                    block.Bytes.AsSpan(block.DataAt(c) + start, length).CopyTo(data.AsSpan(position));
+                    block.Bytes.AsSpan(block.DataAt(c) + start, length).CopyTo(data.Span[position..]);
                 }
 
                 for (var k = 1; k <= count; k++)
                 {
-                    BinaryPrimitives.WriteInt32LittleEndian(offsets.AsSpan((at + k) * 4), position + Offset(block, c, first + k) - start);
+                    BinaryPrimitives.WriteInt32LittleEndian(offsets.Span[((at + k) * 4)..], position + Offset(block, c, first + k) - start);
                 }
 
                 position += length;
@@ -169,10 +213,10 @@ internal static class ViewArrow
     }
 
     // The validity bitmap of column c over entries [from, to): empty when nothing is null.
-    private static (ArrowBuffer Bitmap, int Nulls) Validity(ViewEntries entries, int c, int from, int to)
+    private static (ArrowBuffer Bitmap, int Nulls) Validity(ViewEntries entries, int c, int from, int to, NativeBuffers memory)
     {
         var n = to - from;
-        byte[]? bits = null;
+        Memory<byte>? bits = null;
         var nulls = 0;
         for (var i = 0; i < n; i++)
         {
@@ -186,15 +230,15 @@ internal static class ViewArrow
 
             if (bits is null)
             {
-                bits = new byte[(n + 7) / 8];
-                System.Array.Fill(bits, (byte)0xFF);
+                bits = memory.Allocate((n + 7) / 8);
+                bits.Value.Span.Fill(0xFF);
             }
 
-            bits[i >> 3] &= (byte)~(1 << (i & 7));
+            bits.Value.Span[i >> 3] &= (byte)~(1 << (i & 7));
             nulls++;
         }
 
-        return (bits is null ? ArrowBuffer.Empty : new ArrowBuffer(bits), nulls);
+        return (bits is { } b ? new ArrowBuffer(b) : ArrowBuffer.Empty, nulls);
     }
 
     // Maximal runs of consecutive indexes in one block: (block, first index, count, position in the batch).

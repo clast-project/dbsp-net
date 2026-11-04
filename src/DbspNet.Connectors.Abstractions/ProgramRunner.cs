@@ -536,6 +536,8 @@ public sealed class ProgramRunner
             var ba0 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
             if (DbspNet.Persistence.Blocks.ViewArrow.TryBuild(ArrowSchemaBridge.ToArrow(output.Schema), traces) is { } built)
             {
+                // The batches' buffers are native and freed as soon as the sink has written them.
+                using var release = built;
                 var buildTicks = Stopwatch.GetTimestamp() - b0;
                 var ba1 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
                 var bw0 = Stopwatch.GetTimestamp();
