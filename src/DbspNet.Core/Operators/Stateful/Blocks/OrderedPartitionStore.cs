@@ -638,7 +638,7 @@ internal sealed class OrderedPartitionStore
     public async ValueTask<bool> TryLoadAsync(Circuit.ISnapshotReader reader, string name, CancellationToken cancellationToken)
     {
         if (_cold is null || _keyOf is null || _coldFormat!.BackingCodec is not { } coldCodec || _chunkFormat.BackingCodec is not { } chunkCodec
-            || await chunkCodec.LoadBlockSetAsync(reader, name + ".chunks", cancellationToken).ConfigureAwait(false) is not { } set)
+            || await chunkCodec.LoadBlockSetAsync(reader, name + ".chunks", this, cancellationToken).ConfigureAwait(false) is not { } set)
         {
             return false;
         }

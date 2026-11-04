@@ -145,6 +145,12 @@ public class WindowStoreCheckpointTests
         Assert.All(chunked, s => Assert.Equal(Large, s.Laziness.Untouched));
 
         Assert.Equal(Digest(twin), Digest(restored));
+
+        // Untouched since the restore, a checkpoint names every chain again: nothing rewritten.
+        var written = await ChunkChainsAsync(fs);
+        await Snapshot.WriteAsync(restored.Circuit, fs);
+        Assert.Equal(written.Values.SelectMany(r => r).Order(), (await ChunkChainsAsync(fs)).Values.SelectMany(r => r).Order());
+
         for (var tick = 1; tick <= 4; tick++)
         {
             Touch(restored, tick, tick, 100 + tick);

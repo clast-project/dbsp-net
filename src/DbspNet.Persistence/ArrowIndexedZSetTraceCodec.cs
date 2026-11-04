@@ -111,8 +111,8 @@ internal sealed class ArrowIndexedZSetTraceCodec
 
     /// <inheritdoc/>
     public ValueTask<(byte[] Meta, DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock[] Blocks)?> LoadBlockSetAsync(
-        ISnapshotReader reader, string fileName, CancellationToken cancellationToken) =>
-        Blocks.BlockedTraceCheckpoint.LoadBlockSetAsync(this, reader, fileName, cancellationToken);
+        ISnapshotReader reader, string fileName, object owner, CancellationToken cancellationToken) =>
+        Blocks.BlockedTraceCheckpoint.LoadBlockSetAsync(this, reader, fileName, owner, cancellationToken);
 
     /// <inheritdoc/>
     public ValueTask LoadBlockedAsync(

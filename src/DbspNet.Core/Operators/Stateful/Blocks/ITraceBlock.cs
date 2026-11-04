@@ -130,8 +130,9 @@ internal interface IBlockedTraceCodec
         Action<ITraceBlock[]> onCommit, CancellationToken cancellationToken) =>
         throw new NotSupportedException("this codec writes no block sets");
 
-    /// <summary>A block set's metadata and lazily read blocks; null when the snapshot has none.</summary>
+    /// <summary>A block set's metadata and lazily read blocks; null when the snapshot has none.
+    /// Unchanged, <paramref name="owner"/>'s next save names it again.</summary>
     ValueTask<(byte[] Meta, ITraceBlock[] Blocks)?> LoadBlockSetAsync(
-        Circuit.ISnapshotReader reader, string fileName, CancellationToken cancellationToken) =>
+        Circuit.ISnapshotReader reader, string fileName, object owner, CancellationToken cancellationToken) =>
         ValueTask.FromResult<(byte[], ITraceBlock[])?>(null);
 }

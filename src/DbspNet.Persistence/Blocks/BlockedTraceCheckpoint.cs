@@ -382,9 +382,11 @@ internal static class BlockedTraceCheckpoint
     }
 
     /// <summary>A block set written by <see cref="SaveBlockSetAsync"/>: its metadata and its
-    /// blocks, adopted lazily (each read on first use); null when the snapshot has none.</summary>
+    /// blocks, adopted lazily (each read on first use); null when the snapshot has none. The set
+    /// becomes <paramref name="owner"/>'s last, so its next checkpoint, if nothing changed, names
+    /// this chain again.</summary>
     public static async ValueTask<(byte[] Meta, ITraceBlock[] Blocks)?> LoadBlockSetAsync(
-        ILayout codec, Core.Circuit.ISnapshotReader reader, string fileName, CancellationToken cancellationToken)
+        ILayout codec, Core.Circuit.ISnapshotReader reader, string fileName, object owner, CancellationToken cancellationToken)
     {
         if (await RunCheckpoint.FindChainAsync(reader, fileName, cancellationToken).ConfigureAwait(false) is not { Paths.Count: > 0 } chain)
         {
@@ -417,6 +419,7 @@ internal static class BlockedTraceCheckpoint
             blocks[i] = lazy;
         }
 
+        LastBlockSet.AddOrUpdate(owner, Tuple.Create(fs, chain, bytes));
         return (meta, blocks);
     }
 
