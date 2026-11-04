@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. Not built.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB); S1 and S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -1169,3 +1169,84 @@ every run.
   arm). It used to overlap the wait for the slowest worker at the end of tick 0, and now runs
   before the tick. A one-off per process. TPC-DI's tick 0 is small (267 MB live), so R0 has
   nothing to release there.
+
+### 5.8 S2: window write-back by bytes (2026-11-04, 9c51c44)
+
+**What changed.**
+- **Each cold-backed `OrderedPartitionStore` estimates its write-back cache's managed bytes:**
+  `_small`'s cached partitions plus `_pending`'s queue.
+  - Per row: the mean of `ManagedSize.Row` over a 32-row sample of each change, plus node and
+    queue overhead.
+  - Per partition: dictionary and collection overhead.
+  - Values: `Utf8String` reports its bytes through a new `IManagedSize`. Strings and byte arrays
+    are estimated by length, and any other boxed value as 24 bytes.
+- **At `EndTick`**, after the operator's last read of the step, a store drops its cache into its
+  blocked record (`DropCache`: flush the queue, clear the cache, freeze the record). It does so
+  when its own estimate, or the total over all live stores, is over
+  `DBSPNET_WINDOW_WRITEBACK_MIB` (default 1024; `off` = unbounded, as before). Partitions touched
+  later reload from the record.
+- **The total sums a weak registry of live stores.** Stores are never disposed, so a running
+  counter would keep a dropped program's bytes, and every later program in the process would run
+  over budget.
+- **`SpillSettings`** holds the knob, the first of §5.5's.
+
+**Tests.** `WindowWriteBackBudgetTests` covers LAG, RANK and a framed SUM OVER, with small and
+large partitions:
+- A zero budget gives every tick's outputs equal to an unbounded twin's, with an idle tick in
+  between. Every store ends each step with nothing cached, while the twin keeps its caches.
+- A budget above the caches keeps them.
+- Four mutants each fail a test: never drop; drop without flushing; no estimate; ignore the
+  budget.
+- The whole suite also passes with `DBSPNET_WINDOW_WRITEBACK_MIB=0`, where every window store
+  drops after every step (3,452 pass).
+
+**Extended TPC-DS SF1, W=1, 48 GiB** (xt48 against xt47):
+- **The rank's cache drops at the end of op 29.** Rank state goes from 14.5 GB of objects to
+  3.9 GB of blocks.
+- **Tick 0 completes for the first time:** 180 s step, 40.7 GB live at its end, 25.0 GB of it
+  blocks. Ticks 1–7 complete too.
+- **The OOM is now in tick 8**, in `PartitionedTopKCompactOp`'s own dictionary (another managed
+  state, a new holder).
+- **State at the end of tick 0** is 27.1 GB, almost all reference-free blocks:
+
+| holder | bytes |
+|---|---|
+| inner joins | 10.0 GB |
+| left joins | 7.4 GB |
+| rank (blocks now) | 4.9 GB |
+| views | 3.3 GB |
+| aggregates | 1.5 GB |
+
+  Blocks reach 32 GB by tick 7. **S1's target now dominates.**
+
+**TPC-DI SF=3 W=12.** run52, against R0, 5 runs per arm; views identical in every run.
+
+| | R0 | S2 |
+|---|---|---|
+| batch 1 drain | 15.51 s (15.30–16.16) | 15.87 s (14.84–16.17), ranges overlap fully |
+| batch 1 GC pause | 3.86 s | 3.72 s |
+| batch 1 checkpoint | 1.26 s | 1.16 s |
+| batch 2 / 3 drain | 108 / 123 ms | 97 / 139 ms |
+| **peak RSS** | **14.69 GB** | **12.77 GB (−13%)** |
+
+The tick-18 census (run51, budget off against on):
+
+| | off | on |
+|---|---|---|
+| live after tick 18 | 8.47 GB | **7.47 GB** |
+| RSS after tick 18 | 15.5 GB | **12.9 GB** |
+| write-back actually live | 2,061 MiB, 2.35M rows | 415 MiB, 308K rows |
+| drops in batch 1 | | 166 |
+
+**Under a heap hard limit** (run53, release + R0 + S2):
+- **9 GiB passes 1 run of 3** (drain 16.4 s, views identical). It failed 3 of 3 in §3i.
+- 8 GiB fails 3 of 3. All failures are in the drain: the blocks and the tick's deltas, now S1's
+  part.
+
+**The estimate is rough, in both directions.**
+- **On TPC-DI it is 2.4× high:** 1,005 MiB estimated against 415 MiB measured. Rows of partitions
+  that leave the cache stay counted until the next drop: promotions to chunks, emptied
+  partitions, retractions. That only makes drops earlier, which is safe.
+- **On TPC-DS it is ~0.64× low:** 630 B/row estimated against ~980 B/row from the census.
+- So the knob holds to within a factor of about 2.5. Making the estimate decrease on removal is
+  a possible refinement, if the budget's meaning needs to be tighter.
