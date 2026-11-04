@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB.** Follows
+Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5), not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -910,3 +910,133 @@ timing. Native buffers cost ~0.6 GB at most here, so they stay conditional.
 3. **Batch 1.** Its working set is the whole state (the bulk load), and nothing is persisted
    until its checkpoint. Bounding batch 1 itself needs spilling (Feldera's moderate-pressure
    mode). Is that in scope for this arc?
+
+Q3 is taken up in §5.
+
+## 5. Mid-batch spilling: design (2026-11-04)
+
+**Why now.** Two workloads need state to leave memory *during* a batch, before any checkpoint:
+- **TPC-DI SF=3 W=12.** A 9 GiB heap limit OOMs in batch 1's drain (§3i). Its floor is tick 18.
+- **Extended TPC-DS SF1 (issue #2).** 88M input rows, and the 96 models total 304M output rows.
+  It OOMs at W=1 under a 48 GiB cap after ~3 min, in `BlockedJoinOp` → `Freeze` →
+  `BlockWriter.Write`, at RSS ~43 GB. ivm-bench sets no `DBSPNET_SNAPSHOT_DIR`, so today nothing
+  in it can be evicted at all.
+
+### 5.1 What Feldera does (re-read at origin/main 43f0d6c, November 2026; updates §2)
+
+Paths are under `../feldera/crates/dbsp/src/`.
+
+- **Spilling needs storage.** Every threshold is `None` without a storage backend, and then
+  nothing spills. 70f60b489 (October) also stopped the merger relieving pressure without storage:
+  it had merged its own in-memory output forever.
+- **The limit** is `min(max_rss, memory available)` minus a reservation (capped at half). The
+  available memory is the host's or the cgroup's, and is rechecked every second (b03ea8036). A
+  pipeline with no `max_rss` still has a limit. ivm-bench sets `max_rss_mb: 0`.
+- **Pressure** comes from a 1 s RSS monitor (`circuit/runtime.rs`): Low below 85% of the limit,
+  then Moderate, High (90%) and Critical (95%). High and Critical have hysteresis: they hold until
+  RSS falls two levels.
+- **What spills at each level.** "Build on storage" means the batch builder writes the file
+  directly. `fallback` batches are `Vec` or `File`, and a `Threshold` builder switches partway
+  through (`trace/ord/fallback/utils.rs`).
+
+| level | merge outputs | batches inserted into a spine | a step's transient batches |
+|---|---|---|---|
+| Low | ≥ `min_spill_size` (10 MiB) | memory | memory (`min_step_spill_size` unset) |
+| Moderate | all | ≥ 10 MiB | memory |
+| High | all; the merger also force-merges every in-memory batch, to move it to storage | all | memory |
+| Critical | all | all | all non-empty |
+
+- **Feldera spills even at Low.** With storage on, any merge output of 10 MiB or more goes
+  straight to a file behind the buffer cache. ivm-bench's Feldera runs with storage, and its
+  client notes "batches do spill to storage here". So Feldera's large state lives on disk by
+  default, not only under pressure.
+- **A spilled batch is a checkpoint file.** `Spine::save` names each batch's file, writing it
+  first only if it is still in memory. Since 29880eec9 (September), checkpoints are written in
+  the background, and the in-memory batches they write stay resident. That is our increment 1
+  with the cache off.
+- **Backpressure counts batches, not bytes.** The step waits when merging falls behind.
+
+### 5.2 Where tick 18's bytes are now (run45, main f02030d)
+
+`IVM_TICK_LIVE=1 IVM_TICK_CENSUS=18`, W=12, `gcServer=1`, `gcConcurrent=0`, stream release on
+(the default since §3e). Views were identical, and all three batches passed.
+
+- **Before stream release (§3a):** 14.1 GB live at the end of tick 18.
+- **Now:** 8.47 GB live, 11.4 GB heap before the GC, 16.2 GB RSS.
+- **The object census** accounts for 7.85 GB of it:
+
+| part | bytes | what it is | lever |
+|---|---|---|---|
+| run blocks | **3.76 GB** (join `_left` runs alone 2.0 GB) | frozen, reference-free runs, mostly built in this batch | **S1**: spill runs as they are built |
+| window write-back caches | **~2.2 GB** (`WindowOffset._small` 1.20, `WindowAggregate._small` 0.50 + `_pending` 0.27, rank 0.10) | managed partitions waiting for the cold record. The cap is a partition **count** (`CacheCap` = 2^18), not bytes | **S2**: flush by bytes into the record, which then spills by S1 |
+| unfrozen managed levels | **~1.45 GB** (join left 0.81, right 0.24, aggregate 0.20, distinct 0.15) | 3.5M entries, each trace below its 64K freeze threshold, held as objects at ~230 B/entry | **S3**: freeze at the tick boundary under pressure (Feldera's High: "inserts spill") |
+| aggregate `_stateCache` and the rest | ~0.5 GB | | none yet |
+
+**This is the end-of-tick floor, not the in-tick peak.** The 9 GiB OOM is inside tick 18's step,
+where the tick's deltas are also live until their last reader (§3b). Spilling cuts the state
+under that peak, which the deltas then sit on top of. S1 alone reaches 3.76 of the 8.47 GB. S1–S3
+together leave about 1 GB plus the cache.
+
+**Extended TPC-DS has no census yet.** Its split (join traces, integrated views over 304M rows, the
+output row index) is unknown, and its 304M view rows may make views dominate there, unlike
+TPC-DI. Step 0 below measures it.
+
+### 5.3 Proposal
+
+**Step 0: census on extended TPC-DS.** Take the same per-tick live/blocks/managed lines from the
+server path (the instrument is in the test harness today), at W=1 and W=12, under a cap that
+completes or near the OOM. This decides whether views or join traces lead there.
+
+**S1: spill on build.** When a freeze or a merge produces a run of at least `SpillMin` bytes, the
+`RunBuilder` streams each block to a run file as it flushes it. This is Feldera's Low
+mode. The finished run is `LazyTraceBlock`s over the file (`SpillRun`'s rebind, but done during
+the build, not after it), and the blocks just written enter the cache unreferenced, so they go
+first.
+- **Where.** With a snapshot directory, in its store's `runs/`, pinned (`RunPins`) from creation.
+  The next checkpoint then names the file instead of rewriting it (`Persisted.Store ==
+  ctx.FileSystem` already skips it), which is Feldera's model, and batch 1's checkpoint shrinks
+  by what was spilled. Without one, in a scratch `BlockSpill` directory, deleted when the merges
+  retire it.
+- **Durability.** A spilled file is not state until a checkpoint names it, so the commit must
+  fsync whatever it names (check what the run writer does today), and restore must ignore
+  unnamed spill files. The sweep must not race a spill: the pin goes on before the file
+  appears.
+- **Merges** read their inputs through the cache without promoting them, as today. Their outputs
+  of `SpillMin` or more are built on storage. Batch 1 rarely merges (one freeze per trace is
+  typical), so write amplification should stay small. Count it.
+- **Needs an evicting cache.** Spilling without eviction only adds writes, so S1 is gated on
+  `BlockCache.Enabled`.
+
+**S2: window write-back by bytes.** Flush `_small` and `_pending` into the cold record when their
+estimated bytes pass a cap, not only at `CacheCap` partitions or a checkpoint. The record is a
+`BlockedIndexedTrace`, so S1 then spills it. The risk is the window path's lazy-recompute
+assumptions about which partitions are hot. Measure batch-1 drain time.
+
+**S3: pressure.** A monitor in Feldera's shape: Low / Moderate / High / Critical against a limit.
+In .NET the limit is `GCMemoryInfo.TotalAvailableMemoryBytes`, which honours
+`GCHeapHardLimit` and the cgroup. The measure is either the heap size or RSS, to be decided.
+- **Moderate:** `SpillMin` → 0.
+- **High:** freeze every managed level at the tick boundary, and spill (S3 proper), and shrink the
+  cache budget.
+- **Critical:** a step's transients. **Not proposed**: our deltas are managed objects, not
+  blocks, so spilling them means encoding them first.
+- **Cadence.** Feldera samples every second, but tick 18 allocates ~19 GB in 4.8 s. Our check is
+  better taken at each freeze and merge decision, where it is cheap (`GC.GetGCMemoryInfo` is
+  updated per GC).
+
+**Order:** step 0, then S1 behind a flag with the usual 5-run A/B (TPC-DI SF=3 W=12 at no limit,
+10 GiB and 9 GiB, and Nexmark for the step cost), then S2 and S3. Success: 9 GiB, then 8 GiB,
+completes TPC-DI batch 1, and extended TPC-DS SF1 completes in CI's container.
+
+### 5.4 Open questions
+
+1. **Trigger.** A fixed `SpillMin` always, as Feldera's Low mode does, with pressure added later
+   (S3)? Or pressure-only, so nothing is written unless memory is short?
+2. **Default.** Feldera spills by default whenever storage exists, and our policy is to adopt
+   Feldera's assumptions by default. Our "storage" would be a snapshot directory, or a default
+   scratch directory under temp. ivm-bench has no snapshot directory, so only the second would
+   reach it. Should S1 be default-on with an opt-out once measured, or stay with
+   `DBSPNET_BLOCK_CACHE_MIB`?
+3. **Spill location with a snapshot directory.** Into its `runs/`, so checkpoints reuse the files,
+   or always into scratch, keeping state and spill strictly apart, at the cost of rewriting them
+   at the checkpoint?
