@@ -163,11 +163,12 @@ public static class Snapshot
 
             var ctx = new TableFileSystemSnapshotContext(fs, dir + "/op-" + i, session);
             var t0 = ProfileSave ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var a0 = ProfileSave ? GC.GetTotalAllocatedBytes(precise: false) : 0;
             await s.SaveAsync(ctx, cancellationToken).ConfigureAwait(false);
             if (ProfileSave)
             {
                 SaveProfile.Enqueue((dir, i, circuit.Operators[i].GetType().Name,
-                    System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds));
+                    System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds, GC.GetTotalAllocatedBytes(precise: false) - a0));
             }
 
             snapshotted.Add(i);
@@ -378,11 +379,11 @@ public static class Snapshot
     public static bool ProfileLoad { get; set; }
 
     /// <summary>Diagnostic: while set, every operator save in a write appends (directory, operator
-    /// index, operator type, ms) to <see cref="SaveProfile"/>. Safe across a parallel snapshot's
+    /// index, operator type, ms, bytes allocated process-wide meanwhile: exact for one worker) to <see cref="SaveProfile"/>. Safe across a parallel snapshot's
     /// concurrent workers; the reader drains the queue. Off by default and free when off.</summary>
     internal static bool ProfileSave { get; set; }
 
-    internal static readonly System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms)>
+    internal static readonly System.Collections.Concurrent.ConcurrentQueue<(string Dir, int Index, string Op, double Ms, long Alloc)>
         SaveProfile = new();
 
     /// <summary>With <see cref="ProfileSave"/> set, each concurrent restore enqueues (directory,

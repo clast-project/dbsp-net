@@ -148,7 +148,7 @@ public class IvmMultiBatch
         var runner = parallel is not null
             ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, store, policy)
             : await ProgramRunner.CreateAsync(serial!, inputs, outputs, store, policy);
-        var checkpointProfile = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") is "1" or "all";
+        var checkpointProfile = Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") is "1" or "all" or "alloc";
         DbspNet.Persistence.Snapshot.ProfileSave = checkpointProfile;
 
         // IVM_TYPE_VIEWS=1 (serial only): each view tries the typed fast path, structural
@@ -820,7 +820,7 @@ public class IvmMultiBatch
         }
 
         var cpu = (Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds;
-        var ops = new List<(string Dir, int Index, string Op, double Ms)>();
+        var ops = new List<(string Dir, int Index, string Op, double Ms, long Alloc)>();
         while (DbspNet.Persistence.Snapshot.SaveProfile.TryDequeue(out var e))
         {
             ops.Add(e);
@@ -831,10 +831,10 @@ public class IvmMultiBatch
             $"CKPT {label} wall_ms={wall:F0} cpu_ms={cpu:F0} alloc_gib={(GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (double)(1L << 30):F2} " +
             $"gc_pause_ms={(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds:F0} gc0={GC.CollectionCount(0) - g0} gc1={GC.CollectionCount(1) - g1} gc2={GC.CollectionCount(2) - g2} " +
             $"save_sum_ms={ops.Sum(o => o.Ms):F0} worker_max_ms={(perWorker.Count == 0 ? 0 : perWorker.Max()):F0} worker_min_ms={(perWorker.Count == 0 ? 0 : perWorker.Min()):F0}"));
-        foreach (var g in ops.GroupBy(o => o.Op).OrderByDescending(g => g.Sum(o => o.Ms)).Take(8))
+        foreach (var g in ops.GroupBy(o => o.Op).OrderByDescending(g => Environment.GetEnvironmentVariable("IVM_CHECKPOINT_PROFILE") == "alloc" ? g.Sum(o => o.Alloc) : g.Sum(o => o.Ms)).Take(12))
         {
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"CKPTOP {label} {g.Key} n={g.Count()} sum_ms={g.Sum(o => o.Ms):F0} max_ms={g.Max(o => o.Ms):F0}"));
+                $"CKPTOP {label} {g.Key} n={g.Count()} sum_ms={g.Sum(o => o.Ms):F0} max_ms={g.Max(o => o.Ms):F0} alloc_mib={g.Sum(o => o.Alloc) / 1048576.0:F0}"));
         }
 
         // The slowest operator positions (summed over workers): which op-{i} a file belongs to.
@@ -842,7 +842,7 @@ public class IvmMultiBatch
         foreach (var g in ops.GroupBy(o => (o.Index, o.Op)).OrderByDescending(g => g.Sum(o => o.Ms)).Take(all ? int.MaxValue : 12))
         {
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"CKPTIDX {label} op-{g.Key.Index} {g.Key.Op} sum_ms={g.Sum(o => o.Ms):F0}"));
+                $"CKPTIDX {label} op-{g.Key.Index} {g.Key.Op} sum_ms={g.Sum(o => o.Ms):F0} alloc_mib={g.Sum(o => o.Alloc) / 1048576.0:F0}"));
         }
 
         return wall;
