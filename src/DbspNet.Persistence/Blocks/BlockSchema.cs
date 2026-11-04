@@ -104,6 +104,24 @@ internal sealed class BlockSchema : ITraceBlockFormat
         return bytes;
     }
 
+    int ITraceBlockFormat.GatheredEntryBytes(ITraceBlock source, int index)
+    {
+        if (source is not TraceBlock block)
+        {
+            return 0;
+        }
+
+        var bytes = _fixedBytes;
+        foreach (var c in _keyStrings)
+        {
+            var offsets = block.ValuesAt(c);
+            bytes += System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Bytes.AsSpan(offsets + ((index + 1) * 4)))
+                - System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Bytes.AsSpan(offsets + (index * 4)));
+        }
+
+        return bytes;
+    }
+
     private int _fixedBytes;
     private int[] _keyStrings = [];
     private int[] _valueStrings = [];

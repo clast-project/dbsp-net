@@ -320,7 +320,8 @@ internal sealed class BlockedIndexedTrace
     /// <summary>
     /// Entries whose keys are other blocks' entries and whose value is one BIGINT, each with weight
     /// +1, as one run (docs/design-bounded-memory.md §3h): sorted by the hash their source blocks
-    /// already carry, cut into blocks without splitting a hash, and copied without decoding. The
+    /// already carry, cut into blocks by bytes and entries without splitting a hash, and copied
+    /// without decoding. The
     /// entries must be distinct (key, value) pairs. False, with nothing changed, when the format
     /// cannot gather: integrate rows instead.
     /// </summary>
@@ -339,13 +340,19 @@ internal sealed class BlockedIndexedTrace
         }
 
         Array.Sort(order);
+        // Cut as a freeze cuts rows: once a block reaches the byte budget or the entry count, at the
+        // next hash boundary (a hash is never split here).
         var blocks = new List<ITraceBlock>();
         var from = 0;
         while (from < count)
         {
-            var to = Math.Min(count, from + _blockEntries);
-            while (to < count && (order[to] >> 32) == (order[to - 1] >> 32))
+            var to = from;
+            long bytes = 0;
+            while (to < count && (to == from || ((order[to] >> 32) == (order[to - 1] >> 32))
+                || (bytes < _blockBytes && to - from < _blockEntries)))
             {
+                var i = (int)(uint)order[to];
+                bytes += _format.GatheredEntryBytes(sources[i], indexes[i]);
                 to++;
             }
 

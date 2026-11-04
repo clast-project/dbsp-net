@@ -100,6 +100,11 @@ internal interface ITraceBlockFormat
     /// <paramref name="values"/>[i], copied without decoding; null when the format cannot
     /// (docs/design-bounded-memory.md §3h).</summary>
     ITraceBlock? Gather(ITraceBlock[] sources, int[] indexes, long[] values, long[] weights, int[] hashes, int count) => null;
+
+    /// <summary>The bytes <see cref="EntryBytes"/> counts for a gathered entry: the key of
+    /// <paramref name="source"/>'s entry <paramref name="index"/> and one BIGINT value. 0 when the
+    /// format cannot tell (blocks are then cut by entries alone).</summary>
+    int GatheredEntryBytes(ITraceBlock source, int index) => 0;
 }
 
 /// <summary>Checkpoints a <see cref="BlockedIndexedTrace"/> as run files written from its blocks and
