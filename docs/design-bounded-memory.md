@@ -703,7 +703,7 @@ checkpoint +18%). By type:
   decoding the blocked view into rows to build Arrow. The `string`s are engineered-wood's Delta stats
   (`StatsCollector.CollectStringMinMax`): every VARCHAR cell becomes a .NET string to find the
   column's min and max. Comparing UTF-8 bytes (code-point order, which the code already specifies)
-  and decoding only the final bounds would remove them.
+  and decoding only the final bounds would remove them (filed as engineered-wood#661).
 - **Checkpoint (8.3 GB).** `byte[]` 2.8 GB, then rows again: `object[]` 1.1 GB, `Utf8String` 0.8,
   boxed `double` 0.6, `StructuralRow` 0.4, `(row, row, long)[]` 0.2. That is state decoded into
   rows and re-encoded (window stores via `SnapshotNow` → Z-set → run file; managed levels frozen
