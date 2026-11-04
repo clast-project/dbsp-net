@@ -683,6 +683,35 @@ variables. Recommended for a host bounding memory:
 - `GCHeapHardLimit` at 12 GiB holds on ivm-bench SF=3 W=12 (§3d), at the cost of GC pause +32% and
   output +37%. The floor is set by the places that build a whole result before writing it (§3d).
 
+## 3f. Output and checkpoint: garbage, not transients (2026-11-03)
+
+§3d's OOMs at 10 GiB (the output's Arrow build, a window store materialised for its checkpoint, a
+Z-set run write) looked like three large transients. Measured, batch 1 (`IVM_PHASE_LIVE=1`: full
+GC at each phase boundary; `IVM_ALLOC_TYPES=1`: allocation by type per phase; release on, no cache):
+
+| boundary | live | allocated in the phase |
+|---|---|---|
+| end of drain | 7.06 GB (peak in tick 18: 8.5) | 54.8 GB |
+| end of output | 7.60 GB | **4.7 GB** for 3.6M rows, 175 MB of Parquet |
+| end of checkpoint | 5.78 GB | **8.3 GB** |
+
+None of the three sites is a big transient by itself. The output and checkpoint phases churn
+13 GB of garbage, and under a hard limit that is where the GC time goes (§3d: output +37%,
+checkpoint +18%). By type:
+- **Output (4.7 GB).** `byte[]` 1.5 GB (Arrow buffers, Parquet), `string` 0.9 GB, then rows:
+  `object[]`, `Utf8String`, `StructuralRow`, boxed `double`/`long`/`Timestamp` (~1.3 GB) from
+  decoding the blocked view into rows to build Arrow. The `string`s are engineered-wood's Delta stats
+  (`StatsCollector.CollectStringMinMax`): every VARCHAR cell becomes a .NET string to find the
+  column's min and max. Comparing UTF-8 bytes (code-point order, which the code already specifies)
+  and decoding only the final bounds would remove them.
+- **Checkpoint (8.3 GB).** `byte[]` 2.8 GB, then rows again: `object[]` 1.1 GB, `Utf8String` 0.8,
+  boxed `double` 0.6, `StructuralRow` 0.4, `(row, row, long)[]` 0.2. That is state decoded into
+  rows and re-encoded (window stores via `SnapshotNow` → Z-set → run file; managed levels frozen
+  to blocks).
+
+So the lever is not streaming but **not decoding**: block → Arrow for the output, and window chunks
+written as blocks for the checkpoint. Both cut time as well as memory.
+
 ## 4. Open questions
 
 1. **Budget policy.** A fixed byte budget per worker, as Feldera does by default, or one driven
