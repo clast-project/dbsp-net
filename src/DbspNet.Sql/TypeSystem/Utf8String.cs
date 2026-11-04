@@ -23,8 +23,12 @@ namespace DbspNet.Sql.TypeSystem;
 ///     Used by the Arrow ingest path and any caller already holding bytes.</item>
 /// </list>
 /// </remarks>
-public readonly struct Utf8String : IEquatable<Utf8String>, IComparable<Utf8String>, IComparable
+public readonly struct Utf8String : IEquatable<Utf8String>, IComparable<Utf8String>, IComparable, DbspNet.Core.Collections.IManagedSize
 {
+    /// <summary>Boxed in a row: the box (with the memory's object, index and length) plus the bytes
+    /// themselves, as if this cell owned its buffer (a shared arena is over-charged; safe for a budget).</summary>
+    int DbspNet.Core.Collections.IManagedSize.ManagedBytes => 40 + 24 + _bytes.Length;
+
     private readonly ReadOnlyMemory<byte> _bytes;
 
     public static Utf8String Empty => default;

@@ -45,6 +45,54 @@ internal sealed class OrderedPartitionStore
     private readonly ITraceBlockFormat? _coldFormat;
     private readonly Dictionary<StructuralRow, List<(StructuralRow Row, long Weight)>> _pending = new();
 
+    // The write-back cache's estimated managed bytes (_small's cached partitions and _pending's queue),
+    // and the budget all stores' caches share (docs/design-bounded-memory.md §5.8). A store that ends a
+    // step with the shared total over it drops its cache: one huge step otherwise kept a whole input as
+    // managed partitions (extended TPC-DS: one rank's 14.8M rows, 14.5 GB) until an idle tick.
+    private long _cacheBytes;
+    private readonly long _writeBackBudget = SpillSettings.WindowWriteBackBytes;
+
+    // Per cached row besides the row itself: its SortedDictionary node and its queued (row, weight).
+    private const int CachedRowOverhead = 48 + 24;
+
+    // Per cached partition besides its key: the cache's and the queue's dictionary entries, the
+    // SortedDictionary and the queue's list.
+    private const int CachedPartitionOverhead = 48 + 64 + 48 + 40;
+
+    // Every live cold-backed store, weakly: the shared total sums them (a store is never disposed, so
+    // a running counter would keep a dropped program's bytes).
+    private static readonly List<WeakReference<OrderedPartitionStore>> Live = [];
+
+    /// <summary>Write-back caches dropped by the budget (diagnostics).</summary>
+    internal static long WriteBackDrops;
+
+    /// <summary>The cache's estimated managed bytes (tests, census).</summary>
+    internal long CacheBytes => _cacheBytes;
+
+    /// <summary>All live stores' estimated cache bytes (diagnostics: compare with a census).</summary>
+    internal static long LiveCacheBytesTotal => LiveCacheBytes();
+
+    private static long LiveCacheBytes()
+    {
+        long total = 0;
+        lock (Live)
+        {
+            for (var i = Live.Count - 1; i >= 0; i--)
+            {
+                if (Live[i].TryGetTarget(out var store))
+                {
+                    total += Interlocked.Read(ref store._cacheBytes);
+                }
+                else
+                {
+                    Live.RemoveAt(i);
+                }
+            }
+        }
+
+        return total;
+    }
+
     // Keys the cold trace has ever held (a Bloom filter: no false negatives), so a partition new
     // this tick is read from the tick's own rows instead of probed for (§3.17).
     private KeyFilter _keys = new();
@@ -84,6 +132,13 @@ internal sealed class OrderedPartitionStore
         _chunkRows = Math.Max(1, chunkRows);
         _coldFormat = coldFormat;
         _cold = coldFormat is null ? null : new BlockedIndexedTrace(coldFormat, TraceBlocksMode.FreezeEntries, blockEntries: TraceBlocksMode.BlockEntries);
+        if (_cold is not null && _writeBackBudget != long.MaxValue)
+        {
+            lock (Live)
+            {
+                Live.Add(new WeakReference<OrderedPartitionStore>(this));
+            }
+        }
         _rowOrder = Comparer<StructuralRow>.Create((a, b) =>
         {
             var c = ValueOf(a).CompareTo(ValueOf(b));
@@ -267,6 +322,9 @@ internal sealed class OrderedPartitionStore
             return;
         }
 
+        // A cached row's estimated bytes: the mean of a sample of this change's rows, plus overhead.
+        var perRow = _cold is null ? 0 : ManagedSize.MeanRow(rows.Count, i => rows[i].Row) + CachedRowOverhead;
+        long added = 0;
         var byKey = new Dictionary<StructuralRow, List<(StructuralRow Row, long Weight, long Value)>>();
         foreach (var (key, row, weight) in rows)
         {
@@ -302,9 +360,11 @@ internal sealed class OrderedPartitionStore
                 if (!_small.ContainsKey(key))
                 {
                     Load(key);
+                    added += CachedPartitionOverhead + ManagedSize.Row(key) + (_small[key].Count * perRow);
                 }
 
                 ApplySmall(key, change);
+                added += change.Count * perRow;
                 if (!_pending.TryGetValue(key, out var queued))
                 {
                     _pending[key] = queued = new();
@@ -317,6 +377,11 @@ internal sealed class OrderedPartitionStore
 
                 _keys.Add(key);
             }
+        }
+
+        if (added != 0)
+        {
+            Interlocked.Add(ref _cacheBytes, added);
         }
     }
 
@@ -444,12 +509,24 @@ internal sealed class OrderedPartitionStore
             Flush();
             _small.Clear();
             _cold.Freeze();
+            Interlocked.Exchange(ref _cacheBytes, 0);
         }
     }
 
-    /// <summary>The tick's reads are done: drop its new partitions' rows.</summary>
+    /// <summary>The step's reads are done: past the write-back budget (§5.8), drop the cache into
+    /// the record. Partitions touched again reload from it.</summary>
     public void EndTick()
     {
+        if (_cold is null || _writeBackBudget == long.MaxValue || Interlocked.Read(ref _cacheBytes) == 0)
+        {
+            return;
+        }
+
+        if (Interlocked.Read(ref _cacheBytes) > _writeBackBudget || LiveCacheBytes() > _writeBackBudget)
+        {
+            DropCache();
+            Interlocked.Increment(ref WriteBackDrops);
+        }
     }
 
     /// <summary>Forget everything (a restore replaces the state).</summary>
@@ -459,6 +536,7 @@ internal sealed class OrderedPartitionStore
         _large.Clear();
         _unloaded.Clear();
         _smallRows = 0;
+        Interlocked.Exchange(ref _cacheBytes, 0);
         _cold?.Clear();
         _keys = new KeyFilter();
         _pending.Clear();
@@ -775,6 +853,8 @@ internal sealed class OrderedPartitionStore
                 }
 
                 _small[key] = cached;
+                Interlocked.Add(ref _cacheBytes, CachedPartitionOverhead + ManagedSize.Row(key)
+                    + (all.Count * (ManagedSize.MeanRow(all.Count, i => all[i].Row, sample: 4) + 48)));
             }
         }
 

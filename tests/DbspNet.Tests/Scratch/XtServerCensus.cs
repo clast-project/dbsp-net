@@ -76,7 +76,7 @@ public class XtServerCensus
             var rows = BlockResidency.Walk(replicas, runner, -1);
             long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
             log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"TICKLIVE tick={t} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={before / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0}"));
+                $"TICKLIVE tick={t} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={before / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops}"));
             if (live / (double)(1L << 30) >= nextCensus)
             {
                 while (live / (double)(1L << 30) >= nextCensus)
@@ -128,7 +128,7 @@ public class XtServerCensus
                     var rows = BlockResidency.Walk(replicas, runner, -1);
                     long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
                     log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                        $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0}"));
+                        $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops}"));
                     nextHeap = Math.Max(heap, live) + (long)(opStepGib * (1L << 30));
                     if (live / (double)(1L << 30) >= nextOpCensus)
                     {
