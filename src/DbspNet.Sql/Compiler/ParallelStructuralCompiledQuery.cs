@@ -175,6 +175,10 @@ public sealed class ParallelProgramOutput
 
     public Schema Schema { get; }
 
+    /// <summary>Each worker's view held as blocks, or null unless every one is (§3h).</summary>
+    internal IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace>? ShardTraces =>
+        _shards.All(s => s.ViewTrace is not null) ? [.. _shards.Select(s => s.ViewTrace!)] : null;
+
     /// <summary>This tick's gathered output delta (summed across workers; cached per tick).</summary>
     public ZSet<StructuralRow, Z64> CurrentDelta
     {

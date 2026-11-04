@@ -535,6 +535,163 @@ internal static class BlockWriter
         }
     }
 
+    /// <summary>
+    /// One block of entries gathered from other blocks (docs/design-bounded-memory.md §3h): entry i's
+    /// key columns are copied from <paramref name="sources"/>[i] at <paramref name="indexes"/>[i],
+    /// whose key columns must be <paramref name="schema"/>'s; its one value column, BIGINT, is
+    /// <paramref name="values"/>[i]. Nothing is decoded: an output row index takes a view's rows so.
+    /// </summary>
+    public static TraceBlock Gather(
+        BlockSchema schema, TraceBlock[] sources, int[] indexes, long[] values, long[] weights, int[] hashes, int n)
+    {
+        var keyColumns = schema.KeyKinds.Length;
+        var columns = schema.HashColumn + 1;
+        if (schema.ValueKinds is not [CellKind.Int64])
+        {
+            throw new InvalidOperationException("a gathered block's one value column is a BIGINT");
+        }
+
+        var nulls = new int[columns];
+        var heap = new long[columns];
+        var bufferCount = 0;
+        for (var c = 0; c < columns; c++)
+        {
+            var kind = KindOf(schema, c);
+            bufferCount += kind == CellKind.Utf8 ? 3 : 2;
+            if (c >= keyColumns)
+            {
+                continue;
+            }
+
+            for (var i = 0; i < n; i++)
+            {
+                var src = sources[i];
+                var j = indexes[i];
+                var v = src.ValidityAt(c);
+                if (v >= 0 && ((src.Bytes[v + (j >> 3)] >> (j & 7)) & 1) == 0)
+                {
+                    nulls[c]++;
+                }
+
+                if (kind == CellKind.Utf8)
+                {
+                    heap[c] += Offset(src, c, j + 1) - Offset(src, c, j);
+                }
+            }
+        }
+
+        var buffers = new (long Offset, long Length)[bufferCount];
+        var validity = new int[columns];
+        var valueAt = new int[columns];
+        var dataAt = new int[columns];
+        long body = 0;
+        var b = 0;
+        (long, long) Next(long length)
+        {
+            var at = body;
+            body += Pad8(length);
+            return (at, length);
+        }
+
+        for (var c = 0; c < columns; c++)
+        {
+            var kind = KindOf(schema, c);
+            buffers[b] = Next(nulls[c] > 0 ? (n + 7) / 8 : 0);
+            validity[c] = nulls[c] > 0 ? (int)buffers[b].Offset : -1;
+            b++;
+            buffers[b] = Next(kind switch
+            {
+                CellKind.Bool => (n + 7) / 8,
+                CellKind.Utf8 => (n + 1) * 4L,
+                _ => (long)Width(kind) * n,
+            });
+            valueAt[c] = n == 0 ? -1 : (int)buffers[b].Offset;
+            b++;
+            if (kind == CellKind.Utf8)
+            {
+                buffers[b] = Next(heap[c]);
+                dataAt[c] = heap[c] > 0 ? (int)buffers[b].Offset : -1;
+                b++;
+            }
+            else
+            {
+                dataAt[c] = -1;
+            }
+        }
+
+        var buffersVector = NodesVector + 4 + (16 * columns) + 4;
+        var metadata = (int)Pad8(buffersVector + 4 + (16 * bufferCount));
+        var bodyStart = Prefix + metadata;
+        var message = new byte[checked(bodyStart + body)];
+        var span = message.AsSpan();
+        BinaryPrimitives.WriteUInt32LittleEndian(span, 0xFFFFFFFF);
+        BinaryPrimitives.WriteInt32LittleEndian(span[4..], metadata);
+        WriteHeader(span.Slice(Prefix, metadata), n, nulls, buffers, buffersVector, body);
+        var out_ = span[bodyStart..];
+
+        for (var c = 0; c < keyColumns && n > 0; c++)
+        {
+            var kind = KindOf(schema, c);
+            var heapAt = 0;
+            for (var i = 0; i < n; i++)
+            {
+                var src = sources[i];
+                var bytes = src.Bytes.AsSpan();
+                var j = indexes[i];
+                if (validity[c] >= 0)
+                {
+                    var v = src.ValidityAt(c);
+                    if (v < 0 || ((bytes[v + (j >> 3)] >> (j & 7)) & 1) != 0)
+                    {
+                        out_[validity[c] + (i >> 3)] |= (byte)(1 << (i & 7));
+                    }
+                }
+
+                switch (kind)
+                {
+                    case CellKind.Bool:
+                        if (((bytes[src.ValuesAt(c) + (j >> 3)] >> (j & 7)) & 1) != 0)
+                        {
+                            out_[valueAt[c] + (i >> 3)] |= (byte)(1 << (i & 7));
+                        }
+
+                        break;
+                    case CellKind.Utf8:
+                        var start = Offset(src, c, j);
+                        var length = Offset(src, c, j + 1) - start;
+                        if (length > 0)
+                        {
+                            bytes.Slice(src.DataAt(c) + start, length).CopyTo(out_[(dataAt[c] + heapAt)..]);
+                        }
+
+                        heapAt += length;
+                        BinaryPrimitives.WriteInt32LittleEndian(out_[(valueAt[c] + ((i + 1) * 4))..], heapAt);
+                        break;
+                    default:
+                        var width = Width(kind);
+                        bytes.Slice(src.ValuesAt(c) + (j * width), width).CopyTo(out_[(valueAt[c] + (i * width))..]);
+                        break;
+                }
+            }
+        }
+
+        for (var i = 0; i < n; i++)
+        {
+            BinaryPrimitives.WriteInt64LittleEndian(out_[(valueAt[keyColumns] + (i * 8))..], values[i]);
+            BinaryPrimitives.WriteInt64LittleEndian(out_[(valueAt[schema.WeightColumn] + (i * 8))..], weights[i]);
+            BinaryPrimitives.WriteInt32LittleEndian(out_[(valueAt[schema.HashColumn] + (i * 4))..], hashes[i]);
+        }
+
+        for (var c = 0; c < columns; c++)
+        {
+            validity[c] = validity[c] < 0 ? -1 : validity[c] + bodyStart;
+            valueAt[c] = valueAt[c] < 0 ? -1 : valueAt[c] + bodyStart;
+            dataAt[c] = dataAt[c] < 0 ? -1 : dataAt[c] + bodyStart;
+        }
+
+        return new TraceBlock(schema, message, n, validity, valueAt, dataAt, null);
+    }
+
     private static CellKind KindOf(BlockSchema schema, int c) =>
         c < schema.KeyKinds.Length ? schema.KeyKinds[c]
         : c < schema.WeightColumn ? schema.ValueKinds[c - schema.KeyKinds.Length]

@@ -317,6 +317,69 @@ internal sealed class BlockedIndexedTrace
         Compact();
     }
 
+    /// <summary>
+    /// Entries whose keys are other blocks' entries and whose value is one BIGINT, each with weight
+    /// +1, as one run (docs/design-bounded-memory.md §3h): sorted by the hash their source blocks
+    /// already carry, cut into blocks without splitting a hash, and copied without decoding. The
+    /// entries must be distinct (key, value) pairs. False, with nothing changed, when the format
+    /// cannot gather: integrate rows instead.
+    /// </summary>
+    internal bool IntegrateGathered(ITraceBlock[] sources, int[] indexes, long[] values)
+    {
+        var count = indexes.Length;
+        if (count == 0)
+        {
+            return true;
+        }
+
+        var order = new ulong[count];
+        for (var i = 0; i < count; i++)
+        {
+            order[i] = ((ulong)sources[i].Hashes[indexes[i]] << 32) | (uint)i;
+        }
+
+        Array.Sort(order);
+        var blocks = new List<ITraceBlock>();
+        var from = 0;
+        while (from < count)
+        {
+            var to = Math.Min(count, from + _blockEntries);
+            while (to < count && (order[to] >> 32) == (order[to - 1] >> 32))
+            {
+                to++;
+            }
+
+            var n = to - from;
+            var src = new ITraceBlock[n];
+            var idx = new int[n];
+            var vals = new long[n];
+            var weights = new long[n];
+            var hashes = new int[n];
+            for (var k = 0; k < n; k++)
+            {
+                var i = (int)(uint)order[from + k];
+                src[k] = sources[i];
+                idx[k] = indexes[i];
+                vals[k] = values[i];
+                weights[k] = 1;
+                hashes[k] = (int)(order[from + k] >> 32);
+            }
+
+            if (_format.Gather(src, idx, vals, weights, hashes, n) is not { } block)
+            {
+                return false;
+            }
+
+            blocks.Add(block);
+            from = to;
+        }
+
+        _materialized = null;
+        _runs.Insert(0, new Run([.. blocks], count));
+        Compact();
+        return true;
+    }
+
     // A batch below this many entries is sorted and encoded on the calling thread.
     private const int ParallelEntries = 1 << 16;
 
@@ -748,6 +811,96 @@ internal sealed class BlockedIndexedTrace
 
     /// <summary>A Z-set trace's net contents streamed from its runs in hash order, consolidated across
     /// runs without forming the whole set; null while managed levels wait (the caller materialises).</summary>
+    /// <summary>
+    /// Every entry with its consolidated weight, as (block, index, weight), in hash order, without
+    /// decoding (docs/design-bounded-memory.md §3h): an entry whose hash only one run holds passes
+    /// through; the entries of a hash several runs hold are decoded only to sum equal rows, and the
+    /// first of each set of equals stands for them. Zero sums are dropped. Null when a managed level
+    /// waits or a run carries a GC floor (rows to drop are found by decoding): read rows instead.
+    /// </summary>
+    internal IEnumerable<(ITraceBlock Block, int Index, long Weight)>? StreamEntries() =>
+        _managed.Count > 0 || _runs.Any(r => r.Floor != long.MinValue) ? null : StreamEntriesCore([.. _runs]);
+
+    private static IEnumerable<(ITraceBlock Block, int Index, long Weight)> StreamEntriesCore(Run[] runs)
+    {
+        var cursors = runs.Select(r => new Cursor(r)).ToArray();
+        var group = new List<(ITraceBlock Block, int Index, StructuralRow Row, long Weight)>();
+        while (true)
+        {
+            var hash = uint.MaxValue;
+            var any = false;
+            var sources = 0;
+            foreach (var c in cursors)
+            {
+                if (!c.Done && (!any || c.Hash < hash))
+                {
+                    hash = c.Hash;
+                    any = true;
+                }
+            }
+
+            if (!any)
+            {
+                yield break;
+            }
+
+            foreach (var c in cursors)
+            {
+                sources += !c.Done && c.Hash == hash ? 1 : 0;
+            }
+
+            if (sources == 1)
+            {
+                var c = cursors.First(c => !c.Done && c.Hash == hash);
+                while (!c.Done && c.Hash == hash)
+                {
+                    var w = c.Block.Weight(c.Index);
+                    if (w != 0)
+                    {
+                        yield return (c.Block, c.Index, w);
+                    }
+
+                    c.Advance();
+                }
+
+                continue;
+            }
+
+            group.Clear();
+            foreach (var c in cursors)
+            {
+                while (!c.Done && c.Hash == hash)
+                {
+                    group.Add((c.Block, c.Index, c.Block.Key(c.Index), c.Block.Weight(c.Index)));
+                    c.Advance();
+                }
+            }
+
+            for (var i = 0; i < group.Count; i++)
+            {
+                if (group[i].Row is not { } row)
+                {
+                    continue;
+                }
+
+                var sum = group[i].Weight;
+                for (var j = i + 1; j < group.Count; j++)
+                {
+                    if (group[j].Row is { } other && other.Equals(row))
+                    {
+                        sum += group[j].Weight;
+                        group[j] = (group[j].Block, group[j].Index, null!, 0);
+                    }
+                }
+
+                if (sum != 0)
+                {
+                    yield return (group[i].Block, group[i].Index, sum);
+                }
+            }
+        }
+    }
+
     public IEnumerable<KeyValuePair<StructuralRow, Z64>>? StreamRows() =>
         _managed.Count > 0 ? null : StreamRunsCore([.. _runs]);
 

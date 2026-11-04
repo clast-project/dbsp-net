@@ -68,3 +68,17 @@ public interface IOutputConnector : IAsyncDisposable
         CancellationToken cancellationToken) =>
         throw new NotSupportedException($"{GetType().Name} does not support OutputMode.Incremental.");
 }
+
+/// <summary>
+/// An incremental sink that takes a full write as Arrow batches built from the view's blocks, with
+/// the rows' block entries as their keys (docs/design-bounded-memory.md §3h): nothing is decoded
+/// into rows. Internal: the entries are the engine's blocks.
+/// </summary>
+internal interface IBlockOutputConnector
+{
+    /// <summary>The connector's first incremental write in this process (the sink is truncated
+    /// first): <paramref name="inserts"/> hold the whole view, entry i of
+    /// <paramref name="keys"/> being row i across them.</summary>
+    ValueTask ApplyViewAsync(
+        IReadOnlyList<RecordBatch> inserts, DbspNet.Persistence.Blocks.ViewEntries keys, long tick, CancellationToken cancellationToken);
+}

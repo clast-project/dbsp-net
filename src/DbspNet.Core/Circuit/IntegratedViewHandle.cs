@@ -40,6 +40,9 @@ public sealed class IntegratedViewHandle<TRow>
     /// <summary>Whether enumerating the view decodes rows (cold, or held as blocks).</summary>
     internal bool EnumerationDecodes => _op.EnumerationDecodes;
 
+    /// <summary>The view held as blocks, if it is (docs/design-bounded-memory.md §3h).</summary>
+    internal DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace? ViewTrace => _op.ViewTrace;
+
     /// <summary>The number of rows in <see cref="Current"/>, without forming it.</summary>
     public int Count => _op.ViewCount;
 

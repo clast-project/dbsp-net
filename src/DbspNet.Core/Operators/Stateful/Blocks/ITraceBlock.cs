@@ -94,6 +94,12 @@ internal interface ITraceBlockFormat
     /// <summary>Encode entries <c>[0, count)</c> — ascending unsigned <paramref name="hashes"/>,
     /// each the hash of its key — as one block.</summary>
     ITraceBlock Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count);
+
+    /// <summary>A block whose entry i has the key of <paramref name="sources"/>[i] at
+    /// <paramref name="indexes"/>[i] (blocks whose keys this format's are) and the one BIGINT value
+    /// <paramref name="values"/>[i], copied without decoding; null when the format cannot
+    /// (docs/design-bounded-memory.md §3h).</summary>
+    ITraceBlock? Gather(ITraceBlock[] sources, int[] indexes, long[] values, long[] weights, int[] hashes, int count) => null;
 }
 
 /// <summary>Checkpoints a <see cref="BlockedIndexedTrace"/> as run files written from its blocks and

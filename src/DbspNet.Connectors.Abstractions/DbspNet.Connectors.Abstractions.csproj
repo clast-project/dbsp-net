@@ -17,4 +17,8 @@
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="DbspNet.Connectors.EngineeredWood" />
+    <InternalsVisibleTo Include="DbspNet.Tests" />
+  </ItemGroup>
 </Project>

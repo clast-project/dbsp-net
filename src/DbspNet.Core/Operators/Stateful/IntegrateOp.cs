@@ -59,6 +59,9 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     /// <summary>Whether the view is held as blocks (DBSPNET_TRACE_BLOCKS).</summary>
     internal bool IsBlocked => _view is Blocks.BlockedZSetTrace;
 
+    /// <summary>The view's blocks, when it is held as blocks (a full write builds Arrow from them).</summary>
+    internal Blocks.BlockedIndexedTrace? ViewTrace => (_view as Blocks.BlockedZSetTrace)?.Trace;
+
     /// <summary>The full current view contents — every delta folded in so far —
     /// valid until the next <see cref="Step"/>.</summary>
     /// <summary>Restore output views lazily (increment 6); <c>DBSPNET_LAZY_VIEWS=0</c> reads them

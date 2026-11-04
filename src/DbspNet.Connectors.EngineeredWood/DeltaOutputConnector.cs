@@ -31,7 +31,7 @@ namespace DbspNet.Connectors.EngineeredWood;
 /// under <c>UNION ALL</c>) round-trips correctly. Changelog exactly-once via Delta's
 /// <c>txn</c> app-id is a follow-on.
 /// </remarks>
-public sealed class DeltaOutputConnector : IOutputConnector
+public sealed class DeltaOutputConnector : IOutputConnector, IBlockOutputConnector
 {
     private readonly ITableFileSystem _fs;
     private DeltaTable? _table;
@@ -279,6 +279,85 @@ public sealed class DeltaOutputConnector : IOutputConnector
             lock (PhaseGate)
             {
                 File.AppendAllText(trace, $"{ViewName} first={first} rows={inserts.Length} {string.Join(' ', phases)}\n");
+            }
+        }
+
+        _incrementalStarted = true;
+    }
+
+    /// <inheritdoc/>
+    async ValueTask IBlockOutputConnector.ApplyViewAsync(
+        IReadOnlyList<RecordBatch> inserts, DbspNet.Persistence.Blocks.ViewEntries keys, long tick, CancellationToken cancellationToken)
+    {
+        if (Mode != OutputMode.Incremental || _incrementalStarted)
+        {
+            throw new InvalidOperationException("ApplyViewAsync is an incremental sink's first write.");
+        }
+
+        var rows = inserts.Sum(b => (long)b.Length);
+        if (rows != keys.Count)
+        {
+            throw new ArgumentException("keys must have one entry per inserted row.", nameof(keys));
+        }
+
+        var table = Table();
+        var phase = PhaseTrace is null ? null : System.Diagnostics.Stopwatch.StartNew();
+        var allocated = PhaseTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
+        var phases = new List<string>();
+        void Mark(string name)
+        {
+            if (phase is not null)
+            {
+                var now = GC.GetTotalAllocatedBytes(precise: true);
+                phases.Add(name + "=" + phase.ElapsedMilliseconds + "ms/" + ((now - allocated) >> 20) + "MiB");
+                allocated = now;
+                phase.Restart();
+            }
+        }
+
+        await table.RefreshAsync(cancellationToken).ConfigureAwait(false);
+        await using var txn = table.StartTransaction();
+
+        // Truncate once, in the same commit as the first write, as ApplyChangesAsync does.
+        await txn.DeleteAsync(global::EngineeredWood.Expressions.Expressions.True, cancellationToken).ConfigureAwait(false);
+        _index!.Clear();
+        _files.Clear();
+        _fileIds.Clear();
+        Mark("truncate");
+
+        if (rows > 0)
+        {
+            // Files are written uncommitted, in input order: row i is at its file's position.
+            var files = await table.WriteDataFilesAsync(inserts, cancellationToken).ConfigureAwait(false);
+            Mark("write_files");
+            var addresses = new long[rows];
+            var row = 0;
+            foreach (var file in files)
+            {
+                for (long position = 0; position < file.NumRecords; position++, row++)
+                {
+                    addresses[row] = Address(file.RelativePath, position);
+                }
+            }
+
+            if (row != rows)
+            {
+                throw new InvalidOperationException($"DeltaOutputConnector '{ViewName}': wrote {row} rows for {rows} inserted.");
+            }
+
+            _index!.AddEntries(keys, addresses);
+            txn.StageDataFiles(files);
+        }
+
+        _index!.Commit();
+        Mark("addresses");
+        await txn.CommitAsync(cancellationToken).ConfigureAwait(false);
+        Mark("commit");
+        if (PhaseTrace is { } trace)
+        {
+            lock (PhaseGate)
+            {
+                File.AppendAllText(trace, $"{ViewName} first=True blocks=1 rows={rows} {string.Join(' ', phases)}\n");
             }
         }
 

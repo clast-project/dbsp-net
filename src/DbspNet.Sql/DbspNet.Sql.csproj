@@ -14,6 +14,8 @@
          for the incremental circuit; the evaluator is internal to the SQL
          layer but safe to expose to tests within the same repo. -->
     <InternalsVisibleTo Include="DbspNet.Tests" />
+    <InternalsVisibleTo Include="DbspNet.Connectors.Abstractions" />
+    <InternalsVisibleTo Include="DbspNet.Connectors.EngineeredWood" />
     <!-- WalRecorder subscribes to TableInput.OnPushed to capture per-tick
          input deltas for the durable log. -->
     <InternalsVisibleTo Include="DbspNet.Persistence" />

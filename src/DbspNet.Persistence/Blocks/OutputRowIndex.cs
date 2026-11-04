@@ -65,6 +65,17 @@ public abstract class OutputRowIndex
     /// <summary>Record a new copy of <paramref name="row"/> at <paramref name="address"/>.</summary>
     public abstract void Add(object row, long address);
 
+    /// <summary>Add each of a full write's rows, given as the view's block entries, at its address
+    /// (docs/design-bounded-memory.md §3h). A blocked index copies their bytes; otherwise each row
+    /// is decoded and added.</summary>
+    internal virtual void AddEntries(ViewEntries entries, long[] addresses)
+    {
+        for (var i = 0; i < entries.Count; i++)
+        {
+            Add(entries.Blocks[i].Key(entries.Indexes[i]), addresses[i]);
+        }
+    }
+
     /// <summary>End a batch of changes.</summary>
     public abstract void Commit();
 
@@ -218,6 +229,15 @@ public abstract class OutputRowIndex
             Count++;
         }
 
+        // A full write's entries, staged as they are: gathered into one run at commit.
+        private readonly List<(ViewEntries Entries, long[] Addresses)> _gathered = new();
+
+        internal override void AddEntries(ViewEntries entries, long[] addresses)
+        {
+            _gathered.Add((entries, addresses));
+            Count += entries.Count;
+        }
+
         private void Stage(StructuralRow key, long address, long weight)
         {
             _keys.Add(key);
@@ -231,6 +251,16 @@ public abstract class OutputRowIndex
             var addresses = _addresses;
             var weights = _weights;
             _trace.IntegrateEntries(keys.Count, i => keys[i], i => new StructuralRow(addresses[i]), i => weights[i]);
+            foreach (var (entries, at) in _gathered)
+            {
+                if (!_trace.IntegrateGathered(entries.Blocks, entries.Indexes, at))
+                {
+                    _trace.IntegrateEntries(
+                        entries.Count, i => entries.Blocks[i].Key(entries.Indexes[i]), i => new StructuralRow(at[i]), _ => 1);
+                }
+            }
+
+            _gathered.Clear();
             _spill?.Spill(_trace, _format);
             ResetBatch();
         }
@@ -258,6 +288,7 @@ public abstract class OutputRowIndex
         {
             _trace = NewTrace();
             _spill?.Clear();
+            _gathered.Clear();
             ResetBatch();
             Count = 0;
         }

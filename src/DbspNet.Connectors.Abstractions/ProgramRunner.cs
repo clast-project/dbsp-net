@@ -466,6 +466,9 @@ public sealed class ProgramRunner
     // Diagnostic: DBSPNET_OUTPUT_TRACE=<file> also gets each incremental write's runner-side times.
     private static readonly string? OutputTrace = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_TRACE");
 
+    /// <summary>Full writes from a view's blocks (§3h); <c>DBSPNET_OUTPUT_BLOCKS=0</c> turns it off.</summary>
+    internal static bool ViewBlocks { get; set; } = Environment.GetEnvironmentVariable("DBSPNET_OUTPUT_BLOCKS") != "0";
+
     public async ValueTask WriteOutputsAsync(CancellationToken cancellationToken = default)
     {
         var tick = _program.TickCount;
@@ -521,6 +524,30 @@ public sealed class ProgramRunner
     {
         // The first write in this process carries the whole view (the connector truncates
         // the sink first); later writes carry the net change since the previous one.
+        // A full write of a view held as blocks, to a sink that takes block entries as keys: Arrow
+        // built from the blocks, no row decoded (docs/design-bounded-memory.md §3h).
+        if (!incremental.Written && ViewBlocks && connector is IBlockOutputConnector blocks && output.ViewTraces is { } traces)
+        {
+            var b0 = Stopwatch.GetTimestamp();
+            var ba0 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
+            if (DbspNet.Persistence.Blocks.ViewArrow.TryBuild(ArrowSchemaBridge.ToArrow(output.Schema), traces) is { } built)
+            {
+                var buildTicks = Stopwatch.GetTimestamp() - b0;
+                var ba1 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
+                var bw0 = Stopwatch.GetTimestamp();
+                await blocks.ApplyViewAsync(built.Batches, built.Entries, tick, cancellationToken).ConfigureAwait(false);
+                if (OutputTrace is { } blockTrace)
+                {
+                    File.AppendAllText(blockTrace, $"RUNNER-SPLIT {connector.ViewName} blocks=1 mat={buildTicks * 1000.0 / Stopwatch.Frequency:F0} apply={Stopwatch.GetElapsedTime(bw0).TotalMilliseconds:F0} rows={built.Entries.Count} form_mib=0 arrow_mib={(ba1 - ba0) / 1048576.0:F0} apply_mib={(GC.GetTotalAllocatedBytes(precise: true) - ba1) / 1048576.0:F0}\n");
+                }
+
+                incremental.Pending = new ZSetBuilder<StructuralRow, Z64>();
+                incremental.Written = true;
+                _profile?.Output(connector.ViewName).Add(buildTicks, Stopwatch.GetTimestamp() - bw0, built.Entries.Count);
+                return;
+            }
+        }
+
         var m0 = Stopwatch.GetTimestamp();
         var a0 = OutputTrace is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
         // The first write streams the view (a lazily restored view is never read into memory).

@@ -161,6 +161,9 @@ internal abstract class RunnerProgram
         public override ZSet<StructuralRow, Z64> LastDelta => output.View.LastDelta;
 
         public override IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() => output.View.EnumerateCurrent();
+
+        internal override IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace>? ViewTraces =>
+            output.View.ViewTrace is { } trace ? [trace] : null;
     }
 
     private sealed class ParallelOutput(ParallelProgramOutput output) : RunnerOutput
@@ -175,6 +178,8 @@ internal abstract class RunnerProgram
         public override ZSet<StructuralRow, Z64> LastDelta => output.CurrentDelta;
 
         public override IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() => output.EnumerateView();
+
+        internal override IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace>? ViewTraces => output.ShardTraces;
     }
 }
 
@@ -199,4 +204,8 @@ internal abstract class RunnerOutput
     /// <summary>Every row of the view, for a full write — streamed without reading a lazily
     /// restored view into memory where the program can (docs/design-durable-state.md §1f, increment 6).</summary>
     public virtual IEnumerable<KeyValuePair<StructuralRow, Z64>> EnumerateView() => CurrentView;
+
+    /// <summary>Each worker's view held as blocks, when every one is (docs/design-bounded-memory.md
+    /// §3h): a full write builds its Arrow from them. Null otherwise.</summary>
+    internal virtual IReadOnlyList<DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace>? ViewTraces => null;
 }

@@ -123,6 +123,27 @@ internal sealed class BlockSchema : ITraceBlockFormat
         _valueStrings = [.. Enumerable.Range(0, ValueKinds.Length).Where(c => ValueKinds[c] == CellKind.Utf8)];
     }
 
+    ITraceBlock? ITraceBlockFormat.Gather(ITraceBlock[] sources, int[] indexes, long[] values, long[] weights, int[] hashes, int count)
+    {
+        if (ValueKinds is not [CellKind.Int64])
+        {
+            return null;
+        }
+
+        var bodies = new TraceBlock[count];
+        for (var i = 0; i < count; i++)
+        {
+            if (sources[i] is not TraceBlock body || !body.Schema.KeyKinds.AsSpan().SequenceEqual(KeyKinds))
+            {
+                return null;
+            }
+
+            bodies[i] = body;
+        }
+
+        return BlockWriter.Gather(this, bodies, indexes, values, weights, hashes, count);
+    }
+
     ITraceBlock ITraceBlockFormat.Encode(StructuralRow[] keys, StructuralRow[] values, long[] weights, int[] hashes, int count) =>
         Encode(keys, values, weights, hashes, count);
 
