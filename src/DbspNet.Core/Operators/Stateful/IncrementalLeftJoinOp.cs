@@ -149,7 +149,7 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var leftOld = _leftTrace;
         var rightOld = _rightTrace;
 
-        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
 
         // Every key that could have a non-zero delta this tick shows up in
         // dl or dr; keys not touched either way contribute nothing.

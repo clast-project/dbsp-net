@@ -92,7 +92,7 @@ internal sealed class DistinctOp<TKey, TWeight> : IOperator, ISnapshotable, IInt
             return;
         }
 
-        var outputBuilder = new ZSetBuilder<TKey, TWeight>(_lastOutputSize);
+        var outputBuilder = Blocks.DeltaSpill.For<TKey, TWeight>(_output.DeltaFormat, _lastOutputSize);
         foreach (var (key, dw) in delta)
         {
             var before = _trace.WeightOf(key);

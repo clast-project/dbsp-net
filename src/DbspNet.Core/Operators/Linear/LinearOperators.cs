@@ -77,7 +77,26 @@ public static class LinearOperators
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(projection);
-        return builder.Apply(input, z => z.MapKeys(projection));
+
+        // The output stream's block format, if the compiler gives it one (in-step delta spilling,
+        // docs/design-bounded-memory.md §5.14), is read when the step runs.
+        Stream<ZSet<TOut, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
+        {
+            if (output!.DeltaFormat is not { } format)
+            {
+                return z.MapKeys(projection);
+            }
+
+            var b = Stateful.Blocks.DeltaSpill.For<TOut, TWeight>(format, z.Count);
+            foreach (var (k, w) in z)
+            {
+                b.Add(projection(k), w);
+            }
+
+            return b.Build();
+        });
+        return output;
     }
 
     /// <summary>Keep only rows satisfying the predicate.</summary>
@@ -90,7 +109,29 @@ public static class LinearOperators
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(predicate);
-        return builder.Apply(input, z => z.Filter(predicate));
+
+        // A block-backed input filters into blocks by itself; a managed one does when the output
+        // stream has a block format (§5.14).
+        Stream<ZSet<TRow, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
+        {
+            if (output!.DeltaFormat is not { } format || z.IsExternal)
+            {
+                return z.Filter(predicate);
+            }
+
+            var b = Stateful.Blocks.DeltaSpill.For<TRow, TWeight>(format, 0);
+            foreach (var (k, w) in z)
+            {
+                if (predicate(k))
+                {
+                    b.Add(k, w);
+                }
+            }
+
+            return b.Build();
+        });
+        return output;
     }
 
     /// <summary>Z-set addition of two streams, tick-by-tick.</summary>
@@ -162,9 +203,10 @@ public static class LinearOperators
         // (docs/design-row-representation.md §16.7). Fresh allocation each tick —
         // no cross-tick reuse — so there is no z⁻¹/retention hazard.
         var lastSize = 0;
-        return builder.Apply(input, z =>
+        Stream<ZSet<TOut, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
         {
-            var b = new ZSetBuilder<TOut, TWeight>(lastSize);
+            var b = Stateful.Blocks.DeltaSpill.For<TOut, TWeight>(output!.DeltaFormat, lastSize);
             foreach (var (row, w) in z)
             {
                 var (keep, value) = step(row);
@@ -178,6 +220,7 @@ public static class LinearOperators
             lastSize = result.Count;
             return result;
         });
+        return output;
     }
 
     /// <summary>
@@ -197,9 +240,10 @@ public static class LinearOperators
 
         // Last-output sizing (see MapFilterRows) — fresh alloc, no reuse.
         var lastSize = 0;
-        return builder.Apply(input, z =>
+        Stream<ZSet<TOut, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
         {
-            var b = new ZSetBuilder<TOut, TWeight>(lastSize);
+            var b = Stateful.Blocks.DeltaSpill.For<TOut, TWeight>(output!.DeltaFormat, lastSize);
             foreach (var (row, w) in z)
             {
                 foreach (var expanded in expand(row))
@@ -212,5 +256,6 @@ public static class LinearOperators
             lastSize = result.Count;
             return result;
         });
+        return output;
     }
 }

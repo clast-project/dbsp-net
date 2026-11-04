@@ -243,7 +243,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             }
         }
 
-        var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         foreach (var (key, before) in touched)
         {
             var after = Current(key);

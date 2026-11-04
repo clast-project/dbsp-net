@@ -66,7 +66,18 @@ public sealed class ZSetBuilder<TKey, TWeight>
         _store = entries;
     }
 
-    public int Count => _chunked?.Count ?? Entries.Count;
+    // A builder that can freeze what it holds into block runs (docs/design-bounded-memory.md §5.14).
+    internal ZSetBuilder(ZSetSpillingStore<TKey, TWeight> spilling)
+    {
+        _store = spilling;
+    }
+
+    // The spilling store, or null; tested only after the chunked map (the default) misses.
+    private ZSetSpillingStore<TKey, TWeight>? Spilling => _store as ZSetSpillingStore<TKey, TWeight>;
+
+    /// <summary>Entries held: exact in memory; for a builder that has frozen part of its entries
+    /// into blocks, an upper bound (entries in separate chunks can cancel).</summary>
+    public int Count => _chunked?.Count ?? Spilling?.Count ?? Entries.Count;
 
     private Dictionary<TKey, TWeight> Entries =>
         _store is null
@@ -106,6 +117,12 @@ public sealed class ZSetBuilder<TKey, TWeight>
             return;
         }
 
+        if (Spilling is { } s)
+        {
+            s.Add(key, weight);
+            return;
+        }
+
         var d = Entries;
         if (d.TryGetValue(key, out var existing))
         {
@@ -142,6 +159,12 @@ public sealed class ZSetBuilder<TKey, TWeight>
             return m.Count == 0 ? ZSet<TKey, TWeight>.Empty : new ZSet<TKey, TWeight>(m);
         }
 
+        if (Spilling is { } s)
+        {
+            _store = null; // prevent reuse
+            return s.Build();
+        }
+
         var d = Entries;
         _store = null; // prevent reuse
         if (d.Count == 0)
@@ -166,6 +189,10 @@ public sealed class ZSetBuilder<TKey, TWeight>
         {
             m.Clear();
         }
+        else if (Spilling is { } s)
+        {
+            s.Reset();
+        }
         else
         {
             Entries.Clear();
@@ -179,7 +206,23 @@ public sealed class ZSetBuilder<TKey, TWeight>
     /// is invalidated by the next <see cref="Reset"/>; the caller guarantees it is
     /// dead by then (the §20 dead-after-tick / no-<c>z⁻¹</c> edge constraint).
     /// </summary>
-    public ZSet<TKey, TWeight> BuildShared() => _chunked is { } m ? new(m) : new(Entries);
+    public ZSet<TKey, TWeight> BuildShared()
+    {
+        if (_chunked is { } m)
+        {
+            return new(m);
+        }
+
+        if (Spilling is { } s)
+        {
+            // Built sets own their storage; the store starts over for the next tick.
+            var built = s.Build();
+            s.Reset();
+            return built;
+        }
+
+        return new(Entries);
+    }
 }
 
 internal static class ZSetBuilder

@@ -1187,6 +1187,31 @@ internal sealed class BlockedIndexedTrace
     private bool Dropped(StructuralRow key, long floor) =>
         floor != long.MinValue && _monotoneKey!(key) < floor;
 
+    /// <summary>Freeze, then merge every run into one (a spilling delta builder's last step, §5.14):
+    /// the trace is then one consolidated run, so its entry count is exact. The spiller sees the
+    /// result.</summary>
+    internal void MergeAllRuns()
+    {
+        Freeze();
+        if (_runs.Count < 2)
+        {
+            return;
+        }
+
+        while (_runs.Count >= 2)
+        {
+            var merged = Merge(_runs[0], _runs[1]);
+            _runs.RemoveRange(0, 2);
+            if (merged is not null)
+            {
+                _runs.Insert(0, merged);
+            }
+        }
+
+        _materialized = null;
+        BlockAccess.Spiller?.AfterCompact(this);
+    }
+
     // Merge while the newest run is at least a quarter of the next: about log4 levels.
     private void Compact()
     {

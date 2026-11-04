@@ -196,7 +196,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
             }
         }
 
-        var builder = new ZSetBuilder<TRow, Z64>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         var oldAll = CollectionsMarshal.AsSpan(_oldWindows);
         foreach (var (key, range) in _touched)
         {
@@ -238,7 +238,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         }
 
         _store!.Integrate(changes);
-        var builder = new ZSetBuilder<TRow, Z64>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         var oldAll = CollectionsMarshal.AsSpan(_oldWindows);
         foreach (var (key, range) in _touched)
         {

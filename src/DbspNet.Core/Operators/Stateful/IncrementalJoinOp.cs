@@ -142,7 +142,7 @@ internal sealed class IncrementalJoinOp<TKey, TLeft, TRight, TOut, TWeight> : IO
         }
         else
         {
-            builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+            builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
         }
 
         // dl ⋈ R_t

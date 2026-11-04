@@ -56,6 +56,12 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         _store = new InlineEntry(key, weight);
     }
 
+    // Takes ownership: a block-backed (or other external) set (docs/design-bounded-memory.md §5.14).
+    internal ZSet(ZSetExternalStore<TKey, TWeight> store)
+    {
+        _store = store;
+    }
+
     /// <summary>An empty Z-set to mutate in place (a trace's state), in the configured map.</summary>
     internal static ZSet<TKey, TWeight> NewMutable() =>
         ZSetMapMode.Chunked ? new(new ChunkedMap<TKey, TWeight>()) : new(new Dictionary<TKey, TWeight>());
@@ -71,6 +77,11 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         if (Chunked is { } c)
         {
             return Self + 64 + c.ArrayBytes;
+        }
+
+        if (External is { } x)
+        {
+            return Self + x.ResidentBytes;
         }
 
         if (Dict is not { } d)
@@ -92,6 +103,13 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         _store.GetType() == typeof(ChunkedMap<TKey, TWeight>) ? Unsafe.As<ChunkedMap<TKey, TWeight>>(_store) : null;
 
     private bool IsInline => _store.GetType() == typeof(InlineEntry);
+
+    /// <summary>The external backing (block runs), or null. Checked last: the three managed backings
+    /// are exact type checks, and every hot path settles on one of them first.</summary>
+    internal ZSetExternalStore<TKey, TWeight>? External => _store as ZSetExternalStore<TKey, TWeight>;
+
+    /// <summary>Whether the entries are held outside a managed map (block runs, §5.14).</summary>
+    internal bool IsExternal => _store is ZSetExternalStore<TKey, TWeight>;
 
     // The inline entry's fields; valid only while Dict is null.
     private ref TKey OneKey => ref Unsafe.As<InlineEntry>(_store).Key;
@@ -118,9 +136,13 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     internal static ZSet<TKey, TWeight> Inline(TKey key, TWeight weight) =>
         TWeight.IsZero(weight) ? new(default!, TWeight.Zero) : new(key, weight);
 
-    public int Count => Dict?.Count ?? Chunked?.Count ?? (TWeight.IsZero(OneWeight) ? 0 : 1);
+    public int Count => Dict?.Count ?? Chunked?.Count ?? (IsInline ? (TWeight.IsZero(OneWeight) ? 0 : 1) : Unsafe.As<ZSetExternalStore<TKey, TWeight>>(_store).Count);
 
-    public bool IsEmpty => Dict is { } d ? d.Count == 0 : Chunked is { } c ? c.Count == 0 : TWeight.IsZero(OneWeight);
+    public bool IsEmpty =>
+        Dict is { } d ? d.Count == 0
+        : Chunked is { } c ? c.Count == 0
+        : IsInline ? TWeight.IsZero(OneWeight)
+        : Unsafe.As<ZSetExternalStore<TKey, TWeight>>(_store).Count == 0;
 
     /// <summary>
     /// Sum of every entry's weight. Z-set-linear alternative to
@@ -171,7 +193,18 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     }
 
     public IEnumerable<TKey> Keys =>
-        Dict is { } d ? d.Keys : Chunked is { } c ? c.Keys : TWeight.IsZero(OneWeight) ? Array.Empty<TKey>() : [OneKey];
+        Dict is { } d ? d.Keys
+        : Chunked is { } c ? c.Keys
+        : External is not null ? ExternalKeys()
+        : TWeight.IsZero(OneWeight) ? Array.Empty<TKey>() : [OneKey];
+
+    private IEnumerable<TKey> ExternalKeys()
+    {
+        foreach (var (k, _) in Entries())
+        {
+            yield return k;
+        }
+    }
 
     private bool TryGetWeight(TKey key, out TWeight weight)
     {
@@ -183,6 +216,11 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         if (Chunked is { } c)
         {
             return c.TryGetValue(key, out weight);
+        }
+
+        if (!IsInline)
+        {
+            return Unsafe.As<ZSetExternalStore<TKey, TWeight>>(_store).TryGetWeight(key, out weight);
         }
 
         if (!TWeight.IsZero(OneWeight) && EqualityComparer<TKey>.Default.Equals(OneKey, key))
@@ -207,6 +245,17 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             return new ZSetBuilder<TKey, TWeight>(ChunkedMap<TKey, TWeight>.CopyOf(c));
         }
 
+        if (External is { } x)
+        {
+            var copy = x.NewBuilder(Count + extra);
+            foreach (var (k, w) in Entries())
+            {
+                copy.Add(k, w);
+            }
+
+            return copy;
+        }
+
         var b = new ZSetBuilder<TKey, TWeight>(1 + extra);
         if (!TWeight.IsZero(OneWeight))
         {
@@ -219,7 +268,12 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public ZSet<TKey, TWeight> Plus(ZSet<TKey, TWeight> other)
     {
         ArgumentNullException.ThrowIfNull(other);
-        var b = ToBuilder(other.Count);
+        if ((External?.Plus(other) ?? other.External?.Plus(this)) is { } merged)
+        {
+            return merged; // block runs merge, nothing re-hashed (§5.14)
+        }
+
+        var b = other.External is { } ox && !IsExternal ? ExternalCopy(ox, other.Count) : ToBuilder(other.Count);
         foreach (var (k, w) in other.Entries())
         {
             b.Add(k, w);
@@ -231,7 +285,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public ZSet<TKey, TWeight> Minus(ZSet<TKey, TWeight> other)
     {
         ArgumentNullException.ThrowIfNull(other);
-        var b = ToBuilder(other.Count);
+        var b = other.External is { } ox && !IsExternal ? ExternalCopy(ox, other.Count) : ToBuilder(other.Count);
         foreach (var (k, w) in other.Entries())
         {
             b.Add(k, TWeight.Negate(w));
@@ -240,8 +294,32 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         return b.Build();
     }
 
+    // This set's entries in a builder of another set's external kind (a sum with a block-backed set
+    // spills like it).
+    private ZSetBuilder<TKey, TWeight> ExternalCopy(ZSetExternalStore<TKey, TWeight> like, int extra)
+    {
+        var b = like.NewBuilder(Count + extra);
+        foreach (var (k, w) in Entries())
+        {
+            b.Add(k, w);
+        }
+
+        return b;
+    }
+
     public ZSet<TKey, TWeight> Negate()
     {
+        if (External is { } x)
+        {
+            var nb = x.NewBuilder(Count);
+            foreach (var (k, w) in Entries())
+            {
+                nb.Add(k, TWeight.Negate(w));
+            }
+
+            return nb.Build();
+        }
+
         if (ZSetMapMode.Chunked)
         {
             var m = new ChunkedMap<TKey, TWeight>(Count);
@@ -267,6 +345,17 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         if (TWeight.IsZero(scalar))
         {
             return Empty;
+        }
+
+        if (External is { } x)
+        {
+            var sb = x.NewBuilder(Count);
+            foreach (var (k, w) in Entries())
+            {
+                sb.Add(k, TWeight.Multiply(w, scalar));
+            }
+
+            return sb.Build();
         }
 
         if (ZSetMapMode.Chunked)
@@ -300,6 +389,20 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     public ZSet<TKey, TWeight> Filter(Func<TKey, bool> predicate)
     {
         ArgumentNullException.ThrowIfNull(predicate);
+        if (External is { } x)
+        {
+            var fb = x.NewBuilder(0);
+            foreach (var (k, w) in Entries())
+            {
+                if (predicate(k))
+                {
+                    fb.Add(k, w);
+                }
+            }
+
+            return fb.Build();
+        }
+
         if (ZSetMapMode.Chunked)
         {
             var m = new ChunkedMap<TKey, TWeight>();
@@ -357,6 +460,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
             return;
         }
 
+        Internalize();
         if (IsInline)
         {
             if (delta.Count == 1)
@@ -450,9 +554,50 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         }
     }
 
+    // An external set about to be mutated in place moves into a managed map (state is never block
+    // backed by a builder; this is the fallback that keeps the in-place paths total).
+    private void Internalize()
+    {
+        if (External is not { } x)
+        {
+            return;
+        }
+
+        if (ZSetMapMode.Chunked)
+        {
+            var m = new ChunkedMap<TKey, TWeight>(x.Count);
+            foreach (var (k, w) in Entries())
+            {
+                m[k] = w;
+            }
+
+            _store = m;
+        }
+        else
+        {
+            var d = new Dictionary<TKey, TWeight>(x.Count);
+            foreach (var (k, w) in Entries())
+            {
+                d[k] = w;
+            }
+
+            _store = d;
+        }
+    }
+
     // The only entry of a one-entry Z-set.
     private KeyValuePair<TKey, TWeight> Single()
     {
+        if (External is not null)
+        {
+            foreach (var kv in Entries())
+            {
+                return kv;
+            }
+
+            throw new InvalidOperationException("empty Z-set");
+        }
+
         if (Chunked is { } c)
         {
             foreach (var kv in c)
@@ -493,6 +638,7 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         }
 
         ArgumentNullException.ThrowIfNull(monotoneKey);
+        Internalize();
         if (Chunked is { } map)
         {
             List<TKey>? dropped = null;
@@ -554,6 +700,11 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     /// </summary>
     internal ZSet<TKey, TWeight> Clone()
     {
+        if (External is { } x)
+        {
+            return new ZSet<TKey, TWeight>(x); // immutable: share it
+        }
+
         if (IsInline || Count == 1)
         {
             var (k, w) = IsEmpty ? new KeyValuePair<TKey, TWeight>(default!, TWeight.Zero) : Single();
@@ -603,10 +754,17 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
     IEnumerator IEnumerable.GetEnumerator() => new Enumerator(this);
 
     /// <summary>Enumerates a <see cref="ZSet{TKey,TWeight}"/> in either representation.</summary>
+    /// <remarks>The fourth backing (an external store, §5.14) rides the inline arm: its
+    /// <c>_other</c> field is the external store's enumerator instead of the inline set, told apart by
+    /// one bool, so the dictionary and chunked arms (every delta below the spill threshold) test
+    /// exactly what they did before.</remarks>
     public struct Enumerator : IEnumerator<KeyValuePair<TKey, TWeight>>
     {
-        private readonly ZSet<TKey, TWeight>? _inline;
+        // Null for a dictionary or chunked map; the set itself when inline; the external store's
+        // enumerator when external.
+        private readonly object? _other;
         private readonly bool _isChunked;
+        private readonly bool _isExternal;
         private Dictionary<TKey, TWeight>.Enumerator _dictionary;
         private ChunkedMap<TKey, TWeight>.Enumerator _chunked;
         private bool _done;
@@ -615,42 +773,64 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         {
             if (set.Dict is { } d)
             {
-                _inline = null;
+                _other = null;
                 _isChunked = false;
+                _isExternal = false;
                 _dictionary = d.GetEnumerator();
                 _chunked = default;
                 _done = false;
             }
             else if (set.Chunked is { } c)
             {
-                _inline = null;
+                _other = null;
                 _isChunked = true;
+                _isExternal = false;
                 _dictionary = default;
                 _chunked = c.GetEnumerator();
                 _done = false;
             }
-            else
+            else if (set.IsInline)
             {
-                _inline = set;
+                _other = set;
                 _isChunked = false;
+                _isExternal = false;
                 _dictionary = default;
                 _chunked = default;
                 _done = TWeight.IsZero(set.OneWeight);
             }
+            else
+            {
+                _other = Unsafe.As<ZSetExternalStore<TKey, TWeight>>(set._store).GetEnumerator();
+                _isChunked = false;
+                _isExternal = true;
+                _dictionary = default;
+                _chunked = default;
+                _done = false;
+            }
         }
 
         public readonly KeyValuePair<TKey, TWeight> Current =>
-            _inline is not null ? new(_inline.OneKey, _inline.OneWeight)
+            _other is not null ? OtherCurrent
             : _isChunked ? _chunked.Current
             : _dictionary.Current;
+
+        private readonly KeyValuePair<TKey, TWeight> OtherCurrent =>
+            _isExternal
+                ? Unsafe.As<IEnumerator<KeyValuePair<TKey, TWeight>>>(_other!).Current
+                : new(Unsafe.As<ZSet<TKey, TWeight>>(_other!).OneKey, Unsafe.As<ZSet<TKey, TWeight>>(_other!).OneWeight);
 
         readonly object IEnumerator.Current => Current;
 
         public bool MoveNext()
         {
-            if (_inline is null)
+            if (_other is null)
             {
                 return _isChunked ? _chunked.MoveNext() : _dictionary.MoveNext();
+            }
+
+            if (_isExternal)
+            {
+                return Unsafe.As<IEnumerator<KeyValuePair<TKey, TWeight>>>(_other).MoveNext();
             }
 
             if (_done)
@@ -665,7 +845,14 @@ public sealed class ZSet<TKey, TWeight> : IEquatable<ZSet<TKey, TWeight>>, IMult
         // Lets a method of ZSet foreach over Entries() directly.
         public readonly Enumerator GetEnumerator() => this;
 
-        public void Dispose() => _dictionary.Dispose();
+        public void Dispose()
+        {
+            _dictionary.Dispose();
+            if (_isExternal)
+            {
+                Unsafe.As<IEnumerator<KeyValuePair<TKey, TWeight>>>(_other!).Dispose();
+            }
+        }
 
         void IEnumerator.Reset() => throw new NotSupportedException();
     }

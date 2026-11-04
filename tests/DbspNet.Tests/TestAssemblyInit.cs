@@ -13,6 +13,19 @@ internal static class TestAssemblyInit
 #pragma warning disable CA2255
     [ModuleInitializer]
 #pragma warning restore CA2255
-    internal static void Init() =>
+    internal static void Init()
+    {
         RuntimeHelpers.RunModuleConstructor(typeof(DbspNet.Persistence.Blocks.BlockSchema).Module.ModuleHandle);
+
+        // A forced in-step spill run (DBSPNET_STEP_SPILL_ROWS=0) writes how many deltas it built as
+        // blocks, so a green suite is known not to be vacuous (docs/design-bounded-memory.md §5.14). Appended:
+        // a test that loads a second copy of this assembly (its own AssemblyLoadContext) adds a zero line.
+        if (Environment.GetEnvironmentVariable("DBSPNET_STEP_SPILL_STATS") is { Length: > 0 } path)
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => File.AppendAllText(
+                path,
+                FormattableString.Invariant(
+                    $"blocked deltas {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds}, rows {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows}\n"));
+        }
+    }
 }

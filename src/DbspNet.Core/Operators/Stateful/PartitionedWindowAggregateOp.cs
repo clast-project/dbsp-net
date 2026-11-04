@@ -200,7 +200,7 @@ internal sealed class PartitionedWindowAggregateOp<TInRow, TAgg, TOutRow, TKey>
     {
         var delta = _input.Current;
         _changes.Record(delta);
-        var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
 
         if (!delta.IsEmpty)
         {

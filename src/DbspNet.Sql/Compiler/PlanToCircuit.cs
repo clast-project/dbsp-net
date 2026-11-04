@@ -2324,12 +2324,30 @@ public static partial class PlanToCircuit
 
         MemoMisses++;
         var stream = CompilePlanUncached(builder, plan, ctx);
+        AttachDeltaFormat(stream, plan.Schema);
         if (plan is not (ScanPlan or CteScanPlan))
         {
             ctx.PlanCache[plan] = stream;
         }
 
         return stream;
+    }
+
+    /// <summary>
+    /// In-step delta spilling (docs/design-bounded-memory.md §5.14, D3): give a structural stream its
+    /// rows' Z-set block format, so the operator writing it builds a delta past
+    /// <c>DBSPNET_STEP_SPILL_ROWS</c> as blocks. Only while the knob is on (otherwise no format, and
+    /// every builder is the plain one); the first schema a stream is given wins (a pass-through plan
+    /// returns its input's stream).
+    /// </summary>
+    internal static void AttachDeltaFormat(Stream<ZSet<StructuralRow, Z64>> stream, Schema schema)
+    {
+        if (SpillSettings.StepSpillRows is null || stream.DeltaFormat is not null)
+        {
+            return;
+        }
+
+        stream.DeltaFormat = TraceBlockFormats.Create(schema, Schema.Empty);
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompilePlanUncached(
@@ -3718,6 +3736,7 @@ public static partial class PlanToCircuit
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
+        AttachDeltaFormat(joined, joinedSchema);
         var nullKeyPadded = builder.MapRows(
             nullKeyLeft,
             row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount));
@@ -4057,6 +4076,7 @@ public static partial class PlanToCircuit
             leftShape: (rightKeySchema, plan.Right.Schema), rightShape: (leftKeySchema, plan.Left.Schema),
             residual: pairResidual is null ? null : (_, r, l) => pairResidual(l, r)); // the operator's left is the user's right
 
+        AttachDeltaFormat(joined, joinedSchema);
         var nullKeyPadded = builder.MapRows(
             nullKeyRight,
             row => NullPadLeft(codec, joinedSchema, row, leftCount, rightCount));
@@ -4143,6 +4163,7 @@ public static partial class PlanToCircuit
             leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema),
             residual: pairResidual is null ? null : (_, l, r) => pairResidual(l, r));
 
+        AttachDeltaFormat(joined, joinedSchema);
         var nullKeyLeftPadded = builder.MapRows(
             nullKeyLeft,
             row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount));

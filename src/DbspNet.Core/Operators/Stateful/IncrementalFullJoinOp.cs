@@ -157,7 +157,7 @@ internal sealed class IncrementalFullJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var leftOld = _leftTrace;
         var rightOld = _rightTrace;
 
-        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
 
         var touched = new HashSet<TKey>(dl.GroupCount + dr.GroupCount);
         foreach (var k in dl.Keys)

@@ -1,0 +1,58 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Algebra;
+
+namespace DbspNet.Core.Collections;
+
+/// <summary>
+/// A Z-set's entries held outside a hash map (docs/design-bounded-memory.md §5.14, D1): the fourth
+/// backing of <see cref="ZSet{TKey,TWeight}"/>, after a dictionary, a chunked map and one inline
+/// entry. The one implementation is a sorted, consolidated block run (<c>BlockedRows</c>) that a
+/// spilling builder makes for a delta past the in-step spill threshold. Immutable once built.
+/// </summary>
+internal abstract class ZSetExternalStore<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    /// <summary>Entries (exact: the store is consolidated).</summary>
+    public abstract int Count { get; }
+
+    /// <summary>The weight of <paramref name="key"/>, found by its hash.</summary>
+    public abstract bool TryGetWeight(TKey key, out TWeight weight);
+
+    /// <summary>Every entry, each decoded as it is read.</summary>
+    public abstract IEnumerator<KeyValuePair<TKey, TWeight>> GetEnumerator();
+
+    /// <summary>A builder for a set of the same rows (a filter, a sum, a negation): it spills the
+    /// same way, under the same format.</summary>
+    public abstract ZSetBuilder<TKey, TWeight> NewBuilder(int capacity);
+
+    /// <summary>This set plus <paramref name="other"/>, or null to take the generic path (a
+    /// builder fed both).</summary>
+    public virtual ZSet<TKey, TWeight>? Plus(ZSet<TKey, TWeight> other) => null;
+
+    /// <summary>Approximate heap bytes the store holds resident (the census).</summary>
+    public abstract long ResidentBytes { get; }
+}
+
+/// <summary>
+/// A builder's backing that can leave memory (docs/design-bounded-memory.md §5.14, D2): adds go to a
+/// managed map; past a threshold the map is frozen into a block run, and the built set is block
+/// backed. A builder holds either a map or one of these in its one store field.
+/// </summary>
+internal abstract class ZSetSpillingStore<TKey, TWeight>
+    where TKey : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    /// <summary>Entries added so far: exact in memory, an upper bound once a chunk has frozen
+    /// (entries in separate chunks can cancel).</summary>
+    public abstract int Count { get; }
+
+    public abstract void Add(TKey key, TWeight weight);
+
+    /// <summary>The set: managed while nothing has frozen (unless forced), else block backed.</summary>
+    public abstract ZSet<TKey, TWeight> Build();
+
+    /// <summary>Forget what was added (a pooled builder's next tick).</summary>
+    public abstract void Reset();
+}

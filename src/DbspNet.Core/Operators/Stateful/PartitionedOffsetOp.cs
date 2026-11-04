@@ -420,7 +420,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
         _changes.Record(delta);
         if (_store is not null)
         {
-            var storeBuilder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
+            var storeBuilder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
             if (!delta.IsEmpty)
             {
                 StepStore(delta, storeBuilder);
@@ -477,7 +477,7 @@ internal sealed class PartitionedOffsetOp<TInRow, TOutRow, TKey> : IOperator, IS
             }
         }
 
-        var builder = new ZSetBuilder<TOutRow, Z64>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         if (touched is not null)
         {
             foreach (var (key, dws) in touched)

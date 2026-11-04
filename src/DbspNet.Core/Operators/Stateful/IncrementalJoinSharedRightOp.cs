@@ -77,7 +77,7 @@ internal sealed class IncrementalJoinSharedRightOp<TKey, TLeft, TRight, TOut, TW
         var dl = _leftIn.Current;
         var dr = _rightDelta.Current;
 
-        var builder = new ZSetBuilder<TOut, TWeight>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
         // dl ⋈ R_t — the shared arrangement already folded dr into R_t this tick.
         IncrementalJoinCore.JoinInto(dl, _rightArrangement.Current, _combine, _residual, builder);
         // L_{t-1} ⋈ dr — the delayed left trace against this tick's right delta.

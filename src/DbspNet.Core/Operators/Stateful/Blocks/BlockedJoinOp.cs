@@ -120,7 +120,7 @@ internal sealed class BlockedJoinOp : IOperator, ISnapshotable, IIntrospectable,
         // As IncrementalJoinOp: R_t = R_{t-1} + dr before the first pass absorbs dl ⋈ dr; the left
         // trace stays at L_{t-1} for the second pass.
         _right.Integrate(dr);
-        var builder = new ZSetBuilder<StructuralRow, Z64>(_lastOutputSize);
+        var builder = DeltaSpill.Rows(_output.DeltaFormat, _lastOutputSize);
         foreach (var (key, leftGroup) in dl)
         {
             var visitor = new DeltaOnLeft(this, key, leftGroup, builder);

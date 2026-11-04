@@ -11,6 +11,12 @@ public sealed class Stream<T> : IReleasableStream
 {
     internal T Current = default!;
 
+    /// <summary>The block format of this stream's rows (an <c>ITraceBlockFormat</c> for a structural
+    /// Z-set stream), set by the compiler only while in-step delta spilling is on
+    /// (docs/design-bounded-memory.md §5.14): an operator writing this stream builds its delta with
+    /// <c>DeltaSpill.Rows(DeltaFormat, …)</c>. Null: the plain builder.</summary>
+    internal object? DeltaFormat;
+
     int IReleasableStream.Producer { get; set; } = -2;
 
     bool IReleasableStream.Pinned { get; set; }

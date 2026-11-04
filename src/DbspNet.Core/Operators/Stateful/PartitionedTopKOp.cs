@@ -184,7 +184,7 @@ internal sealed class PartitionedTopKOp<TRow, TKey> : IOperator, ISnapshotable, 
             }
         }
 
-        var builder = new ZSetBuilder<TRow, Z64>(_lastOutputSize);
+        var builder = Blocks.DeltaSpill.For<TRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         if (touched is not null)
         {
             foreach (var key in touched)
