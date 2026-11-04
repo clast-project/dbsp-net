@@ -15,6 +15,8 @@ public sealed class Stream<T> : IReleasableStream
 
     bool IReleasableStream.Pinned { get; set; }
 
+    bool IReleasableStream.CommittedEveryTick { get; set; }
+
     // The released value's Count, so an operator's LastOutputRows (introspection, read after the
     // step) still reports the tick's output once release has dropped the value; −1 when not released.
     private long _releasedCount = -1;

@@ -228,7 +228,7 @@ public class IvmMultiBatch
             var live = GC.GetGCMemoryInfo(GCKind.FullBlocking);
             phaseAlloc = GC.GetTotalAllocatedBytes(precise: true);
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"PHASELIVE {label} alloc_since_mib={sinceMib:F0} live_mib={live.PromotedBytes / 1048576.0:F0} committed_before_mib={before.TotalCommittedBytes / 1048576.0:F0} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops}"));
+                $"PHASELIVE {label} alloc_since_mib={sinceMib:F0} live_mib={live.PromotedBytes / 1048576.0:F0} committed_before_mib={before.TotalCommittedBytes / 1048576.0:F0} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0}"));
         }
 
         void ResidencyAt(string tag, int epoch)
@@ -360,7 +360,7 @@ public class IvmMultiBatch
                     }
 
                     _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                        $"TICKLIVE tick={t} heap_before_mib={before / 1048576.0:F0} committed_mib={committed / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops}"));
+                        $"TICKLIVE tick={t} heap_before_mib={before / 1048576.0:F0} committed_mib={committed / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0}"));
                 };
             }
             else

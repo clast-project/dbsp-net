@@ -73,10 +73,62 @@ public class XtServerCensus
             System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             var live = GC.GetGCMemoryInfo(GCKind.FullBlocking).PromotedBytes;
+            if (Environment.GetEnvironmentVariable("XT_RELEASE_VIEW_INPUTS") == "1")
+            {
+                // Experiment (§5.9): what integrated views' pinned input deltas (LastDelta, read only
+                // by the runner once a view has been written) keep alive past the tick.
+                var released = 0;
+                long releasedRows = 0;
+                foreach (var rep in replicas)
+                {
+                    foreach (var op in rep.Operators)
+                    {
+                        var ot = op.GetType();
+                        if (ot.IsGenericType && ot.GetGenericTypeDefinition() == typeof(DbspNet.Core.Operators.Stateful.IntegrateOp<>)
+                            && ot.GetField("_input", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(op) is IReleasableStream s)
+                        {
+                            releasedRows += (long)(s.GetType().GetProperty("LastCount", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(s) ?? 0L);
+                            s.Release();
+                            released++;
+                        }
+                    }
+                }
+
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                var after = GC.GetGCMemoryInfo(GCKind.FullBlocking).PromotedBytes;
+                log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"VIEWRELEASE tick={t} streams={released} rows={releasedRows} live_before_mib={live / 1048576.0:F0} live_after_mib={after / 1048576.0:F0}"));
+                live = after;
+            }
+
+            {
+                // Where live bytes sit by generation (LOH: large arrays, e.g. block bodies or pooled
+                // arrays; gen2: small objects, e.g. rows), and evicted block bodies still reachable.
+                var info = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+                var gens = string.Join(" ", Enumerable.Range(0, info.GenerationInfo.Length).Select(g =>
+                    string.Create(CultureInfo.InvariantCulture, $"g{g}={info.GenerationInfo[g].SizeAfterBytes / 1048576.0:F0}")));
+                var (deadCount, deadBytes) = DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Enabled
+                    ? DbspNet.Persistence.Blocks.BlockCache.DroppedAlive() : (0, 0);
+                log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"GENS tick={t} {gens} (g3=LOH g4=POH) evicted_alive={deadCount} evicted_alive_mib={deadBytes / 1048576.0:F0}"));
+            }
+
+            if (int.TryParse(Environment.GetEnvironmentVariable("XT_PAUSE_AT_TICK"), out var pauseTick) && pauseTick == t)
+            {
+                // Hold here (after the forced GC) for a heap dump: until XT_PAUSE_AT_TICK's resume file
+                // ({census file}.resume) appears, or 20 minutes.
+                log.WriteLine($"PAUSED tick={t} pid={Environment.ProcessId}");
+                var until = DateTime.UtcNow.AddMinutes(20);
+                while (!File.Exists(censusFile + ".resume") && DateTime.UtcNow < until)
+                {
+                    Thread.Sleep(1000);
+                }
+            }
+
             var rows = BlockResidency.Walk(replicas, runner, -1);
             long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
             log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"TICKLIVE tick={t} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={before / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops}"));
+                $"TICKLIVE tick={t} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={before / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0}"));
             if (live / (double)(1L << 30) >= nextCensus)
             {
                 while (live / (double)(1L << 30) >= nextCensus)
@@ -128,7 +180,7 @@ public class XtServerCensus
                     var rows = BlockResidency.Walk(replicas, runner, -1);
                     long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
                     log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                        $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops}"));
+                        $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0}"));
                     nextHeap = Math.Max(heap, live) + (long)(opStepGib * (1L << 30));
                     if (live / (double)(1L << 30) >= nextOpCensus)
                     {

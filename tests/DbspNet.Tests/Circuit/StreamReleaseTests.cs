@@ -230,4 +230,63 @@ public class StreamReleaseTests
 
         Assert.Equal([1, 2, 3], r.Counts);
     }
+
+    [Fact]
+    public void An_input_is_released_after_its_last_reader_and_reads_zero_on_a_quiet_tick()
+    {
+        if (!StreamRelease.Enabled)
+        {
+            return; // DBSPNET_STREAM_RELEASE=0
+        }
+
+        // §5.10: an input is written by its handle's commit before every step (its zero when nothing
+        // was pushed), so it can go once its last reader has run — in the first tick too, where a
+        // bulk load's whole input otherwise lived to the next tick.
+        InputHandle<object> handle = null!;
+        Stream<object> input = null!;
+        FieldReader first = null!, last = null!;
+        var circuit = RootCircuit.Build(b =>
+        {
+            (handle, input) = b.Input<object>(0, (_, y) => y);
+            first = new FieldReader(input);
+            last = new FieldReader(input);
+            b.AddRawOperator(first);
+            b.AddRawOperator(last);
+        });
+
+        handle.Push(1);
+        circuit.Step();
+        Assert.Null(input.Current);
+        circuit.Step(); // nothing pushed: the readers see the zero, not a released null
+        Assert.Null(input.Current);
+        handle.Push(3);
+        circuit.Step();
+        Assert.Null(input.Current);
+
+        Assert.Equal([1, 0, 3], first.Seen.Cast<int>());
+        Assert.Equal([1, 0, 3], last.Seen.Cast<int>());
+    }
+
+    [Fact]
+    public void A_stream_written_outside_the_step_but_not_every_tick_is_kept()
+    {
+        if (!StreamRelease.Enabled)
+        {
+            return; // DBSPNET_STREAM_RELEASE=0
+        }
+
+        // Written once, before any step, and read every tick (a value set from outside, like a
+        // clock advanced only now and then): unlike an input it is not written again, so releasing
+        // it would hand later ticks null.
+        var external = new Stream<object>();
+        external.SetCurrent(5);
+        var reader = new FieldReader(external);
+        var circuit = Build(reader);
+        for (var i = 0; i < 3; i++)
+        {
+            circuit.Step();
+        }
+
+        Assert.Equal([5, 5, 5], reader.Seen.Cast<int>());
+    }
 }

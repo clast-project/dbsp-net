@@ -301,6 +301,7 @@ public sealed class RootCircuit
         var first = plan is null && !_learning && StreamRelease.FirstTickEnabled
             ? new StreamRelease.FirstTick(StreamRelease.ScanReaders(_operators), _operators.Count)
             : null;
+        first?.QueueInputs();
         var outerFirst = StreamRelease.CurrentFirstTick;
         StreamRelease.CurrentFirstTick = first;
         try

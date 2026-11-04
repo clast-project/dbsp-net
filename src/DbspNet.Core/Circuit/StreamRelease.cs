@@ -15,6 +15,11 @@ internal interface IReleasableStream
     /// <summary>Read after <see cref="RootCircuit.Step"/> (an output or input handle): never released.</summary>
     bool Pinned { get; set; }
 
+    /// <summary>Written before every step (an input handle's commit, even with nothing pushed), so it
+    /// can be released after its last reader: the next step's commit writes it again
+    /// (docs/design-bounded-memory.md §5.10).</summary>
+    bool CommittedEveryTick { get; set; }
+
     /// <summary>Drop the current value (to null: a missed reader fails loudly).</summary>
     void Release();
 }
@@ -60,7 +65,19 @@ internal static class StreamRelease
         /// read it as feedback, so the stream is kept.</summary>
         public int ReleasePoint(IReleasableStream stream, int producer)
         {
-            if (producer < 0 || stream.Pinned || !ByStream.TryGetValue(stream, out var refs))
+            if (stream.Pinned || !ByStream.TryGetValue(stream, out var refs))
+            {
+                return -1;
+            }
+
+            if (producer == -1 && stream.CommittedEveryTick)
+            {
+                // An input: written before the step, so every reader runs after the write; released
+                // after the last of them (and of the opaque operators, which may read anything).
+                return refs.Count == 0 ? -1 : Math.Max(refs.Max(), _opaqueMax);
+            }
+
+            if (producer < 0)
             {
                 return -1;
             }
@@ -163,6 +180,23 @@ internal static class StreamRelease
 
         /// <summary>Streams released in this tick so far (diagnostics).</summary>
         public int Released { get; private set; }
+
+        /// <summary>Queue the inputs the step's commit has just written (they were written before any
+        /// operator ran, so <see cref="Written"/> never sees them).</summary>
+        public void QueueInputs()
+        {
+            foreach (var stream in Readers.ByStream.Keys)
+            {
+                if (stream.Producer == -1 && stream.CommittedEveryTick)
+                {
+                    var at = Readers.ReleasePoint(stream, -1);
+                    if (at >= 0 && at < _pending.Length)
+                    {
+                        (_pending[at] ??= []).Add(stream);
+                    }
+                }
+            }
+        }
 
         /// <summary>A stream's first write, by operator <paramref name="producer"/>.</summary>
         public void Written(IReleasableStream stream, int producer)

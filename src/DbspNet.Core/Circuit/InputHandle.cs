@@ -33,6 +33,7 @@ public sealed class InputHandle<T> : IInputCommit
     {
         _root = root;
         _stream = stream;
+        ((IReleasableStream)stream).CommittedEveryTick = true; // Commit writes it every step (§5.10)
         _merge = merge;
         _mergeMany = mergeMany;
         _zero = zero;
