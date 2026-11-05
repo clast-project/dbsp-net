@@ -1880,3 +1880,43 @@ stopped at op 1671 of tick 18 (~4,700 s).
   (`StorageCompression::Default`; Snappy is the named option). The state's size per row is the other half of the
   question, but this census does not measure it.
 - Memory held: live heap ~11–17 GB through tick 18. The run would still have ended in D4 (§5.19).
+
+### 5.22 D4: block-backed indexed deltas (2026-11-05, f351503, xt64)
+
+**What.** `IndexBy`, `GroupProject`, `MapFilterGroupProject` and `StepGroupProject` build their indexed output
+through a spilling builder whenever the stream carries a block format. The compiler sets that format for join and
+aggregate inputs. Past the step-spill row count (`DBSPNET_STEP_SPILL_ROWS`), the entries freeze into hash-ordered
+`compact:false` runs (`BlockedGroups`, the indexed twin of D1's `BlockedRows`):
+- The exact group count is a k-way walk over each run's in-memory key-hash array. It reads blocks only for hashes
+  that several runs share.
+- Readers merge the runs by hash with a priority queue, again over the hash arrays, and decode only the runs that
+  hold the current hash. A `GroupFor` probe checks every run.
+- A blocked indexed trace that integrates the delta adopts its runs without decoding them (`TryAdoptRuns`, rows:
+  false). It takes one or two runs as they are and merges more than two (`MergeMany`).
+
+D4 is off by default and uses the same knob as D1–D3. Nexmark w1profile B/ev is identical with D4 on and off. The
+full suite passes with D4 off, and with spilling forced on (chunk 2, spill everything).
+
+**A landmine found by the forced suite.** The first enumerator scanned every run's cursor for each hash and read
+the hash from the block body. With many runs and a small block cache, that reloaded spilled blocks O(hashes × runs)
+times, and a lazy-restore test ran for two hours. The fix: the in-memory hash arrays with a priority queue (as
+D1 already did). Rule: **a multi-run reader must order the runs by metadata, never by block bodies.**
+
+**xt64 (xt63's settings plus D4).**
+- **It gets past op 1808.** The `GroupProject` that ran out of memory in xt61–xt62 now finishes.
+- **It ends at the next aggregate.** `IncrementalAggregateOp` integrates the D4 delta, `AdoptInto` gets more than
+  two runs, and `MergeMany` → `RunBuilder.Flush` runs out of memory (peak RSS 43 GB, heap limit 48 GiB). Blocks
+  are bounded by bytes, so no single block is too big. `RunBuilder` holds the whole output run's blocks in memory,
+  and the spiller writes them only after the merge finishes (`AfterCompact`). This applies to **every** merge,
+  ordinary compaction included. The adopted delta was simply the first merge whose output was bigger than the
+  free heap.
+- **Cost.** Through tick 17, allocation was +45% (5,226 GiB vs 3,610) and step time +12% (2,995 s vs 2,666 s). The
+  reason: indexed deltas above 1M entries now freeze and spill on ticks that fit before. In tick 18 the heap is
+  lower at the same ops (25 GB vs 42 GB at op 1500).
+- Spill disk peaked at ~157 GB at op 1433, a mix close to xt63's.
+
+**Next.** The output of a merge has to stream to disk: a run builder that writes each flushed block to a spill
+file once the run outgrows a budget, keeping only lazy block handles. Merge output is then bounded by a block
+rather than a run, for compaction and adoption alike. Without it, any run bigger than the heap ends the batch,
+whatever the deltas do. Compression (§5.21) comes after, because it shrinks bytes on disk but not resident merge
+output.
