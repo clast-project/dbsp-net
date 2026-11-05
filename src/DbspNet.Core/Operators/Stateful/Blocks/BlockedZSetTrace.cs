@@ -86,6 +86,14 @@ internal sealed class BlockedZSetTrace : IRowTrace<StructuralRow, Z64>
         }
 
         _current.SetTarget(null);
+
+        // A block-backed delta (in-step spilling, docs/design-bounded-memory.md §5.19) is already sorted,
+        // consolidated runs of this layout: adopt them rather than decode it into a level and re-encode.
+        if (delta.External is BlockedRows blocked && blocked.AdoptInto(Trace))
+        {
+            return;
+        }
+
         Trace.IntegrateRows(_cloneDeltas ? delta.Clone() : delta);
     }
 

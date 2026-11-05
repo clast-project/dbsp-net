@@ -83,6 +83,49 @@ internal sealed class BlockSchema : ITraceBlockFormat
     public int ValueColumns => ValueKinds.Length;
 
     /// <inheritdoc/>
+    public bool Adopts(ITraceBlockFormat other)
+    {
+        if (ReferenceEquals(this, other))
+        {
+            return true;
+        }
+
+        if (other is not BlockSchema theirs
+            || !KeyKinds.AsSpan().SequenceEqual(theirs.KeyKinds)
+            || !ValueKinds.AsSpan().SequenceEqual(theirs.ValueKinds))
+        {
+            return false;
+        }
+
+        var mine = Codec.RunSchema.FieldsList;
+        var those = theirs.Codec.RunSchema.FieldsList;
+        if (mine.Count != those.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < mine.Count; i++)
+        {
+            if (TypeSignature(mine[i].DataType) != TypeSignature(those[i].DataType) || (!mine[i].IsNullable && those[i].IsNullable))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // An Arrow type's layout, names aside: precision and scale, time units and zones included.
+    private static string TypeSignature(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.Decimal128Type d => FormattableString.Invariant($"decimal128({d.Precision},{d.Scale})"),
+        Apache.Arrow.Types.TimestampType t => FormattableString.Invariant($"timestamp({t.Unit},{t.Timezone})"),
+        Apache.Arrow.Types.Time64Type t => FormattableString.Invariant($"time64({t.Unit})"),
+        Apache.Arrow.Types.Time32Type t => FormattableString.Invariant($"time32({t.Unit})"),
+        _ => type.TypeId.ToString(),
+    };
+
+    /// <inheritdoc/>
     Core.Operators.Stateful.Blocks.IBlockedTraceCodec? ITraceBlockFormat.BackingCodec => Codec;
 
     /// <inheritdoc/>

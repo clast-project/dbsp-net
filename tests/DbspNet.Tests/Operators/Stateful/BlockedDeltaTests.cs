@@ -9,6 +9,8 @@
 //   3. with the knob on, compiled circuits (D3) give the same output every tick as a twin with it off,
 //      across the random-query generator, and actually build block-backed deltas;
 //   4. a fan-out join past the threshold emits a block-backed delta; below it, a managed one;
+//   6. a blocked Z-set trace (view, DISTINCT) adopts a block-backed delta's runs (§5.19) and reads exactly
+//      as one that integrated the same deltas managed; a layout it cannot read falls back to a level;
 //   5. the left join's cross-product guard trips only on a blowup (output far past both groups) into a
 //      managed builder: not on a big 1:N lookup, and not when the output spills (§5.16).
 using CsCheck;
@@ -152,6 +154,54 @@ public class BlockedDeltaTests
             AssertSame(ma.Filter(r => (int)r[0]! >= 6), dropped);
         }, iter: 400);
         Assert.True(multiRun, "no case built a set of several runs");
+    }
+
+    [Fact]
+    public void A_blocked_zset_trace_adopts_block_backed_deltas_and_reads_as_managed()
+    {
+        var adopted0 = Interlocked.Read(ref DeltaSpill.Adopted);
+        Gen.Select(GenAdds.Array[1, 6], Gen.Int[1, 9]).Sample((ticks, chunk) =>
+        {
+            var managed = new BlockedZSetTrace(Format);
+            var adopting = new BlockedZSetTrace(Format);
+            var sum = ZSet<StructuralRow, Z64>.Empty;
+            foreach (var tick in ticks)
+            {
+                var delta = Spilled(tick, 0, chunk);
+                managed.Integrate(Managed(tick));
+                adopting.Integrate(delta);
+                sum += Managed(tick);
+                AssertSame(sum, managed.Current);
+                AssertSame(sum, adopting.Current);
+                Assert.Equal(managed.Count, adopting.Count);
+                adopting.Trace.CheckRuns();
+                for (var k = 0; k <= 12; k++)
+                {
+                    Assert.Equal(sum.WeightOf(Row(k, 2)), adopting.WeightOf(Row(k, 2)));
+                }
+            }
+        }, iter: 200);
+        Assert.True(Interlocked.Read(ref DeltaSpill.Adopted) > adopted0, "no delta was adopted");
+    }
+
+    [Fact]
+    public void A_trace_does_not_adopt_a_layout_it_cannot_read()
+    {
+        // A trace whose s column is NOT NULL cannot take blocks where s may be null.
+        var strict = TraceBlockFormats.Create(
+            new Schema([new SchemaColumn("k", new SqlIntegerType(false)), new SchemaColumn("s", new SqlVarcharType(null, false))]), Schema.Empty)!;
+        Assert.False(strict.Adopts(Format));
+        Assert.True(Format.Adopts(strict)); // the other way round reads fine
+        var renamed = TraceBlockFormats.Create(
+            new Schema([new SchemaColumn("key", new SqlIntegerType(false)), new SchemaColumn("text", new SqlVarcharType(null, true))]), Schema.Empty)!;
+        Assert.True(renamed.Adopts(Format)); // names are not layout
+
+        var trace = new BlockedZSetTrace(strict);
+        var adds = new (int, int, long)[] { (1, 1, 1), (2, 2, 1), (3, 1, -1) };
+        var adopted0 = Interlocked.Read(ref DeltaSpill.Adopted);
+        trace.Integrate(Spilled(adds, 0, 2));
+        Assert.Equal(adopted0, Interlocked.Read(ref DeltaSpill.Adopted));
+        AssertSame(Managed(adds), trace.Current);
     }
 
     [Fact]
@@ -333,9 +383,11 @@ public class BlockedDeltaTests
     public void Random_queries_match_a_twin_every_tick_with_every_delta_forced_to_blocks()
     {
         var blocked0 = Interlocked.Read(ref DeltaSpill.BlockedBuilds);
+        var adopted0 = Interlocked.Read(ref DeltaSpill.Adopted);
         Gen.Select(RandomQuery.GenQuery, RandomQuery.GenTicks, Gen.Int[1, 3], Gen.Bool)
             .Sample((sql, ticks, chunk, blocks) => Twin(sql, ticks, chunk, blocks), iter: 600);
         Assert.True(Interlocked.Read(ref DeltaSpill.BlockedBuilds) > blocked0, "no delta was built as blocks");
+        Assert.True(Interlocked.Read(ref DeltaSpill.Adopted) > adopted0, "no blocked DISTINCT adopted a delta");
     }
 
     private static bool Twin(string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks, int chunk, bool blocks)

@@ -19,6 +19,9 @@ internal static class DeltaSpill
     /// <summary>Deltas built block backed, and their rows, since start (diagnostics, tests).</summary>
     internal static long BlockedBuilds, BlockedRows;
 
+    /// <summary>Block-backed deltas a trace adopted the runs of, and their rows (§5.19).</summary>
+    internal static long Adopted, AdoptedRows;
+
     /// <summary>A builder for a structural delta of <paramref name="format"/> (null: plain).</summary>
     public static ZSetBuilder<StructuralRow, Z64> Rows(object? format, int capacity)
     {
@@ -345,6 +348,22 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
     }
 
     public override ZSetBuilder<StructuralRow, Z64> NewBuilder(int capacity) => DeltaSpill.Rows(_format, capacity);
+
+    /// <summary>Hand this set's runs to <paramref name="trace"/> as its own (a view or DISTINCT integrating
+    /// it, §5.19): no row decoded or encoded. False when the trace cannot take them.</summary>
+    internal bool AdoptInto(BlockedIndexedTrace trace)
+    {
+        var parts = _parts.Select(p => p.Trace).ToArray();
+        var runs = parts.SelectMany(t => t.Runs).ToArray();
+        if (!trace.TryAdoptRuns(runs, _format, parts.All(t => t.OrdersByRowHash)))
+        {
+            return false;
+        }
+
+        Interlocked.Increment(ref DeltaSpill.Adopted);
+        Interlocked.Add(ref DeltaSpill.AdoptedRows, _count);
+        return true;
+    }
 
     /// <summary>A sum with a block-backed set is the union of their runs, merged only when read; a
     /// managed side is frozen into a run first (the small one in practice: a union's null-padded side).</summary>

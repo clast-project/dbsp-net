@@ -100,6 +100,10 @@ internal sealed class BlockedIndexedTrace
         /// it again. Runs are immutable, so it stays valid until the run is merged away.</summary>
         public (ITableFileSystem Store, string Path)? Persisted { get; set; }
 
+        /// <summary>The run this one adopted the blocks of (§5.19): kept reachable while this run lives,
+        /// since a spilled file lives as long as the run object the spiller tracked.</summary>
+        public Run? AdoptedFrom { get; init; }
+
         /// <summary>The first block that can hold <paramref name="hash"/>, or −1. A giant group's
         /// hash can span consecutive blocks; the caller continues while the next block's first hash
         /// is still <paramref name="hash"/>.</summary>
@@ -168,7 +172,39 @@ internal sealed class BlockedIndexedTrace
         _maxManaged = maxManaged;
         _blockEntries = blockEntries;
         _hash = hash ?? (static row => row.GetHashCode());
+        _defaultHash = hash is null;
     }
+
+    // Whether entries are ordered by the row's own hash (so another trace's runs can be adopted).
+    private readonly bool _defaultHash;
+
+    /// <summary>
+    /// Adopt <paramref name="runs"/> — consolidated Z-set runs of a block-backed delta — as runs of this
+    /// Z-set trace, without decoding or encoding a row (docs/design-bounded-memory.md §5.19): false, and
+    /// nothing changes, unless their format reads as this trace's and both order by the row's hash.
+    /// New run objects over the same blocks, each keeping its original reachable (a spilled file's
+    /// owner); a floor set here never touches the delta's. The trace then compacts as after a freeze.
+    /// </summary>
+    internal bool TryAdoptRuns(IReadOnlyList<Run> runs, ITraceBlockFormat format, bool defaultHash)
+    {
+        if (!_defaultHash || !defaultHash || _format.ValueColumns != 0 || !_format.Adopts(format)
+            || _managed.Any(l => l.Rows is null))
+        {
+            return false;
+        }
+
+        _materialized = null;
+        foreach (var run in runs)
+        {
+            _runs.Insert(0, new Run(run.Blocks, run.Entries) { Persisted = run.Persisted, AdoptedFrom = run });
+        }
+
+        Compact();
+        return true;
+    }
+
+    /// <summary>Whether entries are ordered by the row's own hash.</summary>
+    internal bool OrdersByRowHash => _defaultHash;
 
     /// <summary>Forget every level (a restore replaces the state).</summary>
     public void Clear()
@@ -1203,6 +1239,13 @@ internal sealed class BlockedIndexedTrace
             if (merged is not null)
             {
                 _runs.Insert(0, merged);
+
+                // A cascade of merges (adopted runs, §5.19) spills each output as it is made, so they
+                // do not all wait in memory for the cascade to end.
+                if (_runs.Count >= 2 && _runs[0].Entries * 4 >= _runs[1].Entries)
+                {
+                    BlockAccess.Spiller?.AfterCompact(this);
+                }
             }
         }
 

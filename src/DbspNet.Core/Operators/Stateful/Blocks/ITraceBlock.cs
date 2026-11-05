@@ -87,6 +87,12 @@ internal interface ITraceBlockFormat
     /// (docs/design-bounded-memory.md §3.7); null if the format cannot.</summary>
     IBlockedTraceCodec? BackingCodec => null;
 
+    /// <summary>Whether a block of <paramref name="other"/> reads as one of this format's: the same cell
+    /// layout, so a trace of this format can adopt another's runs without decoding them
+    /// (docs/design-bounded-memory.md §5.19). Column names may differ; a column this format holds
+    /// non-nullable must be non-nullable there too.</summary>
+    bool Adopts(ITraceBlockFormat other) => ReferenceEquals(this, other);
+
     /// <summary>About how many bytes one entry adds to a block (fixed widths plus string bytes), so
     /// blocks can be cut below the large-object-heap threshold.</summary>
     int EntryBytes(StructuralRow key, StructuralRow value);
