@@ -1704,3 +1704,55 @@ encode is 8.6 GiB.
   adjacent blocks sharing a first/last hash. This is a format change, but it fixes checkpoints too.
   (b) Best effort: the spiller leaves a run with such a span in memory. That unblocks the measurement but
   not checkpoints.
+
+### 5.18 A giant group spans file blocks (2026-11-04, fe18267)
+
+**Why.** TPC-DS tick 18 ended (§5.17) when S1 spilled the left join's left trace: key `PREMIUM` is a giant
+group of 7.2M rows, and a giant went to a run file as ONE block, with an `int` length and loaded into one
+`byte[]`. In memory a giant's hash already continues from block to block; the file format now does too.
+
+**What changed** (run file format version 4; readers open 3 and 4, and a v3 file never spans).
+- **Writers.** A blocked trace's concatenated giant is cut every `RunFile.MaxSpanBlockBytes` (256 MiB), at
+  part boundaries, so each file block holds only the giant's hash. Compaction cuts a hash run every
+  `MaxSpanBlockEntries` (2^18). `RunStreamWriter` accepts a block that begins with the previous block's
+  last hash; the run's group count counts that group once, and each block keeps its own count.
+- **Readers.** `RunReader`'s point lookups (weight of a row, the entries of a hash, the group of a key)
+  read the whole block range of a hash. `RunColdGroups` sums a key's parts across blocks, preloaded giant
+  blocks included. The in-memory `Run.Find` already continued across blocks.
+- **Compaction.** A delta entry of a spanning hash that matches nothing in the first base block is carried
+  to the next ones and emitted where the span ends. Compacted runs therefore stay consolidated, a
+  blocked reader's invariant, while only one base block is decoded at a time.
+- **Not changed:** the managed run writer (`RunFile.Cut`) still writes a group as one block, so a managed
+  trace's group past ~2 GiB would still overflow. Blocked traces are the default for that state.
+
+**Tests.**
+- The suite passes at the default caps, at 8 KB / 16-entry caps (`DBSPNET_RUN_SPAN_BLOCK_BYTES` /
+  `_ENTRIES`, so every giant splits), and at those caps with forced in-step spilling and S1 (3,468 each).
+  The tiny caps found a bug of mine: `Cuts` dropped the entries before a giant when the cap was below a
+  block's entries.
+- A new test checks that a giant past a 16 KB cap is several consecutive file blocks holding only its
+  hash, that a point lookup returns the whole range, and that it restores exactly into the blocked and
+  the managed join. Eight incremental checkpoints then delete giant rows and probe the whole giant; each
+  restores exactly into both, and the blocked one's runs are checked consolidated.
+- Three mutants each fail it: no split, no carry, a one-block lookup.
+
+**Extended TPC-DS SF1, W=1, 48 GiB, 1M rows** (xt59):
+
+| | xt58 | xt59 |
+|---|---|---|
+| ticks 0–17 | 2,737 s | 2,744 s |
+| live at op 1406 / 1671 | — | 11.5 / 17.1 GB |
+| furthest op in tick 18 | 1433 (run-file overflow) | **1794 of 1868** |
+| peak RSS | 37 GB | 41 GB |
+| how it ended | `OverflowException`, giant block | `OutOfMemoryException`, view freeze |
+
+- **The giant spilled** and the run went 361 operators further, through all 18 left joins of the chain,
+  each a 21.7M-row block-backed delta.
+- **Where it ends:** the last operators sum three 21.7M-row streams into a **65M-row** delta (op 1794,
+  block backed). A view's `IntegrateOp` pushes it as a managed level, and `BlockedIndexedTrace.FreezeRows`
+  enumerates it into pooled arrays to sort and encode: all 65M rows decoded and live at once.
+- **The lever:** the delta already IS sorted, consolidated Z-set block runs in the trace's own layout.
+  Integrating a block-backed delta should adopt its runs, with no decode and no re-encode, given a format
+  check (the delta's format and the trace's must encode the same schema). The same applies wherever a
+  trace integrates a delta: DISTINCT, and the index operators' inputs (D4).
+- Disk: this run left a 208 GB spill directory behind (removed after the run).
