@@ -1648,3 +1648,59 @@ cross product the guard was written for. Feldera has no such guard. **Decided:**
 builder spills (its memory is bounded by the threshold). The limit is now an internal test seam. A test
 covers each case (a 300 × 1 lookup passes, 20 × 20 throws, 20 × 20 into a spilling builder emits 400 block
 rows), and dropping either new condition fails it.
+
+### 5.17 Merge-free deltas (2026-11-04, a2e2926)
+
+**What changed.** A spilling builder's trace no longer compacts, and `Build` no longer merges. A built
+delta keeps its chunk runs, each with its sorted key hashes beside it (4 B a row, taken before the freeze,
+since a spill inside the freeze makes the blocks file-backed).
+- **Count:** exact, from one k-way walk over the hash arrays. Blocks are read only for a hash two runs
+  share.
+- **Readers:** the same walk, decoding entries as they go; a shared hash's entries are decoded and summed.
+- **A sum:** concatenates the two sets' parts.
+- **Ownership:** runs are read through their owning traces (`BlockedRows.Part`), never adopted into a new
+  trace. A spilled file lives as long as its original run object, and holding the owner keeps that run
+  reachable and follows a spill's rebind. This removes §5.15's `KeepAlive` hazard by construction.
+- `MergeAllRuns` is gone.
+
+**Tests.** The suite passes knob off, and forced at chunk 2 with S1 spilling every run into a 1 MiB cache
+(3,466 each). That forced run's exit-time stats did not get written; the SQL and end-to-end subsets in the
+same mode built 365K and 104K blocked deltas. The property test now also requires multi-run sets (its
+48-row domain makes shared hashes common). Mutants on the tie count and the tie's zero-weight filter
+each fail it.
+
+**TPC-DI SF=3 W=12, batch 1, 64K rows** (di4; views identical, bc345419):
+
+| | merged (§5.16) | merge-free | S1 alone |
+|---|---|---|---|
+| drain | 35.2 s | **24.1 s** | 16.4 s |
+| drain allocation | 188.9 GiB | **103.2 GiB** | 55.3 GiB |
+| peak RSS | 14.0 GB | 13.4 GB | 11.8–12.0 GB |
+
+The profile has the builder's merges gone (the 2.2 GiB left is ordinary state merging) and the count pass
+at 0.07 GiB. **Decoding for readers is now most of what is left:** 39 GiB, ~600 B a row. Chunk sort and
+encode is 8.6 GiB.
+
+**Extended TPC-DS SF1, W=1, 48 GiB, 1M rows** (xt58):
+
+| | xt56 (before D1) | xt57 (merged) | xt58 (merge-free) |
+|---|---|---|---|
+| ticks 0–17 | ~2,235 s | 3,308 s | **2,737 s** |
+| allocation by tick 17 | — | 5,746 GiB | 3,589 GiB |
+| live at op 1377 / after the fan-out (op 1388) | 25 / 34–37 GB | 11.2 / — GB | **11.6 / 11.4 GB** |
+| left join op 1397 / Apply op 1400 | — | 141.8 / 95.4 s | 44.1 / 25.8 s |
+| furthest op | 1391 (OOM) | ~1404 (guard) | **1433** |
+| peak RSS | 40 GB | 37 GB | 37 GB |
+
+- **The guard (§5.16) passed the 7.2M × 1 lookup**, and live memory stayed at ~11.5 GB through the fan-out
+  chain.
+- **It ends on a run-file limit:** `OverflowException` in `RunStreamWriter.AppendConcatAsync`, as S1 spilled
+  the left join's left trace. Key `PREMIUM` is a giant group of 7.2M rows. A giant group goes to a run file
+  as ONE block (§3d), and `RunBlock.Length` is an `int`; this group encodes past 2 GiB. The limit is old:
+  a checkpoint of this state hits it too (same `WriteRunAsync`), and a loaded block is one `byte[]`, so a
+  single block cannot pass ~2 GiB anyway.
+- **Options.** (a) Let a hash span file blocks, as it already does in memory: the writer cuts a giant
+  every ~1 GiB, and readers (block index, `Find`, Bloom filter, compaction by `__hash`, RunPins) accept
+  adjacent blocks sharing a first/last hash. This is a format change, but it fixes checkpoints too.
+  (b) Best effort: the spiller leaves a run with such a span in memory. That unblocks the measurement but
+  not checkpoints.
