@@ -19,6 +19,9 @@ internal static class DeltaSpill
     /// <summary>Deltas built block backed, and their rows, since start (diagnostics, tests).</summary>
     internal static long BlockedBuilds, BlockedRows;
 
+    /// <summary>Indexed deltas built block backed, and their entries (D4, §5.22).</summary>
+    internal static long BlockedGroupBuilds, BlockedGroupEntries;
+
     /// <summary>Block-backed deltas a trace adopted the runs of, and their rows (§5.19).</summary>
     internal static long Adopted, AdoptedRows;
 

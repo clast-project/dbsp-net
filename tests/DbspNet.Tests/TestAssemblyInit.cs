@@ -25,7 +25,7 @@ internal static class TestAssemblyInit
             AppDomain.CurrentDomain.ProcessExit += (_, _) => File.AppendAllText(
                 path,
                 FormattableString.Invariant(
-                    $"blocked deltas {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds}, rows {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows}\n"));
+                    $"blocked deltas {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds}, rows {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows}, indexed {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedGroupBuilds} ({DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedGroupEntries} entries), adopted {DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted}\n"));
         }
     }
 }

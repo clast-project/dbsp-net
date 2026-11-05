@@ -185,10 +185,11 @@ internal sealed class BlockedIndexedTrace
     /// New run objects over the same blocks, each keeping its original reachable (a spilled file's
     /// owner); a floor set here never touches the delta's. The trace then compacts as after a freeze.
     /// </summary>
-    internal bool TryAdoptRuns(IReadOnlyList<Run> runs, ITraceBlockFormat format, bool defaultHash)
+    internal bool TryAdoptRuns(IReadOnlyList<Run> runs, ITraceBlockFormat format, bool defaultHash, bool rows = true)
     {
-        if (!_defaultHash || !defaultHash || _format.ValueColumns != 0 || !_format.Adopts(format)
-            || _managed.Any(l => l.Rows is null))
+        // A trace holds Z-set levels or indexed levels, never both (§5.22: indexed deltas adopt too).
+        if (!_defaultHash || !defaultHash || !_format.Adopts(format)
+            || (rows ? _format.ValueColumns != 0 || _managed.Any(l => l.Rows is null) : _managed.Any(l => l.Set is null)))
         {
             return false;
         }
@@ -273,6 +274,14 @@ internal sealed class BlockedIndexedTrace
         ArgumentNullException.ThrowIfNull(delta);
         if (delta.IsEmpty)
         {
+            return;
+        }
+
+        // A block-backed delta (D4, docs/design-bounded-memory.md §5.22) is sorted, consolidated runs:
+        // adopt them rather than decode it into a level and re-encode it.
+        if (delta.External is BlockedGroups blocked && blocked.AdoptInto(this))
+        {
+            _materialized = null;
             return;
         }
 

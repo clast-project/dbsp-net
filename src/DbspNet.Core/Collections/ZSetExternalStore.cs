@@ -56,3 +56,39 @@ internal abstract class ZSetSpillingStore<TKey, TWeight>
     /// <summary>Forget what was added (a pooled builder's next tick).</summary>
     public abstract void Reset();
 }
+
+/// <summary>
+/// An indexed Z-set's groups held outside a hash map (docs/design-bounded-memory.md §5.22, D4): hash-
+/// ordered block runs of (key, value, weight) entries, as a blocked trace holds them. The one
+/// implementation is <c>BlockedGroups</c>, which a spilling indexed builder makes for a delta past the
+/// in-step spill threshold. Immutable once built.
+/// </summary>
+internal abstract class IndexedZSetExternalStore<TKey, TValue, TWeight>
+    where TKey : notnull
+    where TValue : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    /// <summary>Keys with a non-empty group (exact).</summary>
+    public abstract int GroupCount { get; }
+
+    /// <summary>The group of <paramref name="key"/>, found by its hash (empty if none).</summary>
+    public abstract ZSet<TValue, TWeight> GroupFor(TKey key);
+
+    /// <summary>Every non-empty group, each decoded as it is read, in key-hash order.</summary>
+    public abstract IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>> GetEnumerator();
+}
+
+/// <summary>
+/// An indexed builder's backing that can leave memory (§5.22, D4): adds go to a managed builder; past a
+/// threshold its groups are frozen into a block run, and the built set is block backed.
+/// </summary>
+internal abstract class IndexedZSetSpillingStore<TKey, TValue, TWeight>
+    where TKey : notnull
+    where TValue : notnull
+    where TWeight : struct, IZRing<TWeight>
+{
+    public abstract void Add(TKey key, TValue value, TWeight weight);
+
+    /// <summary>The set: managed while nothing has frozen (unless forced), else block backed.</summary>
+    public abstract IndexedZSet<TKey, TValue, TWeight> Build();
+}

@@ -550,7 +550,20 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(keyOf);
 
-        return builder.Apply(input, z => IndexedZSet.IndexBy(z, keyOf));
+        // The indexed delta's builder: block backed past the in-step spill threshold, when the consumer
+        // gave this stream a block format (D4, docs/design-bounded-memory.md §5.22).
+        Stream<IndexedZSet<TKey, TRow, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
+        {
+            var b = Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(output!.DeltaFormat);
+            foreach (var (row, w) in z)
+            {
+                b.Add(keyOf(row), row, w);
+            }
+
+            return b.Build();
+        });
+        return output;
     }
 
     /// <summary>
@@ -572,9 +585,10 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(keyOf);
         ArgumentNullException.ThrowIfNull(valueOf);
 
-        return builder.Apply(input, z =>
+        Stream<IndexedZSet<TKey, TValue, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
         {
-            var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+            var b = Blocks.DeltaSpillGroups.For<TKey, TValue, TWeight>(output!.DeltaFormat);
             foreach (var (row, w) in z)
             {
                 b.Add(keyOf(row), valueOf(row), w);
@@ -582,6 +596,7 @@ public static class StatefulOperators
 
             return b.Build();
         });
+        return output;
     }
 
     /// <summary>
@@ -614,9 +629,10 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(keyOf);
         ArgumentNullException.ThrowIfNull(valueOf);
 
-        return builder.Apply(input, z =>
+        Stream<IndexedZSet<TKey, TValue, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
         {
-            var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
+            var b = Blocks.DeltaSpillGroups.For<TKey, TValue, TWeight>(output!.DeltaFormat);
             foreach (var (row, w) in z)
             {
                 if (map(row) is { } mapped)
@@ -627,6 +643,7 @@ public static class StatefulOperators
 
             return b.Build();
         });
+        return output;
     }
 
     /// <summary>
@@ -651,9 +668,10 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(step);
         ArgumentNullException.ThrowIfNull(keyOf);
 
-        return builder.Apply(input, z =>
+        Stream<IndexedZSet<TKey, TRow, TWeight>>? output = null;
+        output = builder.Apply(input, z =>
         {
-            var b = new IndexedZSetBuilder<TKey, TRow, TWeight>();
+            var b = Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(output!.DeltaFormat);
             foreach (var (row, w) in z)
             {
                 var (keep, mapped) = step(row);
@@ -665,6 +683,7 @@ public static class StatefulOperators
 
             return b.Build();
         });
+        return output;
     }
 
     /// <summary>

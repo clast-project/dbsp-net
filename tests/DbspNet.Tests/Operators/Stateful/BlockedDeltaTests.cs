@@ -11,6 +11,9 @@
 //   4. a fan-out join past the threshold emits a block-backed delta; below it, a managed one;
 //   6. a blocked Z-set trace (view, DISTINCT) adopts a block-backed delta's runs (§5.19) and reads exactly
 //      as one that integrated the same deltas managed; a layout it cannot read falls back to a level;
+//   7. (D4, §5.22) a block-backed indexed delta reads exactly as the managed one of the same adds —
+//      group count, enumeration, GroupFor/ContainsKey, equality, sum, difference, flatten — and a blocked
+//      indexed trace adopting such deltas reads exactly as one integrating them managed;
 //   5. the left join's cross-product guard trips only on a blowup (output far past both groups) into a
 //      managed builder: not on a big 1:N lookup, and not when the output spills (§5.16).
 using CsCheck;
@@ -204,6 +207,111 @@ public class BlockedDeltaTests
         AssertSame(Managed(adds), trace.Current);
     }
 
+    // ---- D4: indexed deltas ----
+    private static readonly Schema KeySchema = new([new SchemaColumn("k", new SqlIntegerType(false))]);
+
+    private static readonly ITraceBlockFormat IndexedFormat =
+        TraceBlockFormats.Create(KeySchema, RowSchema) ?? throw new InvalidOperationException("no block format");
+
+    private static StructuralRow Key(int k) => new(SqlTestHelpers.EncodeStrings([k]));
+
+    // (key, value row, weight) adds over few keys and values, so groups span chunks and cancel.
+    private static readonly Gen<(int K, int V, int S, long W)[]> GenIndexedAdds =
+        Gen.Select(Gen.Int[0, 9], Gen.Int[0, 5], Gen.Int[0, 3], Gen.OneOfConst(-2L, -1L, 1L, 1L, 2L)).Array[0, 150];
+
+    private static IndexedZSet<StructuralRow, StructuralRow, Z64> ManagedIndexed((int K, int V, int S, long W)[] adds)
+    {
+        var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        foreach (var (k, v, s, w) in adds)
+        {
+            b.Add(Key(k), Row(v, s), new Z64(w));
+        }
+
+        return b.Build();
+    }
+
+    private static IndexedZSet<StructuralRow, StructuralRow, Z64> SpilledIndexed((int K, int V, int S, long W)[] adds, long rows, int chunk)
+    {
+        using var _ = SpillSettings.UseStepSpill(rows, chunk);
+        var b = DeltaSpillGroups.For<StructuralRow, StructuralRow, Z64>(IndexedFormat);
+        foreach (var (k, v, s, w) in adds)
+        {
+            b.Add(Key(k), Row(v, s), new Z64(w));
+        }
+
+        return b.Build();
+    }
+
+    private static void AssertSameIndexed(IndexedZSet<StructuralRow, StructuralRow, Z64> expected, IndexedZSet<StructuralRow, StructuralRow, Z64> actual)
+    {
+        Assert.Equal(expected.GroupCount, actual.GroupCount);
+        Assert.Equal(expected.IsEmpty, actual.IsEmpty);
+        Assert.True(expected.Equals(actual), "managed != blocked");
+        Assert.True(actual.Equals(expected), "blocked != managed");
+        var seen = new HashSet<StructuralRow>();
+        foreach (var (key, group) in actual)
+        {
+            Assert.True(seen.Add(key), $"key {key} enumerated twice");
+            Assert.False(group.IsEmpty);
+            Assert.True(expected.GroupFor(key).Equals(group));
+        }
+
+        Assert.Equal(expected.GroupCount, seen.Count);
+        for (var k = 0; k <= 10; k++)
+        {
+            Assert.True(expected.GroupFor(Key(k)).Equals(actual.GroupFor(Key(k))));
+            Assert.Equal(expected.ContainsKey(Key(k)), actual.ContainsKey(Key(k)));
+        }
+    }
+
+    [Fact]
+    public void Block_backed_indexed_sets_read_and_derive_as_managed_ones()
+    {
+        var builds0 = Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds);
+        var multiRun = false;
+        Gen.Select(GenIndexedAdds, GenIndexedAdds, Gen.Int[1, 9]).Sample((a, b, chunk) =>
+        {
+            var ma = ManagedIndexed(a);
+            var sa = SpilledIndexed(a, 0, chunk);
+            Assert.Equal(!ma.IsEmpty, sa.External is not null);
+            multiRun |= sa.External is BlockedGroups { RunCount: > 1 };
+            AssertSameIndexed(ma, sa);
+            var mb = ManagedIndexed(b);
+            var sb = SpilledIndexed(b, 0, chunk);
+            AssertSameIndexed(ma + mb, sa + sb);
+            AssertSameIndexed(ma - mb, sa - sb);
+            AssertSameIndexed(ma + mb, sa + mb);
+            Assert.True(ma.Flatten().Equals(sa.Flatten()));
+
+            // Below the threshold the builder stays managed.
+            Assert.Null(SpilledIndexed(a, 1_000, chunk).External);
+        }, iter: 400);
+        Assert.True(multiRun, "no case built a set of several runs");
+        Assert.True(Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds) > builds0);
+    }
+
+    [Fact]
+    public void A_blocked_indexed_trace_adopts_block_backed_deltas_and_reads_as_managed()
+    {
+        var adopted0 = Interlocked.Read(ref DeltaSpill.Adopted);
+        Gen.Select(GenIndexedAdds.Array[1, 6], Gen.Int[1, 9]).Sample((ticks, chunk) =>
+        {
+            var managed = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+            var adopting = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+            var sum = IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+            foreach (var tick in ticks)
+            {
+                managed.Integrate(ManagedIndexed(tick));
+                adopting.Integrate(SpilledIndexed(tick, 0, chunk));
+                sum += ManagedIndexed(tick);
+                AssertSameIndexed(sum, managed.Materialize());
+                AssertSameIndexed(sum, adopting.Materialize());
+                adopting.CheckRuns();
+            }
+        }, iter: 200);
+        Assert.True(Interlocked.Read(ref DeltaSpill.Adopted) > adopted0, "no indexed delta was adopted");
+    }
+
     [Fact]
     public void Builder_count_and_cancellation_across_chunks()
     {
@@ -384,10 +492,12 @@ public class BlockedDeltaTests
     {
         var blocked0 = Interlocked.Read(ref DeltaSpill.BlockedBuilds);
         var adopted0 = Interlocked.Read(ref DeltaSpill.Adopted);
+        var groups0 = Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds);
         Gen.Select(RandomQuery.GenQuery, RandomQuery.GenTicks, Gen.Int[1, 3], Gen.Bool)
             .Sample((sql, ticks, chunk, blocks) => Twin(sql, ticks, chunk, blocks), iter: 600);
         Assert.True(Interlocked.Read(ref DeltaSpill.BlockedBuilds) > blocked0, "no delta was built as blocks");
         Assert.True(Interlocked.Read(ref DeltaSpill.Adopted) > adopted0, "no blocked DISTINCT adopted a delta");
+        Assert.True(Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds) > groups0, "no indexed delta was built as blocks");
     }
 
     private static bool Twin(string sql, IReadOnlyList<IReadOnlyList<InputEvent>> ticks, int chunk, bool blocks)

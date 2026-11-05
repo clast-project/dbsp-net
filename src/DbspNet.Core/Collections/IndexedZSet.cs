@@ -46,6 +46,21 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     private MapView<TKey, ZSet<TValue, TWeight>> Groups => new(_groupStore);
 
+    /// <summary>A delta held as block runs (§5.22, D4): never a trace's state, never cold.</summary>
+    internal IndexedZSet(IndexedZSetExternalStore<TKey, TValue, TWeight> external) => _groupStore = external;
+
+    /// <summary>The block-backed store, or null for a managed map.</summary>
+    internal IndexedZSetExternalStore<TKey, TValue, TWeight>? External =>
+        _groupStore as IndexedZSetExternalStore<TKey, TValue, TWeight>;
+
+    private void ThrowIfExternal()
+    {
+        if (_groupStore is IndexedZSetExternalStore<TKey, TValue, TWeight>)
+        {
+            throw new InvalidOperationException("a block-backed indexed delta is read-only");
+        }
+    }
+
     // ---- Cold backing (docs/design-durable-state.md §1f, increment 4: lazy restore) ----
     //
     // A restored trace starts with an empty in-memory map and a cold source (the runs it was
@@ -213,14 +228,29 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public static IndexedZSet<TKey, TValue, TWeight> Empty { get; } =
         new(new Dictionary<TKey, ZSet<TValue, TWeight>>());
 
-    public int GroupCount => ColdState is { } cold ? cold.Source.GroupCount - cold.ResolvedPresent + Groups.Count : Groups.Count;
+    public int GroupCount =>
+        _groupStore is IndexedZSetExternalStore<TKey, TValue, TWeight> ext ? ext.GroupCount
+        : ColdState is { } cold ? cold.Source.GroupCount - cold.ResolvedPresent + Groups.Count : Groups.Count;
 
     public bool IsEmpty => GroupCount == 0;
 
-    public IEnumerable<TKey> Keys => All.Keys;
+    public IEnumerable<TKey> Keys => External is not null ? ExternalKeys() : All.Keys;
+
+    private IEnumerable<TKey> ExternalKeys()
+    {
+        foreach (var (key, _) in this)
+        {
+            yield return key;
+        }
+    }
 
     public ZSet<TValue, TWeight> GroupFor(TKey key)
     {
+        if (_groupStore is IndexedZSetExternalStore<TKey, TValue, TWeight> ext)
+        {
+            return ext.GroupFor(key);
+        }
+
         var found = Groups.TryGetValue(key, out var g)
             || (ColdState is { } cold && Resolve(cold, key) && Groups.TryGetValue(key, out g));
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
@@ -233,6 +263,11 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
     public bool ContainsKey(TKey key)
     {
+        if (_groupStore is IndexedZSetExternalStore<TKey, TValue, TWeight> ext)
+        {
+            return !ext.GroupFor(key).IsEmpty;
+        }
+
         var found = Groups.ContainsKey(key) || (ColdState is { } cold && Resolve(cold, key));
         if (TraceAccessProfile.Enabled && TraceAccessProfile.Counting)
         {
@@ -255,31 +290,55 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             TraceAccessProfile.For(this)?.Scan();
         }
 
-        return new Enumerator(All.GetEnumerator());
+        return Enumerate();
     }
 
+    private Enumerator Enumerate() =>
+        _groupStore is IndexedZSetExternalStore<TKey, TValue, TWeight> ext
+            ? new Enumerator(ext.GetEnumerator())
+            : new Enumerator(All.GetEnumerator());
+
     IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
-        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => new Enumerator(All.GetEnumerator());
+        IEnumerable<KeyValuePair<TKey, ZSet<TValue, TWeight>>>.GetEnumerator() => Enumerate();
 
-    IEnumerator IEnumerable.GetEnumerator() => new Enumerator(All.GetEnumerator());
+    IEnumerator IEnumerable.GetEnumerator() => Enumerate();
 
-    /// <summary>Enumerates the groups in either backing map, in the map's order.</summary>
+    /// <summary>Enumerates the groups in either backing map, in the map's order, or a block-backed
+    /// delta's groups in key-hash order.</summary>
     public struct Enumerator : IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>
     {
         private MapView<TKey, ZSet<TValue, TWeight>>.Enumerator _inner;
+        private readonly IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>>? _external;
 
         internal Enumerator(MapView<TKey, ZSet<TValue, TWeight>>.Enumerator inner)
         {
             _inner = inner;
+            _external = null;
         }
 
-        public readonly KeyValuePair<TKey, ZSet<TValue, TWeight>> Current => _inner.Current;
+        internal Enumerator(IEnumerator<KeyValuePair<TKey, ZSet<TValue, TWeight>>> external)
+        {
+            _inner = default;
+            _external = external;
+        }
+
+        public readonly KeyValuePair<TKey, ZSet<TValue, TWeight>> Current => _external is null ? _inner.Current : _external.Current;
 
         readonly object IEnumerator.Current => Current;
 
-        public bool MoveNext() => _inner.MoveNext();
+        public bool MoveNext() => _external is null ? _inner.MoveNext() : _external.MoveNext();
 
-        public void Dispose() => _inner.Dispose();
+        public void Dispose()
+        {
+            if (_external is null)
+            {
+                _inner.Dispose();
+            }
+            else
+            {
+                _external.Dispose();
+            }
+        }
 
         void IEnumerator.Reset() => throw new NotSupportedException();
     }
@@ -293,6 +352,24 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
 
         if (ReferenceEquals(this, other))
         {
+            return true;
+        }
+
+        if (External is not null || other.External is not null)
+        {
+            if (GroupCount != other.GroupCount)
+            {
+                return false;
+            }
+
+            foreach (var (k, g) in this)
+            {
+                if (!g.Equals(other.GroupFor(k)))
+                {
+                    return false;
+                }
+            }
+
             return true;
         }
 
@@ -317,7 +394,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public override int GetHashCode()
     {
         var hash = 0;
-        foreach (var (k, g) in All)
+        foreach (var (k, g) in this)
         {
             hash ^= HashCode.Combine(k, g);
         }
@@ -331,13 +408,13 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     public ZSet<(TKey Key, TValue Value), TWeight> Flatten()
     {
         var total = 0L;
-        foreach (var g in All.Values)
+        foreach (var (_, g) in this)
         {
             total += g.Count;
         }
 
         var b = new ZSetBuilder<(TKey, TValue), TWeight>((int)Math.Min(total, int.MaxValue));
-        foreach (var (k, g) in Groups)
+        foreach (var (k, g) in this)
         {
             foreach (var (v, w) in g)
             {
@@ -352,7 +429,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     {
         ArgumentNullException.ThrowIfNull(other);
         var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (k, g) in All)
+        foreach (var (k, g) in this)
         {
             foreach (var (v, w) in g)
             {
@@ -360,7 +437,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
         }
 
-        foreach (var (k, g) in other.All)
+        foreach (var (k, g) in other)
         {
             foreach (var (v, w) in g)
             {
@@ -375,7 +452,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     {
         ArgumentNullException.ThrowIfNull(other);
         var b = new IndexedZSetBuilder<TKey, TValue, TWeight>();
-        foreach (var (k, g) in All)
+        foreach (var (k, g) in this)
         {
             foreach (var (v, w) in g)
             {
@@ -383,7 +460,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
             }
         }
 
-        foreach (var (k, g) in other.All)
+        foreach (var (k, g) in other)
         {
             foreach (var (v, w) in g)
             {
@@ -408,13 +485,14 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
     internal void MergeInPlace(IndexedZSet<TKey, TValue, TWeight> delta)
     {
         ArgumentNullException.ThrowIfNull(delta);
-        if (delta.All.Count == 0)
+        ThrowIfExternal();
+        if (delta.IsEmpty)
         {
             return;
         }
 
         var cold = ColdState;
-        foreach (var (key, deltaGroup) in delta.Groups)
+        foreach (var (key, deltaGroup) in delta)
         {
             // A key this has not read from cold yet: read it, so the delta adds to what was there.
             if (Groups.TryGetValue(key, out var currentGroup)
@@ -449,6 +527,7 @@ public sealed class IndexedZSet<TKey, TValue, TWeight>
         }
 
         ArgumentNullException.ThrowIfNull(monotoneKey);
+        ThrowIfExternal();
         List<TKey>? removed = null;
         foreach (var key in All.Keys)
         {
@@ -496,6 +575,9 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
         _store = MapView<TKey, ZSetBuilder<TValue, TWeight>>.NewStore();
     }
 
+    /// <summary>A builder that freezes into block runs past a threshold (§5.22, D4).</summary>
+    internal IndexedZSetBuilder(IndexedZSetSpillingStore<TKey, TValue, TWeight> spilling) => _store = spilling;
+
     private MapView<TKey, ZSetBuilder<TValue, TWeight>> Groups =>
         new(_store ?? throw new InvalidOperationException("IndexedZSetBuilder used after Build()."));
 
@@ -503,6 +585,12 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
     {
         if (TWeight.IsZero(weight))
         {
+            return;
+        }
+
+        if (_store is IndexedZSetSpillingStore<TKey, TValue, TWeight> spilling)
+        {
+            spilling.Add(key, value, weight);
             return;
         }
 
@@ -518,6 +606,12 @@ public sealed class IndexedZSetBuilder<TKey, TValue, TWeight>
 
     public IndexedZSet<TKey, TValue, TWeight> Build()
     {
+        if (_store is IndexedZSetSpillingStore<TKey, TValue, TWeight> spilling)
+        {
+            _store = null;
+            return spilling.Build();
+        }
+
         var raw = Groups;
         _store = null;
         if (raw.Count == 0)

@@ -1505,6 +1505,12 @@ public static partial class PlanToCircuit
         ReshardPlacement? rightReshard = null,
         BlockedJoinSpec? blocked = null)
     {
+        if (blocked is { } spec)
+        {
+            AttachIndexedDeltaFormat(left, spec.LeftFormat);
+            AttachIndexedDeltaFormat(right, spec.RightFormat);
+        }
+
         return Recorded(
             builder, ctx,
             () => blocked is { } b
@@ -1576,6 +1582,12 @@ public static partial class PlanToCircuit
         Func<StructuralRow, StructuralRow, StructuralRow, bool>? residual = null)
     {
         var blocks = OuterBlockFormats(ctx, leftShape, rightShape);
+        if (blocks is ({ } leftFormat, { } rightFormat))
+        {
+            AttachIndexedDeltaFormat(left, leftFormat);
+            AttachIndexedDeltaFormat(right, rightFormat);
+        }
+
         return Recorded(
             builder, ctx,
             () => blocks is ({ } lf, { } rf)
@@ -1616,6 +1628,12 @@ public static partial class PlanToCircuit
         Func<StructuralRow, StructuralRow, StructuralRow, bool>? residual = null)
     {
         var blocks = OuterBlockFormats(ctx, leftShape, rightShape);
+        if (blocks is ({ } leftFormat, { } rightFormat))
+        {
+            AttachIndexedDeltaFormat(left, leftFormat);
+            AttachIndexedDeltaFormat(right, rightFormat);
+        }
+
         return Recorded(
             builder, ctx,
             () => blocks is ({ } lf, { } rf)
@@ -1655,6 +1673,11 @@ public static partial class PlanToCircuit
         var format = TraceBlocksMode.Aggregate && ctx.Options.TraceFamily != TraceFamily.Spine && shape is ({ } key, { } value)
             ? TraceBlockFormats.Create(key, value)
             : null;
+
+        if (format is not null)
+        {
+            AttachIndexedDeltaFormat(input, format);
+        }
 
         // The keyed state blobs (aggstate.arrows) are keyed by the group key, like the trace.
         var blobs = snapshotCodec is { SupportsKeyedBlobs: true } && reshard is not null
@@ -2348,6 +2371,23 @@ public static partial class PlanToCircuit
         }
 
         stream.DeltaFormat = TraceBlockFormats.Create(schema, Schema.Empty);
+    }
+
+    /// <summary>
+    /// D4 (docs/design-bounded-memory.md §5.22): give an indexed stream its consumer's trace block format
+    /// (key and value schemas), so the index operator writing it builds a delta past
+    /// <c>DBSPNET_STEP_SPILL_ROWS</c> as block runs the consumer's trace can adopt. Only while the knob is
+    /// on; the first format a stream is given wins (a delta whose layout a trace cannot read is
+    /// integrated as a managed level, as before).
+    /// </summary>
+    internal static void AttachIndexedDeltaFormat(Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> stream, ITraceBlockFormat format)
+    {
+        if (SpillSettings.StepSpillRows is null || stream.DeltaFormat is not null)
+        {
+            return;
+        }
+
+        stream.DeltaFormat = format;
     }
 
     private static Stream<ZSet<StructuralRow, Z64>> CompilePlanUncached(
