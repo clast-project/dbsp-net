@@ -14,7 +14,9 @@
 //   7. the startup sweep removes the spill roots of dead processes only;
 //   8. (§5.23) a freeze or merge whose output passes the threshold writes it to its file as it is built:
 //      the run comes out file-backed (no rewrite after), reads, probes and merges on exactly as in
-//      memory, retractions included, and its file is held and released like a spilled one.
+//      memory, retractions included, and its file is held and released like a spilled one;
+//   9. (§5.24) a giant group's chain is written in pieces as it is built, never held whole: the group
+//      becomes several file blocks, and every output is unchanged.
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Blocks;
@@ -371,6 +373,46 @@ public class RunSpillerTests
 
             return Task.CompletedTask;
         });
+    }
+
+    [Fact]
+    public async Task A_giant_groups_chain_is_written_in_pieces()
+    {
+        const int Ticks = 12;
+        var expected = TwinDigests(Ticks);
+        var saved = BlockedTraceCheckpoint.StreamedRunFile.ChainBytes;
+        BlockedTraceCheckpoint.StreamedRunFile.ChainBytes = 512;
+        try
+        {
+            await WithSpillerAsync(0, (spiller, dir) =>
+            {
+                var p = Compile();
+                var pieces = 0;
+                for (var tick = 0; tick < Ticks; tick++)
+                {
+                    Tick(p, tick);
+                    Assert.Equal(expected[tick], Digest(p));
+                    foreach (var run in Left(p).Runs)
+                    {
+                        // File blocks that hold one hash only and continue it from the block before.
+                        for (var b = 1; b < run.Blocks.Length; b++)
+                        {
+                            if (run.Blocks[b].FirstHash == run.Blocks[b - 1].LastHash && run.Blocks[b].FirstHash == run.Blocks[b].LastHash)
+                            {
+                                pieces++;
+                            }
+                        }
+                    }
+                }
+
+                Assert.True(pieces > 0, "the giant group was never written as several file blocks");
+                return Task.CompletedTask;
+            });
+        }
+        finally
+        {
+            BlockedTraceCheckpoint.StreamedRunFile.ChainBytes = saved;
+        }
     }
 
     [Fact]

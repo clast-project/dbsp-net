@@ -542,6 +542,11 @@ internal sealed class BlockedIndexedTrace
                         }
                     }
 
+                    if (arrival.Count > 1)
+                    {
+                        arrival.Sort(static (x, y) => ((uint)x.GetHashCode()).CompareTo((uint)y.GetHashCode())); // §5.24
+                    }
+
                     foreach (var v in arrival)
                     {
                         if (values[v] != 0)
@@ -605,6 +610,55 @@ internal sealed class BlockedIndexedTrace
                 }
 
                 previous = hashes.Length > 0 ? hashes[^1] : previous;
+            }
+        }
+    }
+
+    /// <summary>Throws unless every run is in canonical order (§5.24): a key's entries together and
+    /// in ascending value hash. Runs built by gathering (<see cref="IntegrateGathered"/>) or restored
+    /// from an older file need not be; tests call this where neither happens.</summary>
+    internal void CheckValueOrder()
+    {
+        foreach (var run in _runs)
+        {
+            var done = new HashSet<StructuralRow>();
+            StructuralRow? key = null;
+            var last = 0u;
+            uint? hash = null;
+            foreach (var block in Bodies(run.Blocks))
+            {
+                for (var i = 0; i < block.Count; i++)
+                {
+                    var k = block.Key(i);
+                    var vh = (uint)block.Value(i).GetHashCode();
+                    if (hash != block.Hashes[i])
+                    {
+                        done.Clear();
+                        hash = block.Hashes[i];
+                        key = null;
+                    }
+
+                    if (key is null || !key.Equals(k))
+                    {
+                        if (key is not null)
+                        {
+                            done.Add(key);
+                        }
+
+                        if (done.Contains(k))
+                        {
+                            throw new InvalidOperationException($"key {k}'s entries are not together");
+                        }
+
+                        key = k;
+                    }
+                    else if (vh < last)
+                    {
+                        throw new InvalidOperationException($"key {k}'s values descend in value hash");
+                    }
+
+                    last = vh;
+                }
             }
         }
     }
@@ -1166,12 +1220,33 @@ internal sealed class BlockedIndexedTrace
 
             Array.Sort(hashes, groups, 0, g);
             var run = new RunBuilder(this, stream: true);
+            var sorted = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
+            var scratch = new MergeScratch();
             for (var i = 0; i < g; i++)
             {
                 var key = groups[i].Key;
+                if (groups[i].Value.Count == 1)
+                {
+                    foreach (var (value, weight) in groups[i].Value)
+                    {
+                        run.Add(hashes[i], key, value, weight.Value);
+                        entries++;
+                    }
+
+                    continue;
+                }
+
+                // A key's values in value-hash order (§5.24): a later merge can stream a giant group.
+                sorted.Clear();
                 foreach (var (value, weight) in groups[i].Value)
                 {
-                    run.Add(hashes[i], key, value, weight.Value);
+                    sorted.Add((key, value, weight.Value));
+                }
+
+                Canonical(sorted, scratch);
+                foreach (var (_, value, weight) in sorted)
+                {
+                    run.Add(hashes[i], key, value, weight);
                     entries++;
                 }
             }
@@ -1367,62 +1442,30 @@ internal sealed class BlockedIndexedTrace
             }
 
             var output = new RunBuilder(this, stream: true);
-            var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
-            var tied = new List<int>();
+            var scratch = new MergeScratch();
+            var tied = new List<Cursor>();
             var dropped = 0L;
             while (queue.TryDequeue(out var first, out var hash))
             {
                 tied.Clear();
-                tied.Add(first);
+                tied.Add(cursors[first]);
+                var ids = scratch.Ids;
+                ids.Clear();
+                ids.Add(first);
                 while (queue.TryPeek(out var next, out var h) && h == hash)
                 {
                     queue.Dequeue();
-                    tied.Add(next);
+                    tied.Add(cursors[next]);
+                    ids.Add(next);
                 }
 
-                group.Clear();
-                var droppedHere = false;
-                foreach (var c in tied)
+                dropped += MergeHash(tied, hash, output, scratch);
+                foreach (var c in ids)
                 {
-                    var cursor = cursors[c];
-                    StructuralRow? key = null;
-                    StructuralRow? lastDropped = null;
-                    while (!cursor.Done && cursor.Hash == hash)
+                    if (!cursors[c].Done)
                     {
-                        var (block, i) = (cursor.Block, cursor.Index);
-                        key = key is not null && block.KeyEquals(i, key) ? key : block.Key(i);
-                        if (Dropped(key, cursor.Run.Floor))
-                        {
-                            if (!ReferenceEquals(key, lastDropped))
-                            {
-                                dropped++;
-                                lastDropped = key;
-                            }
-
-                            droppedHere = true;
-                        }
-                        else
-                        {
-                            group.Add((key, block.Value(i), block.Weight(i)));
-                        }
-
-                        cursor.Advance();
+                        queue.Enqueue(c, cursors[c].Hash);
                     }
-
-                    if (!cursor.Done)
-                    {
-                        queue.Enqueue(c, cursor.Hash);
-                    }
-                }
-
-                if (tied.Count > 1 || droppedHere)
-                {
-                    Consolidate(group);
-                }
-
-                foreach (var (key, value, weight) in group)
-                {
-                    output.Add(hash, key, value, weight);
                 }
             }
 
@@ -1449,60 +1492,274 @@ internal sealed class BlockedIndexedTrace
         var a = new Cursor(newer);
         var b = new Cursor(older);
         var output = new RunBuilder(this, stream: true);
-        var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
+        var scratch = new MergeScratch();
+        var tied = new List<Cursor>(2);
         var dropped = 0L;
         while (!a.Done || !b.Done)
         {
             var hash = a.Done ? b.Hash : b.Done ? a.Hash : Math.Min(a.Hash, b.Hash);
-            group.Clear();
-            var sources = 0;
-            var droppedHere = false;
-            foreach (var cursor in new[] { a, b })
+            tied.Clear();
+            if (!a.Done && a.Hash == hash)
             {
-                if (cursor.Done || cursor.Hash != hash)
-                {
-                    continue;
-                }
-
-                sources++;
-                StructuralRow? key = null;
-                StructuralRow? lastDropped = null;
-                while (!cursor.Done && cursor.Hash == hash)
-                {
-                    var (block, i) = (cursor.Block, cursor.Index);
-                    key = key is not null && block.KeyEquals(i, key) ? key : block.Key(i);
-                    if (Dropped(key, cursor.Run.Floor))
-                    {
-                        if (!ReferenceEquals(key, lastDropped))
-                        {
-                            dropped++;
-                            lastDropped = key;
-                        }
-
-                        droppedHere = true;
-                    }
-                    else
-                    {
-                        group.Add((key, block.Value(i), block.Weight(i)));
-                    }
-
-                    cursor.Advance();
-                }
+                tied.Add(a);
             }
 
-            if (sources > 1 || droppedHere)
+            if (!b.Done && b.Hash == hash)
             {
-                Consolidate(group);
+                tied.Add(b);
             }
 
-            foreach (var (key, value, weight) in group)
-            {
-                output.Add(hash, key, value, weight);
-            }
+            dropped += MergeHash(tied, hash, output, scratch);
         }
 
         DroppedKeys += dropped;
         return output.Finish();
+    }
+
+    /// <summary>A hash with at least this many entries across the runs a merge reads is merged
+    /// streaming, by value hash (docs/design-bounded-memory.md §5.24), when its runs allow it.</summary>
+    internal static int GiantGroupEntries { get; set; } = 1 << 16;
+
+    /// <summary>Giant hashes merged streaming, and those that fell back to the in-memory path because
+    /// a run was not in value-hash order or held several keys there (diagnostics).</summary>
+    internal static long GiantMerges, GiantFallbacks;
+
+    private sealed class MergeScratch
+    {
+        public readonly List<(StructuralRow Key, StructuralRow Value, long Weight)> Group = [];
+        public readonly List<int> Ids = [];
+        public readonly List<StructuralRow> Keys = [];
+        public ulong[] Order = new ulong[16];
+    }
+
+    // The tied cursors' entries of hash, consolidated, into output (each cursor left past them); the
+    // keys a floor dropped. A small group is decoded whole and summed by (key, value); a giant one,
+    // when every run holds it as one key in value-hash order, is merged by value hash, so only the
+    // entries of one value hash are held at a time. Either way the output is in canonical order: a
+    // key's entries together, by value hash.
+    private long MergeHash(List<Cursor> tied, uint hash, RunBuilder output, MergeScratch scratch)
+    {
+        if (IsGiant(tied, hash) && TryMergeGiant(tied, hash, output, scratch, out var giantDropped))
+        {
+            return giantDropped;
+        }
+
+        var group = scratch.Group;
+        group.Clear();
+        var dropped = 0L;
+        var droppedHere = false;
+        foreach (var cursor in tied)
+        {
+            StructuralRow? key = null;
+            StructuralRow? lastDropped = null;
+            while (!cursor.Done && cursor.Hash == hash)
+            {
+                var (block, i) = (cursor.Block, cursor.Index);
+                key = key is not null && block.KeyEquals(i, key) ? key : block.Key(i);
+                if (Dropped(key, cursor.Run.Floor))
+                {
+                    if (!ReferenceEquals(key, lastDropped))
+                    {
+                        dropped++;
+                        lastDropped = key;
+                    }
+
+                    droppedHere = true;
+                }
+                else
+                {
+                    group.Add((key, block.Value(i), block.Weight(i)));
+                }
+
+                cursor.Advance();
+            }
+        }
+
+        if (tied.Count > 1 || droppedHere)
+        {
+            Consolidate(group);
+        }
+
+        Canonical(group, scratch);
+        foreach (var (key, value, weight) in group)
+        {
+            output.Add(hash, key, value, weight);
+        }
+
+        return dropped;
+    }
+
+    // Whether the tied runs hold at least GiantGroupEntries entries of hash: counted from the hash
+    // arrays alone, and only past a block when the hash spans blocks.
+    private static bool IsGiant(List<Cursor> tied, uint hash)
+    {
+        long n = 0;
+        foreach (var cursor in tied)
+        {
+            n += cursor.SpansBlocks(hash) ? cursor.Clone().CountAt(hash, GiantGroupEntries) : cursor.CountInBlock(hash);
+            if (n >= GiantGroupEntries)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryMergeGiant(List<Cursor> tied, uint hash, RunBuilder output, MergeScratch scratch, out long dropped)
+    {
+        dropped = 0;
+
+        // Check on copies first, so a fallback finds the cursors untouched: each run holds the hash
+        // as one key, the same in every run, its values in ascending value hash.
+        StructuralRow? key = null;
+        foreach (var cursor in tied)
+        {
+            var probe = cursor.Clone();
+            if (key is null)
+            {
+                key = probe.Block.Key(probe.Index);
+            }
+
+            var first = true;
+            var last = 0u;
+            while (!probe.Done && probe.Hash == hash)
+            {
+                var (block, i) = (probe.Block, probe.Index);
+                var vh = (uint)block.Value(i).GetHashCode();
+                if (!block.KeyEquals(i, key) || (!first && vh < last))
+                {
+                    Interlocked.Increment(ref GiantFallbacks);
+                    return false;
+                }
+
+                (first, last) = (false, vh);
+                probe.Advance();
+            }
+        }
+
+        // Runs whose floor drops the key give up their entries whole.
+        var live = new List<Cursor>(tied.Count);
+        foreach (var cursor in tied)
+        {
+            if (Dropped(key!, cursor.Run.Floor))
+            {
+                dropped++;
+                while (!cursor.Done && cursor.Hash == hash)
+                {
+                    cursor.Advance();
+                }
+            }
+            else
+            {
+                live.Add(cursor);
+            }
+        }
+
+        // A k-way merge by value hash: the entries of the least value hash across the runs, summed.
+        var heads = new (uint Hash, StructuralRow Value, long Weight)[live.Count];
+        var has = new bool[live.Count];
+        for (var j = 0; j < live.Count; j++)
+        {
+            has[j] = Head(live[j], hash, out heads[j]);
+        }
+
+        var group = scratch.Group;
+        while (true)
+        {
+            var any = false;
+            var min = uint.MaxValue;
+            for (var j = 0; j < live.Count; j++)
+            {
+                if (has[j] && (!any || heads[j].Hash < min))
+                {
+                    min = heads[j].Hash;
+                    any = true;
+                }
+            }
+
+            if (!any)
+            {
+                break;
+            }
+
+            group.Clear();
+            for (var j = 0; j < live.Count; j++)
+            {
+                while (has[j] && heads[j].Hash == min)
+                {
+                    group.Add((key!, heads[j].Value, heads[j].Weight));
+                    live[j].Advance();
+                    has[j] = Head(live[j], hash, out heads[j]);
+                }
+            }
+
+            if (group.Count > 1)
+            {
+                Consolidate(group);
+            }
+
+            foreach (var (_, value, weight) in group)
+            {
+                output.Add(hash, key!, value, weight);
+            }
+        }
+
+        Interlocked.Increment(ref GiantMerges);
+        return true;
+    }
+
+    private static bool Head(Cursor cursor, uint hash, out (uint Hash, StructuralRow Value, long Weight) head)
+    {
+        if (cursor.Done || cursor.Hash != hash)
+        {
+            head = default;
+            return false;
+        }
+
+        var (block, i) = (cursor.Block, cursor.Index);
+        var value = block.Value(i);
+        head = ((uint)value.GetHashCode(), value, block.Weight(i));
+        return true;
+    }
+
+    // A hash's entries in canonical order (§5.24): each key's entries together, keys in first-seen
+    // order, and within a key by value hash, which lets a later merge stream a giant group.
+    private static void Canonical(List<(StructuralRow Key, StructuralRow Value, long Weight)> group, MergeScratch scratch)
+    {
+        var n = group.Count;
+        if (n < 2)
+        {
+            return;
+        }
+
+        if (scratch.Order.Length < n)
+        {
+            scratch.Order = new ulong[Math.Max(n, scratch.Order.Length * 2)];
+        }
+
+        var keys = scratch.Keys;
+        keys.Clear();
+        var order = scratch.Order.AsSpan(0, n);
+        var items = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(group);
+        for (var i = 0; i < n; i++)
+        {
+            var k = items[i].Key;
+            var ord = keys.Count - 1;
+            if (ord < 0 || !ReferenceEquals(keys[ord], k) && !keys[ord].Equals(k))
+            {
+                ord = keys.FindIndex(x => ReferenceEquals(x, k) || x.Equals(k));
+                if (ord < 0)
+                {
+                    keys.Add(k);
+                    ord = keys.Count - 1;
+                }
+            }
+
+            order[i] = ((ulong)(uint)ord << 32) | (uint)items[i].Value.GetHashCode();
+        }
+
+        order.Sort(items);
     }
 
     // Sum equal (key, value) entries in place, keeping first-seen order; drop zero weights.
@@ -1568,6 +1825,41 @@ internal sealed class BlockedIndexedTrace
         {
             Index++;
             Skip();
+        }
+
+        // A copy at the same position (for a look ahead that must not move this one).
+        public Cursor Clone() => new(Run, _block, Index);
+
+        private Cursor(Run run, int block, int index)
+        {
+            Run = run;
+            _block = block;
+            Index = index;
+        }
+
+        // Whether the hash under the cursor continues into the next block.
+        public bool SpansBlocks(uint hash) =>
+            Run.Blocks[_block].LastHash == hash && _block + 1 < Run.Blocks.Length && Run.FirstOf(_block + 1) == hash;
+
+        // Entries of hash from the cursor to the end of its block.
+        public long CountInBlock(uint hash)
+        {
+            var block = Block;
+            return (block.LastHash == hash ? block.Count : block.LowerBound(hash + 1)) - Index;
+        }
+
+        // Entries of hash from here, counting at most to cap (moves this cursor: call it on a copy).
+        public long CountAt(uint hash, long cap)
+        {
+            long n = 0;
+            while (!Done && Hash == hash && n < cap)
+            {
+                n += CountInBlock(hash);
+                Index = Run.Blocks[_block].Count;
+                Skip();
+            }
+
+            return n;
         }
 
         private void Skip()

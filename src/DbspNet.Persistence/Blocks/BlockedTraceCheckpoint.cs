@@ -532,14 +532,22 @@ internal static class BlockedTraceCheckpoint
         internal static StreamedRunFile Open(ITableFileSystem fs, string path, ILayout codec, Func<long, RunFileLease> register) =>
             new(fs, path, codec.Blocks!, CreateRunWriterAsync(fs, path, codec, CancellationToken.None).AsTask().GetAwaiter().GetResult(), register);
 
+        /// <summary>A chain a giant hash continues is written once it holds this many bytes, as a file
+        /// block of its own that the next continues (as <c>Capped</c> cuts one past 2 GiB): a giant
+        /// group's output then waits in memory a piece at a time, never whole (§5.24).</summary>
+        internal static long ChainBytes { get; set; } = 64L << 20;
+
+        private long _chainBytes;
+
         public void Append(ITraceBlock block)
         {
-            if (_chain.Count > 0 && block.FirstHash != _chain[^1].LastHash)
+            if (_chain.Count > 0 && (block.FirstHash != _chain[^1].LastHash || _chainBytes >= ChainBytes))
             {
                 WriteChain();
             }
 
             _chain.Add(block);
+            _chainBytes += block is TraceBlock t ? t.Message.Length : 0;
         }
 
         public (ITraceBlock[] Blocks, (ITableFileSystem Store, string Path) File, RunFileLease Lease) Finish()
@@ -566,6 +574,7 @@ internal static class BlockedTraceCheckpoint
 
             AppendChainAsync(_writer, _schema, _chain, 0, _chain.Count, _bodies, CancellationToken.None).AsTask().GetAwaiter().GetResult();
             _chain.Clear();
+            _chainBytes = 0;
         }
     }
 

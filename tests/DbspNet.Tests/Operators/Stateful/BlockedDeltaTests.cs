@@ -312,6 +312,93 @@ public class BlockedDeltaTests
         Assert.True(Interlocked.Read(ref DeltaSpill.Adopted) > adopted0, "no indexed delta was adopted");
     }
 
+    // ---- §5.24: merges stream a giant group by value hash ----
+
+    // Adds where key 0 holds most entries (a giant group) over many values; other keys stay small.
+    private static readonly Gen<(int K, int V, int S, long W)[]> GenSkewedAdds =
+        Gen.Select(Gen.Int[0, 9], Gen.Int[0, 60], Gen.Int[0, 3], Gen.OneOfConst(-1L, 1L, 1L, 2L))
+            .Select(t => t.Item1 < 7 ? (0, t.Item2, t.Item3, t.Item4) : t)
+            .Array[0, 200];
+
+    [Fact]
+    public void A_giant_group_merges_streaming_and_runs_stay_in_canonical_order()
+    {
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 12;
+        try
+        {
+            var giant0 = Interlocked.Read(ref BlockedIndexedTrace.GiantMerges);
+            var fallback0 = Interlocked.Read(ref BlockedIndexedTrace.GiantFallbacks);
+            Gen.Select(GenSkewedAdds.Array[1, 8], Gen.Int[1, 9], Gen.Bool).Sample((ticks, chunk, adopt) =>
+            {
+                var trace = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+                var sum = IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+                foreach (var tick in ticks)
+                {
+                    trace.Integrate(adopt ? SpilledIndexed(tick, 0, chunk) : ManagedIndexed(tick));
+                    trace.Freeze();
+                    sum += ManagedIndexed(tick);
+                    AssertSameIndexed(sum, trace.Materialize());
+                    trace.CheckRuns();
+                    trace.CheckValueOrder();
+                }
+            }, iter: 300);
+            Assert.True(Interlocked.Read(ref BlockedIndexedTrace.GiantMerges) > giant0, "no giant group was merged streaming");
+            Assert.Equal(fallback0, Interlocked.Read(ref BlockedIndexedTrace.GiantFallbacks));
+        }
+        finally
+        {
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+    }
+
+    [Fact]
+    public void A_giant_group_out_of_value_order_falls_back_and_merges_correctly()
+    {
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 12;
+        try
+        {
+            var fallback0 = Interlocked.Read(ref BlockedIndexedTrace.GiantFallbacks);
+            var trace = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 1_000, blockEntries: 8);
+
+            // A run (as an older file would hold it) with key 0's 40 values in DEScending value hash.
+            var values = Enumerable.Range(0, 40).Select(v => Row(v, 1)).OrderByDescending(v => (uint)v.GetHashCode()).ToArray();
+            var n = values.Length;
+            var key = Key(0);
+            var block = IndexedFormat.Encode(
+                Enumerable.Repeat(key, n).ToArray(), values, Enumerable.Repeat(1L, n).ToArray(),
+                Enumerable.Repeat(key.GetHashCode(), n).ToArray(), n);
+            trace.AdoptRun([block], n, null);
+            var expected = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            foreach (var v in values)
+            {
+                expected.Add(key, v, Z64.One);
+            }
+
+            // A second run retracting half and adding more, then a merge of the two.
+            var delta = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            for (var v = 0; v < 60; v++)
+            {
+                var w = v < 20 ? -1L : 1L;
+                delta.Add(key, Row(v, 1), new Z64(w));
+                expected.Add(key, Row(v, 1), new Z64(w));
+            }
+
+            trace.Integrate(delta.Build());
+            trace.Freeze();
+            Assert.Single(trace.Runs);
+            Assert.True(Interlocked.Read(ref BlockedIndexedTrace.GiantFallbacks) > fallback0, "the out-of-order run did not fall back");
+            AssertSameIndexed(expected.Build(), trace.Materialize());
+            trace.CheckRuns();
+            trace.CheckValueOrder(); // the fallback's output is canonical
+        }
+        finally
+        {
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+    }
+
     [Fact]
     public void Builder_count_and_cancellation_across_chunks()
     {
