@@ -101,69 +101,72 @@ internal sealed class RunColdGroups : IColdGroups<StructuralRow, StructuralRow, 
         ZSetBuilder<StructuralRow, Z64>? sum = null;
         for (var r = 0; r < _runs.Length; r++)
         {
-            var b = _runs[r].BlockOf(key);
-            if (b < 0)
+            // One block, or a giant group's consecutive blocks (its hash spans them, §5.18): each part
+            // is read, and the parts sum like groups from separate runs.
+            var (first, count) = _runs[r].BlocksOf(key);
+            for (var b = first; b < first + count; b++)
             {
-                continue;
-            }
-
-            // Synchronous on purpose: the operator that asked is on the step thread, waiting.
-            // A preloaded giant block is already decoded; otherwise only the key's entries are.
-            ZSet<StructuralRow, Z64> group;
-            if (_giant.TryGetValue((r, b), out var held))
-            {
-                // Decoded in the background (one group per block). A different key that shares the
-                // block's hash is not in it; the giant key is taken, so the block is dropped.
-                if (!held.IsCompleted)
+                var group = Part(r, b, key, whole: count == 1);
+                if (group.IsEmpty)
                 {
-                    var w0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    held.Wait();
-                    Interlocked.Add(ref _giantWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - w0);
-                    Interlocked.Increment(ref _giantWaits);
+                    continue;
                 }
 
-                var (giantKey, giantGroup) = held.GetAwaiter().GetResult();
-                if (giantKey.Equals(key))
+                if (only is null && sum is null)
                 {
-                    _giant.TryRemove((r, b), out _);
-                    group = giantGroup;
+                    only = group;
+                    continue;
                 }
-                else
+
+                if (sum is null)
                 {
-                    group = ZSet<StructuralRow, Z64>.Empty;
+                    sum = new ZSetBuilder<StructuralRow, Z64>();
+                    foreach (var (v, w) in only!)
+                    {
+                        sum.Add(v, w);
+                    }
                 }
-            }
-            else
-            {
-                group = _runs[r].GroupOfKeyAsync(key, _codec).AsTask().GetAwaiter().GetResult();
-            }
-            if (group.IsEmpty)
-            {
-                continue;
-            }
 
-            if (only is null && sum is null)
-            {
-                only = group;
-                continue;
-            }
-
-            if (sum is null)
-            {
-                sum = new ZSetBuilder<StructuralRow, Z64>();
-                foreach (var (v, w) in only!)
+                foreach (var (v, w) in group)
                 {
                     sum.Add(v, w);
                 }
             }
-
-            foreach (var (v, w) in group)
-            {
-                sum.Add(v, w);
-            }
         }
 
         return sum?.Build() ?? only ?? ZSet<StructuralRow, Z64>.Empty;
+    }
+
+    // Key's entries in block b of run r: a preloaded giant block's group if it is the key's, otherwise
+    // only the key's entries decoded (the whole run's, when the key has this one block).
+    private ZSet<StructuralRow, Z64> Part(int r, int b, StructuralRow key, bool whole)
+    {
+        // Synchronous on purpose: the operator that asked is on the step thread, waiting.
+        if (!_giant.TryGetValue((r, b), out var held))
+        {
+            return whole
+                ? _runs[r].GroupOfKeyAsync(key, _codec).AsTask().GetAwaiter().GetResult()
+                : _runs[r].GroupOfKeyInBlockAsync(key, b, _codec).AsTask().GetAwaiter().GetResult();
+        }
+
+        // Decoded in the background (one group per block). A different key that shares the block's
+        // hash is not in it; the giant key is taken, so the block is dropped.
+        if (!held.IsCompleted)
+        {
+            var w0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            held.Wait();
+            Interlocked.Add(ref _giantWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - w0);
+            Interlocked.Increment(ref _giantWaits);
+        }
+
+        var (giantKey, giantGroup) = held.GetAwaiter().GetResult();
+        if (!giantKey.Equals(key))
+        {
+            return ZSet<StructuralRow, Z64>.Empty;
+        }
+
+        _giant.TryRemove((r, b), out _);
+        return giantGroup;
     }
 
     public IEnumerable<KeyValuePair<StructuralRow, ZSet<StructuralRow, Z64>>> ReadAll()

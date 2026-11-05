@@ -40,7 +40,22 @@ internal static class RunFile
 {
     internal static ReadOnlySpan<byte> Magic => "DBSPRUN1"u8;
 
-    internal const int FormatVersion = 3;
+    internal const int FormatVersion = 4;
+
+    /// <summary>The oldest format a reader still opens: version 3 never lets a hash span blocks, which
+    /// version 4 allows (docs/design-bounded-memory.md §5.18), so a v3 run reads the same either way.</summary>
+    internal const int OldestReadableVersion = 3;
+
+    /// <summary>The most bytes a giant group's file block holds before the group continues in the next
+    /// block (§5.18): a block is one record-batch message read into one array, so it must stay well
+    /// under 2 GiB. A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_BYTES</c> sets it for a suite run.</summary>
+    internal static long MaxSpanBlockBytes =
+        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_BYTES"), out var cap) && cap > 0 ? cap : 256L << 20;
+
+    /// <summary>The most entries of one hash a compacted block holds before the hash continues in the
+    /// next block (§5.18; compaction cuts by entries). A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_ENTRIES</c>.</summary>
+    internal static int MaxSpanBlockEntries =
+        int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_ENTRIES"), out var cap) && cap > 0 ? cap : 1 << 18;
     internal const int TrailerBytes = 16;
     internal const int BlockIndexEntryBytes = 4 + 4 + 8 + 4 + 4 + 4;
     internal const int DefaultBlockEntries = 1024;

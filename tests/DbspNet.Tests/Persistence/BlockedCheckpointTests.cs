@@ -85,6 +85,103 @@ public class BlockedCheckpointTests
 
     private static BlockedJoinOp Op(CompiledProgram p) => p.Circuit.Operators.OfType<BlockedJoinOp>().Single();
 
+    // Giant row i of an early tick t (key 0), as Tick wrote it: its x is the i-th draw of Random(t).
+    private static object[] GiantRow(int t, int i)
+    {
+        var rng = new Random(t);
+        long x = 0;
+        for (var j = 0; j <= i; j++)
+        {
+            x = rng.Next(100);
+        }
+
+        return [0, new string('g', 100) + t + "-" + i, x];
+    }
+
+    // docs/design-bounded-memory.md §5.18: a giant group past the span cap is written as several file
+    // blocks that share its hash. It restores exactly into the blocked and the managed (lazy cold group)
+    // join; incremental checkpoints whose deltas delete giant rows compact through the span (a delta
+    // entry carried across the giant's blocks), and each restores exactly.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_giant_past_the_span_cap_spans_file_blocks_and_restores_exactly(bool readBlocked)
+    {
+        using var layout = StateLayout.Use(true);
+        var savedCap = RunFile.MaxSpanBlockBytes;
+        var savedEntries = RunFile.MaxSpanBlockEntries;
+        RunFile.MaxSpanBlockBytes = 16 << 10;
+        RunFile.MaxSpanBlockEntries = 64;
+        try
+        {
+            var fs = new InMemoryTableFileSystem();
+            var p = Compile(true);
+            var twin = Compile(readBlocked);
+            for (var tick = 0; tick < 8; tick++)
+            {
+                Tick(p, tick);
+                Tick(twin, tick);
+            }
+
+            await Snapshot.WriteAsync(p.Circuit, fs, retainCount: 1);
+
+            // The left trace's file: key 0's hash in several consecutive blocks, each only that hash.
+            var giant = (uint)new DbspNet.Core.Collections.StructuralRow([0]).GetHashCode();
+            var spanned = 0;
+            foreach (var path in await ChainOfAsync(fs, "left.arrows"))
+            {
+                await using var run = await RunReader.OpenAsync(fs, path, static r => r.GetHashCode());
+                var at = run.Blocks.Select((b, i) => (b, i)).Where(x => x.b.FirstHash <= giant && giant <= x.b.LastHash).ToList();
+                Assert.Equal(Enumerable.Range(at.Count == 0 ? 0 : at[0].i, at.Count), at.Select(x => x.i));
+                if (at.Count > 1)
+                {
+                    Assert.All(at, x => Assert.Equal((giant, giant, 1), (x.b.FirstHash, x.b.LastHash, x.b.Groups)));
+
+                    // A point lookup reads the whole span, not its first block.
+                    Assert.Equal((at[0].i, at.Count), run.BlocksOf(new DbspNet.Core.Collections.StructuralRow([0])));
+                    spanned++;
+                }
+            }
+
+            Assert.True(spanned > 0, "the giant should span file blocks");
+
+            var restored = Compile(readBlocked);
+            await Snapshot.ReadAsync(restored.Circuit, fs);
+            Assert.Equal(Digest(twin), Digest(restored));
+
+            // Deltas that delete giant rows, checkpointed incrementally until chains compact.
+            for (var k = 0; k < 8; k++)
+            {
+                foreach (var q in new[] { twin, restored })
+                {
+                    q.Table("a").Delete(GiantRow(k % 3, 10 + k));
+                    q.Table("a").Insert(0, "late-" + k, (long)k);
+                    q.Table("b").Insert(0, "probe-" + k); // joins the whole giant: reads every block of its span
+                    q.Step();
+                }
+
+                Assert.Equal(Digest(twin), Digest(restored));
+                await Snapshot.WriteAsync(restored.Circuit, fs, retainCount: 1);
+                await RunCheckpoint.WhenAllCompactedAsync();
+                var again = Compile(readBlocked);
+                await Snapshot.ReadAsync(again.Circuit, fs);
+                Assert.Equal(Digest(twin), Digest(again));
+
+                // Also into a blocked join, which needs every run consolidated (a managed chain's
+                // compaction carried delta entries across the giant's blocks).
+                var blocked = Compile(true);
+                await Snapshot.ReadAsync(blocked.Circuit, fs);
+                Assert.Equal(Digest(twin), Digest(blocked));
+                Op(blocked).LeftTrace.CheckRuns();
+            }
+        }
+        finally
+        {
+            RunFile.MaxSpanBlockBytes = savedCap;
+            RunFile.MaxSpanBlockEntries = savedEntries;
+        }
+    }
+
     [Theory]
     [InlineData(true, true)]
     [InlineData(true, false)]
@@ -215,17 +312,28 @@ public class BlockedCheckpointTests
                     await Snapshot.WriteAsync(p.Circuit, fs, retainCount: 1);
                     Assert.Contains(Op(p).LeftTrace.Runs, r => r.Blocks.Length > 0 && r.Blocks.All(b => b is LazyTraceBlock));
 
-                    // A hash spanning blocks in memory is a file block of its own; its neighbours
-                    // stay in ordinary-sized blocks (§3.5), so probing them never reads the giant.
+                    // A hash spanning blocks in memory has file blocks of its own; its neighbours
+                    // stay in ordinary-sized blocks (§3.5), so probing them never reads the giant. One
+                    // file block unless it outgrows RunFile.MaxSpanBlockBytes (§5.18): then several,
+                    // consecutive, each holding only that hash.
                     var giant = (uint)new DbspNet.Core.Collections.StructuralRow([0]).GetHashCode();
                     var giantBlocks = 0;
                     foreach (var r in Op(p).LeftTrace.Runs)
                     {
-                        var holding = r.Blocks.OfType<LazyTraceBlock>().Where(b => b.FirstHash <= giant && giant <= b.LastHash).ToList();
-                        Assert.True(holding.Count <= 1, "a hash is in one file block of a run");
-                        if (holding is [{ Count: > 100 } big])
+                        var lazy = r.Blocks.OfType<LazyTraceBlock>().ToList();
+                        var at = lazy.Select((b, i) => (b, i)).Where(x => x.b.FirstHash <= giant && giant <= x.b.LastHash).Select(x => x.i).ToList();
+                        if (at.Count == 0)
                         {
-                            Assert.True(big.Groups == 1, $"key 0 block: {big.Count} entries {big.Groups} hashes; run blocks {string.Join(",", r.Blocks.Select(x => x.Count + "/" + ((LazyTraceBlock)x).Groups))}");
+                            continue;
+                        }
+
+                        Assert.Equal(Enumerable.Range(at[0], at.Count), at);
+                        var holding = at.Select(i => lazy[i]).ToList();
+                        if (holding.Sum(b => b.Count) > 100)
+                        {
+                            Assert.All(holding, big => Assert.True(
+                                big.Groups == 1, $"key 0 block: {big.Count} entries {big.Groups} hashes; run blocks {string.Join(",", r.Blocks.Select(x => x.Count + "/" + ((LazyTraceBlock)x).Groups))}"));
+                            Assert.True(holding.Count == 1 || RunFile.MaxSpanBlockBytes < 1 << 20, "a giant splits only past the cap");
                             giantBlocks++;
                         }
                     }

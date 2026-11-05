@@ -168,9 +168,10 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         var at = 8;
         var version = BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
         at += 4;
-        if (version != RunFile.FormatVersion)
+        if (version < RunFile.OldestReadableVersion || version > RunFile.FormatVersion)
         {
-            throw new InvalidDataException($"run '{path}' has format version {version}, expected {RunFile.FormatVersion}");
+            throw new InvalidDataException(
+                $"run '{path}' has format version {version}, expected {RunFile.OldestReadableVersion}–{RunFile.FormatVersion}");
         }
 
         var kind = (RunFile.Kind)BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
@@ -221,7 +222,7 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     public bool MightContain(StructuralRow key)
     {
         var h = (uint)_hash(key);
-        return _bloom.MightContain(h) && FindBlock(h) >= 0;
+        return _bloom.MightContain(h) && FindBlocks(h).Count > 0;
     }
 
     /// <summary>The weight of <paramref name="key"/> in a Z-set run (zero if absent).</summary>
@@ -230,20 +231,32 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     {
         Require(RunFile.Kind.ZSet);
         var h = (uint)_hash(key);
-        if (!_bloom.MightContain(h) || FindBlock(h) is var b && b < 0)
+        var sum = Z64.Zero;
+        if (!_bloom.MightContain(h))
         {
-            return Z64.Zero;
+            return sum;
         }
 
-        var block = await DecodeZSetAsync(_blocks[b], codec, cancellationToken).ConfigureAwait(false);
-        return block.WeightOf(key);
+        var (first, count) = FindBlocks(h);
+        for (var b = first; b < first + count; b++)
+        {
+            var block = await DecodeZSetAsync(_blocks[b], codec, cancellationToken).ConfigureAwait(false);
+            sum = Z64.Add(sum, block.WeightOf(key));
+        }
+
+        return sum;
     }
 
-    /// <summary>The block that may hold <paramref name="key"/>, or -1 when the run certainly does not.</summary>
-    internal int BlockOf(StructuralRow key)
+    /// <summary>The first block that may hold <paramref name="key"/>, or -1 when the run certainly does
+    /// not. A giant group's hash can continue into the next blocks: see <see cref="BlocksOf"/>.</summary>
+    internal int BlockOf(StructuralRow key) => BlocksOf(key).First;
+
+    /// <summary>The blocks that may hold <paramref name="key"/>: one, or a giant group's consecutive
+    /// blocks (§5.18); count 0 when the run certainly does not.</summary>
+    internal (int First, int Count) BlocksOf(StructuralRow key)
     {
         var h = (uint)_hash(key);
-        return _bloom.MightContain(h) ? FindBlock(h) : -1;
+        return _bloom.MightContain(h) ? FindBlocks(h) : (-1, 0);
     }
 
     /// <summary><paramref name="key"/>'s weight in a Z-set run, decoding only the block's entries
@@ -251,22 +264,8 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     internal async ValueTask<Z64> WeightOfRowAsync(StructuralRow key, IZSetRunCodec codec, CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.ZSet);
-        var h = _hash(key);
-        var b = BlockOfHash(h);
-        if (b < 0)
-        {
-            return Z64.Zero;
-        }
-
-        using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
-        var (from, count) = HashRange(block.Batch, h);
-        if (count == 0)
-        {
-            return Z64.Zero;
-        }
-
-        var into = new ZSetBuilder<StructuralRow, Z64>(count);
-        codec.DecodeRange(block.Batch, from, count, into);
+        var into = new ZSetBuilder<StructuralRow, Z64>();
+        await ReadEntriesOfHashAsync(_hash(key), codec, into, cancellationToken).ConfigureAwait(false);
         return into.Build().WeightOf(key);
     }
 
@@ -276,17 +275,15 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         int hash, IZSetRunCodec codec, ZSetBuilder<StructuralRow, Z64> into, CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.ZSet);
-        var b = BlockOfHash(hash);
-        if (b < 0)
+        var (first, blocks) = BlocksOfHash(hash);
+        for (var b = first; b < first + blocks; b++)
         {
-            return;
-        }
-
-        using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
-        var (from, count) = HashRange(block.Batch, hash);
-        if (count > 0)
-        {
-            codec.DecodeRange(block.Batch, from, count, into);
+            using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
+            var (from, count) = HashRange(block.Batch, hash);
+            if (count > 0)
+            {
+                codec.DecodeRange(block.Batch, from, count, into);
+            }
         }
     }
 
@@ -295,15 +292,29 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         StructuralRow key, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
     {
         Require(RunFile.Kind.Indexed);
-        var h = _hash(key);
-        var b = BlockOfHash(h);
-        if (b < 0)
+        var (first, blocks) = BlocksOfHash(_hash(key));
+        if (blocks == 1)
         {
-            return ZSet<StructuralRow, Z64>.Empty;
+            return await GroupOfKeyInBlockAsync(key, first, codec, cancellationToken).ConfigureAwait(false);
         }
 
+        var sum = new ZSetBuilder<StructuralRow, Z64>();
+        for (var b = first; b < first + blocks; b++)
+        {
+            sum.AddRange(await GroupOfKeyInBlockAsync(key, b, codec, cancellationToken).ConfigureAwait(false));
+        }
+
+        return sum.Build();
+    }
+
+    /// <summary><paramref name="key"/>'s entries in block <paramref name="b"/> of an indexed run (a giant
+    /// group's part, when its hash spans blocks), decoding only them.</summary>
+    internal async ValueTask<ZSet<StructuralRow, Z64>> GroupOfKeyInBlockAsync(
+        StructuralRow key, int b, IIndexedRunCodec codec, CancellationToken cancellationToken = default)
+    {
+        Require(RunFile.Kind.Indexed);
         using var block = await ReadBatchAsync(_blocks[b], cancellationToken).ConfigureAwait(false);
-        var (from, count) = HashRange(block.Batch, h);
+        var (from, count) = HashRange(block.Batch, _hash(key));
         if (count == 0)
         {
             return ZSet<StructuralRow, Z64>.Empty;
@@ -399,8 +410,13 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return (message, distinct);
     }
 
-    /// <summary>The block holding entries of order hash <paramref name="hash"/>, or -1 when the run certainly has none.</summary>
-    internal int BlockOfHash(int hash) => _bloom.MightContain((uint)hash) ? FindBlock((uint)hash) : -1;
+    /// <summary>The first block holding entries of order hash <paramref name="hash"/>, or -1 when the
+    /// run certainly has none (see <see cref="BlocksOfHash"/>).</summary>
+    internal int BlockOfHash(int hash) => BlocksOfHash(hash).First;
+
+    /// <summary>The blocks holding entries of order hash <paramref name="hash"/> (more than one for a
+    /// giant group, §5.18); count 0 when the run certainly has none.</summary>
+    internal (int First, int Count) BlocksOfHash(int hash) => _bloom.MightContain((uint)hash) ? FindBlocks((uint)hash) : (-1, 0);
 
     /// <summary>Block <paramref name="b"/> of a Z-set run, decoded.</summary>
     internal ValueTask<ZSet<StructuralRow, Z64>> DecodeZSetBlockAsync(
@@ -424,13 +440,20 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     {
         Require(RunFile.Kind.Indexed);
         var h = (uint)_hash(key);
-        if (!_bloom.MightContain(h) || FindBlock(h) is var b && b < 0)
+        if (!_bloom.MightContain(h))
         {
             return ZSet<StructuralRow, Z64>.Empty;
         }
 
-        var block = await DecodeIndexedAsync(_blocks[b], codec, cancellationToken).ConfigureAwait(false);
-        return block.GroupFor(key);
+        var (first, count) = FindBlocks(h);
+        var sum = new ZSetBuilder<StructuralRow, Z64>();
+        for (var b = first; b < first + count; b++)
+        {
+            var block = await DecodeIndexedAsync(_blocks[b], codec, cancellationToken).ConfigureAwait(false);
+            sum.AddRange(block.GroupFor(key));
+        }
+
+        return sum.Build();
     }
 
     /// <summary>Every block of a Z-set run, decoded, in hash order.</summary>
@@ -509,28 +532,37 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         }
     }
 
-    // The block whose [first, last] hash range holds h, or -1. Ranges are disjoint and ascending.
-    private int FindBlock(uint h)
+    // The blocks whose [first, last] hash ranges hold h: ranges ascend, and consecutive ones share at
+    // most a boundary hash (a giant group continuing, §5.18), so they are the first block whose last
+    // hash is not below h, and those after it that begin with h. (-1, 0) when none does.
+    private (int First, int Count) FindBlocks(uint h)
     {
-        int lo = 0, hi = _blocks.Length - 1;
-        while (lo <= hi)
+        int lo = 0, hi = _blocks.Length;
+        while (lo < hi)
         {
             var mid = (lo + hi) >>> 1;
-            if (h < _blocks[mid].FirstHash)
-            {
-                hi = mid - 1;
-            }
-            else if (h > _blocks[mid].LastHash)
+            if (_blocks[mid].LastHash < h)
             {
                 lo = mid + 1;
             }
             else
             {
-                return mid;
+                hi = mid;
             }
         }
 
-        return -1;
+        if (lo >= _blocks.Length || _blocks[lo].FirstHash > h)
+        {
+            return (-1, 0);
+        }
+
+        var end = lo + 1;
+        while (end < _blocks.Length && _blocks[end].FirstHash == h)
+        {
+            end++;
+        }
+
+        return (lo, end - lo);
     }
 
     // One block as a record batch: the cached schema message followed by the block's record-batch

@@ -10,8 +10,9 @@ namespace DbspNet.Persistence.Runs;
 /// increment 7). The delta runs are small by construction (a chain is extended only while its deltas
 /// stay under half its base), so they are read whole and sorted by their stored order hash; the base
 /// streams block by block, each base block's hash range taking the delta entries that fall in it.
-/// Equal entries sum, zeros drop, and the output is cut exactly as a written run is — never inside a
-/// hash, a group larger than a block alone in its block — so it reads like any base run. Memory: one
+/// Equal entries sum, zeros drop, and the output is cut as a written run is — a group larger than a
+/// block alone in its blocks, and inside a hash only past <see cref="RunFile.MaxSpanBlockEntries"/> (§5.18)
+/// — so it reads like any base run. Memory: one
 /// base block plus the deltas.
 /// </summary>
 internal static class RunCompactor
@@ -48,49 +49,21 @@ internal static class RunCompactor
             }
         }
 
-        var sorted = deltas.OrderBy(d => d.Hash).ToList(); // stable
+        var sorted = deltas.OrderBy(d => d.Hash).Select(d => (d.Hash, d.Row, d.Weight)).ToList(); // stable
         await using var writer = await RunStreamWriter.CreateAsync(
             chain.Store, outPath, codec.RunSchema, RunFile.Kind.ZSet, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
-        var d = 0;
-        var chunk = new Dictionary<StructuralRow, (uint Hash, long Weight)>();
-        foreach (var block in runs[0].Blocks.Select((_, i) => i))
-        {
-            // No delta entry falls in this block's chunk: copy it unchanged — no decode, no
-            // row objects (most blocks: the deltas are small). Only touched blocks are merged.
-            var meta = runs[0].Blocks[block];
-            if (d >= sorted.Count || sorted[d].Hash > meta.LastHash)
+        await MergeBaseAsync(
+            runs[0],
+            sorted,
+            writer,
+            async b =>
             {
-                var (message, keyHashes) = await runs[0].ReadBlockRawAsync(block, cancellationToken).ConfigureAwait(false);
-                await writer.AppendRawAsync(message, keyHashes, meta.Entries, meta.Groups, cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
-            var (entries, hashes) = await runs[0].ReadBlockAsync(block, codec.DecodeEntries, cancellationToken).ConfigureAwait(false);
-            chunk.Clear();
-            for (var i = 0; i < entries.Length; i++)
-            {
-                Add(chunk, entries[i].Row, hashes[i], entries[i].Weight);
-            }
-
-            for (var last = runs[0].Blocks[block].LastHash; d < sorted.Count && sorted[d].Hash <= last; d++)
-            {
-                Add(chunk, sorted[d].Row, sorted[d].Hash, sorted[d].Weight);
-            }
-
-            await EmitAsync(chunk.Select(e => (e.Value.Hash, e.Key, e.Value.Weight)), writer, codec, cancellationToken).ConfigureAwait(false);
-        }
-
-        chunk.Clear();
-        for (; d < sorted.Count; d++)
-        {
-            Add(chunk, sorted[d].Row, sorted[d].Hash, sorted[d].Weight);
-        }
-
-        await EmitAsync(chunk.Select(e => (e.Value.Hash, e.Key, e.Value.Weight)), writer, codec, cancellationToken).ConfigureAwait(false);
+                var (entries, hashes) = await runs[0].ReadBlockAsync(b, codec.DecodeEntries, cancellationToken).ConfigureAwait(false);
+                return ([.. entries.Select(e => e.Row)], [.. entries.Select(e => e.Weight)], hashes);
+            },
+            chunk => EmitAsync(chunk.Select(e => (e.Value.Hash, e.Key, e.Value.Weight)), writer, codec, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
         return (await writer.FinishAsync(cancellationToken).ConfigureAwait(false)).Entries;
-
-        static void Add(Dictionary<StructuralRow, (uint Hash, long Weight)> into, StructuralRow row, uint hash, long weight) =>
-            into[row] = into.TryGetValue(row, out var had) ? (hash, had.Weight + weight) : (hash, weight);
     }
 
     /// <summary>Merge an indexed chain into <paramref name="outPath"/>; returns the entries written.</summary>
@@ -111,50 +84,119 @@ internal static class RunCompactor
             }
         }
 
-        var sorted = deltas.OrderBy(x => x.Hash).ToList();
+        var sorted = deltas.OrderBy(x => x.Hash).Select(x => (x.Hash, (x.Key, x.Value), x.Weight)).ToList();
         await using var writer = await RunStreamWriter.CreateAsync(
             chain.Store, outPath, codec.RunSchema, RunFile.Kind.Indexed, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
-        var d = 0;
-        var chunk = new Dictionary<(StructuralRow, StructuralRow), (uint Hash, long Weight)>();
-        foreach (var block in runs[0].Blocks.Select((_, i) => i))
-        {
-            // No delta entry falls in this block's chunk: copy it unchanged — no decode, no
-            // row objects (most blocks: the deltas are small). Only touched blocks are merged.
-            var meta = runs[0].Blocks[block];
-            if (d >= sorted.Count || sorted[d].Hash > meta.LastHash)
+        await MergeBaseAsync(
+            runs[0],
+            sorted,
+            writer,
+            async b =>
             {
-                var (message, keyHashes) = await runs[0].ReadBlockRawAsync(block, cancellationToken).ConfigureAwait(false);
+                var (entries, hashes) = await runs[0].ReadBlockAsync(b, codec.DecodeEntries, cancellationToken).ConfigureAwait(false);
+                return ([.. entries.Select(e => (e.Key, e.Value))], [.. entries.Select(e => e.Weight)], hashes);
+            },
+            chunk => EmitIndexedAsync(chunk, writer, codec, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+        return (await writer.FinishAsync(cancellationToken).ConfigureAwait(false)).Entries;
+    }
+
+    /// <summary>
+    /// The base run streamed block by block, each block's hash range taking the (sorted) delta entries
+    /// that fall in it. A block no delta touches is copied raw. A giant group's hash can span consecutive
+    /// base blocks (§5.18): a delta entry of that hash that matches nothing in the first block is carried
+    /// to the next ones, and emitted only where the hash's span ends, so it consolidates against every
+    /// base entry of its hash while only one base block is ever decoded. Equal entries sum; zeros drop
+    /// in the emit.
+    /// </summary>
+    private static async ValueTask MergeBaseAsync<TKey>(
+        RunReader baseRun,
+        List<(uint Hash, TKey Key, long Weight)> sorted,
+        RunStreamWriter writer,
+        Func<int, ValueTask<(TKey[] Keys, long[] Weights, uint[] Hashes)>> readBlock,
+        Func<Dictionary<TKey, (uint Hash, long Weight)>, ValueTask> emit,
+        CancellationToken cancellationToken)
+        where TKey : notnull
+    {
+        var blocks = baseRun.Blocks;
+        var d = 0;
+        var chunk = new Dictionary<TKey, (uint Hash, long Weight)>();
+        var pending = new Dictionary<TKey, (uint Hash, long Weight)>(); // of the hash the last block ended with
+        for (var b = 0; b < blocks.Count; b++)
+        {
+            var meta = blocks[b];
+            var spansOut = b + 1 < blocks.Count && blocks[b + 1].FirstHash == meta.LastHash;
+
+            // No delta entry falls in this block and none is carried into it: copy it unchanged — no
+            // decode, no row objects (most blocks: the deltas are small).
+            if (pending.Count == 0 && (d >= sorted.Count || sorted[d].Hash > meta.LastHash))
+            {
+                var (message, keyHashes) = await baseRun.ReadBlockRawAsync(b, cancellationToken).ConfigureAwait(false);
                 await writer.AppendRawAsync(message, keyHashes, meta.Entries, meta.Groups, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            var (entries, hashes) = await runs[0].ReadBlockAsync(block, codec.DecodeEntries, cancellationToken).ConfigureAwait(false);
+            var (keys, weights, hashes) = await readBlock(b).ConfigureAwait(false);
             chunk.Clear();
-            for (var i = 0; i < entries.Length; i++)
+            for (var i = 0; i < keys.Length; i++)
             {
-                Add(chunk, entries[i].Key, entries[i].Value, hashes[i], entries[i].Weight);
+                chunk[keys[i]] = (hashes[i], weights[i]);
             }
 
-            for (var last = runs[0].Blocks[block].LastHash; d < sorted.Count && sorted[d].Hash <= last; d++)
+            // Carried entries (this block begins with their hash): those this block holds merge here.
+            foreach (var key in pending.Keys.ToArray())
             {
-                Add(chunk, sorted[d].Key, sorted[d].Value, sorted[d].Hash, sorted[d].Weight);
+                if (chunk.TryGetValue(key, out var had))
+                {
+                    chunk[key] = (had.Hash, had.Weight + pending[key].Weight);
+                    pending.Remove(key);
+                }
             }
 
-            await EmitIndexedAsync(chunk, writer, codec, cancellationToken).ConfigureAwait(false);
+            // Their span ends here unless this block is wholly that hash and the next continues it.
+            if (pending.Count > 0 && !(spansOut && meta.FirstHash == meta.LastHash))
+            {
+                foreach (var (key, e) in pending)
+                {
+                    chunk[key] = e;
+                }
+
+                pending.Clear();
+            }
+
+            for (; d < sorted.Count && sorted[d].Hash <= meta.LastHash; d++)
+            {
+                var (h, key, w) = sorted[d];
+                if (chunk.TryGetValue(key, out var had))
+                {
+                    chunk[key] = (h, had.Weight + w);
+                }
+                else if (spansOut && h == meta.LastHash)
+                {
+                    pending[key] = pending.TryGetValue(key, out var p) ? (h, p.Weight + w) : (h, w); // may be in a later block
+                }
+                else
+                {
+                    chunk[key] = (h, w);
+                }
+            }
+
+            await emit(chunk).ConfigureAwait(false);
         }
 
         chunk.Clear();
-        for (; d < sorted.Count; d++)
+        foreach (var (key, e) in pending)
         {
-            Add(chunk, sorted[d].Key, sorted[d].Value, sorted[d].Hash, sorted[d].Weight);
+            chunk[key] = e;
         }
 
-        await EmitIndexedAsync(chunk, writer, codec, cancellationToken).ConfigureAwait(false);
-        return (await writer.FinishAsync(cancellationToken).ConfigureAwait(false)).Entries;
+        for (; d < sorted.Count; d++)
+        {
+            var (h, key, w) = sorted[d];
+            chunk[key] = chunk.TryGetValue(key, out var had) ? (h, had.Weight + w) : (h, w);
+        }
 
-        static void Add(
-            Dictionary<(StructuralRow, StructuralRow), (uint Hash, long Weight)> into, StructuralRow key, StructuralRow value, uint hash, long weight) =>
-            into[(key, value)] = into.TryGetValue((key, value), out var had) ? (hash, had.Weight + weight) : (hash, weight);
+        await emit(chunk).ConfigureAwait(false);
     }
 
     // Blocks of a chunk: entries sorted by hash, zeros dropped, cut as RunFile cuts — never inside a
@@ -178,6 +220,23 @@ internal static class RunCompactor
             {
                 blocks.Add((start, i));
                 start = i;
+            }
+
+            // A giant hash run past the cap continues from block to block (§5.18): a block is one message
+            // read into one array.
+            if (runLength > RunFile.MaxSpanBlockEntries)
+            {
+                if (i > start)
+                {
+                    blocks.Add((start, i)); // the entries before it, whatever the cap
+                }
+
+                for (var s = i; s < end; s += RunFile.MaxSpanBlockEntries)
+                {
+                    blocks.Add((s, Math.Min(end, s + RunFile.MaxSpanBlockEntries)));
+                }
+
+                start = end;
             }
 
             i = end;

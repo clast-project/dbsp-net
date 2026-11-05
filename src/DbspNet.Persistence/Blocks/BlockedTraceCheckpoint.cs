@@ -469,7 +469,7 @@ internal static class BlockedTraceCheckpoint
                 Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Count));
             }
 
-            foreach (var piece in pieces)
+            foreach (var piece in Capped(pieces))
             {
                 if (piece.Parts is { } parts)
                 {
@@ -577,6 +577,42 @@ internal static class BlockedTraceCheckpoint
         }
 
         return schema.Encode(keys, values, weights, hashes, n);
+    }
+
+    // A concatenated piece past RunFile.MaxSpanBlockBytes split at part boundaries into consecutive
+    // pieces (docs/design-bounded-memory.md §5.18): a file block is one message read into one array, so
+    // a giant group over ~2 GiB cannot be one block; its hash continues from block to block instead,
+    // as it does in memory.
+    private static IEnumerable<Piece> Capped(List<Piece> pieces)
+    {
+        foreach (var piece in pieces)
+        {
+            if (piece.Parts is not { } parts || parts.Sum(p => (long)p.Message.Length) <= RunFile.MaxSpanBlockBytes)
+            {
+                yield return piece;
+                continue;
+            }
+
+            var chunk = new List<TraceBlock>();
+            long bytes = 0;
+            foreach (var part in parts)
+            {
+                if (chunk.Count > 0 && bytes + part.Message.Length > RunFile.MaxSpanBlockBytes)
+                {
+                    yield return new Piece(null, [.. chunk]);
+                    chunk.Clear();
+                    bytes = 0;
+                }
+
+                chunk.Add(part);
+                bytes += part.Message.Length;
+            }
+
+            if (chunk.Count > 0)
+            {
+                yield return new Piece(null, [.. chunk]);
+            }
+        }
     }
 
     // One file block: a block written as it is (and kept as the file block's body), or a giant

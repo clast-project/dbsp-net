@@ -9,8 +9,9 @@ namespace DbspNet.Persistence.Runs;
 
 /// <summary>
 /// Writes a run one block at a time, for a producer that cannot hold every entry at once (compaction,
-/// docs/design-durable-state.md §1f, increment 7). Blocks must arrive in ascending, non-overlapping
-/// hash order; the layout is exactly <see cref="RunFile"/>'s.
+/// docs/design-durable-state.md §1f, increment 7). Blocks must arrive in ascending hash order; a block
+/// may begin with the hash the previous one ended with — a giant group continuing — and readers then
+/// read that hash across both (docs/design-bounded-memory.md §5.18). The layout is <see cref="RunFile"/>'s.
 /// </summary>
 internal sealed class RunStreamWriter : IAsyncDisposable
 {
@@ -52,17 +53,14 @@ internal sealed class RunStreamWriter : IAsyncDisposable
     {
         var first = keyHashes[0];
         var last = keyHashes[^1];
-        if (_lastHash is { } previous && first <= previous)
-        {
-            throw new InvalidOperationException("run blocks must arrive in ascending, non-overlapping hash order");
-        }
+        var runGroups = Admit(first, groups);
 
         var offset = _file.Position;
         await _ipc.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
         _index.Add(new RunBlock(first, last, offset, checked((int)(_file.Position - offset)), entries, groups));
         _keyHashes.AddRange(keyHashes);
         _entries += entries;
-        _groups += groups;
+        _groups += runGroups;
         _lastHash = last;
     }
 
@@ -73,10 +71,7 @@ internal sealed class RunStreamWriter : IAsyncDisposable
     {
         var first = keyHashes[0];
         var last = keyHashes[^1];
-        if (_lastHash is { } previous && first <= previous)
-        {
-            throw new InvalidOperationException("run blocks must arrive in ascending, non-overlapping hash order");
-        }
+        var runGroups = Admit(first, groups);
 
         // A stored block is a complete, aligned IPC record-batch message: written between the
         // writer's own batches, the stream stays well formed.
@@ -85,7 +80,7 @@ internal sealed class RunStreamWriter : IAsyncDisposable
         _index.Add(new RunBlock(first, last, offset, checked((int)(_file.Position - offset)), entries, groups));
         _keyHashes.AddRange(keyHashes);
         _entries += entries;
-        _groups += groups;
+        _groups += runGroups;
         _lastHash = last;
     }
 
@@ -96,22 +91,36 @@ internal sealed class RunStreamWriter : IAsyncDisposable
     {
         var first = keyHashes[0];
         var last = keyHashes[^1];
-        if (_lastHash is { } previous && first <= previous)
-        {
-            throw new InvalidOperationException("run blocks must arrive in ascending, non-overlapping hash order");
-        }
+        var runGroups = Admit(first, groups);
 
         var offset = _file.Position;
         await Blocks.BlockWriter.ConcatToAsync(schema, parts, _file, cancellationToken).ConfigureAwait(false);
         _index.Add(new RunBlock(first, last, offset, checked((int)(_file.Position - offset)), entries, groups));
         _keyHashes.AddRange(keyHashes);
         _entries += entries;
-        _groups += groups;
+        _groups += runGroups;
         _lastHash = last;
     }
 
     /// <summary>The blocks written so far: offsets, lengths and hash ranges.</summary>
     internal IReadOnlyList<RunBlock> Index => _index;
+
+    // Blocks ascend; one that begins with the previous block's last hash continues that hash's group,
+    // which the run's group count has already counted once.
+    private int Admit(uint first, int groups)
+    {
+        if (_lastHash is not { } previous)
+        {
+            return groups;
+        }
+
+        if (first < previous)
+        {
+            throw new InvalidOperationException("run blocks must arrive in ascending hash order");
+        }
+
+        return first == previous ? Math.Max(0, groups - 1) : groups;
+    }
 
     internal async ValueTask<RunInfo> FinishAsync(CancellationToken cancellationToken)
     {
