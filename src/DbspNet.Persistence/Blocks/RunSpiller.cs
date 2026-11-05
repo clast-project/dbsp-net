@@ -123,23 +123,7 @@ internal sealed class RunSpiller : IRunSpiller
             var path = Guid.NewGuid().ToString("N") + ".run";
             if (BlockedTraceCheckpoint.SpillRun(_fs, path, schema.Codec, trace, run) is { } rebound)
             {
-                var length = new FileInfo(_fs.FullPath(path)).Length;
-                var lease = new RunFileLease(() => Delete(path, length)) { Bytes = length };
-                rebound.Lease = lease;
-                lease.Hold(trace);
-                lock (_files)
-                {
-                    _files.Add(lease);
-                }
-
-                Interlocked.Increment(ref Runs);
-                Interlocked.Add(ref Bytes, bytes);
-                Interlocked.Increment(ref LiveFiles);
-                var live = Interlocked.Add(ref LiveFileBytes, length);
-                long peak;
-                while (live > (peak = Interlocked.Read(ref PeakFileBytes)) && Interlocked.CompareExchange(ref PeakFileBytes, live, peak) != peak)
-                {
-                }
+                rebound.Lease = Register(path, new FileInfo(_fs.FullPath(path)).Length, bytes, trace);
             }
             else
             {
@@ -152,6 +136,42 @@ internal sealed class RunSpiller : IRunSpiller
             _sinceSweep = 0;
             Sweep();
         }
+    }
+
+    public long StreamAtBytes => _minBytes;
+
+    public IRunSink? BeginRun(BlockedIndexedTrace trace)
+    {
+        if (!BlockCache.Enabled || trace.Format is not BlockSchema schema)
+        {
+            return null; // without eviction a file only adds a write
+        }
+
+        var path = Guid.NewGuid().ToString("N") + ".run";
+        return BlockedTraceCheckpoint.StreamedRunFile.Open(_fs, path, schema.Codec, length => Register(path, length, length, trace));
+    }
+
+    // A new spill file: its lease, held by holder BEFORE a sweep can see it, tracked for sweeps,
+    // census and the counters.
+    private RunFileLease Register(string path, long length, long blockBytes, BlockedIndexedTrace holder)
+    {
+        var lease = new RunFileLease(() => Delete(path, length)) { Bytes = length };
+        lease.Hold(holder);
+        lock (_files)
+        {
+            _files.Add(lease);
+        }
+
+        Interlocked.Increment(ref Runs);
+        Interlocked.Add(ref Bytes, blockBytes);
+        Interlocked.Increment(ref LiveFiles);
+        var live = Interlocked.Add(ref LiveFileBytes, length);
+        long peak;
+        while (live > (peak = Interlocked.Read(ref PeakFileBytes)) && Interlocked.CompareExchange(ref PeakFileBytes, live, peak) != peak)
+        {
+        }
+
+        return lease;
     }
 
     // A run's in-memory block bytes; a block already lazy counts nothing.

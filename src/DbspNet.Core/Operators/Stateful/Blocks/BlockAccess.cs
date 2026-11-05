@@ -152,4 +152,21 @@ internal interface IRunSpiller
     /// <summary>The trace's runs have just changed (a freeze or merge, on the trace's own thread):
     /// spill the large ones that have no file.</summary>
     void AfterCompact(BlockedIndexedTrace trace);
+
+    /// <summary>Encoded bytes at which a run being built streams its blocks to a file (§5.23).</summary>
+    long StreamAtBytes { get; }
+
+    /// <summary>A file for a run <paramref name="trace"/> is building, written block by block as it is
+    /// built so its output never sits whole in memory (§5.23); null: build it in memory.</summary>
+    IRunSink? BeginRun(BlockedIndexedTrace trace);
+}
+
+/// <summary>A run file being written as its run is built (§5.23).</summary>
+internal interface IRunSink
+{
+    /// <summary>The next block of the run, in hash order.</summary>
+    void Append(ITraceBlock block);
+
+    /// <summary>The run's blocks over the finished file (evictable), the file, and its lease, already held by the building trace.</summary>
+    (ITraceBlock[] Blocks, (DbspNet.Core.IO.ITableFileSystem Store, string Path) File, RunFileLease Lease) Finish();
 }

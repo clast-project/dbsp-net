@@ -11,7 +11,10 @@
 //      exactly the files the circuit's traces list; a lazy reader captured before the merge still
 //      reads the merged-away files, and they go once the reader is collected;
 //   6. a lease deletes on its last release, waits for live readers, and refuses a hold after delete;
-//   7. the startup sweep removes the spill roots of dead processes only.
+//   7. the startup sweep removes the spill roots of dead processes only;
+//   8. (§5.23) a freeze or merge whose output passes the threshold writes it to its file as it is built:
+//      the run comes out file-backed (no rewrite after), reads, probes and merges on exactly as in
+//      memory, retractions included, and its file is held and released like a spilled one.
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Blocks;
@@ -319,6 +322,55 @@ public class RunSpillerTests
         // Every body was evicted (budget 1): the reader reads the files back, and sees the old state.
         Assert.Equal(Rows(0, 120).OrderBy(e => (int)e.Key[0]!), reader.OrderBy(e => (int)e.Key[0]!));
         return new WeakReference<object>(reader);
+    }
+
+    [Fact]
+    public async Task A_run_past_the_threshold_is_written_as_it_is_built()
+    {
+        await WithSpillerAsync(4096, (spiller, dir) =>
+        {
+            using var noDeltas = SpillSettings.UseStepSpill(null);
+            using var mode = TraceBlocksMode.Use(join: true, freezeEntries: 64, blockEntries: 8);
+            var format = TraceBlockFormats.Create(RowSchema, Schema.Empty)!;
+            var trace = new BlockedZSetTrace(format);
+            var streamed0 = Interlocked.Read(ref BlockedIndexedTrace.StreamedRuns);
+            var expected = new Dictionary<int, long>();
+            var rng = new Random(7);
+            for (var d = 0; d < 40; d++)
+            {
+                var b = new ZSetBuilder<StructuralRow, Z64>();
+                for (var i = 0; i < 60; i++)
+                {
+                    // Inserts, and retractions of earlier rows (some cancelling whole rows).
+                    var k = rng.Next(0, 1500);
+                    var w = expected.TryGetValue(k, out var have) && have > 0 && rng.Next(3) == 0 ? -1L : 1L;
+                    b.Add(new StructuralRow(k, Utf8String.Of(new string('r', 40) + k)), new Z64(w));
+                    expected[k] = have + w;
+                }
+
+                trace.Integrate(b.Build());
+                trace.Idle();
+
+                // Every run past the threshold is file-backed; each file is held by the trace, and the
+                // files on disk are exactly the ones its runs list.
+                var listed = trace.Trace.Runs.Select(r => r.Lease).OfType<RunFileLease>().Distinct().ToList();
+                Assert.All(listed, l => Assert.False(l.Deleted));
+                Assert.Equal(listed.Count, FilesIn(dir));
+            }
+
+            Assert.True(Interlocked.Read(ref BlockedIndexedTrace.StreamedRuns) > streamed0, "no run was streamed");
+            Assert.Contains(trace.Trace.Runs, r => r.Persisted is not null && r.Blocks.All(b => b is LazyTraceBlock));
+            var want = expected.Where(e => e.Value != 0).OrderBy(e => e.Key).Select(e => (e.Key, e.Value)).ToList();
+            var got = trace.EnumerateWhole().Select(e => ((int)e.Key[0]!, e.Value.Value)).OrderBy(e => e.Item1).ToList();
+            Assert.Equal(want, got);
+            foreach (var k in new[] { 0, 1, 77, 500, 1499 })
+            {
+                var row = new StructuralRow(k, Utf8String.Of(new string('r', 40) + k));
+                Assert.Equal(expected.GetValueOrDefault(k), trace.WeightOf(row).Value);
+            }
+
+            return Task.CompletedTask;
+        });
     }
 
     [Fact]

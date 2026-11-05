@@ -446,8 +446,7 @@ internal static class BlockedTraceCheckpoint
     {
         var schema = codec.Blocks!;
         var bodies = new List<(RunBlock Index, TraceBlock? Body)>();
-        await using var writer = await RunStreamWriter.CreateAsync(
-            fs, path, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken).ConfigureAwait(false);
+        await using var writer = await CreateRunWriterAsync(fs, path, codec, cancellationToken).ConfigureAwait(false);
         var blocks = run.Blocks;
         for (var b = 0; b < blocks.Length;)
         {
@@ -457,40 +456,117 @@ internal static class BlockedTraceCheckpoint
                 end++;
             }
 
-            var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
-            // Without eviction a span is written whole (neighbours and all): nothing faults it in for
-            // a neighbour, and slicing would cost the checkpoint (§3.6). A giant's parts are streamed
-            // to the file, never concatenated in memory (§3d).
-            var pieces = end == b + 1 ? [new Piece(Materialized(blocks[b]), null)]
-                : BlockCache.Enabled ? Pieces(schema, blocks, b, end)
-                : [new Piece(null, [.. blocks[b..end].Select(Materialized)])];
-            if (end > b + 1 && Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
-            {
-                Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Count));
-            }
-
-            foreach (var piece in Capped(pieces))
-            {
-                if (piece.Parts is { } parts)
-                {
-                    var hashes = Distinct(parts);
-                    await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
-                    bodies.Add((writer.Index[^1], null));
-                }
-                else
-                {
-                    var block = piece.Block!;
-                    var hashes = Distinct(block.Hashes);
-                    await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
-                    bodies.Add((writer.Index[^1], block));
-                }
-            }
-
+            await AppendChainAsync(writer, schema, blocks, b, end, bodies, cancellationToken).ConfigureAwait(false);
             b = end;
         }
 
         await writer.FinishAsync(cancellationToken).ConfigureAwait(false);
         return bodies;
+    }
+
+    private static ValueTask<RunStreamWriter> CreateRunWriterAsync(ITableFileSystem fs, string path, ILayout codec, CancellationToken cancellationToken) =>
+        RunStreamWriter.CreateAsync(fs, path, codec.RunSchema, codec.Kind, RowHash(RunFile.FingerprintRow), cancellationToken);
+
+    // Blocks [b, end), chained by a hash that spans them (or one block), appended as file blocks.
+    private static async ValueTask AppendChainAsync(
+        RunStreamWriter writer, BlockSchema schema, IReadOnlyList<ITraceBlock> blocks, int b, int end,
+        List<(RunBlock Index, TraceBlock? Body)> bodies, CancellationToken cancellationToken)
+    {
+        var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
+        // Without eviction a span is written whole (neighbours and all): nothing faults it in for
+        // a neighbour, and slicing would cost the checkpoint (§3.6). A giant's parts are streamed
+        // to the file, never concatenated in memory (§3d).
+        var chain = blocks is ITraceBlock[] array ? array : [.. blocks];
+        var pieces = end == b + 1 ? [new Piece(Materialized(chain[b]), null)]
+            : BlockCache.Enabled ? Pieces(schema, chain, b, end)
+            : [new Piece(null, [.. chain[b..end].Select(Materialized)])];
+        if (end > b + 1 && Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
+        {
+            Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Count));
+        }
+
+        foreach (var piece in Capped(pieces))
+        {
+            if (piece.Parts is { } parts)
+            {
+                var hashes = Distinct(parts);
+                await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+                bodies.Add((writer.Index[^1], null));
+            }
+            else
+            {
+                var block = piece.Block!;
+                var hashes = Distinct(block.Hashes);
+                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
+                bodies.Add((writer.Index[^1], block));
+            }
+        }
+    }
+
+    /// <summary>
+    /// A run file written as its run is built (§5.23): blocks arrive in hash order and are appended as
+    /// they come, except a chain a spanning hash still continues, held until the hash ends so it is
+    /// written as one file block (as <see cref="SpillRun"/> writes it). At the finish the run's blocks
+    /// are lazy over the file, each written body admitted to the block cache, so they can be evicted.
+    /// </summary>
+    internal sealed class StreamedRunFile : IRunSink
+    {
+        private readonly ITableFileSystem _fs;
+        private readonly string _path;
+        private readonly BlockSchema _schema;
+        private readonly RunStreamWriter _writer;
+        private readonly Func<long, RunFileLease> _register;
+        private readonly List<ITraceBlock> _chain = [];
+        private readonly List<(RunBlock Index, TraceBlock? Body)> _bodies = [];
+
+        private StreamedRunFile(ITableFileSystem fs, string path, BlockSchema schema, RunStreamWriter writer, Func<long, RunFileLease> register)
+        {
+            _fs = fs;
+            _path = path;
+            _schema = schema;
+            _writer = writer;
+            _register = register;
+        }
+
+        /// <param name="register">Given the finished file's length, its lease.</param>
+        internal static StreamedRunFile Open(ITableFileSystem fs, string path, ILayout codec, Func<long, RunFileLease> register) =>
+            new(fs, path, codec.Blocks!, CreateRunWriterAsync(fs, path, codec, CancellationToken.None).AsTask().GetAwaiter().GetResult(), register);
+
+        public void Append(ITraceBlock block)
+        {
+            if (_chain.Count > 0 && block.FirstHash != _chain[^1].LastHash)
+            {
+                WriteChain();
+            }
+
+            _chain.Add(block);
+        }
+
+        public (ITraceBlock[] Blocks, (ITableFileSystem Store, string Path) File, RunFileLease Lease) Finish()
+        {
+            WriteChain();
+            _writer.FinishAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            _writer.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            var blocks = new ITraceBlock[_bodies.Count];
+            for (var b = 0; b < blocks.Length; b++)
+            {
+                blocks[b] = new LazyTraceBlock(_schema, _fs, _path, _bodies[b].Index, _bodies[b].Body);
+            }
+
+            var length = _fs is IO.Local.LocalTableFileSystem local ? new FileInfo(local.FullPath(_path)).Length : 0;
+            return (blocks, (_fs, _path), _register(length));
+        }
+
+        private void WriteChain()
+        {
+            if (_chain.Count == 0)
+            {
+                return;
+            }
+
+            AppendChainAsync(_writer, _schema, _chain, 0, _chain.Count, _bodies, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            _chain.Clear();
+        }
     }
 
     private static TraceBlock Materialized(ITraceBlock block) => block switch

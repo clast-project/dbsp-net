@@ -84,6 +84,9 @@ internal sealed class BlockedIndexedTrace
         }
     }
 
+    /// <summary>Runs written to a file as they were built (§5.23), since start (diagnostics).</summary>
+    internal static long StreamedRuns;
+
     internal sealed class Run(ITraceBlock[] blocks, long entries)
     {
         private readonly uint[] _first = [.. blocks.Select(b => b.FirstHash)];
@@ -1162,7 +1165,7 @@ internal sealed class BlockedIndexedTrace
             }
 
             Array.Sort(hashes, groups, 0, g);
-            var run = new RunBuilder(this);
+            var run = new RunBuilder(this, stream: true);
             for (var i = 0; i < g; i++)
             {
                 var key = groups[i].Key;
@@ -1245,7 +1248,7 @@ internal sealed class BlockedIndexedTrace
             }
 
             Array.Sort(hashes, rows, 0, g);
-            var run = new RunBuilder(this);
+            var run = new RunBuilder(this, stream: true);
             for (var i = 0; i < g; i++)
             {
                 run.Add(hashes[i], rows[i].Key, NoValue, rows[i].Value.Value);
@@ -1363,7 +1366,7 @@ internal sealed class BlockedIndexedTrace
                 }
             }
 
-            var output = new RunBuilder(this);
+            var output = new RunBuilder(this, stream: true);
             var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
             var tied = new List<int>();
             var dropped = 0L;
@@ -1445,7 +1448,7 @@ internal sealed class BlockedIndexedTrace
     {
         var a = new Cursor(newer);
         var b = new Cursor(older);
-        var output = new RunBuilder(this);
+        var output = new RunBuilder(this, stream: true);
         var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
         var dropped = 0L;
         while (!a.Done || !b.Done)
@@ -1584,9 +1587,15 @@ internal sealed class BlockedIndexedTrace
 
     // Cuts entries (ascending hash) into blocks: after blockEntries entries where the hash changes,
     // and after the byte budget anywhere — a giant group's hash then spans consecutive blocks.
-    private sealed class RunBuilder(BlockedIndexedTrace trace)
+    // stream: the run goes into the trace's levels (a freeze or merge), so once its blocks pass the
+    // spiller's threshold they are written to a file as they are made (§5.23); a merge's output is then
+    // bounded by a block, not by the run.
+    private sealed class RunBuilder(BlockedIndexedTrace trace, bool stream = false)
     {
         private long _bytes;
+        private long _flushedBytes;
+        private IRunSink? _sink;
+        private bool _noSink;
         private readonly List<ITraceBlock> _blocks = new();
         private StructuralRow[] _keys = new StructuralRow[64];
         private StructuralRow[] _values = new StructuralRow[64];
@@ -1658,6 +1667,15 @@ internal sealed class BlockedIndexedTrace
         public Run? Finish()
         {
             Flush();
+            if (_sink is not null)
+            {
+                var (blocks, file, lease) = _sink.Finish();
+                _sink = null;
+                var run = new Run(blocks, _entries) { Persisted = file, Lease = lease };
+                Interlocked.Increment(ref StreamedRuns);
+                return run;
+            }
+
             return _blocks.Count == 0 ? null : new Run([.. _blocks], _entries);
         }
 
@@ -1691,7 +1709,31 @@ internal sealed class BlockedIndexedTrace
             }
 
             var t0 = BlockTraceProfile.Now();
-            _blocks.Add(trace._format.Encode(_keys, _values, _weights, _hashes, _count));
+            var block = trace._format.Encode(_keys, _values, _weights, _hashes, _count);
+            _flushedBytes += _bytes;
+            if (_sink is not null)
+            {
+                _sink.Append(block);
+            }
+            else
+            {
+                _blocks.Add(block);
+                if (stream && !_noSink && BlockAccess.Spiller is { } spiller && _flushedBytes >= spiller.StreamAtBytes)
+                {
+                    _sink = spiller.BeginRun(trace);
+                    _noSink = _sink is null;
+                    if (_sink is not null)
+                    {
+                        foreach (var made in _blocks)
+                        {
+                            _sink.Append(made);
+                        }
+
+                        _blocks.Clear();
+                    }
+                }
+            }
+
             if (BlockTraceProfile.Enabled)
             {
                 BlockTraceProfile.Encode(t0);
