@@ -194,9 +194,19 @@ internal sealed class BlockedIndexedTrace
         }
 
         _materialized = null;
-        foreach (var run in runs)
+        var adopted = runs.Select(run => new Run(run.Blocks, run.Entries) { Persisted = run.Persisted, AdoptedFrom = run }).ToList();
+
+        // Many runs (a delta's chunks) merge in ONE k-way pass, not a pairwise cascade: the cascade wrote
+        // every row ~log2(k) times, each output spilled, and filled a disk on TPC-DS (§5.19).
+        if (adopted.Count > 2)
         {
-            _runs.Insert(0, new Run(run.Blocks, run.Entries) { Persisted = run.Persisted, AdoptedFrom = run });
+            var merged = MergeMany(adopted);
+            adopted = merged is null ? [] : [merged];
+        }
+
+        foreach (var run in adopted)
+        {
+            _runs.Insert(0, run);
         }
 
         Compact();
@@ -1276,6 +1286,104 @@ internal sealed class BlockedIndexedTrace
             if (BlockTraceProfile.Enabled)
             {
                 BlockTraceProfile.Merge(t0, newer.Entries + older.Entries);
+            }
+        }
+    }
+
+    // A k-way merge in hash order (adopted runs, §5.19): MergeCore's grouping for any number of runs —
+    // entries of one hash from several runs consolidated by key and value, those under a floor dropped.
+    private Run? MergeMany(IReadOnlyList<Run> runs)
+    {
+        var t0 = BlockTraceProfile.Now();
+        var maintenance = BlockAccess.InMaintenance;
+        BlockAccess.InMaintenance = true;
+        var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
+        try
+        {
+            var cursors = runs.Select(r => new Cursor(r)).ToArray();
+            var queue = new PriorityQueue<int, uint>(cursors.Length);
+            for (var c = 0; c < cursors.Length; c++)
+            {
+                if (!cursors[c].Done)
+                {
+                    queue.Enqueue(c, cursors[c].Hash);
+                }
+            }
+
+            var output = new RunBuilder(this);
+            var group = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
+            var tied = new List<int>();
+            var dropped = 0L;
+            while (queue.TryDequeue(out var first, out var hash))
+            {
+                tied.Clear();
+                tied.Add(first);
+                while (queue.TryPeek(out var next, out var h) && h == hash)
+                {
+                    queue.Dequeue();
+                    tied.Add(next);
+                }
+
+                group.Clear();
+                var droppedHere = false;
+                foreach (var c in tied)
+                {
+                    var cursor = cursors[c];
+                    StructuralRow? key = null;
+                    StructuralRow? lastDropped = null;
+                    while (!cursor.Done && cursor.Hash == hash)
+                    {
+                        var (block, i) = (cursor.Block, cursor.Index);
+                        key = key is not null && block.KeyEquals(i, key) ? key : block.Key(i);
+                        if (Dropped(key, cursor.Run.Floor))
+                        {
+                            if (!ReferenceEquals(key, lastDropped))
+                            {
+                                dropped++;
+                                lastDropped = key;
+                            }
+
+                            droppedHere = true;
+                        }
+                        else
+                        {
+                            group.Add((key, block.Value(i), block.Weight(i)));
+                        }
+
+                        cursor.Advance();
+                    }
+
+                    if (!cursor.Done)
+                    {
+                        queue.Enqueue(c, cursor.Hash);
+                    }
+                }
+
+                if (tied.Count > 1 || droppedHere)
+                {
+                    Consolidate(group);
+                }
+
+                foreach (var (key, value, weight) in group)
+                {
+                    output.Add(hash, key, value, weight);
+                }
+            }
+
+            DroppedKeys += dropped;
+            return output.Finish();
+        }
+        finally
+        {
+            if (StepSpillProfile.Enabled)
+            {
+                StepSpillProfile.End(StepSpillProfile.RunMerge, m);
+            }
+
+            BlockAccess.InMaintenance = maintenance;
+            if (BlockTraceProfile.Enabled)
+            {
+                BlockTraceProfile.Merge(t0, runs.Sum(r => r.Entries));
             }
         }
     }
