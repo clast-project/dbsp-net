@@ -1851,3 +1851,32 @@ hold for readers, no release on merge. Suite green knob off and in forced + S1 +
   released, or nudging a GC under disk pressure.
 - **The exit cleanup did not run** when the process died this way; the startup sweep now covers it.
 - The run still ends in D4 (§5.19).
+
+### 5.21 What the spill disk holds: a census by holder (2026-11-05, 4eed547, xt63)
+
+**Method.** Every spilled file is classed by its strongest live holder: a state trace that lists the run, else
+a block-backed delta's own trace, else a lazy reader. A file with no live holder is *dead*: a sweep deletes it.
+Readings come right after a forced full GC (the census's tick-end and per-op points), so *dead* is exactly what
+only a GC frees. A sweep follows each reading. xt63 used xt62's settings with a per-op point every 2 GiB; it was
+stopped at op 1671 of tick 18 (~4,700 s).
+
+| point | files | state | delta | dead (swept) |
+|---|---|---|---|---|
+| end of tick 0 | 84 | 24.6 GB | 3.1 GB | 6.0 GB |
+| end of tick 8 | 176 | 68.0 GB | 4.9 GB | 5.1 GB |
+| end of tick 11 | 237 | 89.4 GB | 2.3 GB | 2.3 GB |
+| end of tick 17 | 284 | 92.8 GB | 0.9 GB | 1.6 GB |
+| tick 18, op 1269 | 280 | 92.7 GB | 1.2 GB | 0.6 GB |
+| tick 18, op 1388 | 396 | 106.2 GB | 8.9 GB | 14.6 GB |
+| tick 18, op 1425 | 400 | 128.0 GB | 10.4 GB | 15.0 GB |
+| tick 18, op 1671 | 421 | **186.6 GB** | 10.3 GB | 9.0 GB |
+
+- **The disk is state.** Live operator traces list 87–95% of the spilled bytes at every point. Tick 18 adds
+  ~94 GB of state between op 1269 and op 1671, the fan-out's joins, aggregates and views integrating 21–65M-row deltas.
+- **What a GC alone frees is small.** Dead bytes peak at ~15 GB, and in-step deltas at ~10 GB, in the fan-out.
+  Between ticks, a delta's files die by the next tick. Deleting delta files deterministically, or nudging a GC
+  under disk pressure, would trim at most ~25 GB from a ~200 GB peak. Not worth the risk of freeing a stashed delta.
+- **Next disk lever: compression.** Our run files are uncompressed. Feldera compresses storage batches by default
+  (`StorageCompression::Default`; Snappy is the named option). The state's size per row is the other half of the
+  question, but this census does not measure it.
+- Memory held: live heap ~11–17 GB through tick 18. The run would still have ended in D4 (§5.19).
