@@ -396,6 +396,12 @@ internal static class StreamRelease
         {
             result = true;
         }
+        else if (t == typeof(DbspNet.Core.Operators.Stateful.Blocks.RunFileLease))
+        {
+            // A spilled file's holders (bounded-memory §5.20): no wiring, and its delete closure reaches
+            // the process-wide spiller, whose leases other threads' traces change while this walks.
+            result = false;
+        }
         else if (t.IsPrimitive || t.IsEnum || t.IsPointer || t == typeof(string) || t == typeof(decimal)
             || ns.StartsWith("DbspNet.Core.Collections", StringComparison.Ordinal)
             || (ns.StartsWith("System", StringComparison.Ordinal) && !t.IsGenericType && !t.IsArray && t != typeof(object)

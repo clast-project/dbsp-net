@@ -11,18 +11,26 @@ namespace DbspNet.Persistence.Blocks;
 /// write it to a scratch run file and rebind it there, so the block cache can evict its blocks —
 /// Feldera's low-pressure mode (merge outputs of 10 MiB or more built on storage). The files are a
 /// cache, not state: a checkpoint still writes the run into its own store (S1b will let it name the
-/// spilled file instead), and a file is deleted once its run is gone (merged away, or replaced by
-/// the checkpoint's rebind).
+/// spilled file instead). A file is deleted as soon as nothing reads it (§5.20): each carries a
+/// <see cref="RunFileLease"/> its trace releases when the run leaves its levels (merged away, or
+/// replaced by the checkpoint's rebind), and that lazy readers hold until they are collected.
 /// </summary>
 internal sealed class RunSpiller : IRunSpiller
 {
     private readonly LocalTableFileSystem _fs;
     private readonly long _minBytes;
-    private readonly List<(WeakReference<BlockedIndexedTrace.Run> Run, string Path)> _files = [];
+    private readonly List<RunFileLease> _files = [];
     private int _sinceSweep;
 
     /// <summary>Runs spilled, and their block bytes, since start (diagnostics).</summary>
     internal static long Runs, Bytes;
+
+    /// <summary>Spill files on disk now, their bytes, and the most bytes on disk at once; files
+    /// deleted at a holder's release, and by a sweep after a collection (diagnostics, §5.20).</summary>
+    internal static long LiveFiles, LiveFileBytes, PeakFileBytes, DeletedOnRelease, DeletedBySweep;
+
+    [ThreadStatic]
+    private static bool _sweeping;
 
     internal RunSpiller(string dir, long minBytes)
     {
@@ -31,14 +39,14 @@ internal sealed class RunSpiller : IRunSpiller
         _minBytes = minBytes;
     }
 
-    /// <summary>Files held (tests).</summary>
+    /// <summary>Files on disk (tests).</summary>
     internal int Files
     {
         get
         {
             lock (_files)
             {
-                return _files.Count;
+                return _files.Count(static l => !l.Deleted);
             }
         }
     }
@@ -72,13 +80,23 @@ internal sealed class RunSpiller : IRunSpiller
             var path = Guid.NewGuid().ToString("N") + ".run";
             if (BlockedTraceCheckpoint.SpillRun(_fs, path, schema.Codec, trace, run) is { } rebound)
             {
+                var length = new FileInfo(_fs.FullPath(path)).Length;
+                var lease = new RunFileLease(() => Delete(path, length));
+                rebound.Lease = lease;
+                lease.Hold(trace);
                 lock (_files)
                 {
-                    _files.Add((new WeakReference<BlockedIndexedTrace.Run>(rebound), path));
+                    _files.Add(lease);
                 }
 
                 Interlocked.Increment(ref Runs);
                 Interlocked.Add(ref Bytes, bytes);
+                Interlocked.Increment(ref LiveFiles);
+                var live = Interlocked.Add(ref LiveFileBytes, length);
+                long peak;
+                while (live > (peak = Interlocked.Read(ref PeakFileBytes)) && Interlocked.CompareExchange(ref PeakFileBytes, live, peak) != peak)
+                {
+                }
             }
             else
             {
@@ -108,26 +126,49 @@ internal sealed class RunSpiller : IRunSpiller
         return bytes;
     }
 
-    /// <summary>Delete the files whose runs are gone (tests call it after a GC).</summary>
+    // The lease's last holder let go: the file goes now.
+    private void Delete(string path, long length)
+    {
+        _fs.DeleteAsync(path).AsTask().GetAwaiter().GetResult();
+        Interlocked.Decrement(ref LiveFiles);
+        Interlocked.Add(ref LiveFileBytes, -length);
+        if (_sweeping)
+        {
+            Interlocked.Increment(ref DeletedBySweep);
+        }
+        else
+        {
+            Interlocked.Increment(ref DeletedOnRelease);
+        }
+    }
+
+    /// <summary>Delete the files whose every holder is gone without a release — readers collected,
+    /// or a trace dropped whole (tests call it after a GC).</summary>
     internal void Sweep()
     {
-        List<string> dead = [];
+        RunFileLease[] leases;
         lock (_files)
         {
-            for (var i = _files.Count - 1; i >= 0; i--)
-            {
-                if (!_files[i].Run.TryGetTarget(out _))
-                {
-                    dead.Add(_files[i].Path);
-                    _files[i] = _files[^1];
-                    _files.RemoveAt(_files.Count - 1);
-                }
-            }
+            _files.RemoveAll(static l => l.Deleted);
+            leases = [.. _files];
         }
 
-        foreach (var path in dead)
+        _sweeping = true;
+        try
         {
-            _fs.DeleteAsync(path).AsTask().GetAwaiter().GetResult();
+            foreach (var lease in leases)
+            {
+                lease.TryDelete();
+            }
+        }
+        finally
+        {
+            _sweeping = false;
+        }
+
+        lock (_files)
+        {
+            _files.RemoveAll(static l => l.Deleted);
         }
     }
 

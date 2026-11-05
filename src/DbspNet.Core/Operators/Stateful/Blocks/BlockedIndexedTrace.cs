@@ -100,9 +100,9 @@ internal sealed class BlockedIndexedTrace
         /// it again. Runs are immutable, so it stays valid until the run is merged away.</summary>
         public (ITableFileSystem Store, string Path)? Persisted { get; set; }
 
-        /// <summary>The run this one adopted the blocks of (§5.19): kept reachable while this run lives,
-        /// since a spilled file lives as long as the run object the spiller tracked.</summary>
-        public Run? AdoptedFrom { get; init; }
+        /// <summary>The spilled file this run's blocks read, if any (§5.20): a trace listing the run
+        /// holds it, and lets it go when the run leaves its levels.</summary>
+        public RunFileLease? Lease { get; set; }
 
         /// <summary>The first block that can hold <paramref name="hash"/>, or −1. A giant group's
         /// hash can span consecutive blocks; the caller continues while the next block's first hash
@@ -194,14 +194,27 @@ internal sealed class BlockedIndexedTrace
         }
 
         _materialized = null;
-        var adopted = runs.Select(run => new Run(run.Blocks, run.Entries) { Persisted = run.Persisted, AdoptedFrom = run }).ToList();
+        var adopted = runs.Select(run => new Run(run.Blocks, run.Entries) { Persisted = run.Persisted }).ToList();
 
         // Many runs (a delta's chunks) merge in ONE k-way pass, not a pairwise cascade: the cascade wrote
-        // every row ~log2(k) times, each output spilled, and filled a disk on TPC-DS (§5.19).
+        // every row ~log2(k) times, each output spilled, and filled a disk on TPC-DS (§5.19). The merge
+        // reads the delta's files now, while the delta holds them; the trace keeps only its output.
         if (adopted.Count > 2)
         {
             var merged = MergeMany(adopted);
             adopted = merged is null ? [] : [merged];
+        }
+        else
+        {
+            // Runs kept as they are read the delta's files: the trace holds them too (§5.20).
+            for (var i = 0; i < adopted.Count; i++)
+            {
+                if (runs[i].Lease is { } lease)
+                {
+                    adopted[i].Lease = lease;
+                    lease.Hold(this);
+                }
+            }
         }
 
         foreach (var run in adopted)
@@ -220,6 +233,11 @@ internal sealed class BlockedIndexedTrace
     public void Clear()
     {
         _managed.Clear();
+        foreach (var run in _runs)
+        {
+            Retire(run);
+        }
+
         _runs.Clear();
         _managedEntries = 0;
         _materialized = null;
@@ -598,7 +616,8 @@ internal sealed class BlockedIndexedTrace
                 continue;
             }
 
-            var filtered = Merge(_runs[r], new Run([], 0));
+            var old = _runs[r];
+            var filtered = Merge(old, new Run([], 0));
             if (filtered is null)
             {
                 _runs.RemoveAt(r--);
@@ -607,9 +626,11 @@ internal sealed class BlockedIndexedTrace
             {
                 _runs[r] = filtered;
             }
+
+            Retire(old);
         }
 
-        return [.. _runs];
+        return Captured([.. _runs]);
     }
 
     /// <summary>Adopt a restored run as the newest level (a chain's runs in order, base first).</summary>
@@ -649,6 +670,7 @@ internal sealed class BlockedIndexedTrace
 
         var rebound = new Run(blocks, run.Entries) { Floor = run.Floor, Persisted = run.Persisted };
         _runs[at] = rebound;
+        Retire(run);
         return rebound;
     }
 
@@ -891,7 +913,7 @@ internal sealed class BlockedIndexedTrace
         // left as it is: a reader must not change what the next tick or checkpoint sees.
         if (_managed.Count == 0)
         {
-            return StreamEntriesCore([.. _runs]);
+            return StreamEntriesCore(Captured([.. _runs]));
         }
 
         var pending = new ZSetBuilder<StructuralRow, Z64>();
@@ -911,7 +933,7 @@ internal sealed class BlockedIndexedTrace
             builder.Add(hash, row, NoValue, weight);
         }
 
-        return builder.Finish() is { } scratch ? StreamEntriesCore([scratch, .. _runs]) : StreamEntriesCore([.. _runs]);
+        return builder.Finish() is { } scratch ? StreamEntriesCore(Captured([scratch, .. _runs])) : StreamEntriesCore(Captured([.. _runs]));
     }
 
     private static IEnumerable<(ITraceBlock Block, int Index, long Weight)> StreamEntriesCore(Run[] runs)
@@ -995,7 +1017,7 @@ internal sealed class BlockedIndexedTrace
     }
 
     public IEnumerable<KeyValuePair<StructuralRow, Z64>>? StreamRows() =>
-        _managed.Count > 0 ? null : StreamRunsCore([.. _runs]);
+        _managed.Count > 0 ? null : StreamRunsCore(Captured([.. _runs]));
 
     private IEnumerable<KeyValuePair<StructuralRow, Z64>> StreamRunsCore(Run[] runs)
     {
@@ -1236,6 +1258,22 @@ internal sealed class BlockedIndexedTrace
         Compact();
     }
 
+    // A run left this trace's levels: its spilled file (if any) loses this trace as a holder, and is
+    // deleted at once if no reader still holds it (§5.20).
+    private void Retire(Run run) => run.Lease?.Release(this);
+
+    // Runs captured by a reader that outlives the call (a lazy enumeration): the array holds each
+    // spilled file until the reader is collected, whatever the trace merges meanwhile (§5.20).
+    private static Run[] Captured(Run[] runs)
+    {
+        foreach (var run in runs)
+        {
+            run.Lease?.Hold(runs);
+        }
+
+        return runs;
+    }
+
     private bool Dropped(StructuralRow key, long floor) =>
         floor != long.MinValue && _monotoneKey!(key) < floor;
 
@@ -1244,8 +1282,11 @@ internal sealed class BlockedIndexedTrace
     {
         while (_compact && _runs.Count >= 2 && _runs[0].Entries * 4 >= _runs[1].Entries)
         {
-            var merged = Merge(_runs[0], _runs[1]);
+            var (newer, older) = (_runs[0], _runs[1]);
+            var merged = Merge(newer, older);
             _runs.RemoveRange(0, 2);
+            Retire(newer);
+            Retire(older);
             if (merged is not null)
             {
                 _runs.Insert(0, merged);

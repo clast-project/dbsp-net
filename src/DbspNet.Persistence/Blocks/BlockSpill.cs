@@ -13,20 +13,26 @@ namespace DbspNet.Persistence.Blocks;
 /// </summary>
 internal sealed class BlockSpill
 {
+    private const string Prefix = "dbspnet-spill-";
+
+    private static readonly string Parent =
+        Environment.GetEnvironmentVariable("DBSPNET_BLOCK_SPILL_DIR") is { Length: > 0 } dir ? dir : Path.GetTempPath();
+
     private static readonly string Root = Path.Combine(
-        Environment.GetEnvironmentVariable("DBSPNET_BLOCK_SPILL_DIR") is { Length: > 0 } dir ? dir : Path.GetTempPath(),
-        "dbspnet-spill-" + Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Parent, Prefix + Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
     private static int _registered;
 
     /// <summary>This process's spill root.</summary>
     internal static string RootPath => Root;
 
-    /// <summary>Delete the spill root at process exit (once).</summary>
+    /// <summary>Delete the spill root at process exit (once), and first the roots of processes that
+    /// died without deleting theirs (§5.20).</summary>
     internal static void RegisterCleanup()
     {
         if (Interlocked.Exchange(ref _registered, 1) == 0)
         {
+            SweepStale(Parent);
             AppDomain.CurrentDomain.ProcessExit += (_, _) =>
             {
                 try
@@ -40,6 +46,68 @@ internal sealed class BlockSpill
                 {
                 }
             };
+        }
+    }
+
+    /// <summary>
+    /// Delete every <c>dbspnet-spill-&lt;pid&gt;</c> directory under <paramref name="parent"/> whose
+    /// process is not running: a process killed (or out of memory) never ran its exit cleanup, and its
+    /// spill files are only a cache. A directory whose pid is running is left alone, even if the pid was
+    /// reused by an unrelated process. Returns the directories deleted.
+    /// </summary>
+    internal static int SweepStale(string parent)
+    {
+        string[] dirs;
+        try
+        {
+            dirs = Directory.GetDirectories(parent, Prefix + "*");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return 0;
+        }
+
+        var deleted = 0;
+        foreach (var dir in dirs)
+        {
+            var name = Path.GetFileName(dir);
+            if (!int.TryParse(name.AsSpan(Prefix.Length), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var pid)
+                || pid == Environment.ProcessId || Running(pid))
+            {
+                continue;
+            }
+
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+                deleted++;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
+        return deleted;
+    }
+
+    private static bool Running(int pid)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false; // no such process
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return true; // exists, not ours to inspect
         }
     }
 
