@@ -237,6 +237,12 @@ public class RunSpillerTests
                 Assert.All(listed, l => Assert.False(l.Deleted));
                 Assert.Equal(listed.Count, FilesIn(dir));
                 Assert.Equal(listed.Count, spiller.Files);
+
+                // The census sees them all as state files: no delta, reader or dead bytes.
+                var mix = spiller.Census();
+                Assert.Equal(listed.Count, mix.Files);
+                Assert.Equal(listed.Sum(l => l.Bytes), mix.State);
+                Assert.Equal(0, mix.Delta + mix.Reader + mix.Dead);
             }
 
             Assert.True(Interlocked.Read(ref RunSpiller.DeletedOnRelease) > released0, "no file was deleted on release");

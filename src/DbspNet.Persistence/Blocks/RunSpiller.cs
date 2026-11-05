@@ -39,6 +39,49 @@ internal sealed class RunSpiller : IRunSpiller
         _minBytes = minBytes;
     }
 
+    /// <summary>Bytes of the files on disk by their strongest live holder (§5.20): a state trace that lists
+    /// the run, else a block-backed delta's own trace, else a lazy reader; Dead: no holder alive (a sweep
+    /// deletes it). Read after a full collection, Dead is what only a GC frees.</summary>
+    internal (long State, long Delta, long Reader, long Dead, int Files) Census()
+    {
+        RunFileLease[] leases;
+        lock (_files)
+        {
+            leases = [.. _files];
+        }
+
+        long state = 0, delta = 0, reader = 0, dead = 0;
+        var files = 0;
+        foreach (var lease in leases)
+        {
+            if (lease.Deleted)
+            {
+                continue;
+            }
+
+            files++;
+            var holders = lease.AliveHolders();
+            if (holders.Any(static h => h is BlockedIndexedTrace { Compacts: true }))
+            {
+                state += lease.Bytes;
+            }
+            else if (holders.Any(static h => h is BlockedIndexedTrace))
+            {
+                delta += lease.Bytes;
+            }
+            else if (holders.Count > 0)
+            {
+                reader += lease.Bytes;
+            }
+            else
+            {
+                dead += lease.Bytes;
+            }
+        }
+
+        return (state, delta, reader, dead, files);
+    }
+
     /// <summary>Files on disk (tests).</summary>
     internal int Files
     {
@@ -81,7 +124,7 @@ internal sealed class RunSpiller : IRunSpiller
             if (BlockedTraceCheckpoint.SpillRun(_fs, path, schema.Codec, trace, run) is { } rebound)
             {
                 var length = new FileInfo(_fs.FullPath(path)).Length;
-                var lease = new RunFileLease(() => Delete(path, length));
+                var lease = new RunFileLease(() => Delete(path, length)) { Bytes = length };
                 rebound.Lease = lease;
                 lease.Hold(trace);
                 lock (_files)

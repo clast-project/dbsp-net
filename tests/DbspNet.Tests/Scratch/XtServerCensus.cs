@@ -135,6 +135,7 @@ public class XtServerCensus
                 }
             }
 
+            log.WriteLine(SpillMix($"tick={t}"));
             var rows = BlockResidency.Walk(replicas, runner, -1);
             long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
             log.WriteLine(string.Create(CultureInfo.InvariantCulture,
@@ -218,6 +219,7 @@ public class XtServerCensus
                     long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
                     log.WriteLine(string.Create(CultureInfo.InvariantCulture,
                         $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} spill_disk_mib={DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes / 1048576.0:F0} spill_disk_peak_mib={DbspNet.Persistence.Blocks.RunSpiller.PeakFileBytes / 1048576.0:F0} spill_files={DbspNet.Persistence.Blocks.RunSpiller.LiveFiles} del_release={DbspNet.Persistence.Blocks.RunSpiller.DeletedOnRelease} del_sweep={DbspNet.Persistence.Blocks.RunSpiller.DeletedBySweep} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows / 1e6:F1} adopted={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted} adopted_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.AdoptedRows / 1e6:F1}"));
+                    log.WriteLine(SpillMix($"tick={circuit.TickCount} op={i}"));
                     nextHeap = Math.Max(heap, live) + (long)(opStepGib * (1L << 30));
                     if (live / (double)(1L << 30) >= nextOpCensus)
                     {
@@ -274,5 +276,22 @@ public class XtServerCensus
         }
 
         throw new InvalidOperationException("no compiled program in " + program.GetType());
+    }
+
+    // Spilled bytes by holder, read right after a forced full collection; then a sweep, and what it freed.
+    private static string SpillMix(string where)
+    {
+        if (DbspNet.Core.Operators.Stateful.Blocks.BlockAccess.Spiller is not DbspNet.Persistence.Blocks.RunSpiller spiller)
+        {
+            return $"SPILLMIX {where} none";
+        }
+
+        var (state, delta, reader, dead, files) = spiller.Census();
+        var disk0 = DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes;
+        spiller.Sweep();
+        var freed = disk0 - DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes;
+        static double M(long b) => b / 1048576.0;
+        return string.Create(CultureInfo.InvariantCulture,
+            $"SPILLMIX {where} files={files} state_mib={M(state):F0} delta_mib={M(delta):F0} reader_mib={M(reader):F0} dead_mib={M(dead):F0} swept_mib={M(freed):F0}");
     }
 }

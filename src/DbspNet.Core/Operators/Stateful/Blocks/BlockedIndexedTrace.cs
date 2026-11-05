@@ -226,6 +226,9 @@ internal sealed class BlockedIndexedTrace
         return true;
     }
 
+    /// <summary>Whether the trace merges its runs (state), as opposed to a block-backed delta's own trace.</summary>
+    internal bool Compacts => _compact;
+
     /// <summary>Whether entries are ordered by the row's own hash.</summary>
     internal bool OrdersByRowHash => _defaultHash;
 

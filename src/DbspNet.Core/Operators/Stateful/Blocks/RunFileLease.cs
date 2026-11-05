@@ -25,6 +25,27 @@ internal sealed class RunFileLease
     /// found no holder alive.</param>
     internal RunFileLease(Action delete) => _delete = delete;
 
+    /// <summary>The file's length in bytes (the census).</summary>
+    internal long Bytes { get; init; }
+
+    /// <summary>The holders still alive, for the census (§5.20): what kind of reader keeps the file.</summary>
+    internal List<object> AliveHolders()
+    {
+        var alive = new List<object>();
+        lock (_holders)
+        {
+            foreach (var w in _holders)
+            {
+                if (w.TryGetTarget(out var h))
+                {
+                    alive.Add(h);
+                }
+            }
+        }
+
+        return alive;
+    }
+
     /// <summary>Whether the file has been deleted.</summary>
     internal bool Deleted
     {
