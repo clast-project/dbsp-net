@@ -1806,3 +1806,48 @@ delta as a managed level, and its freeze decoded every row to sort and re-encode
   produced by the index and exchange-index operators), the next planned increment, and not a regression.
 - Disk: 217 GB of spill files were left when this run died (removed). Files of merged-away runs wait for a
   GC; a deterministic delete (reference counting, as Feldera does) is worth doing alongside the startup sweep.
+
+### 5.20 Spilled run files deleted when their last holder lets go (2026-11-05, 0461c08)
+
+**Why.** Before this, a spilled run file was deleted only after a GC found its run object dead and a sweep
+ran (every 64 spills). Large, long-lived run objects die in gen2, so on a big heap the files of merged-away
+runs piled up (217 GB left by xt61, 518 GB in xt60).
+
+**What changed.**
+- **A lease per spilled file** (`RunFileLease`). A trace that lists a run over the file holds it, and
+  releases it the moment the run leaves its levels: merged away (`Compact`, `PrepareCheckpoint`), rebound to a
+  checkpoint's copy (`Rebind`), or the trace cleared. The file is deleted at once if no other holder is alive.
+- **Readers hold it until collected.** A lazy reader that captured runs (`StreamRows`/`StreamEntries` snapshot
+  arrays, the checkpoint's list) and a block-backed delta's own trace hold the lease without releasing it.
+  Holds are weak references, so a trace dropped whole also frees its files at the next sweep.
+- **Adopted runs hold their delta's lease** (§5.19's `Run.AdoptedFrom` is gone).
+- **A tripwire.** A hold on a deleted file throws, so a missed hold fails loudly, not as a missing-file read.
+- **Startup sweep.** The first spill in a process deletes the `dbspnet-spill-<pid>` roots of processes that are
+  not running. It leaves its own root, roots whose pid is running, and names that don't parse.
+- **StreamRelease's scan skips leases.** A lease's delete closure reaches the process-wide spiller; walking into
+  it raced with other threads' prunes (18 failures in the forced suite).
+
+**Tests.** No GC between ticks, yet on disk are exactly the files the circuit's traces list. A reader taken
+before the merges still reads the merged-away files with every body evicted, and they go once it is collected.
+An adopted delta's files outlive the delta. Plus lease and sweep units. Mutants fail them: no hold on adopt, no
+hold for readers, no release on merge. Suite green knob off and in forced + S1 + 8 KB span caps (3,475 each).
+
+**Extended TPC-DS (xt62, same settings as xt61):**
+
+| | xt61 | xt62 |
+|---|---|---|
+| ticks 0–17 | 2,684 s | 2,721 s |
+| the 65M-row view integrate (op 1795) | 36.9 s | 37.0 s |
+| how it ended | OOM in `GroupProject`, ~op 1808 | the same (`BlockedRows.Merged` into a managed `IndexedZSet`) |
+| spill dir left at death | 217 GB | 214 GB |
+| lowest free disk | — | 351 GB of 600 (~250 GB of spill at peak) |
+| files deleted on release / by sweep | — | 313 / 1,928 (by op 1444) |
+
+- **No time cost, and no disk saving.** About 86% of the deletes still came from sweeps. Most spilled bytes in
+  this workload are not runs merged away by a state trace. They are in-step delta chunks, which only a GC can
+  free, because nothing yet says when a delta is dead (a sum with another set can keep it).
+- **What is unknown.** How much of the ~214–250 GB is live state, live deltas, or dead deltas waiting for a GC.
+  The census needs that split before choosing a fix: releasing a delta's files when its stream value is
+  released, or nudging a GC under disk pressure.
+- **The exit cleanup did not run** when the process died this way; the startup sweep now covers it.
+- The run still ends in D4 (§5.19).
