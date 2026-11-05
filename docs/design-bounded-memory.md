@@ -1756,3 +1756,53 @@ group of 7.2M rows, and a giant went to a run file as ONE block, with an `int` l
   check (the delta's format and the trace's must encode the same schema). The same applies wherever a
   trace integrates a delta: DISTINCT, and the index operators' inputs (D4).
 - Disk: this run left a 208 GB spill directory behind (removed after the run).
+
+### 5.19 A blocked Z-set trace adopts a block-backed delta's runs (2026-11-04, 7a96ef2 + 58874ea)
+
+**Why.** xt59 ended in a view's `IntegrateOp`. The view's blocked Z-set trace pushed a 65M-row block-backed
+delta as a managed level, and its freeze decoded every row to sort and re-encode them.
+
+**What changed.**
+- **`BlockedZSetTrace.Integrate`** (views and DISTINCT) hands a block-backed delta's runs to the trace
+  (`BlockedIndexedTrace.TryAdoptRuns`): no row decoded or encoded.
+- **New run objects over the same blocks.** Each keeps its original reachable (`Run.AdoptedFrom`, the
+  owner a spilled file lives with), so a GC floor set on the view's run never touches the delta's.
+- **Layout check.** The formats must read alike (`ITraceBlockFormat.Adopts`: the same cell kinds and Arrow
+  types, column names aside, and no nullable column taken into a NOT NULL one); otherwise the old level
+  path.
+- **One merge, not a cascade.** More than two adopted runs merge in ONE k-way pass (`MergeMany`, MergeCore's
+  grouping for k runs), and the trace then compacts as usual.
+  - The first version (xt60) let the trace's pairwise compaction merge a delta's ~65 chunk runs, about
+    log2(k) passes, each output spilled.
+  - Dead intermediate files are deleted only after a GC collects their run and a sweep runs, so they piled
+    up: 518 GB of live spill files filled the disk.
+  - A merge cascade inside `Compact` now also spills each output as it is made.
+
+**Tests.**
+- Property test (200 cases): a blocked Z-set trace adopting block-backed deltas reads exactly like one
+  integrating the same deltas managed (`Current`, `Count`, `WeightOf`), and its runs stay consolidated.
+- Layout test: refused into NOT NULL, accepted across renamed columns, and a refused delta still
+  integrates correctly.
+- The random-query twin must now see adoptions (its blocked DISTINCTs).
+- Mutants fail it: adopting all runs but one, and a k-way merge that skips consolidation.
+- Suite green knob off, and forced + S1 + 8 KB span caps (3,470 each).
+
+**Extended TPC-DS SF1, W=1, 48 GiB, 1M rows:**
+
+| | xt59 | xt60 (adopt, pairwise merges) | xt61 (adopt, one k-way merge) |
+|---|---|---|---|
+| ticks 0–17 | 2,744 s | 2,774 s | 2,684 s |
+| deltas adopted by tick 17 | — | 37 (152M rows) | 37 (152M rows) |
+| the 65M-row view integrate (op 1795) | OOM decoding it | disk full (518 GB of spill files) | **36.9 s** |
+| furthest op in tick 18 | 1794 | 1795 | **~1808 of 1868** |
+| peak RSS | 41 GB | 41 GB | 42 GB |
+| how it ended | OOM, view freeze | `IOException`, no space left on device | OOM in `GroupProject` |
+
+- **The view took the 65M-row delta without decoding it.** Live memory through the fan-out chain stayed at
+  ~11.5 GB.
+- **It ends in an index operator** (`StatefulOperators.GroupProject`): an `Apply` that turns a Z-set delta
+  into a managed `IndexedZSet` for a join or aggregate, here over one of the large deltas after the view.
+  Its builder's map pre-sizing exhausted the heap. That is **D4** (§5.14: block-backed `IndexedZSet` deltas,
+  produced by the index and exchange-index operators), the next planned increment, and not a regression.
+- Disk: 217 GB of spill files were left when this run died (removed). Files of merged-away runs wait for a
+  GC; a deterministic delete (reference counting, as Feldera does) is worth doing alongside the startup sweep.
