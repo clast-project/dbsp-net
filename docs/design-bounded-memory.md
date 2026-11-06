@@ -1920,3 +1920,69 @@ file once the run outgrows a budget, keeping only lazy block handles. Merge outp
 rather than a run, for compaction and adoption alike. Without it, any run bigger than the heap ends the batch,
 whatever the deltas do. Compression (§5.21) comes after, because it shrinks bytes on disk but not resident merge
 output.
+
+### 5.23 Merge output streams to its spill file (2026-11-05, a04fed2, xt65)
+
+**What.** A `RunBuilder` whose run goes into a trace's levels (both freezes, `MergeCore`, `MergeMany`) hands its
+blocks to a spill file (`IRunSpiller.BeginRun` → `StreamedRunFile`) once they pass the spill threshold
+(`DBSPNET_SPILL_MIN_MIB`, default 10, Feldera's `min_spill_size`). It hands over the blocks made so far, then each
+block as it is flushed. The run comes back file-backed, with no rewrite by `AfterCompact`. A chain of blocks that
+a spanning hash continues is held until the hash ends, and written as one file block, as `SpillRun` writes it. The
+building trace holds the lease *before* the file is registered: otherwise a sweep, even one on another worker
+thread, can delete it in between.
+
+**xt65.** Same pace as xt64, and a lower heap through tick 18. It still ran out of memory in the op-1809
+aggregate's `MergeMany`, now while decoding one hash's entries into a list. That led to §5.24.
+
+### 5.24 Giant groups, a leak in §5.23, and tick 18 completes (2026-11-05, 08f2c7e, 786304f, 6f32916, xt66–xt70)
+
+**Value-hash order (08f2c7e).** Runs now keep each key's entries in canonical order: together, by ascending value
+hash. Freezes sort each group; a merge's small path sorts its consolidated output. `MergeCore` and `MergeMany`
+share one per-hash step:
+- A hash with at least `GiantGroupEntries` (64K) entries across the tied runs is counted from the hash arrays
+  alone (past one block only when the hash spans blocks).
+- Before merging, a check on cursor copies confirms that each run holds the hash as one key, the same in every
+  run, with decoded value hashes never decreasing.
+- If so, the runs are merged k-way by value hash, holding only one value hash's entries at a time. If not, the
+  merge falls back to the in-memory path, and a counter records it.
+
+The sink writes a giant chain in pieces of at most 64 MiB. Nexmark w1profile B/ev is identical on all 10 queries.
+xt66 did 364 giant merges with 0 fallbacks, but still ran out of memory in op 1809, now on the *small* path.
+
+**Finding what fills the heap (xt67, xt68).**
+- `dotnet-gcdump` cannot snapshot this heap on .NET 10: it fails, or stops at a 10M-object cap (322 MB of tens of
+  GB). The tool is the in-process census: `XT_CENSUS_AT_OPS=1801,1808` forces a live reading and a full
+  `StateCensus` after those ops (about 40 s each).
+- The census's per-op reading re-armed at `max(heap, live) + step`. The heap figure includes garbage, so after a
+  70 GB reading at op 1433 no reading was taken for the rest of the tick. It now re-arms at `live + step`, and
+  unforced readings come at least 30 s apart.
+- xt68: live is 11–15 GB through tick 18, and 15.3 GB going into op 1809. Operator state is 10.9 GB after ops 1801
+  and 1808: partitioned rank 3.6 GB, aggregates 1.4 GB, then joins and views. Op 1809 alone fills the 48 GiB heap.
+
+**The leak (786304f).** `StreamedRunFile` kept every written block's body until `Finish`, to wrap them as cached
+lazy blocks at the end. So a streamed merge still held its whole output in memory. Each written block now becomes
+a `LazyTraceBlock` at once, its body admitted to the block cache, which evicts past its budget. Only the pending
+chain waits. A test drives the sink with a one-byte cache: every appended block but the pending one is collectable
+before `Finish`.
+
+*Wrong turn, for the record:* I suspected that values with `string` cells hash differently from their decoded
+`Utf8String` form, which would break the value-hash order. They can't: `BlockWriter` casts every VARCHAR cell to
+`Utf8String`, so an encoded value never holds a `string`.
+
+**xt69: tick 18 completes.**
+- All 1,868 ops ran. The tick-18 step took 4,624 s, 616 s of it in GC pauses. Peak RSS was 42 GB, and spill disk
+  went to about 330 GB (230 GB free at the low point).
+- Op 1809 took 261 s, and live went from 15 to 36 GB: the aggregate's 28.6M-row output delta is a managed Z-set of
+  about 21 GB. Op 1815 is the same, at 35 GB live. **That is the next pressure point:** aggregate output should go
+  through a block-backed builder, as join and index outputs already do.
+- The run then ran out of memory in the server's `/wait` reply. `OutputStats` asks each view for its row count,
+  and `BlockedZSetTrace.Count` materialized the whole view to count it. **Fixed (6f32916):** `CountRows` streams
+  the runs (consolidated by hash, floors applied) and folds in the managed levels, which a freeze bounds.
+
+**xt70: batch 1 completes and validates.** These are xt69's settings plus the driver's validation: a fresh DuckDB
+replay of the sources and a full recomputation of every model, compared by `EXCEPT ALL` with floats rounded to 10
+decimals. The driver reported `status: completed` (`run_batch` sets `failed` unless validation passes) after
+7,783 s: 19 ticks and 96 output views, tick 18 in 4,492 s, peak RSS 42 GB, at least 172 GB of disk free. **The
+extended TPC-DS batch that motivated this arc (issue #2) now runs within a 48 GiB heap, and its result is correct.**
+Next: block-backed aggregate output deltas (ops 1809/1815 hold about 21 GB live each), then run-file compression
+(spill disk peaked at about 330 GB).
