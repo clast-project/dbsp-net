@@ -16,7 +16,8 @@
 //      the run comes out file-backed (no rewrite after), reads, probes and merges on exactly as in
 //      memory, retractions included, and its file is held and released like a spilled one;
 //   9. (§5.24) a giant group's chain is written in pieces as it is built, never held whole: the group
-//      becomes several file blocks, and every output is unchanged.
+//      becomes several file blocks, and every output is unchanged; and a streamed run's written
+//      blocks are released to the cache as they are written, not held until its finish.
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Blocks;
@@ -413,6 +414,49 @@ public class RunSpillerTests
         {
             BlockedTraceCheckpoint.StreamedRunFile.ChainBytes = saved;
         }
+    }
+
+    [Fact]
+    public async Task A_streamed_runs_written_blocks_are_not_held_until_its_finish()
+    {
+        await WithSpillerAsync(0, (spiller, dir) =>
+        {
+            var format = (BlockSchema)TraceBlockFormats.Create(RowSchema, Schema.Empty)!;
+            var fs = new DbspNet.Persistence.IO.Local.LocalTableFileSystem(dir);
+            RunFileLease? lease = null;
+            var sink = BlockedTraceCheckpoint.StreamedRunFile.Open(fs, "streamed.run", format.Codec, length => lease = new RunFileLease(() => { }) { Bytes = length });
+            var written = AppendBlocks(sink, format, blocks: 200, perBlock: 50);
+
+            // Budget 1: the cache evicts every admitted body at once, so only the pending chain (the
+            // last block, which the next could still continue) may hold one.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert.All(written[..^1], w => Assert.False(w.TryGetTarget(out _), "a written block's body is still held"));
+
+            var (blocks, _, _) = sink.Finish();
+            Assert.NotNull(lease);
+            var rows = blocks.SelectMany(b => Enumerable.Range(0, b.Count).Select(i => (int)b.Key(i)[0]!)).ToList();
+            Assert.Equal(Enumerable.Range(0, 200 * 50).OrderBy(k => (uint)Rows(k, 1).Single().Key.GetHashCode()).ThenBy(k => k), rows.OrderBy(k => (uint)Rows(k, 1).Single().Key.GetHashCode()).ThenBy(k => k));
+            return Task.CompletedTask;
+        });
+    }
+
+    // Blocks of consecutive rows in hash order appended to sink; weak references to them.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static List<WeakReference<object>> AppendBlocks(BlockedTraceCheckpoint.StreamedRunFile sink, BlockSchema format, int blocks, int perBlock)
+    {
+        var all = Rows(0, blocks * perBlock).Select(e => e.Key).OrderBy(r => (uint)r.GetHashCode()).ToArray();
+        var written = new List<WeakReference<object>>();
+        for (var b = 0; b < blocks; b++)
+        {
+            var keys = all[(b * perBlock)..((b + 1) * perBlock)];
+            var block = format.Encode(keys, [.. keys.Select(_ => BlockedIndexedTrace.NoValue)], [.. keys.Select(_ => 1L)], [.. keys.Select(k => k.GetHashCode())], perBlock);
+            sink.Append(block);
+            written.Add(new WeakReference<object>(block));
+        }
+
+        return written;
     }
 
     [Fact]

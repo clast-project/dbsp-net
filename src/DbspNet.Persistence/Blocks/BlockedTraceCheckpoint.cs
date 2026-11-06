@@ -518,6 +518,11 @@ internal static class BlockedTraceCheckpoint
         private readonly Func<long, RunFileLease> _register;
         private readonly List<ITraceBlock> _chain = [];
         private readonly List<(RunBlock Index, TraceBlock? Body)> _bodies = [];
+        private readonly List<ITraceBlock> _blocks = [];
+        private long _heldBytes;
+
+        /// <summary>The most block bytes any streamed run held in memory at once (tests, §5.24).</summary>
+        internal static long PeakHeldBytes;
 
         private StreamedRunFile(ITableFileSystem fs, string path, BlockSchema schema, RunStreamWriter writer, Func<long, RunFileLease> register)
         {
@@ -547,7 +552,13 @@ internal static class BlockedTraceCheckpoint
             }
 
             _chain.Add(block);
-            _chainBytes += block is TraceBlock t ? t.Message.Length : 0;
+            var bytes = block is TraceBlock t ? t.Message.Length : 0;
+            _chainBytes += bytes;
+            _heldBytes += bytes;
+            long peak;
+            while (_heldBytes > (peak = Interlocked.Read(ref PeakHeldBytes)) && Interlocked.CompareExchange(ref PeakHeldBytes, _heldBytes, peak) != peak)
+            {
+            }
         }
 
         public (ITraceBlock[] Blocks, (ITableFileSystem Store, string Path) File, RunFileLease Lease) Finish()
@@ -555,12 +566,7 @@ internal static class BlockedTraceCheckpoint
             WriteChain();
             _writer.FinishAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
             _writer.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            var blocks = new ITraceBlock[_bodies.Count];
-            for (var b = 0; b < blocks.Length; b++)
-            {
-                blocks[b] = new LazyTraceBlock(_schema, _fs, _path, _bodies[b].Index, _bodies[b].Body);
-            }
-
+            var blocks = _blocks.ToArray();
             var length = _fs is IO.Local.LocalTableFileSystem local ? new FileInfo(local.FullPath(_path)).Length : 0;
             return (blocks, (_fs, _path), _register(length));
         }
@@ -573,8 +579,18 @@ internal static class BlockedTraceCheckpoint
             }
 
             AppendChainAsync(_writer, _schema, _chain, 0, _chain.Count, _bodies, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+            // Each written block becomes a file block now, its body handed to the block cache (which
+            // evicts past its budget): holding the bodies until the finish held the whole run (§5.24).
+            foreach (var (index, body) in _bodies)
+            {
+                _blocks.Add(new LazyTraceBlock(_schema, _fs, _path, index, body));
+            }
+
+            _bodies.Clear();
             _chain.Clear();
             _chainBytes = 0;
+            _heldBytes = 0;
         }
     }
 

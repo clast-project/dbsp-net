@@ -167,8 +167,15 @@ public class XtServerCensus
         var nextHeap = (long)(opStepGib * (1L << 30));
         var nextOpCensus = stepGib;
         var lastOp = Stopwatch.GetTimestamp();
+        var lastReading = double.NegativeInfinity; // at most one unforced reading per 30 s
         var gate = new object();
         var opTick = long.TryParse(Environment.GetEnvironmentVariable("XT_OP_TICK"), out var ot) ? ot : -1;
+
+        // XT_CENSUS_AT_OPS=1801,1808: a live reading and a full census after these operators of the
+        // sampled tick, whatever the heap did (what holds the heap going into a failing operator).
+        var censusAt = (Environment.GetEnvironmentVariable("XT_CENSUS_AT_OPS") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToHashSet();
         RootCircuit.AfterOperatorStep = (circuit, i) =>
         {
             lock (gate)
@@ -209,8 +216,10 @@ public class XtServerCensus
                         $"OPSLOW tick={circuit.TickCount} op={i} type={op.GetType().Name} ms={opMs:F0} heap_mib={heap / 1048576.0:F0} t_s={sw.Elapsed.TotalSeconds:F0}"));
                 }
 
-                if (heap >= nextHeap)
+                var forced = censusAt.Contains(i);
+                if (forced || (heap >= nextHeap && sw.Elapsed.TotalSeconds - lastReading >= 30))
                 {
+                    lastReading = sw.Elapsed.TotalSeconds;
                     System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
                     GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
                     var live = GC.GetGCMemoryInfo(GCKind.FullBlocking).PromotedBytes;
@@ -220,8 +229,10 @@ public class XtServerCensus
                     log.WriteLine(string.Create(CultureInfo.InvariantCulture,
                         $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} spill_disk_mib={DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes / 1048576.0:F0} spill_disk_peak_mib={DbspNet.Persistence.Blocks.RunSpiller.PeakFileBytes / 1048576.0:F0} spill_files={DbspNet.Persistence.Blocks.RunSpiller.LiveFiles} del_release={DbspNet.Persistence.Blocks.RunSpiller.DeletedOnRelease} del_sweep={DbspNet.Persistence.Blocks.RunSpiller.DeletedBySweep} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows / 1e6:F1} adopted={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted} adopted_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.AdoptedRows / 1e6:F1} streamed_runs={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.StreamedRuns} giant_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantMerges} giant_fallbacks={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantFallbacks}"));
                     log.WriteLine(SpillMix($"tick={circuit.TickCount} op={i}"));
-                    nextHeap = Math.Max(heap, live) + (long)(opStepGib * (1L << 30));
-                    if (live / (double)(1L << 30) >= nextOpCensus)
+                    // From live, not the heap before the collection: garbage once put the next reading
+                    // out of reach for the rest of the tick (§5.24).
+                    nextHeap = live + (long)(opStepGib * (1L << 30));
+                    if (forced || live / (double)(1L << 30) >= nextOpCensus)
                     {
                         while (live / (double)(1L << 30) >= nextOpCensus)
                         {
