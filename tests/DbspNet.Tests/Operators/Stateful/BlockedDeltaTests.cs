@@ -530,6 +530,85 @@ public class BlockedDeltaTests
         Assert.False(actual[2].IsExternal, "a 30-row tick is below it");
     }
 
+    // HAVING reads an aggregate the SELECT does not, so the aggregate's row is wider than plan.Schema.
+    private const string AggregateSql = "SELECT k, MAX(s) AS hs, SUM(x) AS sx FROM f GROUP BY k HAVING SUM(x) > 5 AND COUNT(*) > 0";
+
+    private static CompiledQuery CompileAggregate()
+    {
+        var resolver = new Resolver(new Catalog());
+        foreach (var ddl in JoinDdl)
+        {
+            resolver.Resolve(Parser.ParseStatement(ddl));
+        }
+
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(AggregateSql))).Query;
+        using var mode = TraceBlocksMode.Use(join: false, aggregate: true);
+        return PlanToCircuit.Compile(plan, Structural, StructuralRowCodec.Instance);
+    }
+
+    private static IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow> AggregateOf(CompiledQuery q) =>
+        q.Circuit.Operators.OfType<IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>>().Single();
+
+    // Tick 0: 300 groups; tick 1: 250 of them change (a retraction and an insertion each); tick 2: a few.
+    private static List<(ZSet<StructuralRow, Z64> Output, bool Blocked)> RunAggregate(CompiledQuery q)
+    {
+        var outputs = new List<(ZSet<StructuralRow, Z64>, bool)>();
+        void Step()
+        {
+            q.Step();
+            outputs.Add((q.Current, AggregateOf(q).LastOutputBlocked));
+        }
+
+        for (var k = 0; k < 300; k++)
+        {
+            q.Table("f").Insert(k, (long)(k % 10), "s" + (k % 7));
+        }
+
+        Step();
+        for (var k = 0; k < 250; k++)
+        {
+            q.Table("f").Insert(k, 3L, "t" + (k % 5));
+        }
+
+        Step();
+        q.Table("f").Delete(1, 1L, "s1");
+        q.Table("f").Insert(400, 9L, null);
+        Step();
+        return outputs;
+    }
+
+    [Fact]
+    public void An_aggregate_past_the_threshold_emits_its_rows_as_blocks()
+    {
+        List<(ZSet<StructuralRow, Z64> Output, bool Blocked)> expected;
+        CompiledQuery managed;
+        using (SpillSettings.UseStepSpill(null))
+        {
+            managed = CompileAggregate();
+            Assert.False(AggregateOf(managed).IsFused, "knob off: aggregate and flatten are two operators");
+            expected = RunAggregate(managed);
+        }
+
+        using var _ = SpillSettings.UseStepSpill(100, 1);
+        var q = CompileAggregate();
+        Assert.True(AggregateOf(q).IsFused);
+
+        // Fused, the circuit keeps the unfused shape, so a checkpoint restores across the two.
+        Assert.Equal(managed.Circuit.Operators.Count, q.Circuit.Operators.Count);
+        Assert.Equal(
+            DbspNet.Persistence.SnapshotManifest.ComputeCircuitFingerprint(managed.Circuit),
+            DbspNet.Persistence.SnapshotManifest.ComputeCircuitFingerprint(q.Circuit));
+        var actual = RunAggregate(q);
+        for (var t = 0; t < expected.Count; t++)
+        {
+            AssertSameRows(expected[t].Output, actual[t].Output);
+        }
+
+        Assert.True(actual[0].Blocked, "300 new groups are past the threshold");
+        Assert.True(actual[1].Blocked, "250 changed groups emit 500 rows");
+        Assert.False(actual[2].Blocked, "a few rows are below it");
+    }
+
     private const string LeftJoinSql = "SELECT f.k, f.x, d.y FROM f LEFT JOIN d ON f.k = d.k";
 
     private static CompiledQuery CompileLeftJoin()

@@ -28,7 +28,14 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     where TOut : notnull
 {
     private readonly Stream<IndexedZSet<TKey, TValue, Z64>> _input;
-    private readonly Stream<ZSet<(TKey Key, TOut Value), Z64>> _output;
+    private readonly Stream<ZSet<(TKey Key, TOut Value), Z64>>? _output;
+
+    // Fused output (docs/design-bounded-memory.md §5.25): the structural compiler's flatten of
+    // (key, aggregate) into one row runs here, and the rows go through the stream's delta builder
+    // (block backed past the step-spill threshold), so no managed (key, aggregate) delta is built.
+    private readonly Stream<ZSet<StructuralRow, Z64>>? _rowOutput;
+    private readonly Func<TKey, TOut, StructuralRow>? _flatten;
+    private ZSetBuilder<StructuralRow, Z64>? _rows;
 
     // Previous tick's output size — pre-sizes this tick's delta builder to avoid
     // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
@@ -84,11 +91,41 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         Func<TKey, long>? monotoneKey = null,
         IGroupTrace<TKey, TValue, Z64>? trace = null,
         IComparer<TValue>? canonicalOrder = null)
+        : this(input, aggregator, snapshotCodec, frontier, monotoneKey, trace, canonicalOrder)
+    {
+        _output = output;
+    }
+
+    /// <summary>The fused form: emits <paramref name="flatten"/>(key, aggregate) rows to
+    /// <paramref name="output"/> through its delta builder (§5.25).</summary>
+    public IncrementalAggregateOp(
+        Stream<IndexedZSet<TKey, TValue, Z64>> input,
+        Stream<ZSet<StructuralRow, Z64>> output,
+        Func<TKey, TOut, StructuralRow> flatten,
+        IAggregator<TValue, TOut> aggregator,
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Func<TKey, long>? monotoneKey,
+        IGroupTrace<TKey, TValue, Z64>? trace,
+        IComparer<TValue>? canonicalOrder)
+        : this(input, aggregator, snapshotCodec, frontier, monotoneKey, trace, canonicalOrder)
+    {
+        _rowOutput = output;
+        _flatten = flatten;
+    }
+
+    private IncrementalAggregateOp(
+        Stream<IndexedZSet<TKey, TValue, Z64>> input,
+        IAggregator<TValue, TOut> aggregator,
+        IIndexedZSetTraceCodec<TKey, TValue, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Func<TKey, long>? monotoneKey,
+        IGroupTrace<TKey, TValue, Z64>? trace,
+        IComparer<TValue>? canonicalOrder)
     {
         _trace = trace ?? new ManagedGroupTrace<TKey, TValue, Z64>();
         _canonical = canonicalOrder;
         _input = input;
-        _output = output;
         _aggregator = aggregator;
         _snapshotCodec = snapshotCodec;
         _frontier = frontier;
@@ -350,6 +387,12 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
     // The eager restore path only runs over a managed trace (a blocked one is always lazy).
     private ManagedGroupTrace<TKey, TValue, Z64> Managed => (ManagedGroupTrace<TKey, TValue, Z64>)_trace;
 
+    /// <summary>Whether the (key, aggregate) flatten is fused into this operator (§5.25).</summary>
+    internal bool IsFused => _rowOutput is not null;
+
+    /// <summary>Whether the last non-empty fused output was built block backed (tests).</summary>
+    internal bool LastOutputBlocked { get; private set; }
+
     /// <summary>Whether the trace is held as blocks (DBSPNET_TRACE_BLOCKS).</summary>
     internal bool IsBlocked => _trace is Blocks.BlockedGroupTrace;
 
@@ -365,15 +408,21 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             // Mirrors DistinctOp's empty-path CollectGarbage. An idle tick
             // is also when a blocked trace freezes.
             _trace.Idle();
-            _output.SetCurrent(ZSet<(TKey, TOut), Z64>.Empty);
+            _output?.SetCurrent(ZSet<(TKey, TOut), Z64>.Empty);
+            _rowOutput?.SetCurrent(ZSet<StructuralRow, Z64>.Empty);
             CollectGarbage();
             return;
         }
 
         var before = _trace;
 
-        ZSetBuilder<(TKey, TOut), Z64> builder;
-        if (_pooledBuilder is not null)
+        ZSetBuilder<(TKey, TOut), Z64>? builder;
+        if (_rowOutput is not null)
+        {
+            builder = null;
+            _rows = Blocks.DeltaSpill.Rows(_rowOutput.DeltaFormat, _lastOutputSize);
+        }
+        else if (_pooledBuilder is not null)
         {
             _pooledBuilder.Reset();
             builder = _pooledBuilder;
@@ -451,9 +500,21 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             }
         }
 
-        var result = _pooledBuilder is not null ? builder.BuildShared() : builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
+        if (_rows is not null)
+        {
+            var rows = _rows.Build();
+            _rows = null;
+            _lastOutputSize = rows.Count;
+            LastOutputBlocked = rows.IsExternal;
+            _rowOutput!.SetCurrent(rows);
+        }
+        else
+        {
+            var result = _pooledBuilder is not null ? builder!.BuildShared() : builder!.Build();
+            _lastOutputSize = result.Count;
+            _output!.SetCurrent(result);
+        }
+
         _trace.Integrate(delta);
         CollectGarbage();
     }
@@ -475,7 +536,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
         TKey key,
         ZSet<TValue, Z64> groupDelta,
         IMultiset<TValue, Z64> afterGroup,
-        ZSetBuilder<(TKey, TOut), Z64> builder,
+        ZSetBuilder<(TKey, TOut), Z64>? builder,
         ZSet<TValue, Z64>? refold = null,
         bool keepCaches = true,
         IMultiset<TValue, Z64>? beforeView = null)
@@ -538,12 +599,24 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
         if (oldAgg.HasValue)
         {
-            builder.Add((key, oldAgg.Value), new Z64(-1));
+            Emit(builder, key, oldAgg.Value, new Z64(-1));
         }
 
         if (newAgg.HasValue)
         {
-            builder.Add((key, newAgg.Value), new Z64(1));
+            Emit(builder, key, newAgg.Value, new Z64(1));
+        }
+    }
+
+    private void Emit(ZSetBuilder<(TKey, TOut), Z64>? builder, TKey key, TOut value, Z64 weight)
+    {
+        if (builder is not null)
+        {
+            builder.Add((key, value), weight);
+        }
+        else
+        {
+            _rows!.Add(_flatten!(key, value), weight);
         }
     }
 
@@ -623,7 +696,7 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
 
     public long RetainedRows => _trace.GroupCount;
 
-    public long LastOutputRows => _output.LastCount;
+    public long LastOutputRows => _output?.LastCount ?? _rowOutput!.LastCount;
 
     public long? GcFrontier => Metric.Frontier(_frontier);
 

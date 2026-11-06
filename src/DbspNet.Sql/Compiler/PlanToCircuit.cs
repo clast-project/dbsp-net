@@ -1701,6 +1701,48 @@ public static partial class PlanToCircuit
     }
 
     /// <summary>
+    /// The fused aggregate (docs/design-bounded-memory.md §5.25): only with in-step spilling on and the
+    /// aggregate's trace as blocks; otherwise null, and the caller emits the aggregate and its flatten
+    /// as two operators.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>>? EmitAggregateRows(
+        CircuitBuilder builder,
+        CompileContext ctx,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> input,
+        IAggregator<StructuralRow, StructuralRow> aggregator,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey,
+        ReshardPlacement? reshard,
+        (Schema Key, Schema Value) shape,
+        Func<StructuralRow, StructuralRow, StructuralRow> flatten,
+        Schema rowSchema)
+    {
+        if (SpillSettings.StepSpillRows is null || !TraceBlocksMode.Aggregate || ctx.Options.TraceFamily == TraceFamily.Spine)
+        {
+            return null;
+        }
+
+        if (TraceBlockFormats.Create(shape.Key, shape.Value) is not { } format
+            || TraceBlockFormats.Create(rowSchema, Schema.Empty) is not { } rowFormat)
+        {
+            return null;
+        }
+
+        AttachIndexedDeltaFormat(input, format);
+        var blobs = snapshotCodec is { SupportsKeyedBlobs: true } && reshard is not null
+            ? new KeyedBlobsReshardFile("aggstate.arrows", reshard, snapshotCodec)
+            : null;
+        return Recorded(
+            builder, ctx,
+            () => builder.BlockedAggregateRows(
+                input, aggregator, format, flatten, rowFormat,
+                snapshotCodec, frontier, monotoneKey),
+            IZ("trace.arrows", reshard, snapshotCodec),
+            blobs);
+    }
+
+    /// <summary>
     /// If an aggregate's group key has a monotone column (per the monotonicity
     /// analyzer), returns the frontier to GC against and an extractor for the
     /// monotone value from the group-key row. The frontier is the min across all
@@ -4998,12 +5040,9 @@ public static partial class PlanToCircuit
         // frontier. The group-key row stores keys in GROUP BY order, so the
         // monotone column sits at its group-key index.
         var (gcFrontier, gcMonotoneKey) = ResolveGroupKeyFrontier(plan, ctx);
-        var aggregated = EmitAggregate(
-            builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey,
-            reshard: ctx.Workers <= 1 ? null
-                : needsExchange ? ReshardPlacement.WholeRow(groupKeySchema)
-                : ElidedAggregatePlacement(ctx.GetPartition(input), bareGroupIndices!),
-            shape: (groupKeySchema, plan.Input.Schema));
+        var reshard = ctx.Workers <= 1 ? null
+            : needsExchange ? ReshardPlacement.WholeRow(groupKeySchema)
+            : ElidedAggregatePlacement(ctx.GetPartition(input), bareGroupIndices!);
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;
@@ -5012,10 +5051,9 @@ public static partial class PlanToCircuit
         // exceed plan.Schema.Count (see comment above). The wrapping Project
         // narrows to plan.Schema downstream, so we don't need a typed codec
         // for this intermediate row — pass null and let the codec fall back.
-        var mapped = builder.MapRows(aggregated, pair =>
+        StructuralRow Flatten(StructuralRow key, StructuralRow aggRow)
         {
-            // pair = (GroupKey, CompositeAggregate output)
-            var (key, aggRow) = pair;
+            // (GroupKey, CompositeAggregate output)
             var vs = new object?[groupCount + aggCount];
             for (var i = 0; i < groupCount; i++)
             {
@@ -5028,7 +5066,20 @@ public static partial class PlanToCircuit
             }
 
             return codec.BuildRow(null, vs);
-        });
+        }
+
+        // With in-step spilling on and the trace as blocks, the flatten runs inside the aggregate, so
+        // its output rows go through a block-backed builder and no managed (key, aggregate) delta is
+        // built (docs/design-bounded-memory.md §5.25). The rows' format is their runtime layout (group
+        // key, then every aggregate), not plan.Schema, which can be narrower.
+        var mapped = EmitAggregateRows(
+                builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey, reshard,
+                (groupKeySchema, plan.Input.Schema), Flatten, new Schema([.. groupKeySchema.Columns, .. aggOnlySchema.Columns]))
+            ?? builder.MapRows(
+                EmitAggregate(
+                    builder, ctx, indexed, composite, aggCodec, gcFrontier, gcMonotoneKey, reshard,
+                    shape: (groupKeySchema, plan.Input.Schema)),
+                pair => Flatten(pair.Key, pair.Value));
 
         // The output lays the group key out as the first groupCount columns and
         // every group is co-located on one worker, so the result is partitioned by

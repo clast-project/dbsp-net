@@ -41,3 +41,15 @@ internal sealed class Apply2Op<TIn1, TIn2, TOut> : IOperator
         _output.SetCurrent(_transform(_left.Current, _right.Current));
     }
 }
+
+/// <summary>
+/// Passes its input through, in the slot of an operator fused into its producer (the aggregate's
+/// flatten, docs/design-bounded-memory.md §5.25): it fingerprints as that operator, so the circuit's
+/// shape, and a snapshot's plan fingerprint, are the same fused or not.
+/// </summary>
+internal sealed class FusedSlotOp<T>(Stream<T> input, Stream<T> output, Type slotType) : IOperator, IFingerprintIdentity
+{
+    public Type FingerprintType => slotType;
+
+    public void Step() => output.SetCurrent(input.Current);
+}

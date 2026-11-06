@@ -903,6 +903,34 @@ public static class StatefulOperators
         return output;
     }
 
+    /// <summary>As <see cref="BlockedAggregate"/>, with the (key, aggregate) → row flatten fused into
+    /// the operator, whose rows go through the output stream's delta builder (block backed past the
+    /// step-spill threshold; docs/design-bounded-memory.md §5.25).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> BlockedAggregateRows(
+        this CircuitBuilder builder,
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> input,
+        IAggregator<StructuralRow, StructuralRow> aggregator,
+        Blocks.ITraceBlockFormat format,
+        Func<StructuralRow, StructuralRow, StructuralRow> flatten,
+        object? rowFormat,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? snapshotCodec,
+        IFrontier? frontier,
+        Func<StructuralRow, long>? monotoneKey)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var rows = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty) { DeltaFormat = rowFormat };
+        builder.AddRawOperator(new IncrementalAggregateOp<StructuralRow, StructuralRow, StructuralRow>(
+            input, rows, flatten, aggregator, snapshotCodec, frontier, monotoneKey, new Blocks.BlockedGroupTrace(format),
+            canonicalOrder: StructuralRowComparer.Instance));
+
+        // The flatten's slot: the circuit keeps the unfused shape (operator indexes, and the snapshot's
+        // plan fingerprint), so a checkpoint restores across fused and unfused circuits.
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty) { DeltaFormat = rowFormat };
+        builder.AddRawOperator(new Circuit.Operators.FusedSlotOp<ZSet<StructuralRow, Z64>>(
+            rows, output, typeof(Circuit.Operators.ApplyOp<ZSet<(StructuralRow, StructuralRow), Z64>, ZSet<StructuralRow, Z64>>)));
+        return output;
+    }
+
     /// <summary>The structural LEFT OUTER join with both sides' traces held as blocks
     /// (<see cref="Blocks.BlockedGroupTrace"/>, docs/design-flat-trace-state.md §3.3).</summary>
     internal static Stream<ZSet<StructuralRow, Z64>> BlockedLeftJoin(
