@@ -1986,3 +1986,44 @@ decimals. The driver reported `status: completed` (`run_batch` sets `failed` unl
 extended TPC-DS batch that motivated this arc (issue #2) now runs within a 48 GiB heap, and its result is correct.**
 Next: block-backed aggregate output deltas (ops 1809/1815 hold about 21 GB live each), then run-file compression
 (spill disk peaked at about 330 GB).
+
+### 5.25 A blocked aggregate's output rows build as blocks (2026-11-06, fa7274f, xt71)
+
+**What.** The structural aggregate emitted a managed `ZSet<(key, aggregate)>`, which a `MapRows` then flattened
+into one row of group key plus every aggregate. The map's output already went through a block-backed builder
+(D3), but the tuple delta in between did not. In xt69 that delta was op 1809's 28.6M rows, about 21 GB live.
+With in-step spilling on and the aggregate's trace as blocks, the flatten now runs inside
+`IncrementalAggregateOp`, and its rows go through the output stream's `DeltaSpill` builder.
+- **The rows' format is their runtime layout** (group key, then every aggregate the plan collects), not
+  `plan.Schema`, which the compiler's comment says can be narrower. A format narrower than the row fails the
+  new test (mutant); on the queries tried, `plan.Schema` happened to be the full width.
+- **The circuit keeps its shape.** Removing the map op shifted operator indexes and changed the snapshot's plan
+  fingerprint, so a checkpoint written by a blocked aggregate no longer restored into a managed one (the forced
+  suite caught it in `Checkpoint_RestoresLazily_AndContinuesExactly`). A `FusedSlotOp` now sits in the map's
+  slot. It passes the rows through and fingerprints as the `ApplyOp` it replaces (`IFingerprintIdentity`).
+- Knob off, nothing changes: Nexmark w1profile B/ev is identical on all 10 queries. Suites pass normal (3,484)
+  and forced (3,484). Mutants caught: never fusing, a plain builder in the fused op, a narrower format, no slot.
+
+**xt71 (xt70's settings plus fa7274f): batch 1 completes and validates**. The driver reports `status: completed`
+after 7,720 s (xt70: 7,783 s).
+
+| | xt69/xt70 | xt71 |
+|---|---|---|
+| live after op 1809 (aggregate) | 36.0 GB | **15.3 GB** |
+| live after op 1815 (aggregate) | 35.3 GB | **15.5 GB** |
+| peak live in tick 18 | 36.0 GB (op 1809) | **15.6 GB** (op 1812), the level going in |
+| heap after op 1809 / 1811 (incl. garbage) | 69.6 / 78.4 GB | 33.4 / 35.8 GB |
+| op 1809 / op 1810 | 261 s / 18 s (the map) | 264 s / below the log threshold (the slot) |
+| ticks 0–17, tick 18 done | 3,018 s, 7,511 s | 3,020 s, 7,452 s |
+| peak RSS, spill disk peak, min free | 42 GB, ~330 GB, 172 GB | 45 GB, 312 GB, 178 GB |
+
+- **Tick 18 no longer grows live memory.** Every op after 1808 runs at the 15–15.6 GB that the state takes going
+  in. The two aggregates' deltas were the last managed copies of tick 18's big outputs.
+- **Peak RSS did not fall** (45 vs 42 GB). It is garbage: the highest heap readings are at ops 1433 (an `Apply`,
+  70.6 GB) and 1823 (a left join, 67.8 GB), and live never passes 15.6 GB. Under server GC with a 48 GiB hard limit,
+  RSS follows how much garbage the GC lets build up, not the live set. Bounding it is a GC-settings question
+  (§3c, §3i), separate from what the engine holds.
+- Time is unchanged. The fused aggregate saves the map's 18 s and a second pass, which is within run-to-run noise
+  at this length.
+
+**Next.** Spill disk (312 GB peak) is now the largest resource the batch uses: run-file compression (§5.21).
