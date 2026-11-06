@@ -2028,7 +2028,7 @@ after 7,720 s (xt70: 7,783 s).
 
 **Next.** Spill disk (312 GB peak) is now the largest resource the batch uses: run-file compression (§5.21).
 
-### 5.26 Run files compress each block whole, with zstd level 1 (2026-11-06, xt72)
+### 5.26 Run files compress each block whole, with zstd level 1 (2026-11-06, bff1bfd, xt72–xt73)
 
 **What we measured.** xt72 reran batch 1 with a sampler that hard-linked random spill files as they appeared:
 120 files, 40.7 GiB of blocks, every layout the batch spills. Each block's record-batch message was compressed
@@ -2096,3 +2096,27 @@ The streamed-run memory test now allows the compression window.
 Suites pass with compression on, off (`DBSPNET_RUN_COMPRESSION=none`), and in the forced spill mode with each
 (3,491 every time). Mutants caught: a decoder that ignores the codec (64 failures) and a block-set manifest that
 drops the codec (8, the window stores). Nexmark does not spill, so its hot path is untouched.
+
+**xt73 (xt71's settings plus bff1bfd): batch 1 completes and validates, with a quarter of the spill disk.**
+The driver reports `status: completed`, which `run_batch` only does when validation passes.
+
+| | xt72 (raw) | xt73 (zstd 1) | |
+|---|---|---|---|
+| spill disk peak (`spill_disk_peak_mib`) | 311,711 MiB | 73,588 MiB | 4.24× smaller |
+| bytes written to spill (`spilled_mib`) | 1,151,926 MiB | 298,855 MiB | 3.85× smaller |
+| batch duration (`duration_s`) | 7,785 s | 8,800 s | +1,015 s, +13% |
+| tick 17 / tick 18 done at | 3,008 / 7,517 s | 3,299 / 8,468 s | |
+| tick 18 live heap | 15,538 MiB | 15,565 MiB | unchanged |
+| peak RSS | 44.8 GiB | 40.6 GiB | |
+
+- **The disk saving is what the samples predicted.** The peak shrank 4.24×, against 4.97× on the sampled
+  blocks. Blocks written from record batches (compaction's merged blocks; see What changed) stay raw, and so do blocks
+  under 256 bytes. That is why the bytes written shrank less (3.85×) than the peak did.
+- **The time cost is about the size the inline estimate gave (~1,100 s), even though compression now runs in
+  parallel.** This is one run of each, and it is not apportioned. Candidates are decompression on block faults
+  (every faulted spilled block now decodes at ~2.2 GB/s) and spill writes that do not go through
+  `RunStreamWriter`'s parallel window. If the cost matters, LZ4 is a one-line change (6.8 GB/s decode) and
+  would keep about 96 GB of the 312.
+- xt72's minimum free disk (178 GiB) included 41 GB of sample hard links, so the two runs' free-disk minima
+  (xt73: 445 GiB) are not comparable. As in xt72, the run's spill directory outlived the test host and was
+  deleted by hand (80 GB).
