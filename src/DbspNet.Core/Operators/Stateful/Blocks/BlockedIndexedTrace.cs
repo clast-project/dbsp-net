@@ -928,6 +928,47 @@ internal sealed class BlockedIndexedTrace
         return builder.Build();
     }
 
+    /// <summary>How many rows of a Z-set trace have a non-zero weight, counted by streaming its runs
+    /// (and summing its managed levels, which a freeze bounds) — never materialized: a server's view
+    /// statistics once materialized a 65M-row view to count it (§5.24).</summary>
+    public int CountRows()
+    {
+        Dictionary<StructuralRow, long>? managed = null;
+        foreach (var level in _managed)
+        {
+            foreach (var (row, weight) in level.Rows ?? throw new InvalidOperationException("not a Z-set trace"))
+            {
+                if (!Dropped(row, level.Floor))
+                {
+                    managed ??= [];
+                    managed[row] = managed.GetValueOrDefault(row) + weight.Value;
+                }
+            }
+        }
+
+        long count = 0;
+        foreach (var (row, weight) in StreamRunsCore(Captured([.. _runs])))
+        {
+            var total = weight.Value;
+            if (managed is not null && managed.Remove(row, out var more))
+            {
+                total += more;
+            }
+
+            if (total != 0)
+            {
+                count++;
+            }
+        }
+
+        if (managed is not null)
+        {
+            count += managed.Values.Count(static w => w != 0);
+        }
+
+        return (int)Math.Min(count, int.MaxValue);
+    }
+
     /// <summary>A Z-set trace's net contents (<see cref="IntegrateRows"/>): every row with a non-zero
     /// weight. Not cached: the caller decides how long to hold it.</summary>
     public ZSet<StructuralRow, Z64> MaterializeRows()

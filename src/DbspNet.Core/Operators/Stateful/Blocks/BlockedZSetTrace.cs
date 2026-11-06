@@ -31,7 +31,10 @@ internal sealed class BlockedZSetTrace : IRowTrace<StructuralRow, Z64>
 
     internal BlockedIndexedTrace Trace { get; }
 
-    public int Count => _count >= 0 ? _count : _count = Current.Count;
+    // Counted from the materialized set when one is cached, else streamed: never materialized just
+    // to count (a server's statistics did, on a 65M-row view, §5.24).
+    public int Count => _count >= 0 ? _count
+        : _count = _current.TryGetTarget(out var cached) && cached is not null ? cached.Count : Trace.CountRows();
 
     public long RetainedRows => Count;
 

@@ -400,6 +400,34 @@ public class BlockedDeltaTests
     }
 
     [Fact]
+    public void A_traces_count_is_streamed_and_equals_its_materialized_count()
+    {
+        Gen.Select(GenAdds.Array[1, 10], Gen.Bool.Array[10]).Sample((ticks, freeze) =>
+        {
+            var trace = new BlockedIndexedTrace(Format, freezeEntries: 16, blockEntries: 8);
+            for (var t = 0; t < ticks.Length; t++)
+            {
+                trace.IntegrateRows(Managed(ticks[t]));
+                if (freeze[t])
+                {
+                    trace.Freeze(); // a mix of runs and managed levels
+                }
+
+                Assert.Equal(trace.MaterializeRows().Count, trace.CountRows());
+            }
+
+            // A fresh view over the same trace counts without materializing.
+            var view = new BlockedZSetTrace(Format);
+            foreach (var tick in ticks)
+            {
+                view.Integrate(Managed(tick));
+            }
+
+            Assert.Equal(view.Trace.MaterializeRows().Count, view.Count);
+        }, iter: 300);
+    }
+
+    [Fact]
     public void Builder_count_and_cancellation_across_chunks()
     {
         using var _ = SpillSettings.UseStepSpill(4, 4);
