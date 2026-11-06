@@ -8,6 +8,9 @@
     <ProjectReference Include="..\DbspNet.Arrow\DbspNet.Arrow.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="ZstdSharp.Port" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="DbspNet.Tests" />
     <InternalsVisibleTo Include="DbspNet.Connectors.Abstractions" />
     <InternalsVisibleTo Include="DbspNet.Connectors.EngineeredWood" />

@@ -204,8 +204,8 @@ internal static class BlockedTraceCheckpoint
             for (var b = 0; b < blocks.Count; b++)
             {
                 var body = Materialized(blocks[b]);
-                await file.AppendRawAsync(body.Message, [(uint)b], body.Count, 1, cancellationToken).ConfigureAwait(false);
-                bodies.Add((file.Index[^1], body));
+                await file.AppendRawAsync(body.Message, [(uint)b], body.Count, 1, cancellationToken, ix => bodies.Add((ix, body)))
+                    .ConfigureAwait(false);
             }
 
             await file.FinishAsync(cancellationToken).ConfigureAwait(false);
@@ -227,7 +227,7 @@ internal static class BlockedTraceCheckpoint
 
     /// <summary>A block set's manifest: magic, version.</summary>
     private const uint BlockSetMagic = 0x53424244; // "DBBS"
-    private const int BlockSetVersion = 1;
+    private const int BlockSetVersion = 2; // 2: each block's message length and codec (§5.26)
 
     /// <summary>A block set naming more files than this is written whole (raw) to one new file:
     /// a file stays alive while any block in it does, so without this a set would pin every file
@@ -305,8 +305,9 @@ internal static class BlockedTraceCheckpoint
             for (var k = 0; k < fresh.Count; k++)
             {
                 var body = fresh[k].Body;
-                await run.AppendRawAsync(body.Message, [(uint)k], body.Count, 1, cancellationToken).ConfigureAwait(false);
-                refs[fresh[k].At] = (file, run.Index[^1]);
+                var at = fresh[k].At;
+                await run.AppendRawAsync(body.Message, [(uint)k], body.Count, 1, cancellationToken, ix => refs[at] = (file, ix))
+                    .ConfigureAwait(false);
             }
 
             await run.FinishAsync(cancellationToken).ConfigureAwait(false);
@@ -336,6 +337,8 @@ internal static class BlockedTraceCheckpoint
                 w.Write(ix.Length);
                 w.Write(ix.Entries);
                 w.Write(ix.Groups);
+                w.Write(ix.RawLength);
+                w.Write((int)ix.Codec);
             }
         }
 
@@ -396,7 +399,7 @@ internal static class BlockedTraceCheckpoint
         var fs = chain.Store;
         var bytes = await fs.ReadAllBytesAsync(chain.Paths[0], cancellationToken).ConfigureAwait(false);
         using var r = new System.IO.BinaryReader(new System.IO.MemoryStream(bytes), System.Text.Encoding.UTF8);
-        if (r.ReadUInt32() != BlockSetMagic || r.ReadInt32() is var version && version != BlockSetVersion)
+        if (r.ReadUInt32() != BlockSetMagic || r.ReadInt32() is var version && version is < 1 or > BlockSetVersion)
         {
             throw new InvalidDataException($"'{chain.Paths[0]}' is not a block set this version reads");
         }
@@ -414,6 +417,9 @@ internal static class BlockedTraceCheckpoint
         {
             var f = r.ReadInt32();
             var index = new RunBlock(r.ReadUInt32(), r.ReadUInt32(), r.ReadInt64(), r.ReadInt32(), r.ReadInt32(), r.ReadInt32());
+            index = version >= 2
+                ? index with { RawLength = r.ReadInt32(), Codec = (BlockCodec)r.ReadInt32() }
+                : index with { RawLength = index.Length };
             var lazy = new LazyTraceBlock(schema, fs, paths[f], index) { Durable = true };
             RunPins.Add(lazy, fs, [paths[f]]);
             blocks[i] = lazy;
@@ -456,7 +462,7 @@ internal static class BlockedTraceCheckpoint
                 end++;
             }
 
-            await AppendChainAsync(writer, schema, blocks, b, end, bodies, cancellationToken).ConfigureAwait(false);
+            await AppendChainAsync(writer, schema, blocks, b, end, (ix, body) => bodies.Add((ix, body)), cancellationToken).ConfigureAwait(false);
             b = end;
         }
 
@@ -470,7 +476,7 @@ internal static class BlockedTraceCheckpoint
     // Blocks [b, end), chained by a hash that spans them (or one block), appended as file blocks.
     private static async ValueTask AppendChainAsync(
         RunStreamWriter writer, BlockSchema schema, IReadOnlyList<ITraceBlock> blocks, int b, int end,
-        List<(RunBlock Index, TraceBlock? Body)> bodies, CancellationToken cancellationToken)
+        Action<RunBlock, TraceBlock?> written, CancellationToken cancellationToken)
     {
         var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
         // Without eviction a span is written whole (neighbours and all): nothing faults it in for
@@ -490,15 +496,15 @@ internal static class BlockedTraceCheckpoint
             if (piece.Parts is { } parts)
             {
                 var hashes = Distinct(parts);
-                await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
-                bodies.Add((writer.Index[^1], null));
+                await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken, ix => written(ix, null))
+                    .ConfigureAwait(false);
             }
             else
             {
                 var block = piece.Block!;
                 var hashes = Distinct(block.Hashes);
-                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken).ConfigureAwait(false);
-                bodies.Add((writer.Index[^1], block));
+                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken, ix => written(ix, block))
+                    .ConfigureAwait(false);
             }
         }
     }
@@ -517,7 +523,6 @@ internal static class BlockedTraceCheckpoint
         private readonly RunStreamWriter _writer;
         private readonly Func<long, RunFileLease> _register;
         private readonly List<ITraceBlock> _chain = [];
-        private readonly List<(RunBlock Index, TraceBlock? Body)> _bodies = [];
         private readonly List<ITraceBlock> _blocks = [];
         private long _heldBytes;
 
@@ -578,16 +583,12 @@ internal static class BlockedTraceCheckpoint
                 return;
             }
 
-            AppendChainAsync(_writer, _schema, _chain, 0, _chain.Count, _bodies, CancellationToken.None).AsTask().GetAwaiter().GetResult();
-
-            // Each written block becomes a file block now, its body handed to the block cache (which
-            // evicts past its budget): holding the bodies until the finish held the whole run (§5.24).
-            foreach (var (index, body) in _bodies)
-            {
-                _blocks.Add(new LazyTraceBlock(_schema, _fs, _path, index, body));
-            }
-
-            _bodies.Clear();
+            // Each block becomes a file block once written (its compression may finish at a later
+            // append), its body handed to the block cache (which evicts past its budget): holding the
+            // bodies until the finish held the whole run (§5.24).
+            AppendChainAsync(
+                _writer, _schema, _chain, 0, _chain.Count, (index, body) => _blocks.Add(new LazyTraceBlock(_schema, _fs, _path, index, body)),
+                CancellationToken.None).AsTask().GetAwaiter().GetResult();
             _chain.Clear();
             _chainBytes = 0;
             _heldBytes = 0;
@@ -910,10 +911,10 @@ internal sealed class LazyTraceBlock : ITraceBlock
             var o1 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             long r = 0;
             var local = lease.File;
-            var adopted = _schema.Adopt(_index.Length, m =>
+            var adopted = _schema.Adopt(_index.MessageLength, m =>
             {
                 var r0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                local.ReadExactly(_index.Offset, m.Span);
+                BlockCompression.ReadInto(_index, m.Span, into => local.ReadExactly(_index.Offset, into));
                 if (prof)
                 {
                     r = System.Diagnostics.Stopwatch.GetTimestamp() - r0;
@@ -939,10 +940,10 @@ internal sealed class LazyTraceBlock : ITraceBlock
             TraceBlock block;
             if (file is IO.Local.LocalRandomAccessFile local)
             {
-                block = _schema.Adopt(_index.Length, m =>
+                block = _schema.Adopt(_index.MessageLength, m =>
                 {
                     var r0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    local.ReadExactly(_index.Offset, m.Span);
+                    BlockCompression.ReadInto(_index, m.Span, into => local.ReadExactly(_index.Offset, into));
                     if (prof)
                     {
                         readTicks = System.Diagnostics.Stopwatch.GetTimestamp() - r0;
@@ -952,7 +953,10 @@ internal sealed class LazyTraceBlock : ITraceBlock
             else
             {
                 using var bytes = file.ReadAsync(new FileRange(_index.Offset, _index.Length)).AsTask().GetAwaiter().GetResult();
-                block = _schema.Adopt(bytes.Memory.Span[.._index.Length]);
+                var stored = bytes.Memory[.._index.Length];
+                block = _index.Codec == BlockCodec.None
+                    ? _schema.Adopt(stored.Span)
+                    : _schema.Adopt(_index.MessageLength, m => BlockCompression.Decompress(_index.Codec, stored.Span, m.Span));
             }
 
             if (prof)

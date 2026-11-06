@@ -40,7 +40,9 @@ internal static class RunFile
 {
     internal static ReadOnlySpan<byte> Magic => "DBSPRUN1"u8;
 
-    internal const int FormatVersion = 4;
+    /// <summary>Version 5 adds each block's codec and message length to the index (whole-block
+    /// compression, docs/design-bounded-memory.md §5.26).</summary>
+    internal const int FormatVersion = 5;
 
     /// <summary>The oldest format a reader still opens: version 3 never lets a hash span blocks, which
     /// version 4 allows (docs/design-bounded-memory.md §5.18), so a v3 run reads the same either way.</summary>
@@ -57,7 +59,10 @@ internal static class RunFile
     internal static int MaxSpanBlockEntries =
         int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_ENTRIES"), out var cap) && cap > 0 ? cap : 1 << 18;
     internal const int TrailerBytes = 16;
-    internal const int BlockIndexEntryBytes = 4 + 4 + 8 + 4 + 4 + 4;
+    internal const int BlockIndexEntryBytes = 4 + 4 + 8 + 4 + 4 + 4 + 4 + 4;
+
+    /// <summary>A version 3 or 4 index entry: no codec, no message length (every block raw).</summary>
+    internal const int BlockIndexEntryBytesV4 = 4 + 4 + 8 + 4 + 4 + 4;
     internal const int DefaultBlockEntries = 1024;
 
     /// <summary>A row with one cell of every engine type (and a null): its hash pins the hash
@@ -323,8 +328,8 @@ internal static class RunFile
                 {
                     var offset = file.Position;
                     await ipc.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
-                    index.Add(new RunBlock(
-                        sortedHashes[from], sortedHashes[to - 1], offset, checked((int)(file.Position - offset)), entries, to - from));
+                    var length = checked((int)(file.Position - offset));
+                    index.Add(new RunBlock(sortedHashes[from], sortedHashes[to - 1], offset, length, entries, to - from, length));
                 }
 
                 RunWriteProfile.Add(4, t);
@@ -375,6 +380,8 @@ internal static class RunFile
             BinaryPrimitives.WriteInt32LittleEndian(s[(at + 16)..], b.Length);
             BinaryPrimitives.WriteInt32LittleEndian(s[(at + 20)..], b.Entries);
             BinaryPrimitives.WriteInt32LittleEndian(s[(at + 24)..], b.Groups);
+            BinaryPrimitives.WriteInt32LittleEndian(s[(at + 28)..], b.MessageLength);
+            BinaryPrimitives.WriteInt32LittleEndian(s[(at + 32)..], (int)b.Codec);
             at += BlockIndexEntryBytes;
         }
 
@@ -395,8 +402,15 @@ internal static class RunFile
 /// <summary>What a run holds, as the writer reports it.</summary>
 internal readonly record struct RunInfo(RunFile.Kind Kind, long Entries, long Groups, int Blocks, long Bytes);
 
-/// <summary>One block of a run: the hash range it covers, where it is, and how much it holds.</summary>
-internal readonly record struct RunBlock(uint FirstHash, uint LastHash, long Offset, int Length, int Entries, int Groups);
+/// <summary>One block of a run: the hash range it covers, where it is (<paramref name="Length"/> stored
+/// bytes), how much it holds, and how it is stored — a <paramref name="Codec"/> other than none decodes
+/// to a record-batch message of <paramref name="RawLength"/> bytes.</summary>
+internal readonly record struct RunBlock(
+    uint FirstHash, uint LastHash, long Offset, int Length, int Entries, int Groups, int RawLength = 0, BlockCodec Codec = BlockCodec.None)
+{
+    /// <summary>The block's record-batch message length, decoded.</summary>
+    public int MessageLength => Codec == BlockCodec.None ? Length : RawLength;
+}
 
 /// <summary>A Bloom filter over 32-bit key hashes (~10 bits per key, 7 probes): rejects most
 /// probes for keys a run does not hold without touching a block.</summary>

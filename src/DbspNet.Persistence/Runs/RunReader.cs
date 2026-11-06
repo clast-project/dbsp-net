@@ -192,16 +192,27 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         var count = BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
         at += 4;
         var blocks = new RunBlock[count];
+        var coded = version >= 5;
         for (var i = 0; i < count; i++)
         {
+            var length = BinaryPrimitives.ReadInt32LittleEndian(f[(at + 16)..]);
+            var rawLength = coded ? BinaryPrimitives.ReadInt32LittleEndian(f[(at + 28)..]) : length;
+            var codec = coded ? (BlockCodec)BinaryPrimitives.ReadInt32LittleEndian(f[(at + 32)..]) : BlockCodec.None;
+            if (codec is not (BlockCodec.None or BlockCodec.Zstd) || rawLength < 0)
+            {
+                throw new InvalidDataException($"run '{path}' block {i} has codec {(int)codec}, message length {rawLength}");
+            }
+
             blocks[i] = new RunBlock(
                 BinaryPrimitives.ReadUInt32LittleEndian(f[at..]),
                 BinaryPrimitives.ReadUInt32LittleEndian(f[(at + 4)..]),
                 BinaryPrimitives.ReadInt64LittleEndian(f[(at + 8)..]),
-                BinaryPrimitives.ReadInt32LittleEndian(f[(at + 16)..]),
+                length,
                 BinaryPrimitives.ReadInt32LittleEndian(f[(at + 20)..]),
-                BinaryPrimitives.ReadInt32LittleEndian(f[(at + 24)..]));
-            at += RunFile.BlockIndexEntryBytes;
+                BinaryPrimitives.ReadInt32LittleEndian(f[(at + 24)..]),
+                rawLength,
+                codec);
+            at += coded ? RunFile.BlockIndexEntryBytes : RunFile.BlockIndexEntryBytesV4;
         }
 
         var words = BinaryPrimitives.ReadInt32LittleEndian(f[at..]);
@@ -370,18 +381,18 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
         return (decode(block.Batch), hashes);
     }
 
-    /// <summary>Block <paramref name="b"/> as stored — its record-batch message bytes, to copy into
-    /// another run of the same schema unchanged — and its distinct order hashes (read from the
-    /// <c>__hash</c> column only; no row is decoded).</summary>
-    internal async ValueTask<(byte[] Message, List<uint> KeyHashes)> ReadBlockRawAsync(int b, CancellationToken cancellationToken = default)
+    /// <summary>Block <paramref name="b"/> as stored — its bytes and codec, to copy into another run of
+    /// the same schema unchanged — and its distinct order hashes (read from the <c>__hash</c> column
+    /// only; no row is decoded).</summary>
+    internal async ValueTask<(StoredBlock Stored, List<uint> KeyHashes)> ReadBlockRawAsync(int b, CancellationToken cancellationToken = default)
     {
         var block = _blocks[b];
         var file = _file ?? await _store!.OpenReadAsync(_path!, cancellationToken).ConfigureAwait(false);
-        byte[] message;
+        byte[] stored;
         try
         {
             using var bytes = await file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false);
-            message = bytes.Memory.Span[..block.Length].ToArray();
+            stored = bytes.Memory.Span[..block.Length].ToArray();
         }
         finally
         {
@@ -391,15 +402,15 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
             }
         }
 
-        var buffer = new byte[_schemaMessage.Length + message.Length];
+        var buffer = new byte[_schemaMessage.Length + block.MessageLength];
         _schemaMessage.CopyTo(buffer, 0);
-        message.CopyTo(buffer, _schemaMessage.Length);
+        BlockCompression.Decompress(block.Codec, stored, buffer.AsSpan(_schemaMessage.Length));
         using var reader = new ArrowStreamReader(new MemoryStream(buffer, writable: false), leaveOpen: false);
         using var batch = reader.ReadNextRecordBatch()
             ?? throw new InvalidDataException($"run block at offset {block.Offset} holds no record batch");
-        var stored = ((Int32Array)batch.Column(batch.ColumnCount - 1)).Values;
+        var orderHashes = ((Int32Array)batch.Column(batch.ColumnCount - 1)).Values;
         var distinct = new List<uint>();
-        foreach (var h in stored)
+        foreach (var h in orderHashes)
         {
             if (distinct.Count == 0 || distinct[^1] != (uint)h)
             {
@@ -407,7 +418,7 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
             }
         }
 
-        return (message, distinct);
+        return (new StoredBlock(stored, block.Codec, block.MessageLength), distinct);
     }
 
     /// <summary>The first block holding entries of order hash <paramref name="hash"/>, or -1 when the
@@ -570,13 +581,13 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
     // The reader stays alive with the batch, so nothing the batch points at is released early.
     private async ValueTask<Block> ReadBatchAsync(RunBlock block, CancellationToken cancellationToken)
     {
-        var buffer = new byte[_schemaMessage.Length + block.Length];
+        var buffer = new byte[_schemaMessage.Length + block.MessageLength];
         _schemaMessage.CopyTo(buffer, 0);
         var file = _file ?? await _store!.OpenReadAsync(_path!, cancellationToken).ConfigureAwait(false);
         try
         {
             using var bytes = await file.ReadAsync(new FileRange(block.Offset, block.Length), cancellationToken).ConfigureAwait(false);
-            bytes.Memory.Span[..block.Length].CopyTo(buffer.AsSpan(_schemaMessage.Length));
+            BlockCompression.Decompress(block.Codec, bytes.Memory.Span[..block.Length], buffer.AsSpan(_schemaMessage.Length));
         }
         finally
         {

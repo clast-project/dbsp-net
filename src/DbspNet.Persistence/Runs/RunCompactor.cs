@@ -131,8 +131,8 @@ internal static class RunCompactor
             // decode, no row objects (most blocks: the deltas are small).
             if (pending.Count == 0 && (d >= sorted.Count || sorted[d].Hash > meta.LastHash))
             {
-                var (message, keyHashes) = await baseRun.ReadBlockRawAsync(b, cancellationToken).ConfigureAwait(false);
-                await writer.AppendRawAsync(message, keyHashes, meta.Entries, meta.Groups, cancellationToken).ConfigureAwait(false);
+                var (stored, keyHashes) = await baseRun.ReadBlockRawAsync(b, cancellationToken).ConfigureAwait(false);
+                await writer.AppendStoredAsync(stored, keyHashes, meta.Entries, meta.Groups, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 

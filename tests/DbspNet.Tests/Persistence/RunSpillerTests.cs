@@ -428,11 +428,12 @@ public class RunSpillerTests
             var written = AppendBlocks(sink, format, blocks: 200, perBlock: 50);
 
             // Budget 1: the cache evicts every admitted body at once, so only the pending chain (the
-            // last block, which the next could still continue) may hold one.
+            // last block, which the next could still continue) and the blocks still compressing (at
+            // most RunStreamWriter.MaxInFlight, §5.26) may hold one.
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
-            Assert.All(written[..^1], w => Assert.False(w.TryGetTarget(out _), "a written block's body is still held"));
+            Assert.All(written[..^(1 + RunStreamWriter.MaxInFlight)], w => Assert.False(w.TryGetTarget(out _), "a written block's body is still held"));
 
             var (blocks, _, _) = sink.Finish();
             Assert.NotNull(lease);

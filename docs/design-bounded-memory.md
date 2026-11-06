@@ -2027,3 +2027,72 @@ after 7,720 s (xt70: 7,783 s).
   at this length.
 
 **Next.** Spill disk (312 GB peak) is now the largest resource the batch uses: run-file compression (§5.21).
+
+### 5.26 Run files compress each block whole, with zstd level 1 (2026-11-06, xt72)
+
+**What we measured.** xt72 reran batch 1 with a sampler that hard-linked random spill files as they appeared:
+120 files, 40.7 GiB of blocks, every layout the batch spills. Each block's record-batch message was compressed
+whole, as Feldera compresses a block. Ratios are identical in both runtimes; speeds are .NET 10 on the M4, one
+thread, with tiering off so the JIT does not muddy them (`DOTNET_TieredCompilation=0`).
+
+| codec | ratio | compress MB/s | decompress MB/s | the 312 GB peak becomes |
+|---|---|---|---|---|
+| Snappy (Feldera's default) | 3.01 | 2,990 | 5,801 | ~104 GB |
+| LZ4 | 3.25 | 1,610 | 6,813 | ~96 GB |
+| zstd −1 | 3.68 | 1,364 | 4,053 | ~85 GB |
+| **zstd 1** | **4.97** | 1,050 | 2,207 | **~63 GB** |
+| zstd 3 | 5.06 | 827 | 2,306 | ~62 GB |
+| Brotli q0 / q1 | 4.26 / 4.62 | 1,151 / 676 | 873 / 833 | |
+| Deflate (through `DeflateStream`) | 3.45 | 822 | 1,196 | |
+| Arrow IPC per-buffer LZ4 / zstd | 2.40 / 4.33 | | | |
+
+- **zstd 1 is the pick.** It keeps about 40% more off the disk than Snappy, and the disk is what we are saving.
+  Level 3 costs 25% more CPU for under 2% more ratio. Brotli and Deflate lose on ratio and on decompression.
+  The widest layout (a fact row, 16% of all bytes) compresses 11.6×; timestamp-heavy rows compress least (1.6×).
+- **Whole blocks, not Arrow's per-buffer compression.** Per-buffer zstd compresses less (4.33×), and a compressed
+  Arrow message no longer takes `TraceBlock.TryParseHeader`'s fast path.
+- **zstd ships in .NET 11** (`ZstandardEncoder`/`ZstandardDecoder`, span to span). On .NET 10 we use
+  ZstdSharp.Port, behind the same span-shaped calls, so the switch changes no byte on disk.
+
+**The cost is CPU on the step thread.** The batch writes 1.15 TB of spill over its life (`spilled_mib`), almost
+4× the disk peak. Compressed inline at 1,050 MB/s, that is about 1,100 s on a 7,785 s batch. Spill writes are
+synchronous on the step thread (`RunSpiller.AfterCompact`, the streamed run sink), but the batch runs one worker
+on a 14-core machine and blocks are independent.
+
+**What changed.**
+
+- **Run format 5.** Each index entry gains the block's message length and codec (36 bytes, from 28), so a block
+  is stored raw or compressed block by block. A reader still opens versions 3 and 4 (every block raw). Block-set
+  manifests (§3g) are version 2 for the same two fields, and still read version 1.
+- **`BlockCompression`.** zstd at `DBSPNET_RUN_ZSTD_LEVEL` (default 1) with per-thread contexts;
+  `DBSPNET_RUN_COMPRESSION=none` turns it off. A block under 256 bytes, or one that does not shrink, is stored raw.
+- **`RunStreamWriter` compresses in parallel and writes in order.** A block appended as its message is
+  compressed on the thread pool. Up to `MaxInFlight` blocks (cores − 2) and 256 MB are in flight before an append
+  waits for the oldest. Its index entry reaches the caller through a callback once it is written, so the callers
+  that read `Index[^1]` after each append (the spill writer, the streamed run file, backing blocks, block sets)
+  now take the entry from the callback.
+- **The writer waits for a compression synchronously; it never awaits one.** Awaited, the rest of the write moved
+  to a pool thread. That thread's last work item, the write's state machine, then stayed reachable while the
+  thread sat idle, and it pinned the blocks the callbacks had built, and through them their files. The spiller
+  test caught it as two spill files that outlived their program.
+- **A giant block streams through a zstd frame** (`AppendConcatAsync`). It is never built in memory, raw or
+  compressed.
+- **Reads decompress straight into the block's array:** the lazy block fault, both on local files and other
+  stores, and the reader's block decode. Compaction copies a stored block as stored, with no decode and no
+  recompression. Blocks written from a record batch (`RunFile.WriteAsync`, `AppendAsync`: the managed traces'
+  checkpoints and compaction's merged blocks) stay raw. A run with compressed blocks is no longer a plain Arrow
+  IPC stream, as Feldera's files are not.
+
+**Tests.** Seven in `RunCompressionTests`:
+- a streamed run is compressed and reads back byte for byte, on local and in-memory stores;
+- with compression off, blocks are stored raw;
+- a giant block streams through the compressor;
+- a run can mix codecs block by block, and compaction's copy keeps each block as stored;
+- blocks that finish compressing out of order are still written in append order;
+- a version 4 run still reads.
+
+The streamed-run memory test now allows the compression window.
+
+Suites pass with compression on, off (`DBSPNET_RUN_COMPRESSION=none`), and in the forced spill mode with each
+(3,491 every time). Mutants caught: a decoder that ignores the codec (64 failures) and a block-set manifest that
+drops the codec (8, the window stores). Nexmark does not spill, so its hot path is untouched.
