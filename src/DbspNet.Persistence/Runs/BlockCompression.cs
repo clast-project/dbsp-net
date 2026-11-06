@@ -13,6 +13,12 @@ internal enum BlockCodec
 
     /// <summary>The whole message as one zstd frame.</summary>
     Zstd = 1,
+
+    /// <summary>The whole message as one LZ4 block (no frame).</summary>
+    Lz4 = 2,
+
+    /// <summary>The whole message as one LZ4 frame: a giant block streamed from its parts.</summary>
+    Lz4Frame = 3,
 }
 
 /// <summary>
@@ -22,7 +28,7 @@ internal enum BlockCodec
 /// (4.97x against LZ4 3.25x and Snappy 3.01x, §5.26). Blocks a codec does not shrink are stored raw.
 /// </summary>
 /// <remarks>
-/// <c>DBSPNET_RUN_COMPRESSION</c> = <c>zstd</c> (default) or <c>none</c>; <c>DBSPNET_RUN_ZSTD_LEVEL</c>
+/// <c>DBSPNET_RUN_COMPRESSION</c> = <c>zstd</c> (default), <c>lz4</c> or <c>none</c>; <c>DBSPNET_RUN_ZSTD_LEVEL</c>
 /// (default 1). The codec is chosen on the writing thread, so a test may override it for its own writes.
 /// The API is span to span with reusable per-thread contexts, the shape of .NET 11's
 /// <c>ZstandardEncoder</c>/<c>ZstandardDecoder</c>, which can replace ZstdSharp here unchanged on disk.
@@ -34,6 +40,7 @@ internal static class BlockCompression
         Environment.GetEnvironmentVariable("DBSPNET_RUN_COMPRESSION")?.Trim().ToLowerInvariant() switch
         {
             "none" or "off" or "0" => BlockCodec.None,
+            "lz4" => BlockCodec.Lz4,
             _ => BlockCodec.Zstd,
         };
 
@@ -94,6 +101,19 @@ internal static class BlockCompression
             return new Stored(message, BlockCodec.None, null);
         }
 
+        if (codec == BlockCodec.Lz4)
+        {
+            var lz4 = ArrayPool<byte>.Shared.Rent(K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(message.Length));
+            var m = K4os.Compression.LZ4.LZ4Codec.Encode(message.Span, lz4, K4os.Compression.LZ4.LZ4Level.L00_FAST);
+            if (m <= 0 || m >= message.Length)
+            {
+                ArrayPool<byte>.Shared.Return(lz4);
+                return new Stored(message, BlockCodec.None, null);
+            }
+
+            return new Stored(lz4.AsMemory(0, m), BlockCodec.Lz4, lz4);
+        }
+
         var level = ZstdLevel;
         if (t_compressor is null || t_compressorLevel != level)
         {
@@ -131,8 +151,51 @@ internal static class BlockCompression
                 }
 
                 return;
+            case BlockCodec.Lz4:
+                var m = K4os.Compression.LZ4.LZ4Codec.Decode(stored, destination);
+                if (m != destination.Length)
+                {
+                    throw new InvalidDataException($"an LZ4 run block decoded to {m} bytes, expected {destination.Length}");
+                }
+
+                return;
+            case BlockCodec.Lz4Frame:
+                DecodeFrame(stored, destination);
+                return;
             default:
                 throw new InvalidDataException($"unknown run block codec {(int)codec}");
+        }
+    }
+
+    // A frame is a giant block's, which is rare: its stored bytes are copied once so the frame reader
+    // (which takes memory, not a span) can read them.
+    private static void DecodeFrame(ReadOnlySpan<byte> stored, Span<byte> destination)
+    {
+        var copy = ArrayPool<byte>.Shared.Rent(stored.Length);
+        try
+        {
+            stored.CopyTo(copy);
+            using var lz4 = K4os.Compression.LZ4.Streams.LZ4Frame.Decode(copy.AsMemory(0, stored.Length));
+            var at = 0;
+            while (at < destination.Length)
+            {
+                var n = lz4.ReadManyBytes(destination[at..]);
+                if (n <= 0)
+                {
+                    break;
+                }
+
+                at += n;
+            }
+
+            if (at != destination.Length || lz4.ReadOneByte() != -1)
+            {
+                throw new InvalidDataException($"an LZ4 frame run block did not decode to {destination.Length} bytes");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(copy);
         }
     }
 
@@ -162,23 +225,32 @@ internal static class BlockCompression
     /// <summary>Fills a span with stored bytes.</summary>
     internal delegate void ReadStored(Span<byte> into);
 
-    /// <summary>A sequential file that zstd-compresses everything written to it into
-    /// <paramref name="inner"/> as one frame (a giant block streamed from its parts); disposing it ends
+    /// <summary>A sequential file that compresses everything written to it into
+    /// <paramref name="inner"/> as one zstd or LZ4 frame (a giant block streamed from its parts); disposing it ends
     /// the frame and leaves <paramref name="inner"/> open. <see cref="ISequentialFile.Position"/> counts
     /// uncompressed bytes.</summary>
-    internal static CompressingFile Compressing(ISequentialFile inner) => new(inner);
+    internal static CompressingFile Compressing(ISequentialFile inner, BlockCodec codec) => new(inner, codec);
 
     internal sealed class CompressingFile : ISequentialFile
     {
         private readonly Stream _sink;
-        private readonly ZstdSharp.CompressionStream _zstd;
+        private readonly Stream _zstd;
         private long _position;
 
-        internal CompressingFile(ISequentialFile inner)
+        internal CompressingFile(ISequentialFile inner, BlockCodec codec)
         {
             _sink = inner.AsStream(); // not disposed: disposing the adapter disposes the file
-            _zstd = new ZstdSharp.CompressionStream(_sink, ZstdLevel, leaveOpen: true);
+            (_zstd, Codec) = codec switch
+            {
+                BlockCodec.Zstd => ((Stream)new ZstdSharp.CompressionStream(_sink, ZstdLevel, leaveOpen: true), BlockCodec.Zstd),
+                BlockCodec.Lz4 or BlockCodec.Lz4Frame => (K4os.Compression.LZ4.Streams.LZ4Stream.Encode(
+                    _sink, K4os.Compression.LZ4.LZ4Level.L00_FAST, leaveOpen: true), BlockCodec.Lz4Frame),
+                _ => throw new ArgumentOutOfRangeException(nameof(codec)),
+            };
         }
+
+        /// <summary>The codec the block is stored with.</summary>
+        public BlockCodec Codec { get; }
 
         public long Position => _position;
 

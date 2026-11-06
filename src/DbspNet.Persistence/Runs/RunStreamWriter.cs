@@ -186,11 +186,13 @@ internal sealed class RunStreamWriter : IAsyncDisposable
 
         var offset = _file.Position;
         int messageLength;
-        if (_codec == BlockCodec.Zstd)
+        var codec = _codec;
+        if (codec != BlockCodec.None)
         {
-            await using var z = BlockCompression.Compressing(_file);
+            await using var z = BlockCompression.Compressing(_file, codec);
             await Blocks.BlockWriter.ConcatToAsync(schema, parts, z, cancellationToken).ConfigureAwait(false);
             messageLength = checked((int)z.Position);
+            codec = z.Codec;
         }
         else
         {
@@ -199,7 +201,7 @@ internal sealed class RunStreamWriter : IAsyncDisposable
         }
 
         var index = new RunBlock(
-            first, last, offset, checked((int)(_file.Position - offset)), entries, groups, messageLength, _codec);
+            first, last, offset, checked((int)(_file.Position - offset)), entries, groups, messageLength, codec);
         _index.Add(index);
         _keyHashes.AddRange(keyHashes);
         _entries += entries;

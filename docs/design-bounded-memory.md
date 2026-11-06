@@ -2120,3 +2120,24 @@ The driver reports `status: completed`, which `run_batch` only does when validat
 - xt72's minimum free disk (178 GiB) included 41 GB of sample hard links, so the two runs' free-disk minima
   (xt73: 445 GiB) are not comparable. As in xt72, the run's spill directory outlived the test host and was
   deleted by hand (80 GB).
+
+**xt74 (xt73 with `DBSPNET_RUN_COMPRESSION=lz4`): LZ4 trades disk for time, as the samples said.** LZ4 is a
+third codec: the LZ4 block format for a block, an LZ4 frame for a giant block streamed from its parts (codec 3).
+Batch 1 completes and validates.
+
+| | raw (xt72) | LZ4 (xt74) | zstd 1 (xt73) |
+|---|---|---|---|
+| spill disk peak | 311,711 MiB | 111,980 MiB (2.78×) | 73,588 MiB (4.24×) |
+| bytes written to spill | 1,151,926 MiB | 442,828 MiB (2.60×) | 298,855 MiB (3.85×) |
+| batch duration | 7,785 s | 8,155 s (+370 s, +4.8%) | 8,800 s (+1,015 s, +13%) |
+| tick 17 / 18 done at | 3,008 / 7,517 s | 3,111 / 7,862 s | 3,299 / 8,468 s |
+| tick 18 live heap | 15,538 MiB | 15,575 MiB | 15,565 MiB |
+
+- Against the samples, LZ4 shrank the peak a little less than predicted (2.78× against 3.25×), as zstd did
+  (4.24× against 4.97×): the raw-written blocks dilute both.
+- **Per GB of disk saved, zstd's time is not much dearer.** LZ4 saves 200 GB of peak for 370 s, and zstd saves
+  238 GB for 1,015 s, so zstd's last 38 GB cost about 645 s. Each arm is one run.
+- **The default stays zstd 1.** Disk is the constraint this arc exists for. LZ4 is there for when time matters
+  more (`DBSPNET_RUN_COMPRESSION=lz4`). Tests: the round-trip and giant-block tests now run for LZ4 too (10 in
+  `RunCompressionTests`), and the suite passes with LZ4 as the default and in the forced spill mode (3,494).
+

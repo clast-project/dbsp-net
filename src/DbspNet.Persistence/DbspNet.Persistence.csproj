@@ -8,6 +8,7 @@
     <ProjectReference Include="..\DbspNet.Arrow\DbspNet.Arrow.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="K4os.Compression.LZ4.Streams" />
     <PackageReference Include="ZstdSharp.Port" />
   </ItemGroup>
   <ItemGroup>

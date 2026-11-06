@@ -81,19 +81,21 @@ public sealed class RunCompressionTests
         return dir;
     }
 
-    public static TheoryData<bool> Stores => new() { true, false };
-
     [Theory]
-    [MemberData(nameof(Stores))]
-    public async Task A_streamed_run_is_compressed_and_reads_back_exactly(bool local)
+    [InlineData(true, (int)BlockCodec.Zstd)]
+    [InlineData(false, (int)BlockCodec.Zstd)]
+    [InlineData(true, (int)BlockCodec.Lz4)]
+    [InlineData(false, (int)BlockCodec.Lz4)]
+    public async Task A_streamed_run_is_compressed_and_reads_back_exactly(bool local, int codecValue)
     {
+        var codec = (BlockCodec)codecValue;
         var dir = TempDir();
         try
         {
             ITableFileSystem fs = local ? new LocalTableFileSystem(dir) : new InMemoryTableFileSystem();
             var format = Format();
             var blocks = Blocks(format, blocks: 60, perBlock: 50);
-            using (BlockCompression.Use(BlockCodec.Zstd))
+            using (BlockCompression.Use(codec))
             {
                 var sink = BlockedTraceCheckpoint.StreamedRunFile.Open(fs, "z.run", format.Codec, _ => new RunFileLease(() => { }));
                 foreach (var b in blocks)
@@ -110,7 +112,7 @@ public sealed class RunCompressionTests
             for (var b = 0; b < blocks.Count; b++)
             {
                 var index = run.Blocks[b];
-                Assert.Equal(BlockCodec.Zstd, index.Codec);
+                Assert.Equal(codec, index.Codec);
                 Assert.Equal(blocks[b].Message.Length, index.MessageLength);
                 Assert.True(index.Length < index.MessageLength / 2, $"block {b}: {index.Length} of {index.MessageLength} bytes");
 
@@ -118,7 +120,7 @@ public sealed class RunCompressionTests
                 var lazy = new LazyTraceBlock(format, fs, "z.run", index);
                 Assert.Equal(blocks[b].Message.ToArray(), lazy.Loaded.Message.ToArray());
                 var (stored, hashes) = await run.ReadBlockRawAsync(b);
-                Assert.Equal(BlockCodec.Zstd, stored.Codec);
+                Assert.Equal(codec, stored.Codec);
                 Assert.Equal(Distinct(blocks[b].Hashes), hashes);
             }
         }
@@ -153,15 +155,18 @@ public sealed class RunCompressionTests
         }
     }
 
-    [Fact]
-    public async Task A_giant_block_streams_through_the_compressor()
+    [Theory]
+    [InlineData((int)BlockCodec.Zstd, (int)BlockCodec.Zstd)]
+    [InlineData((int)BlockCodec.Lz4, (int)BlockCodec.Lz4Frame)]
+    public async Task A_giant_block_streams_through_the_compressor(int codecValue, int storedValue)
     {
+        var (codec, stored) = ((BlockCodec)codecValue, (BlockCodec)storedValue);
         var fs = new InMemoryTableFileSystem();
         var format = Format();
         var parts = Blocks(format, blocks: 8, perBlock: 200);
         var hashes = parts.SelectMany(p => Distinct(p.Hashes)).ToList();
         RunBlock? index = null;
-        using (BlockCompression.Use(BlockCodec.Zstd))
+        using (BlockCompression.Use(codec))
         {
             await using var w = await CreateAsync(fs, "g.run", format);
             await w.AppendConcatAsync(format, parts, hashes, parts.Sum(p => p.Count), hashes.Count, CancellationToken.None, ix => index = ix);
@@ -169,7 +174,7 @@ public sealed class RunCompressionTests
         }
 
         Assert.NotNull(index);
-        Assert.Equal(BlockCodec.Zstd, index.Value.Codec);
+        Assert.Equal(stored, index.Value.Codec);
         Assert.Equal(parts.Sum(p => p.Count), index.Value.Entries);
         Assert.True(index.Value.Length < index.Value.MessageLength / 2);
         var block = new LazyTraceBlock(format, fs, "g.run", index.Value);

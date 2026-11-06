@@ -198,7 +198,7 @@ internal sealed class RunReader : IAsyncDisposable, IDisposable
             var length = BinaryPrimitives.ReadInt32LittleEndian(f[(at + 16)..]);
             var rawLength = coded ? BinaryPrimitives.ReadInt32LittleEndian(f[(at + 28)..]) : length;
             var codec = coded ? (BlockCodec)BinaryPrimitives.ReadInt32LittleEndian(f[(at + 32)..]) : BlockCodec.None;
-            if (codec is not (BlockCodec.None or BlockCodec.Zstd) || rawLength < 0)
+            if (codec is not (BlockCodec.None or BlockCodec.Zstd or BlockCodec.Lz4 or BlockCodec.Lz4Frame) || rawLength < 0)
             {
                 throw new InvalidDataException($"run '{path}' block {i} has codec {(int)codec}, message length {rawLength}");
             }
