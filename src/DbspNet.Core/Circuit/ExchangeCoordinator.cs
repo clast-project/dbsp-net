@@ -1,5 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using DbspNet.Core.Operators.Stateful.Blocks;
+
 namespace DbspNet.Core.Circuit;
 
 /// <summary>
@@ -55,7 +57,7 @@ internal sealed class ExchangeCoordinator<T> : IExchangeCoordinator
     /// tick (an exception is a conditional skip the barrier cannot otherwise
     /// survive); a released waiter throws <see cref="OperationCanceledException"/>.
     /// </summary>
-    internal void Wait(CancellationToken abort) => _barrier.SignalAndWait(abort);
+    internal void Wait(CancellationToken abort) => PressureRelief.WaitRelieving(_barrier, PressureRelief.Current, abort);
 
     /// <summary>Read the bucket worker <paramref name="from"/> sent to worker <paramref name="to"/>.</summary>
     internal T Read(int from, int to) => _mailbox[from, to];

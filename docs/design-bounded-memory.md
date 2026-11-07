@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2248,8 +2248,12 @@ Critical from below bumps a **pressure epoch**.
   `RootCircuit` keeps weak references to the state traces (`Compacts`) that took a managed level since its last
   push. At its next operator boundary, if it last pushed in an older epoch, it freezes them all on its own
   thread. Each worker has a dedicated thread (`ParallelCircuit`) and one replica per circuit, so the owner is
-  the one stepping. **Limit:** a worker blocked at an exchange barrier pushes only when it resumes. A
-  delta's private trace is never registered, so a dead delta is not kept alive.
+  the one stepping. A delta's private trace is never registered, so a dead delta is not kept alive.
+- **Waiting workers relieve too** (added after xt82's first half, below). A worker parked at an exchange
+  barrier, or at the end-of-step rendezvous behind a skewed peer, waits in 100 ms slices
+  (`PressureRelief.WaitRelieving`) and runs its boundary check between them. A timed-out `SignalAndWait`
+  withdraws its signal, so the retry is the same rendezvous. It's the worker's own thread with none of its
+  operators running, so it may freeze its traces.
 - **Critical has a floor, not Feldera's "all non-empty".** Feldera's unit is a whole batch. Ours is a
   builder's managed chunk, so freezing every non-empty chunk would mean a run per row. The floor is the trace
   freeze size, as a knob. It acts only where in-step spilling is on (`STEP_SPILL_ROWS` set, a format
@@ -2281,3 +2285,37 @@ freezes a delta chunk at the floor. Each test fails with its threshold left at L
 
 **Measure.** xt82 = xt81's setup (W=12, 48 GiB cap, step spill 1M, spill on, cache 1 GiB) with pressure on.
 Question: does tick 18 fit? Log the level changes and the census next to xt81's.
+
+### 5.29 xt82: pressure acts, and tick 18 still does not fit (2026-11-06)
+
+xt82 = xt81's setup (W=12, 48 GiB `GCHeapHardLimit`, server GC, step spill 1M rows, spill on, cache 1 GiB),
+with §5.28 at its defaults (98c3a7d).
+
+| | xt81 | xt82 |
+|---|---|---|
+| ticks 0–17 | 1,166 s | ~1,170 s (tick 18 starts at 1,172 s) |
+| furthest op in tick 18 | 1671 | **1733** |
+| out of memory at | 1,480 s | **2,471 s** |
+| managed entries in tick 18 | 9.06M throughout | 9.06M → **0** (op 1681 on) |
+| live at the last census | 25.0 GB | 26.6 GB |
+| peak RSS | 44 GiB | 44 GiB |
+
+- **The level moved 74 times**, all within tick 18 (ticks 0–17 stayed Low). It was Moderate from about 42 GB in
+  use, High from about 45 GB, and Critical four times, at 46.9–48.7 GB. Every High ended at Low within seconds:
+  a collection freed garbage. The hysteresis was never what held a level.
+- **The push did the work, but late.** 17 pushes froze all 9,058,761 managed entries. Until op ~1680 there were
+  none, though the level reached High several times. The busy worker sat inside one long operator, and the
+  other eleven were parked at an exchange barrier, so none of them reached a boundary while High lasted. Fix,
+  built after xt82 and not yet measured at scale: a parked worker waits in 100 ms slices and checks between them
+  (`PressureRelief.WaitRelieving`, §5.28). It would have pushed at the first High, around op 1657.
+- **What still fails is not state the thresholds move.** At the last census live is 26.6 GB, nothing is managed,
+  resident blocks are 3.6 GB, and the cache is 1 GiB. The last level reading is Low (29.4 GB in use). The run
+  died in an allocation burst inside ApplyOps that emit ~2M-row outputs over and over. The heap swung between
+  38 and 69 GB between collections (`GC.GetTotalMemory`), and an OOM came while live was half the cap. So the
+  remaining gap is allocation rate against what server GC's twelve heaps can reclaim under a hard limit, not
+  live bytes.
+
+**Next candidates, not tried:** the GC configuration under the cap (`GCHeapCount` below 12, `GCConserveMemory`,
+regions; CI's container gives ~90 GB, not 48); what op 1731/1733 builds per output row (a managed builder per
+2M-row chunk); and whether step spill at 1M rows is too coarse at W=12, where a chunk is per worker. The barrier
+fix is unlikely to move xt82's failure, since everything was pushed by op 1681.

@@ -8,7 +8,9 @@
 //   4. entering High pushes every listed state trace's managed level at the next operator boundary, once
 //      per epoch, and never lists a delta's private trace (Low pushes nothing);
 //   5. Critical freezes an in-step delta chunk at the floor (Low builds it managed);
-//   6. every output is unchanged at each pinned level.
+//   6. a worker waiting at a barrier relieves its own traces between wait slices, and the rendezvous
+//      completes once (xt82: the parked workers never reached an operator boundary);
+//   7. every output is unchanged at each pinned level.
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Blocks;
@@ -312,6 +314,40 @@ public class MemoryPressureTests
         {
             PressureRelief.Current = outer;
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_worker_waiting_at_a_barrier_pushes_its_traces_and_the_rendezvous_completes_once(bool high)
+    {
+        // xt82: the workers parked behind a skewed peer never reached an operator boundary while High lasted.
+        using var low = MemoryPressure.Use(PressureLevel.Low);
+        var relief = new PressureRelief();
+        var trace = new BlockedIndexedTrace(RowFormat, freezeEntries: 1 << 20);
+        var outer = PressureRelief.Current;
+        PressureRelief.Current = relief;
+        try
+        {
+            trace.IntegrateRows(new ZSet<StructuralRow, Z64>(new Dictionary<StructuralRow, Z64> { [new StructuralRow(1L)] = new Z64(1) }));
+        }
+        finally
+        {
+            PressureRelief.Current = outer;
+        }
+
+        Assert.Equal(1, relief.Listed);
+        using var barrier = new Barrier(2);
+        using var level = MemoryPressure.Use(high ? PressureLevel.High : PressureLevel.Low);
+        var waiter = new Thread(() => PressureRelief.WaitRelieving(barrier, relief, CancellationToken.None));
+        waiter.Start();
+        Thread.Sleep(PressureRelief.WaitSliceMs * 3); // the waiter times out a few slices
+        barrier.SignalAndWait();
+        waiter.Join();
+
+        Assert.Equal(1, barrier.CurrentPhaseNumber); // one rendezvous, however many slices
+        Assert.Equal(high ? 0 : 1, trace.ManagedEntries);
+        Assert.Equal(high ? 0 : 1, relief.Listed);
     }
 
     [Theory]

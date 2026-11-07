@@ -67,6 +67,35 @@ internal sealed class PressureRelief
         Push();
     }
 
+    /// <summary>How often a worker waiting at a barrier looks at the pressure (ms).</summary>
+    internal const int WaitSliceMs = 100;
+
+    /// <summary>
+    /// <see cref="Barrier.SignalAndWait(CancellationToken)"/>, but a worker that waits longer than
+    /// <see cref="WaitSliceMs"/> runs <paramref name="relief"/>'s boundary check between slices: a worker
+    /// parked behind a skewed peer is otherwise the one circuit that never reaches an operator boundary
+    /// while the pressure lasts (xt82, §5.28). Its own thread, and none of its operators is running, so it
+    /// may freeze its traces. A timed-out <c>SignalAndWait</c> withdraws its signal, so the retry is the
+    /// same rendezvous.
+    /// </summary>
+    internal static void WaitRelieving(Barrier barrier, PressureRelief? relief, CancellationToken abort)
+    {
+        if (relief is null || !MemoryPressure.Monitoring && MemoryPressure.Current < PressureLevel.High)
+        {
+            barrier.SignalAndWait(abort);
+            return;
+        }
+
+        while (!barrier.SignalAndWait(WaitSliceMs, abort))
+        {
+            WaitChecks++;
+            relief.AtBoundary();
+        }
+    }
+
+    /// <summary>Barrier wait slices that checked the pressure (diagnostics).</summary>
+    internal static long WaitChecks;
+
     /// <summary>Freeze every listed trace's managed levels, and empty the list.</summary>
     internal void Push()
     {

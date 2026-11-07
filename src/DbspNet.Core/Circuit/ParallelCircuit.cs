@@ -3,6 +3,8 @@
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 
+using DbspNet.Core.Operators.Stateful.Blocks;
+
 namespace DbspNet.Core.Circuit;
 
 /// <summary>
@@ -492,7 +494,8 @@ public sealed class ParallelCircuit : IDisposable
                 _abort.Cancel();
             }
 
-            barrier.SignalAndWait();   // "done"
+            // "done". A worker that finished first waits relieving its traces under pressure (§5.28).
+            PressureRelief.WaitRelieving(barrier, _replicas[worker].Relief, CancellationToken.None);
         }
     }
 
