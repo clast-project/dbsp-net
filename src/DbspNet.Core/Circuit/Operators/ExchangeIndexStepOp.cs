@@ -98,7 +98,9 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
             t0 = t2;
         }
 
-        var indexed = new IndexedZSetBuilder<TKey, TRow, TWeight>();
+        // Block backed past the step threshold when the consumer gave the output a format, as the
+        // single-worker StepGroupProject does (D4; docs/design-bounded-memory.md §5.32).
+        var indexed = DbspNet.Core.Operators.Stateful.Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(_output.DeltaFormat);
         long gatherRows = 0;
         for (var src = 0; src < workers; src++)
         {

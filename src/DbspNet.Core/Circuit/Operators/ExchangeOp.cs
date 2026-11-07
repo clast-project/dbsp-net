@@ -68,7 +68,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
             // A block-backed input (in-step spilling, docs/design-bounded-memory.md §5.27): listing its
             // rows would materialize all of them at once. Split into one spilling builder per
             // destination instead, so a large bucket stays blocks.
-            splitRows = SplitSpilling(format, buckets);
+            splitRows = ExchangeBuckets.SplitSpilling(_input.Current, buckets, _partition);
         }
         else
         {
@@ -144,40 +144,5 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
             var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
         }
-    }
-
-    private long SplitSpilling(object format, IReadOnlyList<KeyValuePair<TKey, TWeight>>?[] buckets)
-    {
-        var workers = _workers;
-        var builders = new ZSetBuilder<TKey, TWeight>?[workers];
-        long rows = 0;
-        foreach (var kv in _input.Current)
-        {
-            var j = ((_partition(kv.Key) % workers) + workers) % workers;
-            (builders[j] ??= DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.For<TKey, TWeight>(format, 0)).Add(kv.Key, kv.Value);
-            rows++;
-        }
-
-        for (var j = 0; j < workers; j++)
-        {
-            if (builders[j] is { } b && b.Build() is { IsEmpty: false } set)
-            {
-                buckets[j] = new SetBucket(set);
-            }
-        }
-
-        return rows;
-    }
-
-    // A built (possibly block-backed) Z-set published as a bucket: the gather only enumerates it.
-    private sealed class SetBucket(ZSet<TKey, TWeight> set) : IReadOnlyList<KeyValuePair<TKey, TWeight>>
-    {
-        public int Count => set.Count;
-
-        public KeyValuePair<TKey, TWeight> this[int index] => throw new NotSupportedException("a spilled exchange bucket is enumerated, not indexed");
-
-        public IEnumerator<KeyValuePair<TKey, TWeight>> GetEnumerator() => set.GetEnumerator();
-
-        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

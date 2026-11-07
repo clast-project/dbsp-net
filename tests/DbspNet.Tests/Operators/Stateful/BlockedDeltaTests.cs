@@ -787,4 +787,55 @@ public class BlockedDeltaTests
             Assert.True(pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", w).Current.IsEmpty);
         }
     }
+
+    // §5.32: the fused exchange-and-index keeps a block-backed delta as blocks too. At W=1 the same plan is a
+    // GroupProject, which builds its index through D4's spilling builder; at W>1 the exchange gathered every
+    // row into a managed index. Both shards' rows go to worker 0 (a low-cardinality key's skew), past the
+    // threshold: the output must be block-backed and equal the managed index of the union.
+    // With a pre-step (ExchangeIndexStep, the W>1 StepGroupProject) the gather is the same.
+    [Theory]
+    [InlineData(4, false)]
+    [InlineData(12, false)]
+    [InlineData(4, true)]
+    [InlineData(12, true)]
+    public void An_exchange_index_keeps_a_block_backed_delta_as_blocks(int workers, bool step)
+    {
+        var a = Enumerable.Range(0, 300).Select(i => (i, i % 4, 1L)).ToArray();
+        var b = Enumerable.Range(150, 300).Select(i => (i, i % 4, 2L)).ToArray(); // overlaps a: weights sum
+        using var _ = SpillSettings.UseStepSpill(100, 10);
+        using var pc = DbspNet.Core.Circuit.ParallelCircuit.Build(workers, cb =>
+        {
+            var (_, input) = cb.Input<ZSet<StructuralRow, Z64>>(ZSet.Empty<StructuralRow, Z64>(), (x, y) => x.Plus(y), name: "in");
+            input.DeltaFormat = Format;
+            var indexed = step
+                ? cb.ExchangeIndexStep<StructuralRow, StructuralRow, StructuralRow, Z64>(input, static row => (true, row), static _ => 0, static row => Key(KeyOf(row)))
+                : cb.ExchangeIndex(input, static _ => 0, static row => Key(KeyOf(row)));
+            indexed.DeltaFormat = IndexedFormat;
+            cb.Output(indexed, name: "out");
+        });
+        var sa = Spilled(a, 100, 10);
+        var sb = Spilled(b, 100, 10);
+        Assert.True(sa.IsExternal && sb.IsExternal);
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", 0).Push(sa);
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", workers - 1).Push(sb);
+
+        pc.Step();
+
+        var expected = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        foreach (var (k, s, w) in a.Concat(b))
+        {
+            expected.Add(Key(k % 10), Row(k, s), new Z64(w));
+        }
+
+        var out0 = pc.WorkerOutput<IndexedZSet<StructuralRow, StructuralRow, Z64>>("out", 0).Current;
+        Assert.True(out0.External is BlockedGroups, "600 rows on one worker are past the 100-row threshold");
+        AssertSameIndexed(expected.Build(), out0);
+        for (var w = 1; w < workers; w++)
+        {
+            Assert.True(pc.WorkerOutput<IndexedZSet<StructuralRow, StructuralRow, Z64>>("out", w).Current.IsEmpty);
+        }
+    }
+
+    // The test rows' first column, mod 10 (the index key: ten groups over every chunk).
+    private static int KeyOf(StructuralRow row) => (int)row[0]! % 10;
 }

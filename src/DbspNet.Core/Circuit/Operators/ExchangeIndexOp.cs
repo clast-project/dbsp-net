@@ -67,12 +67,21 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         // publish null.
         var buckets = new IReadOnlyList<KeyValuePair<TRow, TWeight>>?[workers];
         long splitRows = 0;
-        foreach (var kv in _input.Current)
+        if (_input.Current.IsExternal)
         {
-            // Non-negative modulo: partition() may return a negative hash.
-            var j = ((_partition(kv.Key) % workers) + workers) % workers;
-            ExchangeBuckets.Add(ref buckets[j], kv);
-            splitRows++;
+            // A block-backed input (docs/design-bounded-memory.md §5.32): listing its rows would
+            // materialize all of them at once, so split into one spilling builder per destination.
+            splitRows = ExchangeBuckets.SplitSpilling(_input.Current, buckets, _partition);
+        }
+        else
+        {
+            foreach (var kv in _input.Current)
+            {
+                // Non-negative modulo: partition() may return a negative hash.
+                var j = ((_partition(kv.Key) % workers) + workers) % workers;
+                ExchangeBuckets.Add(ref buckets[j], kv);
+                splitRows++;
+            }
         }
 
         for (var j = 0; j < workers; j++)
@@ -101,12 +110,22 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         // point: each full row is hashed once. The builder accumulates weight
         // per (key, row) and drops zeros, so the same row arriving from two
         // source workers (a column-dropping map upstream) merges correctly.
-        var indexed = new IndexedZSetBuilder<TKey, TRow, TWeight>();
+        // With the consumer's block format (D4) the index spills past the step threshold like the
+        // single-worker GroupProject does (§5.32): at W=12 a skewed key lands most of a large delta here.
+        var indexed = DbspNet.Core.Operators.Stateful.Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(_output.DeltaFormat);
         long gatherRows = 0;
         for (var src = 0; src < workers; src++)
         {
             var bucket = _coordinator.Take(src, _worker);
-            if (bucket is not null)
+            if (bucket is ExchangeBuckets.SetBucket<TRow, TWeight> set)
+            {
+                foreach (var (row, weight) in set.Set)
+                {
+                    indexed.Add(_keyOf(row), row, weight);
+                    gatherRows++;
+                }
+            }
+            else if (bucket is not null)
             {
                 foreach (var (row, weight) in ExchangeBuckets.Items(bucket))
                 {

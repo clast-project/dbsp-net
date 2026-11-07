@@ -276,7 +276,8 @@ public class XtServerCensus
                         $"OPSLOW tick={circuit.TickCount} op={i} type={op.GetType().Name} ms={opMs:F0} heap_mib={heap / 1048576.0:F0} t_s={sw.Elapsed.TotalSeconds:F0}"));
                 }
 
-                var forced = censusAt.Contains(i);
+                // Once per op: every replica runs it, and twelve walks under this lock distort the tick.
+                var forced = censusAt.Remove(i);
                 if (forced || (heap >= nextHeap && sw.Elapsed.TotalSeconds - lastReading >= 30))
                 {
                     lastReading = sw.Elapsed.TotalSeconds;

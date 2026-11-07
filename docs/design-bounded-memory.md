@@ -2406,3 +2406,33 @@ Suites pass default and forced.
 stands in for tick 18 from here (~27 min to op 1994 instead of ~54). Op 1994 is live-bound: ~27 GB more live
 appears during one exchange. Next: a census right after ops 1984, 1993 and 1994 in a restored run
 (`XT_CENSUS_AT_OPS`) to see what holds it.
+
+### 5.32 The fused exchange-and-index gathered managed (2026-11-07)
+
+**Why.** Op 1994 is an `ExchangeIndexOp`: a W>1 shuffle fused with the re-index a join or aggregate reads.
+At W=1 the same plan is a `GroupProject`, whose index is D4's spilling builder (`DeltaSpillGroups`, §5.22).
+The compiler attaches the consumer's block format to the indexed stream either way, but `ExchangeIndexOp`
+ignored it: it split a block-backed input by listing every row into managed buckets, then gathered its
+column into a plain `IndexedZSetBuilder`. A skewed key puts most of a large delta on one worker, all managed.
+§5.27 made the plain `ExchangeOp` spill-aware; its fused siblings were left (§5.27 "still open").
+
+**Fix.**
+- `ExchangeIndexOp` splits a block-backed input into one spilling builder per destination
+  (`ExchangeBuckets.SplitSpilling`, now shared with `ExchangeOp`; each builder comes from the delta's own
+  store, `NewBuilder`, so it needs no stream format), and gathers through `DeltaSpillGroups.For(output format)`.
+  A spilled bucket (`ExchangeBuckets.SetBucket`) is enumerated as a set; `Items` reads only list buckets.
+- `ExchangeIndexStepOp` (the W>1 `StepGroupProject`) gathers through the same builder. Its split stays
+  managed: mapped rows have no block format.
+- Not changed: `ExchangeIndexJoinOp` (its indexes are internal to the join) and `BroadcastExchangeOp`.
+
+Test: `BlockedDeltaTests.An_exchange_index_keeps_a_block_backed_delta_as_blocks` (W=4 and 12, with and
+without a pre-step): two block-backed shards all routed to worker 0, past a 100-row threshold, must come out
+as a `BlockedGroups` delta equal to the managed index of their union. With the plain builder back, the
+`ExchangeIndexOp` cases fail, and so do the `ExchangeIndexStepOp` cases.
+Suites pass default, forced, and forced at Critical (3,535).
+
+**The census that pointed here (xt86, restored, `XT_CENSUS_AT_OPS=1984,1993,1994`).** Right after op 1984
+(also an `ExchangeIndexOp`, feeding an aggregate) live is 27.2 GB, but the state walk reaches 4.4 GB: ~22 GB
+is in flight (deltas and exchange buckets), not operator state. (That run's forced census fired once per
+replica, twelve walks under the hook's lock, and stalled op 1993 for ~20 min; the hook now fires once per op.)
+
