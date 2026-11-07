@@ -18,6 +18,7 @@
 //   9. (§5.24) a giant group's chain is written in pieces as it is built, never held whole: the group
 //      becomes several file blocks, and every output is unchanged; and a streamed run's written
 //      blocks are released to the cache as they are written, not held until its finish.
+//  10. (§5.30) a checkpoint that rewrites spilled runs leaves the bodies it read to the cache.
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful.Blocks;
@@ -175,6 +176,44 @@ public class RunSpillerTests
             spiller.Sweep();
             Assert.Equal(0, spiller.Files);
             Assert.Equal(0, FilesIn(dir));
+        });
+    }
+
+    [Fact]
+    public async Task A_checkpoint_of_spilled_runs_holds_none_of_their_bodies()
+    {
+        // §5.30: a checkpoint rewrites a spilled run into its own store by reading each block from the spill
+        // file. Those bodies must stay the cache's: before, each was handed back to be bound to the
+        // checkpoint's copy at commit, so a whole circuit's spilled state was in memory at once (xt83-save
+        // ran out of memory at tick 17, rewriting ~67 GB). With a budget nothing evicts, no rebound block
+        // may hold a body; and the restore still matches.
+        const int Ticks = 12;
+        await WithSpillerAsync(0, async (_, _) =>
+        {
+            var p = Compile();
+            for (var tick = 0; tick < Ticks; tick++)
+            {
+                Tick(p, tick);
+            }
+
+            BlockCache.Clear();
+            Assert.All(Left(p).Runs, r => Assert.All(r.Blocks, b => Assert.Null(Assert.IsType<LazyTraceBlock>(b).Resident)));
+
+            BlockCache.Budget = 1L << 40;
+            var fs = new InMemoryTableFileSystem();
+            await Snapshot.WriteAsync(p.Circuit, fs, retainCount: 1);
+            Assert.All(Left(p).Runs, r =>
+            {
+                Assert.Same(fs, r.Persisted!.Value.Store);
+                Assert.All(r.Blocks, b => Assert.Null(Assert.IsType<LazyTraceBlock>(b).Resident));
+            });
+
+            var restored = Compile();
+            await Snapshot.ReadAsync(restored.Circuit, fs);
+            Assert.Equal(Digest(p), Digest(restored));
+            Tick(p, Ticks);
+            Tick(restored, Ticks);
+            Assert.Equal(Digest(p), Digest(restored));
         });
     }
 

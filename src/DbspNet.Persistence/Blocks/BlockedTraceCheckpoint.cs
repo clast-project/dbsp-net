@@ -491,6 +491,12 @@ internal static class BlockedTraceCheckpoint
             Core.Operators.Stateful.Blocks.BlockTraceProfile.Section(6, tj, pieces.Sum(p => p.Count));
         }
 
+        var fromFile = false;
+        for (var i = b; i < end && !fromFile; i++)
+        {
+            fromFile = chain[i] is LazyTraceBlock;
+        }
+
         foreach (var piece in Capped(pieces))
         {
             if (piece.Parts is { } parts)
@@ -503,7 +509,11 @@ internal static class BlockedTraceCheckpoint
             {
                 var block = piece.Block!;
                 var hashes = Distinct(block.Hashes);
-                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken, ix => written(ix, block))
+
+                // Hand back only a body that was in memory already: one read from a file (a spilled run
+                // a checkpoint rewrites) stays the cache's to drop, not pinned by the caller until commit.
+                var keep = fromFile && Array.IndexOf(chain, block, b, end - b) < 0 ? null : block;
+                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken, ix => written(ix, keep))
                     .ConfigureAwait(false);
             }
         }

@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration, but a restored tick 18 starts ~16 GB leaner and is not a faithful stand-in; it fixed a checkpoint that pinned every spilled body until commit. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2319,3 +2319,43 @@ with §5.28 at its defaults (98c3a7d).
 regions; CI's container gives ~90 GB, not 48); what op 1731/1733 builds per output row (a managed builder per
 2M-row chunk); and whether step spill at 1M rows is too coarse at W=12, where a chunk is per worker. The barrier
 fix is unlikely to move xt82's failure, since everything was pushed by op 1681.
+
+### 5.30 A restart point before tick 18, and what a restore leaves behind (2026-11-07)
+
+Ticks 0–17 take ~1,170 s of each ~2,470 s W=12 run. To iterate on tick 18 alone, the census harness can
+checkpoint after a chosen tick and exit (`XT_CHECKPOINT_AT_TICK`, with `DBSPNET_SNAPSHOT_DIR` and
+`DBSPNET_STATE_LAYOUT=runs`); a later run deploys against an APFS clone (`cp -c`) of that directory and restores
+before tick 18. `ProgramRunner.AfterTick` now fires after the tick's source cursor advances, so a checkpoint
+taken there resumes at the next tick; the harness offsets its tick numbers by the restored tick.
+
+- **Smoke (checkpoint after tick 2):** 8.7 s to save 6.6 GB. The restored run resumes at `ext_account_profile`
+  (xt82's tick 3), and step times match (tick 3 109 s vs 103 s, tick 6 3.5 s vs 3.1 s).
+- **A bug the save found.** The first save after tick 17 ran out of memory. A checkpoint rewrites a spilled run
+  into its own store by reading each block from the spill file, and `AppendChainAsync` handed each body it read
+  back to be bound to the checkpoint's copy at commit. Until commit, every spilled body of the circuit was held:
+  ~67 GB uncompressed at tick 17. Now only a body that was already in memory is handed back; one read from a
+  file is left to the cache (`RunSpillerTests.A_checkpoint_of_spilled_runs_holds_none_of_their_bodies`, which
+  fails without the fix). The fixed save takes 22.5 s and writes 19 GB. Production checkpoints with spill on
+  hit the same path.
+- **The control (xt83-ctl: today's code, restored after tick 17) is not faithful.** It ran out of memory at
+  tick 18 op 1994/2222 (`ExchangeIndexOp`, 15.7 s, live 46.7 GB: live-bound), not at xt82's op 1733 (an
+  allocation-rate failure at 26.6 GB live). At every matching op it is 10–14 GB leaner:
+
+  | op in tick 18 | xt82 live | xt83-ctl live |
+  |---|---|---|
+  | start | 17.0 GB | 0.9 GB (op 436) |
+  | 1528 | 20.8 GB | 10.4 GB |
+  | 1669 | 27.5 GB | 19.4 GB |
+  | ~1733 | 26.6 GB | 12.9 GB (op 1735) |
+
+  Its pushes came at about the same point (managed 8.1M → 4 by op 1725; xt82: op 1681), so the barrier-wait
+  relief (§5.28) does not explain the difference. Time per op is about the same (op 1733 at 1,136 s after
+  restore; xt82 1,292 s after tick 17).
+
+**What this means.** A restore keeps the state and drops ~16 GB that xt82 carries into tick 18: resident
+blocks (4.5 GB), managed entries (2.5M), and ~10 GB more that the state does not need. That ~10 GB is itself
+the cheapest lead: whatever the restore does not rebuild, the live run could drop. Until it is identified,
+the restart point answers "does this change help tick 18 after op 1733" (the control's op 1994 failure,
+live-bound) but not "does tick 18 fit" in a run that did not restore. Next: a state census at the end of tick
+17 (`XT_STATE_CENSUS_TICK=17`) in a save run, against the same census right after a restore.
+

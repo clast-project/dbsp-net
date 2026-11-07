@@ -12,6 +12,8 @@
 //   XT_CENSUS_STEP_GIB (optional, default 8) a full object census each time live crosses another
 //                     multiple of this many GiB; TICKLIVE lines (forced compacting GC) every tick
 //   DBSPNET_WORKERS   as for the server
+//   XT_CHECKPOINT_AT_TICK (optional, with DBSPNET_SNAPSHOT_DIR) checkpoint after this tick and exit; a
+//                     later run with DBSPNET_SNAPSHOT_DIR on a copy of that directory restores and goes on
 using System.Diagnostics;
 using System.Globalization;
 using DbspNet.Core.Circuit;
@@ -40,12 +42,22 @@ public class XtServerCensus
         await using var log = new StreamWriter(censusFile, append: false) { AutoFlush = true };
 
         var engine = new DbspNetEngine();
+        var sw = Stopwatch.StartNew();
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
         await using var app = builder.Build();
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
         app.MapPost("/compile", (CompileSpec spec) => Results.Ok(DbspNetEngine.Compile(spec)));
-        app.MapPost("/deploy", async (ProgramSpec spec, CancellationToken ct) => Results.Ok(await engine.DeployAsync(spec, ct)));
+        // A restored deploy's drain counts from 0 again; census lines carry the circuit's tick.
+        long tickBase = 0;
+        app.MapPost("/deploy", async (ProgramSpec spec, CancellationToken ct) =>
+        {
+            var r = await engine.DeployAsync(spec, ct);
+            tickBase = r.RestoredTick;
+            log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"DEPLOYED t_s={sw.Elapsed.TotalSeconds:F0} persistent={r.Persistent} restored_tick={r.RestoredTick} workers={r.Workers} deploy_s={r.CompileTimeS:F1}"));
+            return Results.Ok(r);
+        });
         app.MapPost("/resume", () => Results.Ok(engine.Resume()));
         app.MapPost("/wait", async (CancellationToken ct) =>
         {
@@ -64,9 +76,10 @@ public class XtServerCensus
         app.MapGet("/stats", () => Results.Ok(engine.GetStats()));
 
         var nextCensus = stepGib;
-        var sw = Stopwatch.StartNew();
-        DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = t =>
+        var checkpointAt = long.TryParse(Environment.GetEnvironmentVariable("XT_CHECKPOINT_AT_TICK"), out var ca) ? ca : -1;
+        DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = drainTick =>
         {
+            var t = drainTick + tickBase;
             var (runner, replicas) = Locate(engine);
             var before = GC.GetGCMemoryInfo(GCKind.Any).HeapSizeBytes;
             var allocated = GC.GetTotalAllocatedBytes(precise: false);
@@ -156,6 +169,19 @@ public class XtServerCensus
                 {
                     log.WriteLine(line);
                 }
+            }
+
+            if (t == checkpointAt)
+            {
+                // XT_CHECKPOINT_AT_TICK (with DBSPNET_SNAPSHOT_DIR): snapshot state and source cursors after
+                // this tick, then end the process. A deploy against a copy of the snapshot directory resumes
+                // at the next tick (docs/design-bounded-memory.md §5.30).
+                var c0 = sw.Elapsed.TotalSeconds;
+                ((DbspNet.Connectors.Abstractions.ProgramRunner)runner).CheckpointAsync().AsTask().GetAwaiter().GetResult();
+                log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"CHECKPOINTED tick={t} t_s={sw.Elapsed.TotalSeconds:F0} save_s={sw.Elapsed.TotalSeconds - c0:F1}"));
+                log.Flush();
+                Environment.Exit(0);
             }
         };
 
