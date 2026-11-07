@@ -232,7 +232,8 @@ public sealed class CircuitBuilder
         var workers = _parallel.Workers;
         var coordinator = _parallel.NextCoordinator(
             () => new ExchangeCoordinator<IReadOnlyList<KeyValuePair<TKey, TWeight>>>(workers));
-        var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
+        // The shuffle keeps the rows' layout, so the output spills in-step as its input does (§5.27).
+        var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty) { DeltaFormat = input.DeltaFormat };
         _root.AddOperator(new ExchangeOp<TKey, TWeight>(
             input, output, partition, coordinator, _parallel.WorkerId, _parallel.Abort));
         return output;

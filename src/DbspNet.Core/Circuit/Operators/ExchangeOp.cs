@@ -62,12 +62,23 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
         // twice — once per bucket, once at the gather).
         var buckets = new IReadOnlyList<KeyValuePair<TKey, TWeight>>?[workers];
         long splitRows = 0;
-        foreach (var kv in _input.Current)
+        var format = _output.DeltaFormat;
+        if (format is not null && _input.Current.IsExternal)
         {
-            // Non-negative modulo: partition() may return a negative hash.
-            var j = ((_partition(kv.Key) % workers) + workers) % workers;
-            ExchangeBuckets.Add(ref buckets[j], kv);
-            splitRows++;
+            // A block-backed input (in-step spilling, docs/design-bounded-memory.md §5.27): listing its
+            // rows would materialize all of them at once. Split into one spilling builder per
+            // destination instead, so a large bucket stays blocks.
+            splitRows = SplitSpilling(format, buckets);
+        }
+        else
+        {
+            foreach (var kv in _input.Current)
+            {
+                // Non-negative modulo: partition() may return a negative hash.
+                var j = ((_partition(kv.Key) % workers) + workers) % workers;
+                ExchangeBuckets.Add(ref buckets[j], kv);
+                splitRows++;
+            }
         }
 
         // Publish our row of the grid, then rendezvous: after the barrier every
@@ -111,7 +122,12 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
             gatherRows += _coordinator.Read(src, _worker)?.Count ?? 0;
         }
 
-        var gathered = new ZSetBuilder<TKey, TWeight>((int)Math.Min(gatherRows, int.MaxValue));
+        // With a block format the gather spills past the step threshold like any delta builder
+        // (§5.27): a skewed key can land most of a large delta on one worker.
+        var capacity = (int)Math.Min(gatherRows, int.MaxValue);
+        var gathered = format is not null
+            ? DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.For<TKey, TWeight>(format, capacity)
+            : new ZSetBuilder<TKey, TWeight>(capacity);
         for (var src = 0; src < workers; src++)
         {
             var bucket = _coordinator.Take(src, _worker);
@@ -128,5 +144,40 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
             var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
         }
+    }
+
+    private long SplitSpilling(object format, IReadOnlyList<KeyValuePair<TKey, TWeight>>?[] buckets)
+    {
+        var workers = _workers;
+        var builders = new ZSetBuilder<TKey, TWeight>?[workers];
+        long rows = 0;
+        foreach (var kv in _input.Current)
+        {
+            var j = ((_partition(kv.Key) % workers) + workers) % workers;
+            (builders[j] ??= DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.For<TKey, TWeight>(format, 0)).Add(kv.Key, kv.Value);
+            rows++;
+        }
+
+        for (var j = 0; j < workers; j++)
+        {
+            if (builders[j] is { } b && b.Build() is { IsEmpty: false } set)
+            {
+                buckets[j] = new SetBucket(set);
+            }
+        }
+
+        return rows;
+    }
+
+    // A built (possibly block-backed) Z-set published as a bucket: the gather only enumerates it.
+    private sealed class SetBucket(ZSet<TKey, TWeight> set) : IReadOnlyList<KeyValuePair<TKey, TWeight>>
+    {
+        public int Count => set.Count;
+
+        public KeyValuePair<TKey, TWeight> this[int index] => throw new NotSupportedException("a spilled exchange bucket is enumerated, not indexed");
+
+        public IEnumerator<KeyValuePair<TKey, TWeight>> GetEnumerator() => set.GetEnumerator();
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

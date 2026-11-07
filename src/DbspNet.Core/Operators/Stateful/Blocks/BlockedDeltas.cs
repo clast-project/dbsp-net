@@ -317,7 +317,17 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
         }
 
         var runs = Runs();
+
         IEnumerator<KeyValuePair<StructuralRow, Z64>> inner = runs.Length == 1 ? new Cursor(runs[0].Run) : Merged(runs).GetEnumerator();
+
+        // The enumerator holds its runs' spilled files until it is collected (§5.20), as a trace's lazy
+        // readers do: it may outlive every other reference to this set (an exchange gathers a bucket it
+        // has already taken from the mailbox, §5.27).
+        foreach (var (run, _) in runs)
+        {
+            run.Lease?.Hold(inner);
+        }
+
         return StepSpillProfile.Enabled ? new Profiled(inner) : inner;
     }
 

@@ -176,27 +176,24 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
         return true;
     }
 
-    // The entries of hash in a run, as (block body, index).
-    private static List<(ITraceBlock Block, int Index)> At(BlockedIndexedTrace.Run run, uint hash)
+    // The entries of hash in a run, as (block body, index), streamed: a giant group's blocks are read
+    // one at a time, never all pinned at once (§5.27).
+    private static IEnumerable<(ITraceBlock Block, int Index)> At(BlockedIndexedTrace.Run run, uint hash)
     {
-        var found = new List<(ITraceBlock Block, int Index)>();
         var b = run.Find(hash);
         if (b < 0)
         {
-            return found;
+            yield break;
         }
 
         for (; b < run.Blocks.Length && run.FirstOf(b) <= hash; b++)
         {
             var block = run.Blocks[b].Body;
-            var hashes = block.Hashes;
-            for (var i = block.LowerBound(hash); i < hashes.Length && hashes[i] == hash; i++)
+            for (var i = block.LowerBound(hash); i < block.Hashes.Length && block.Hashes[i] == hash; i++)
             {
-                found.Add((block, i));
+                yield return (block, i);
             }
         }
-
-        return found;
     }
 
     // Groups across runs: a hash only one run holds counts its keys (consolidated there, so every group
@@ -218,10 +215,66 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
         long count = 0;
         while (walk.Next(out var hash, out var tied, out var groups))
         {
-            count += tied.Count == 1 ? groups : Resolve(tied.Select(r => runs[r]), hash).Count;
+            count += tied.Count == 1 ? groups : CountTied(tied.Select(r => runs[r]).ToArray(), hash);
         }
 
         return (int)Math.Min(count, int.MaxValue);
+    }
+
+    // The non-empty groups of a hash several runs hold, without building them (§5.27): a key whose
+    // entries all have one sign cannot cancel, so its group is non-empty whatever its values. Only a
+    // key with both signs is resolved by summing. A giant group (one key over many runs) is a stream of
+    // its entries, not a materialized set.
+    private static int CountTied(BlockedIndexedTrace.Run[] runs, uint hash)
+    {
+        var keys = new List<StructuralRow>();
+        var signs = new List<int>(); // bit 1: a positive weight seen, bit 2: a negative one
+        foreach (var run in runs)
+        {
+            foreach (var (block, i) in At(run, hash))
+            {
+                var k = 0;
+                while (k < keys.Count && !block.KeyEquals(i, keys[k]))
+                {
+                    k++;
+                }
+
+                if (k == keys.Count)
+                {
+                    keys.Add(block.Key(i));
+                    signs.Add(0);
+                }
+
+                signs[k] |= block.Weight(i) > 0 ? 1 : 2;
+            }
+        }
+
+        var count = 0;
+        List<StructuralRow>? mixed = null;
+        for (var k = 0; k < keys.Count; k++)
+        {
+            if (signs[k] == 3)
+            {
+                (mixed ??= []).Add(keys[k]);
+            }
+            else
+            {
+                count++;
+            }
+        }
+
+        if (mixed is not null)
+        {
+            foreach (var group in Resolve(runs, hash))
+            {
+                if (mixed.Exists(m => m.Equals(group.Key)))
+                {
+                    count++;
+                }
+            }
+        }
+
+        return count;
     }
 
     // The non-empty groups of hash across runs, summed.

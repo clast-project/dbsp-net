@@ -2141,3 +2141,66 @@ Batch 1 completes and validates.
   more (`DBSPNET_RUN_COMPRESSION=lz4`). Tests: the round-trip and giant-block tests now run for LZ4 too (10 in
   `RunCompressionTests`), and the suite passes with LZ4 as the default and in the forced spill mode (3,494).
 
+
+### 5.27 Twelve workers: what grows with W, and three fixes (2026-11-06, xt75–xt81)
+
+**The question.** ivm-bench runs DbspNet at `DBSPNET_WORKERS=12`. Every run so far (xt70–xt74) was W=1. xt75
+reran batch 1 at W=12 with xt73's settings (48 GiB heap cap, spill on, step threshold 1M rows, zstd).
+
+**W=12 is 3.2× faster through tick 17 (1,039 s against 3,299 s) and runs out of memory in tick 18.** Every W=12
+run so far fails there (cap 48 GiB; CI's container gives .NET about 90 GB, which this 64 GB machine cannot test):
+
+| run | change | ticks 0–17 | tick 18 |
+|---|---|---|---|
+| xt75 | W=12, xt73's settings | 1,039 s | OOM at 1,448 s, op 1689 |
+| xt76 | step threshold ÷ 12 (83k rows) | 1,251 s | OOM at 1,536 s, same op and stack |
+| xt79 | every run spills, freeze ÷ 12 | 1,062 s | OOM at 1,480 s, same op |
+| xt80 | spill-aware exchange (fix 1, 2) | 1,186 s | OOM at 1,799 s, op 1691 |
+| xt81 | + streamed group count (fix 3) | 1,166 s | OOM at 1,480 s, in a block load |
+
+**What grows with W, at the end of tick 17** (state census, xt77 against xt78):
+
+| | W=1 | W=12 |
+|---|---|---|
+| live state | 7.4 GB | 13.7 GB |
+| blocked traces (left/inner join, view, aggregate, distinct) | ~1.1 GB | ~6.2 GB |
+| ordered partition stores (TOP-K, rank) | 4.0 GB | 5.5 GB |
+| resident blocks / managed entries | 0.5 GB / 0 | 4.0–4.5 GB / 2.5M |
+
+The two thresholds that let a trace's state leave memory are per trace: a run under `DBSPNET_SPILL_MIN_MIB`
+(10 MiB) never spills, and a trace keeps up to `DBSPNET_TRACE_BLOCKS_FREEZE` (65,536) managed rows. W=12 has
+twelve times the traces at a twelfth of the size each, so far more stay under both. xt79 forced both down and
+the baseline went back to W=1's (blocks 515 MB, managed 0), but tick 18 still failed: the baseline is real but
+not what kills tick 18. Feldera's thresholds are the same per-batch kind, but it switches them by memory
+pressure (RSS against `max_rss`: 0.85 moderate spills every merge, 0.90 high every insert, 0.95 critical every
+step batch); that is the fix for the baseline, and is not built.
+
+**What kills tick 18 is skew through an exchange.** An exchange (op 1687) repartitions 21.6M rows on a key with
+about three values: three workers receive about 7.2M rows each. At W=1 there is no exchange and those rows are
+built as blocks past the threshold.
+
+1. **The exchange was not part of in-step spilling** (`ExchangeOp`). It listed every input row (materializing a
+   block-backed input) and gathered into a plain builder. Now the output inherits the input's block format; a
+   block-backed input splits into one spilling builder per destination, and the gather spills past the
+   threshold. Spill off: the path is unchanged. Test: two block-backed shards all routed to worker 0 (W=4, 12)
+   stay blocks and equal the union; the plain gather fails it.
+2. **A block-backed delta's enumerator did not hold its files** (`BlockedRows.GetEnumerator`). Every consumer
+   so far also held the set through its stream; fix 1's gather enumerates a bucket nothing else references, and
+   a sweep deleted its files mid-read (the forced suite caught it: 7 parallel tests, "Could not find file").
+   The enumerator now holds its runs' leases, as a trace's lazy readers do. Test: only an enumerator left, the
+   set collected and swept, it still reads every row, and the files go once it is collected; without the hold
+   both cases fail.
+3. **Counting a group-by delta's groups built every group a key hash spans runs for** (`BlockedGroups`). The
+   skewed key spans every 1M-row run, so the count materialized three 7.2M-value groups at once, with every
+   block body pinned (`At` returned a list). `At` now streams, and the count reads a key whose entries all have
+   one sign as non-empty without building it; only a key with both signs is summed. Test: a key cancelled
+   across chunks, a one-signed giant key and a mixed key that survives; counting mixed keys as non-empty fails
+   it (the randomized test did not: random adds almost never cancel a whole group across chunks).
+
+Suites pass default and forced (3,499).
+
+**Still open.** xt81 fails while loading a block (an allocation at the limit, not one structure): worker 0's
+live heap through tick 18 is 25–30 GB against W=1's 15.5 GB, and managed entries reach 9M. Candidates: the
+per-trace baseline (memory pressure, above), the downstream consumer of the skewed group-by (each worker
+enumerating a 7.2M-value group), and server GC's twelve heaps under a hard cap. `BroadcastExchangeOp` and
+`ExchangeIndexOp` still gather managed.

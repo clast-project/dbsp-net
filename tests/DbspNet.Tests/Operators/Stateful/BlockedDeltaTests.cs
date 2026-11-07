@@ -290,6 +290,25 @@ public class BlockedDeltaTests
         Assert.True(Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds) > builds0);
     }
 
+    // §5.27: the group count reads a hash several runs hold without building its groups, unless a key
+    // has both signs. Key 0's only entry is added in one chunk and cancelled in another, so its group is
+    // empty; key 1 spans every chunk with one sign (a giant group); key 2 has both signs but survives.
+    [Fact]
+    public void A_group_count_across_runs_skips_cancelled_groups_and_counts_one_signed_ones()
+    {
+        var adds = new List<(int K, int V, int S, long W)> { (0, 1, 1, 1) };
+        adds.AddRange(Enumerable.Range(0, 40).Select(i => (1, i % 6, i % 4, 1L)));
+        adds.Add((0, 1, 1, -1));
+        adds.Add((2, 2, 2, 3));
+        adds.AddRange(Enumerable.Range(0, 10).Select(i => (1, i % 6, 3 - (i % 4), 2L)));
+        adds.Add((2, 2, 2, -1));
+        var managed = ManagedIndexed([.. adds]);
+        var spilled = SpilledIndexed([.. adds], 0, 4);
+        Assert.True(spilled.External is BlockedGroups { RunCount: > 1 });
+        Assert.Equal(2, managed.GroupCount);
+        AssertSameIndexed(managed, spilled);
+    }
+
     [Fact]
     public void A_blocked_indexed_trace_adopts_block_backed_deltas_and_reads_as_managed()
     {
@@ -733,5 +752,39 @@ public class BlockedDeltaTests
         }
 
         return true;
+    }
+
+    // §5.27: an exchange keeps a block-backed delta as blocks. Every row of two block-backed shards is
+    // shuffled to worker 0 (the skew a low-cardinality key makes), past the step threshold, so the
+    // gather must spill instead of collecting all of them managed; worker 0's output is the union.
+    [Theory]
+    [InlineData(4)]
+    [InlineData(12)]
+    public void An_exchange_keeps_a_block_backed_delta_as_blocks(int workers)
+    {
+        var a = Enumerable.Range(0, 300).Select(i => (i, i % 4, 1L)).ToArray();
+        var b = Enumerable.Range(300, 300).Select(i => (i, i % 4, 2L)).ToArray();
+        using var _ = SpillSettings.UseStepSpill(100, 10);
+        using var pc = DbspNet.Core.Circuit.ParallelCircuit.Build(workers, cb =>
+        {
+            var (_, input) = cb.Input<ZSet<StructuralRow, Z64>>(ZSet.Empty<StructuralRow, Z64>(), (x, y) => x.Plus(y), name: "in");
+            input.DeltaFormat = Format;
+            cb.Output(cb.Exchange(input, static _ => 0), name: "out");
+        });
+        var sa = Spilled(a, 100, 10);
+        var sb = Spilled(b, 100, 10);
+        Assert.True(sa.IsExternal && sb.IsExternal);
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", 0).Push(sa);
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", workers - 1).Push(sb);
+
+        pc.Step();
+
+        var out0 = pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", 0).Current;
+        Assert.True(out0.IsExternal, "600 rows on one worker are past the 100-row threshold");
+        AssertSame(Managed(a) + Managed(b), out0);
+        for (var w = 1; w < workers; w++)
+        {
+            Assert.True(pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", w).Current.IsEmpty);
+        }
     }
 }

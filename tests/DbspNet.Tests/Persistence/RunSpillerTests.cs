@@ -488,6 +488,70 @@ public class RunSpillerTests
         });
     }
 
+    // §5.27: an enumerator of a block-backed delta holds the delta's files on its own. An exchange
+    // takes a bucket out of the mailbox and enumerates it, so nothing else may reference the set; a
+    // sweep then must not delete its files mid-read. One run (a cursor) and several (a merge).
+    [Theory]
+    [InlineData(64)]
+    [InlineData(8)]
+    public async Task A_deltas_enumerator_alone_keeps_its_files(int chunk)
+    {
+        await WithSpillerAsync(0, (spiller, dir) =>
+        {
+            using var mode = TraceBlocksMode.Use(join: true, freezeEntries: 1000, blockEntries: 8);
+            var format = TraceBlockFormats.Create(RowSchema, Schema.Empty)!;
+            ReadAfterSweep(spiller, format, chunk);
+
+            // Once the enumerator is gone too, the files go.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            spiller.Sweep();
+            Assert.Equal(0, spiller.Files);
+            return Task.CompletedTask;
+        });
+    }
+
+    // The delta collected and its files swept while only its enumerator is left, then read to the end.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void ReadAfterSweep(RunSpiller spiller, ITraceBlockFormat format, int chunk)
+    {
+        var (rows, weak) = EnumeratorOfSpilledDelta(format, chunk);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Assert.False(weak.TryGetTarget(out _), "only the enumerator is left");
+        spiller.Sweep();
+        Assert.True(spiller.Files > 0);
+        var read = new List<KeyValuePair<StructuralRow, Z64>>();
+        while (rows.MoveNext())
+        {
+            read.Add(rows.Current);
+        }
+
+        Assert.Equal(Rows(0, 40).OrderBy(e => (int)e.Key[0]!), read.OrderBy(e => (int)e.Key[0]!));
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static (IEnumerator<KeyValuePair<StructuralRow, Z64>> Rows, WeakReference<object> Set) EnumeratorOfSpilledDelta(ITraceBlockFormat format, int chunk)
+    {
+        ZSet<StructuralRow, Z64> delta;
+        using (SpillSettings.UseStepSpill(0, chunk))
+        {
+            var b = DeltaSpill.Rows(format, 40);
+            foreach (var (row, w) in Rows(0, 40))
+            {
+                b.Add(row, w);
+            }
+
+            delta = b.Build();
+        }
+
+        var blocked = Assert.IsType<BlockedRows>(delta.External);
+        Assert.Equal(chunk >= 40 ? 1 : 5, blocked.RunCount);
+        return (delta.GetEnumerator(), new WeakReference<object>(delta));
+    }
+
     // A delta built as one spilled run (adopted as it is, not merged), integrated into the view and
     // dropped. Returns a weak reference to it.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
