@@ -2204,3 +2204,79 @@ live heap through tick 18 is 25–30 GB against W=1's 15.5 GB, and managed entri
 per-trace baseline (memory pressure, above), the downstream consumer of the skewed group-by (each worker
 enumerating a 7.2M-value group), and server GC's twelve heaps under a hard cap. `BroadcastExchangeOp` and
 `ExchangeIndexOp` still gather managed.
+
+### 5.28 S3: spill thresholds that follow memory pressure (2026-11-06, design)
+
+**Why.** §5.27 left two things at W=12: twelve times the traces, each under the per-trace thresholds
+(`SPILL_MIN` 10 MiB, `FREEZE` 65,536 entries), keep ~5 GB more of baseline in memory than W=1. Tick 18 then
+runs out of room on top of it. xt79 showed that forcing the thresholds down for the whole run brings the
+baseline back to W=1's, but that costs every run. Feldera keeps its thresholds where they are until memory is
+short, then moves them (§5.1). This section builds that S3 (§5.3), with the knobs of §5.5.
+
+**The signal: the GC heap in use, not RSS.** Feldera measures RSS against `max_rss`. Under a .NET hard limit,
+RSS and the committed heap both climb toward the cap between full collections: that headroom is what server
+GC is for. Measured that way, a healthy run would read Critical half the time. The measure here is the heap
+still in use after the most recent collection of any kind: `GCMemoryInfo.HeapSizeBytes - FragmentedBytes`.
+After a gen0 or gen1 collection it still counts gen2 garbage, so it overstates and never understates. That
+errs the same way RSS does, only less. The limit is `DBSPNET_MEMORY_LIMIT_MIB`, or else
+`TotalAvailableMemoryBytes`, which is the hard limit when one is set and otherwise physical memory or the
+cgroup's.
+
+**Cadence: every collection, not a 1 s timer.** Tick 18 allocates gigabytes a second, so a 1 s sample is
+stale before anyone reads it. A finalizable sentinel object re-registers itself on every collection (the
+`Gen2GcCallback` pattern, minus the gen2). Its finalizer recomputes the level once per GC, on the finalizer
+thread. Hot paths read one static `int`, so a per-row check costs one load.
+
+**Levels and hysteresis are Feldera's.** Low below 85% of the limit, Moderate below 90, High below 95, then
+Critical (`DBSPNET_PRESSURE_LEVELS`, default `85,90,95`). Low and Moderate follow the raw level. High holds
+until the raw level falls to Low. Critical holds until it falls to Moderate or below. Each entry into High or
+Critical from below bumps a **pressure epoch**.
+
+**What each level changes.** Each row is Feldera's table (§5.1) mapped onto our three knobs:
+
+| level | runs written to files (`RunSpiller`, merge and freeze outputs, §5.9/§5.23) | managed entries before a trace freezes (`BlockedIndexedTrace.Push`) | in-step delta chunks (`SpillingRows`/`SpillingGroups`, §5.15/§5.22) | window write-back (§5.8) |
+|---|---|---|---|---|
+| Low | ≥ `SPILL_MIN` (10 MiB) | `FREEZE` (65,536) | `STEP_SPILL_ROWS` | ≤ `WINDOW_WRITEBACK` (1 GiB) |
+| Moderate | **all** | `FREEZE` | `STEP_SPILL_ROWS` | as Low |
+| High | all | **every insert** (`DBSPNET_PRESSURE_HIGH_FREEZE`, default 0), and **every managed level pushed** once per epoch | `STEP_SPILL_ROWS` | **dropped at every step end** |
+| Critical | all | as High | **`DBSPNET_PRESSURE_CRITICAL_STEP_ROWS`** (default 65,536) when that is lower | as High |
+
+- **Moderate is Feldera's "merge outputs all", widened to freezes.** We have one spill hook for both
+  (`AfterCompact`), and a freeze's run is what Feldera calls an inserted batch.
+- **High's push is Feldera's `memory_pressure_epoch`.** Feldera wakes its merger threads to write every
+  in-memory batch. Our traces belong to their worker thread, so nobody else may freeze them. Instead, each
+  `RootCircuit` keeps weak references to the state traces (`Compacts`) that took a managed level since its last
+  push. At its next operator boundary, if it last pushed in an older epoch, it freezes them all on its own
+  thread. Each worker has a dedicated thread (`ParallelCircuit`) and one replica per circuit, so the owner is
+  the one stepping. **Limit:** a worker blocked at an exchange barrier pushes only when it resumes. A
+  delta's private trace is never registered, so a dead delta is not kept alive.
+- **Critical has a floor, not Feldera's "all non-empty".** Feldera's unit is a whole batch. Ours is a
+  builder's managed chunk, so freezing every non-empty chunk would mean a run per row. The floor is the trace
+  freeze size, as a knob. It acts only where in-step spilling is on (`STEP_SPILL_ROWS` set, a format
+  attached).
+- **Not changed by pressure:** the block cache budget (Feldera doesn't change its cache either), the
+  window promotion sizes, and backpressure (Feldera's is counted in batches, §5.1).
+
+**Knobs** (all read once at start, overridable in an async context for tests):
+
+| knob | default | |
+|---|---|---|
+| `DBSPNET_PRESSURE` | `on` | `off`: the fixed thresholds only. `low`/`moderate`/`high`/`critical`: pin the level (a forced suite run uses `high` and `critical`) |
+| `DBSPNET_MEMORY_LIMIT_MIB` | `TotalAvailableMemoryBytes` | the limit |
+| `DBSPNET_PRESSURE_LEVELS` | `85,90,95` | Moderate, High and Critical, in % of the limit |
+| `DBSPNET_PRESSURE_HIGH_FREEZE` | 0 | managed entries a trace keeps at High or above (0: freeze every insert, as Feldera) |
+| `DBSPNET_PRESSURE_CRITICAL_STEP_ROWS` | 65,536 | the in-step chunk at Critical |
+
+**Default on.** This follows Feldera's default (policy: adopt Feldera's assumptions by default). Below 85% of
+the limit nothing changes, so runs that never come near the limit (Nexmark, TPC-DI with no cap) see one int
+load per insert and per delta row. The host logs the limit, the levels, and every level change (with the
+used bytes), so a run's log shows when pressure acted.
+
+**Tests.** The hysteresis table, and the raw level from used bytes and limit, as pure functions. Pinned
+levels change behaviour: Moderate spills a run under `SPILL_MIN`; High freezes on one insert; an epoch bump
+pushes an idle trace's managed level at the next operator boundary and leaves a delta's trace alone; Critical
+freezes a delta chunk at the floor. Each test fails with its threshold left at Low. A forced suite run with
+`DBSPNET_PRESSURE=high`, and one with `critical`, must give the same results as default.
+
+**Measure.** xt82 = xt81's setup (W=12, 48 GiB cap, step spill 1M, spill on, cache 1 GiB) with pressure on.
+Question: does tick 18 fit? Log the level changes and the census next to xt81's.
