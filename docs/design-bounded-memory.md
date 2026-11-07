@@ -2274,7 +2274,8 @@ used bytes), so a run's log shows when pressure acted.
 
 **Tests.** The hysteresis table, and the raw level from used bytes and limit, as pure functions. Pinned
 levels change behaviour: Moderate spills a run under `SPILL_MIN`; High freezes on one insert; an epoch bump
-pushes an idle trace's managed level at the next operator boundary and leaves a delta's trace alone; Critical
+pushes every listed trace's managed level at the next operator boundary, once, and only at High or above
+(an idle join already freezes on its empty tick, §3.2), and leaves a delta's trace alone; Critical
 freezes a delta chunk at the floor. Each test fails with its threshold left at Low. A forced suite run with
 `DBSPNET_PRESSURE=high`, and one with `critical`, must give the same results as default.
 

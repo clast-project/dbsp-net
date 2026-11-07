@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Runtime.CompilerServices;
+using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Sql.Compiler;
 
 namespace DbspNet.Persistence.Blocks;
@@ -19,9 +20,14 @@ internal static class BlockFormatRegistration
         TraceBlockFormats.Factory = static (key, value) => BlockSchema.TryCreate(key, value);
 
         // Mid-batch spilling (docs/design-bounded-memory.md §5.9), opt-in: DBSPNET_SPILL=on.
-        if (Core.Operators.Stateful.Blocks.SpillSettings.Spill)
+        if (SpillSettings.Spill)
         {
-            Core.Operators.Stateful.Blocks.BlockAccess.Spiller = RunSpiller.CreateDefault();
+            BlockAccess.Spiller = RunSpiller.CreateDefault();
+
+            // The thresholds follow memory pressure (§5.28): say what they follow, and when the level moves.
+            Console.Error.WriteLine("dbspnet: spill on; " + MemoryPressure.Describe());
+            MemoryPressure.Changed = static (from, to, used, limit) => Console.Error.WriteLine(
+                $"dbspnet: memory pressure {from} -> {to} (used {used >> 20} MiB of {limit >> 20} MiB)");
         }
     }
 }

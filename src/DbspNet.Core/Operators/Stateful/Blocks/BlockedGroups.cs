@@ -34,7 +34,8 @@ internal sealed class SpillingGroups : IndexedZSetSpillingStore<StructuralRow, S
     public override void Add(StructuralRow key, StructuralRow value, Z64 weight)
     {
         _chunk.Add(key, value, weight);
-        if (++_entries >= _chunkEntries)
+        if (++_entries >= _chunkEntries
+            || (_entries >= MemoryPressure.CriticalStepRows && MemoryPressure.Current == PressureLevel.Critical))
         {
             FreezeChunk();
         }

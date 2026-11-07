@@ -568,11 +568,22 @@ internal sealed class BlockedIndexedTrace
     {
         _managed.Add(level);
         _managedEntries += level.Entries;
-        if (_managedEntries >= _freezeEntries || _managed.Count > _maxManaged)
+
+        // At High pressure or above an insert freezes past a much lower threshold (default: every insert,
+        // as Feldera's inserts all go to storage, docs/design-bounded-memory.md §5.28).
+        var freezeAt = MemoryPressure.Current >= PressureLevel.High ? Math.Min(_freezeEntries, MemoryPressure.HighFreezeEntries) : _freezeEntries;
+        if (_managedEntries >= freezeAt || _managed.Count > _maxManaged)
         {
             Freeze();
         }
+        else if (_compact && !PressureRegistered)
+        {
+            PressureRelief.Register(this); // pushed when the circuit next sees a new pressure epoch
+        }
     }
+
+    /// <summary>Whether the stepping circuit's <see cref="PressureRelief"/> lists this trace (§5.28).</summary>
+    internal bool PressureRegistered;
 
     /// <summary>Throws unless every run is consolidated (no repeated key and value, no zero weight)
     /// and in ascending hash order across its blocks — the invariants freeze and merge keep, which

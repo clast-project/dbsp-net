@@ -123,6 +123,7 @@ public class WindowWriteBackBudgetTests
     [Fact]
     public void A_budget_above_the_caches_keeps_them()
     {
+        using var pressure = MemoryPressure.Use(PressureLevel.Low); // asserts the Low thresholds (§5.28)
         var p = Compile(1L << 40);
         for (var tick = 0; tick < 4; tick++)
         {

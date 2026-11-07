@@ -93,7 +93,8 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
     {
         var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         _chunk.Add(key, weight);
-        if (_chunk.Count >= _chunkRows)
+        if (_chunk.Count >= _chunkRows
+            || (_chunk.Count >= MemoryPressure.CriticalStepRows && MemoryPressure.Current == PressureLevel.Critical))
         {
             FreezeChunk();
         }

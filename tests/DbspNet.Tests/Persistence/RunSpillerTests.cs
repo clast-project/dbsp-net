@@ -181,6 +181,7 @@ public class RunSpillerTests
     [Fact]
     public async Task Runs_below_the_threshold_stay_in_memory()
     {
+        using var pressure = MemoryPressure.Use(PressureLevel.Low); // asserts the Low thresholds (§5.28)
         await WithSpillerAsync(1L << 40, (spiller, dir) =>
         {
             var p = Compile();

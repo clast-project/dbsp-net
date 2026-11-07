@@ -249,6 +249,7 @@ public class BlockedIndexedTraceTests
     [Fact]
     public void Integrate_CopiesNothing_AndFreezeMergesGeometrically()
     {
+        using var pressure = MemoryPressure.Use(PressureLevel.Low); // asserts the Low thresholds (§5.28)
         var format = BlockSchema.TryCreate(KeySchema, ValueSchema)!;
         var trace = new BlockedIndexedTrace(format, freezeEntries: 4, maxManaged: 100, blockEntries: 2);
         var delta = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();

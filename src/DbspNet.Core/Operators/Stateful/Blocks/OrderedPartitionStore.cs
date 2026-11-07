@@ -522,7 +522,9 @@ internal sealed class OrderedPartitionStore
             return;
         }
 
-        if (Interlocked.Read(ref _cacheBytes) > _writeBackBudget || LiveCacheBytes() > _writeBackBudget)
+        // At High pressure or above every store drops its cache at its step's end (§5.28).
+        if (MemoryPressure.Current >= PressureLevel.High
+            || Interlocked.Read(ref _cacheBytes) > _writeBackBudget || LiveCacheBytes() > _writeBackBudget)
         {
             DropCache();
             Interlocked.Increment(ref WriteBackDrops);

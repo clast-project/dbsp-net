@@ -115,7 +115,7 @@ internal sealed class RunSpiller : IRunSpiller
         for (var r = 0; r < runs.Count; r++)
         {
             var run = runs[r];
-            if (run.Persisted is not null || Size(run) is var bytes && bytes < _minBytes)
+            if (run.Persisted is not null || Size(run) is var bytes && bytes < MinBytes)
             {
                 continue;
             }
@@ -138,7 +138,10 @@ internal sealed class RunSpiller : IRunSpiller
         }
     }
 
-    public long StreamAtBytes => _minBytes;
+    // From Moderate pressure on, every run goes to a file (Feldera: merge outputs all on storage, §5.28).
+    private long MinBytes => MemoryPressure.Current >= PressureLevel.Moderate ? 0 : _minBytes;
+
+    public long StreamAtBytes => MinBytes;
 
     public IRunSink? BeginRun(BlockedIndexedTrace trace)
     {

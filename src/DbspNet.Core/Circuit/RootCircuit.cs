@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using DbspNet.Core.Collections;
 using DbspNet.Core.Operators.Stateful;
+using DbspNet.Core.Operators.Stateful.Blocks;
 
 namespace DbspNet.Core.Circuit;
 
@@ -284,13 +285,35 @@ public sealed class RootCircuit
     private List<IReleasableStream>[]? _release;
     private bool _learning;
 
+    // High pressure's push (docs/design-bounded-memory.md §5.28): the traces this circuit's operators
+    // left managed levels in, frozen at an operator boundary once per pressure epoch.
+    private readonly PressureRelief _relief = new();
+
+    /// <summary>This circuit's pressure relief (tests).</summary>
+    internal PressureRelief Relief => _relief;
+
     private void StepOperators()
+    {
+        var outerRelief = PressureRelief.Current;
+        PressureRelief.Current = _relief;
+        try
+        {
+            StepOperatorsCore();
+        }
+        finally
+        {
+            PressureRelief.Current = outerRelief;
+        }
+    }
+
+    private void StepOperatorsCore()
     {
         if (!StreamRelease.Enabled)
         {
             for (var i = 0; i < _operators.Count; i++)
             {
                 _operators[i].Step();
+                _relief.AtBoundary();
                 AfterOperatorStep?.Invoke(this, i);
             }
 
@@ -322,6 +345,7 @@ public sealed class RootCircuit
                     first?.After(i);
                 }
 
+                _relief.AtBoundary();
                 AfterOperatorStep?.Invoke(this, i);
             }
         }
