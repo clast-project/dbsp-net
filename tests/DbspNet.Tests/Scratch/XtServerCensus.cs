@@ -108,6 +108,16 @@ public class XtServerCensus
             {
                 log.WriteLine("WAIT FAILED " + ex.GetType().Name + ": " + ex.Message);
                 log.WriteLine(ex.StackTrace);
+                if (ex is AggregateException agg)
+                {
+                    // Where each worker's allocation failed: distinct inner stacks, with how many workers hit each.
+                    foreach (var g in agg.Flatten().InnerExceptions.GroupBy(e => e.StackTrace))
+                    {
+                        log.WriteLine($"INNER x{g.Count()} {g.First().GetType().Name}");
+                        log.WriteLine(g.Key);
+                    }
+                }
+
                 return Results.Json(new { error = ex.Message, detail = ex.ToString() }, statusCode: 500);
             }
         });

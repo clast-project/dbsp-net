@@ -2436,3 +2436,9 @@ Suites pass default, forced, and forced at Critical (3,535).
 is in flight (deltas and exchange buckets), not operator state. (That run's forced census fired once per
 replica, twelve walks under the hook's lock, and stalled op 1993 for ~20 min; the hook now fires once per op.)
 
+
+**xt87 (restored after tick 17, with the fix).** Op 1994 takes 22.2 s (40.5 s in xt85) and no longer holds
+the heap; tick 18 runs on to op 2064/2222, the next `ExchangeIndexOp` (63.5 s, live 26.4 GB), then out of
+memory during op 2068 (an `ApplyOp` emitting ~1.5M-row chunks, heap 60–76 GB between collections, RSS at the
+48 GiB cap). Wall 1,836 s; peak RSS 47 GiB. The harness logged only the outer stack; it now logs each distinct
+inner stack (`INNER xN`).
