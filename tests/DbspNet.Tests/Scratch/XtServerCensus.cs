@@ -14,6 +14,8 @@
 //   DBSPNET_WORKERS   as for the server
 //   XT_CHECKPOINT_AT_TICK (optional, with DBSPNET_SNAPSHOT_DIR) checkpoint after this tick and exit; a
 //                     later run with DBSPNET_SNAPSHOT_DIR on a copy of that directory restores and goes on
+//   XT_STATE_CENSUS_TICK (optional) a full state census after this tick (before any checkpoint there)
+//   XT_CENSUS_AFTER_DEPLOY (optional) 1: a full state census once deploy (and any restore) is done; exit: then exit
 using System.Diagnostics;
 using System.Globalization;
 using DbspNet.Core.Circuit;
@@ -43,6 +45,31 @@ public class XtServerCensus
 
         var engine = new DbspNetEngine();
         var sw = Stopwatch.StartNew();
+
+        // A forced compacting collection, live bytes, then the state census (by operator and field) and the
+        // block residency report. What the walk does not reach (statics: the block cache, file pins) is
+        // live minus the walk's total.
+        void FullCensus(string tag)
+        {
+            var (runner, replicas) = Locate(engine);
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            var live = GC.GetGCMemoryInfo(GCKind.FullBlocking).PromotedBytes;
+            var res = StateCensus.Walk(replicas, runner, null, 3);
+            log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"CENSUS {tag} live_mib={live / 1048576.0:F0} walked_mib={res.Buckets.Sum(b => b.Bytes) / 1048576.0:F0} walk_s={res.Took.TotalSeconds:F0} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0}"));
+            foreach (var line in StateCensus.Report(tag, res, 80))
+            {
+                log.WriteLine(line);
+            }
+
+            foreach (var line in BlockResidency.Report(tag, BlockResidency.Walk(replicas, runner, -1), 40))
+            {
+                log.WriteLine(line);
+            }
+
+            log.WriteLine($"CENSUS-DONE {tag}");
+        }
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
         await using var app = builder.Build();
@@ -56,6 +83,18 @@ public class XtServerCensus
             tickBase = r.RestoredTick;
             log.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"DEPLOYED t_s={sw.Elapsed.TotalSeconds:F0} persistent={r.Persistent} restored_tick={r.RestoredTick} workers={r.Workers} deploy_s={r.CompileTimeS:F1}"));
+            if (Environment.GetEnvironmentVariable("XT_CENSUS_AFTER_DEPLOY") is { Length: > 0 } after)
+            {
+                // §5.30: what a restored deploy holds before its first tick, as XT_STATE_CENSUS_TICK reports a
+                // tick's end; "exit" ends the process once it is written.
+                FullCensus($"deploy{r.RestoredTick}");
+                if (after == "exit")
+                {
+                    log.Flush();
+                    Environment.Exit(0);
+                }
+            }
+
             return Results.Ok(r);
         });
         app.MapPost("/resume", () => Results.Ok(engine.Resume()));
@@ -128,12 +167,7 @@ public class XtServerCensus
 
             if (int.TryParse(Environment.GetEnvironmentVariable("XT_STATE_CENSUS_TICK"), out var censusTick) && censusTick == t)
             {
-                foreach (var line in StateCensus.Report($"end{t}", StateCensus.Walk(replicas, runner, null, 3), 60))
-                {
-                    log.WriteLine(line);
-                }
-
-                log.WriteLine($"CENSUS-DONE tick={t}");
+                FullCensus($"end{t}");
             }
 
             if (int.TryParse(Environment.GetEnvironmentVariable("XT_PAUSE_AT_TICK"), out var pauseTick) && pauseTick == t)

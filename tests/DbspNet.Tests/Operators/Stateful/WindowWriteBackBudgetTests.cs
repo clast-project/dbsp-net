@@ -121,6 +121,46 @@ public class WindowWriteBackBudgetTests
     }
 
     [Fact]
+    public void A_dropped_cache_releases_a_huge_ticks_capacity()
+    {
+        // §5.30: Dictionary.Clear keeps its arrays, so a cache that once held a huge tick's partitions
+        // kept that capacity, empty, after every drop (~4 GB at extended TPC-DS tick 17). After a drop
+        // past the budget, neither the cache nor its queue may keep more than a small capacity, and the
+        // outputs still match an unbounded twin's.
+        const int Partitions = 20_000;
+        var bounded = Compile(0);
+        var unbounded = Compile(long.MaxValue);
+        foreach (var p in new[] { bounded, unbounded })
+        {
+            var t = p.Table("t");
+            for (var a = 0; a < Partitions; a++)
+            {
+                t.Insert(1000 + a, a % 13, "h" + a);
+            }
+
+            p.Step();
+        }
+
+        Assert.Equal(Digest(unbounded), Digest(bounded));
+        Assert.All(Stores(bounded), s =>
+        {
+            Assert.Equal(0, s.SmallManaged.Partitions);
+            Assert.True(s.CacheCapacity.Small <= OrderedPartitionStore.KeepCapacity, $"cache capacity {s.CacheCapacity.Small}");
+            Assert.True(s.CacheCapacity.Pending <= OrderedPartitionStore.KeepCapacity, $"queue capacity {s.CacheCapacity.Pending}");
+        });
+
+        // The twin kept its cache, so the tick really was huge.
+        Assert.Contains(Stores(unbounded), s => s.CacheCapacity.Small >= Partitions);
+
+        for (var tick = 1; tick < 6; tick++)
+        {
+            Tick(bounded, tick);
+            Tick(unbounded, tick);
+            Assert.Equal(Digest(unbounded), Digest(bounded));
+        }
+    }
+
+    [Fact]
     public void A_budget_above_the_caches_keeps_them()
     {
         using var pressure = MemoryPressure.Use(PressureLevel.Low); // asserts the Low thresholds (§5.28)

@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration, but a restored tick 18 starts ~16 GB leaner and is not a faithful stand-in; it fixed a checkpoint that pinned every spilled body until commit. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2353,9 +2353,56 @@ taken there resumes at the next tick; the harness offsets its tick numbers by th
   restore; xt82 1,292 s after tick 17).
 
 **What this means.** A restore keeps the state and drops ~16 GB that xt82 carries into tick 18: resident
-blocks (4.5 GB), managed entries (2.5M), and ~10 GB more that the state does not need. That ~10 GB is itself
-the cheapest lead: whatever the restore does not rebuild, the live run could drop. Until it is identified,
+blocks (4.5 GB), managed entries (2.5M), and ~10 GB more. (§5.31: most of that ~10 GB is state a restore
+leaves lazy, not state the run does not need; ~4–5 GB of it was empty dictionary capacity, now released.)
+That ~10 GB is itself the cheapest lead: whatever the restore does not rebuild, the live run could drop. Until it is identified,
 the restart point answers "does this change help tick 18 after op 1733" (the control's op 1994 failure,
 live-bound) but not "does tick 18 fit" in a run that did not restore. Next: a state census at the end of tick
 17 (`XT_STATE_CENSUS_TICK=17`) in a save run, against the same census right after a restore.
 
+### 5.31 What a restore leaves behind: empty window-store capacity (2026-11-07)
+
+**Census.** `XT_STATE_CENSUS_TICK=17` (a forced compacting GC, then `StateCensus` and `BlockResidency`) at
+the end of tick 17 in a save run (xt84-save), against the same census right after a restore
+(`XT_CENSUS_AFTER_DEPLOY=1`, xt84-restored):
+
+| | end of tick 17 | right after restore |
+|---|---|---|
+| live | 16,958 MB | 597 MB |
+| reached by the walk | 13,066 MB | 322 MB |
+| block cache | 1,024 MB | — |
+
+Charged by the walk at the end of tick 17:
+
+- `PartitionedRank` 4.2 GB: `_accum` (managed rank state, 1.2 GB in 32.8M objects; a restore leaves it lazy),
+  `_window` 0.5 GB, `_store` 2.5 GB.
+- `PartitionedTopK` `_store` 3.0 GB.
+- Blocked traces' resident in-memory runs ~4.9 GB, managed levels ~1 GB, window aggregates' `_small` 0.3 GB.
+- ~2.9 GB beyond the cache that the walk does not reach (statics), not yet identified.
+
+So most of the gap is residency, state the live run holds in memory and a restore reads back on demand, not
+garbage. The exception was in the two stores: `Entry<StructuralRow, SortedDictionary>[]` and
+`Entry<StructuralRow, List>[]` arrays of 1,092 MB each under TOP-K, 901 MB each under rank, and
+`Int32[]` buckets of 369 and 306 MB. Each had zero entries. `OrderedPartitionStore` keeps a write-back
+cache (`_small`) and a queue (`_pending`) of partitions, bounded by `WindowWriteBackBytes` (§5.8). It
+empties both with `Dictionary.Clear()`, which keeps the capacity, so one huge tick leaves arrays sized for
+it in every replica's store for the rest of the run. The byte estimate the budget reads counts entries, not
+capacity, so it saw none of the ~4–5 GB.
+
+**Fix.** Emptying either dictionary now trims it when its capacity is above 1,024
+(`OrderedPartitionStore.Release`). Test: `WindowWriteBackBudgetTests.A_dropped_cache_releases_a_huge_ticks_capacity`
+(20,000 partitions in one tick, budget 0: both capacities must be ≤ 1,024 afterwards and the unbounded twin's
+≥ 20,000, then five more ticks with matching digests); without the trim it fails with capacity 36,353.
+Suites pass default and forced.
+
+**xt85 (a full W=12 batch 1, xt82's setup, with the fix).**
+
+- At the end of tick 17, live is 11,989 MB, against 16,958 MB: −5.0 GB. Walked is 8,081 MB, against 13,066 MB.
+- In tick 18 it passes op 1733, where xt82 failed (live there 20.8 GB, against 26.6 GB), and runs out of
+  memory after op 1994/2222 (`ExchangeIndexOp`, 40.5 s, live 48.0 GB, pressure Critical). That is where the
+  restored control xt83-ctl failed (46.7 GB). Wall 3,350 s, peak RSS 43 GiB, spill on disk 35 GB.
+
+**What this means.** The live run and the restored run now hit the same wall, so the tick-17 restart point
+stands in for tick 18 from here (~27 min to op 1994 instead of ~54). Op 1994 is live-bound: ~27 GB more live
+appears during one exchange. Next: a census right after ops 1984, 1993 and 1994 in a restored run
+(`XT_CENSUS_AT_OPS`) to see what holds it.

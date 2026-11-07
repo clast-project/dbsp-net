@@ -447,7 +447,7 @@ internal sealed class OrderedPartitionStore
             }
         }
 
-        _pending.Clear();
+        Release(_pending);
         _cold!.IntegrateEntries(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
     }
 
@@ -507,7 +507,7 @@ internal sealed class OrderedPartitionStore
         if (_cold is not null)
         {
             Flush();
-            _small.Clear();
+            Release(_small);
             _cold.Freeze();
             Interlocked.Exchange(ref _cacheBytes, 0);
         }
@@ -531,17 +531,35 @@ internal sealed class OrderedPartitionStore
         }
     }
 
+    // Dictionary.Clear keeps its arrays. A cache that held one huge tick's partitions would keep that
+    // tick's capacity, empty, for good: at extended TPC-DS tick 17 ~4 GB of entry and bucket arrays
+    // across the rank and top-K stores, invisible to the byte estimate (docs/design-bounded-memory.md
+    // §5.30). Past a small capacity, cleared means released.
+    internal const int KeepCapacity = 1024;
+
+    private static void Release<TValue>(Dictionary<StructuralRow, TValue> map)
+    {
+        map.Clear();
+        if (map.EnsureCapacity(0) > KeepCapacity)
+        {
+            map.TrimExcess();
+        }
+    }
+
+    /// <summary>The cache's and the queue's dictionary capacities (tests).</summary>
+    internal (int Small, int Pending) CacheCapacity => (_small.EnsureCapacity(0), _pending.EnsureCapacity(0));
+
     /// <summary>Forget everything (a restore replaces the state).</summary>
     public void Clear()
     {
-        _small.Clear();
+        Release(_small);
         _large.Clear();
         _unloaded.Clear();
         _smallRows = 0;
         Interlocked.Exchange(ref _cacheBytes, 0);
         _cold?.Clear();
         _keys = new KeyFilter();
-        _pending.Clear();
+        Release(_pending);
     }
 
     /// <summary>Every row and weight (a whole-state write).</summary>
