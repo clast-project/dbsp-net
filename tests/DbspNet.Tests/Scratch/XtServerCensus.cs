@@ -273,12 +273,13 @@ public class XtServerCensus
                     {
                         seen = info.Index;
                         var used = info.HeapSizeBytes - info.FragmentedBytes;
-                        if (used >= timelineMib << 20 || info.Generation == 2)
+                        if (used >= timelineMib << 20 || info.TotalCommittedBytes >= timelineMib << 20 || info.Generation == 2)
                         {
+                            var g = info.GenerationInfo;
                             lock (gate)
                             {
                                 log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                                    $"GCUSED t_s={sw.Elapsed.TotalSeconds:F1} gc={info.Index} gen={info.Generation} used_mib={used >> 20} promoted_mib={info.PromotedBytes >> 20} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current}"));
+                                    $"GCUSED t_s={sw.Elapsed.TotalSeconds:F1} gc={info.Index} gen={info.Generation} used_mib={used >> 20} promoted_mib={info.PromotedBytes >> 20} committed_mib={info.TotalCommittedBytes >> 20} frag_mib={info.FragmentedBytes >> 20} frag_g2_mib={g[2].FragmentationAfterBytes >> 20} frag_loh_mib={g[3].FragmentationAfterBytes >> 20} frag_poh_mib={g[4].FragmentationAfterBytes >> 20} loh_mib={g[3].SizeAfterBytes >> 20} poh_mib={g[4].SizeAfterBytes >> 20} pinned={info.PinnedObjectsCount} compacted={info.Compacted} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current}"));
                             }
                         }
                     }

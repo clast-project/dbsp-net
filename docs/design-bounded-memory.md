@@ -2802,3 +2802,13 @@ measured once per collection moves. A quarter-size chunk makes far fewer such co
 completed 31% faster than xt118 (the gen-2 work saved), but it allocates 17% more: more, smaller runs per
 delta, so readers decode and sum more entries that several runs share (ops reading those deltas, e.g. the
 left joins 2012, 2082 and 2194, 10–14 → 52–76 GiB). One run each, under a failure that is nondeterministic.
+
+**xt122 (full batch 1 from scratch, `DBSPNET_STEP_SPILL_ROWS=262144`): out of memory at t = 1,814 s, op
+~1724 of tick 18,** with little live. The throw came from `LazyTraceBlock.Load`, reading a block for a
+streamed giant group's walk (`StreamedGroup.TryCreate` → `TouchedKeys.Of` → `IncrementalLeftJoinOp.Step`;
+ops 1719–1721 carry 21.7M rows a worker). For its last ~10 s the GC ran a full collection about every
+second, each leaving ~12.5 GB in use (the most after any full collection in the run was 30.5 GB, at t =
+1,462 s). A failure with three quarters of the 48 GiB limit not holding live data is not working memory:
+it is committed memory the heap cannot use (fragmentation, free regions kept committed, pinned blocks).
+The census line did not record which; `GCUSED` now adds committed bytes, fragmentation by generation
+(gen 2, LOH, POH), LOH and POH sizes, the pinned-object count and whether the collection compacted.
