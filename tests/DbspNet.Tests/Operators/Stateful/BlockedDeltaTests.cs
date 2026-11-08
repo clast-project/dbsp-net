@@ -935,4 +935,32 @@ public class BlockedDeltaTests
         AssertSame(Managed(adds), view.LastDelta);
         AssertSame(Managed(adds), view.Current);
     }
+
+    // §5.34: a parallel view's row count is the number of rows whose weight summed over the shards is non-zero.
+    // It was counted by forming the whole view (the end of extended TPC-DS batch 1 ran out of memory there);
+    // it is now one hash-ordered merge of every shard's runs. A row on two shards counts once, a row that
+    // cancels across shards not at all, and rows not yet frozen (a managed level) count too.
+    [Fact]
+    public void A_count_across_shards_sums_each_rows_weight_without_forming_the_view()
+    {
+        var a = new BlockedZSetTrace(Format);
+        var b = new BlockedZSetTrace(Format);
+        var c = new BlockedZSetTrace(Format);
+        var aRows = Enumerable.Range(0, 100).Select(i => (i, i % 4, 1L)).ToArray();
+        var bRows = Enumerable.Range(50, 100).Select(i => (i, i % 4, 1L)).Append((0, 0, -1L)).ToArray();
+        var bPending = Enumerable.Range(200, 10).Select(i => (i, i % 4, 1L)).ToArray();
+        var cPending = Enumerable.Range(140, 20).Select(i => (i, i % 4, -1L)).Append((205, 1, -1L)).ToArray();
+        a.Integrate(Managed(aRows));
+        a.Idle();
+        b.Integrate(Managed(bRows));
+        b.Idle();
+        b.Integrate(Managed(bPending));
+        c.Integrate(Managed(cPending));
+
+        var count = BlockedIndexedTrace.CountRowsAcross([a.Trace, b.Trace, c.Trace]);
+
+        var sum = Managed(aRows) + Managed(bRows) + Managed(bPending) + Managed(cPending);
+        Assert.Equal(sum.Count, count);
+        Assert.NotEqual(a.Count + b.Count + c.Count, count);
+    }
 }

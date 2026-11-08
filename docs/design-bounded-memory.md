@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **Tick 18 at W=12 now reaches op 2171/2222 restored (§5.33: stored views kept each tick's delta managed, ~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **Tick 18 at W=12 completed restored once (xt99, §5.34) and fails in its ops 1689–1700 in other runs, by heap swing at 8–10 GB live; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2512,3 +2512,43 @@ because its rows were past its own chunk.
 touched keys (`HashSet(dl.GroupCount + dr.GroupCount)`). Live there is 24.3 GB but the heap before the
 collection is 82.6 GB at Low pressure: what is left is allocation between collections, not held state.
 Wall 2,781 s.
+
+### 5.34 Outer joins' touched-key set, and a parallel view's first count (2026-11-07)
+
+**The outer joins' touched keys.** `IncrementalLeftJoinOp` and `IncrementalFullJoinOp` collected every key
+of both deltas into a `HashSet` sized for both before visiting them: xt98's six failing workers were
+allocating it. They now visit the left delta's keys, then the right's not on the left
+(`TouchedKeys.Of`): each key once, no set. Without the test (a key on both sides visited twice), 65 join
+tests fail. The first version tested membership with `ContainsKey` and then probed the left group again:
+on a block-backed left delta that doubled the probes, and op 1693 (a left join) took 81 s and 68 s in xt99
+and xt100 against 34.6 s in xt98. `TouchedKeys.Of` now yields each key with its left group: a left key's
+group as the enumeration gives it (no probe), a right key's one probe as both the test and the group.
+
+**xt99 (restored, the above).** Tick 18 completes: op 2222 at 3,087 s, live 9.6 GB at the end of the tick,
+peak RSS 47 GiB. Live after the busiest ops stays 16–27 GB; the heap between collections reaches 62–84 GB.
+Then, still in batch 1, the run runs out of memory *after* the step: the engine's statistics
+(`DbspNetEngine.OutputStats`) read each view's `RowCount`, and a parallel view's first count formed the whole
+view (every shard's rows decoded into lists, then summed into one set) to count it. A count is kept current
+from each tick's delta only once it has been read, and batch 1's ticks run under one wait, so a full run
+reads it for the first time here too: this is the end of batch 1 at W > 1, not a restore artifact (W = 1
+counts its one shard's trace in place, §5.24).
+
+**Fix.** `BlockedIndexedTrace.CountRowsAcross(traces)` counts the rows whose weight summed over the shards
+is non-zero, by one hash-ordered merge of every shard's runs (the shards are replicas of one operator, so
+their runs share one layout and order), plus a dictionary of rows not yet frozen (which a freeze bounds).
+A row split across workers counts once, a row that cancels across them not at all. `RowCount` uses it
+whenever every shard is held as blocks. Test
+`BlockedDeltaTests.A_count_across_shards_sums_each_rows_weight_without_forming_the_view` (three shards with
+overlapping, cancelling and pending rows, against the sum's count); it fails if the pending rows are dropped,
+and if each shard is streamed by itself (a split row counted twice).
+
+**xt100 (restored, the count fixed, the doubled probe still in).** Out of memory at 635 s, just past op 1693,
+in `ZSet.Plus` (a key's left group plus its delta, `IncrementalLeftJoinOp`), with 7.7 GB live but RSS 45 GiB:
+the heap between collections swings up to ~44 GB at ops 1689–1696, and whether a run survives this stretch
+varies (xt98 and xt99 did).
+
+**xt101 (restored, one probe per key).** Op 1693 takes 43.9 s (xt98 34.6 s). Out of memory at 665 s, again just
+past op 1693, in that left join's trace adopting its delta's runs (`MergeMany` loading lazily restored blocks).
+Through ops 1650–1700 live stays 8–10 GB in all four runs; what differs is RSS at op 1693: 35–39 GiB in xt98
+and xt99, which went on, and 42–45 GiB in xt100 and xt101, which did not. The failure here is the heap's swing
+between collections, not held state, and it is not deterministic from run to run.

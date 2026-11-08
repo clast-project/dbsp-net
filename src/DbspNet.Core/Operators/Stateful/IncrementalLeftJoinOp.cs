@@ -151,24 +151,11 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
 
         var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
 
-        // Every key that could have a non-zero delta this tick shows up in
-        // dl or dr; keys not touched either way contribute nothing.
-        var touched = new HashSet<TKey>(dl.GroupCount + dr.GroupCount);
-        foreach (var k in dl.Keys)
-        {
-            touched.Add(k);
-        }
-
-        foreach (var k in dr.Keys)
-        {
-            touched.Add(k);
-        }
-
-        foreach (var key in touched)
+        // Every key that could have a non-zero delta this tick shows up in dl or dr, each once (§5.34).
+        foreach (var (key, dlK) in TouchedKeys.Of(dl, dr))
         {
             var oldL = leftOld.GroupFor(key);
             var oldR = rightOld.GroupFor(key);
-            var dlK = dl.GroupFor(key);
             var drK = dr.GroupFor(key);
             var newL = oldL + dlK;
             var newR = oldR + drK;

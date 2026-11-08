@@ -217,7 +217,10 @@ public sealed class ParallelProgramOutput
                 // Counted from a view formed for this read only: caching it would keep a decoded
                 // copy of every row alive, which a blocked view (and its sink's index) otherwise
                 // holds as bytes (docs/design-flat-trace-state.md §3.10).
-                _rowCount = _cached is not null && _cachedTick == tick ? _cached.Count : FormView().Count;
+                // Blocked shards are counted by one merge of their runs, never formed (§5.34).
+                _rowCount = _cached is not null && _cachedTick == tick ? _cached.Count
+                    : ShardTraces is { } traces && DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.CountRowsAcross(traces) is { } n ? n
+                    : FormView().Count;
                 _rowCountTick = tick;
             }
 

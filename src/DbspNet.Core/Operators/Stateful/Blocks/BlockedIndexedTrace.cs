@@ -980,6 +980,65 @@ internal sealed class BlockedIndexedTrace
         return (int)Math.Min(count, int.MaxValue);
     }
 
+    /// <summary>
+    /// As <see cref="CountRows"/> for the sum of several Z-set traces of one layout (a parallel view's
+    /// shards, whose rows may be split across workers): every shard's runs in one hash-ordered merge,
+    /// so a row is counted once, by its summed weight, and nothing is materialized. A parallel view's
+    /// first count formed the whole view to count it (§5.34). Null when the traces do not share the
+    /// default row-hash order.
+    /// </summary>
+    internal static long? CountRowsAcross(IReadOnlyList<BlockedIndexedTrace> traces)
+    {
+        if (traces.Count == 0)
+        {
+            return 0;
+        }
+
+        if (traces.Any(t => !t.OrdersByRowHash))
+        {
+            return null;
+        }
+
+        Dictionary<StructuralRow, long>? managed = null;
+        foreach (var trace in traces)
+        {
+            foreach (var level in trace._managed)
+            {
+                foreach (var (row, weight) in level.Rows ?? throw new InvalidOperationException("not a Z-set trace"))
+                {
+                    if (!trace.Dropped(row, level.Floor))
+                    {
+                        managed ??= [];
+                        managed[row] = managed.GetValueOrDefault(row) + weight.Value;
+                    }
+                }
+            }
+        }
+
+        // Replicas of one operator: one layout, one monotone key, so the first trace reads every run.
+        long count = 0;
+        foreach (var (row, weight) in traces[0].StreamRunsCore(Captured([.. traces.SelectMany(t => t._runs)])))
+        {
+            var total = weight.Value;
+            if (managed is not null && managed.Remove(row, out var more))
+            {
+                total += more;
+            }
+
+            if (total != 0)
+            {
+                count++;
+            }
+        }
+
+        if (managed is not null)
+        {
+            count += managed.Values.Count(static w => w != 0);
+        }
+
+        return count;
+    }
+
     /// <summary>A Z-set trace's net contents (<see cref="IntegrateRows"/>): every row with a non-zero
     /// weight. Not cached: the caller decides how long to hold it.</summary>
     public ZSet<StructuralRow, Z64> MaterializeRows()
