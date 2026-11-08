@@ -2769,3 +2769,14 @@ each hold a materialized 7.2M-row group at once (~8 GB each), and the run passed
 xt114/xt115 ran out of memory. One completion is not proof against a nondeterministic failure (xt99 and
 xt109 completed before it too), but the margin it removes is the one measured. End-of-batch live 11.7 GB
 (xt109 10.5).
+
+**xt119 (296f18a, full batch 1 from scratch, W = 12, 48 GiB heap): out of memory late in tick 18.**
+It passed everything that had stopped full runs before: the giant joins (ops 1683–1703), op 1994 (xt85's
+wall) and ops 2153–2170, and it allocated like xt118 up to there (ops 1680–1705 577 GiB, op 2171 261 GiB
+against xt109's 359). It failed at t = 3,732 s in op 2171, the eligibility left join
+(`ResidualOuterJoin.Pairs` → `ZSetBuilder.Add` → `SpillingRows.FreezeChunk` → `BlockedIndexedTrace.FreezeRows`),
+on the one worker of twelve that had not finished it. That op is not skewed: every worker emits ~2.39M rows
+and allocates ~24 GiB in it. The full run carries more between ops than the restored one (live 29.8–33.4 GB
+after ops 2168–2170, against 26.2–29.9 GB in xt118; cf. §5.30), so twelve workers' concurrent working memory
+in op 2171, including each worker's managed output chunk (up to `DBSPNET_STEP_SPILL_ROWS` = 1M rows,
+held while it freezes), no longer fits. Wall to the failure 3,733 s, peak RSS 46 GiB, spill 65 GB.
