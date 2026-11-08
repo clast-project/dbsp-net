@@ -200,4 +200,44 @@ public class IncrementalLeftJoinTests
 
         Assert.Equal(expected.Build(), outAcc);
     }
+
+    // docs/design-bounded-memory.md §5.35: a key whose match does not change reads neither its old left group
+    // (decoded from blocks when the trace is blocked) nor forms its new one (a copy of it): on a coarse key
+    // (extended TPC-DS op 1693, 7.2M rows a worker under a few keys) that was millions of rows each tick for
+    // nothing. One key with a 100k-row left group and a match; one more left row, no right change: the step
+    // allocates a small fraction of one copy of the group.
+    [Fact]
+    public void A_matched_key_with_no_right_change_does_not_copy_its_left_group()
+    {
+        InputHandle<ZSet<Person, Z64>>? li = null;
+        InputHandle<ZSet<Role, Z64>>? ri = null;
+        OutputHandle<ZSet<OutRow, Z64>>? oh = null;
+        var c = RootCircuit.Build(b =>
+        {
+            var (lh, ls) = b.ZSetInput<Person, Z64>();
+            var (rh, rs) = b.ZSetInput<Role, Z64>();
+            li = lh;
+            ri = rh;
+            var joined = b.IncrementalLeftJoin(
+                b.IndexBy(ls, static _ => 0),
+                b.IndexBy(rs, static _ => 0),
+                joinCombine: (_, p, r) => new OutRow(p.Id, p.Name, r.RoleName),
+                nullPadCombine: (_, p) => new OutRow(p.Id, p.Name, RoleName: null));
+            oh = b.Output(joined);
+        });
+        const int group = 100_000;
+        li!.Push(ZSet.FromEntries(Enumerable.Range(0, group).Select(i => (new Person(i, "p"), Z64.One))));
+        ri!.Push(ZSet.Singleton(new Role(0, "r"), Z64.One));
+        c.Step();
+        c.Step();
+
+        li.Push(ZSet.Singleton(new Person(group, "p"), Z64.One));
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        c.Step();
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(Z64.One, oh!.Current.WeightOf(new OutRow(group, "p", "r")));
+        Assert.Equal(1, oh.Current.Count);
+        Assert.True(allocated < group * 8L, $"allocated {allocated:N0} bytes for a one-row delta against a {group:N0}-row group");
+    }
 }

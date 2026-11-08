@@ -67,7 +67,7 @@ internal static class BlockedTraceCheckpoint
         }
 
         var paths = new List<string>(runs.Count);
-        var written = new List<(BlockedIndexedTrace.Run Run, string Path, List<(RunBlock Index, TraceBlock? Body)> Bodies)>();
+        var written = new List<(BlockedIndexedTrace.Run Run, string Path, List<(RunBlock Index, TraceBlock? Body, int[]? ValueHashes)> Bodies)>();
         long baseEntries = 0, deltaEntries = 0;
 
         // Chain order is base first: the oldest (largest) run.
@@ -438,7 +438,11 @@ internal static class BlockedTraceCheckpoint
         var blocks = new ITraceBlock[bodies.Count];
         for (var b = 0; b < blocks.Length; b++)
         {
-            blocks[b] = new LazyTraceBlock(schema, fs, path, bodies[b].Index, bodies[b].Body);
+            blocks[b] = new LazyTraceBlock(schema, fs, path, bodies[b].Index, bodies[b].Body)
+            {
+                KeepValueHashes = !trace.Compacts,
+                SeedValueHashes = trace.Compacts ? null : bodies[b].ValueHashes,
+            };
         }
 
         run.Persisted = (fs, path);
@@ -447,11 +451,11 @@ internal static class BlockedTraceCheckpoint
 
     // One run file from a run's blocks, raw. A hash spanning blocks in memory becomes one block.
     // Returns each file block's index and, where it is byte for byte one in-memory block, that block.
-    private static async ValueTask<List<(RunBlock Index, TraceBlock? Body)>> WriteRunAsync(
+    private static async ValueTask<List<(RunBlock Index, TraceBlock? Body, int[]? ValueHashes)>> WriteRunAsync(
         ITableFileSystem fs, string path, ILayout codec, BlockedIndexedTrace.Run run, CancellationToken cancellationToken)
     {
         var schema = codec.Blocks!;
-        var bodies = new List<(RunBlock Index, TraceBlock? Body)>();
+        var bodies = new List<(RunBlock Index, TraceBlock? Body, int[]? ValueHashes)>();
         await using var writer = await CreateRunWriterAsync(fs, path, codec, cancellationToken).ConfigureAwait(false);
         var blocks = run.Blocks;
         for (var b = 0; b < blocks.Length;)
@@ -462,7 +466,7 @@ internal static class BlockedTraceCheckpoint
                 end++;
             }
 
-            await AppendChainAsync(writer, schema, blocks, b, end, (ix, body) => bodies.Add((ix, body)), cancellationToken).ConfigureAwait(false);
+            await AppendChainAsync(writer, schema, blocks, b, end, (ix, body, hashes) => bodies.Add((ix, body, hashes)), cancellationToken).ConfigureAwait(false);
             b = end;
         }
 
@@ -476,7 +480,7 @@ internal static class BlockedTraceCheckpoint
     // Blocks [b, end), chained by a hash that spans them (or one block), appended as file blocks.
     private static async ValueTask AppendChainAsync(
         RunStreamWriter writer, BlockSchema schema, IReadOnlyList<ITraceBlock> blocks, int b, int end,
-        Action<RunBlock, TraceBlock?> written, CancellationToken cancellationToken)
+        Action<RunBlock, TraceBlock?, int[]?> written, CancellationToken cancellationToken)
     {
         var tj = Core.Operators.Stateful.Blocks.BlockTraceProfile.Now();
         // Without eviction a span is written whole (neighbours and all): nothing faults it in for
@@ -502,7 +506,9 @@ internal static class BlockedTraceCheckpoint
             if (piece.Parts is { } parts)
             {
                 var hashes = Distinct(parts);
-                await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken, ix => written(ix, null))
+                // No body (the parts were never concatenated in memory), but the parts' value hashes (§5.35).
+                var valueHashes = ConcatValueHashes(parts);
+                await writer.AppendConcatAsync(schema, parts, hashes, piece.Count, hashes.Count, cancellationToken, ix => written(ix, null, valueHashes))
                     .ConfigureAwait(false);
             }
             else
@@ -513,10 +519,35 @@ internal static class BlockedTraceCheckpoint
                 // Hand back only a body that was in memory already: one read from a file (a spilled run
                 // a checkpoint rewrites) stays the cache's to drop, not pinned by the caller until commit.
                 var keep = fromFile && Array.IndexOf(chain, block, b, end - b) < 0 ? null : block;
-                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken, ix => written(ix, keep))
+                await writer.AppendRawAsync(block.Message, hashes, block.Count, hashes.Count, cancellationToken, ix => written(ix, keep, block.KnownValueHashes))
                     .ConfigureAwait(false);
             }
         }
+    }
+
+    // The parts' value hashes end to end, or null when a part has none.
+    private static int[]? ConcatValueHashes(IReadOnlyList<TraceBlock> parts)
+    {
+        var n = 0;
+        foreach (var part in parts)
+        {
+            if (part.KnownValueHashes is null)
+            {
+                return null;
+            }
+
+            n += part.Count;
+        }
+
+        var hashes = new int[n];
+        var at = 0;
+        foreach (var part in parts)
+        {
+            part.KnownValueHashes!.AsSpan(0, part.Count).CopyTo(hashes.AsSpan(at));
+            at += part.Count;
+        }
+
+        return hashes;
     }
 
     /// <summary>
@@ -539,8 +570,11 @@ internal static class BlockedTraceCheckpoint
         /// <summary>The most block bytes any streamed run held in memory at once (tests, §5.24).</summary>
         internal static long PeakHeldBytes;
 
-        private StreamedRunFile(ITableFileSystem fs, string path, BlockSchema schema, RunStreamWriter writer, Func<long, RunFileLease> register)
+        private readonly bool _keepValueHashes;
+
+        private StreamedRunFile(ITableFileSystem fs, string path, BlockSchema schema, RunStreamWriter writer, Func<long, RunFileLease> register, bool keepValueHashes)
         {
+            _keepValueHashes = keepValueHashes;
             _fs = fs;
             _path = path;
             _schema = schema;
@@ -549,8 +583,10 @@ internal static class BlockedTraceCheckpoint
         }
 
         /// <param name="register">Given the finished file's length, its lease.</param>
-        internal static StreamedRunFile Open(ITableFileSystem fs, string path, ILayout codec, Func<long, RunFileLease> register) =>
-            new(fs, path, codec.Blocks!, CreateRunWriterAsync(fs, path, codec, CancellationToken.None).AsTask().GetAwaiter().GetResult(), register);
+        /// <param name="keepValueHashes">The run is a block-backed delta's: its blocks keep their value hashes
+        /// when the cache drops their bodies (<see cref="LazyTraceBlock.KeepValueHashes"/>).</param>
+        internal static StreamedRunFile Open(ITableFileSystem fs, string path, ILayout codec, Func<long, RunFileLease> register, bool keepValueHashes = false) =>
+            new(fs, path, codec.Blocks!, CreateRunWriterAsync(fs, path, codec, CancellationToken.None).AsTask().GetAwaiter().GetResult(), register, keepValueHashes);
 
         /// <summary>A chain a giant hash continues is written once it holds this many bytes, as a file
         /// block of its own that the next continues (as <c>Capped</c> cuts one past 2 GiB): a giant
@@ -597,7 +633,11 @@ internal static class BlockedTraceCheckpoint
             // append), its body handed to the block cache (which evicts past its budget): holding the
             // bodies until the finish held the whole run (§5.24).
             AppendChainAsync(
-                _writer, _schema, _chain, 0, _chain.Count, (index, body) => _blocks.Add(new LazyTraceBlock(_schema, _fs, _path, index, body)),
+                _writer, _schema, _chain, 0, _chain.Count, (index, body, hashes) => _blocks.Add(new LazyTraceBlock(_schema, _fs, _path, index, body)
+                {
+                    KeepValueHashes = _keepValueHashes,
+                    SeedValueHashes = _keepValueHashes ? hashes : null,
+                }),
                 CancellationToken.None).AsTask().GetAwaiter().GetResult();
             _chain.Clear();
             _chainBytes = 0;
@@ -828,12 +868,34 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     internal volatile bool Referenced;
 
+    /// <summary>Keep the body's value hashes when the cache drops it (docs/design-bounded-memory.md §5.35): a
+    /// block-backed delta's spilled run, which a trace adopting it merges by value hash. A reload would
+    /// otherwise decode every value to hash it again. 4 bytes an entry, for a delta's lifetime only.</summary>
+    internal bool KeepValueHashes { get; init; }
+
+    /// <summary>Value hashes known when the block was written though it has no body (a giant group's
+    /// chain, written from its parts): kept as <see cref="KeepValueHashes"/> keeps a dropped body's.</summary>
+    internal int[]? SeedValueHashes
+    {
+        init => _valueHashes = value is { } hashes && hashes.Length == _index.Entries ? hashes : null;
+    }
+
+    private int[]? _valueHashes;
+
     /// <summary>Forget the body (the cache evicted it); the next read loads it again.</summary>
     internal void DropBody()
     {
-        if (Core.Operators.Stateful.Blocks.BlockAccess.Enabled && _loaded is { } body)
+        if (_loaded is { } body)
         {
-            BlockCache.TrackDropped(body);
+            if (Core.Operators.Stateful.Blocks.BlockAccess.Enabled)
+            {
+                BlockCache.TrackDropped(body);
+            }
+
+            if (KeepValueHashes && body.KnownValueHashes is { } hashes)
+            {
+                Interlocked.CompareExchange(ref _valueHashes, hashes, null);
+            }
         }
 
         Volatile.Write(ref _loaded, null);
@@ -904,7 +966,7 @@ internal sealed class LazyTraceBlock : ITraceBlock
 
     public object? ValueCell(int i, int column) => Loaded.ValueCell(i, column);
 
-    public int ValueHash(int i) => Loaded.ValueHash(i);
+    public int ValueHash(int i) => Volatile.Read(ref _valueHashes) is { } hashes ? hashes[i] : Loaded.ValueHash(i);
 
     public bool ValueEquals(int i, StructuralRow value) => Loaded.ValueEquals(i, value);
 
@@ -991,6 +1053,11 @@ internal sealed class LazyTraceBlock : ITraceBlock
     // Publish a loaded body (another thread may have won) and admit it to the cache.
     private TraceBlock Install(TraceBlock block)
     {
+        if (Volatile.Read(ref _valueHashes) is { } hashes)
+        {
+            block.AdoptValueHashes(hashes);
+        }
+
         if (Interlocked.CompareExchange(ref _loaded, block, null) is { } other)
         {
             return other;

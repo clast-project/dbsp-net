@@ -124,20 +124,31 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
 
         // With a block format the gather spills past the step threshold like any delta builder
         // (§5.27): a skewed key can land most of a large delta on one worker.
-        var capacity = (int)Math.Min(gatherRows, int.MaxValue);
-        var gathered = format is not null
-            ? DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.For<TKey, TWeight>(format, capacity)
-            : new ZSetBuilder<TKey, TWeight>(capacity);
+        var column = new IReadOnlyList<KeyValuePair<TKey, TWeight>>?[workers];
         for (var src = 0; src < workers; src++)
         {
-            var bucket = _coordinator.Take(src, _worker);
-            if (bucket is not null)
-            {
-                gathered.AddRange(bucket);
-            }
+            column[src] = _coordinator.Take(src, _worker);
         }
 
-        _output.SetCurrent(gathered.Build());
+        // Spilled buckets are summed as the union of their runs, never decoded here (§5.35).
+        if (format is null || ExchangeBuckets.GatherBlocked(column, format) is not { } result)
+        {
+            var capacity = (int)Math.Min(gatherRows, int.MaxValue);
+            var gathered = format is not null
+                ? DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.For<TKey, TWeight>(format, capacity)
+                : new ZSetBuilder<TKey, TWeight>(capacity);
+            foreach (var bucket in column)
+            {
+                if (bucket is not null)
+                {
+                    gathered.AddRange(bucket);
+                }
+            }
+
+            result = gathered.Build();
+        }
+
+        _output.SetCurrent(result);
 
         if (profile)
         {

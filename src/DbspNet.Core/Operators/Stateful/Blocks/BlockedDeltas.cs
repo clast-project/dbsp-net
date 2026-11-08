@@ -25,6 +25,9 @@ internal static class DeltaSpill
     /// <summary>Block-backed deltas a trace adopted the runs of, and their rows (§5.19).</summary>
     internal static long Adopted, AdoptedRows;
 
+    /// <summary>Block-backed sets an exchange gather summed as the union of their runs (§5.35).</summary>
+    internal static long Unioned;
+
     /// <summary>A builder for a structural delta of <paramref name="format"/> (null: plain).</summary>
     public static ZSetBuilder<StructuralRow, Z64> Rows(object? format, int capacity) => Rows(format, capacity, 1);
 
@@ -224,6 +227,19 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
 
     /// <summary>Runs across every part (tests, census).</summary>
     internal int RunCount => _parts.Sum(p => p.Trace.Runs.Count);
+
+    /// <summary>The block format of every run.</summary>
+    internal ITraceBlockFormat Format => _format;
+
+    /// <summary>The sum of <paramref name="sets"/>, all of <paramref name="format"/>: the union of their
+    /// runs, merged only when read (an exchange gathering spilled buckets, §5.35). No row is decoded.</summary>
+    internal static ZSet<StructuralRow, Z64> Union(IReadOnlyList<BlockedRows> sets, ITraceBlockFormat format)
+    {
+        Interlocked.Add(ref DeltaSpill.Unioned, sets.Count);
+        return sets.Count == 1 ? new ZSet<StructuralRow, Z64>(sets[0])
+            : Create([.. sets.SelectMany(s => s._parts)], format) is { } union ? new ZSet<StructuralRow, Z64>(union)
+            : ZSet<StructuralRow, Z64>.Empty;
+    }
 
     public override int Count => _count;
 

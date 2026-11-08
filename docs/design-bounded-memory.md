@@ -2552,3 +2552,81 @@ past op 1693, in that left join's trace adopting its delta's runs (`MergeMany` l
 Through ops 1650–1700 live stays 8–10 GB in all four runs; what differs is RSS at op 1693: 35–39 GiB in xt98
 and xt99, which went on, and 42–45 GiB in xt100 and xt101, which did not. The failure here is the heap's swing
 between collections, not held state, and it is not deterministic from run to run.
+
+### 5.35 Ops 1680–1705: one join key per worker, decoded and encoded again at every step (2026-11-07)
+
+**Lazy left groups (xt102).** The left join read each touched key's old left group from its trace and
+formed the new one (`oldL + dlK`) before choosing a branch. On a coarse key that is millions of rows
+decoded from blocks and copied again, and the common branch (still matched, no right-side change) uses
+neither. Each branch now reads `oldL` only where it needs it (matched with a right delta, gained a match,
+lost one). `IncrementalFullJoinOp` is unchanged: its case analysis needs the emptiness of both left
+groups. Test `IncrementalLeftJoinTests.A_matched_key_with_no_right_change_does_not_copy_its_left_group`
+(a 100k-row group, one new row: the step allocates under 8 B a row of the group; the eager version
+allocated 3.46 MB and fails). Fourteen join tests fail if `oldL ⋈ drK` is skipped on the wrong condition.
+xt102 (restored) **completed tick 18 and batch 1**: 3,246 s, live 9.2 GB at the end of the tick,
+peak RSS 47 GiB. Op 1693 took 47 s.
+
+**Per-op allocation.** The census harness now logs `OPALLOC` (each worker's allocated bytes per
+operator, ≥ 512 MiB) and, with `XT_DESCRIBE_OPS=from-to`, `OPDESC` (each operator's streams and
+delegates). Tick 18 allocates 7,138 GiB. Ops 1680–1700 come to ~560 GiB summed over workers. Their shape
+repeats every ten ops: an exchange (1687, 1697) hashes on the next join's key, which has three values, so
+three workers take 7.2M rows each and the other nine none. Two filters (1688, 1689) read the exchange's
+output, a `GroupProject` (1691) indexes it, and a left join (1693, 1703) finds one key with 7.2M left rows
+and one right row. The left delta is block backed (`BlockedGroups`). A temporary probe in the join gave
+each phase's allocation on a hot worker:
+
+| op 1693, one hot worker | xt103 | xt107 | xt108 |
+|---|---|---|---|
+| per-key loop (combine, output builder) | 19.5–20.7 GiB | same | same |
+| output `Build` | 0.6 GiB | same | same |
+| left trace `Integrate(dl)` | 16.6–17.8 GiB | 11.7–12.5 GiB | 5.2–5.5 GiB |
+| whole op | 37.5–39.9 GiB | 31.8–33.8 GiB | 25.3–26.7 GiB |
+
+**The integrate is a giant merge.** The trace adopts the delta's runs (§5.19), and with more than two
+runs it merges them in one k-way pass (`MergeMany`), which for one key is `TryMergeGiant`. That pass
+decoded every value twice: once to check that each run is in value-hash order, and once to merge by
+value hash. Then it encoded every value again. Three changes:
+
+1. The order check reads each entry's stored value hash (`ITraceBlock.ValueHash`), not its decoded row.
+2. The merge copies entries whole. A new `ITraceBlockFormat.Copy` (`BlockWriter.Copy`, the key-only
+   `Gather` of §3h generalised to every column) builds a block from (source block, index) pairs without
+   decoding, carrying the value hashes over. `RunBuilder` gains a copy mode for one hash, so that hash's
+   blocks hold only it, as before. A value is decoded only where entries from two runs share its value
+   hash, to sum equal rows; the survivor is copied from one of its entries with the summed weight.
+3. A delta's spilled blocks keep their value hashes. The bodies of a 7.2M-row delta are written to files
+   and evicted long before the merge reads them, and a body reloaded from a file had no value hashes, so
+   the first `ValueHash` decoded the whole block to compute them. `LazyTraceBlock.KeepValueHashes` holds
+   them (4 B an entry) when the cache drops the body, for a block-backed delta's own runs only (a trace
+   that does not compact; a delta dies with its tick). A giant group's chain, written to the file from
+   its parts and never concatenated in memory, is seeded with the parts' hashes.
+
+Change 1 alone moved nothing on xt105 (17.4 GiB): change 3 was the reason. Tests:
+
+- `BlockedDeltaTests.A_giant_groups_merge_checks_value_order_without_decoding_values`: merging one key's
+  60k values across six runs allocates 0.44× one decode of every value. It was 1.24× with only change 1,
+  and 2.08× before; the test requires under 1×.
+- `A_giant_group_merges_streaming_and_runs_stay_in_canonical_order` (the property test of §5.24) now runs
+  the copying merge. It fails if tied entries are copied without summing, or if a sum's weight is dropped.
+- `RunSpillerTests.A_spilled_deltas_blocks_keep_their_value_hashes_when_evicted`: every body is evicted
+  as it is admitted; adopting the delta recomputes no value hash. With the kept hashes ignored, it
+  recomputes 14.
+
+The giant joins earlier in the tick gain too: a 2M-row giant integrate at t ≈ 51 s went from 8.9 GiB to
+5.9 GiB. Those merge the adopted run into the trace's older run pairwise, and the trace's own runs
+(which compact) keep no hashes, so their reloaded blocks are still hashed by decoding.
+
+**The skewed exchange's gather.** Each source splits its block-backed share into one spilling builder
+per destination (§5.32), so a hot worker receives twelve block-backed buckets. It then decoded every row
+into one more builder and encoded it again: 13 GiB on each hot worker at op 1687. `ExchangeOp` now sums
+block-backed buckets of its format as the union of their runs (`ExchangeBuckets.GatherBlocked`,
+`BlockedRows.Union`), merged only when read, and adds any managed buckets through a builder. Op 1687 on a
+hot worker went from 13 GiB to 3 GiB (most of that is now its own split). Test
+`BlockedDeltaTests.An_exchange_gathers_spilled_buckets_without_decoding_them` (two overlapping block-backed
+shards, with cancelling rows, and a managed one, at W = 4 and 12); it fails with the union disabled.
+
+**What is left.** The join's per-key loop is ~2.8 KB a row: each left row is decoded, combined with the
+right row into a new structural row, hashed into the output builder and encoded at its freeze. The
+filters and projections in this stretch (1688, 1689, 1691, 1696) cost 10–13 GiB each on a hot worker for
+the same reason. A filter over a block-backed delta could copy its surviving entries instead of building
+them again (its input is consolidated, so its output needs no dictionary). That and the loop are general
+structural-row costs, not specific to this stretch.

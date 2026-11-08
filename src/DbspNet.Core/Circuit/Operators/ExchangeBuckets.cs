@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections;
 using System.Runtime.CompilerServices;
+using DbspNet.Core.Algebra;
 using DbspNet.Core.Collections;
 
 namespace DbspNet.Core.Circuit.Operators;
@@ -75,6 +76,62 @@ internal static class ExchangeBuckets
         }
 
         return rows;
+    }
+
+    /// <summary>
+    /// A gathered column whose buckets are block-backed sets of <paramref name="format"/>, summed as the
+    /// union of their runs instead of decoded into a builder and encoded again (docs/design-bounded-memory.md
+    /// §5.35: a skewed exchange lands millions of spilled rows on one worker). Any other buckets go through a
+    /// spilling builder and are added. Null when the rows are not structural or no bucket is block backed.
+    /// </summary>
+    public static ZSet<TKey, TWeight>? GatherBlocked<TKey, TWeight>(
+        IReadOnlyList<KeyValuePair<TKey, TWeight>>?[] column, object format)
+        where TKey : notnull
+        where TWeight : struct, DbspNet.Core.Algebra.IZRing<TWeight>
+    {
+        if (typeof(TKey) != typeof(StructuralRow) || typeof(TWeight) != typeof(Z64)
+            || format is not DbspNet.Core.Operators.Stateful.Blocks.ITraceBlockFormat blockFormat)
+        {
+            return null;
+        }
+
+        var blocked = new List<DbspNet.Core.Operators.Stateful.Blocks.BlockedRows>();
+        long rest = 0;
+        foreach (var bucket in column)
+        {
+            if (bucket is SetBucket<TKey, TWeight> { Set.External: DbspNet.Core.Operators.Stateful.Blocks.BlockedRows b }
+                && ReferenceEquals(b.Format, blockFormat))
+            {
+                blocked.Add(b);
+            }
+            else
+            {
+                rest += bucket?.Count ?? 0;
+            }
+        }
+
+        if (blocked.Count == 0)
+        {
+            return null;
+        }
+
+        var sum = DbspNet.Core.Operators.Stateful.Blocks.BlockedRows.Union(blocked, blockFormat);
+        if (rest > 0)
+        {
+            var builder = DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Rows(format, (int)Math.Min(rest, int.MaxValue));
+            foreach (var bucket in column)
+            {
+                if (bucket is not null && !(bucket is SetBucket<TKey, TWeight> { Set.External: DbspNet.Core.Operators.Stateful.Blocks.BlockedRows b }
+                    && ReferenceEquals(b.Format, blockFormat)))
+                {
+                    builder.AddRange(Unsafe.As<IReadOnlyList<KeyValuePair<StructuralRow, Z64>>>(bucket));
+                }
+            }
+
+            sum += builder.Build();
+        }
+
+        return Unsafe.As<ZSet<TKey, TWeight>>(sum);
     }
 
     /// <summary>A built (possibly block-backed) Z-set published as a bucket: a gather only enumerates it.</summary>

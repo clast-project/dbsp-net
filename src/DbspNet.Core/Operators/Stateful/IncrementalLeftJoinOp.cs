@@ -154,14 +154,16 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         // Every key that could have a non-zero delta this tick shows up in dl or dr, each once (§5.34).
         foreach (var (key, dlK) in TouchedKeys.Of(dl, dr))
         {
-            var oldL = leftOld.GroupFor(key);
             var oldR = rightOld.GroupFor(key);
             var drK = dr.GroupFor(key);
-            var newL = oldL + dlK;
             var newR = oldR + drK;
 
+            // The key's old left group, read from the trace only where a branch needs it, and its new one
+            // formed only where a match changes (§5.35): on a coarse key the left group is millions of rows,
+            // decoded from blocks and copied once more for newL, and the common case uses neither.
             if (_residual is { } residual)
             {
+                var oldL = leftOld.GroupFor(key);
                 ResidualOuterJoin.JoinInto(builder, key, oldL, dlK, drK, newR, residual, _joinCombine);
                 ResidualOuterJoin.PadInto(builder, key, oldL, dlK, oldR, drK, newR, residual, _nullPadCombine);
                 continue;
@@ -174,9 +176,12 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             {
                 // Bilinear inner-join delta, just for this key. Two-pass
                 // asymmetric form: dlK ⋈ newR absorbs both dlK ⋈ oldR and
-                // the cross term dlK ⋈ drK.
+                // the cross term dlK ⋈ drK; oldL ⋈ drK is empty without a right delta.
                 JoinInto(builder, key, dlK, newR);
-                JoinInto(builder, key, oldL, drK);
+                if (!drK.IsEmpty)
+                {
+                    JoinInto(builder, key, leftOld.GroupFor(key), drK);
+                }
             }
             else if (!oldMatched && !newMatched)
             {
@@ -188,15 +193,17 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
             {
                 // Key gained a match this tick. Retract every NULL-padded
                 // row that was present (oldL), emit the full join on newL × newR.
+                var oldL = leftOld.GroupFor(key);
                 NullPadInto(builder, key, oldL.Negate());
-                JoinInto(builder, key, newL, newR);
+                JoinInto(builder, key, oldL + dlK, newR);
             }
             else
             {
                 // Key lost all matches this tick. Retract the prior joined
                 // rows, emit newL × NULL.
+                var oldL = leftOld.GroupFor(key);
                 JoinInto(builder, key, oldL.Negate(), oldR);
-                NullPadInto(builder, key, newL);
+                NullPadInto(builder, key, oldL + dlK);
             }
         }
 

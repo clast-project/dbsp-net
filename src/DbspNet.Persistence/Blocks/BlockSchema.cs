@@ -165,6 +165,55 @@ internal sealed class BlockSchema : ITraceBlockFormat
         return bytes;
     }
 
+    ITraceBlock? ITraceBlockFormat.Copy(ITraceBlock[] sources, int[] indexes, long[] weights, int[] hashes, int count)
+    {
+        var bodies = new TraceBlock[count];
+        for (var i = 0; i < count; i++)
+        {
+            if (sources[i].Body is not TraceBlock body || !SameLayout(body.Schema))
+            {
+                return null;
+            }
+
+            bodies[i] = body;
+        }
+
+        return BlockWriter.Copy(this, bodies, indexes, weights, hashes, count);
+    }
+
+    int ITraceBlockFormat.CopiedEntryBytes(ITraceBlock source, int index)
+    {
+        if (source.Body is not TraceBlock block || !SameLayout(block.Schema))
+        {
+            return 0;
+        }
+
+        var bytes = _fixedBytes;
+        foreach (var c in _keyStrings)
+        {
+            bytes += StringBytes(block, c, index);
+        }
+
+        foreach (var c in _valueStrings)
+        {
+            bytes += StringBytes(block, KeyKinds.Length + c, index);
+        }
+
+        return bytes;
+    }
+
+    private static int StringBytes(TraceBlock block, int column, int index)
+    {
+        var offsets = block.ValuesAt(column);
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Bytes.AsSpan(offsets + ((index + 1) * 4)))
+            - System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Bytes.AsSpan(offsets + (index * 4)));
+    }
+
+    // Whether blocks of other hold their columns as this schema's do (entries copy between them).
+    private bool SameLayout(BlockSchema other) =>
+        ReferenceEquals(this, other)
+        || (other.KeyKinds.AsSpan().SequenceEqual(KeyKinds) && other.ValueKinds.AsSpan().SequenceEqual(ValueKinds));
+
     private int _fixedBytes;
     private int[] _keyStrings = [];
     private int[] _valueStrings = [];

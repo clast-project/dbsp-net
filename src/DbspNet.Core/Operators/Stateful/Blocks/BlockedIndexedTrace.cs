@@ -1737,7 +1737,8 @@ internal sealed class BlockedIndexedTrace
             while (!probe.Done && probe.Hash == hash)
             {
                 var (block, i) = (probe.Block, probe.Index);
-                var vh = (uint)block.Value(i).GetHashCode();
+                // The stored value hash: the check reads no value row (§5.35), only the merge below does.
+                var vh = (uint)block.ValueHash(i);
                 if (!block.KeyEquals(i, key) || (!first && vh < last))
                 {
                     Interlocked.Increment(ref GiantFallbacks);
@@ -1765,6 +1766,13 @@ internal sealed class BlockedIndexedTrace
             {
                 live.Add(cursor);
             }
+        }
+
+        if (live.Count > 0 && !live[0].Done && output.BeginCopy(live[0].Block))
+        {
+            MergeGiantCopying(live, hash, key!, output);
+            Interlocked.Increment(ref GiantMerges);
+            return true;
         }
 
         // A k-way merge by value hash: the entries of the least value hash across the runs, summed.
@@ -1820,6 +1828,94 @@ internal sealed class BlockedIndexedTrace
         return true;
     }
 
+    // The giant merge's k-way pass by stored value hash, copying entries whole (§5.35): a value is decoded
+    // only where two entries share its hash, to sum equal rows; each surviving row is copied from one of
+    // its entries with the summed weight. The output is in canonical order, as the decoding merge's is.
+    private static void MergeGiantCopying(List<Cursor> live, uint hash, StructuralRow key, RunBuilder output)
+    {
+        var heads = new uint[live.Count];
+        var has = new bool[live.Count];
+        for (var j = 0; j < live.Count; j++)
+        {
+            has[j] = HeadHash(live[j], hash, out heads[j]);
+        }
+
+        var tied = new List<(ITraceBlock Block, int Index, long Weight)>();
+        Dictionary<StructuralRow, (ITraceBlock Block, int Index, long Weight)>? sums = null;
+        while (true)
+        {
+            var any = false;
+            var min = uint.MaxValue;
+            for (var j = 0; j < live.Count; j++)
+            {
+                if (has[j] && (!any || heads[j] < min))
+                {
+                    min = heads[j];
+                    any = true;
+                }
+            }
+
+            if (!any)
+            {
+                break;
+            }
+
+            tied.Clear();
+            for (var j = 0; j < live.Count; j++)
+            {
+                while (has[j] && heads[j] == min)
+                {
+                    var c = live[j];
+                    tied.Add((c.Block, c.Index, c.Block.Weight(c.Index)));
+                    c.Advance();
+                    has[j] = HeadHash(c, hash, out heads[j]);
+                }
+            }
+
+            if (tied.Count == 1)
+            {
+                var (block, index, weight) = tied[0];
+                if (weight != 0)
+                {
+                    output.AddCopy(hash, block, index, weight);
+                }
+
+                continue;
+            }
+
+            // Entries sharing a value hash: equal rows sum, in first-seen order.
+            sums ??= new Dictionary<StructuralRow, (ITraceBlock, int, long)>();
+            sums.Clear();
+            foreach (var (block, index, weight) in tied)
+            {
+                var value = block.Value(index);
+                sums[value] = sums.TryGetValue(value, out var at) ? (at.Item1, at.Item2, at.Item3 + weight) : (block, index, weight);
+            }
+
+            foreach (var (block, index, weight) in sums.Values)
+            {
+                if (weight != 0)
+                {
+                    output.AddCopy(hash, block, index, weight);
+                }
+            }
+        }
+
+        output.EndCopy();
+    }
+
+    private static bool HeadHash(Cursor cursor, uint hash, out uint valueHash)
+    {
+        if (cursor.Done || cursor.Hash != hash)
+        {
+            valueHash = 0;
+            return false;
+        }
+
+        valueHash = (uint)cursor.Block.ValueHash(cursor.Index);
+        return true;
+    }
+
     private static bool Head(Cursor cursor, uint hash, out (uint Hash, StructuralRow Value, long Weight) head)
     {
         if (cursor.Done || cursor.Hash != hash)
@@ -1829,8 +1925,7 @@ internal sealed class BlockedIndexedTrace
         }
 
         var (block, i) = (cursor.Block, cursor.Index);
-        var value = block.Value(i);
-        head = ((uint)value.GetHashCode(), value, block.Weight(i));
+        head = ((uint)block.ValueHash(i), block.Value(i), block.Weight(i));
         return true;
     }
 
@@ -2010,6 +2105,55 @@ internal sealed class BlockedIndexedTrace
         // Whether the buffered block continues a hash from the previous block (a giant group).
         private bool _spanning;
 
+        // Copy mode (§5.35): the buffered entries are other blocks' entries, copied whole at the flush.
+        private bool _copying;
+        private ITraceBlock[] _sources = [];
+        private int[] _indexes = [];
+
+        /// <summary>Start buffering copied entries (<see cref="AddCopy"/>) of one hash: what is buffered is
+        /// flushed first, so that hash's blocks hold only it. False when the format cannot copy.</summary>
+        public bool BeginCopy(ITraceBlock probe)
+        {
+            if (trace._format.CopiedEntryBytes(probe, 0) == 0)
+            {
+                return false;
+            }
+
+            Flush();
+            _copying = true;
+            return true;
+        }
+
+        /// <summary>Add another block's entry, copied whole when its block is flushed.</summary>
+        public void AddCopy(uint hash, ITraceBlock source, int index, long weight)
+        {
+            if (_count > 0 && _bytes >= trace._blockBytes)
+            {
+                Flush();
+                _copying = true;
+            }
+
+            _bytes += trace._format.CopiedEntryBytes(source, index);
+            if (_count == _sources.Length)
+            {
+                var size = Math.Max(64, _count * 2);
+                Array.Resize(ref _sources, size);
+                Array.Resize(ref _indexes, size);
+                Array.Resize(ref _weights, Math.Max(size, _weights.Length));
+                Array.Resize(ref _hashes, Math.Max(size, _hashes.Length));
+            }
+
+            _sources[_count] = source;
+            _indexes[_count] = index;
+            _weights[_count] = weight;
+            _hashes[_count] = (int)hash;
+            _count++;
+            _entries++;
+        }
+
+        /// <summary>End the copied hash: its last block holds only it.</summary>
+        public void EndCopy() => Flush();
+
         private static bool NoSpanAlign => !BlockAccess.AlignSpans;
 
         public void Add(uint hash, StructuralRow key, StructuralRow value, long weight)
@@ -2112,7 +2256,16 @@ internal sealed class BlockedIndexedTrace
             }
 
             var t0 = BlockTraceProfile.Now();
-            var block = trace._format.Encode(_keys, _values, _weights, _hashes, _count);
+            ITraceBlock block;
+            if (_copying)
+            {
+                block = trace._format.Copy(_sources, _indexes, _weights, _hashes, _count) ?? EncodeCopies();
+            }
+            else
+            {
+                block = trace._format.Encode(_keys, _values, _weights, _hashes, _count);
+            }
+
             _flushedBytes += _bytes;
             if (_sink is not null)
             {
@@ -2141,10 +2294,33 @@ internal sealed class BlockedIndexedTrace
             {
                 BlockTraceProfile.Encode(t0);
             }
-            Array.Clear(_keys, 0, _count);
-            Array.Clear(_values, 0, _count);
+            if (_copying)
+            {
+                Array.Clear(_sources, 0, _count);
+                _copying = false;
+            }
+            else
+            {
+                Array.Clear(_keys, 0, _count);
+                Array.Clear(_values, 0, _count);
+            }
+
             _count = 0;
             _bytes = 0;
+        }
+
+        // The buffered copies decoded and encoded (a source the format would not copy from).
+        private ITraceBlock EncodeCopies()
+        {
+            var keys = new StructuralRow[_count];
+            var values = new StructuralRow[_count];
+            for (var i = 0; i < _count; i++)
+            {
+                keys[i] = _sources[i].Key(_indexes[i]);
+                values[i] = _sources[i].Value(_indexes[i]);
+            }
+
+            return trace._format.Encode(keys, values, _weights, _hashes, _count);
         }
     }
 }

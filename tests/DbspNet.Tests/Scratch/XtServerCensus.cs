@@ -253,10 +253,51 @@ public class XtServerCensus
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToHashSet();
         var gcdumpDir = Environment.GetEnvironmentVariable("XT_GCDUMP_DIR") ?? Path.GetTempPath();
+
+        // Per-op allocation (§5.35): each worker steps on its own thread, so the thread's allocated bytes
+        // since its previous operator are that operator's on that worker. OPALLOC when >= 512 MiB.
+        var lastAlloc = new ThreadLocal<long>(() => GC.GetAllocatedBytesForCurrentThread());
+        // XT_DESCRIBE_OPS=1680-1700: once, each operator's stream fields and delegates (what the plan wired).
+        var describe = (Environment.GetEnvironmentVariable("XT_DESCRIBE_OPS") ?? "").Split('-', StringSplitOptions.RemoveEmptyEntries);
+        var describeFrom = describe.Length == 2 ? int.Parse(describe[0], CultureInfo.InvariantCulture) : -1;
+        var describeTo = describe.Length == 2 ? int.Parse(describe[1], CultureInfo.InvariantCulture) : -1;
+        var described = 0;
         RootCircuit.AfterOperatorStep = (circuit, i) =>
         {
+            if (describeFrom >= 0 && i == describeTo && Interlocked.Exchange(ref described, 1) == 0)
+            {
+                lock (gate)
+                {
+                    for (var k = describeFrom; k <= describeTo && k < circuit.Operators.Count; k++)
+                    {
+                        var o = circuit.Operators[k];
+                        var parts = new List<string>();
+                        foreach (var f in o.GetType().GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public))
+                        {
+                            var v = f.GetValue(o);
+                            if (v is null) continue;
+                            if (v.GetType().Name.StartsWith("Stream", StringComparison.Ordinal))
+                                parts.Add($"{f.Name}=s{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(v):x}");
+                            else if (v is Delegate d)
+                                parts.Add($"{f.Name}={d.Method.DeclaringType?.Name}.{d.Method.Name}" + (d.Target is { } t ? $"[{t.GetType().Name}]" : ""));
+                        }
+
+                        log.WriteLine($"OPDESC op={k} type={o.GetType().Name} {string.Join(' ', parts)}");
+                    }
+                }
+            }
+
+            var allocNow = GC.GetAllocatedBytesForCurrentThread();
+            var opAlloc = allocNow - lastAlloc.Value;
+            lastAlloc.Value = allocNow;
             lock (gate)
             {
+                if (opAlloc >= 512L << 20 && (opTick < 0 || circuit.TickCount == opTick))
+                {
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"OPALLOC tick={circuit.TickCount} op={i} type={circuit.Operators[i].GetType().Name} thread={Environment.CurrentManagedThreadId} alloc_mib={opAlloc >> 20} t_s={sw.Elapsed.TotalSeconds:F0}"));
+                }
+
                 var now = Stopwatch.GetTimestamp();
                 var op = circuit.Operators[i];
                 if (opTick >= 0 && circuit.TickCount != opTick)

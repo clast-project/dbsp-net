@@ -544,12 +544,38 @@ internal static class BlockWriter
     public static TraceBlock Gather(
         BlockSchema schema, TraceBlock[] sources, int[] indexes, long[] values, long[] weights, int[] hashes, int n)
     {
-        var keyColumns = schema.KeyKinds.Length;
-        var columns = schema.HashColumn + 1;
         if (schema.ValueKinds is not [CellKind.Int64])
         {
             throw new InvalidOperationException("a gathered block's one value column is a BIGINT");
         }
+
+        return GatherCore(schema, sources, indexes, values, weights, hashes, n, schema.KeyKinds.Length, null);
+    }
+
+    /// <summary>
+    /// One block of whole entries copied from other blocks of <paramref name="schema"/>'s layout
+    /// (docs/design-bounded-memory.md §5.35): entry i is <paramref name="sources"/>[i]'s entry
+    /// <paramref name="indexes"/>[i], every key and value column copied, nothing decoded, with its
+    /// weight and key hash given and its value hash the source's.
+    /// </summary>
+    public static TraceBlock Copy(BlockSchema schema, TraceBlock[] sources, int[] indexes, long[] weights, int[] hashes, int n)
+    {
+        var valueHashes = new int[n];
+        for (var i = 0; i < n; i++)
+        {
+            valueHashes[i] = sources[i].ValueHash(indexes[i]);
+        }
+
+        return GatherCore(schema, sources, indexes, null, weights, hashes, n, schema.WeightColumn, valueHashes);
+    }
+
+    // Columns [0, copied) copied from the sources; with values, the one column after them is that BIGINT.
+    private static TraceBlock GatherCore(
+        BlockSchema schema, TraceBlock[] sources, int[] indexes, long[]? values, long[] weights, int[] hashes, int n,
+        int copied, int[]? valueHashes)
+    {
+        var keyColumns = copied;
+        var columns = schema.HashColumn + 1;
 
         var nulls = new int[columns];
         var heap = new long[columns];
@@ -677,7 +703,11 @@ internal static class BlockWriter
 
         for (var i = 0; i < n; i++)
         {
-            BinaryPrimitives.WriteInt64LittleEndian(out_[(valueAt[keyColumns] + (i * 8))..], values[i]);
+            if (values is not null)
+            {
+                BinaryPrimitives.WriteInt64LittleEndian(out_[(valueAt[keyColumns] + (i * 8))..], values[i]);
+            }
+
             BinaryPrimitives.WriteInt64LittleEndian(out_[(valueAt[schema.WeightColumn] + (i * 8))..], weights[i]);
             BinaryPrimitives.WriteInt32LittleEndian(out_[(valueAt[schema.HashColumn] + (i * 4))..], hashes[i]);
         }
@@ -689,7 +719,7 @@ internal static class BlockWriter
             dataAt[c] = dataAt[c] < 0 ? -1 : dataAt[c] + bodyStart;
         }
 
-        return new TraceBlock(schema, message, n, validity, valueAt, dataAt, null);
+        return new TraceBlock(schema, message, n, validity, valueAt, dataAt, valueHashes);
     }
 
     private static CellKind KindOf(BlockSchema schema, int c) =>

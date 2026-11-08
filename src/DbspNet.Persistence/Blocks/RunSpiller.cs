@@ -151,7 +151,7 @@ internal sealed class RunSpiller : IRunSpiller
         }
 
         var path = Guid.NewGuid().ToString("N") + ".run";
-        return BlockedTraceCheckpoint.StreamedRunFile.Open(_fs, path, schema.Codec, length => Register(path, length, length, trace));
+        return BlockedTraceCheckpoint.StreamedRunFile.Open(_fs, path, schema.Codec, length => Register(path, length, length, trace), keepValueHashes: !trace.Compacts);
     }
 
     // A new spill file: its lease, held by holder BEFORE a sweep can see it, tracked for sweeps,

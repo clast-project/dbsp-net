@@ -166,6 +166,15 @@ internal sealed class TraceBlock : ITraceBlock
     /// <summary>The value hashes, if known (BlockWriter.Concat carries them over).</summary>
     internal int[]? KnownValueHashes => _valueHashes;
 
+    /// <summary>Take value hashes kept from this block's earlier body (a lazy block reloaded, §5.35).</summary>
+    internal void AdoptValueHashes(int[] hashes)
+    {
+        if (hashes.Length == Count)
+        {
+            Interlocked.CompareExchange(ref _valueHashes, hashes, null);
+        }
+    }
+
     /// <inheritdoc/>
     public int ValueHash(int i)
     {
@@ -191,8 +200,13 @@ internal sealed class TraceBlock : ITraceBlock
         }
     }
 
+    /// <summary>Blocks whose value hashes this thread computed by decoding (tests, §5.35).</summary>
+    [ThreadStatic]
+    internal static long ThreadValueHashComputes;
+
     private int[] ComputeValueHashesCore()
     {
+        ThreadValueHashComputes++;
         var hashes = new int[Count];
         for (var i = 0; i < Count; i++)
         {

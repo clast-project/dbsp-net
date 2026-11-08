@@ -619,6 +619,56 @@ public class RunSpillerTests
         return new WeakReference<object>(blocked);
     }
 
+    // §5.35: a block-backed delta's spilled runs keep their value hashes when the cache drops their bodies. A
+    // trace adopting the delta merges a giant group by value hash; a reloaded body without them decoded every
+    // value to hash it again (extended TPC-DS tick 18: ~1.7 KB a row of a left join's integrate). Every body
+    // here is evicted as soon as it is admitted, so the merge reloads each one.
+    [Fact]
+    public async Task A_spilled_deltas_blocks_keep_their_value_hashes_when_evicted()
+    {
+        await WithSpillerAsync(0, (spiller, dir) =>
+        {
+            var keySchema = new Schema([new SchemaColumn("g", new SqlIntegerType(false))]);
+            var format = TraceBlockFormats.Create(keySchema, RowSchema)!;
+            var key = new StructuralRow(7);
+            var saved = BlockedIndexedTrace.GiantGroupEntries;
+            BlockedIndexedTrace.GiantGroupEntries = 50;
+            try
+            {
+                IndexedZSet<StructuralRow, StructuralRow, Z64> delta;
+                using (SpillSettings.UseStepSpill(0, 64))
+                {
+                    var b = DeltaSpillGroups.For<StructuralRow, StructuralRow, Z64>(format);
+                    foreach (var (row, w) in Rows(0, 400))
+                    {
+                        b.Add(key, row, w);
+                    }
+
+                    delta = b.Build();
+                }
+
+                Assert.IsType<BlockedGroups>(delta.External);
+                var computes0 = TraceBlock.ThreadValueHashComputes;
+                var giant0 = Interlocked.Read(ref BlockedIndexedTrace.GiantMerges);
+                var trace = new BlockedIndexedTrace(format);
+                trace.Integrate(delta);
+
+                Assert.True(Interlocked.Read(ref BlockedIndexedTrace.GiantMerges) > giant0, "the giant group was not merged streaming");
+                Assert.Equal(computes0, TraceBlock.ThreadValueHashComputes);
+                var merged = trace.Materialize();
+                Assert.Equal(Rows(0, 400).OrderBy(e => (int)e.Key[0]!), merged.GroupFor(key).OrderBy(e => (int)e.Key[0]!));
+                trace.CheckValueOrder();
+                GC.KeepAlive(delta);
+            }
+            finally
+            {
+                BlockedIndexedTrace.GiantGroupEntries = saved;
+            }
+
+            return Task.CompletedTask;
+        });
+    }
+
     [Fact]
     public void A_lease_deletes_on_its_last_release_and_waits_for_live_readers()
     {

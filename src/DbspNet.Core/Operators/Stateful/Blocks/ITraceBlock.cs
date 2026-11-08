@@ -111,6 +111,16 @@ internal interface ITraceBlockFormat
     /// <paramref name="source"/>'s entry <paramref name="index"/> and one BIGINT value. 0 when the
     /// format cannot tell (blocks are then cut by entries alone).</summary>
     int GatheredEntryBytes(ITraceBlock source, int index) => 0;
+
+    /// <summary>A block whose entry i is <paramref name="sources"/>[i]'s entry <paramref name="indexes"/>[i]
+    /// (blocks of this format), key and value copied without decoding, with weight
+    /// <paramref name="weights"/>[i] and key hash <paramref name="hashes"/>[i]; its value hashes are the
+    /// sources' (docs/design-bounded-memory.md §5.35: a giant group's merge). Null when the format cannot.</summary>
+    ITraceBlock? Copy(ITraceBlock[] sources, int[] indexes, long[] weights, int[] hashes, int count) => null;
+
+    /// <summary>The bytes <see cref="EntryBytes"/> counts for <paramref name="source"/>'s entry
+    /// <paramref name="index"/>, read from the block. 0 when the format cannot tell.</summary>
+    int CopiedEntryBytes(ITraceBlock source, int index) => 0;
 }
 
 /// <summary>Checkpoints a <see cref="BlockedIndexedTrace"/> as run files written from its blocks and

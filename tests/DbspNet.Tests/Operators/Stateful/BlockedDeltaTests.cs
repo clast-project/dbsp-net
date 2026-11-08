@@ -371,6 +371,54 @@ public class BlockedDeltaTests
         }
     }
 
+    // §5.35: adopting a block-backed delta of one giant key merges its runs streaming, and copies each entry
+    // whole: the value-order check and the merge read stored value hashes, and a value is decoded only to sum
+    // entries sharing its hash. Extended TPC-DS tick 18 lands 7.2M rows of one join key on a worker; decoding
+    // and encoding them cost the left join's integrate 2.4 KB a row. The merge allocates less than one decode
+    // of every value (decoding for the check as well came to 2.1 decodes, decoding for the merge alone 1.2).
+    [Fact]
+    public void A_giant_groups_merge_checks_value_order_without_decoding_values()
+    {
+        const int n = 60_000;
+        var adds = Enumerable.Range(0, n).Select(i => (0, i, i % 4, 1L)).ToArray();
+        var delta = SpilledIndexed(adds, 0, n / 6);
+        Assert.True(delta.External is BlockedGroups);
+
+        // One decode of every value (what the merge needs), measured on the delta itself.
+        var decode = GC.GetAllocatedBytesForCurrentThread();
+        long count = 0;
+        foreach (var (_, group) in delta)
+        {
+            foreach (var _ in group)
+            {
+                count++;
+            }
+        }
+
+        decode = GC.GetAllocatedBytesForCurrentThread() - decode;
+        Assert.Equal(n, count);
+
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 1000;
+        var giant0 = Interlocked.Read(ref BlockedIndexedTrace.GiantMerges);
+        var trace = new BlockedIndexedTrace(IndexedFormat);
+        var merge = GC.GetAllocatedBytesForCurrentThread();
+        try
+        {
+            trace.Integrate(delta);
+        }
+        finally
+        {
+            merge = GC.GetAllocatedBytesForCurrentThread() - merge;
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+
+        Assert.True(Interlocked.Read(ref BlockedIndexedTrace.GiantMerges) > giant0, "the giant group was not merged streaming");
+        AssertSameIndexed(ManagedIndexed(adds), trace.Materialize());
+        Console.WriteLine($"GIANT decode={decode} merge={merge} ratio={(double)merge / decode:F2}");
+        Assert.True(merge < decode, $"the merge allocated {merge} B, a decode of every value {decode} B");
+    }
+
     [Fact]
     public void A_giant_group_out_of_value_order_falls_back_and_merges_correctly()
     {
@@ -782,6 +830,46 @@ public class BlockedDeltaTests
         var out0 = pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", 0).Current;
         Assert.True(out0.IsExternal, "600 rows on one worker are past the 100-row threshold");
         AssertSame(Managed(a) + Managed(b), out0);
+        for (var w = 1; w < workers; w++)
+        {
+            Assert.True(pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", w).Current.IsEmpty);
+        }
+    }
+
+    // §5.35: the gather sums its spilled buckets as the union of their runs instead of decoding every row
+    // into a builder and encoding it again (a skewed exchange lands 7.2M rows of extended TPC-DS tick 18 on
+    // each of three workers: 13 GiB each). Two block-backed shards overlap (weights sum, some cancel) and a
+    // third, managed shard joins them; everything goes to worker 0, which must hold their sum, block backed.
+    [Theory]
+    [InlineData(4)]
+    [InlineData(12)]
+    public void An_exchange_gathers_spilled_buckets_without_decoding_them(int workers)
+    {
+        var a = Enumerable.Range(0, 300).Select(i => (i, i % 4, 1L)).ToArray();
+        var b = Enumerable.Range(200, 300).Select(i => (i, i % 4, i < 250 ? -1L : 2L)).ToArray(); // 200..249 cancel
+        var c = Enumerable.Range(1000, 5).Select(i => (i, 0, 1L)).ToArray();
+        using var _ = SpillSettings.UseStepSpill(100, 10);
+        using var pc = DbspNet.Core.Circuit.ParallelCircuit.Build(workers, cb =>
+        {
+            var (_, input) = cb.Input<ZSet<StructuralRow, Z64>>(ZSet.Empty<StructuralRow, Z64>(), (x, y) => x.Plus(y), name: "in");
+            input.DeltaFormat = Format;
+            cb.Output(cb.Exchange(input, static _ => 0), name: "out");
+        });
+        var sa = Spilled(a, 100, 10);
+        var sb = Spilled(b, 100, 10);
+        Assert.True(sa.IsExternal && sb.IsExternal);
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", 0).Push(sa);
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", 1).Push(Managed(c));
+        pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", workers - 1).Push(sb);
+        var unioned0 = Interlocked.Read(ref DeltaSpill.Unioned);
+
+        pc.Step();
+
+        Assert.True(Interlocked.Read(ref DeltaSpill.Unioned) >= unioned0 + 2, "the spilled buckets were decoded");
+        var out0 = pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", 0).Current;
+        Assert.True(out0.External is BlockedRows, "the gather is block backed");
+        AssertSame(Managed([.. a, .. b, .. c]), out0);
+        Assert.Equal(200 + 250 + 5, out0.Count); // 0..199, 250..499 (200..249 cancelled), c
         for (var w = 1; w < workers; w++)
         {
             Assert.True(pc.WorkerOutput<ZSet<StructuralRow, Z64>>("out", w).Current.IsEmpty);
