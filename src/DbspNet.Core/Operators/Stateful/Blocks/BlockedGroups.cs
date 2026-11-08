@@ -334,10 +334,259 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
         while (walk.Next(out var hash, out var tied, out _))
         {
             IEnumerable<BlockedIndexedTrace.Run> holding = tied.Count == 1 ? Single(one, runs[tied[0]]) : tied.Select(r => runs[r]).ToArray();
+
+            // A giant group is handed out streamed (§5.36), not resolved into a managed set: a join over
+            // a skewed key held 7.2M decoded rows of it per worker, and three such workers at once ran a
+            // 48 GiB heap out of memory.
+            if (StreamGiantGroups && GiantEntries(holding, hash) >= BlockedIndexedTrace.GiantGroupEntries
+                && StreamedGroup.TryCreate([.. holding], hash) is { } streamed)
+            {
+                Interlocked.Increment(ref StreamedGroups);
+                yield return new(streamed.Key, new ZSet<StructuralRow, Z64>(streamed));
+                continue;
+            }
+
             foreach (var group in Resolve(holding, hash))
             {
                 Interlocked.Add(ref StepSpillProfile.RowsDecoded, group.Value.Count);
                 yield return group;
+            }
+        }
+    }
+
+    /// <summary>Whether enumeration hands a giant group out streamed (§5.36). Off for A/B
+    /// (<c>DBSPNET_STREAM_GIANT_GROUPS=off</c>).</summary>
+    internal static bool StreamGiantGroups { get; set; } =
+        !string.Equals(Environment.GetEnvironmentVariable("DBSPNET_STREAM_GIANT_GROUPS"), "off", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Giant groups handed out streamed (diagnostics).</summary>
+    internal static long StreamedGroups;
+
+    // A lower bound on hash's entries across the runs, from block metadata alone (no block is read): the
+    // blocks the hash fills whole count fully (a spanning hash's blocks hold only it), others one.
+    private static long GiantEntries(IEnumerable<BlockedIndexedTrace.Run> runs, uint hash)
+    {
+        long n = 0;
+        foreach (var run in runs)
+        {
+            var b = run.Find(hash);
+            if (b < 0)
+            {
+                continue;
+            }
+
+            for (; b < run.Blocks.Length && run.FirstOf(b) <= hash; b++)
+            {
+                var block = run.Blocks[b];
+                n += block.FirstHash == hash && block.LastHash == hash ? block.Count : 1;
+            }
+        }
+
+        return n;
+    }
+
+    /// <summary>
+    /// One giant group of a block-backed indexed delta, read from its runs as it is walked (§5.36): every
+    /// run holds the hash as one key, its values in ascending value hash (as freezes and merges write them),
+    /// so a k-way walk by stored value hash yields the group's rows in order, decoding only the entries it
+    /// yields, and summing entries of equal value hash (decoded) only where several share one. The exact
+    /// count is one such walk at creation that decodes only those ties. A point lookup materializes the
+    /// group once. The runs are the delta's: the group is read while the delta is.
+    /// </summary>
+    private sealed class StreamedGroup : ZSetExternalStore<StructuralRow, Z64>
+    {
+        private readonly BlockedIndexedTrace.Run[] _runs;
+        private readonly uint _hash;
+        private readonly int _count;
+        private ZSet<StructuralRow, Z64>? _materialized;
+
+        private StreamedGroup(BlockedIndexedTrace.Run[] runs, uint hash, StructuralRow key, int count)
+        {
+            _runs = runs;
+            _hash = hash;
+            Key = key;
+            _count = count;
+        }
+
+        public StructuralRow Key { get; }
+
+        // The group, if every run holds the hash as one key with its values in value-hash order; null
+        // (resolve it instead) otherwise, or when its entries all cancel.
+        public static StreamedGroup? TryCreate(BlockedIndexedTrace.Run[] runs, uint hash)
+        {
+            StructuralRow? key = null;
+            foreach (var run in runs)
+            {
+                foreach (var (block, i) in At(run, hash))
+                {
+                    key = block.Key(i);
+                    break;
+                }
+
+                if (key is not null)
+                {
+                    break;
+                }
+            }
+
+            if (key is null)
+            {
+                return null;
+            }
+
+            var ok = new StrongBox<bool>(true);
+            var count = 0;
+            foreach (var _ in Walk(runs, hash, key, ok))
+            {
+                count++;
+            }
+
+            return ok.Value && count > 0 ? new StreamedGroup(runs, hash, key, count) : null;
+        }
+
+        public override int Count => _count;
+
+        public override bool TryGetWeight(StructuralRow key, out Z64 weight)
+        {
+            weight = (_materialized ??= Materialize()).WeightOf(key);
+            return !Z64.IsZero(weight);
+        }
+
+        public override IEnumerator<KeyValuePair<StructuralRow, Z64>> GetEnumerator()
+        {
+            foreach (var (block, index, value, weight) in Walk(_runs, _hash, Key, null))
+            {
+                yield return new(value ?? block.Value(index), new Z64(weight));
+            }
+        }
+
+        public override ZSetBuilder<StructuralRow, Z64> NewBuilder(int capacity) => new(capacity);
+
+        public override long ResidentBytes => 0;
+
+        private ZSet<StructuralRow, Z64> Materialize()
+        {
+            var b = new ZSetBuilder<StructuralRow, Z64>(_count);
+            using var e = GetEnumerator();
+            while (e.MoveNext())
+            {
+                b.Add(e.Current.Key, e.Current.Value);
+            }
+
+            return b.Build();
+        }
+
+        // The group's surviving entries in value-hash order: (block, index, decoded value or null, summed
+        // weight). With ok, each entry is checked (the key, ascending value hash) and the walk stops,
+        // ok false, at the first that fails.
+        private static IEnumerable<(ITraceBlock Block, int Index, StructuralRow? Value, long Weight)> Walk(
+            BlockedIndexedTrace.Run[] runs, uint hash, StructuralRow key, StrongBox<bool>? ok)
+        {
+            var n = runs.Length;
+            var its = new IEnumerator<(ITraceBlock Block, int Index)>[n];
+            var has = new bool[n];
+            var heads = new uint[n];
+            for (var j = 0; j < n; j++)
+            {
+                its[j] = At(runs[j], hash).GetEnumerator();
+                if (!Advance(j, first: true))
+                {
+                    yield break;
+                }
+            }
+
+            var tied = new List<(ITraceBlock Block, int Index, long Weight)>();
+            Dictionary<StructuralRow, (ITraceBlock Block, int Index, long Weight)>? sums = null;
+            while (true)
+            {
+                var any = false;
+                var min = 0u;
+                for (var j = 0; j < n; j++)
+                {
+                    if (has[j] && (!any || heads[j] < min))
+                    {
+                        (min, any) = (heads[j], true);
+                    }
+                }
+
+                if (!any)
+                {
+                    yield break;
+                }
+
+                tied.Clear();
+                for (var j = 0; j < n; j++)
+                {
+                    while (has[j] && heads[j] == min)
+                    {
+                        var (block, index) = its[j].Current;
+                        tied.Add((block, index, block.Weight(index)));
+                        if (!Advance(j, first: false))
+                        {
+                            yield break;
+                        }
+                    }
+                }
+
+                if (tied.Count == 1)
+                {
+                    var (block, index, weight) = tied[0];
+                    if (weight != 0)
+                    {
+                        yield return (block, index, null, weight);
+                    }
+
+                    continue;
+                }
+
+                // Entries sharing a value hash: equal rows sum, in first-seen order.
+                sums ??= [];
+                sums.Clear();
+                var order = new List<StructuralRow>(tied.Count);
+                foreach (var (block, index, weight) in tied)
+                {
+                    var value = block.Value(index);
+                    if (sums.TryGetValue(value, out var at))
+                    {
+                        sums[value] = (at.Block, at.Index, at.Weight + weight);
+                    }
+                    else
+                    {
+                        sums[value] = (block, index, weight);
+                        order.Add(value);
+                    }
+                }
+
+                foreach (var value in order)
+                {
+                    var (block, index, weight) = sums[value];
+                    if (weight != 0)
+                    {
+                        yield return (block, index, value, weight);
+                    }
+                }
+            }
+
+            // Move run j's cursor on; false (ok cleared) when a checked entry is not the key or goes back.
+            bool Advance(int j, bool first)
+            {
+                if (!its[j].MoveNext())
+                {
+                    has[j] = false;
+                    return true;
+                }
+
+                var (block, index) = its[j].Current;
+                var vh = (uint)block.ValueHash(index);
+                if (ok is not null && (!block.KeyEquals(index, key) || (!first && vh < heads[j])))
+                {
+                    ok.Value = false;
+                    return false;
+                }
+
+                heads[j] = vh;
+                has[j] = true;
+                return true;
             }
         }
     }

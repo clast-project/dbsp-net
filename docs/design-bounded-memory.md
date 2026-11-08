@@ -2721,3 +2721,38 @@ this: the giant joins at ops 1683–1703 are fragile at 48 GiB on the old engine
 completing was luck. (xt109's 8.9 GB at op 1693 was sampled when the first worker finished it, not the
 last; the samples are not comparable to the fixed-point measure.) What holds the 20 GB at op 1683 is
 the next question.
+
+### 5.37 The giant joins' peak: a skewed key's left group, streamed (2026-11-08)
+
+§5.36's restored runs fail at the giant left joins (ops 1683–1703) on the old engine as well. The
+in-process census after op 1683 (§5.36 probes) settles where the memory is: operator state 7.1 GB and
+stream deltas 3.1 GB, ~10 GB as before; but live once all twelve workers have stepped the next operator
+is 18–23 GB. The difference is the working memory of operators still running on other workers, chiefly
+the three hot workers' joins running at once. (A full `dotnet-dump` after op 1683, 42 GB, cannot be read
+on macOS: ClrMD's Mach-O reader fails on it; nor can ClrMD snapshot its own process there.)
+
+`Scratch/GiantJoinPeakProbe` measures one hot join: a W = 2 program, 2M left rows of one key and one
+right row, with the xt run's spill settings (set through the environment: a test's `AsyncLocal`
+overrides do not reach worker threads started before them). Sampling live with forced GCs every ~100 ms,
+the hot worker's join rose ~2.7 GB above where it started; the left delta's group, resolved into a
+managed Z-set as `TouchedKeys` enumerates it, is 2.1 GB of that (1,130 B a row, measured alone). At 7.2M
+rows a hot worker held ~8 GB of it, three workers at once.
+
+**The change.** Enumerating a block-backed delta (`BlockedGroups`) hands out a giant group streamed
+(`StreamedGroup`; `DBSPNET_STREAM_GIANT_GROUPS=off` to A/B): a hash whose entries, counted from block
+metadata alone (the blocks it fills whole), reach `GiantGroupEntries`. Every run holds the hash as one
+key, its values in ascending stored value hash (as freezes and merges write them), so a k-way walk by
+value hash yields the group's rows in order, decoding only the entries it yields and summing entries of
+equal value hash (decoded) where several share one. The exact count is one such walk at creation that
+decodes only those ties; the walk also checks the key and the order, and a group that fails is resolved
+as before. A point lookup (the residual join's `WeightOf`) materializes the group once. The join's
+common branches only enumerate it.
+
+In the probe, the hot join's peak live went from 3.91 to 1.93 GiB (its rise from ~2.7 to ~0.7 GB).
+
+Tests: `A_streamed_giant_group_reads_as_the_managed_one` (property test over skewed adds in 4-entry
+blocks: rows, count, lookups, sums, negation), `A_streamed_giant_group_decodes_none_of_its_rows_until_read` (60k rows, this thread's allocation: 2 KB against 15.7 MB; was
+8.9 KB held against 30.8 MB materialized by GC.GetTotalMemory, which other tests disturb), `A_left_join_over_a_streamed_giant_group_matches_its_twin`
+(W = 2, plain and residual: unmatched, gaining a match, cancellations, losing it, against an unspilled
+twin), `A_giant_group_out_of_value_order_is_resolved_not_streamed` (an adopted run in descending value
+hash). Mutants caught: ties not summed, lookups wrong, count off by one, streaming off, order check off.

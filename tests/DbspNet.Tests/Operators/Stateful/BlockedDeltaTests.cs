@@ -483,6 +483,138 @@ public class BlockedDeltaTests
         Assert.True(Interlocked.Read(ref BlockedIndexedTrace.SummedHashes) > summed0, "no merge summed a hash several runs held");
     }
 
+    // §5.36: a block-backed delta hands out a giant group streamed: it reads as the managed group (rows,
+    // count, lookups, sums), cancelling and duplicated entries across runs included.
+    [Fact]
+    public void A_streamed_giant_group_reads_as_the_managed_one()
+    {
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 12;
+        var streamed0 = Interlocked.Read(ref BlockedGroups.StreamedGroups);
+        try
+        {
+            Gen.Select(GenSkewedAdds, Gen.Int[1, 9]).Sample((adds, chunk) =>
+            {
+                IndexedZSet<StructuralRow, StructuralRow, Z64> spilled;
+                using (TraceBlocksMode.Use(join: true, blockEntries: 4))
+                {
+                    spilled = SpilledIndexed(adds, 0, chunk);
+                }
+
+                var managed = ManagedIndexed(adds);
+                AssertSameIndexed(managed, spilled);
+                foreach (var (key, group) in spilled)
+                {
+                    var expected = managed.GroupFor(key);
+                    Assert.Equal(expected.Count, group.Count);
+                    foreach (var (value, weight) in expected)
+                    {
+                        Assert.Equal(weight, group.WeightOf(value));
+                    }
+
+                    Assert.True((expected + expected).Equals(group + group));
+                    Assert.True(expected.Negate().Equals(group.Negate()));
+                }
+            }, iter: 300);
+        }
+        finally
+        {
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+
+        Assert.True(Interlocked.Read(ref BlockedGroups.StreamedGroups) > streamed0, "no giant group was streamed");
+    }
+
+    // §5.36: a giant group whose run is out of value-hash order (as an older file could hold it) is not
+    // streamed: the walk's order check rejects it, and the group is resolved, summing correctly.
+    [Fact]
+    public void A_giant_group_out_of_value_order_is_resolved_not_streamed()
+    {
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 12;
+        try
+        {
+            var trace = new BlockedIndexedTrace(IndexedFormat, freezeEntries: int.MaxValue, maxManaged: int.MaxValue, blockEntries: 8, compact: false);
+            var key = Key(0);
+            var values = Enumerable.Range(0, 40).Select(v => Row(v, 1)).OrderByDescending(v => (uint)v.GetHashCode()).ToArray();
+            var n = values.Length;
+            var blocks = values.Chunk(8).Select(part => IndexedFormat.Encode(
+                Enumerable.Repeat(key, part.Length).ToArray(), part, Enumerable.Repeat(1L, part.Length).ToArray(),
+                Enumerable.Repeat(key.GetHashCode(), part.Length).ToArray(), part.Length)).ToArray();
+            trace.AdoptRun(blocks, n, null);
+            var expected = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            foreach (var v in values)
+            {
+                expected.Add(key, v, Z64.One);
+            }
+
+            var delta = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+            for (var v = 0; v < 60; v++)
+            {
+                var w = v < 20 ? -1L : 1L;
+                delta.Add(key, Row(v, 1), new Z64(w));
+                expected.Add(key, Row(v, 1), new Z64(w));
+            }
+
+            trace.Integrate(delta.Build());
+            trace.Freeze();
+            Assert.Equal(2, trace.Runs.Count);
+            var hashes = trace.Runs.Select(_ => new[] { (uint)key.GetHashCode() }).ToArray();
+            var groups = BlockedGroups.Create(trace, hashes, IndexedFormat)!;
+            var streamed0 = Interlocked.Read(ref BlockedGroups.StreamedGroups);
+            AssertSameIndexed(expected.Build(), new IndexedZSet<StructuralRow, StructuralRow, Z64>(groups));
+            Assert.Equal(streamed0, Interlocked.Read(ref BlockedGroups.StreamedGroups));
+        }
+        finally
+        {
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+    }
+
+    // §5.37: taking a giant group from a block-backed delta decodes none of its rows (only its count is
+    // read, by stored value hashes): extended TPC-DS's skewed left joins each held a 7.2M-row group of
+    // their left delta decoded (~1.1 KB a row), three at once. Measured as this thread's allocation (the
+    // heap is shared with tests running alongside).
+    [Fact]
+    public void A_streamed_giant_group_decodes_none_of_its_rows_until_read()
+    {
+        const int n = 60_000;
+        var adds = Enumerable.Range(0, n).Select(i => (0, i, i % 4, 1L)).ToArray();
+        long Taken(bool stream)
+        {
+            var delta = SpilledIndexed(adds, 0, n / 6);
+            var saved = BlockedGroups.StreamGiantGroups;
+            var savedGiant = BlockedIndexedTrace.GiantGroupEntries;
+            BlockedGroups.StreamGiantGroups = stream;
+            BlockedIndexedTrace.GiantGroupEntries = 1000;
+            try
+            {
+                var before = GC.GetAllocatedBytesForCurrentThread();
+                ZSet<StructuralRow, Z64>? group = null;
+                foreach (var (_, g) in delta)
+                {
+                    group = g;
+                }
+
+                var taken = GC.GetAllocatedBytesForCurrentThread() - before;
+                Assert.Equal(n, group!.Count);
+                Assert.Equal(stream, group.IsExternal);
+                return taken;
+            }
+            finally
+            {
+                BlockedGroups.StreamGiantGroups = saved;
+                BlockedIndexedTrace.GiantGroupEntries = savedGiant;
+            }
+        }
+
+        var materialized = Taken(stream: false);
+        var streamed = Taken(stream: true);
+        Console.WriteLine($"STREAMED taken={streamed} materialized={materialized} ratio={(double)streamed / materialized:F3}");
+        // ~0 by default; 0.28 under the forced suites' 1 MiB cache, where the count's walk reloads blocks.
+        Assert.True(streamed * 2 < materialized, $"taking a streamed group allocated {streamed} B, a materialized one {materialized} B");
+    }
+
     [Fact]
     public void A_giant_group_out_of_value_order_falls_back_and_merges_correctly()
     {
@@ -781,6 +913,72 @@ public class BlockedDeltaTests
         q.Table("f").Insert(5, 1L, "s");
         q.Step();
         Assert.Equal(1, q.Current.Count);
+    }
+
+    // §5.36: left joins over a giant key whose left delta group is streamed give a twin's rows every tick:
+    // matched, unmatched, gaining a match (the group summed with the old one), losing one, and the
+    // residual form (which looks rows up in the group).
+    [Theory]
+    [InlineData("SELECT f.k, f.x, d.y FROM f LEFT JOIN d ON f.k = d.k")]
+    [InlineData("SELECT f.k, f.x, d.y FROM f LEFT JOIN d ON f.k = d.k AND f.x > d.y")]
+    public void A_left_join_over_a_streamed_giant_group_matches_its_twin(string sql)
+    {
+        // A parallel program, as extended TPC-DS runs: the left delta reaches the join through an exchange
+        // index's gather, block backed. Worker threads start at compile and keep the settings then in force.
+        ParallelCompiledProgram Compile(bool spill)
+        {
+            using var mode = TraceBlocksMode.Use(join: true, blockEntries: 16);
+            using var _ = spill ? SpillSettings.UseStepSpill(100, 1) : SpillSettings.UseStepSpill(null);
+            Assert.True(SqlProgram.TryCompileParallel(
+                [.. JoinDdl, "CREATE VIEW v AS " + sql], new HashSet<string> { "v" }, 2, out var p));
+            return p!;
+        }
+
+        List<ZSet<StructuralRow, Z64>> Run(ParallelCompiledProgram q)
+        {
+            var outputs = new List<ZSet<StructuralRow, Z64>>();
+            void Step()
+            {
+                q.Step();
+                outputs.Add(q.Outputs["v"].CurrentView);
+            }
+
+            // Tick 0: a giant key with no match (null-padded). Tick 1: it gains a match, and grows.
+            // Tick 2: more rows, still matched (some cancel). Tick 3: the match goes.
+            q.Table("f").Push(Enumerable.Range(0, 1500).Select(i => (new object?[] { 1, (long)i, "s" + (i % 3) }, 1L)));
+            Step();
+            q.Table("d").Insert(1, 700L);
+            q.Table("f").Push(Enumerable.Range(1500, 1000).Select(i => (new object?[] { 1, (long)i, null }, 1L)));
+            Step();
+            q.Table("f").Push(Enumerable.Range(0, 1500).Where(i => i % 7 == 0).Select(i => (new object?[] { 1, (long)i, "s" + (i % 3) }, -1L))
+                .Concat(Enumerable.Range(2500, 1500).Select(i => (new object?[] { 1, (long)i, "t" }, 1L))));
+            Step();
+            q.Table("d").Delete(1, 700L);
+            q.Table("f").Push(Enumerable.Range(4000, 1000).Select(i => (new object?[] { 1, (long)i, "u" }, 1L)));
+            Step();
+            return outputs;
+        }
+
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 200;
+        var streamed0 = Interlocked.Read(ref BlockedGroups.StreamedGroups);
+        try
+        {
+            using var plain = Compile(spill: false);
+            using var spilled = Compile(spill: true);
+            var expected = Run(plain);
+            var actual = Run(spilled);
+            for (var t = 0; t < expected.Count; t++)
+            {
+                AssertSameRows(expected[t], actual[t]);
+            }
+        }
+        finally
+        {
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+
+        Assert.True(Interlocked.Read(ref BlockedGroups.StreamedGroups) > streamed0, "no giant group was streamed");
     }
 
     private const string LeftJoinSql = "SELECT f.k, f.x, d.y FROM f LEFT JOIN d ON f.k = d.k";

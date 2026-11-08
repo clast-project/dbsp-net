@@ -320,6 +320,22 @@ public class XtServerCensus
                         log.WriteLine(string.Create(CultureInfo.InvariantCulture,
                             $"LIVEAT tick={circuit.TickCount} op={i} type={op.GetType().Name} live_mib={GC.GetTotalMemory(false) >> 20} t_s={sw.Elapsed.TotalSeconds:F0} copy_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.CopyMerges}"));
                         log.Flush();
+
+                        // XT_LIVE_DUMP=1: a full heap dump (dotnet-dump, --type Heap) after the GC, to XT_GCDUMP_DIR,
+                        // for exact per-type totals and roots (a gcdump keeps only ~10M objects).
+                        if (Environment.GetEnvironmentVariable("XT_LIVE_DUMP") == "1")
+                        {
+                            var dumpFile = Path.Combine(gcdumpDir, $"tick{circuit.TickCount}-op{i}.dmp");
+                            var dumpTool = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools", "dotnet-dump");
+                            var t0 = sw.Elapsed.TotalSeconds;
+                            using var dump = Process.Start(new ProcessStartInfo(dumpTool, $"collect -p {Environment.ProcessId} --type Heap -o {dumpFile}") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true })!;
+                            var output = dump.StandardOutput.ReadToEnd() + dump.StandardError.ReadToEnd();
+                            dump.WaitForExit();
+                            log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                                $"DUMP tick={circuit.TickCount} op={i} exit={dump.ExitCode} file={dumpFile} took_s={sw.Elapsed.TotalSeconds - t0:F0} {output.ReplaceLineEndings(" ")}"));
+                            log.Flush();
+                        }
+
                         if (liveAt.Values.All(v => v >= liveWorkers) && Environment.GetEnvironmentVariable("XT_LIVE_EXIT") == "1")
                         {
                             Environment.Exit(0);
