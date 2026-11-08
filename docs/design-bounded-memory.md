@@ -2708,3 +2708,16 @@ Each change was mutation-checked: its test fails with it undone.
 **What is left** is the general structural-row cost: each operator decodes its spilled input row by row
 into boxed cells and builds its output rows again (the exchanges' splits, the projections and filters, the
 join's per-group lists and builders for groups of one or two rows), and a probe of an old group decodes it.
+
+**The restored run on 9c98731 (xt111, xt112) did not complete.** Up to where it failed, the changes held:
+op 2140 81.0 → 24.3 GiB, 2154 385 → 288 GiB, 2162 162 → 81 GiB, 2159 113 → 100 GiB (2153, 2157, 2158 are
+the operators' own row-by-row decoding, unchanged). xt111 then ran out of memory at op 2170 (an exchange
+index freezing a chunk), xt112 at op 1693 (the giant left join's integrate loading a spilled block). A
+census hook now measures live bytes after chosen operators, once every worker has stepped them
+(`XT_LIVE_AT_OPS`, a forced compacting GC; `XT_LIVE_EXIT`), and `DBSPNET_COPY_MERGES=off` turns the
+copying merge off. With it off and on (xt114), and on the pre-§5.36 engine (2d50551, xt115), the restored
+run holds 20–23 GB live after op 1683 and runs out of memory in op 1693 alike. So §5.36 did not cause
+this: the giant joins at ops 1683–1703 are fragile at 48 GiB on the old engine too, and xt102 and xt109
+completing was luck. (xt109's 8.9 GB at op 1693 was sampled when the first worker finished it, not the
+last; the samples are not comparable to the fixed-point measure.) What holds the 20 GB at op 1683 is
+the next question.

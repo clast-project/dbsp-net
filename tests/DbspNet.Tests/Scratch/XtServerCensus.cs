@@ -253,6 +253,9 @@ public class XtServerCensus
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToHashSet();
         var gcdumpDir = Environment.GetEnvironmentVariable("XT_GCDUMP_DIR") ?? Path.GetTempPath();
+        var liveAt = (Environment.GetEnvironmentVariable("XT_LIVE_AT_OPS") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries).ToDictionary(x => int.Parse(x, CultureInfo.InvariantCulture), _ => 0);
+        var liveWorkers = int.Parse(Environment.GetEnvironmentVariable("DBSPNET_WORKERS") ?? "1", CultureInfo.InvariantCulture);
 
         // Per-op allocation (§5.35): each worker steps on its own thread, so the thread's allocated bytes
         // since its previous operator are that operator's on that worker. OPALLOC when >= 512 MiB.
@@ -304,6 +307,24 @@ public class XtServerCensus
                 {
                     lastOp = now; // XT_OP_TICK: sample inside that tick only
                     return;
+                }
+
+                // XT_LIVE_AT_OPS=1693,1703: once every worker has stepped one of these operators of the sampled
+                // tick, a full compacting GC and its live bytes (LIVEAT); XT_LIVE_EXIT=1 exits after the last.
+                if (liveAt.TryGetValue(i, out var seen))
+                {
+                    liveAt[i] = ++seen;
+                    if (seen == liveWorkers)
+                    {
+                        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                        log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"LIVEAT tick={circuit.TickCount} op={i} type={op.GetType().Name} live_mib={GC.GetTotalMemory(false) >> 20} t_s={sw.Elapsed.TotalSeconds:F0} copy_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.CopyMerges}"));
+                        log.Flush();
+                        if (liveAt.Values.All(v => v >= liveWorkers) && Environment.GetEnvironmentVariable("XT_LIVE_EXIT") == "1")
+                        {
+                            Environment.Exit(0);
+                        }
+                    }
                 }
 
                 if (gcdumpAt.Remove(i))

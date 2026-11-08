@@ -1644,7 +1644,8 @@ internal sealed class BlockedIndexedTrace
     /// <summary>Whether a merge copies its entries between blocks rather than decoding and encoding them
     /// (docs/design-bounded-memory.md §5.36): a hash one run holds is copied as it is; entries of a hash
     /// several runs hold are decoded only to sum equal rows, and the survivors copied. Off for A/B.</summary>
-    internal static bool CopyMerges { get; set; } = true;
+    internal static bool CopyMerges { get; set; } =
+        !string.Equals(Environment.GetEnvironmentVariable("DBSPNET_COPY_MERGES"), "off", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Hashes a copying merge copied as they were, and hashes it decoded to sum (diagnostics).</summary>
     internal static long CopiedHashes, SummedHashes;
