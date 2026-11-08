@@ -422,6 +422,10 @@ public sealed class RootCircuit
     /// and (for stateful operators) its retained- and last-output-row counts, so a
     /// caller can rank the circuit's hot operators after a batch.
     /// </summary>
+    /// <summary>The view an operator was built for (<see cref="CurrentBuildLabel"/>), if any.</summary>
+    internal string? OperatorLabel(int index) =>
+        index >= 0 && index < _operatorLabels.Count ? _operatorLabels[index] : null;
+
     public IReadOnlyList<OperatorProfile> CollectOperatorProfile()
     {
         if (_opCumTicks is null)

@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **§5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2637,3 +2637,74 @@ xt102's 7,138 GiB (−6%), and ops 1680–1705 together 581 GiB against 706 GiB 
 against 47.2 s. The rest of the tick is unchanged, and the largest allocators are now at its end (ops
 2153–2177: aggregates, a left join and an exchange-index of 80–385 GiB each), which this section did not
 touch.
+
+### 5.36 Ops 2153–2177: a rolling eligibility view, decoded and built again row by row (2026-11-08)
+
+After §5.35, the largest allocators of the restored tick 18 (xt109) are at its end: ops 2153–2175 are
+one view, `fact_engagement_status_channel_eligibility_28d_rolling_hist_12m` (ops 2176 on are its 7-day
+twin). It reads `int_hist_unpivoted_28d`, a three-way `UNION ALL` of ~65M rows in tick 18. It aggregates
+them twice (`COUNT(DISTINCT)` and two `SUM`s by eleven columns; `SUM`s over a `SELECT DISTINCT`), left-joins
+the two on eleven columns (three by `COALESCE`, a residual), and keys each row by
+`MD5(CONCAT_WS('-', COALESCE(TRY_CAST(c AS TEXT), ''), ...))` over eleven columns. There is no skew:
+each worker holds ~2.4M rows. The cost is per row, ~36 KB per unpivoted row across the stretch, with
+2154 (aggregate, 385 GiB), 2171 (left join, 359 GiB), 2153 (exchange-index, 252 GiB) and 2174 (the MD5
+projection, 157 GiB) the largest.
+
+**The instrument.** The census hook now prints each op's view (`OPDESC ... view=`; operators keep the
+view they were built for) at the first step, so a restored run names a stretch in seconds.
+`Scratch/RollingEligibilityRepro` compiles the two views as a W = 12 program over synthetic rows of the
+same columns, with the xt run's spill settings (`XT_MICRO=1`, step spill 100k). It allocates ~39 KB per
+unpivoted row, and its ops rank as production's; an allocation trace (EventPipe `AllocationTick` with
+stacks) totalled by leaf frame apportions it. About 40% was `TraceBlock.Cell`: decoding cells into boxed
+values and `Utf8String`s. By mechanism: trace merges decoding and encoding rows (~19% of the step),
+operators decoding a spilled delta row by row (~19%), a spilled delta's groups resolved to name their
+keys (~13%), probes of old groups (~8%).
+
+**Each group read once.** The aggregate walked `delta.Keys`, which for a block-backed delta resolves
+every group (values and all) to name its key, then probed `delta.GroupFor(key)`, decoding the group
+again. It now enumerates (key, group) pairs. `TouchedKeys` (the left and full joins, §5.34) also
+hands back each key's right group: probed for a left key, as enumerated for a right-only one (the join
+probed the right delta again for it). Tests `An_aggregate_reads_a_block_backed_deltas_groups_once`,
+`A_left_join_reads_a_block_backed_right_deltas_groups_once` (no probe of the delta;
+`BlockedGroups.ThreadProbes`).
+
+**Merges copy entries.** §5.35's copying merge was for a giant group only; every other hash was decoded,
+consolidated and encoded again. `MergeHash` now copies (`BlockedIndexedTrace.CopyMerges`, on): a hash one
+run holds is consolidated and canonical there, so its entries are copied as they are, no row read unless
+a floor needs the key; entries of a hash several runs hold are decoded to sum equal (key, value) entries,
+and each survivor is copied from its first entry with the summed weight, in canonical order. `RunBuilder`
+cuts copied entries into blocks by the same rules as decoded ones (block entries at a hash change, byte
+budget, spanning hashes), and keeps its mode across a flush. `BlockWriter.Copy` carries value hashes only
+when every source holds them: a trace block reloaded from a file has none, and computing them would decode
+the block. Tests `A_merge_copies_entries_rather_than_decoding_and_encoding_them` (30k keys over six runs:
+0.28× the decoding merge's allocation), `A_copying_merge_sums_entries_several_runs_hold` (property test,
+cancelling entries, canonical order); the floored path is covered by `BlockedTrace_BehavesLikeTheManagedTrace`.
+
+**Surrogate keys in one buffer.** Each `CAST(x AS TEXT)` built a .NET string, its UTF-8 copy and a
+`Utf8String`; `CONCAT_WS` took them in an `object[]` and copied them into its result, which `MD5` hashed.
+A `CONCAT_WS` with a literal separator now compiles each argument to write its text into a per-thread
+`Utf8TextBuffer` (`BuiltinScalarFunctions.FusedConcatWs`, on): a cast to text of an integer, float, date,
+boolean or string formats into it as the cast formats (invariant culture; `yyyy-MM-dd`; `True`/`False`),
+a failing `TRY_CAST` rolls back to NULL, a `COALESCE` writes its first non-NULL argument, anything else
+is evaluated and copied. `MD5` of such a `CONCAT_WS` hashes the buffer, allocating only the digest.
+Decimals and timestamps keep their cast and are copied. Tests `FusedConcatWsTests`: the same rows as the
+runtime form over every argument shape and edge values (NaN, infinities, −0.0, extreme dates and
+integers, empty and non-ASCII strings, nested `CONCAT_WS`, a column separator), a failing `TRY_CAST`,
+and the eleven-column key at 0.08× the runtime form's allocation.
+
+**In the stand-in** (W = 12, 2.85M unpivoted rows; per-op allocation):
+
+| op | before | after |
+|---|---|---|
+| first aggregate (2154) | 17.6 GiB | 12.0 GiB |
+| second aggregate (2162) | 8.8 GiB | 5.2 GiB |
+| left join (2171) | 21.0 GiB | 16.1 GiB |
+| MD5 projection (2174) | 10.2 GiB | 5.1 GiB |
+| the two views' integrals | 5.7 GiB | 1.7 GiB |
+| step (less the harness's own profile reads, ~20 GiB) | ~83 GiB | ~59 GiB (−29%) |
+
+Each change was mutation-checked: its test fails with it undone.
+
+**What is left** is the general structural-row cost: each operator decodes its spilled input row by row
+into boxed cells and builds its output rows again (the exchanges' splits, the projections and filters, the
+join's per-group lists and builders for groups of one or two rows), and a probe of an old group decodes it.

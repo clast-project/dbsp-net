@@ -152,10 +152,9 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
 
         // Every key that could have a non-zero delta this tick shows up in dl or dr, each once (§5.34).
-        foreach (var (key, dlK) in TouchedKeys.Of(dl, dr))
+        foreach (var (key, dlK, drK) in TouchedKeys.Of(dl, dr))
         {
             var oldR = rightOld.GroupFor(key);
-            var drK = dr.GroupFor(key);
             var newR = oldR + drK;
 
             // The key's old left group, read from the trace only where a branch needs it, and its new one

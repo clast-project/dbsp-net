@@ -264,7 +264,7 @@ public class XtServerCensus
         var described = 0;
         RootCircuit.AfterOperatorStep = (circuit, i) =>
         {
-            if (describeFrom >= 0 && i == describeTo && Interlocked.Exchange(ref described, 1) == 0)
+            if (describeFrom >= 0 && Interlocked.Exchange(ref described, 1) == 0)
             {
                 lock (gate)
                 {
@@ -282,7 +282,7 @@ public class XtServerCensus
                                 parts.Add($"{f.Name}={d.Method.DeclaringType?.Name}.{d.Method.Name}" + (d.Target is { } t ? $"[{t.GetType().Name}]" : ""));
                         }
 
-                        log.WriteLine($"OPDESC op={k} type={o.GetType().Name} {string.Join(' ', parts)}");
+                        log.WriteLine($"OPDESC op={k} view={circuit.OperatorLabel(k) ?? "-"} type={o.GetType().Name} {string.Join(' ', parts)}");
                     }
                 }
             }

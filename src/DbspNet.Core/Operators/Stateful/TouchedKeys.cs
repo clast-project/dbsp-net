@@ -11,11 +11,12 @@ namespace DbspNet.Core.Operators.Stateful;
 /// whose left group is empty. The outer joins built a <c>HashSet</c> sized for both deltas, the allocation
 /// extended TPC-DS tick 18 failed in. A right key's one left probe is both the membership test and the
 /// group, and a left key needs none: a block-backed left delta is probed less than before, not more (a
-/// separate membership test doubled the probes and op 1693's time, xt99/xt100).
+/// separate membership test doubled the probes and op 1693's time, xt99/xt100). Each key comes with its
+/// right group too: probed for a left key, as enumerated for a right one.
 /// </summary>
 internal static class TouchedKeys
 {
-    public static IEnumerable<(TKey Key, ZSet<TLeft, TWeight> Left)> Of<TKey, TLeft, TRight, TWeight>(
+    public static IEnumerable<(TKey Key, ZSet<TLeft, TWeight> Left, ZSet<TRight, TWeight> Right)> Of<TKey, TLeft, TRight, TWeight>(
         IndexedZSet<TKey, TLeft, TWeight> left,
         IndexedZSet<TKey, TRight, TWeight> right)
         where TKey : notnull
@@ -25,15 +26,17 @@ internal static class TouchedKeys
     {
         foreach (var (k, group) in left)
         {
-            yield return (k, group);
+            yield return (k, group, right.GroupFor(k));
         }
 
-        foreach (var k in right.Keys)
+        // The right's groups as enumerated (§5.36): a block-backed delta's Keys resolves each group to name
+        // its key, and the caller's GroupFor decoded it again.
+        foreach (var (k, rightGroup) in right)
         {
             var group = left.GroupFor(k);
             if (group.IsEmpty)
             {
-                yield return (k, group);
+                yield return (k, group, rightGroup);
             }
         }
     }

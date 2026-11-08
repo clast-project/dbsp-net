@@ -1553,6 +1553,7 @@ internal sealed class BlockedIndexedTrace
             }
 
             var output = new RunBuilder(this, stream: true);
+            output.CopyMerge = CanCopyFrom(cursors.FirstOrDefault(c => !c.Done));
             var scratch = new MergeScratch();
             var tied = new List<Cursor>();
             var dropped = 0L;
@@ -1598,11 +1599,16 @@ internal sealed class BlockedIndexedTrace
         }
     }
 
+    // Whether a merge reading cursor's run can copy its entries (§5.36).
+    private bool CanCopyFrom(Cursor? cursor) =>
+        CopyMerges && cursor is not null && _format.CopiedEntryBytes(cursor.Block, cursor.Index) > 0;
+
     private Run? MergeCore(Run newer, Run older)
     {
         var a = new Cursor(newer);
         var b = new Cursor(older);
         var output = new RunBuilder(this, stream: true);
+        output.CopyMerge = CanCopyFrom(!a.Done ? a : !b.Done ? b : null);
         var scratch = new MergeScratch();
         var tied = new List<Cursor>(2);
         var dropped = 0L;
@@ -1635,12 +1641,22 @@ internal sealed class BlockedIndexedTrace
     /// a run was not in value-hash order or held several keys there (diagnostics).</summary>
     internal static long GiantMerges, GiantFallbacks;
 
+    /// <summary>Whether a merge copies its entries between blocks rather than decoding and encoding them
+    /// (docs/design-bounded-memory.md §5.36): a hash one run holds is copied as it is; entries of a hash
+    /// several runs hold are decoded only to sum equal rows, and the survivors copied. Off for A/B.</summary>
+    internal static bool CopyMerges { get; set; } = true;
+
+    /// <summary>Hashes a copying merge copied as they were, and hashes it decoded to sum (diagnostics).</summary>
+    internal static long CopiedHashes, SummedHashes;
+
     private sealed class MergeScratch
     {
         public readonly List<(StructuralRow Key, StructuralRow Value, long Weight)> Group = [];
         public readonly List<int> Ids = [];
         public readonly List<StructuralRow> Keys = [];
         public ulong[] Order = new ulong[16];
+        public readonly List<(StructuralRow Key, StructuralRow Value, long Weight, ITraceBlock Block, int Index)> Copies = [];
+        public readonly Dictionary<(StructuralRow, StructuralRow), int> At = [];
     }
 
     // The tied cursors' entries of hash, consolidated, into output (each cursor left past them); the
@@ -1653,6 +1669,11 @@ internal sealed class BlockedIndexedTrace
         if (IsGiant(tied, hash) && TryMergeGiant(tied, hash, output, scratch, out var giantDropped))
         {
             return giantDropped;
+        }
+
+        if (output.CopyMerge)
+        {
+            return MergeHashCopying(tied, hash, output, scratch);
         }
 
         var group = scratch.Group;
@@ -1697,6 +1718,133 @@ internal sealed class BlockedIndexedTrace
             output.Add(hash, key, value, weight);
         }
 
+        return dropped;
+    }
+
+    // MergeHash copying entries whole (§5.36). A hash one run holds is consolidated and in canonical order
+    // there: its entries are copied as they are, with no row read unless a floor needs the key. Entries of
+    // a hash several runs hold are decoded to sum equal (key, value) entries; each survivor is copied
+    // from its first entry with the summed weight, in canonical order (a key's entries together, by
+    // value hash), as the decoding merge writes them.
+    private long MergeHashCopying(List<Cursor> tied, uint hash, RunBuilder output, MergeScratch scratch)
+    {
+        var dropped = 0L;
+        if (tied.Count == 1)
+        {
+            var c = tied[0];
+            var floor = c.Run.Floor;
+            StructuralRow? key = null;
+            StructuralRow? lastDropped = null;
+            while (!c.Done && c.Hash == hash)
+            {
+                var (block, i) = (c.Block, c.Index);
+                if (floor != long.MinValue)
+                {
+                    key = key is not null && block.KeyEquals(i, key) ? key : block.Key(i);
+                    if (Dropped(key, floor))
+                    {
+                        if (!ReferenceEquals(key, lastDropped))
+                        {
+                            dropped++;
+                            lastDropped = key;
+                        }
+
+                        c.Advance();
+                        continue;
+                    }
+                }
+
+                output.AddCopy(hash, block, i, block.Weight(i));
+                c.Advance();
+            }
+
+            Interlocked.Increment(ref CopiedHashes);
+            return dropped;
+        }
+
+        var entries = scratch.Copies;
+        entries.Clear();
+        foreach (var cursor in tied)
+        {
+            StructuralRow? key = null;
+            StructuralRow? lastDropped = null;
+            while (!cursor.Done && cursor.Hash == hash)
+            {
+                var (block, i) = (cursor.Block, cursor.Index);
+                key = key is not null && block.KeyEquals(i, key) ? key : block.Key(i);
+                if (Dropped(key, cursor.Run.Floor))
+                {
+                    if (!ReferenceEquals(key, lastDropped))
+                    {
+                        dropped++;
+                        lastDropped = key;
+                    }
+                }
+                else
+                {
+                    entries.Add((key, block.Value(i), block.Weight(i), block, i));
+                }
+
+                cursor.Advance();
+            }
+        }
+
+        // Sum equal entries in place, first seen first; drop zeros.
+        var at = scratch.At;
+        at.Clear();
+        var kept = 0;
+        for (var j = 0; j < entries.Count; j++)
+        {
+            var e = entries[j];
+            if (at.TryGetValue((e.Key, e.Value), out var first))
+            {
+                var f = entries[first];
+                entries[first] = (f.Key, f.Value, f.Weight + e.Weight, f.Block, f.Index);
+            }
+            else
+            {
+                at[(e.Key, e.Value)] = kept;
+                entries[kept++] = e;
+            }
+        }
+
+        entries.RemoveRange(kept, entries.Count - kept);
+        entries.RemoveAll(static e => e.Weight == 0);
+
+        var n = entries.Count;
+        if (n > 1)
+        {
+            if (scratch.Order.Length < n)
+            {
+                scratch.Order = new ulong[Math.Max(n, scratch.Order.Length * 2)];
+            }
+
+            var keys = scratch.Keys;
+            keys.Clear();
+            var order = scratch.Order.AsSpan(0, n);
+            var items = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(entries);
+            for (var j = 0; j < n; j++)
+            {
+                var k = items[j].Key;
+                var ord = keys.FindIndex(x => ReferenceEquals(x, k) || x.Equals(k));
+                if (ord < 0)
+                {
+                    keys.Add(k);
+                    ord = keys.Count - 1;
+                }
+
+                order[j] = ((ulong)(uint)ord << 32) | (uint)items[j].Value.GetHashCode();
+            }
+
+            order.Sort(items);
+        }
+
+        foreach (var e in entries)
+        {
+            output.AddCopy(hash, e.Block, e.Index, e.Weight);
+        }
+
+        Interlocked.Increment(ref SummedHashes);
         return dropped;
     }
 
@@ -2110,6 +2258,9 @@ internal sealed class BlockedIndexedTrace
         private ITraceBlock[] _sources = [];
         private int[] _indexes = [];
 
+        /// <summary>A merge writing every entry by <see cref="AddCopy"/> (§5.36).</summary>
+        public bool CopyMerge { get; set; }
+
         /// <summary>Start buffering copied entries (<see cref="AddCopy"/>) of one hash: what is buffered is
         /// flushed first, so that hash's blocks hold only it. False when the format cannot copy.</summary>
         public bool BeginCopy(ITraceBlock probe)
@@ -2127,12 +2278,13 @@ internal sealed class BlockedIndexedTrace
         /// <summary>Add another block's entry, copied whole when its block is flushed.</summary>
         public void AddCopy(uint hash, ITraceBlock source, int index, long weight)
         {
-            if (_count > 0 && _bytes >= trace._blockBytes)
+            if (!_copying)
             {
                 Flush();
                 _copying = true;
             }
 
+            Cut(hash);
             _bytes += trace._format.CopiedEntryBytes(source, index);
             if (_count == _sources.Length)
             {
@@ -2157,6 +2309,36 @@ internal sealed class BlockedIndexedTrace
         private static bool NoSpanAlign => !BlockAccess.AlignSpans;
 
         public void Add(uint hash, StructuralRow key, StructuralRow value, long weight)
+        {
+            if (_copying)
+            {
+                Flush();
+                _copying = false;
+            }
+
+            Cut(hash);
+            _bytes += trace._format.EntryBytes(key, value);
+
+            if (_count == _keys.Length)
+            {
+                var size = _count * 2;
+                Array.Resize(ref _keys, size);
+                Array.Resize(ref _values, size);
+                Array.Resize(ref _weights, Math.Max(size, _weights.Length));
+                Array.Resize(ref _hashes, Math.Max(size, _hashes.Length));
+            }
+
+            _keys[_count] = key;
+            _values[_count] = value;
+            _weights[_count] = weight;
+            _hashes[_count] = (int)hash;
+            _count++;
+            _entries++;
+        }
+
+        // Where a block ends before an entry of hash (decoded or copied alike): after blockEntries entries
+        // where the hash changes, after the byte budget anywhere, and around a hash that spans blocks.
+        private void Cut(uint hash)
         {
             if (_count > 0)
             {
@@ -2192,23 +2374,6 @@ internal sealed class BlockedIndexedTrace
                     Flush();
                 }
             }
-
-            _bytes += trace._format.EntryBytes(key, value);
-
-            if (_count == _keys.Length)
-            {
-                Array.Resize(ref _keys, _count * 2);
-                Array.Resize(ref _values, _count * 2);
-                Array.Resize(ref _weights, _count * 2);
-                Array.Resize(ref _hashes, _count * 2);
-            }
-
-            _keys[_count] = key;
-            _values[_count] = value;
-            _weights[_count] = weight;
-            _hashes[_count] = (int)hash;
-            _count++;
-            _entries++;
         }
 
         public Run? Finish()
@@ -2230,20 +2395,33 @@ internal sealed class BlockedIndexedTrace
         private void FlushPrefix(int n)
         {
             var rest = _count - n;
-            var keys = _keys[n.._count];
-            var values = _values[n.._count];
             var weights = _weights[n.._count];
             var hashes = _hashes[n.._count];
-            _count = n;
-            Flush();
-            Array.Copy(keys, _keys, rest);
-            Array.Copy(values, _values, rest);
+            if (_copying)
+            {
+                var sources = _sources[n.._count];
+                var indexes = _indexes[n.._count];
+                _count = n;
+                Flush();
+                Array.Copy(sources, _sources, rest);
+                Array.Copy(indexes, _indexes, rest);
+            }
+            else
+            {
+                var keys = _keys[n.._count];
+                var values = _values[n.._count];
+                _count = n;
+                Flush();
+                Array.Copy(keys, _keys, rest);
+                Array.Copy(values, _values, rest);
+            }
+
             Array.Copy(weights, _weights, rest);
             Array.Copy(hashes, _hashes, rest);
             _count = rest;
             for (var i = 0; i < rest; i++)
             {
-                _bytes += trace._format.EntryBytes(_keys[i], _values[i]);
+                _bytes += _copying ? trace._format.CopiedEntryBytes(_sources[i], _indexes[i]) : trace._format.EntryBytes(_keys[i], _values[i]);
             }
         }
 
@@ -2297,7 +2475,6 @@ internal sealed class BlockedIndexedTrace
             if (_copying)
             {
                 Array.Clear(_sources, 0, _count);
-                _copying = false;
             }
             else
             {

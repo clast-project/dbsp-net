@@ -729,6 +729,94 @@ internal static class BuiltinScalarFunctions
         return Expression.Convert(Expression.Call(ConcatWsRuntime, argArray), typeof(object));
     }
 
+    /// <summary>Whether a <c>CONCAT_WS</c> with a literal separator writes its arguments into one buffer
+    /// (<see cref="Utf8TextBuffer"/>, docs/design-bounded-memory.md §5.36). Off for A/B.</summary>
+    internal static bool FusedConcatWs { get; set; } = true;
+
+    private static readonly MethodInfo BufferRent = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.Rent))!;
+    private static readonly MethodInfo BufferReturn = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.Return))!;
+    private static readonly MethodInfo BufferOpen = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.Open))!;
+    private static readonly MethodInfo BufferClose = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.Close))!;
+    private static readonly MethodInfo BufferAppendUtf8 = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.AppendUtf8))!;
+    private static readonly MethodInfo BufferAppendCast = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.AppendCast))!;
+    private static readonly MethodInfo BufferToUtf8 = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.ToUtf8String))!;
+    private static readonly MethodInfo BufferMd5 = typeof(Utf8TextBuffer).GetMethod(nameof(Utf8TextBuffer.Md5Hex))!;
+
+    /// <summary>
+    /// <c>CONCAT_WS(sep, a, ...)</c> with a non-NULL literal separator, each argument writing its text into
+    /// one <see cref="Utf8TextBuffer"/> (§5.36); with <paramref name="md5"/>, <c>MD5</c> of it, hashed in the
+    /// buffer. Null when the separator is not such a literal (the runtime-dispatched form is used).
+    /// </summary>
+    internal static Expression? BuildConcatWsFused(ResolvedFunctionCall fn, Func<ResolvedExpression, Expression> buildArg, bool md5)
+    {
+        if (!FusedConcatWs || fn.Arguments[0] is not ResolvedLiteral { Value: var sepValue } || sepValue is null)
+        {
+            return null;
+        }
+
+        Utf8String? sep = sepValue switch
+        {
+            Utf8String u => u,
+            string str => Utf8String.Of(str),
+            _ => null,
+        };
+        if (sep is null)
+        {
+            return null;
+        }
+
+        var buf = Expression.Variable(typeof(Utf8TextBuffer), "text");
+        var result = Expression.Variable(typeof(Utf8String), "joined");
+        var body = new List<Expression> { Expression.Assign(buf, Expression.Call(BufferRent)) };
+        for (var i = 1; i < fn.Arguments.Count; i++)
+        {
+            var mark = Expression.Variable(typeof(int), "mark" + i);
+            body.Add(Expression.Block(
+                [mark],
+                Expression.Assign(mark, Expression.Call(buf, BufferOpen, Expression.Constant(sep))),
+                Expression.Call(buf, BufferClose, mark, BuildAppend(fn.Arguments[i], buildArg, buf))));
+        }
+
+        body.Add(Expression.Assign(result, Expression.Call(buf, md5 ? BufferMd5 : BufferToUtf8)));
+        body.Add(Expression.Call(buf, BufferReturn));
+        body.Add(Expression.Convert(result, typeof(object)));
+        return Expression.Block([buf, result], body);
+    }
+
+    // Write e's text into buf; true unless e is NULL (nothing is written then). A cast to text of a type
+    // the buffer formats, a COALESCE (its first non-NULL argument), and a string literal write directly;
+    // anything else is evaluated and its string copied.
+    private static Expression BuildAppend(ResolvedExpression e, Func<ResolvedExpression, Expression> buildArg, ParameterExpression buf)
+    {
+        switch (e)
+        {
+            case ResolvedCast { Type: SqlVarcharType } cast when FormatsDirectly(cast.Operand.Type):
+                return Expression.Call(buf, BufferAppendCast,
+                    Expression.Convert(buildArg(cast.Operand), typeof(object)), Expression.Constant(cast.Safe));
+            case ResolvedFunctionCall { FunctionName: "coalesce" } coalesce when coalesce.Arguments.Count > 0:
+            {
+                Expression? any = null;
+                for (var i = coalesce.Arguments.Count - 1; i >= 0; i--)
+                {
+                    var one = BuildAppend(coalesce.Arguments[i], buildArg, buf);
+                    any = any is null ? one : Expression.OrElse(one, any);
+                }
+
+                return any!;
+            }
+
+            default:
+                return Expression.Call(buf, BufferAppendUtf8, Expression.Convert(buildArg(e), typeof(object)));
+        }
+    }
+
+    // The source types Utf8TextBuffer.AppendCast formats exactly as BuildCastValue's cast to text does.
+    private static bool FormatsDirectly(SqlType source) =>
+        source is not SqlDecimalType and not SqlNullType
+        && (source.ClrType == typeof(int) || source.ClrType == typeof(long) || source.ClrType == typeof(float)
+            || source.ClrType == typeof(double) || source.ClrType == typeof(bool) || source.ClrType == typeof(Date32)
+            || source.ClrType == typeof(Utf8String));
+
     internal static readonly MethodInfo Md5Runtime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.Md5))!;
 
@@ -1122,9 +1210,14 @@ internal static class SqlBuiltinRuntime
     {
         Span<byte> digest = stackalloc byte[16];
         MD5.HashData(s.Span, digest);
+        return HexOf(digest);
+    }
 
-        var hex = new byte[32];
-        for (var i = 0; i < 16; i++)
+    /// <summary>A digest as lowercase hex.</summary>
+    public static Utf8String HexOf(ReadOnlySpan<byte> digest)
+    {
+        var hex = new byte[digest.Length * 2];
+        for (var i = 0; i < digest.Length; i++)
         {
             hex[i * 2] = HexDigits[digest[i] >> 4];
             hex[i * 2 + 1] = HexDigits[digest[i] & 0xF];

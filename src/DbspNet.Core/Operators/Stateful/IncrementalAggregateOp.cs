@@ -432,9 +432,10 @@ internal sealed class IncrementalAggregateOp<TKey, TValue, TOut> : IOperator, IS
             builder = new ZSetBuilder<(TKey, TOut), Z64>(_lastOutputSize);
         }
 
-        foreach (var key in delta.Keys)
+        // Each group as enumerated (§5.36): a block-backed delta's Keys resolves every group to name its
+        // key, and a GroupFor after it decoded the group a second time.
+        foreach (var (key, groupDelta) in delta)
         {
-            var groupDelta = delta.GroupFor(key);
             var beforeView = before.GroupView(key);
             if (beforeView is not ZSet<TValue, Z64> beforeGroup)
             {

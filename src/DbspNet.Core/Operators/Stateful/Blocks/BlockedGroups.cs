@@ -138,8 +138,13 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
 
     public override int GroupCount => _groupCount;
 
+    /// <summary>Probes of a block-backed indexed delta on this thread (tests, §5.36).</summary>
+    [ThreadStatic]
+    internal static long ThreadProbes;
+
     public override ZSet<StructuralRow, Z64> GroupFor(StructuralRow key)
     {
+        ThreadProbes++;
         var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         var hash = (uint)key.GetHashCode();
         var b = new ZSetBuilder<StructuralRow, Z64>();

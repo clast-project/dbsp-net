@@ -556,14 +556,22 @@ internal static class BlockWriter
     /// One block of whole entries copied from other blocks of <paramref name="schema"/>'s layout
     /// (docs/design-bounded-memory.md §5.35): entry i is <paramref name="sources"/>[i]'s entry
     /// <paramref name="indexes"/>[i], every key and value column copied, nothing decoded, with its
-    /// weight and key hash given and its value hash the source's.
+    /// weight and key hash given and its value hash the source's. Value hashes are copied only when every
+    /// source already holds them (§5.36): a source reloaded from a file without them would be decoded to
+    /// compute them, the cost the copy avoids; the block then computes them if a merge asks.
     /// </summary>
     public static TraceBlock Copy(BlockSchema schema, TraceBlock[] sources, int[] indexes, long[] weights, int[] hashes, int n)
     {
-        var valueHashes = new int[n];
+        int[]? valueHashes = new int[n];
         for (var i = 0; i < n; i++)
         {
-            valueHashes[i] = sources[i].ValueHash(indexes[i]);
+            if (sources[i].KnownValueHashes is not { } known)
+            {
+                valueHashes = null;
+                break;
+            }
+
+            valueHashes[i] = known[indexes[i]];
         }
 
         return GatherCore(schema, sources, indexes, null, weights, hashes, n, schema.WeightColumn, valueHashes);

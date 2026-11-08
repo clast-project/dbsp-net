@@ -419,6 +419,70 @@ public class BlockedDeltaTests
         Assert.True(merge < decode, $"the merge allocated {merge} B, a decode of every value {decode} B");
     }
 
+    // §5.36: a merge copies entries between blocks. A hash one run holds is copied as it is, with no row
+    // decoded; entries of a hash several runs hold are decoded only to sum them, and the survivors copied.
+    // Extended TPC-DS's aggregates and joins spent ~20% of a step decoding and encoding rows in trace merges.
+    [Fact]
+    public void A_merge_copies_entries_rather_than_decoding_and_encoding_them()
+    {
+        const int n = 30_000;
+        var adds = Enumerable.Range(0, n).Select(i => (i, i % 50, i % 4, 1L)).ToArray();
+        long Adopt(bool copy)
+        {
+            var delta = SpilledIndexed(adds, 0, n / 6);
+            Assert.True(delta.External is BlockedGroups { RunCount: > 2 });
+            var saved = BlockedIndexedTrace.CopyMerges;
+            BlockedIndexedTrace.CopyMerges = copy;
+            var trace = new BlockedIndexedTrace(IndexedFormat);
+            var before = GC.GetAllocatedBytesForCurrentThread();
+            try
+            {
+                trace.Integrate(delta);
+            }
+            finally
+            {
+                before = GC.GetAllocatedBytesForCurrentThread() - before;
+                BlockedIndexedTrace.CopyMerges = saved;
+            }
+
+            AssertSameIndexed(ManagedIndexed(adds), trace.Materialize());
+            trace.CheckRuns();
+            return before;
+        }
+
+        var copied0 = Interlocked.Read(ref BlockedIndexedTrace.CopiedHashes);
+        var decoding = Adopt(copy: false);
+        Assert.Equal(copied0, Interlocked.Read(ref BlockedIndexedTrace.CopiedHashes));
+        var copying = Adopt(copy: true);
+        Assert.True(Interlocked.Read(ref BlockedIndexedTrace.CopiedHashes) - copied0 >= n, "the merge did not copy its hashes");
+        Console.WriteLine($"MERGECOPY decoding={decoding} copying={copying} ratio={(double)copying / decoding:F2}");
+        // 0.28 by default; 0.46 under the forced suites' 16-entry blocks and 1 MiB cache (blocks reloaded).
+        Assert.True(copying * 5 < decoding * 3, $"the copying merge allocated {copying} B, the decoding one {decoding} B");
+    }
+
+    // §5.36: entries of one hash in several runs are summed before they are copied (cancelling ones
+    // dropped), and the merged runs stay canonical.
+    [Fact]
+    public void A_copying_merge_sums_entries_several_runs_hold()
+    {
+        var summed0 = Interlocked.Read(ref BlockedIndexedTrace.SummedHashes);
+        Gen.Select(GenIndexedAdds.Array[1, 6], Gen.Int[1, 9]).Sample((ticks, chunk) =>
+        {
+            var trace = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+            var sum = IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+            foreach (var tick in ticks)
+            {
+                trace.Integrate(SpilledIndexed(tick, 0, chunk));
+                trace.Freeze();
+                sum += ManagedIndexed(tick);
+                AssertSameIndexed(sum, trace.Materialize());
+                trace.CheckRuns();
+                trace.CheckValueOrder();
+            }
+        }, iter: 300);
+        Assert.True(Interlocked.Read(ref BlockedIndexedTrace.SummedHashes) > summed0, "no merge summed a hash several runs held");
+    }
+
     [Fact]
     public void A_giant_group_out_of_value_order_falls_back_and_merges_correctly()
     {
@@ -674,6 +738,49 @@ public class BlockedDeltaTests
         Assert.True(actual[0].Blocked, "300 new groups are past the threshold");
         Assert.True(actual[1].Blocked, "250 changed groups emit 500 rows");
         Assert.False(actual[2].Blocked, "a few rows are below it");
+    }
+
+    // §5.36: the aggregate reads each group of a block-backed delta once, as enumerated. It walked the
+    // delta's keys (which resolves every group, values and all) and then probed each key's group again.
+    [Fact]
+    public void An_aggregate_reads_a_block_backed_deltas_groups_once()
+    {
+        using var _ = SpillSettings.UseStepSpill(100, 1);
+        var q = CompileAggregate();
+        for (var k = 0; k < 300; k++)
+        {
+            q.Table("f").Insert(k, (long)(k % 10), "s" + (k % 7));
+        }
+
+        var builds0 = Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds);
+        var probes0 = BlockedGroups.ThreadProbes;
+        q.Step();
+        Assert.True(Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds) > builds0, "the aggregate's input was not block backed");
+        Assert.Equal(0, BlockedGroups.ThreadProbes - probes0);
+        Assert.Equal(120, q.Current.Count); // HAVING SUM(x) > 5 keeps the groups with x in 6..9
+    }
+
+    // §5.36: a left join takes a right-only key's right group as enumerated, not by probing the right
+    // delta for it again.
+    [Fact]
+    public void A_left_join_reads_a_block_backed_right_deltas_groups_once()
+    {
+        using var _ = SpillSettings.UseStepSpill(100, 1);
+        var q = CompileLeftJoin();
+        for (var k = 0; k < 300; k++)
+        {
+            q.Table("d").Insert(k, (long)k);
+        }
+
+        var builds0 = Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds);
+        var probes0 = BlockedGroups.ThreadProbes;
+        q.Step();
+        Assert.True(Interlocked.Read(ref DeltaSpill.BlockedGroupBuilds) > builds0, "the join's right delta was not block backed");
+        Assert.Equal(0, BlockedGroups.ThreadProbes - probes0);
+        Assert.Equal(0, q.Current.Count);
+        q.Table("f").Insert(5, 1L, "s");
+        q.Step();
+        Assert.Equal(1, q.Current.Count);
     }
 
     private const string LeftJoinSql = "SELECT f.k, f.x, d.y FROM f LEFT JOIN d ON f.k = d.k";
