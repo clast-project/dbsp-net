@@ -2780,3 +2780,25 @@ and allocates ~24 GiB in it. The full run carries more between ops than the rest
 after ops 2168–2170, against 26.2–29.9 GB in xt118; cf. §5.30), so twelve workers' concurrent working memory
 in op 2171, including each worker's managed output chunk (up to `DBSPNET_STEP_SPILL_ROWS` = 1M rows,
 held while it freezes), no longer fits. Wall to the failure 3,733 s, peak RSS 46 GiB, spill 65 GB.
+
+**The step-spill chunk, A/B (xt120, xt121; restored, same binaries, `XT_GC_TIMELINE=30000`).** A new
+census hook, `XT_GC_TIMELINE=MIB`, logs every collection that leaves at least MIB in use (heap less
+fragmentation, the pressure monitor's measure), and every gen-2 one, as a `GCUSED` line.
+
+| | xt120: 1M rows (default) | xt121: 262,144 rows |
+|---|---|---|
+| Batch 1 | out of memory, op 2170, t ≈ 2,170 s | completes, 2,276 s (xt118: 3,326 s) |
+| Most in use after a full GC | 34.3 GB | 30.7 GB |
+| Most in use after any GC | 48.1 GB (t = 1,741 s, Critical) | 45.4 GB (t = 225 s, High) |
+| Collections leaving ≥ 30 GB | 660, 190 of them gen 1 | 406, 30 of them gen 1 |
+| Tick 18 allocation | — | 7,139 GiB (xt118: 6,087) |
+| Peak RSS | 47 GiB | 44 GiB |
+
+xt120 failed where xt118 (same settings) passed, in an exchange-index's chunk freeze
+(`SpillingGroups.FreezeChunk` → `BlockedIndexedTrace.Freeze` → `ArrayPool.Rent`). Live after full GCs
+was 24–26 GB just before it, and the pressure monitor read Low: between full collections each gen-1 GC
+promoted 4–6 GB of chunk-lived data into gen 2, and the heap filled in seconds, faster than a level
+measured once per collection moves. A quarter-size chunk makes far fewer such collections, and the run
+completed 31% faster than xt118 (the gen-2 work saved), but it allocates 17% more: more, smaller runs per
+delta, so readers decode and sum more entries that several runs share (ops reading those deltas, e.g. the
+left joins 2012, 2082 and 2194, 10–14 → 52–76 GiB). One run each, under a failure that is nondeterministic.

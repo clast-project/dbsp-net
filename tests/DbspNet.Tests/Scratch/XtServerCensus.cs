@@ -257,6 +257,37 @@ public class XtServerCensus
             .Split(',', StringSplitOptions.RemoveEmptyEntries).ToDictionary(x => int.Parse(x, CultureInfo.InvariantCulture), _ => 0);
         var liveWorkers = int.Parse(Environment.GetEnvironmentVariable("DBSPNET_WORKERS") ?? "1", CultureInfo.InvariantCulture);
 
+        // XT_GC_TIMELINE=MIB (§5.37): every collection that leaves at least MIB in use (heap less
+        // fragmentation, the pressure monitor's measure), or any gen-2 one, as a GCUSED line, so an
+        // operator's in-flight peak can be read off between its workers' OPROWS times. Polled every 100 ms.
+        using var timelineStop = new CancellationTokenSource();
+        if (long.TryParse(Environment.GetEnvironmentVariable("XT_GC_TIMELINE"), CultureInfo.InvariantCulture, out var timelineMib))
+        {
+            new Thread(() =>
+            {
+                long seen = -1;
+                while (!timelineStop.IsCancellationRequested)
+                {
+                    var info = GC.GetGCMemoryInfo(GCKind.Any);
+                    if (info.Index != seen)
+                    {
+                        seen = info.Index;
+                        var used = info.HeapSizeBytes - info.FragmentedBytes;
+                        if (used >= timelineMib << 20 || info.Generation == 2)
+                        {
+                            lock (gate)
+                            {
+                                log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                                    $"GCUSED t_s={sw.Elapsed.TotalSeconds:F1} gc={info.Index} gen={info.Generation} used_mib={used >> 20} promoted_mib={info.PromotedBytes >> 20} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current}"));
+                            }
+                        }
+                    }
+
+                    Thread.Sleep(100);
+                }
+            }) { IsBackground = true, Name = "xt-gc-timeline" }.Start();
+        }
+
         // Per-op allocation (§5.35): each worker steps on its own thread, so the thread's allocated bytes
         // since its previous operator are that operator's on that worker. OPALLOC when >= 512 MiB.
         var lastAlloc = new ThreadLocal<long>(() => GC.GetAllocatedBytesForCurrentThread());
