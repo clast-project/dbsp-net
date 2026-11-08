@@ -2812,3 +2812,20 @@ second, each leaving ~12.5 GB in use (the most after any full collection in the 
 it is committed memory the heap cannot use (fragmentation, free regions kept committed, pinned blocks).
 The census line did not record which; `GCUSED` now adds committed bytes, fragmentation by generation
 (gen 2, LOH, POH), LOH and POH sizes, the pinned-object count and whether the collection compacted.
+
+**xt123 (xt122 again, with the wider `GCUSED` line): out of memory at t = 1,624 s, op ~1696, the same
+throw** (`LazyTraceBlock.Load` ← `StreamedGroup.TryCreate`'s counting walk ← `TouchedKeys.Of` ← a left join).
+The last collections before it: 14–18 GB in use, 39–40 GB committed (limit 48 GiB), fragmentation ~0, LOH
+under 1 GB, nothing pinned, every collection compacting. So it is not fragmentation or a full heap. The
+failing allocation is the block's message buffer (`new byte[MessageLength]`, inlined into `Load`); an
+out-of-memory there now throws `InsufficientMemoryException` naming the block's size, entries, groups,
+codec and file, and the heap's state, so the next failure says whether one block is outsized.
+
+**xt124 (xt123's settings and binaries plus that message): batch 1 completes and validates.** The driver
+reports `status: completed` (DuckDB replay and full recomputation, `EXCEPT ALL`) after 3,492 s (xt70, W = 1:
+7,783 s), every model `success`. Tick 18 (t ≈ 1,300–2,900 s) allocates 7,125 GiB (restored xt121: 7,139);
+live after it 17.1 GB; spill disk peak 72.7 GB. The most in use after any collection was 44.9 GB, and
+committed peaked at 48,871 MiB, 281 MiB under the limit; the most after a full collection 31.9 GB (with
+7.8 GB fragmentation, 4.2 GB of it gen 2). It passed ops 1696–1724, where xt122 and xt123 failed, so that
+failure is nondeterministic too: **one full run of three at 262,144 rows validated, and the margin is a
+few hundred MiB.** Open: what `TryCreate`'s block read failed on with ~9 GB of commit headroom.

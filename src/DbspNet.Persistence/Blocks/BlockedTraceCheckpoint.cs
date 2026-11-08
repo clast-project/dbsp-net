@@ -974,6 +974,22 @@ internal sealed class LazyTraceBlock : ITraceBlock
     // blocks they build are identical, and either may win.
     private TraceBlock Load()
     {
+        try
+        {
+            return LoadCore();
+        }
+        catch (OutOfMemoryException e)
+        {
+            // §5.37: which block a failing read wanted (an out-of-memory here has struck with the heap
+            // far from its limit), so the report names its size, not just the stack.
+            var info = GC.GetGCMemoryInfo();
+            throw new InsufficientMemoryException(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"loading a {_index.MessageLength:N0}-byte block ({_index.Length:N0} stored, {_index.Entries:N0} entries, {_index.Groups:N0} groups, codec {_index.Codec}) of {_path}; heap {(info.HeapSizeBytes - info.FragmentedBytes) >> 20} MiB in use, {info.TotalCommittedBytes >> 20} MiB committed, limit {info.TotalAvailableMemoryBytes >> 20} MiB"), e);
+        }
+    }
+
+    private TraceBlock LoadCore()
+    {
         var prof = BlockCache.Profile;
         var t0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (_store is IO.Local.LocalTableFileSystem localFs)
