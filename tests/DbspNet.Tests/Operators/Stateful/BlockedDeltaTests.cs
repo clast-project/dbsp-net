@@ -838,4 +838,101 @@ public class BlockedDeltaTests
 
     // The test rows' first column, mod 10 (the index key: ten groups over every chunk).
     private static int KeyOf(StructuralRow row) => (int)row[0]! % 10;
+
+    // §5.32: an exchange's split fills one builder per destination side by side; each freezes at its share of
+    // the step chunk, so the split holds one chunk managed, not one per destination (W x W chunks across a
+    // circuit). 400 rows spread evenly over 4 destinations under a 120-row threshold: every bucket (100 rows)
+    // is past its 30-row share, so every bucket is block backed, and together they are the input.
+    [Fact]
+    public void An_exchange_split_shares_one_step_chunk_across_its_destinations()
+    {
+        var adds = Enumerable.Range(0, 400).Select(i => (i, i % 4, 1L)).ToArray();
+        using var _ = SpillSettings.UseStepSpill(120, 10);
+        var input = Spilled(adds, 120, 10);
+        Assert.True(input.IsExternal);
+        var buckets = new IReadOnlyList<KeyValuePair<StructuralRow, Z64>>?[4];
+
+        var rows = DbspNet.Core.Circuit.Operators.ExchangeBuckets.SplitSpilling(input, buckets, static row => (int)row[0]! % 4);
+
+        Assert.Equal(400, rows);
+        var sum = ZSet.Empty<StructuralRow, Z64>();
+        foreach (var bucket in buckets)
+        {
+            var set = Assert.IsType<DbspNet.Core.Circuit.Operators.ExchangeBuckets.SetBucket<StructuralRow, Z64>>(bucket).Set;
+            Assert.Equal(100, set.Count);
+            Assert.True(set.IsExternal, "a 100-row bucket is past its share (120 / 4) of the step chunk");
+            sum = sum.Plus(set);
+        }
+
+        AssertSame(Managed(adds), sum);
+    }
+
+    // §5.33: a stored view's handle reads the tick's delta after the step, so the integrate op kept its input's
+    // value to the end of the tick: a managed set of the view's whole tick of output (~20 GB across extended
+    // TPC-DS tick 18). Past the step threshold the op re-stores it as blocks the view adopts; below it, and
+    // with the knob off, the delta is the managed set it was. Either way it reads as the delta, and the view
+    // as the sum.
+    [Fact]
+    public void A_stored_views_kept_delta_is_block_backed_past_the_threshold()
+    {
+        DbspNet.Core.Circuit.InputHandle<ZSet<StructuralRow, Z64>>? input = null;
+        DbspNet.Core.Circuit.IntegratedViewHandle<StructuralRow>? view = null;
+        using var _ = SpillSettings.UseStepSpill(100, 10);
+        var circuit = DbspNet.Core.Circuit.RootCircuit.Build(b =>
+        {
+            var (h, s) = DbspNet.Core.Operators.Linear.LinearOperators.ZSetInput<StructuralRow, Z64>(b);
+            input = h;
+            view = b.BlockedIntegrate(s, Format, null).View;
+        });
+        var big = Enumerable.Range(0, 300).Select(i => (i, i % 4, 1L)).ToArray();
+        var small = Enumerable.Range(0, 50).Select(i => (i, i % 4, -1L)).ToArray();
+
+        input!.Push(Managed(big));
+        circuit.Step();
+        Assert.True(view!.LastDelta.IsExternal, "300 rows are past the 100-row threshold");
+        AssertSame(Managed(big), view.LastDelta);
+        AssertSame(Managed(big), view.Current);
+
+        input.Push(Managed(small));
+        circuit.Step();
+        Assert.False(view.LastDelta.IsExternal, "50 rows are below it");
+        AssertSame(Managed(small), view.LastDelta);
+        AssertSame(Managed(big) + Managed(small), view.Current);
+
+        using (SpillSettings.UseStepSpill(null))
+        {
+            input.Push(Managed(big));
+            circuit.Step();
+            Assert.False(view.LastDelta.IsExternal, "the knob is off");
+            AssertSame(Managed(big), view.LastDelta);
+        }
+
+        circuit.Step();
+        Assert.True(view.LastDelta.IsEmpty);
+    }
+
+    // §5.33: the floor is the Critical chunk, under the step chunk, so a kept delta between the two must be
+    // frozen whole: one under the step chunk never freezes on its own, and the re-store built a managed copy
+    // (xt96/xt97: every kept delta stayed managed, and twice the memory).
+    [Fact]
+    public void A_kept_delta_under_one_step_chunk_is_still_block_backed()
+    {
+        DbspNet.Core.Circuit.InputHandle<ZSet<StructuralRow, Z64>>? input = null;
+        DbspNet.Core.Circuit.IntegratedViewHandle<StructuralRow>? view = null;
+        using var _ = SpillSettings.UseStepSpill(1_000_000);
+        var circuit = DbspNet.Core.Circuit.RootCircuit.Build(b =>
+        {
+            var (h, s) = DbspNet.Core.Operators.Linear.LinearOperators.ZSetInput<StructuralRow, Z64>(b);
+            input = h;
+            view = b.BlockedIntegrate(s, Format, null).View;
+        });
+        var adds = Enumerable.Range(0, MemoryPressure.CriticalStepRows + 10).Select(i => (i, i % 4, 1L)).ToArray();
+
+        input!.Push(Managed(adds));
+        circuit.Step();
+
+        Assert.True(view!.LastDelta.IsExternal, "past the Critical chunk, under the step chunk");
+        AssertSame(Managed(adds), view.LastDelta);
+        AssertSame(Managed(adds), view.Current);
+    }
 }

@@ -87,6 +87,8 @@ internal static class StateCensus
             }
         }
 
+        // Pass 2: the stream objects only. Entering their deltas would put every in-flight row in Seen
+        // (hundreds of millions of objects mid-tick: the walk ran out of memory); see Streams instead.
         foreach (var (i, kind, s) in streams)
         {
             w.Labelled(s, i, kind, "(streams)", 0);
@@ -94,7 +96,140 @@ internal static class StateCensus
 
         // Pass 3: the rest of the runner (connectors, output views, exchange), by runner field.
         w.Labelled(runner, -1, "(runner)", Short(runner.GetType()), depth);
+
+        // Pass 4: closures. Delegates met above were counted but not entered; what only their targets
+        // reach is charged to the op (or path's op) that held the delegate.
+        var closures = 0;
+        for (; closures < w.Delegates.Count; closures++)
+        {
+            var (d, b) = w.Delegates[closures];
+            if (d.Target is { } target)
+            {
+                w.Contents(target, w.BucketFor(b.Op, b.Kind, "(closures)"));
+            }
+        }
+
+        // Pass 5: static fields of the engine's assemblies (non-generic types), by type and field.
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies().Where(a => a.GetName().Name?.StartsWith("DbspNet", StringComparison.Ordinal) == true))
+        {
+            Type[] types;
+            try
+            {
+                types = asm.GetTypes();
+            }
+            catch (ReflectionTypeLoadException e)
+            {
+                types = e.Types.Where(t => t is not null).ToArray()!;
+            }
+
+            foreach (var t in types.Where(t => !t.ContainsGenericParameters))
+            {
+                foreach (var f in t.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                {
+                    if (f.IsLiteral || !HasRefs(f.FieldType))
+                    {
+                        continue;
+                    }
+
+                    object? v;
+                    try
+                    {
+                        v = f.GetValue(null);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (v is not null)
+                    {
+                        w.Contents(v, w.BucketFor(-1, "(statics)", Short(t) + "." + f.Name));
+                    }
+                }
+            }
+        }
+
+        // Closures only statics reached.
+        for (; closures < w.Delegates.Count; closures++)
+        {
+            var (d, b) = w.Delegates[closures];
+            if (d.Target is { } target)
+            {
+                w.Contents(target, w.BucketFor(b.Op, b.Kind, "(closures)"));
+            }
+        }
         return new Result { Buckets = w.Buckets.Values.ToList(), Seen = w.Seen, Took = sw.Elapsed };
+    }
+
+    /// <summary>
+    /// In-flight deltas, estimated: each distinct stream's current value (attributed to the first op holding
+    /// it), its entry count, and the deep size of up to <paramref name="sample"/> entries extrapolated to the
+    /// count (rows shared by two streams count in both). Block-backed values are counted, not sampled.
+    /// Summed over replicas per op and field.
+    /// </summary>
+    public static IEnumerable<string> Streams(string tag, IReadOnlyList<RootCircuit> replicas, int sample = 256, int top = 30)
+    {
+        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var rows = new Dictionary<(int Op, string Kind, string Field), (long Count, double Bytes, int External, int Streams)>();
+        foreach (var r in replicas)
+        {
+            for (var i = 0; i < r.Operators.Count; i++)
+            {
+                var op = r.Operators[i];
+                var kind = op is IIntrospectable m ? m.MetricName : Short(op.GetType());
+                foreach (var f in FieldsOf(op.GetType()))
+                {
+                    if (f.GetValue(op) is not { } stream || !IsStream(stream.GetType()) || !seen.Add(stream))
+                    {
+                        continue;
+                    }
+
+                    var current = stream.GetType().GetField("Current", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(stream);
+                    if (current is null)
+                    {
+                        continue;
+                    }
+
+                    var t = current.GetType();
+                    var external = t.GetProperty("External", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(current) is not null;
+                    var count = t.GetProperty("Count")?.GetValue(current) is int c ? c
+                        : t.GetProperty("GroupCount")?.GetValue(current) is int g ? g : 0;
+                    double bytes = 0;
+                    if (!external && count > 0 && current is System.Collections.IEnumerable items)
+                    {
+                        var w = new Walker(null);
+                        var b = w.BucketFor(i, kind, f.Name);
+                        var n = 0;
+                        foreach (var item in items)
+                        {
+                            if (item is not null)
+                            {
+                                w.Contents(item, b);
+                            }
+
+                            if (++n >= sample)
+                            {
+                                break;
+                            }
+                        }
+
+                        bytes = n == 0 ? 0 : (double)b.Bytes / n * count;
+                    }
+
+                    var key = (i, kind, f.Name);
+                    rows.TryGetValue(key, out var e);
+                    rows[key] = (e.Count + count, e.Bytes + bytes, e.External + (external ? 1 : 0), e.Streams + 1);
+                }
+            }
+        }
+
+        yield return string.Create(CultureInfo.InvariantCulture,
+            $"STREAMS {tag} total streams={seen.Count} entries={rows.Values.Sum(v => v.Count)} est_mib={rows.Values.Sum(v => v.Bytes) / 1048576:F0} external={rows.Values.Sum(v => v.External)}");
+        foreach (var ((op, kind, field), v) in rows.OrderByDescending(kv => kv.Value.Bytes).Take(top))
+        {
+            yield return string.Create(CultureInfo.InvariantCulture,
+                $"STREAMS {tag} op={op} {kind} {field} entries={v.Count} est_mib={v.Bytes / 1048576:F0} external={v.External}/{v.Streams}");
+        }
     }
 
     public static IEnumerable<string> Report(string tag, Result res, int top = 40)
@@ -405,6 +540,37 @@ internal static class StateCensus
             Push(x);
         }
 
+        /// <summary>Delegates reached but not entered, with the bucket that reached them (pass 4).</summary>
+        public readonly List<(Delegate D, Bucket B)> Delegates = [];
+
+        /// <summary>Charge <paramref name="o"/> (if new) and everything new below it to <paramref name="b"/>,
+        /// entering it even when it is a stream (whose contents a plain push does not enter).</summary>
+        public void Contents(object o, Bucket b)
+        {
+            _cur = b;
+            if (Stop.Contains(o))
+            {
+                return;
+            }
+
+            var t = o.GetType();
+            if (t.IsArray || Skip(t) || t == typeof(string))
+            {
+                Push(o); // counted and entered once, like any reference
+            }
+            else
+            {
+                if (Seen.Add(o))
+                {
+                    Count(o, b);
+                }
+
+                Fields(o, t); // entered even if seen: a stream was counted but never entered
+            }
+
+            Drain();
+        }
+
         private void Push(object x)
         {
             if (Stop.Contains(x) || !Seen.Add(x))
@@ -414,7 +580,11 @@ internal static class StateCensus
 
             Count(x, _cur);
             var t = x.GetType();
-            if (!Skip(t) && !IsStream(t))
+            if (x is Delegate d)
+            {
+                Delegates.Add((d, _cur));
+            }
+            else if (!Skip(t) && !IsStream(t))
             {
                 _stack.Push(x);
             }

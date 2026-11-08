@@ -27,6 +27,11 @@ internal abstract class ZSetExternalStore<TKey, TWeight>
     /// same way, under the same format.</summary>
     public abstract ZSetBuilder<TKey, TWeight> NewBuilder(int capacity);
 
+    /// <summary>One of <paramref name="parts"/> builders filled side by side (an exchange's split, one per
+    /// destination): each freezes at its share of the step chunk, so together they hold one chunk managed
+    /// (docs/design-bounded-memory.md §5.32).</summary>
+    public virtual ZSetBuilder<TKey, TWeight> NewBuilder(int capacity, int parts) => NewBuilder(capacity);
+
     /// <summary>This set plus <paramref name="other"/>, or null to take the generic path (a
     /// builder fed both).</summary>
     public virtual ZSet<TKey, TWeight>? Plus(ZSet<TKey, TWeight> other) => null;

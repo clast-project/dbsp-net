@@ -41,6 +41,11 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     private readonly IRowTrace<TRow, Z64> _view;
     private readonly IZSetTraceCodec<TRow, Z64>? _snapshotCodec;
 
+    // A view handle reads the tick's delta after the step (§3b). The op keeps it, block backed when large
+    // (§5.33), rather than pinning the input stream's managed value to the end of the tick.
+    private bool _keepDelta;
+    private ZSet<TRow, Z64>? _lastDelta;
+
     public IntegrateOp(
         Stream<ZSet<TRow, Z64>> input,
         Stream<ZSet<TRow, Z64>> output,
@@ -87,11 +92,14 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     public Z64 WeightOf(TRow row) => _view.WeightOf(row);
 
     /// <summary>The delta the most recent step integrated.</summary>
-    public ZSet<TRow, Z64> LastDelta => _input.Current;
+    public ZSet<TRow, Z64> LastDelta => _keepDelta ? _lastDelta ?? ZSet<TRow, Z64>.Empty : _input.Current;
 
-    /// <summary>Keep the input's value after the step: a view handle reads it as the tick's delta
-    /// (docs/design-bounded-memory.md §3b).</summary>
-    internal void PinInput() => ((IReleasableStream)_input).Pinned = true;
+    /// <summary>Keep the tick's delta after the step: a view handle reads it (docs/design-bounded-memory.md
+    /// §3b). Kept by the op, so the input stream's value is released as any other (§5.33).</summary>
+    internal void PinInput() => _keepDelta = true;
+
+    /// <summary>Deltas re-stored block backed for a view handle, and their rows (diagnostics, tests).</summary>
+    internal static long SpilledDeltas, SpilledDeltaRows;
 
     public string MetricName => "IntegratedView";
 
@@ -111,8 +119,43 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
             _view.Idle();
         }
 
+        if (_keepDelta)
+        {
+            delta = BlockBacked(delta);
+            _lastDelta = delta;
+        }
+
         _view.Integrate(delta);      // O(|delta|): fold the tick's delta into the view.
         _output.SetCurrent(delta);   // the delta flows through unchanged.
+    }
+
+    // §5.33: a kept delta lives to the end of the tick, so a large managed one (a view's whole tick of
+    // output, ~20 GB over extended TPC-DS tick 18) is re-stored as block runs. A blocked view adopts the
+    // runs, so the rows are encoded once either way. The floor is the Critical chunk, not the step chunk:
+    // kept deltas add up over a tick (a worker's share of a 5.8M-row view is ~480k, under 1M).
+    private ZSet<TRow, Z64> BlockBacked(ZSet<TRow, Z64> delta)
+    {
+        if (delta.IsExternal
+            || _view is not Blocks.BlockedZSetTrace blocked
+            || Blocks.SpillSettings.StepSpillRows is not { } rows
+            || delta.Count < Math.Max(1, Math.Min(rows, Blocks.MemoryPressure.CriticalStepRows))
+            || delta is not ZSet<StructuralRow, Z64> structural)
+        {
+            return delta;
+        }
+
+        // Always blocked: a delta under one step chunk never freezes on its own, and would build a managed copy.
+        var builder = new ZSetBuilder<StructuralRow, Z64>(
+            Blocks.DeltaSpill.Store(blocked.Trace.Format, rows, alwaysBlocked: true, structural.Count));
+        foreach (var (row, weight) in structural)
+        {
+            builder.Add(row, weight);
+        }
+
+        var spilled = builder.Build();
+        Interlocked.Increment(ref SpilledDeltas);
+        Interlocked.Add(ref SpilledDeltaRows, spilled.Count);
+        return (ZSet<TRow, Z64>)(object)spilled;
     }
 
     public ValueTask SaveAsync(ISnapshotWriter writer, CancellationToken cancellationToken = default)

@@ -196,7 +196,7 @@ public class XtServerCensus
             var rows = BlockResidency.Walk(replicas, runner, -1);
             long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
             log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"TICKLIVE tick={t} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={before / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} spill_disk_mib={DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes / 1048576.0:F0} spill_disk_peak_mib={DbspNet.Persistence.Blocks.RunSpiller.PeakFileBytes / 1048576.0:F0} spill_files={DbspNet.Persistence.Blocks.RunSpiller.LiveFiles} del_release={DbspNet.Persistence.Blocks.RunSpiller.DeletedOnRelease} del_sweep={DbspNet.Persistence.Blocks.RunSpiller.DeletedBySweep} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows / 1e6:F1} adopted={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted} adopted_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.AdoptedRows / 1e6:F1} streamed_runs={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.StreamedRuns} giant_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantMerges} giant_fallbacks={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantFallbacks} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current} pressure_changes={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Changes} pressure_used_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.LastUsedBytes >> 20} pressure_peak_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.PeakUsedBytes >> 20} pushes={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.Pushes} pushed_entries={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.PushedEntries}"));
+                $"TICKLIVE tick={t} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={before / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} alloc_gib={allocated / (double)(1L << 30):F1} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} spill_disk_mib={DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes / 1048576.0:F0} spill_disk_peak_mib={DbspNet.Persistence.Blocks.RunSpiller.PeakFileBytes / 1048576.0:F0} spill_files={DbspNet.Persistence.Blocks.RunSpiller.LiveFiles} del_release={DbspNet.Persistence.Blocks.RunSpiller.DeletedOnRelease} del_sweep={DbspNet.Persistence.Blocks.RunSpiller.DeletedBySweep} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows / 1e6:F1} adopted={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted} adopted_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.AdoptedRows / 1e6:F1} streamed_runs={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.StreamedRuns} giant_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantMerges} giant_fallbacks={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantFallbacks} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current} pressure_changes={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Changes} pressure_used_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.LastUsedBytes >> 20} pressure_peak_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.PeakUsedBytes >> 20} pushes={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.Pushes} pushed_entries={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.PushedEntries} kept_spilled={DbspNet.Core.Operators.Stateful.IntegrateOp<DbspNet.Core.Collections.StructuralRow>.SpilledDeltas} kept_spilled_mrows={DbspNet.Core.Operators.Stateful.IntegrateOp<DbspNet.Core.Collections.StructuralRow>.SpilledDeltaRows / 1e6:F1}"));
             if (live / (double)(1L << 30) >= nextCensus)
             {
                 while (live / (double)(1L << 30) >= nextCensus)
@@ -246,6 +246,13 @@ public class XtServerCensus
         var censusAt = (Environment.GetEnvironmentVariable("XT_CENSUS_AT_OPS") ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToHashSet();
+        // XT_GCDUMP_AT_OPS=2064: a whole-heap dotnet-gcdump of this process after these operators of the
+        // sampled tick (once each), to XT_GCDUMP_DIR; XT_GCDUMP_EXIT=1 exits after the last one. The state
+        // census reaches operators, streams and the runner but not closures or statics.
+        var gcdumpAt = (Environment.GetEnvironmentVariable("XT_GCDUMP_AT_OPS") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToHashSet();
+        var gcdumpDir = Environment.GetEnvironmentVariable("XT_GCDUMP_DIR") ?? Path.GetTempPath();
         RootCircuit.AfterOperatorStep = (circuit, i) =>
         {
             lock (gate)
@@ -256,6 +263,28 @@ public class XtServerCensus
                 {
                     lastOp = now; // XT_OP_TICK: sample inside that tick only
                     return;
+                }
+
+                if (gcdumpAt.Remove(i))
+                {
+                    var file = Path.Combine(gcdumpDir, $"tick{circuit.TickCount}-op{i}.gcdump");
+                    var tool = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools", "dotnet-gcdump");
+                    var t0 = sw.Elapsed.TotalSeconds;
+                    using (var dump = Process.Start(new ProcessStartInfo(tool, $"collect -p {Environment.ProcessId} -o {file} -t 3600") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true })!)
+                    {
+                        var output = dump.StandardOutput.ReadToEnd() + dump.StandardError.ReadToEnd();
+                        dump.WaitForExit();
+                        log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"GCDUMP tick={circuit.TickCount} op={i} type={op.GetType().Name} exit={dump.ExitCode} file={file} took_s={sw.Elapsed.TotalSeconds - t0:F0} {output.ReplaceLineEndings(" ")}"));
+                    }
+
+                    log.Flush();
+                    if (gcdumpAt.Count == 0 && Environment.GetEnvironmentVariable("XT_GCDUMP_EXIT") == "1")
+                    {
+                        Environment.Exit(0);
+                    }
+
+                    now = Stopwatch.GetTimestamp();
                 }
 
                 {
@@ -298,7 +327,7 @@ public class XtServerCensus
                     var rows = BlockResidency.Walk(replicas, runner, -1);
                     long blocks = rows.Sum(r => r.Resident), managed = rows.Sum(r => r.ManagedEntries), small = rows.Sum(r => r.SmallRows);
                     log.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                        $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} spill_disk_mib={DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes / 1048576.0:F0} spill_disk_peak_mib={DbspNet.Persistence.Blocks.RunSpiller.PeakFileBytes / 1048576.0:F0} spill_files={DbspNet.Persistence.Blocks.RunSpiller.LiveFiles} del_release={DbspNet.Persistence.Blocks.RunSpiller.DeletedOnRelease} del_sweep={DbspNet.Persistence.Blocks.RunSpiller.DeletedBySweep} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows / 1e6:F1} adopted={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted} adopted_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.AdoptedRows / 1e6:F1} streamed_runs={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.StreamedRuns} giant_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantMerges} giant_fallbacks={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantFallbacks} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current} pressure_changes={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Changes} pressure_used_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.LastUsedBytes >> 20} pressure_peak_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.PeakUsedBytes >> 20} pushes={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.Pushes} pushed_entries={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.PushedEntries}"));
+                        $"OPLIVE tick={circuit.TickCount} op={i}/{circuit.Operators.Count} type={op.GetType().Name} t_s={sw.Elapsed.TotalSeconds:F0} heap_before_mib={heap / 1048576.0:F0} live_mib={live / 1048576.0:F0} blocks_mib={blocks / 1048576.0:F0} managed_entries={managed} small_window_rows={small} rss_mib={Environment.WorkingSet / 1048576.0:F0} writeback_est_mib={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.LiveCacheBytesTotal / 1048576.0:F0} writeback_drops={DbspNet.Core.Operators.Stateful.Blocks.OrderedPartitionStore.WriteBackDrops} spilled_runs={DbspNet.Persistence.Blocks.RunSpiller.Runs} spilled_mib={DbspNet.Persistence.Blocks.RunSpiller.Bytes / 1048576.0:F0} spill_disk_mib={DbspNet.Persistence.Blocks.RunSpiller.LiveFileBytes / 1048576.0:F0} spill_disk_peak_mib={DbspNet.Persistence.Blocks.RunSpiller.PeakFileBytes / 1048576.0:F0} spill_files={DbspNet.Persistence.Blocks.RunSpiller.LiveFiles} del_release={DbspNet.Persistence.Blocks.RunSpiller.DeletedOnRelease} del_sweep={DbspNet.Persistence.Blocks.RunSpiller.DeletedBySweep} cache_mib={DbspNet.Persistence.Blocks.BlockCache.Bytes / 1048576.0:F0} step_blocked={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedBuilds} step_blocked_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.BlockedRows / 1e6:F1} adopted={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.Adopted} adopted_mrows={DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.AdoptedRows / 1e6:F1} streamed_runs={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.StreamedRuns} giant_merges={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantMerges} giant_fallbacks={DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.GiantFallbacks} pressure={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Current} pressure_changes={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.Changes} pressure_used_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.LastUsedBytes >> 20} pressure_peak_mib={DbspNet.Core.Operators.Stateful.Blocks.MemoryPressure.PeakUsedBytes >> 20} pushes={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.Pushes} pushed_entries={DbspNet.Core.Operators.Stateful.Blocks.PressureRelief.PushedEntries} kept_spilled={DbspNet.Core.Operators.Stateful.IntegrateOp<DbspNet.Core.Collections.StructuralRow>.SpilledDeltas} kept_spilled_mrows={DbspNet.Core.Operators.Stateful.IntegrateOp<DbspNet.Core.Collections.StructuralRow>.SpilledDeltaRows / 1e6:F1}"));
                     log.WriteLine(SpillMix($"tick={circuit.TickCount} op={i}"));
                     // From live, not the heap before the collection: garbage once put the next reading
                     // out of reach for the rest of the tick (§5.24).
@@ -310,6 +339,12 @@ public class XtServerCensus
                             nextOpCensus += stepGib;
                         }
 
+                        foreach (var line in StateCensus.Streams($"tick{circuit.TickCount}-op{i}", replicas))
+                        {
+                            log.WriteLine(line);
+                        }
+
+                        log.Flush();
                         var census = StateCensus.Walk(replicas, runner, null, 3);
                         foreach (var line in StateCensus.Report($"tick{circuit.TickCount}-op{i}", census))
                         {

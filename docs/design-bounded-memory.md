@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **Tick 18 at W=12 now reaches op 2171/2222 restored (§5.33: stored views kept each tick's delta managed, ~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2442,3 +2442,73 @@ the heap; tick 18 runs on to op 2064/2222, the next `ExchangeIndexOp` (63.5 s, l
 memory during op 2068 (an `ApplyOp` emitting ~1.5M-row chunks, heap 60–76 GB between collections, RSS at the
 48 GiB cap). Wall 1,836 s; peak RSS 47 GiB. The harness logged only the outer stack; it now logs each distinct
 inner stack (`INNER xN`).
+
+**xt88 (the same restored run, inner stacks and a census after ops 2064 and 2067).** It gets further than
+xt87: past op 2068 to op 2152 (`IntegrateOp`, live 43.3 GB), then out of memory in a later `ExchangeIndexOp`
+while its split's spilling builder freezes a chunk (`SharedArrayPool.Rent` in `FreezeRows`, three workers),
+the allocation that happened to fail, not the holder. The census is the finding: after op 2064, live is
+28.8 GB and the walk reaches 5.9 GB; after op 2067, 27.8 GB against 6.1 GB. The walk covers operators and the runner
+but, it turned out, not the streams' current deltas: its streams pass counted each `Stream` object and never
+entered it. Nor closures (delegates) or statics. So ~22 GB is in-flight deltas, closures or statics.
+
+- **xt89** (a whole-heap `dotnet-gcdump` after op 2064, `XT_GCDUMP_AT_OPS`, `XT_GCDUMP_EXIT=1`) failed in op
+  2064 before the dump, again in the split's spilling builders. That was a flaw of this section's split: one
+  builder per destination, each holding up to a whole step chunk (1M rows) managed before it freezes, so up to
+  W chunks per worker where D2 promises one. Each split builder now freezes at its share
+  (`ZSetExternalStore.NewBuilder(capacity, parts)`, `DeltaSpill.Rows(…, parts)`): test
+  `BlockedDeltaTests.An_exchange_split_shares_one_step_chunk_across_its_destinations` (400 rows over four
+  destinations under a 120-row threshold: every 100-row bucket must be block backed; without the share all four
+  stay managed).
+- **xt90** dumped after op 2016, but on .NET 10 `dotnet-gcdump` falls back to lossy buffering and stopped at
+  10M objects (270 MB of a ~25 GB heap): no use at this size.
+- The census then entered each stream's current delta (xt91, xt92): with hundreds of millions of rows in
+  flight, its visited set ran out of memory itself, at 48 and at 56 GiB. It now walks closures (delegates'
+  targets, `(closures)`) and the static fields of the engine's assemblies (`(statics)`), and *estimates*
+  the streams instead (`StateCensus.Streams`): each distinct stream's current value, its entry count, whether
+  it is block backed, and a deep size sampled over 256 entries and extrapolated.
+
+### 5.33 Stored views kept each tick's delta managed (2026-11-07)
+
+**xt93 (restored, census after ops 2016 and 2063).** Closures hold 7 MB and statics 1.1 GB (the block
+cache's ring, which is accounted). The streams hold the rest: 26,892 streams, 162M entries after op 2063,
+only 53 block backed. Every large one is a stored view's delta, in pairs: the `ApplyOp` that produces a
+view's rows and the view's `IntegrateOp` (`IntegratedView`), with equal counts. The integrate op passes the
+delta through, so each pair is one set counted twice; halved, the estimate is ~20 GB, the gap the census
+could not account for. The largest are views finished long before op 2063 (op 1863 5.8M rows ~2.6 GB, op
+2015 6.2M ~2.1 GB, op 1552 5.8M ~1.0 GB, then ops 1018, 732, 2038, 845…): each lives to the end of the tick
+because the view handle pins its integrate op's input (§3b) for the sink, which reads `LastDelta` after the
+step. The pin keeps a *managed* set: a view's producer is a pointwise `ApplyOp`, which never builds through
+D2, so a view's whole tick of output stays in memory. xt93 itself went on to op 2174 of 2222 before running out
+of memory (wall 3,688 s; at 56 GiB it had headroom the 48 GiB runs do not).
+
+**Fix.** The integrate op keeps the delta itself instead of pinning the stream (the input's managed value is
+released like any other). Past a threshold (below), with a blocked view, it re-stores the delta as block runs
+(`DeltaSpill.Rows` over the view's format) before integrating; the view adopts the runs (§5.19), so the rows
+are encoded once either way, and the kept delta is spillable. Below the threshold, and with the knob off, the
+delta is the managed set it was. Test `BlockedDeltaTests.A_stored_views_kept_delta_is_block_backed_past_the_threshold`
+(300 rows under a 100-row threshold must be kept block backed and read as the delta, the view as the sum; 50
+rows and the knob off stay managed); without the re-store it fails.
+
+**xt94 (restored, the fix at the step chunk's threshold).** Live after op 2064 fell only from 28.8 GB (xt88)
+to 24.9 GB, and the run ran out of memory in op 2082 (`IncrementalLeftJoinOp`, a `HashSet` sized for its
+delta). The threshold was wrong: the census sums twelve replicas, so op 1863's 5.8M rows are ~480k a worker,
+under the 1M-row step chunk, and most views never re-stored. The step chunk bounds one builder's managed
+peak; kept deltas add up over the tick, so their floor is now the Critical chunk (65,536 rows). The runner
+logs `kept_spilled` (deltas re-stored, and their rows) on each `OPLIVE` line.
+
+**xt96, xt97 (the 65,536-row floor).** 167 deltas (57.7M rows) re-stored and xt96 reached op 2146, but live
+*rose* (op 1994: 25.3 GB against ~19–21 GB). xt97's census after op 1994 says why: every view stream is still
+managed (`external=0/12`), and the integrate ops' own state is 13.6 GB. The re-store built through the
+ordinary spilling builder, which freezes only a full step chunk, so a delta under 1M rows came back as a
+managed *copy*: each kept delta was held twice until the original was released. The re-store now builds always
+blocked (the remainder freezes on build). Test
+`BlockedDeltaTests.A_kept_delta_under_one_step_chunk_is_still_block_backed` (65,546 rows under a 1M-row step
+chunk must be kept block backed); with `alwaysBlocked: false` it fails, and the first test did not see it
+because its rows were past its own chunk.
+
+**xt98 (restored, kept deltas block backed).** 173 deltas (59.0M rows) re-stored. Live after op 1994 is 14.3 GB
+(19–25 GB before), after op 2064 16.5 GB (25–29 GB). Tick 18 runs to op 2171 of 2222, the furthest under the
+48 GiB cap, and runs out of memory there: six workers in `IncrementalLeftJoinOp.Step`, allocating the set of
+touched keys (`HashSet(dl.GroupCount + dr.GroupCount)`). Live there is 24.3 GB but the heap before the
+collection is 82.6 GB at Low pressure: what is left is allocation between collections, not held state.
+Wall 2,781 s.

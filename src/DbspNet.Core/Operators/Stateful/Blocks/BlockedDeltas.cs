@@ -26,18 +26,22 @@ internal static class DeltaSpill
     internal static long Adopted, AdoptedRows;
 
     /// <summary>A builder for a structural delta of <paramref name="format"/> (null: plain).</summary>
-    public static ZSetBuilder<StructuralRow, Z64> Rows(object? format, int capacity)
+    public static ZSetBuilder<StructuralRow, Z64> Rows(object? format, int capacity) => Rows(format, capacity, 1);
+
+    /// <summary>As <see cref="Rows(object?, int)"/>, for one of <paramref name="parts"/> builders filled side
+    /// by side: its chunk is the step chunk's share (at least one row), so together they hold one chunk.</summary>
+    public static ZSetBuilder<StructuralRow, Z64> Rows(object? format, int capacity, int parts)
     {
         if (format is null || SpillSettings.StepSpillRows is not { } rows)
         {
             return new ZSetBuilder<StructuralRow, Z64>(capacity);
         }
 
-        return new ZSetBuilder<StructuralRow, Z64>(Store((ITraceBlockFormat)format, rows, alwaysBlocked: rows == 0, capacity));
+        return new ZSetBuilder<StructuralRow, Z64>(Store((ITraceBlockFormat)format, rows, alwaysBlocked: rows == 0, capacity, parts));
     }
 
-    internal static SpillingRows Store(ITraceBlockFormat format, long rows, bool alwaysBlocked, int capacity) =>
-        new(format, rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue), alwaysBlocked, capacity);
+    internal static SpillingRows Store(ITraceBlockFormat format, long rows, bool alwaysBlocked, int capacity, int parts = 1) =>
+        new(format, Math.Max(1, (rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue)) / Math.Max(1, parts)), alwaysBlocked, capacity);
 
     /// <summary>As <see cref="Rows"/> for a generic operator: plain unless the rows are structural.</summary>
     public static ZSetBuilder<TKey, TWeight> For<TKey, TWeight>(object? format, int capacity)
@@ -362,6 +366,8 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
     }
 
     public override ZSetBuilder<StructuralRow, Z64> NewBuilder(int capacity) => DeltaSpill.Rows(_format, capacity);
+
+    public override ZSetBuilder<StructuralRow, Z64> NewBuilder(int capacity, int parts) => DeltaSpill.Rows(_format, capacity, parts);
 
     /// <summary>Hand this set's runs to <paramref name="trace"/> as its own (a view or DISTINCT integrating
     /// it, §5.19): no row decoded or encoded. False when the trace cannot take them.</summary>

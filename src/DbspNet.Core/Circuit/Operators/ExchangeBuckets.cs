@@ -44,7 +44,7 @@ internal static class ExchangeBuckets
     public static Items<T> Items<T>(IReadOnlyList<T> bucket) => new(bucket);
 
     /// <summary>
-    /// Split a block-backed delta into one builder per destination, each spilling as the delta does (docs/design-bounded-memory.md
+    /// Split a block-backed delta into one builder per destination, each spilling as the delta does at its share of the step chunk (so the split holds one chunk managed, not one per destination) (docs/design-bounded-memory.md
     /// §5.27, §5.32), so a large bucket stays blocks. Each non-empty bucket is a <see cref="SetBucket{TKey,TWeight}"/>,
     /// which a gather enumerates directly (<see cref="Items{T}"/> reads only the list buckets).
     /// </summary>
@@ -62,7 +62,7 @@ internal static class ExchangeBuckets
         foreach (var kv in input)
         {
             var j = ((partition(kv.Key) % workers) + workers) % workers;
-            (builders[j] ??= external.NewBuilder(0)).Add(kv.Key, kv.Value);
+            (builders[j] ??= external.NewBuilder(0, workers)).Add(kv.Key, kv.Value);
             rows++;
         }
 
