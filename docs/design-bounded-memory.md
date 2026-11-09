@@ -2835,3 +2835,14 @@ out-of-memory). xt126 passed ops 1696–1724 and reached op 2180 at t = 2,922 s 
 the host stopped it for low system memory (not a failure of the run). Full runs at 262,144 rows so far: two
 validate (xt124, xt125), two fail in `StreamedGroup.TryCreate`'s block read (xt122, xt123), one stopped
 past that point (xt126). The named-block message has not fired yet.
+
+**xt127–xt129 (xt124's settings, run outside the Claude Code host so its memory reaper cannot stop them):
+all three complete and validate** (3,560, 3,469 and 3,496 s; peak RSS 44–47 GiB). Tally of full batch-1 runs
+at 262,144-row step chunks: **five validate (xt124, xt125, xt127, xt128, xt129), two fail in
+`StreamedGroup.TryCreate`'s block read (xt122, xt123), one was stopped past that point by the host (xt126).**
+Committed memory peaks at exactly 48,871 MiB in every one of them, so that figure is where the GC holds
+the heap at its hard limit, not a margin; xt124's "281 MiB under the limit" above measured nothing. The
+two failures were the two runs before `LazyTraceBlock.Load`'s out-of-memory handler went in (it moves the
+load body into `LoadCore`, behind a try/catch); every run since has passed. Five straight passes at a 5-in-7
+rate has a probability of about 0.19, so that is not evidence the change matters, and the named-block
+message has still never fired. Open: the cause of those two failures.
