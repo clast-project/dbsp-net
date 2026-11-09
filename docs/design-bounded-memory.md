@@ -2893,3 +2893,24 @@ The byte cap matches 262,144 rows on speed and reliability but does not recover 
 off by default. Next: (1) on an out-of-memory in a block load, collect (blocking, compacting, the large
 object heap included) and retry once, which both tests the diagnosis and would turn these failures into a
 pause; (2) cut the cost of reading block-backed deltas, which is where the 17% went.
+
+**Correction, and what the GC timeline shows.** The runtime already makes a full compacting collection
+(large object heap included) before it throws `OutOfMemoryException`, so collect-and-retry is dropped as a
+fix. Native memory is not the cause either: `GCHeapHardLimit` counts only the managed heap's commit, native
+allocations do not stop compaction (only pinning does, and the timeline shows ≤1 pinned object), and the
+process allocates almost nothing natively (ZstdSharp is a managed port). xt133's last collections before the
+failure at ~1,621 s: gen 0/1 every ~0.8 s promoting 0.7–3.5 GB; between gen 2s the large object heap grows to
+6.4 GB, almost all garbage (gc 2222, gen 2 at 1,616 s, takes it to 0.67 GB); committed sits at 47.9–48.2 GB
+with 21–24 GB in use before that gen 2, and even right after it holds 42.0 GB committed for 14.8 GB in use.
+The last logged collection (gc 2228, gen 1, 1,620.3 s) left 18.3 GB in use and 41.3 GB committed; the
+exception reports 17.5 GB in use and 48.9 GB committed, so committed rose 7.5 GB within about a second while
+in use fell. The GC keeps ~25 GB of committed-but-free space (gen 0 budgets across 14 server heaps, free
+regions not yet decommitted), and a block message of 59 MiB is larger than a large-object region (32 MiB),
+so it needs a fresh region of its own and fresh commit at the limit. That, not live state, is the leading
+explanation; it is unverified. A standalone repro (server GC, hard limit 8 and 24 GiB, 12 threads, 59 MiB
+arrays into a 1 GiB queue, 2–6 GB live, chunk-lived garbage) did not fail in any shape tried: its live set
+was a large share of the limit, so every collection was gen 2. The block-load message now records the last
+collection's index, generation, compaction and pinning and the last full blocking collection's (90530f1),
+so the next failure says whether the numbers follow a full compacting collection. Candidate fix, needing no
+GC setting: keep every block-read allocation under the large-object region size (read and decode a big
+block in pieces, or bound a block's message size when it is written, giant groups included).
