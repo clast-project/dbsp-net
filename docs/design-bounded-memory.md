@@ -1712,7 +1712,7 @@ group of 7.2M rows, and a giant went to a run file as ONE block, with an `int` l
 `byte[]`. In memory a giant's hash already continues from block to block; the file format now does too.
 
 **What changed** (run file format version 4; readers open 3 and 4, and a v3 file never spans).
-- **Writers.** A blocked trace's concatenated giant is cut every `RunFile.MaxSpanBlockBytes` (256 MiB), at
+- **Writers.** A blocked trace's concatenated giant is cut every `RunFile.MaxSpanBlockBytes` (256 MiB; 16 MiB since §5.38), at
   part boundaries, so each file block holds only the giant's hash. Compaction cuts a hash run every
   `MaxSpanBlockEntries` (2^18). `RunStreamWriter` accepts a block that begins with the previous block's
   last hash; the run's group count counts that group once, and each block keeps its own count.
@@ -2914,3 +2914,16 @@ collection's index, generation, compaction and pinning and the last full blockin
 so the next failure says whether the numbers follow a full compacting collection. Candidate fix, needing no
 GC setting: keep every block-read allocation under the large-object region size (read and decode a big
 block in pieces, or bound a block's message size when it is written, giant groups included).
+
+**The fix: file blocks of at most 16 MiB.** The failing block was a giant group's in-memory blocks
+(60,000 bytes each) concatenated into one file block, which `RunFile.MaxSpanBlockBytes` allowed up to
+256 MiB. A block is adopted zero-copy over one `byte[]`, so reading it in pieces would change `TraceBlock`;
+cutting it smaller when written needs nothing new, since a giant's hash already continues from file block to
+file block (§5.18) and every reader follows it (the suite has passed with the cap at 8 KB). The default is
+now 16 MiB, half a large-object region: the 59 MiB block becomes four. This also fixes the problem if the
+diagnosis is only partly right, since no block load asks for more than 16 MiB at once. Not covered: the
+checkpoint compactor (`RunCompactor`, managed traces' checkpoints, not the in-step path) still cuts a giant
+by entries (2^18) only. The block-load message stays, so a failure that recurs says which collection
+preceded it.
+Suites: default and forced+critical pass (3,569); forced had one failure, the timing-bound
+`Read_RunsTheWorkersConcurrently_OverASynchronousFileSystem` rendezvous, which passed 5 of 5 alone.

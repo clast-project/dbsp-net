@@ -49,10 +49,12 @@ internal static class RunFile
     internal const int OldestReadableVersion = 3;
 
     /// <summary>The most bytes a giant group's file block holds before the group continues in the next
-    /// block (§5.18): a block is one record-batch message read into one array, so it must stay well
-    /// under 2 GiB. A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_BYTES</c> sets it for a suite run.</summary>
+    /// block (§5.18): a block is one record-batch message read into one array. 16 MiB keeps that array
+    /// inside one of the GC's 32 MiB large-object regions (§5.38): a 59 MiB block load failed at the
+    /// 48 GiB hard limit with 17.5 GB in use, an array past the region size needing a fresh region of its
+    /// own and fresh commit. A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_BYTES</c> sets it for a suite run.</summary>
     internal static long MaxSpanBlockBytes =
-        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_BYTES"), out var cap) && cap > 0 ? cap : 256L << 20;
+        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_BYTES"), out var cap) && cap > 0 ? cap : 16L << 20;
 
     /// <summary>The most entries of one hash a compacted block holds before the hash continues in the
     /// next block (§5.18; compaction cuts by entries). A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_ENTRIES</c>.</summary>
