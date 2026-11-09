@@ -982,9 +982,13 @@ internal sealed class LazyTraceBlock : ITraceBlock
         {
             // §5.37: which block a failing read wanted (an out-of-memory here has struck with the heap
             // far from its limit), so the report names its size, not just the stack.
+            // §5.38: which collection those numbers come from. The runtime makes a full compacting
+            // collection before it throws; if the last one is that (gen 2, compacted, index = the last
+            // full blocking one) the heap was mostly free after it and the large object still did not fit.
             var info = GC.GetGCMemoryInfo();
+            var full = GC.GetGCMemoryInfo(GCKind.FullBlocking);
             throw new InsufficientMemoryException(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-                $"loading a {_index.MessageLength:N0}-byte block ({_index.Length:N0} stored, {_index.Entries:N0} entries, {_index.Groups:N0} groups, codec {_index.Codec}) of {_path}; heap {(info.HeapSizeBytes - info.FragmentedBytes) >> 20} MiB in use, {info.TotalCommittedBytes >> 20} MiB committed, limit {info.TotalAvailableMemoryBytes >> 20} MiB"), e);
+                $"loading a {_index.MessageLength:N0}-byte block ({_index.Length:N0} stored, {_index.Entries:N0} entries, {_index.Groups:N0} groups, codec {_index.Codec}) of {_path}; heap {(info.HeapSizeBytes - info.FragmentedBytes) >> 20} MiB in use, {info.TotalCommittedBytes >> 20} MiB committed, limit {info.TotalAvailableMemoryBytes >> 20} MiB; last gc #{info.Index} gen {info.Generation} compacted={info.Compacted} concurrent={info.Concurrent} promoted {info.PromotedBytes >> 20} MiB frag {info.FragmentedBytes >> 20} MiB pinned {info.PinnedObjectsCount}; last full blocking gc #{full.Index} in use {(full.HeapSizeBytes - full.FragmentedBytes) >> 20} MiB committed {full.TotalCommittedBytes >> 20} MiB; gen2 count {GC.CollectionCount(2)}"), e);
         }
     }
 
