@@ -44,7 +44,8 @@ internal static class DeltaSpill
     }
 
     internal static SpillingRows Store(ITraceBlockFormat format, long rows, bool alwaysBlocked, int capacity, int parts = 1) =>
-        new(format, Math.Max(1, (rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue)) / Math.Max(1, parts)), alwaysBlocked, capacity);
+        new(format, Math.Max(1, (rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue)) / Math.Max(1, parts)), alwaysBlocked, capacity,
+            rows == 0 ? 0 : SpillSettings.StepSpillBytes / Math.Max(1, parts));
 
     /// <summary>As <see cref="Rows"/> for a generic operator: plain unless the rows are structural.</summary>
     public static ZSetBuilder<TKey, TWeight> For<TKey, TWeight>(object? format, int capacity)
@@ -57,6 +58,61 @@ internal static class DeltaSpill
         }
 
         return Unsafe.As<ZSetBuilder<TKey, TWeight>>(Rows(format, capacity));
+    }
+}
+
+/// <summary>
+/// §5.37: an in-step chunk's size limit in entries: the row cap, or fewer where the rows are wide. Every
+/// 256th entry added is sized (<see cref="ManagedSize.Row"/>, plus a map entry), and the limit is the byte
+/// cap over the running mean. A mutable struct, kept in a field and called in place.
+/// </summary>
+internal struct ChunkBudget
+{
+    private const int SampleMask = 255;
+
+    // A builder's map entry and its share of the buckets, beyond the row itself.
+    private const int EntryOverhead = 48;
+
+    private readonly int _rows;
+    private readonly long _bytes;
+    private long _sampledBytes;
+    private int _samples;
+    private int _added;
+
+    /// <summary>Chunks frozen by the byte cap before the row cap, and their entries (diagnostics).</summary>
+    internal static long ByteFreezes, ByteFreezeEntries;
+
+    public ChunkBudget(int rows, long bytes)
+    {
+        _rows = rows;
+        _bytes = bytes;
+        Limit = rows;
+    }
+
+    /// <summary>Entries at which the chunk freezes.</summary>
+    public int Limit { get; private set; }
+
+    /// <summary>An entry was added: size every 256th (with its group key, for an indexed builder).</summary>
+    public void Added(StructuralRow row, StructuralRow? key)
+    {
+        if (_bytes <= 0 || (_added++ & SampleMask) != 0)
+        {
+            return;
+        }
+
+        _sampledBytes += ManagedSize.Row(row) + (key is null ? 0 : ManagedSize.Row(key)) + EntryOverhead;
+        _samples++;
+        Limit = (int)Math.Clamp(_bytes / Math.Max(1, _sampledBytes / _samples), 1, _rows);
+    }
+
+    /// <summary>The chunk freezes at <paramref name="entries"/>: counted when the byte cap set the limit.</summary>
+    public readonly void Freezing(int entries)
+    {
+        if (Limit < _rows && entries >= Limit)
+        {
+            Interlocked.Increment(ref ByteFreezes);
+            Interlocked.Add(ref ByteFreezeEntries, entries);
+        }
     }
 }
 
@@ -75,6 +131,7 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
     private readonly bool _alwaysBlocked;
     private readonly int _capacity;
     private ZSetBuilder<StructuralRow, Z64> _chunk;
+    private ChunkBudget _budget;
     private BlockedIndexedTrace? _trace;
     private List<uint[]> _hashes = []; // newest first, as the trace's runs
     private long _frozen;
@@ -82,12 +139,14 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
     /// <param name="chunkRows">Managed rows at which a chunk freezes into a run.</param>
     /// <param name="alwaysBlocked">Build block backed even when nothing froze (the forced mode, and a
     /// sum with a block-backed set).</param>
-    public SpillingRows(ITraceBlockFormat format, int chunkRows, bool alwaysBlocked, int capacity)
+    /// <param name="chunkBytes">Estimated managed bytes at which a chunk freezes sooner (0: rows only).</param>
+    public SpillingRows(ITraceBlockFormat format, int chunkRows, bool alwaysBlocked, int capacity, long chunkBytes = 0)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(chunkRows, 1);
         _format = format;
         _alwaysBlocked = alwaysBlocked;
         _chunkRows = chunkRows;
+        _budget = new ChunkBudget(chunkRows, chunkBytes);
 
         // A capacity hint past the threshold would pre-size the very map this bounds.
         _capacity = Math.Clamp(capacity, 0, _chunkRows);
@@ -100,9 +159,11 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
     {
         var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         _chunk.Add(key, weight);
-        if (_chunk.Count >= _chunkRows
+        _budget.Added(key, null);
+        if (_chunk.Count >= _budget.Limit
             || (_chunk.Count >= MemoryPressure.CriticalStepRows && MemoryPressure.Current == PressureLevel.Critical))
         {
+            _budget.Freezing(_chunk.Count);
             FreezeChunk();
         }
 

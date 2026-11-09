@@ -1356,4 +1356,70 @@ public class BlockedDeltaTests
         Assert.Equal(sum.Count, count);
         Assert.NotEqual(a.Count + b.Count + c.Count, count);
     }
+
+    // ---- §5.37: the step chunk's byte cap ----
+    private static StructuralRow WideRow(int k) => new(SqlTestHelpers.EncodeStrings([k, new string((char)('a' + (k % 26)), 2000)]));
+
+    [Fact]
+    public void A_byte_cap_freezes_wide_rows_before_the_row_cap_and_leaves_narrow_ones_managed()
+    {
+        // 2,000 rows under a 10,000-row cap: never frozen by rows. At 1 MiB, ~2 KB rows freeze every ~500.
+        var wide = new ZSetBuilder<StructuralRow, Z64>(new SpillingRows(Format, 10_000, alwaysBlocked: false, capacity: 0, chunkBytes: 1 << 20));
+        var narrow = new ZSetBuilder<StructuralRow, Z64>(new SpillingRows(Format, 10_000, alwaysBlocked: false, capacity: 0, chunkBytes: 1 << 20));
+        var wideTwin = new ZSetBuilder<StructuralRow, Z64>();
+        var narrowTwin = new ZSetBuilder<StructuralRow, Z64>();
+        for (var i = 0; i < 2000; i++)
+        {
+            wide.Add(WideRow(i), new Z64(1));
+            wideTwin.Add(WideRow(i), new Z64(1));
+            narrow.Add(Row(i, i % 3), new Z64(1));
+            narrowTwin.Add(Row(i, i % 3), new Z64(1));
+        }
+
+        var w = wide.Build();
+        var n = narrow.Build();
+        var parts = Assert.IsType<BlockedRows>(w.External);
+        Assert.InRange(parts.RunCount, 3, 8); // ~2,048 B a row estimated: a chunk of ~512 rows
+        Assert.Null(n.External);
+        AssertSameRows(wideTwin.Build(), w);
+        AssertSameRows(narrowTwin.Build(), n);
+    }
+
+    [Fact]
+    public void A_byte_cap_never_freezes_past_the_row_cap()
+    {
+        var b = new ZSetBuilder<StructuralRow, Z64>(new SpillingRows(Format, 100, alwaysBlocked: false, capacity: 0, chunkBytes: 1L << 40));
+        for (var i = 0; i < 1000; i++)
+        {
+            b.Add(Row(i, 0), new Z64(1));
+        }
+
+        Assert.Equal(10, Assert.IsType<BlockedRows>(b.Build().External).RunCount);
+    }
+
+    [Fact]
+    public void An_indexed_builder_freezes_wide_groups_by_the_byte_cap()
+    {
+        var b = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>(
+            new SpillingGroups(IndexedFormat, 10_000, alwaysBlocked: false, chunkBytes: 1 << 20));
+        var twin = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+        for (var i = 0; i < 2000; i++)
+        {
+            b.Add(Key(i % 7), WideRow(i), new Z64(1));
+            twin.Add(Key(i % 7), WideRow(i), new Z64(1));
+        }
+
+        var built = b.Build();
+        Assert.IsType<BlockedGroups>(built.External);
+        AssertSameIndexed(twin.Build(), built);
+    }
+
+    [Theory]
+    [InlineData(null, 0L)]
+    [InlineData("", 0L)]
+    [InlineData("off", 0L)]
+    [InlineData("0", 0L)]
+    [InlineData("256", 256L << 20)]
+    public void The_step_byte_cap_setting_parses(string? setting, long bytes) =>
+        Assert.Equal(bytes, SpillSettings.ByteCap(setting));
 }

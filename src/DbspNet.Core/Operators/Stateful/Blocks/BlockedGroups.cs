@@ -16,27 +16,30 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 internal sealed class SpillingGroups : IndexedZSetSpillingStore<StructuralRow, StructuralRow, Z64>
 {
     private readonly ITraceBlockFormat _format;
-    private readonly int _chunkEntries;
     private readonly bool _alwaysBlocked;
     private IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> _chunk = new();
+    private ChunkBudget _budget;
     private int _entries;
     private BlockedIndexedTrace? _trace;
     private readonly List<uint[]> _hashes = []; // newest first, as the trace's runs
 
-    public SpillingGroups(ITraceBlockFormat format, int chunkEntries, bool alwaysBlocked)
+    /// <param name="chunkBytes">Estimated managed bytes at which a chunk freezes sooner (0: entries only, §5.37).</param>
+    public SpillingGroups(ITraceBlockFormat format, int chunkEntries, bool alwaysBlocked, long chunkBytes = 0)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(chunkEntries, 1);
         _format = format;
-        _chunkEntries = chunkEntries;
         _alwaysBlocked = alwaysBlocked;
+        _budget = new ChunkBudget(chunkEntries, chunkBytes);
     }
 
     public override void Add(StructuralRow key, StructuralRow value, Z64 weight)
     {
         _chunk.Add(key, value, weight);
-        if (++_entries >= _chunkEntries
+        _budget.Added(value, key);
+        if (++_entries >= _budget.Limit
             || (_entries >= MemoryPressure.CriticalStepRows && MemoryPressure.Current == PressureLevel.Critical))
         {
+            _budget.Freezing(_entries);
             FreezeChunk();
         }
     }
@@ -681,6 +684,7 @@ internal static class DeltaSpillGroups
 
         var chunk = rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue);
         return Unsafe.As<IndexedZSetBuilder<TKey, TValue, TWeight>>(
-            new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>(new SpillingGroups(f, chunk, alwaysBlocked: rows == 0)));
+            new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>(new SpillingGroups(f, chunk, alwaysBlocked: rows == 0,
+                chunkBytes: rows == 0 ? 0 : SpillSettings.StepSpillBytes)));
     }
 }

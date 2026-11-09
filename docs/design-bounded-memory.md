@@ -2846,3 +2846,23 @@ two failures were the two runs before `LazyTraceBlock.Load`'s out-of-memory hand
 load body into `LoadCore`, behind a try/catch); every run since has passed. Five straight passes at a 5-in-7
 rate has a probability of about 0.19, so that is not evidence the change matters, and the named-block
 message has still never fired. Open: the cause of those two failures.
+
+### 5.38 The step chunk capped by bytes (2026-11-09)
+
+At 262,144 rows a step chunk keeps wide rows' joins inside the heap (§5.37: five of seven full runs
+validate, against none of the 1M-row full runs that reached tick 18's late joins), but every delta pays for
+it, narrow ones included: more, smaller runs, more entries that several runs share to decode and sum,
++17% allocation in the restored tick 18. What matters is the chunk's bytes, not its rows.
+
+`DBSPNET_STEP_SPILL_MIB` (off by default until measured) caps the in-step chunk of both delta builders
+(`SpillingRows`, `SpillingGroups`) by estimated managed bytes, beside `DBSPNET_STEP_SPILL_ROWS`, whichever
+comes first. `ChunkBudget` sizes every 256th entry added (`ManagedSize.Row` of the row, and of the group key
+for an indexed builder, plus 48 B of map entry) and sets the chunk's entry limit to the cap over the running
+mean, never above the row cap. A builder filled as one of several side by side gets its share of the cap, as
+of the rows. The forced test mode (rows 0) ignores it. The census tick line counts chunks the byte cap froze
+(`byte_freezes`, `byte_freeze_mrows`).
+
+Tests: wide rows freeze under the byte cap where narrow ones stay managed (and both read as their managed
+twins), the row cap still bounds a chunk under a huge byte cap, an indexed builder freezes wide groups by
+bytes, and the setting parses. Mutants caught: the limit never lowered, no row ceiling, groups ignoring the
+budget. Suites: default, forced and forced+critical, 3,569 each.

@@ -22,6 +22,8 @@ namespace DbspNet.Core.Operators.Stateful.Blocks;
 /// <c>DBSPNET_SPILL</c> like a trace's). Unset or <c>off</c>: off, and the compiler attaches no formats.
 /// 0 is the FORCED mode for tests: every such delta is built as blocks, freezing every
 /// <see cref="ForcedChunkRows"/> rows. Structural path only.</item>
+/// <item><c>DBSPNET_STEP_SPILL_MIB</c> (§5.37): a byte cap on the same chunk, by estimated managed size, so
+/// wide rows freeze sooner than <c>DBSPNET_STEP_SPILL_ROWS</c> and narrow ones still at it. Unset: no cap.</item>
 /// </list>
 /// </summary>
 internal static class SpillSettings
@@ -68,6 +70,35 @@ internal static class SpillSettings
         return long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var rows) && rows >= 0
             ? rows
             : null;
+    }
+
+    // DBSPNET_STEP_SPILL_MIB (§5.37): unset, 0 or off is no byte cap.
+    private static readonly long DefaultStepSpillBytes = ByteCap(Environment.GetEnvironmentVariable("DBSPNET_STEP_SPILL_MIB"));
+
+    private static readonly AsyncLocal<long?> StepSpillBytesOverride = new();
+
+    private static volatile bool _stepSpillBytesOverridden;
+
+    /// <summary>The in-step chunk's byte cap (<c>DBSPNET_STEP_SPILL_MIB</c>, §5.37): a builder freezes its
+    /// chunk once its rows' estimated managed bytes reach it, or at <see cref="StepSpillRows"/> rows,
+    /// whichever comes first. 0 is no cap. Not applied in the forced mode.</summary>
+    public static long StepSpillBytes =>
+        _stepSpillBytesOverridden && StepSpillBytesOverride.Value is { } o ? o : DefaultStepSpillBytes;
+
+    /// <summary><see cref="StepSpillBytes"/> in the current async context until disposed (0: no cap).</summary>
+    public static IDisposable UseStepSpillBytes(long bytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        _stepSpillBytesOverridden = true;
+        var previous = StepSpillBytesOverride.Value;
+        StepSpillBytesOverride.Value = bytes;
+        return new Restore(() => StepSpillBytesOverride.Value = previous);
+    }
+
+    internal static long ByteCap(string? setting)
+    {
+        var bytes = ParseMib(setting, 0);
+        return bytes == long.MaxValue ? 0 : bytes;
     }
 
     private static readonly long DefaultWindowWriteBack = ParseMib(Environment.GetEnvironmentVariable("DBSPNET_WINDOW_WRITEBACK_MIB"), 1024);
