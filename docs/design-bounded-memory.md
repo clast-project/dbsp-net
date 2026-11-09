@@ -2829,3 +2829,9 @@ committed peaked at 48,871 MiB, 281 MiB under the limit; the most after a full c
 7.8 GB fragmentation, 4.2 GB of it gen 2). It passed ops 1696–1724, where xt122 and xt123 failed, so that
 failure is nondeterministic too: **one full run of three at 262,144 rows validated, and the margin is a
 few hundred MiB.** Open: what `TryCreate`'s block read failed on with ~9 GB of commit headroom.
+
+**xt125, xt126 (xt124's settings, run until one fails).** xt125 completes and validates (3,521 s, no
+out-of-memory). xt126 passed ops 1696–1724 and reached op 2180 at t = 2,922 s with no out-of-memory, when
+the host stopped it for low system memory (not a failure of the run). Full runs at 262,144 rows so far: two
+validate (xt124, xt125), two fail in `StreamedGroup.TryCreate`'s block read (xt122, xt123), one stopped
+past that point (xt126). The named-block message has not fired yet.
