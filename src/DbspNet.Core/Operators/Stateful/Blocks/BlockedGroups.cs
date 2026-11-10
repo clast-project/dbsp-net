@@ -102,20 +102,23 @@ internal sealed class SpillingGroups : IndexedZSetSpillingStore<StructuralRow, S
 /// </summary>
 internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, StructuralRow, Z64>
 {
-    private readonly BlockedIndexedTrace _trace;
+    /// <summary>One builder's runs (its private trace) and each run's sorted group-key hashes, in the
+    /// trace's run order. A union (an exchange gather, §5.41) holds several.</summary>
+    internal readonly record struct Part(BlockedIndexedTrace Trace, uint[][] Hashes);
+
+    private readonly Part[] _parts;
     private readonly ITraceBlockFormat _format;
-    private readonly uint[][] _hashes;
     private readonly int _groupCount;
     private readonly long _entries;
 
-    private BlockedGroups(BlockedIndexedTrace trace, uint[][] hashes, ITraceBlockFormat format)
+    private BlockedGroups(Part[] parts, ITraceBlockFormat format)
     {
-        _trace = trace;
+        _parts = parts;
         _format = format;
-        _hashes = hashes;
         var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
-        _groupCount = CountGroups(hashes);
-        _entries = trace.Runs.Sum(r => r.Entries);
+        var (runs, hashes) = Runs();
+        _groupCount = CountGroups(runs, hashes);
+        _entries = runs.Sum(r => r.Entries);
         if (StepSpillProfile.Enabled)
         {
             StepSpillProfile.End(StepSpillProfile.BuildCount, m);
@@ -123,9 +126,12 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
     }
 
     /// <summary>The set over <paramref name="trace"/>'s runs, or null when every entry cancelled.</summary>
-    internal static BlockedGroups? Create(BlockedIndexedTrace trace, uint[][] hashes, ITraceBlockFormat format)
+    internal static BlockedGroups? Create(BlockedIndexedTrace trace, uint[][] hashes, ITraceBlockFormat format) =>
+        Create([new Part(trace, hashes)], format);
+
+    private static BlockedGroups? Create(Part[] parts, ITraceBlockFormat format)
     {
-        var built = new BlockedGroups(trace, hashes, format);
+        var built = new BlockedGroups(parts, format);
         if (built._groupCount == 0)
         {
             return null;
@@ -136,8 +142,56 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
         return built;
     }
 
+    /// <summary>The sum of <paramref name="sets"/>, all of <paramref name="format"/>: the union of their
+    /// runs, merged only when read (an exchange-index gather, §5.41). No row is decoded.</summary>
+    internal static IndexedZSet<StructuralRow, StructuralRow, Z64> Union(IReadOnlyList<BlockedGroups> sets, ITraceBlockFormat format)
+    {
+        Interlocked.Add(ref DeltaSpill.Unioned, sets.Count);
+        return sets.Count == 1 ? new IndexedZSet<StructuralRow, StructuralRow, Z64>(sets[0])
+            : Create([.. sets.SelectMany(s => s._parts)], format) is { } union ? new IndexedZSet<StructuralRow, StructuralRow, Z64>(union)
+            : IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+    }
+
+    /// <summary>The block format the runs are in.</summary>
+    internal ITraceBlockFormat Format => _format;
+
+    /// <summary>Entries across the runs (each run consolidated, runs not merged).</summary>
+    internal long Entries => _entries;
+
+    // Every run with its hashes, read through the owners now (a spill may have rebound a run).
+    private (BlockedIndexedTrace.Run[] Runs, uint[][] Hashes) Runs()
+    {
+        if (_parts.Length == 1)
+        {
+            var only = _parts[0];
+            var r = only.Trace.Runs.ToArray();
+            if (r.Length != only.Hashes.Length)
+            {
+                throw new InvalidOperationException("a run's key hashes are missing");
+            }
+
+            return (r, only.Hashes);
+        }
+
+        var runs = new List<BlockedIndexedTrace.Run>();
+        var hashes = new List<uint[]>();
+        foreach (var part in _parts)
+        {
+            var r = part.Trace.Runs;
+            if (r.Count != part.Hashes.Length)
+            {
+                throw new InvalidOperationException("a run's key hashes are missing");
+            }
+
+            runs.AddRange(r);
+            hashes.AddRange(part.Hashes);
+        }
+
+        return ([.. runs], [.. hashes]);
+    }
+
     /// <summary>Runs held (tests, census).</summary>
-    internal int RunCount => _trace.Runs.Count;
+    internal int RunCount => _parts.Sum(p => p.Trace.Runs.Count);
 
     public override int GroupCount => _groupCount;
 
@@ -151,13 +205,16 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
         var m = StepSpillProfile.Enabled ? StepSpillProfile.Begin() : default;
         var hash = (uint)key.GetHashCode();
         var b = new ZSetBuilder<StructuralRow, Z64>();
-        foreach (var run in _trace.Runs)
+        foreach (var part in _parts)
         {
-            foreach (var (block, i) in At(run, hash))
+            foreach (var run in part.Trace.Runs)
             {
-                if (block.KeyEquals(i, key))
+                foreach (var (block, i) in At(run, hash))
                 {
-                    b.Add(block.Value(i), new Z64(block.Weight(i)));
+                    if (block.KeyEquals(i, key))
+                    {
+                        b.Add(block.Value(i), new Z64(block.Weight(i)));
+                    }
                 }
             }
         }
@@ -175,7 +232,7 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
     /// it reads this layout; false and nothing changes otherwise.</summary>
     internal bool AdoptInto(BlockedIndexedTrace trace)
     {
-        if (!trace.TryAdoptRuns(_trace.Runs, _format, _trace.OrdersByRowHash, rows: false))
+        if (!trace.TryAdoptRuns([.. _parts.SelectMany(p => p.Trace.Runs)], _format, _parts.All(p => p.Trace.OrdersByRowHash), rows: false))
         {
             return false;
         }
@@ -207,15 +264,9 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
 
     // Groups across runs: a hash only one run holds counts its keys (consolidated there, so every group
     // is non-empty); a hash several runs hold is resolved by summing their entries.
-    private int CountGroups(uint[][] hashes)
+    private static int CountGroups(BlockedIndexedTrace.Run[] runs, uint[][] hashes)
     {
-        var runs = _trace.Runs;
-        if (runs.Count != hashes.Length)
-        {
-            throw new InvalidOperationException("a run's key hashes are missing");
-        }
-
-        if (runs.Count == 1)
+        if (runs.Length == 1)
         {
             return hashes[0].Length;
         }
@@ -326,13 +377,8 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
     public override IEnumerator<KeyValuePair<StructuralRow, ZSet<StructuralRow, Z64>>> GetEnumerator()
     {
         Interlocked.Increment(ref StepSpillProfile.Enumerations);
-        var runs = _trace.Runs.ToArray();
-        if (runs.Length != _hashes.Length)
-        {
-            throw new InvalidOperationException("a run's key hashes are missing");
-        }
-
-        var walk = new HashWalk(_hashes);
+        var (runs, hashes) = Runs();
+        var walk = new HashWalk(hashes);
         var one = new BlockedIndexedTrace.Run[1];
         while (walk.Next(out var hash, out var tied, out _))
         {
@@ -674,17 +720,36 @@ internal static class DeltaSpillGroups
     public static IndexedZSetBuilder<TKey, TValue, TWeight> For<TKey, TValue, TWeight>(object? format)
         where TKey : notnull
         where TValue : notnull
+        where TWeight : struct, IZRing<TWeight> => For<TKey, TValue, TWeight>(format, 1);
+
+    /// <summary>As <see cref="For{TKey,TValue,TWeight}(object?)"/>, for one of <paramref name="parts"/>
+    /// builders filled side by side (an exchange split, §5.41): its chunk is the step chunk's share (at
+    /// least one entry), so together they hold one chunk managed.</summary>
+    public static IndexedZSetBuilder<TKey, TValue, TWeight> For<TKey, TValue, TWeight>(object? format, int parts)
+        where TKey : notnull
+        where TValue : notnull
         where TWeight : struct, IZRing<TWeight>
     {
+        parts = Math.Max(1, parts);
         if (format is not ITraceBlockFormat f || SpillSettings.StepSpillRows is not { } rows
             || typeof(TKey) != typeof(StructuralRow) || typeof(TValue) != typeof(StructuralRow) || typeof(TWeight) != typeof(Z64))
         {
             return new IndexedZSetBuilder<TKey, TValue, TWeight>();
         }
 
-        var chunk = rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue);
+        var chunk = Math.Max(1, (rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue)) / parts);
         return Unsafe.As<IndexedZSetBuilder<TKey, TValue, TWeight>>(
             new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>(new SpillingGroups(f, chunk, alwaysBlocked: rows == 0,
-                chunkBytes: rows == 0 ? 0 : SpillSettings.StepSpillBytes)));
+                chunkBytes: rows == 0 ? 0 : SpillSettings.StepSpillBytes / parts)));
+    }
+
+    /// <summary>A builder whose result is always block backed (an exchange-index gather's managed
+    /// remainder, unioned with blocked buckets, §5.41).</summary>
+    internal static IndexedZSetBuilder<StructuralRow, StructuralRow, Z64> Blocked(ITraceBlockFormat format)
+    {
+        var rows = SpillSettings.StepSpillRows ?? 0;
+        var chunk = rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue);
+        return new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>(new SpillingGroups(format, chunk, alwaysBlocked: true,
+            chunkBytes: rows == 0 ? 0 : SpillSettings.StepSpillBytes));
     }
 }

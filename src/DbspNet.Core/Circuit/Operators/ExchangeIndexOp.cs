@@ -67,7 +67,14 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         // publish null.
         var buckets = new IReadOnlyList<KeyValuePair<TRow, TWeight>>?[workers];
         long splitRows = 0;
-        if (_input.Current.IsExternal)
+        if (_input.Current.IsExternal
+            && ExchangeBuckets.SplitGrouping(_input.Current, buckets, _partition, _keyOf, _output.DeltaFormat) is { } grouped)
+        {
+            // Keyed and grouped here, where each row is decoded anyway: the gather unions the grouped
+            // runs instead of decoding every row again to key it (docs/design-bounded-memory.md §5.41).
+            splitRows = grouped;
+        }
+        else if (_input.Current.IsExternal)
         {
             // A block-backed input (docs/design-bounded-memory.md §5.32): listing its rows would
             // materialize all of them at once, so split into one spilling builder per destination.
@@ -112,11 +119,29 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         // source workers (a column-dropping map upstream) merges correctly.
         // With the consumer's block format (D4) the index spills past the step threshold like the
         // single-worker GroupProject does (§5.32): at W=12 a skewed key lands most of a large delta here.
-        var indexed = DbspNet.Core.Operators.Stateful.Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(_output.DeltaFormat);
         long gatherRows = 0;
+        var column = new IReadOnlyList<KeyValuePair<TRow, TWeight>>?[workers];
         for (var src = 0; src < workers; src++)
         {
-            var bucket = _coordinator.Take(src, _worker);
+            column[src] = _coordinator.Take(src, _worker);
+        }
+
+        if (ExchangeBuckets.GatherGrouped(column, _keyOf, _output.DeltaFormat, out gatherRows) is { } union)
+        {
+            _output.SetCurrent(union);
+            if (profile)
+            {
+                StepProfiler.RecordGather(_worker, System.Diagnostics.Stopwatch.GetTimestamp() - t0, gatherRows);
+            }
+
+            return;
+        }
+
+        var indexed = DbspNet.Core.Operators.Stateful.Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(_output.DeltaFormat);
+        for (var src = 0; src < workers; src++)
+        {
+            var bucket = column[src];
+            column[src] = null; // released once read, as before
             if (bucket is ExchangeBuckets.SetBucket<TRow, TWeight> set)
             {
                 foreach (var (row, weight) in set.Set)

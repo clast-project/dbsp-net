@@ -1304,6 +1304,70 @@ public class BlockedDeltaTests
         }
     }
 
+    // §5.41: the exchange-index split keys and groups a block-backed shard's rows, and the gather unions the
+    // grouped runs instead of decoding every row again to key it. Two block-backed shards overlap (weights
+    // sum, some cancel), a third managed shard joins them, and the keys spread over every worker: each
+    // worker's output is the managed index of its share, with grouped splits on and off.
+    [Theory]
+    [InlineData(4, true)]
+    [InlineData(12, true)]
+    [InlineData(4, false)]
+    public void An_exchange_index_gathers_grouped_buckets_without_decoding_them(int workers, bool grouped)
+    {
+        var a = Enumerable.Range(0, 300).Select(i => (i, i % 4, 1L)).ToArray();
+        var b = Enumerable.Range(200, 300).Select(i => (i, i % 4, i < 250 ? -1L : 2L)).ToArray(); // 200..249 cancel
+        var c = Enumerable.Range(1000, 25).Select(i => (i, 0, 1L)).ToArray();
+        var saved = DbspNet.Core.Circuit.Operators.ExchangeBuckets.GroupedSplits;
+        DbspNet.Core.Circuit.Operators.ExchangeBuckets.GroupedSplits = grouped;
+        try
+        {
+            using var _ = SpillSettings.UseStepSpill(40, 10);
+            using var pc = DbspNet.Core.Circuit.ParallelCircuit.Build(workers, cb =>
+            {
+                var (_, input) = cb.Input<ZSet<StructuralRow, Z64>>(ZSet.Empty<StructuralRow, Z64>(), (x, y) => x.Plus(y), name: "in");
+                input.DeltaFormat = Format;
+                var indexed = cb.ExchangeIndex(input, static row => KeyOf(row), static row => Key(KeyOf(row)));
+                indexed.DeltaFormat = IndexedFormat;
+                cb.Output(indexed, name: "out");
+            });
+            var sa = Spilled(a, 40, 10);
+            var sb = Spilled(b, 40, 10);
+            Assert.True(sa.IsExternal && sb.IsExternal);
+            pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", 0).Push(sa);
+            pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", 1).Push(Managed(c));
+            pc.WorkerInput<ZSet<StructuralRow, Z64>>("in", workers - 1).Push(sb);
+            var unioned0 = Interlocked.Read(ref DeltaSpill.Unioned);
+
+            pc.Step();
+
+            if (grouped)
+            {
+                Assert.True(Interlocked.Read(ref DeltaSpill.Unioned) > unioned0, "no gather unioned grouped buckets");
+            }
+
+            for (var w = 0; w < workers; w++)
+            {
+                var expected = new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>();
+                foreach (var (k, s, wt) in a.Concat(b).Concat(c))
+                {
+                    if (k % 10 % workers == w)
+                    {
+                        expected.Add(Key(k % 10), Row(k, s), new Z64(wt));
+                    }
+                }
+
+                var built = expected.Build();
+                var outW = pc.WorkerOutput<IndexedZSet<StructuralRow, StructuralRow, Z64>>("out", w).Current;
+                AssertSameIndexed(built, outW);
+                Assert.Equal(built.GroupCount, outW.GroupCount);
+            }
+        }
+        finally
+        {
+            DbspNet.Core.Circuit.Operators.ExchangeBuckets.GroupedSplits = saved;
+        }
+    }
+
     // The test rows' first column, mod 10 (the index key: ten groups over every chunk).
     private static int KeyOf(StructuralRow row) => (int)row[0]! % 10;
 
