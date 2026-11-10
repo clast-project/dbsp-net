@@ -351,7 +351,7 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
 
             foreach (var group in Resolve(holding, hash))
             {
-                Interlocked.Add(ref StepSpillProfile.RowsDecoded, group.Value.Count);
+                StepSpillProfile.RowDecoded(group.Value.Count);
                 yield return group;
             }
         }

@@ -663,7 +663,7 @@ internal sealed class BlockedRows : ZSetExternalStore<StructuralRow, Z64>
             StepSpillProfile.End(StepSpillProfile.Enumerate, m);
             if (more)
             {
-                Interlocked.Increment(ref StepSpillProfile.RowsDecoded);
+                StepSpillProfile.RowDecoded();
             }
 
             return more;

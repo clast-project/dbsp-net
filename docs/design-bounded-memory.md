@@ -2943,3 +2943,33 @@ proof: before the cap, 3 of 10 full runs at these two settings failed (xt122, xt
 rate four in a row come out clean about a quarter of the time by chance. The new message has not fired, so
 the diagnosis (a fresh large region needing commit at the limit) is still unconfirmed, but no block load
 now asks for more than 16 MiB.
+
+### 5.39 Where block-backed deltas' extra allocation goes (2026-11-09)
+
+**The question.** At 262,144-row step chunks the restored tick 18 allocates 7,139 GiB (xt121), against
+6,087 GiB at 1M rows (xt118): +17%. The 256 MiB byte cap gives the same (xt130, §5.38), so the cost is a
+delta being block-backed at all, not how many chunks it has.
+
+**What the census already shows.** Per operator (OPALLOC, tick 18, summed over workers) the extra is spread
+over every operator type that reads deltas, 15–30% each, not concentrated in a few:
+
+| type | ops | xt118 GiB | xt121 GiB | Δ |
+|---|---|---|---|---|
+| `ApplyOp` (map/filter) | 165 | 2,229 | 2,621 | +393 |
+| `IncrementalLeftJoinOp` | 39 | 1,194 | 1,539 | +344 |
+| `ExchangeIndexOp` | 18 | 685 | 867 | +182 |
+| `IncrementalAggregateOp` | 13 | 711 | 822 | +111 |
+| `ExchangeOp` | 43 | 563 | 637 | +74 |
+
+The census counters: xt121 built 7,705 block-backed deltas (3,050M rows) against xt118's 3,630 (2,399M),
+so ~4,075 more deltas and ~650M more rows went to blocks. 1,052 GiB over 650M rows is ~1,700 bytes per
+extra block-backed row, several times one row's decode. A block-backed delta decodes every row into a new
+`StructuralRow` (strings copied, so a kept row does not pin a block) on every enumeration, where a managed
+delta hands out the rows it holds; each one also pays for encoding when its chunk freezes. Chains of maps
+pay both per operator. Which of these dominates is not known yet.
+
+**Instrument.** `DBSPNET_STEP_SPILL_PROFILE=1` (§5.16's `StepSpillProfile`) now also charges each phase to
+the operator running it (the circuit sets `StepSpillProfile.CurrentOp` while profiling), and the xt census
+prints a `STEPPROF` line per tick and a `STEPOP` line per operator whose phases allocated ≥1 GiB: GiB and
+calls for chunk add, freeze, count, enumerate, probe, plus, copy, spill and run merge, and rows decoded.
+Next: two restored runs with the profile, at 262,144 and 1M rows (`~/xtpcds/scripts/profile.sh`).

@@ -34,6 +34,26 @@ internal static class StepSpillProfile
     /// <summary>Rows decoded for readers, enumerations started, rows built as blocks (read amplification).</summary>
     public static long RowsDecoded, Enumerations;
 
+    /// <summary>The operator this thread is stepping (set by the circuit when profiling), so each phase is
+    /// also charged to the operator that ran it (§5.39); -1 outside a step.</summary>
+    [ThreadStatic]
+    public static int CurrentOp;
+
+    private const int MaxOps = 8192;
+    private static readonly long[] OpBytes = new long[MaxOps * Names.Length];
+    private static readonly long[] OpCalls = new long[MaxOps * Names.Length];
+    private static readonly long[] OpRowsDecoded = new long[MaxOps];
+
+    /// <summary>A row decoded for a reader, charged to the running operator too.</summary>
+    public static void RowDecoded(long n = 1)
+    {
+        Interlocked.Add(ref RowsDecoded, n);
+        if ((uint)CurrentOp < MaxOps)
+        {
+            Interlocked.Add(ref OpRowsDecoded[CurrentOp], n);
+        }
+    }
+
     [ThreadStatic]
     private static long _childTicks;
 
@@ -56,6 +76,12 @@ internal static class StepSpillProfile
         Interlocked.Add(ref Ticks[slot], ticks - _childTicks);
         Interlocked.Add(ref Bytes[slot], bytes - _childBytes);
         Interlocked.Increment(ref Calls[slot]);
+        if ((uint)CurrentOp < MaxOps)
+        {
+            Interlocked.Add(ref OpBytes[CurrentOp * Names.Length + slot], bytes - _childBytes);
+            Interlocked.Increment(ref OpCalls[CurrentOp * Names.Length + slot]);
+        }
+
         _childTicks = m.ParentChildTicks + ticks;
         _childBytes = m.ParentChildBytes + bytes;
     }
@@ -74,6 +100,50 @@ internal static class StepSpillProfile
 
         sb.Append(System.Globalization.CultureInfo.InvariantCulture, $" rows_decoded={Interlocked.Exchange(ref RowsDecoded, 0)} enumerations={Interlocked.Exchange(ref Enumerations, 0)}");
         return sb.ToString();
+    }
+
+    /// <summary>One STEPOP line per operator whose phases allocated at least <paramref name="minBytes"/>
+    /// since the last call (GiB and calls per phase, rows decoded), and reset.</summary>
+    public static IEnumerable<string> TakeOpReport(long minBytes)
+    {
+        var lines = new List<string>();
+        for (var op = 0; op < MaxOps; op++)
+        {
+            long total = 0;
+            for (var i = 0; i < Names.Length; i++)
+            {
+                total += Volatile.Read(ref OpBytes[op * Names.Length + i]);
+            }
+
+            var rows = Interlocked.Exchange(ref OpRowsDecoded[op], 0);
+            if (total < minBytes)
+            {
+                for (var i = 0; i < Names.Length; i++)
+                {
+                    Interlocked.Exchange(ref OpBytes[op * Names.Length + i], 0);
+                    Interlocked.Exchange(ref OpCalls[op * Names.Length + i], 0);
+                }
+
+                continue;
+            }
+
+            var sb = new StringBuilder();
+            sb.Append(System.Globalization.CultureInfo.InvariantCulture, $"STEPOP op={op} total_gib={total / (double)(1L << 30):F2}");
+            for (var i = 0; i < Names.Length; i++)
+            {
+                var b = Interlocked.Exchange(ref OpBytes[op * Names.Length + i], 0);
+                var c = Interlocked.Exchange(ref OpCalls[op * Names.Length + i], 0);
+                if (c > 0)
+                {
+                    sb.Append(System.Globalization.CultureInfo.InvariantCulture, $" {Names[i]}={b / (double)(1L << 30):F2}/{c}");
+                }
+            }
+
+            sb.Append(System.Globalization.CultureInfo.InvariantCulture, $" rows_decoded={rows}");
+            lines.Add(sb.ToString());
+        }
+
+        return lines;
     }
 
     public readonly record struct Mark(long Ticks, long Bytes, long ParentChildTicks, long ParentChildBytes);

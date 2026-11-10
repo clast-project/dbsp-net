@@ -303,6 +303,10 @@ public sealed class RootCircuit
         finally
         {
             PressureRelief.Current = outerRelief;
+            if (StepSpillProfile.Enabled)
+            {
+                StepSpillProfile.CurrentOp = -1;
+            }
         }
     }
 
@@ -312,6 +316,11 @@ public sealed class RootCircuit
         {
             for (var i = 0; i < _operators.Count; i++)
             {
+                if (StepSpillProfile.Enabled)
+                {
+                    StepSpillProfile.CurrentOp = i;
+                }
+
                 _operators[i].Step();
                 _relief.AtBoundary();
                 AfterOperatorStep?.Invoke(this, i);
@@ -332,6 +341,11 @@ public sealed class RootCircuit
             for (var i = 0; i < _operators.Count; i++)
             {
                 StreamRelease.CurrentOp = i;
+                if (StepSpillProfile.Enabled)
+                {
+                    StepSpillProfile.CurrentOp = i;
+                }
+
                 _operators[i].Step();
                 if (plan is not null)
                 {
