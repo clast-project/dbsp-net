@@ -3015,3 +3015,41 @@ worth a fix that keeps mid-sized deltas managed.
    first.
 3. Cheaper strings: a block's string heap copied once per block and the rows' strings aliasing that copy,
    not one array per string. A kept row then pins its block's string bytes (tens of KB), not just its own.
+
+### 5.40 Merges sum a key several runs hold by value hash (2026-11-10)
+
+**The aggregate's second read was its merge.** §5.39 counted `IncrementalAggregateOp` as reading its
+input twice. Its STEPOP lines show one decode of the delta (`rows_decoded` = its input's rows) and a
+large `run_merge`: 270 GiB in tick 18 (op 2154 alone 109 GiB for 65M input rows, ~1.7 KB a row). The
+cause is in `BlockedIndexedTrace.MergeHashCopying`. A hash one run holds is copied whole (§5.36), but a
+hash several runs hold had every entry decoded, key and value, to sum equal rows. An aggregate's or a
+join's group touched by one delta row was decoded whole at every merge. Only giant groups (≥ 2^16
+entries) avoided it, by the value-hash walk of §5.24/§5.35. Merges across operators cost 857 GiB of tick
+18 (left joins 401, aggregates 270, distinct 78, integrate 56).
+
+**Fix** (d905105): when each tied run holds the hash as one key, the same in every run, its values in
+ascending stored value hash (canonical order, checked with `KeyEquals` and `ValueHash`, no row decoded),
+`TryMergeTiedByValueHash` walks the runs k-way by value hash. Entries are copied whole, and values are
+decoded only where entries share a value hash, to sum equal rows. It is the giant merge's walk without
+its `BeginCopy`/`EndCopy` flushes, which would give every small hash blocks of its own. Anything else (a
+hash collision holding two keys, a run out of order) falls back to the decoding sum. Default on;
+`DBSPNET_VALUE_HASH_MERGES=off` for A/B. A test with 200 keys of 150 rows over six runs allocates 0.28x
+the decoding merge (0.52x under the forced suites' reloaded blocks). Suites: default, forced and
+forced+critical pass.
+
+**Measured** (xt140: xt138's settings, restored tick 18 at 262,144-row chunks, profiled; completes):
+
+| | xt138 | xt140 | Δ |
+|---|---|---|---|
+| tick-18 allocation (GiB) | 7,133.5 | 6,828.4 | −305 (−4.3%) |
+| `run_merge` (GiB) | 857 | 553 | −304 (−35%) |
+| `run_merge` thread time (s) | 1,259 | 1,005 | −254 |
+| batch wall (s) | 2,536 | 2,564 | +1% (noise) |
+
+By type: aggregates 270 → 133, left joins 401 → 286, distinct 78 → 33; `IntegrateOp` unchanged at 56
+(its merges are row traces). Every other phase is unchanged, so the cut is exactly the merge. Wall time
+did not move: allocation is not the wall's bottleneck here (as §5.39 found for chunk size). The 553 GiB
+left is mostly encoding the merged output and the decoding fallback.
+
+Next: `ExchangeIndexOp`'s double read (455 GiB of decode): group rows at the split, so the gather unions
+grouped blocks without decoding them.
