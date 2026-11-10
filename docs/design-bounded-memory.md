@@ -3114,3 +3114,40 @@ tick 18's live heap after gen 2s, from its first operator to its end, and the ba
 
 Per run, p95 (MiB): 19,360 / 22,936 / 22,175 / 21,500 before, 16,571 / 20,454 / 16,591 / 20,381 after.
 The highest live heap of the whole run, outside tick 18, stays noisy in both sets (27–41 GB).
+
+### 5.42 Canonical freezes only in bounded-memory mode (2026-11-10)
+
+**ivm-bench had slowed.** Before pinning a new engine in ivm-bench, a local A/B of its TPC-DI SF=3 batch 1
+(W=12, server GC with background GC off, incremental output; `IvmMultiBatch`) found HEAD 92081a5 12%
+slower than the pinned f02030d: 16.8 s against 15.0 s over five runs each, every HEAD run slower than every
+f02030d run, outputs identical (16 views by row count and digest). A sweep of all 43 commits touching
+`src/` between them, three runs each, put most of it on one commit, 08f2c7e (§5.24): batch 1 went from
+15.5 to 16.7 s (+0.8 GiB) and stayed there. The earlier commits drift 15.0 → ~15.6 s within the noise.
+
+**The cost was the canonical order at freeze.** Since §5.24 every freeze sorted each multi-value group into
+ascending value hash. A/B switches on HEAD: no freeze sort −1.5 s (17.0 → 15.4 s) and −0.6 GiB; no sort
+in merges, and no giant-group check, made no difference. A cheaper sort (one key, so only value hashes, in
+reused arrays) took back the allocation but only 0.5 s. The rest follows the order itself. Per-operator
+CPU fell with the sort off in the operators that read frozen groups (inner joins −4.6 s, window offsets
+−3.8, aggregates −3.2, integrated views −1.4, summed over workers). A group enumerated in insertion order
+is near the data's own order (dates, for TPC-DI); in value-hash order it is effectively random.
+
+**Fix.** A freeze writes canonical order only in bounded-memory mode (`DBSPNET_SPILL` on or
+`DBSPNET_STEP_SPILL_ROWS` set), where giant streaming merges (§5.24) and value-hash merges (§5.40) use it;
+`DBSPNET_CANONICAL_FREEZE=on/off` overrides. Merges check the order and fall back to decoding a hash whose
+runs are not in it, so both settings are correct (`Plain_freezes_merge_to_the_same_trace_as_canonical_ones`).
+When it does sort, it uses `MergeScratch.SortByValueHash`. Extended TPC-DS runs set
+`DBSPNET_STEP_SPILL_ROWS`, so they keep canonical freezes.
+
+| SF=3 batch 1, W=12 (3 runs each) | f02030d | HEAD before | HEAD after |
+|---|---|---|---|
+| drain (s) | 15.21 / 14.81 / 15.13 | 16.85 / 16.91 / 17.15 | 15.61 / 15.73 / 15.65 |
+| allocation (GiB) | 53.92 | 54.51 | 53.74 |
+
+What is left (~0.6 s, ~4%) is mostly the first tick's stream release (§5.6):
+`DBSPNET_STREAM_RELEASE_FIRST_TICK=0` takes 0.35 s off (15.9 → 15.6 s). It stays on, since it is what
+cut extended TPC-DS's first-tick memory (§5.7), and turning stream release off altogether is 1.2 s
+slower.
+
+**Lesson.** Bounded-memory work changed default paths that ivm-bench exercises, and nothing re-measured
+ivm-bench across 78 commits. Before re-pinning, run the local A/B against the current pin.

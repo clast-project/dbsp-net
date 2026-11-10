@@ -350,6 +350,7 @@ public class BlockedDeltaTests
             var fallback0 = Interlocked.Read(ref BlockedIndexedTrace.GiantFallbacks);
             Gen.Select(GenSkewedAdds.Array[1, 8], Gen.Int[1, 9], Gen.Bool).Sample((ticks, chunk, adopt) =>
             {
+                using var canonical = BlockedIndexedTrace.UseCanonicalFreeze(true); // set per sample: CsCheck runs them on its own threads
                 var trace = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
                 var sum = IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
                 foreach (var tick in ticks)
@@ -364,6 +365,48 @@ public class BlockedDeltaTests
             }, iter: 300);
             Assert.True(Interlocked.Read(ref BlockedIndexedTrace.GiantMerges) > giant0, "no giant group was merged streaming");
             Assert.Equal(fallback0, Interlocked.Read(ref BlockedIndexedTrace.GiantFallbacks));
+        }
+        finally
+        {
+            BlockedIndexedTrace.GiantGroupEntries = saved;
+        }
+    }
+
+    // §5.42: without canonical freezes (a workload that never spills) a frozen key's values stay in the
+    // order they were added; merges of such runs fall back to decoding the hash and stay correct. Giant
+    // groups and several-run keys included; canonical and plain freezes give the same trace.
+    [Fact]
+    public void Plain_freezes_merge_to_the_same_trace_as_canonical_ones()
+    {
+        var saved = BlockedIndexedTrace.GiantGroupEntries;
+        BlockedIndexedTrace.GiantGroupEntries = 12;
+        try
+        {
+            Gen.Select(GenSkewedAdds.Array[1, 8], Gen.Int[1, 9], Gen.Bool).Sample((ticks, chunk, adopt) =>
+            {
+                var plain = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+                var canonical = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+                var sum = IndexedZSet<StructuralRow, StructuralRow, Z64>.Empty;
+                foreach (var tick in ticks)
+                {
+                    using (BlockedIndexedTrace.UseCanonicalFreeze(false))
+                    {
+                        plain.Integrate(adopt ? SpilledIndexed(tick, 0, chunk) : ManagedIndexed(tick));
+                        plain.Freeze();
+                    }
+
+                    using (BlockedIndexedTrace.UseCanonicalFreeze(true))
+                    {
+                        canonical.Integrate(adopt ? SpilledIndexed(tick, 0, chunk) : ManagedIndexed(tick));
+                        canonical.Freeze();
+                    }
+
+                    sum += ManagedIndexed(tick);
+                    AssertSameIndexed(sum, plain.Materialize());
+                    AssertSameIndexed(sum, canonical.Materialize());
+                    plain.CheckRuns();
+                }
+            }, iter: 300);
         }
         finally
         {

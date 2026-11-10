@@ -1336,12 +1336,12 @@ internal sealed class BlockedIndexedTrace
 
             Array.Sort(hashes, groups, 0, g);
             var run = new RunBuilder(this, stream: true);
-            var sorted = new List<(StructuralRow Key, StructuralRow Value, long Weight)>();
             var scratch = new MergeScratch();
+            var canonical = CanonicalFreeze;
             for (var i = 0; i < g; i++)
             {
                 var key = groups[i].Key;
-                if (groups[i].Value.Count == 1)
+                if (groups[i].Value.Count == 1 || !canonical)
                 {
                     foreach (var (value, weight) in groups[i].Value)
                     {
@@ -1352,17 +1352,15 @@ internal sealed class BlockedIndexedTrace
                     continue;
                 }
 
-                // A key's values in value-hash order (§5.24): a later merge can stream a giant group.
-                sorted.Clear();
-                foreach (var (value, weight) in groups[i].Value)
+                // A key's values in value-hash order (§5.24): a later merge can stream a giant group, or
+                // sum a key several runs hold by value hash (§5.40). One key, so only its values' hashes
+                // are sorted, in reused arrays: Canonical's per-key bookkeeping and a list copy per group
+                // allocated more than these arrays (§5.42).
+                var n = scratch.SortByValueHash(groups[i].Value);
+                var items = scratch.Items;
+                for (var e = 0; e < n; e++)
                 {
-                    sorted.Add((key, value, weight.Value));
-                }
-
-                Canonical(sorted, scratch);
-                foreach (var (_, value, weight) in sorted)
-                {
-                    run.Add(hashes[i], key, value, weight);
+                    run.Add(hashes[i], key, items[e].Value, items[e].Weight);
                     entries++;
                 }
             }
@@ -1642,6 +1640,41 @@ internal sealed class BlockedIndexedTrace
     /// streaming, by value hash (docs/design-bounded-memory.md §5.24), when its runs allow it.</summary>
     internal static int GiantGroupEntries { get; set; } = 1 << 16;
 
+    /// <summary>
+    /// Whether a freeze writes each key's values in canonical order, ascending value hash (§5.24), so a
+    /// later merge can stream a giant group or sum a key several runs hold by value hash (§5.40); merges
+    /// fall back to decoding a hash whose runs are not in that order, so either way is correct. Ordering
+    /// costs a workload that never spills: ivm-bench's batch 1 at W=12 took ~1.5 s more of 17 (§5.42),
+    /// most of it in the operators that read the frozen groups. On only in bounded-memory mode
+    /// (<c>DBSPNET_SPILL</c> or <c>DBSPNET_STEP_SPILL_ROWS</c>) unless <c>DBSPNET_CANONICAL_FREEZE</c>
+    /// says <c>on</c>/<c>off</c>; tests scope it with <see cref="UseCanonicalFreeze"/>.
+    /// </summary>
+    internal static bool CanonicalFreeze =>
+        CanonicalFreezeOverride.Value ?? CanonicalFreezeSetting ?? (SpillSettings.Spill || SpillSettings.StepSpillRows is not null);
+
+    private static readonly AsyncLocal<bool?> CanonicalFreezeOverride = new();
+
+    /// <summary>Freezes on this async flow write canonical order or not, until disposed (tests).</summary>
+    internal static IDisposable UseCanonicalFreeze(bool on)
+    {
+        var previous = CanonicalFreezeOverride.Value;
+        CanonicalFreezeOverride.Value = on;
+        return new Restore(() => CanonicalFreezeOverride.Value = previous);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
+    }
+
+    private static readonly bool? CanonicalFreezeSetting =
+        Environment.GetEnvironmentVariable("DBSPNET_CANONICAL_FREEZE")?.Trim().ToLowerInvariant() switch
+        {
+            "on" => true,
+            "off" => false,
+            _ => null,
+        };
+
     /// <summary>Giant hashes merged streaming, and those that fell back to the in-memory path because
     /// a run was not in value-hash order or held several keys there (diagnostics).</summary>
     internal static long GiantMerges, GiantFallbacks;
@@ -1665,6 +1698,38 @@ internal sealed class BlockedIndexedTrace
         public readonly Dictionary<(StructuralRow, StructuralRow), int> At = [];
         public readonly List<Cursor> Live = [];
         public readonly Dictionary<StructuralRow, int> Sums = [];
+        public uint[] ValueHashes = new uint[16];
+        public (StructuralRow Value, long Weight)[] Items = new (StructuralRow, long)[16];
+
+        // One key's values in ascending value hash, into Items[0..n): reused arrays, nothing allocated
+        // per group once they have grown. Returns n.
+        public int SortByValueHash(ZSet<StructuralRow, Z64> group)
+        {
+            var n = group.Count;
+            if (ValueHashes.Length < n)
+            {
+                var size = Math.Max(n, ValueHashes.Length * 2);
+                ValueHashes = new uint[size];
+                Items = new (StructuralRow, long)[size];
+            }
+
+            var i = 0;
+            var sorted = true;
+            foreach (var (value, weight) in group)
+            {
+                var vh = (uint)value.GetHashCode();
+                sorted &= i == 0 || ValueHashes[i - 1] <= vh;
+                ValueHashes[i] = vh;
+                Items[i++] = (value, weight.Value);
+            }
+
+            if (!sorted)
+            {
+                ValueHashes.AsSpan(0, i).Sort(Items.AsSpan(0, i));
+            }
+
+            return i; // the arrays keep their rows only as long as this freeze's scratch
+        }
     }
 
     // The tied cursors' entries of hash, consolidated, into output (each cursor left past them); the
