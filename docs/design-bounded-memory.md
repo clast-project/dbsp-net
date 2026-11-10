@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **§5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **§5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -2973,3 +2973,44 @@ the operator running it (the circuit sets `StepSpillProfile.CurrentOp` while pro
 prints a `STEPPROF` line per tick and a `STEPOP` line per operator whose phases allocated ≥1 GiB: GiB and
 calls for chunk add, freeze, count, enumerate, probe, plus, copy, spill and run merge, and rows decoded.
 Next: two restored runs with the profile, at 262,144 and 1M rows (`~/xtpcds/scripts/profile.sh`).
+
+**Measured (xt138 at 262,144 rows, xt139 at 1M; restored tick 18, profile on).** Profiling costs no
+allocation: tick 18 allocates 7,133.5 GiB in xt138 (xt121: 7,139) and 6,076.4 in xt139 (xt118: 6,087).
+The gap, 1,057 GiB, by phase (GiB, thread allocation, exclusive of nested phases):
+
+| phase | xt139 (1M) | xt138 (262,144) | Δ |
+|---|---|---|---|
+| enumerate (decode rows for readers) | 2,376 | 2,844 | **+468** |
+| run merge | 721 | 857 | +135 |
+| chunk freeze (sort, encode) | 609 | 741 | +131 |
+| probe (weight lookups across runs) | 186 | 284 | +97 |
+| build count (hash walk, tied hashes decoded) | 275 | 339 | +64 |
+| chunk add | 93 | 101 | +8 |
+| all phases | 4,262 | 5,167 | +905 |
+
+The other ~150 GiB lies outside the phases (consumers handling the decoded rows). Rows decoded:
+2,748M → 3,554M (+806M); enumerations 2,288 → 5,294. By operator type the gap is `ApplyOp` +320 GiB
+(+210 of it decode), `IncrementalLeftJoinOp` +213 (probes across 4x the runs +98, giant merges +70),
+`ExchangeIndexOp` +143 (+100 decode: it reads its input twice, decoding 2x the rows it adds),
+`ExchangeOp` +74, `IncrementalAggregateOp` +58 (merges +52; also reads its input twice).
+
+So the +17% is mid-sized deltas (262,144 to 1M rows) going to blocks: each reader then decodes every row,
+~600–1,000 B a row for TPC-DS's wide rows (an `object[]`, every numeric cell boxed, every string a new
+`Utf8String` over a copied array), and each pays an encode, more runs to probe and merge. Not a defect
+in one place.
+
+**And it is the faster setting.** xt138 took 2,536 s, xt139 3,268 s: the 1M-row chunks spend 10,673 s of
+thread time freezing against 3,394 s at 262,144 (bigger sorts, large-object builder arrays), and their
+wall is worse though they allocate less. Allocation here does not track time, so the +17% alone is not
+worth a fix that keeps mid-sized deltas managed.
+
+**Where the prize is.** Decoding for readers is the largest single cost in both arms: 2,376–2,844 GiB,
+33–40% of tick 18's allocation, `ApplyOp` 1,765 GiB of it. Candidates, cheapest first:
+1. Read once: `ExchangeIndexOp` and `IncrementalAggregateOp` enumerate a block-backed input twice. One
+   pass, or decode once into the first pass's output, saves ~455 + ~180 GiB of decode at 262,144 rows.
+2. Decode only the columns a projection reads. Plan-level column liveness exists
+   (`PlanColumnLiveness`); a map over a block-backed delta could ask the reader for those columns. Worth it
+   only where projections narrow wide rows; a filter keeping the row needs every column. Measure the share
+   first.
+3. Cheaper strings: a block's string heap copied once per block and the rows' strings aliasing that copy,
+   not one array per string. A kept row then pins its block's string bytes (tens of KB), not just its own.
