@@ -3007,7 +3007,8 @@ worth a fix that keeps mid-sized deltas managed.
 **Where the prize is.** Decoding for readers is the largest single cost in both arms: 2,376–2,844 GiB,
 33–40% of tick 18's allocation, `ApplyOp` 1,765 GiB of it. Candidates, cheapest first:
 1. Read once: `ExchangeIndexOp` and `IncrementalAggregateOp` enumerate a block-backed input twice. One
-   pass, or decode once into the first pass's output, saves ~455 + ~180 GiB of decode at 262,144 rows.
+   pass, or decode once into the first pass's output, saves half their decode: ~230 + ~180 GiB at
+   262,144 rows.
 2. Decode only the columns a projection reads. Plan-level column liveness exists
    (`PlanColumnLiveness`); a map over a block-backed delta could ask the reader for those columns. Worth it
    only where projections narrow wide rows; a filter keeping the row needs every column. Measure the share
