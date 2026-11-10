@@ -552,6 +552,34 @@ public class RunSpillerTests
         });
     }
 
+    // §5.41: a delta builder that is one of N filled side by side (an exchange split) freezes runs at 1/N of
+    // the step chunk, so it spills at 1/N of the usual floor; otherwise none of its runs would reach it and a
+    // gather's union of them stayed in memory whole. Under a 1 TiB floor, a lone builder's run stays in
+    // memory and one of 2^30 builders' (a 1 KiB floor) is spilled.
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(1 << 30, true)]
+    public async Task A_split_builders_runs_spill_at_their_share_of_the_floor(int parts, bool spills)
+    {
+        using var pressure = MemoryPressure.Use(PressureLevel.Low);
+        await WithSpillerAsync(1L << 40, (spiller, dir) =>
+        {
+            using var mode = TraceBlocksMode.Use(join: true, freezeEntries: 1000, blockEntries: 8);
+            var format = TraceBlockFormats.Create(RowSchema, Schema.Empty)!;
+            var rows = new ZSetBuilder<StructuralRow, Z64>(new SpillingRows(format, 1000, alwaysBlocked: true, 400, parts: parts));
+            foreach (var (row, w) in Rows(0, 400))
+            {
+                rows.Add(row, w);
+            }
+
+            var delta = rows.Build();
+            Assert.Equal(spills, spiller.Files > 0);
+            Assert.Equal(Rows(0, 400).OrderBy(e => (int)e.Key[0]!), delta.OrderBy(e => (int)e.Key[0]!));
+            GC.KeepAlive(delta);
+            return Task.CompletedTask;
+        });
+    }
+
     // The delta collected and its files swept while only its enumerator is left, then read to the end.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static void ReadAfterSweep(RunSpiller spiller, ITraceBlockFormat format, int chunk)

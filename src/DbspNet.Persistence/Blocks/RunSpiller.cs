@@ -112,10 +112,11 @@ internal sealed class RunSpiller : IRunSpiller
         }
 
         var runs = trace.Runs;
+        var min = MinBytes / Math.Max(1, trace.SpillFloorDivisor);
         for (var r = 0; r < runs.Count; r++)
         {
             var run = runs[r];
-            if (run.Persisted is not null || Size(run) is var bytes && bytes < MinBytes)
+            if (run.Persisted is not null || Size(run) is var bytes && bytes < min)
             {
                 continue;
             }

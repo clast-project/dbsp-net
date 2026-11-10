@@ -21,11 +21,15 @@ internal sealed class SpillingGroups : IndexedZSetSpillingStore<StructuralRow, S
     private ChunkBudget _budget;
     private int _entries;
     private BlockedIndexedTrace? _trace;
+    private readonly int _parts;
     private readonly List<uint[]> _hashes = []; // newest first, as the trace's runs
 
     /// <param name="chunkBytes">Estimated managed bytes at which a chunk freezes sooner (0: entries only, §5.37).</param>
-    public SpillingGroups(ITraceBlockFormat format, int chunkEntries, bool alwaysBlocked, long chunkBytes = 0)
+    /// <param name="parts">Builders filled side by side, this one of them: its runs spill at that share
+    /// of the usual floor (§5.41).</param>
+    public SpillingGroups(ITraceBlockFormat format, int chunkEntries, bool alwaysBlocked, long chunkBytes = 0, int parts = 1)
     {
+        _parts = Math.Max(1, parts);
         ArgumentOutOfRangeException.ThrowIfLessThan(chunkEntries, 1);
         _format = format;
         _alwaysBlocked = alwaysBlocked;
@@ -63,7 +67,8 @@ internal sealed class SpillingGroups : IndexedZSetSpillingStore<StructuralRow, S
 
             Array.Sort(hashes);
             _trace ??= new BlockedIndexedTrace(
-                _format, freezeEntries: int.MaxValue, maxManaged: int.MaxValue, blockEntries: TraceBlocksMode.BlockEntries, compact: false);
+                _format, freezeEntries: int.MaxValue, maxManaged: int.MaxValue, blockEntries: TraceBlocksMode.BlockEntries, compact: false)
+            { SpillFloorDivisor = _parts };
             _trace.Integrate(part);
             _trace.Freeze();
             _hashes.Insert(0, hashes);
@@ -749,7 +754,7 @@ internal static class DeltaSpillGroups
         var chunk = Math.Max(1, (rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue)) / parts);
         return Unsafe.As<IndexedZSetBuilder<TKey, TValue, TWeight>>(
             new IndexedZSetBuilder<StructuralRow, StructuralRow, Z64>(new SpillingGroups(f, chunk, alwaysBlocked: rows == 0,
-                chunkBytes: rows == 0 ? 0 : SpillSettings.StepSpillBytes / parts)));
+                chunkBytes: rows == 0 ? 0 : SpillSettings.StepSpillBytes / parts, parts: parts)));
     }
 
     /// <summary>A builder whose result is always block backed (an exchange-index gather's managed

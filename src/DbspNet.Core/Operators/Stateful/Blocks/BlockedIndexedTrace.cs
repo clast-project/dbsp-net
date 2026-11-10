@@ -233,6 +233,11 @@ internal sealed class BlockedIndexedTrace
     /// <summary>Whether the trace merges its runs (state), as opposed to a block-backed delta's own trace.</summary>
     internal bool Compacts => _compact;
 
+    /// <summary>The spiller's smallest run here is its usual one over this (§5.41): a delta builder that is
+    /// one of N filled side by side (an exchange split) freezes runs at 1/N of the step chunk, and with the
+    /// usual floor none of them would spill, so a gather's union of them stayed in memory whole.</summary>
+    internal int SpillFloorDivisor { get; set; } = 1;
+
     /// <summary>Whether entries are ordered by the row's own hash.</summary>
     internal bool OrdersByRowHash => _defaultHash;
 

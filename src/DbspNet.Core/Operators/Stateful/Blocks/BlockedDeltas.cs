@@ -45,7 +45,7 @@ internal static class DeltaSpill
 
     internal static SpillingRows Store(ITraceBlockFormat format, long rows, bool alwaysBlocked, int capacity, int parts = 1) =>
         new(format, Math.Max(1, (rows == 0 ? SpillSettings.ForcedChunkRows : (int)Math.Min(rows, int.MaxValue)) / Math.Max(1, parts)), alwaysBlocked, capacity,
-            rows == 0 ? 0 : SpillSettings.StepSpillBytes / Math.Max(1, parts));
+            rows == 0 ? 0 : SpillSettings.StepSpillBytes / Math.Max(1, parts), parts);
 
     /// <summary>As <see cref="Rows"/> for a generic operator: plain unless the rows are structural.</summary>
     public static ZSetBuilder<TKey, TWeight> For<TKey, TWeight>(object? format, int capacity)
@@ -133,6 +133,7 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
     private ZSetBuilder<StructuralRow, Z64> _chunk;
     private ChunkBudget _budget;
     private BlockedIndexedTrace? _trace;
+    private readonly int _parts;
     private List<uint[]> _hashes = []; // newest first, as the trace's runs
     private long _frozen;
 
@@ -140,8 +141,11 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
     /// <param name="alwaysBlocked">Build block backed even when nothing froze (the forced mode, and a
     /// sum with a block-backed set).</param>
     /// <param name="chunkBytes">Estimated managed bytes at which a chunk freezes sooner (0: rows only).</param>
-    public SpillingRows(ITraceBlockFormat format, int chunkRows, bool alwaysBlocked, int capacity, long chunkBytes = 0)
+    /// <param name="parts">Builders filled side by side, this one of them: its runs spill at that share
+    /// of the usual floor (§5.41).</param>
+    public SpillingRows(ITraceBlockFormat format, int chunkRows, bool alwaysBlocked, int capacity, long chunkBytes = 0, int parts = 1)
     {
+        _parts = Math.Max(1, parts);
         ArgumentOutOfRangeException.ThrowIfLessThan(chunkRows, 1);
         _format = format;
         _alwaysBlocked = alwaysBlocked;
@@ -203,7 +207,8 @@ internal sealed class SpillingRows : ZSetSpillingStore<StructuralRow, Z64>
 
         Array.Sort(hashes);
         _trace ??= new BlockedIndexedTrace(
-            _format, freezeEntries: int.MaxValue, maxManaged: int.MaxValue, blockEntries: TraceBlocksMode.BlockEntries, compact: false);
+            _format, freezeEntries: int.MaxValue, maxManaged: int.MaxValue, blockEntries: TraceBlocksMode.BlockEntries, compact: false)
+        { SpillFloorDivisor = _parts };
         _trace.IntegrateRows(part);
         _trace.Freeze();
         _hashes.Insert(0, hashes);
