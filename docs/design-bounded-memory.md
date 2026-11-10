@@ -3099,3 +3099,18 @@ blocks from files. Group counts at the union +104 GiB, reader decode +150, merge
 +23. Against xt140, xt143 allocates the same, takes 4% less wall, and holds ~2 GB less at p95 and ~4 GB
 less at the peak. Kept for headroom. If allocation matters later, the gather could count groups before
 the bodies are evicted, or the floor could be lowered only past Low pressure.
+
+**Full runs** (xt144–xt147, `repeat.sh`, 262,144-row chunks, 1273934): 4 of 4 complete and validate
+(21 of 21 outputs), none out of memory. Against xt134–xt137 (b50feb2, the same settings before §5.40–§5.41),
+tick 18's live heap after gen 2s, from its first operator to its end, and the batch:
+
+| | xt134–xt137 mean | xt144–xt147 mean | Δ |
+|---|---|---|---|
+| tick-18 live p50 (MiB) | 14,488 | 13,159 | −9% |
+| tick-18 live p95 (MiB) | 21,493 | 18,499 | −14% |
+| tick-18 live max (MiB) | 29,937 | 27,824 | −7% |
+| tick-18 allocation (GiB) | 11,928 | 11,514 | −3.5% |
+| batch wall (s) | 3,480 | 3,512 | +1% (noise) |
+
+Per run, p95 (MiB): 19,360 / 22,936 / 22,175 / 21,500 before, 16,571 / 20,454 / 16,591 / 20,381 after.
+The highest live heap of the whole run, outside tick 18, stays noisy in both sets (27–41 GB).
