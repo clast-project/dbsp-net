@@ -1368,6 +1368,28 @@ public class BlockedDeltaTests
         }
     }
 
+    // §5.41: a probe of a block-backed indexed delta allocates nothing per run it searches. A gather's
+    // union holds a run from every source, and an iterator per run per probe doubled the left joins'
+    // probe allocation in extended TPC-DS tick 18.
+    [Fact]
+    public void A_probe_allocates_nothing_per_run()
+    {
+        var adds = Enumerable.Range(0, 500).Select(i => (i % 10, i, i % 4, 1L)).ToArray();
+        var delta = SpilledIndexed(adds, 0, 10);
+        Assert.True(delta.External is BlockedGroups { RunCount: >= 50 });
+        var missing = Key(99);
+        Assert.True(delta.External!.GroupFor(missing).IsEmpty);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 100; i++)
+        {
+            Assert.True(delta.External.GroupFor(missing).IsEmpty);
+        }
+
+        var perProbe = (GC.GetAllocatedBytesForCurrentThread() - before) / 100;
+        Assert.True(perProbe < 1024, $"a probe of {((BlockedGroups)delta.External).RunCount} runs allocated {perProbe} B");
+        AssertSameIndexed(ManagedIndexed(adds), delta);
+    }
+
     // The test rows' first column, mod 10 (the index key: ten groups over every chunk).
     private static int KeyOf(StructuralRow row) => (int)row[0]! % 10;
 

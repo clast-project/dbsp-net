@@ -207,13 +207,22 @@ internal sealed class BlockedGroups : IndexedZSetExternalStore<StructuralRow, St
         var b = new ZSetBuilder<StructuralRow, Z64>();
         foreach (var part in _parts)
         {
-            foreach (var run in part.Trace.Runs)
+            var runs = part.Trace.Runs;
+            for (var r = 0; r < runs.Count; r++)
             {
-                foreach (var (block, i) in At(run, hash))
+                // At(run, hash) inline: an iterator per run per probe allocated as much as the probe's
+                // rows once a gather unioned a run from every source (§5.41).
+                var run = runs[r];
+                for (var bi = run.Find(hash); bi >= 0 && bi < run.Blocks.Length && run.FirstOf(bi) <= hash; bi++)
                 {
-                    if (block.KeyEquals(i, key))
+                    var block = run.Blocks[bi].Body;
+                    var hashes = block.Hashes;
+                    for (var i = block.LowerBound(hash); i < hashes.Length && hashes[i] == hash; i++)
                     {
-                        b.Add(block.Value(i), new Z64(block.Weight(i)));
+                        if (block.KeyEquals(i, key))
+                        {
+                            b.Add(block.Value(i), new Z64(block.Weight(i)));
+                        }
                     }
                 }
             }
