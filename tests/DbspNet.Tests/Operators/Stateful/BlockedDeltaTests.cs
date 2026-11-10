@@ -460,12 +460,86 @@ public class BlockedDeltaTests
         Assert.True(copying * 5 < decoding * 3, $"the copying merge allocated {copying} B, the decoding one {decoding} B");
     }
 
+    // §5.40: a hash several runs hold, as one key, is merged by stored value hash: entries copied whole,
+    // values decoded only where value hashes tie. Each of 200 groups of 150 rows lies across six runs
+    // (below the giant size), and the merge allocates far less than decoding every entry.
+    [Fact]
+    public void A_merge_sums_a_key_several_runs_hold_by_value_hash()
+    {
+        const int n = 30_000;
+        var adds = Enumerable.Range(0, n).Select(i => (i % 200, i / 200, i % 4, 1L)).ToArray();
+        long Adopt(bool byValueHash)
+        {
+            var delta = SpilledIndexed(adds, 0, n / 6);
+            Assert.True(delta.External is BlockedGroups { RunCount: > 2 });
+            var saved = BlockedIndexedTrace.ValueHashMerges;
+            BlockedIndexedTrace.ValueHashMerges = byValueHash;
+            var trace = new BlockedIndexedTrace(IndexedFormat);
+            var before = GC.GetAllocatedBytesForCurrentThread();
+            try
+            {
+                trace.Integrate(delta);
+            }
+            finally
+            {
+                before = GC.GetAllocatedBytesForCurrentThread() - before;
+                BlockedIndexedTrace.ValueHashMerges = saved;
+            }
+
+            AssertSameIndexed(ManagedIndexed(adds), trace.Materialize());
+            trace.CheckRuns();
+            trace.CheckValueOrder();
+            return before;
+        }
+
+        var merged0 = Interlocked.Read(ref BlockedIndexedTrace.ValueHashMerged);
+        var decoding = Adopt(byValueHash: false);
+        Assert.Equal(merged0, Interlocked.Read(ref BlockedIndexedTrace.ValueHashMerged));
+        var streaming = Adopt(byValueHash: true);
+        Assert.True(Interlocked.Read(ref BlockedIndexedTrace.ValueHashMerged) > merged0, "no hash was merged by value hash");
+        Console.WriteLine($"VALUEHASHMERGE decoding={decoding} streaming={streaming} ratio={(double)streaming / decoding:F2}");
+        // 0.28 by default; 0.52 under the forced suites' 16-entry blocks and 1 MiB cache (blocks reloaded).
+        Assert.True(streaming * 5 < decoding * 3, $"the value-hash merge allocated {streaming} B, the decoding one {decoding} B");
+    }
+
+    // §5.40: with value-hash merges off, the same ticks give the same trace (the property test below runs
+    // with them on).
+    [Fact]
+    public void A_merge_by_value_hash_matches_the_decoding_merge()
+    {
+        Gen.Select(GenIndexedAdds.Array[1, 6], Gen.Int[1, 9]).Sample((ticks, chunk) =>
+        {
+            var saved = BlockedIndexedTrace.ValueHashMerges;
+            try
+            {
+                var on = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+                var off = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
+                foreach (var tick in ticks)
+                {
+                    BlockedIndexedTrace.ValueHashMerges = true;
+                    on.Integrate(SpilledIndexed(tick, 0, chunk));
+                    on.Freeze();
+                    BlockedIndexedTrace.ValueHashMerges = false;
+                    off.Integrate(SpilledIndexed(tick, 0, chunk));
+                    off.Freeze();
+                    AssertSameIndexed(off.Materialize(), on.Materialize());
+                    on.CheckRuns();
+                    on.CheckValueOrder();
+                }
+            }
+            finally
+            {
+                BlockedIndexedTrace.ValueHashMerges = saved;
+            }
+        }, iter: 300);
+    }
+
     // §5.36: entries of one hash in several runs are summed before they are copied (cancelling ones
     // dropped), and the merged runs stay canonical.
     [Fact]
     public void A_copying_merge_sums_entries_several_runs_hold()
     {
-        var summed0 = Interlocked.Read(ref BlockedIndexedTrace.SummedHashes);
+        var summed0 = Interlocked.Read(ref BlockedIndexedTrace.SummedHashes) + Interlocked.Read(ref BlockedIndexedTrace.ValueHashMerged);
         Gen.Select(GenIndexedAdds.Array[1, 6], Gen.Int[1, 9]).Sample((ticks, chunk) =>
         {
             var trace = new BlockedIndexedTrace(IndexedFormat, freezeEntries: 16, blockEntries: 8);
@@ -480,7 +554,8 @@ public class BlockedDeltaTests
                 trace.CheckValueOrder();
             }
         }, iter: 300);
-        Assert.True(Interlocked.Read(ref BlockedIndexedTrace.SummedHashes) > summed0, "no merge summed a hash several runs held");
+        Assert.True(Interlocked.Read(ref BlockedIndexedTrace.SummedHashes) + Interlocked.Read(ref BlockedIndexedTrace.ValueHashMerged) > summed0,
+            "no merge summed a hash several runs held");
     }
 
     // §5.36: a block-backed delta hands out a giant group streamed: it reads as the managed group (rows,

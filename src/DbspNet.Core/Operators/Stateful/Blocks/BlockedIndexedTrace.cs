@@ -1658,6 +1658,8 @@ internal sealed class BlockedIndexedTrace
         public ulong[] Order = new ulong[16];
         public readonly List<(StructuralRow Key, StructuralRow Value, long Weight, ITraceBlock Block, int Index)> Copies = [];
         public readonly Dictionary<(StructuralRow, StructuralRow), int> At = [];
+        public readonly List<Cursor> Live = [];
+        public readonly Dictionary<StructuralRow, int> Sums = [];
     }
 
     // The tied cursors' entries of hash, consolidated, into output (each cursor left past them); the
@@ -1674,6 +1676,11 @@ internal sealed class BlockedIndexedTrace
 
         if (output.CopyMerge)
         {
+            if (tied.Count > 1 && ValueHashMerges && TryMergeTiedByValueHash(tied, hash, output, scratch, out var tiedDropped))
+            {
+                return tiedDropped;
+            }
+
             return MergeHashCopying(tied, hash, output, scratch);
         }
 
@@ -1847,6 +1854,130 @@ internal sealed class BlockedIndexedTrace
 
         Interlocked.Increment(ref SummedHashes);
         return dropped;
+    }
+
+    /// <summary>Whether a copying merge sums a hash several runs hold by stored value hash when every run
+    /// holds it as one key (docs/design-bounded-memory.md §5.40), decoding only entries whose value hashes
+    /// tie, as a giant group's merge does; otherwise it decodes every entry of that hash. Off for A/B
+    /// (<c>DBSPNET_VALUE_HASH_MERGES=off</c>).</summary>
+    internal static bool ValueHashMerges { get; set; } =
+        !string.Equals(Environment.GetEnvironmentVariable("DBSPNET_VALUE_HASH_MERGES"), "off", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Hashes several runs held that a copying merge summed by value hash (diagnostics).</summary>
+    internal static long ValueHashMerged;
+
+    // A copying merge of a hash several runs hold (§5.40): when each run holds it as one key, the same in
+    // every run, its values in ascending value hash (canonical order), the runs are walked k-way by stored
+    // value hash and entries copied whole; a value is decoded only where entries share its value hash, to
+    // sum equal rows. Unlike the giant merge, the hash is not flushed into blocks of its own. False, with
+    // the cursors untouched, when a run holds another key there or is out of order.
+    private bool TryMergeTiedByValueHash(List<Cursor> tied, uint hash, RunBuilder output, MergeScratch scratch, out long dropped)
+    {
+        dropped = 0;
+        var key = tied[0].Block.Key(tied[0].Index);
+        foreach (var cursor in tied)
+        {
+            if (!cursor.OneKeyAscending(hash, key))
+            {
+                return false;
+            }
+        }
+
+        var live = scratch.Live;
+        live.Clear();
+        foreach (var cursor in tied)
+        {
+            if (Dropped(key, cursor.Run.Floor))
+            {
+                dropped++;
+                while (!cursor.Done && cursor.Hash == hash)
+                {
+                    cursor.Advance();
+                }
+            }
+            else
+            {
+                live.Add(cursor);
+            }
+        }
+
+        // The walk: the least value hash across the live runs, its entries gathered and summed.
+        var group = scratch.Copies;
+        Dictionary<StructuralRow, int>? sums = null;
+        while (true)
+        {
+            var any = false;
+            var min = 0u;
+            foreach (var c in live)
+            {
+                if (!c.Done && c.Hash == hash)
+                {
+                    var vh = (uint)c.Block.ValueHash(c.Index);
+                    if (!any || vh < min)
+                    {
+                        (min, any) = (vh, true);
+                    }
+                }
+            }
+
+            if (!any)
+            {
+                break;
+            }
+
+            group.Clear();
+            foreach (var c in live)
+            {
+                while (!c.Done && c.Hash == hash && (uint)c.Block.ValueHash(c.Index) == min)
+                {
+                    group.Add((key, null!, c.Block.Weight(c.Index), c.Block, c.Index));
+                    c.Advance();
+                }
+            }
+
+            if (group.Count == 1)
+            {
+                var (_, _, weight, block, index) = group[0];
+                if (weight != 0)
+                {
+                    output.AddCopy(hash, block, index, weight);
+                }
+
+                continue;
+            }
+
+            // Entries sharing a value hash: equal rows sum, first seen first; zeros dropped.
+            sums ??= scratch.Sums;
+            sums.Clear();
+            var kept = 0;
+            for (var j = 0; j < group.Count; j++)
+            {
+                var e = group[j];
+                var value = e.Block.Value(e.Index);
+                if (sums.TryGetValue(value, out var first))
+                {
+                    var f = group[first];
+                    group[first] = (f.Key, f.Value, f.Weight + e.Weight, f.Block, f.Index);
+                }
+                else
+                {
+                    sums[value] = kept;
+                    group[kept++] = (e.Key, value, e.Weight, e.Block, e.Index);
+                }
+            }
+
+            for (var j = 0; j < kept; j++)
+            {
+                var (_, _, weight, block, index) = group[j];
+                if (weight != 0)
+                {
+                    output.AddCopy(hash, block, index, weight);
+                }
+            }
+        }
+
+        Interlocked.Increment(ref ValueHashMerged);
+        return true;
     }
 
     // Whether the tied runs hold at least GiantGroupEntries entries of hash: counted from the hash
@@ -2190,6 +2321,42 @@ internal sealed class BlockedIndexedTrace
             Run = run;
             _block = block;
             Index = index;
+        }
+
+        // Whether every entry of hash from here has key (no row decoded) and they ascend by stored value
+        // hash: the run holds hash as one key in canonical order. Moves nothing.
+        public bool OneKeyAscending(uint hash, StructuralRow key)
+        {
+            var last = 0u;
+            var first = true;
+            var b = _block;
+            var i = Index;
+            while (b < Run.Blocks.Length)
+            {
+                if (i >= Run.Blocks[b].Count)
+                {
+                    b++;
+                    i = 0;
+                    continue;
+                }
+
+                var block = b == _block ? Block : Run.Blocks[b].Body;
+                if (block.Hashes[i] != hash)
+                {
+                    break;
+                }
+
+                var vh = (uint)block.ValueHash(i);
+                if ((!first && vh < last) || !block.KeyEquals(i, key))
+                {
+                    return false;
+                }
+
+                (first, last) = (false, vh);
+                i++;
+            }
+
+            return true;
         }
 
         // Whether the hash under the cursor continues into the next block.
