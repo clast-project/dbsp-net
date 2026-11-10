@@ -3053,3 +3053,49 @@ left is mostly encoding the merged output and the decoding fallback.
 
 Next: `ExchangeIndexOp`'s double read (455 GiB of decode): group rows at the split, so the gather unions
 grouped blocks without decoding them.
+
+### 5.41 The exchange-index reads once; its split's runs spill (2026-11-10)
+
+**Grouped splits** (f60b0dc). `ExchangeIndexOp` decoded a block-backed delta twice: once to split it by
+destination (`SplitSpilling`), and again at the gather to key every row into the index (§5.39: 455 GiB of
+tick 18, `rows_decoded` = 2x its rows). The split now keys and groups each row where it already decodes
+it (`ExchangeBuckets.SplitGrouping`: one spilling grouping builder per destination, each at its share of
+the step chunk), and the gather sums the grouped buckets as the union of their runs
+(`GatherGrouped`; `BlockedGroups` holds several parts, as `BlockedRows` does for the plain exchange,
+§5.35). Rows a managed split sent are keyed into one blocked builder and unioned too.
+`DBSPNET_GROUPED_SPLITS=off` for A/B.
+
+**Probes allocated per run** (8c034ef). The union holds a run from every source, ~12x the runs, and
+xt141's left joins' probe allocation doubled (284 → 568 GiB): `BlockedGroups.GroupFor` walked each run
+through a `yield` iterator, ~80 B a run a probe (4,136 B a probe of 50 runs in a test). Inline, a probe
+allocates nothing per run, and the probe fell below where it started (221 GiB).
+
+**The split's runs never spilled** (2e1fc90). With both fixes xt142 allocated 6,371 GiB, but the live
+heap rose: after gen 2s around op 2153 (65M rows grouped for an aggregate) it reached 30.2 GB against
+xt140's 23.9. Each split builder freezes runs at 1/W of the step chunk (~2 MB at 262,144 rows, W=12),
+below the spiller's 10 MiB floor (`DBSPNET_SPILL_MIN_MIB`), so at Low pressure none spilled and the
+gather's union stayed in memory whole. Before, the gather re-encoded into full-chunk runs, which did spill.
+The plain exchange's split (§5.32) had the same gap. A delta builder that is one of N side by side now
+spills at 1/N of the floor (`BlockedIndexedTrace.SpillFloorDivisor`, set by `SpillingRows` and
+`SpillingGroups` from their `parts`).
+
+**Measured** (restored tick 18, 262,144-row chunks, profiled, each run completes):
+
+| | xt140 (§5.40) | xt141 grouped | xt142 + probe | xt143 + spill floor |
+|---|---|---|---|---|
+| tick-18 allocation (GiB) | 6,828 | 6,718 | 6,371 | 6,801 |
+| `ExchangeIndexOp` (GiB) | 677 | 386 | 384 | 473 |
+| left-join probe (GiB) | 284 | 568 | 221 | 230 |
+| batch wall (s) | 2,564 | 2,366 | 2,349 | 2,458 |
+| tick-18 live after gen 2, p50 / p95 / max (MiB) | 10,547 / 17,559 / 23,906 | 10,078 / 19,625 / 29,626 | 10,623 / 20,141 / 30,227 | 9,781 / 15,988 / 19,738 |
+
+Live is taken from tick 18's gen-2 GCs past the restore (t > 300 s). Earlier restored runs, all before
+these changes: xt121 11,421 / 17,929 / 22,713; xt138 11,251 / 18,083 / 25,225. xt143 is the lowest on
+every percentile. The output phase after the tick (the driver reading 15M-row views) peaks anywhere from
+23 to 31 GB in runs before any of this (xt121 30.7), so its 28.9 is noise.
+
+Spilling the small runs costs back most of the allocation the grouped split saved: reading them reloads
+blocks from files. Group counts at the union +104 GiB, reader decode +150, merges +60, the spill itself
++23. Against xt140, xt143 allocates the same, takes 4% less wall, and holds ~2 GB less at p95 and ~4 GB
+less at the peak. Kept for headroom. If allocation matters later, the gather could count groups before
+the bodies are evicted, or the floor could be lowered only past Low pressure.
