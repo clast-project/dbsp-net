@@ -45,7 +45,9 @@ public readonly record struct OperatorStat(
 /// one operator's total wall-clock across every profiled <see cref="RootCircuit.Step"/>,
 /// paired with a type label and (for stateful operators) its state / output sizes.
 /// <paramref name="RetainedRows"/> and <paramref name="LastOutputRows"/> are <c>-1</c>
-/// for stateless (linear) operators that expose no metrics.
+/// for stateless (linear) operators that expose no metrics. For an exchange in a parallel circuit,
+/// <paramref name="WaitMs"/> is the part of <paramref name="CumulativeMs"/> spent at its barrier, and
+/// <paramref name="SplitRows"/> / <paramref name="GatherRows"/> the rows it sent and received on this worker.
 /// </summary>
 public readonly record struct OperatorProfile(
     int Index,
@@ -54,7 +56,10 @@ public readonly record struct OperatorProfile(
     long RetainedRows,
     long LastOutputRows,
     string? Label = null,
-    long AllocBytes = 0)
+    long AllocBytes = 0,
+    double WaitMs = 0,
+    long SplitRows = 0,
+    long GatherRows = 0)
 {
     public override string ToString() => System.FormattableString.Invariant(
         $"[{Index}] {Name}{(Label is null ? "" : $" <{Label}>")}: {CumulativeMs:F1}ms state={RetainedRows} out={LastOutputRows} alloc={AllocBytes}");

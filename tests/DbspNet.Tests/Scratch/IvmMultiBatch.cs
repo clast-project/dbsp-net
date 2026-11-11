@@ -34,6 +34,7 @@
 //   IVM_CHECKPOINT_REPEAT=1   after batch 1's checkpoint, write a second one straight away (same
 //                     tick, so a fresh generation directory) and profile it the same way
 //   IVM_CHECKPOINT_PREGC=1    force a full compacting GC (untimed) before every checkpoint
+//   IVM_BCAST_MAXROWS=N (parallel) broadcast join right sides estimated at <= N rows (Delta-log counts)
 //   IVM_STEP_PROFILE=1  (parallel) per batch, each worker's step as exchange split / barrier wait / gather / other
 //                     (StepProfiler; STEPPROF lines). Pair with IVM_GC_EVENTS=1 for the GC share.
 using System.Diagnostics;
@@ -136,19 +137,6 @@ public class IvmMultiBatch
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         var workers = int.TryParse(Environment.GetEnvironmentVariable("IVM_WORKERS"), out var w) ? w : 1;
-        ParallelCompiledProgram? CompileParallel(int? at = null)
-        {
-            Assert.True(
-                SqlProgram.TryCompileParallel(
-                    spec.Program, outputViews, at ?? workers, out var compiled, codecs,
-                    new CompileOptions { TraceFamily = TraceFamily },
-                    numericStringCoercion: true, nullCollation: NullCollation.Low),
-                "parallel compile refused the program");
-            return compiled;
-        }
-
-        var parallel = workers > 1 ? CompileParallel() : null;
-
         string InUri(string uri)
         {
             var rel = uri.StartsWith("/data/raw/delta/", StringComparison.Ordinal) ? uri["/data/raw/delta/".Length..] : uri.TrimStart('/');
@@ -156,6 +144,42 @@ public class IvmMultiBatch
                 ? Path.Combine(stagingRoot, rel["staging/".Length..])
                 : Path.Combine(dataRoot, rel);
         }
+
+        // IVM_BCAST_MAXROWS=N (parallel): broadcast a join's right side when its estimated size, from the
+        // inputs' Delta-log row counts at batch 1, is at most N (CompileOptions.BroadcastMaxRows).
+        var broadcastMaxRows = long.TryParse(Environment.GetEnvironmentVariable("IVM_BCAST_MAXROWS"), out var bm) ? bm : 0;
+        Dictionary<string, long>? rowCounts = null;
+        if (broadcastMaxRows > 0 && workers > 1)
+        {
+            rowCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var input in spec.Inputs)
+            {
+                if (await DeltaRowCounts.TryReadAsync(InUri(input.Uri)) is { } n)
+                {
+                    rowCounts[input.Table] = n;
+                }
+            }
+
+            _out.WriteLine("BCAST counts " + string.Join(" ", rowCounts.OrderBy(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value}")));
+        }
+
+        ParallelCompiledProgram? CompileParallel(int? at = null)
+        {
+            Assert.True(
+                SqlProgram.TryCompileParallel(
+                    spec.Program, outputViews, at ?? workers, out var compiled, codecs,
+                    new CompileOptions
+                    {
+                        TraceFamily = TraceFamily,
+                        BroadcastMaxRows = broadcastMaxRows,
+                        RelationRowCounts = rowCounts,
+                    },
+                    numericStringCoercion: true, nullCollation: NullCollation.Low),
+                "parallel compile refused the program");
+            return compiled;
+        }
+
+        var parallel = workers > 1 ? CompileParallel() : null;
 
         List<IInputConnector> Inputs() => spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))

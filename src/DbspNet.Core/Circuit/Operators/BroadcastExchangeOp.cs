@@ -54,7 +54,7 @@ internal sealed class BroadcastExchangeOp<TRow, TWeight> : IOperator
     public void Step()
     {
         var workers = _workers;
-        var profile = StepProfiler.Enabled;
+        var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // This worker's whole shard becomes one bucket, published to every cell of

@@ -38,6 +38,7 @@ public sealed class RootCircuit
     private long _lastStepTicks;
     private long[]? _opCumTicks;
     private long[]? _opCumAlloc;
+    private StepProfiler.OperatorSink? _opExchange;
 
     /// <summary>
     /// When set, <see cref="Step"/> times each operator individually and
@@ -387,6 +388,8 @@ public sealed class RootCircuit
     {
         _opCumTicks ??= new long[_operators.Count];
         _opCumAlloc ??= new long[_operators.Count];
+        _opExchange ??= new StepProfiler.OperatorSink(_operators.Count);
+        var outerSink = StepProfiler.CurrentOperator;
         for (var i = 0; i < _operators.Count; i++)
         {
             // Alloc delta is thread-local; the engine step is a serial foreach on
@@ -399,7 +402,17 @@ public sealed class RootCircuit
                 DeltaSizeProfile.Current = _operators[i] is IIntrospectable named ? named.MetricName : _operators[i].GetType().Name;
             }
 
-            _operators[i].Step();
+            _opExchange.Index = i;
+            StepProfiler.CurrentOperator = _opExchange;
+            try
+            {
+                _operators[i].Step();
+            }
+            finally
+            {
+                StepProfiler.CurrentOperator = outerSink;
+            }
+
             if (DeltaSizeProfile.Enabled)
             {
                 DeltaSizeProfile.Current = null;
@@ -426,6 +439,8 @@ public sealed class RootCircuit
         {
             System.Array.Clear(_opCumAlloc);
         }
+
+        _opExchange?.Clear();
     }
 
     /// <summary>
@@ -455,9 +470,12 @@ public sealed class RootCircuit
             var ms = _opCumTicks[i] * 1000.0 / freq;
             var alloc = _opCumAlloc is not null ? _opCumAlloc[i] : 0L;
             var label = i < _operatorLabels.Count ? _operatorLabels[i] : null;
+            var waitMs = _opExchange is not null ? _opExchange.WaitTicks[i] * 1000.0 / freq : 0;
+            var splitRows = _opExchange?.SplitRows[i] ?? 0;
+            var gatherRows = _opExchange?.GatherRows[i] ?? 0;
             if (op is IIntrospectable m)
             {
-                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label, alloc));
+                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label, alloc, waitMs, splitRows, gatherRows));
             }
             else
             {
@@ -468,7 +486,7 @@ public sealed class RootCircuit
                     name = name[..tick];
                 }
 
-                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label, alloc));
+                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label, alloc, waitMs, splitRows, gatherRows));
             }
         }
 

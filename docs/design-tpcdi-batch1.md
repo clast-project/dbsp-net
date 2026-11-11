@@ -140,6 +140,46 @@ the long-run per-row difference. A–D work inside the current design.
 6. **Re-pin ivm-bench** when the local A/B shows a net gain against `f02030d`, the current upstream
    pin. Drop the Dockerfile's `git submodule update --init` step in the same commit.
 
+## 4a. Step 2 result: the wait is skew from tiny dimensions (2026-11-10)
+
+New instrument: under `DBSPNET_PROFILE=1` the batch profile now prints **exchanges by barrier wait**.
+That is each exchange's wait summed over workers, plus the max/mean of rows it sent and received per
+worker (`OperatorProfile.WaitMs` / `SplitRows` / `GatherRows`, recorded by `StepProfiler` for whichever
+operator a profiled circuit is stepping).
+
+Total wait: 36.2 s summed over workers (3.0 s each), concentrated in two places:
+
+- **trades_history: ~16.2 s, 45%.** The view joins 982k trades to `reference_trade_type` (5 rows) on
+  `t_tt_id` and to `reference_status_type` (6 rows) twice. Hash-sharding the fact side on a key with 5–6
+  values puts it on at most 5–6 workers. Exchange 218 lands its 982k rows at 11.37× the mean on one
+  worker.
+- **financials: ~25%.** Exchanges receive 6.5–9.8× the mean, and wrk_company_financials then waits
+  4.6 s on 49k balanced rows.
+
+**The broadcast join already existed** (`CompileOptions.BroadcastMaxRows` with `RelationRowCounts`, and
+`DeltaRowCounts` to read sizes from Delta-log stats), but nothing set it. `IvmMultiBatch` now takes
+`IVM_BCAST_MAXROWS=N`. Interleaved A/B, five runs per arm, all three batches, views identical in all 15:
+
+| | batch-1 drain median | alloc | batches 2 / 3 |
+|---|---|---|---|
+| no broadcast | 15.59 s | 53.76 GiB | ~0.10 / 0.10 s |
+| **≤ 1,000 rows** (trade_type, status_type, industry, tax_rate, audit) | **14.53 s (−6.8%; 5 of 5 pairs)** | 53.74 | unchanged |
+| ≤ 30,000 rows (adds hr, date, prospect, customer_mgmt) | 14.83 s (−4.9%) | 55.65 (+1.9) | unchanged |
+
+With broadcast on, total wait falls to 26.0 s. What's left is led by financials' skew (exchanges 484, 494,
+496 at 6.5–9.8×) and by fact_trade exchange 245. That exchange's own rows are balanced, so it is waiting
+on an upstream operator, the trades Distinct.
+
+Feldera handles the same problem at runtime. ivm-bench's Feldera profile sets `adaptive_joins: true`,
+and its `Balancer` (`crates/dbsp/src/operator/dynamic/balance/`) picks shard, broadcast, or balance per
+join stream each step from observed key distributions, redistributing the integral when the policy
+changes.
+
+**Shipping it needs one decision.** A broadcast side's state is replicated, not sharded, so the choice
+is part of the plan's state layout. If the server reads row counts at deploy, a restore after the
+tables grow could compile a different plan than the snapshot holds. Fresh deploys are fine. Persistent
+runs must record the broadcast set with the checkpoint (as the worker count is) and reuse it on restore.
+
 ## 5. Lessons this pass rests on
 
 - Per-operator wall time in a parallel run follows where GC pauses land. Two IntegratedViews went

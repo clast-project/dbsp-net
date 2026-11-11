@@ -57,7 +57,7 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
     public void Step()
     {
         var workers = _workers;
-        var profile = StepProfiler.Enabled;
+        var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // Map, then split by the mapped row's partition. Two inputs can map to one row;

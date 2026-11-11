@@ -900,6 +900,53 @@ public sealed class ProgramRunner
                 sb.AppendLine(FormattableString.Invariant(
                     $"  [{op.Index,4}] {op.Name,-24} max {max,8:F1} ms (worker {at,2})  mean {mean,8:F1} ms  {op.Label}"));
             }
+
+            // Each exchange's barrier wait, summed over workers: the time workers spent there waiting for the
+            // slowest one to publish. Received rows max/mean > 1 means the exchange's output is skewed (the
+            // operators after it run longer on one worker); sent rows max/mean > 1 means its input was.
+            // A GC pause during a wait counts as wait.
+            var exchanges = new List<(OperatorProfile Op, double Wait, double Total, double GatherSkew, double SplitSkew, long Rows)>();
+            for (var i = 0; i < ops; i++)
+            {
+                if (!IsExchange(perWorker[0][i]))
+                {
+                    continue;
+                }
+
+                double wait = 0, total = 0;
+                long gMax = 0, gSum = 0, sMax = 0, sSum = 0;
+                foreach (var worker in perWorker)
+                {
+                    if (i >= worker.Count)
+                    {
+                        continue;
+                    }
+
+                    var o = worker[i];
+                    wait += o.WaitMs;
+                    total += o.CumulativeMs;
+                    gMax = Math.Max(gMax, o.GatherRows);
+                    gSum += o.GatherRows;
+                    sMax = Math.Max(sMax, o.SplitRows);
+                    sSum += o.SplitRows;
+                }
+
+                static double Skew(long max, long sum, int n) => sum > 0 ? max * (double)n / sum : 1.0;
+                exchanges.Add((perWorker[0][i], wait, total, Skew(gMax, gSum, perWorker.Count), Skew(sMax, sSum, perWorker.Count), gSum));
+            }
+
+            if (exchanges.Count > 0)
+            {
+                var allWait = exchanges.Sum(e => e.Wait);
+                sb.AppendLine();
+                sb.AppendLine(FormattableString.Invariant(
+                    $"-- exchanges by barrier wait (summed over workers; all {exchanges.Count} exchanges wait {allWait:F0} ms of {exchanges.Sum(e => e.Total):F0} ms; top 30) --"));
+                foreach (var e in exchanges.OrderByDescending(e => e.Wait).Take(30))
+                {
+                    sb.AppendLine(FormattableString.Invariant(
+                        $"  [{e.Op.Index,4}] {e.Op.Name,-22} wait {e.Wait,8:F0} ms ({(allWait > 0 ? e.Wait / allWait * 100 : 0),4:F1}%)  of {e.Total,8:F0} ms  rows {e.Rows,9}  recv max/mean {e.GatherSkew,5:F2}  sent max/mean {e.SplitSkew,5:F2}  {e.Op.Label}"));
+                }
+            }
         }
 
         private static void AppendPhase(StringBuilder sb, string label, double ms, long totalTicks)

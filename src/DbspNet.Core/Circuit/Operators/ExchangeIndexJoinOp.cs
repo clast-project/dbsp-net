@@ -85,7 +85,7 @@ internal sealed class ExchangeIndexJoinOp<TKey, TLeftRow, TRightRow, TWeight> : 
     public void Step()
     {
         var workers = _workers;
-        var profile = StepProfiler.Enabled;
+        var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // Split each side's rows into one append-only bucket per destination. The

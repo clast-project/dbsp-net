@@ -58,7 +58,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
     public void Step()
     {
         var workers = _workers;
-        var profile = StepProfiler.Enabled;
+        var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // Split this shard's rows into one append-only bucket per destination —

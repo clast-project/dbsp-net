@@ -224,6 +224,9 @@ public sealed class ParallelCircuit : IDisposable
                 {
                     CumulativeMs = a.CumulativeMs + s.CumulativeMs,
                     AllocBytes = a.AllocBytes + s.AllocBytes,
+                    WaitMs = a.WaitMs + s.WaitMs,
+                    SplitRows = a.SplitRows + s.SplitRows,
+                    GatherRows = a.GatherRows + s.GatherRows,
                     RetainedRows = a.RetainedRows < 0 ? a.RetainedRows : a.RetainedRows + s.RetainedRows,
                     LastOutputRows = a.LastOutputRows < 0 ? a.LastOutputRows : a.LastOutputRows + s.LastOutputRows,
                 };

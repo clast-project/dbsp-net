@@ -50,7 +50,7 @@ internal sealed class ExchangeOp<TKey, TWeight> : IOperator
     public void Step()
     {
         var workers = _workers;
-        var profile = StepProfiler.Enabled;
+        var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
         // Split this shard's rows into one bucket per destination worker. The

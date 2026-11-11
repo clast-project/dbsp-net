@@ -45,6 +45,40 @@ internal static class StepProfiler
     /// <summary>Master switch — leave <see langword="false"/> outside benchmarks.</summary>
     internal static bool Enabled { get; set; }
 
+    /// <summary>
+    /// Per-operator exchange accounting for the operator profile (<see cref="RootCircuit.ProfileOperators"/>):
+    /// while a profiled circuit steps an operator, its sink is current on that thread, and the exchange
+    /// records below also add to that operator's barrier wait and row counts.
+    /// </summary>
+    internal sealed class OperatorSink(int operators)
+    {
+        public readonly long[] WaitTicks = new long[operators];
+        public readonly long[] SplitRows = new long[operators];
+        public readonly long[] GatherRows = new long[operators];
+        public int Index;
+
+        public void Clear()
+        {
+            Array.Clear(WaitTicks);
+            Array.Clear(SplitRows);
+            Array.Clear(GatherRows);
+        }
+    }
+
+    [ThreadStatic]
+    private static OperatorSink? _operator;
+
+    /// <summary>The profiled operator stepping on this thread, if any.</summary>
+    internal static OperatorSink? CurrentOperator
+    {
+        get => _operator;
+        set => _operator = value;
+    }
+
+    /// <summary>Whether an exchange should time its phases: the per-worker profiler is on, or a
+    /// profiled circuit is stepping it.</summary>
+    internal static bool Active => Enabled || _operator is not null;
+
     /// <summary>Number of completed steps recorded since the last <see cref="Configure"/>.</summary>
     internal static long Steps { get; private set; }
 
@@ -83,16 +117,43 @@ internal static class StepProfiler
 
     internal static void RecordSplit(int worker, long ticks, long rows)
     {
-        _splitTicks[worker] += ticks;
-        _splitRows[worker] += rows;
+        if (Enabled)
+        {
+            _splitTicks[worker] += ticks;
+            _splitRows[worker] += rows;
+        }
+
+        if (_operator is { } op)
+        {
+            op.SplitRows[op.Index] += rows;
+        }
     }
 
-    internal static void RecordWait(int worker, long ticks) => _waitTicks[worker] += ticks;
+    internal static void RecordWait(int worker, long ticks)
+    {
+        if (Enabled)
+        {
+            _waitTicks[worker] += ticks;
+        }
+
+        if (_operator is { } op)
+        {
+            op.WaitTicks[op.Index] += ticks;
+        }
+    }
 
     internal static void RecordGather(int worker, long ticks, long rows)
     {
-        _gatherTicks[worker] += ticks;
-        _gatherRows[worker] += rows;
+        if (Enabled)
+        {
+            _gatherTicks[worker] += ticks;
+            _gatherRows[worker] += rows;
+        }
+
+        if (_operator is { } op)
+        {
+            op.GatherRows[op.Index] += rows;
+        }
     }
 
     internal static void RecordStep(int worker, long ticks) => _stepTicks[worker] += ticks;
