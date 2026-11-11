@@ -789,17 +789,18 @@ public static class TypedExpressionCompiler
         throw Unsupported();
     }
 
-    private static Expression BuildBoolToUtf8(Expression operand)
-    {
-        var toStr = Expression.Call(operand,
-            typeof(bool).GetMethod(nameof(object.ToString), Type.EmptyTypes)!);
-        return Expression.Call(
-            typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
-            toStr);
-    }
+    // VARCHAR casts go to and from UTF-8 bytes through the same SqlCasts helpers as the structural
+    // compiler (no .NET string in between where a helper exists).
+    private static Expression BuildBoolToUtf8(Expression operand) =>
+        Expression.Call(typeof(SqlCasts).GetMethod(nameof(SqlCasts.BoolToUtf8))!, operand);
 
     private static Expression BuildNumericToUtf8(Expression operand, Type srcClr)
     {
+        if (typeof(SqlCasts).GetMethod(nameof(SqlCasts.NumericToUtf8), [srcClr]) is { } direct)
+        {
+            return Expression.Call(direct, operand);
+        }
+
         var method = typeof(SqlCasts).GetMethod(nameof(SqlCasts.NumericToString), [srcClr])
             ?? throw Unsupported();
         return Expression.Call(
@@ -809,21 +810,24 @@ public static class TypedExpressionCompiler
 
     private static Expression BuildUtf8ToNumeric(Expression operand, Type dstClr)
     {
-        var asString = Expression.Call(operand,
-            typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
         var method = dstClr switch
         {
-            var t when t == typeof(int) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt32))!,
-            var t when t == typeof(long) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt64))!,
-            var t when t == typeof(float) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseSingle))!,
-            var t when t == typeof(double) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDouble))!,
+            var t when t == typeof(int) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt32Utf8))!,
+            var t when t == typeof(long) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt64Utf8))!,
+            var t when t == typeof(float) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseSingleUtf8))!,
+            var t when t == typeof(double) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDoubleUtf8))!,
             _ => throw Unsupported(),
         };
-        return Expression.Call(method, asString);
+        return Expression.Call(method, operand);
     }
 
     private static Expression BuildUtf8ToTemporal(Expression operand, Type dstClr)
     {
+        if (dstClr == typeof(Date32))
+        {
+            return Expression.Call(typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDateUtf8))!, operand);
+        }
+
         var asString = Expression.Call(operand,
             typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
         var method = dstClr switch
@@ -879,16 +883,9 @@ public static class TypedExpressionCompiler
 
         if (srcType is SqlVarcharType)
         {
-            var asString = Expression.Call(operand,
-                typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
-            var asSpan = Expression.Call(
-                typeof(MemoryExtensions).GetMethod(nameof(MemoryExtensions.AsSpan), [typeof(string)])!,
-                asString);
             return Expression.Call(
-                typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128),
-                    [typeof(ReadOnlySpan<char>), typeof(DecimalType), typeof(DecimalRounding)])!,
-                asSpan,
+                typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDecimal128Utf8))!,
+                operand,
                 Expression.Constant(targetType),
                 Expression.Constant(DecimalRounding.HalfUp));
         }

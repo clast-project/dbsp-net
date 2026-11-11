@@ -548,22 +548,28 @@ public static class ExpressionCompiler
         else if (srcClr == typeof(bool) && dstClr == typeof(Utf8String))
         {
             var unboxed = Expression.Convert(operand, typeof(bool));
-            var toStr = Expression.Call(unboxed,
-                typeof(bool).GetMethod(nameof(object.ToString), Type.EmptyTypes)!);
-            var toUtf8 = Expression.Call(
-                typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
-                toStr);
-            converted = Expression.Convert(toUtf8, typeof(object));
+            converted = Expression.Convert(
+                Expression.Call(typeof(SqlCasts).GetMethod(nameof(SqlCasts.BoolToUtf8))!, unboxed), typeof(object));
         }
         else if (IsNumeric(srcClr) && dstClr == typeof(Utf8String))
         {
             var unboxed = Expression.Convert(operand, srcClr);
-            // Use invariant culture so CAST(1.5 AS VARCHAR) is locale-stable.
-            var method = typeof(SqlCasts).GetMethod(nameof(SqlCasts.NumericToString), [srcClr])
-                ?? throw new InvalidOperationException($"no string cast for {srcClr}");
-            var toUtf8 = Expression.Call(
-                typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
-                Expression.Call(method, unboxed));
+            // Use invariant culture so CAST(1.5 AS VARCHAR) is locale-stable. Formatted straight to
+            // UTF-8 where SqlCasts has the overload; through a string otherwise.
+            Expression toUtf8;
+            if (typeof(SqlCasts).GetMethod(nameof(SqlCasts.NumericToUtf8), [srcClr]) is { } direct)
+            {
+                toUtf8 = Expression.Call(direct, unboxed);
+            }
+            else
+            {
+                var method = typeof(SqlCasts).GetMethod(nameof(SqlCasts.NumericToString), [srcClr])
+                    ?? throw new InvalidOperationException($"no string cast for {srcClr}");
+                toUtf8 = Expression.Call(
+                    typeof(Utf8String).GetMethod(nameof(Utf8String.Of), [typeof(string)])!,
+                    Expression.Call(method, unboxed));
+            }
+
             converted = Expression.Convert(toUtf8, typeof(object));
         }
         else if (srcClr == typeof(Utf8String) && IsNumeric(dstClr))
@@ -719,20 +725,9 @@ public static class ExpressionCompiler
             // Parse via DecimalText, applying the target type's scale and
             // precision (scale-up / banker's rounding handled inside).
             var unboxed = Expression.Convert(operand, typeof(Utf8String));
-            var asString = Expression.Call(
-                unboxed,
-                typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
             var parse = Expression.Call(
-                typeof(Clast.DatabaseDecimal.Text.DecimalText).GetMethod(
-                    nameof(Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128),
-                    [
-                        typeof(ReadOnlySpan<char>),
-                        typeof(Clast.DatabaseDecimal.DecimalType),
-                        typeof(Clast.DatabaseDecimal.DecimalRounding),
-                    ])!,
-                Expression.Call(
-                    typeof(MemoryExtensions).GetMethod(nameof(MemoryExtensions.AsSpan), [typeof(string)])!,
-                    asString),
+                typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDecimal128Utf8))!,
+                unboxed,
                 Expression.Constant(targetType),
                 Expression.Constant(Clast.DatabaseDecimal.DecimalRounding.HalfUp));
             converted = Expression.Convert(parse, typeof(object));
@@ -929,6 +924,55 @@ internal static class SqlCasts
     public static double ParseDoubleUtf8(Utf8String s) =>
         double.TryParse(s.Span, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var value)
             ? value : ParseDouble(s.ToStringDecoded());
+
+    /// <summary>CAST(varchar AS DECIMAL): the decimal parser reads chars, so decode into a stack buffer
+    /// (exactly what <see cref="Utf8String.ToStringDecoded"/> would produce) instead of a new string.</summary>
+    public static Clast.DatabaseDecimal.Values.Decimal128 ParseDecimal128Utf8(
+        Utf8String s, Clast.DatabaseDecimal.DecimalType type, Clast.DatabaseDecimal.DecimalRounding rounding)
+    {
+        var bytes = s.Span;
+        if (bytes.Length <= 128)
+        {
+            Span<char> chars = stackalloc char[128];
+            var n = System.Text.Encoding.UTF8.GetChars(bytes, chars);
+            return Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128(chars[..n], type, rounding);
+        }
+
+        return Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128(s.ToStringDecoded().AsSpan(), type, rounding);
+    }
+
+    // Number / boolean -> VARCHAR, formatted straight to UTF-8 bytes. The invariant-culture default
+    // format is the same text NumericToString produces; the string path stays as the fallback.
+    public static Utf8String NumericToUtf8(int v)
+    {
+        Span<byte> buf = stackalloc byte[16];
+        return v.TryFormat(buf, out var n, default, CultureInfo.InvariantCulture)
+            ? Utf8String.FromBytes(buf[..n].ToArray()) : Utf8String.Of(NumericToString(v));
+    }
+
+    public static Utf8String NumericToUtf8(long v)
+    {
+        Span<byte> buf = stackalloc byte[24];
+        return v.TryFormat(buf, out var n, default, CultureInfo.InvariantCulture)
+            ? Utf8String.FromBytes(buf[..n].ToArray()) : Utf8String.Of(NumericToString(v));
+    }
+
+    public static Utf8String NumericToUtf8(float v)
+    {
+        Span<byte> buf = stackalloc byte[48];
+        return v.TryFormat(buf, out var n, default, CultureInfo.InvariantCulture)
+            ? Utf8String.FromBytes(buf[..n].ToArray()) : Utf8String.Of(NumericToString(v));
+    }
+
+    public static Utf8String NumericToUtf8(double v)
+    {
+        Span<byte> buf = stackalloc byte[48];
+        return v.TryFormat(buf, out var n, default, CultureInfo.InvariantCulture)
+            ? Utf8String.FromBytes(buf[..n].ToArray()) : Utf8String.Of(NumericToString(v));
+    }
+
+    /// <summary>CAST(boolean AS VARCHAR): <c>True</c> / <c>False</c>, as <see cref="bool.ToString()"/>.</summary>
+    public static Utf8String BoolToUtf8(bool v) => Utf8String.FromBytes(v ? "True"u8.ToArray() : "False"u8.ToArray());
 
     /// <summary>CAST(varchar AS DATE): the strict <c>yyyy-MM-dd</c> form read from the bytes; anything
     /// else (or an impossible date) goes to <see cref="Date32.Parse"/>, which decides.</summary>

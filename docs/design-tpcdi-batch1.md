@@ -176,6 +176,23 @@ Against the pin: drain −16%, drain + output −13%, allocation −17%. An earl
 ran the string build second showed it 1.3% slower. With the order rotated it's level or ahead, so
 read sub-2% wall differences from fixed-order pairs as noise.
 
+**Follow-up pass (2026-11-11): the other per-row string conversions.**
+- **Typed compiler:** its VARCHAR → number/DATE casts now use the same byte parsers. The first pass had missed them.
+- **Number and boolean → VARCHAR (both compilers):** these format straight to UTF-8.
+- **VARCHAR → DECIMAL:** decodes into a stack buffer, because the decimal library only parses `char` spans.
+- **`JSON_EXTRACT_STRING`:** parses valid UTF-8 from the bytes and returns unescaped strings as their raw bytes.
+- **`LIKE`:** a constant, case-sensitive pattern of literals and `%` matches on bytes as prefix, suffix and in-order middle pieces. Every other regex match (`ILIKE`, `_`, `SIMILAR TO`, `REGEXP_LIKE`) decodes into a stack or pooled buffer and matches the span. Byte matching is exact even for malformed values, because the decoder restarts at every non-continuation byte. The one exception is a pattern containing U+FFFD, which falls back to the regex for malformed values.
+
+Each fast path has a property test against the path it replaces; 8 more mutants each fail them.
+
+Left as they are:
+- **Decimal → VARCHAR:** the library's UTF-8 formatter isn't public.
+- **`STRPTIME` and TIME/TIMESTAMP/INTERVAL casts:** never seen in a profile.
+- **Compile-time decodes:** these run once per query.
+- **`LIKE` in typed views:** it still has no typed path, so a view using it falls back to the structural pipeline.
+
+Measured on TPC-DI (5 rotated rounds, views identical): allocation 45.30 → 45.16 GiB, with drain within noise. Nexmark w1profile is byte-identical on all ten queries, because none of them use these functions. As expected, this pass is cleanup for workloads that use these functions, not a TPC-DI lever.
+
 ## 4c. Input order: load the dimensions first (2026-11-11)
 
 Chasing the financials skew left over from §4a turned up a different cause. `financials` left-joins

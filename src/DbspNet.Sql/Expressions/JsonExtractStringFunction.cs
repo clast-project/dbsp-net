@@ -64,7 +64,13 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
     public static object? Extract(object? source, string[] path)
     {
         if (source is null) return null;
-        using var document = JsonDocument.Parse(((Utf8String)source).ToStringDecoded());
+        // Valid UTF-8 parses from the bytes: the string overload transcodes back to exactly these
+        // bytes. Invalid UTF-8 goes through the string, which turns bad bytes into U+FFFD where the
+        // byte parser would throw.
+        var utf8 = ((Utf8String)source).Memory;
+        using var document = System.Text.Unicode.Utf8.IsValid(utf8.Span)
+            ? JsonDocument.Parse(utf8)
+            : JsonDocument.Parse(((Utf8String)source).ToStringDecoded());
         var value = document.RootElement;
         foreach (var key in path)
         {
@@ -84,12 +90,22 @@ internal sealed class JsonExtractStringFunction : IScalarFunction
         return value.ValueKind switch
         {
             JsonValueKind.Null => null,
-            JsonValueKind.String => Utf8String.Of(value.GetString()!),
+            JsonValueKind.String => StringValue(value),
             JsonValueKind.Number => Utf8String.Of(FormatNumber(value)),
             JsonValueKind.True => Utf8String.Of("true"),
             JsonValueKind.False => Utf8String.Of("false"),
             _ => Serialize(value),
         };
+    }
+
+    // A JSON string's value: its raw bytes between the quotes when it has no escape sequence (the
+    // parser has validated them), else the unescaped string.
+    private static Utf8String StringValue(JsonElement value)
+    {
+        var raw = System.Runtime.InteropServices.JsonMarshal.GetRawUtf8Value(value);
+        return raw.Length >= 2 && raw.IndexOf((byte)'\\') < 0
+            ? Utf8String.FromBytes(raw[1..^1].ToArray())
+            : Utf8String.Of(value.GetString()!);
     }
 
     private static Utf8String Serialize(JsonElement value)

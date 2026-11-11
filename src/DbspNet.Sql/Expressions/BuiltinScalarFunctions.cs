@@ -297,6 +297,8 @@ internal static class BuiltinScalarFunctions
 
     internal static readonly MethodInfo RegexMatchRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.RegexMatch))!;
+    internal static readonly MethodInfo LiteralLikeRuntime =
+        typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.LiteralLike))!;
     internal static readonly MethodInfo PatternMatchRuntime =
         typeof(SqlBuiltinRuntime).GetMethod(nameof(SqlBuiltinRuntime.PatternMatch))!;
     internal static readonly MethodInfo PatternMatchEscRuntime =
@@ -317,7 +319,15 @@ internal static class BuiltinScalarFunctions
         if (fn.Arguments[1] is ResolvedLiteral { Value: Utf8String patLit }
             && TryConstEscape(escapeArg, out var escChar))
         {
-            var regex = SqlPatternMatch.Compile(patLit.ToStringDecoded(), escChar, caseInsensitive, similar);
+            var pattern = patLit.ToStringDecoded();
+            var regex = SqlPatternMatch.Compile(pattern, escChar, caseInsensitive, similar);
+            if (!caseInsensitive && !similar && SqlPatternMatch.LiteralLike(pattern, escChar, regex) is { } literal)
+            {
+                // Literals and '%' only: matched on the UTF-8 bytes (SqlPatternMatch.LiteralLikePattern).
+                return NullPropagatingUnary(c[0], typeof(Utf8String),
+                    s => Expression.Call(LiteralLikeRuntime, Expression.Constant(literal), s));
+            }
+
             return NullPropagatingUnary(c[0], typeof(Utf8String),
                 s => Expression.Call(RegexMatchRuntime, Expression.Constant(regex), s));
         }
@@ -1323,7 +1333,36 @@ internal static class SqlBuiltinRuntime
     /// path). The caller's <see cref="BuiltinScalarFunctions.NullPropagatingUnary"/>
     /// has already guaranteed a non-NULL value.
     /// </summary>
-    public static bool RegexMatch(Regex re, Utf8String value) => re.IsMatch(value.ToStringDecoded());
+    public static bool RegexMatch(Regex re, Utf8String value) => IsMatchDecoded(re, value);
+
+    /// <summary>A constant LIKE pattern of literals and '%' (<see cref="SqlPatternMatch.LiteralLikePattern"/>).</summary>
+    public static bool LiteralLike(SqlPatternMatch.LiteralLikePattern pattern, Utf8String value) => pattern.IsMatch(value);
+
+    /// <summary>
+    /// <paramref name="re"/> against <paramref name="value"/> decoded into a stack (or pooled) buffer:
+    /// the same characters <see cref="Utf8String.ToStringDecoded"/> gives, with no string.
+    /// </summary>
+    internal static bool IsMatchDecoded(Regex re, Utf8String value)
+    {
+        var bytes = value.Span;
+        if (bytes.Length <= 256)
+        {
+            Span<char> chars = stackalloc char[256];
+            var n = Encoding.UTF8.GetChars(bytes, chars);
+            return re.IsMatch(chars[..n]);
+        }
+
+        var rented = System.Buffers.ArrayPool<char>.Shared.Rent(Encoding.UTF8.GetMaxCharCount(bytes.Length));
+        try
+        {
+            var n = Encoding.UTF8.GetChars(bytes, rented);
+            return re.IsMatch(rented.AsSpan(0, n));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        }
+    }
 
     /// <summary>
     /// LIKE / ILIKE / SIMILAR TO with a runtime (non-constant) pattern and the
@@ -1332,9 +1371,9 @@ internal static class SqlBuiltinRuntime
     public static object? PatternMatch(object? value, object? pattern, bool caseInsensitive, bool similar) =>
         value is null || pattern is null
             ? null
-            : (object)SqlPatternMatch.Compile(
-                ((Utf8String)pattern).ToStringDecoded(), SqlPatternMatch.DefaultEscape, caseInsensitive, similar)
-                .IsMatch(((Utf8String)value).ToStringDecoded());
+            : (object)IsMatchDecoded(SqlPatternMatch.Compile(
+                ((Utf8String)pattern).ToStringDecoded(), SqlPatternMatch.DefaultEscape, caseInsensitive, similar),
+                (Utf8String)value);
 
     /// <summary>
     /// LIKE / ILIKE / SIMILAR TO with an explicit ESCAPE clause. The escape
@@ -1349,11 +1388,13 @@ internal static class SqlBuiltinRuntime
             return null;
         }
 
-        return SqlPatternMatch.Compile(
-            ((Utf8String)pattern).ToStringDecoded(),
-            SqlPatternMatch.EscapeCharOf((Utf8String)escape),
-            caseInsensitive,
-            similar).IsMatch(((Utf8String)value).ToStringDecoded());
+        return IsMatchDecoded(
+            SqlPatternMatch.Compile(
+                ((Utf8String)pattern).ToStringDecoded(),
+                SqlPatternMatch.EscapeCharOf((Utf8String)escape),
+                caseInsensitive,
+                similar),
+            (Utf8String)value);
     }
 
     // ---- POSIX regex functions (runtime path; the build-time fold for a
@@ -1368,7 +1409,7 @@ internal static class SqlBuiltinRuntime
     private static object? RegexpLikeCore(object? value, object? pattern, string? flags) =>
         value is null || pattern is null
             ? null
-            : (object)RegexOf(pattern, flags).IsMatch(((Utf8String)value).ToStringDecoded());
+            : (object)IsMatchDecoded(RegexOf(pattern, flags), (Utf8String)value);
 
     public static object? RegexpReplace(object? value, object? pattern, object? replacement) =>
         RegexpReplaceCore(value, pattern, replacement, null);
@@ -1991,6 +2032,104 @@ internal static class SqlPatternMatch
             1 => s[0],
             _ => throw new InvalidOperationException("ESCAPE must be a single-character string"),
         };
+    }
+
+    /// <summary>
+    /// A case-sensitive LIKE pattern made only of literals and '%': its literal pieces as UTF-8 bytes.
+    /// It matches a value that starts with the first piece, ends with the last, and holds the middle
+    /// ones in order between them, all compared on bytes. For valid UTF-8 that is exactly what the
+    /// regex decides: a UTF-8 encoding can match another only at character boundaries, and the regex
+    /// compares characters ordinally. That holds for malformed values too. The decoder restarts at
+    /// every byte that isn't a continuation byte, so a valid piece found in the bytes decodes to the
+    /// same characters, and a malformed run decodes to U+FFFD, which no piece contains. The exception
+    /// is a pattern with U+FFFD in it: then a malformed value goes to the regex, which sees its bad
+    /// bytes as U+FFFD. ('_' is one UTF-16 unit to the regex, so a pattern with '_' isn't here.)
+    /// </summary>
+    internal sealed class LiteralLikePattern
+    {
+        private readonly byte[][] _pieces;   // the pattern split at each '%' (so one piece: no '%')
+        private readonly Regex _fallback;
+        private readonly bool _hasReplacementChar;
+
+        internal LiteralLikePattern(byte[][] pieces, Regex fallback, bool hasReplacementChar)
+        {
+            _pieces = pieces;
+            _fallback = fallback;
+            _hasReplacementChar = hasReplacementChar;
+        }
+
+        public bool IsMatch(Utf8String value)
+        {
+            var s = value.Span;
+            if (_hasReplacementChar && !System.Text.Unicode.Utf8.IsValid(s))
+            {
+                return SqlBuiltinRuntime.IsMatchDecoded(_fallback, value);
+            }
+
+            if (_pieces.Length == 1)
+            {
+                return s.SequenceEqual(_pieces[0]);
+            }
+
+            var first = _pieces[0];
+            var last = _pieces[^1];
+            if (s.Length < first.Length + last.Length || !s.StartsWith(first) || !s.EndsWith(last))
+            {
+                return false;
+            }
+
+            var rest = s[first.Length..^last.Length];
+            for (var i = 1; i < _pieces.Length - 1; i++)
+            {
+                var at = rest.IndexOf(_pieces[i]);
+                if (at < 0)
+                {
+                    return false;
+                }
+
+                rest = rest[(at + _pieces[i].Length)..];
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>The byte matcher for <paramref name="pattern"/>, or null when it has a '_' (or ends
+    /// in the escape character, an error the regex reports).</summary>
+    internal static LiteralLikePattern? LiteralLike(string pattern, char? escape, Regex fallback)
+    {
+        var pieces = new List<byte[]>();
+        var piece = new StringBuilder();
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            var ch = pattern[i];
+            if (escape is char e && ch == e)
+            {
+                if (++i >= pattern.Length)
+                {
+                    return null;
+                }
+
+                piece.Append(pattern[i]);
+                continue;
+            }
+
+            switch (ch)
+            {
+                case '_':
+                    return null;
+                case '%':
+                    pieces.Add(Encoding.UTF8.GetBytes(piece.ToString()));
+                    piece.Clear();
+                    break;
+                default:
+                    piece.Append(ch);
+                    break;
+            }
+        }
+
+        pieces.Add(Encoding.UTF8.GetBytes(piece.ToString()));
+        return new LiteralLikePattern([.. pieces], fallback, pattern.Contains('\uFFFD'));
     }
 
     private static Regex Build(string pattern, char? escape, bool caseInsensitive, bool similar)
