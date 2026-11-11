@@ -140,6 +140,29 @@ the long-run per-row difference. A–D work inside the current design.
 6. **Re-pin ivm-bench** when the local A/B shows a net gain against `f02030d`, the current upstream
    pin. Drop the Dockerfile's `git submodule update --init` step in the same commit.
 
+## 4b. Step 1 result: Feldera at SF=3 on the M4 (2026-11-11)
+
+Feldera alone through ivm-bench's harness (`BENCHMARK_RUNS=3`, batches 100/1/1, the Feldera profile's
+twelve workers with `adaptive_joins`, `pipeline-manager:latest`, inside Docker Desktop's Linux VM).
+Its batch time runs from `/resume` until every output connector has finished writing, so it includes
+output writes. Our `drain_ms` does not; the comparable figure for us is `drain_ms + output_ms`.
+
+| | batch 1 | batches 2 / 3 |
+|---|---|---|
+| Feldera (3 runs) | 14.7, 13.7, 13.4 s (mean **13.9 s**); 113–132 CPU-s | 2.07 / 2.04 s |
+| DbspNet, no broadcast (§4a, 5 runs) | 15.7 + 1.5 output = **~17.2 s** (1.24×) | ~0.1 + ~0.03 s |
+| DbspNet, broadcast ≤ 1,000 (5 runs) | 14.4 + 1.4 output = **~15.9 s** (1.14×) | unchanged |
+
+- **The SF10 ratio carries over.** Without broadcast we are 1.24× locally against 1.27× in CI, so the
+  local loop is a fair proxy for GCI.
+- **Broadcast closes about a third of the gap.** What's left is ~2.0 s at SF=3, so the target is
+  ~13.9 s end to end, or ~12.5 s drain at our current 1.4 s of output writes.
+- **Caveats.** The arms ran natively on macOS versus in a Linux VM, and Feldera's end time comes from
+  polling, so read differences under ~0.5 s as noise. Batches 2/3 are dominated by Feldera's per-batch
+  overhead, not its operator work.
+- **Ticks per batch is still open.** The harness log doesn't show whether Feldera steps once per
+  source or once per batch.
+
 ## 4a. Step 2 result: the wait is skew from tiny dimensions (2026-11-10)
 
 New instrument: under `DBSPNET_PROFILE=1` the batch profile now prints **exchanges by barrier wait**.
