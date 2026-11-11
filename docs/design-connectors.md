@@ -104,7 +104,7 @@ version). This is the key simplification DBSP + Delta buy us.
 
 `Abstractions` depends only on `DbspNet.Sql` / `.Core` / `.Persistence` / `Apache.Arrow`
 (no engineered-wood). `EngineeredWood` depends on both `Abstractions` and the EW
-projects (via git submodule + `ProjectReference`, until EW ships NuGet).
+packages from nuget.org (0.4.0).
 
 ---
 
@@ -365,7 +365,9 @@ the chosen one-tick-per-version default.
    packages (`EngineeredWood.DeltaLake.Table` + `EngineeredWood.Parquet` at 0.1.0, which
    pull DeltaLake/Expressions/Core transitively); originally a git submodule at
    `external/engineered-wood`, swapped to packages 2026-07-20 once the fixes shipped to
-   nuget.org. Apache.Arrow unified to **23.0.0** across dbsp-net + EW (one `RecordBatch`
+   nuget.org; back on a submodule 2026-10-29 (main was 281 commits past 0.3.0:
+   deletion-vector row deletes, write-then-commit) and on packages again at 0.4.0
+   2026-11-10. Apache.Arrow unified to **23.0.0** across dbsp-net + EW (one `RecordBatch`
    type across the boundary). New project
    `DbspNet.Connectors.EngineeredWood`: `DeltaInputConnector` (CDF-from-0 follow, one tick
    per version, `_change_type`→signed weights), `DeltaOutputConnector`

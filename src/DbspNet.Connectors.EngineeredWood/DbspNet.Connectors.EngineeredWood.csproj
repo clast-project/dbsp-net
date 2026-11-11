@@ -7,12 +7,11 @@
     <ProjectReference Include="..\DbspNet.Connectors.Abstractions\DbspNet.Connectors.Abstractions.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <!-- engineered-wood from the external/engineered-wood submodule (its main branch is well
-         ahead of the last NuGet release, 0.3.0: deletion-vector row deletes, write-then-commit).
-         DeltaLake.Table brings DeltaLake + Expressions(.Arrow) + Parquet + Core transitively;
-         Parquet is referenced directly for the bounded Parquet source. -->
-    <ProjectReference Include="..\..\external\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
-    <ProjectReference Include="..\..\external\engineered-wood\src\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
+    <!-- engineered-wood from nuget.org. DeltaLake.Table brings DeltaLake + Expressions(.Arrow)
+         + Parquet + Core transitively; Parquet is referenced directly for the bounded Parquet
+         source. -->
+    <PackageReference Include="EngineeredWood.DeltaLake.Table" />
+    <PackageReference Include="EngineeredWood.Parquet" />
     <PackageReference Include="Apache.Arrow" />
   </ItemGroup>
 </Project>
