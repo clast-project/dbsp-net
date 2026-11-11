@@ -175,10 +175,19 @@ and its `Balancer` (`crates/dbsp/src/operator/dynamic/balance/`) picks shard, br
 join stream each step from observed key distributions, redistributing the integral when the policy
 changes.
 
-**Shipping it needs one decision.** A broadcast side's state is replicated, not sharded, so the choice
-is part of the plan's state layout. If the server reads row counts at deploy, a restore after the
-tables grow could compile a different plan than the snapshot holds. Fresh deploys are fine. Persistent
-runs must record the broadcast set with the checkpoint (as the worker count is) and reuse it on restore.
+**Built (server, default on).** `DbspNetEngine` broadcasts dimensions of at most
+`DBSPNET_BROADCAST_MAX_ROWS` rows (default 1,000; `0` or `off` disables) in a parallel deploy
+(`BroadcastJoins`). Sizes come from the inputs' Delta-log row counts at deploy. A zero or unreadable
+count counts as large, so an empty table, or a fact table staged after deploy, is never broadcast.
+ivm-bench stages batch 1 before it starts the engine, so deploy sees the real sizes.
+
+The choice is part of the plan's state layout, so a persistent deploy records `{max_rows, row_counts}`
+under `compile.broadcast` in every snapshot's metadata. A restore compiles with the recorded values.
+Without them, a dimension grown past the threshold compiles a hash join, and the restore fails with
+"snapshot plan fingerprint mismatch". That is a loud failure, not wrong results, but the deploy is
+blocked. `DeployResult` reports `BroadcastMaxRows` and `BroadcastInputs`. Tests are in
+`BroadcastJoinsTests`; four mutants (ignore the recorded choice, count empty tables as small, drop the
+metadata, drop the compile options) each fail them.
 
 ## 5. Lessons this pass rests on
 

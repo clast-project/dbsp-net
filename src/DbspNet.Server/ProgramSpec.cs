@@ -49,7 +49,9 @@ public sealed record OutputSpec(string View, string Uri, string? Mode = null);
 /// persistence is on, and the engine tick restored from a pre-existing checkpoint (0 =
 /// fresh start, the normal benchmark case). <paramref name="Workers"/> is the replica count
 /// the program runs on (1 = the serial program); <paramref name="SerialFallback"/> says why a
-/// deploy asked for more workers ran serially, and is null otherwise.</summary>
+/// deploy asked for more workers ran serially, and is null otherwise. <paramref name="BroadcastMaxRows"/>
+/// is the broadcast-join threshold the program was compiled with (0: none), and
+/// <paramref name="BroadcastInputs"/> the inputs whose recorded size was within it.</summary>
 public sealed record DeployResult(
     double CompileTimeS,
     int InputCount,
@@ -57,7 +59,9 @@ public sealed record DeployResult(
     bool Persistent = false,
     long RestoredTick = 0,
     int Workers = 1,
-    string? SerialFallback = null);
+    string? SerialFallback = null,
+    long BroadcastMaxRows = 0,
+    IReadOnlyList<string>? BroadcastInputs = null);
 
 /// <summary>Result of resume: the epoch second the batch timer started.</summary>
 public sealed record ResumeResult(long ResumedAtEpochS);

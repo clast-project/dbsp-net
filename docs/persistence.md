@@ -326,6 +326,17 @@ Serial and parallel restores refuse each other's snapshots and name the worker c
 the parallel `ProgramRunner.CreateAsync` overload takes the latter. A persistent deploy with
 `DBSPNET_WORKERS > 1` therefore runs parallel instead of falling back to serial.
 
+A checkpoint also pins the **broadcast-join choice** (docs/design-tpcdi-batch1.md §4a). A parallel
+deploy broadcasts dimensions of at most `DBSPNET_BROADCAST_MAX_ROWS` rows (default 1,000; `0` or
+`off` disables), sized from the inputs' Delta-log row counts at deploy. Zero and unknown counts
+count as large. A broadcast side's state is replicated, so the choice is part of the plan. The
+server records `{max_rows, row_counts}` under `compile.broadcast` in every snapshot's metadata
+(`SnapshotCheckpointStore.ProgramMetadata`), and a restore compiles with the recorded values, never
+fresh counts. Without that, a dimension grown past the threshold would compile a hash join and the
+restore would refuse the snapshot (plan fingerprint mismatch). A snapshot with no key restores
+without broadcast. Re-sharding copies the metadata forward, and broadcast state is placed
+`OnEveryWorker`.
+
 `Snapshot.Exists(store)` returns true iff `current.txt` exists and names a snap-T whose manifest
 exists. `Snapshot.PointerExists(store)` is the "was anything ever committed" test:
 `SnapshotCheckpointStore` treats only a missing pointer as a fresh start. A pointer naming an

@@ -9,4 +9,7 @@
     <ProjectReference Include="..\DbspNet.Connectors.Abstractions\DbspNet.Connectors.Abstractions.csproj" />
     <ProjectReference Include="..\DbspNet.Connectors.EngineeredWood\DbspNet.Connectors.EngineeredWood.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="DbspNet.Tests" />
+  </ItemGroup>
 </Project>

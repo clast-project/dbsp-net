@@ -34,6 +34,11 @@ public sealed class DbspNetEngine
         ? OutputMode.Truncate
         : OutputMode.Incremental;
 
+    // DBSPNET_BROADCAST_MAX_ROWS: dimensions of at most this many rows are broadcast in parallel joins
+    // (default 1,000; 0 or off disables). See BroadcastJoins.
+    private static readonly long BroadcastMaxRowsSetting =
+        BroadcastJoins.ConfiguredMaxRows(Environment.GetEnvironmentVariable("DBSPNET_BROADCAST_MAX_ROWS"));
+
     // Worker count W. DBSPNET_WORKERS > 1 compiles the program data-parallel across W
     // replicas when every view shards, and falls back to the serial program (logged) when
     // one does not. Default 1: the serial program, today's behaviour.
@@ -42,6 +47,10 @@ public sealed class DbspNetEngine
 
     private readonly int _workers;
     private readonly CheckpointPolicy? _checkpointPolicy;
+    private readonly long _broadcastMaxRows;
+
+    /// <summary>The parallel program of the last deploy, if it runs parallel (tests inspect its circuit).</summary>
+    internal ParallelCompiledProgram? DeployedParallel { get; private set; }
     private readonly object _gate = new();
     private readonly List<IInputConnector> _inputs = new();
     private readonly List<IOutputConnector> _outputs = new();
@@ -59,12 +68,15 @@ public sealed class DbspNetEngine
     /// <summary>An engine that runs programs across <paramref name="workers"/> replicas when
     /// they shard (see <see cref="DeployAsync"/>). A persistent deploy commits batches by
     /// <paramref name="checkpointPolicy"/>, or by <c>DBSPNET_CHECKPOINT_INTERVAL_SECS</c> when it is
-    /// null.</summary>
-    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null)
+    /// null. Small dimensions are broadcast in parallel joins up to <paramref name="broadcastMaxRows"/>
+    /// rows, or <c>DBSPNET_BROADCAST_MAX_ROWS</c> when it is null (<see cref="BroadcastJoins"/>).</summary>
+    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null, long? broadcastMaxRows = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(broadcastMaxRows ?? 0);
         _workers = workers;
         _checkpointPolicy = checkpointPolicy;
+        _broadcastMaxRows = broadcastMaxRows ?? BroadcastMaxRowsSetting;
     }
 
     /// <summary>Compile the program, wire its Delta connectors, and validate each source
@@ -151,12 +163,31 @@ public sealed class DbspNetEngine
         }
 
         var snapshotCodecs = persistent ? ArrowSqlSnapshotCodecs.Instance : null;
+
+        // Broadcast joins for small dimensions (BroadcastJoins): chosen from the inputs' sizes on a
+        // fresh start, or the choice the checkpoint recorded on a restore.
+        var broadcast = workers > 1
+            ? await BroadcastJoins.ChooseAsync(
+                spec.Inputs.Select(i => (i.Table, i.Uri)), _broadcastMaxRows, checkpoint, cancellationToken)
+                .ConfigureAwait(false)
+            : null;
+        if (broadcast is not null)
+        {
+            Console.Error.WriteLine(
+                $"dbspnet: broadcast joins on dimensions of at most {broadcast.MaxRows} rows; inputs that small: " +
+                (broadcast.Small().Any() ? string.Join(", ", broadcast.Small().Select(kv => $"{kv.Key}={kv.Value}")) : "(none)"));
+        }
+
+        var compileOptions = broadcast is null
+            ? null
+            : new CompileOptions { BroadcastMaxRows = broadcast.MaxRows, RelationRowCounts = broadcast.RowCounts };
         ParallelCompiledProgram? parallel = null;
         string? fallback = null;
         if (workers > 1
             && !SqlProgram.TryCompileParallel(
                 spec.Program, outputViews, workers, out parallel,
                 snapshotCodecs: snapshotCodecs,
+                options: compileOptions,
                 numericStringCoercion: true, nullCollation: NullCollation.Low))
         {
             var blockers = SqlProgram.ParallelBlockers(
@@ -164,6 +195,12 @@ public sealed class DbspNetEngine
             fallback = "views that do not shard: " + (blockers.Count == 0
                 ? "(none reported)"
                 : string.Join("; ", blockers.Select(b => b.View + " [" + string.Join(", ", b.Blockers) + "]")));
+        }
+
+        if (parallel is null)
+        {
+            // Serial: no broadcast, so nothing for a restore to repeat.
+            checkpoint?.ProgramMetadata.Remove(BroadcastJoins.MetadataKey);
         }
 
         if (fallback is not null)
@@ -217,6 +254,7 @@ public sealed class DbspNetEngine
         {
             previous = _runner;
             _runner = runner;
+            DeployedParallel = parallel;
             _inputs.Clear();
             _inputs.AddRange(inputs);
             _outputs.Clear();
@@ -229,7 +267,9 @@ public sealed class DbspNetEngine
         sw.Stop();
         return new DeployResult(
             sw.Elapsed.TotalSeconds, inputs.Count, outputs.Count, persistent, restoredTick,
-            runner.Workers, fallback);
+            runner.Workers, fallback,
+            parallel is null ? 0 : broadcast?.MaxRows ?? 0,
+            parallel is null ? null : broadcast?.Small().Select(kv => kv.Key).ToList());
     }
 
     /// <summary>Start ingesting the current batch (all source versions available now) in

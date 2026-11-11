@@ -89,6 +89,19 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore, IParallelCheckpo
     /// <summary>The tick journal kept beside the snapshots.</summary>
     public TickJournal Journal { get; }
 
+    /// <summary>
+    /// Entries written into every snapshot's manifest metadata beside the connector offsets: compile
+    /// choices a restore must repeat to rebuild the same plan (for example the broadcast-join sizes,
+    /// <c>DbspNet.Server</c>'s <c>compile.broadcast</c>). Read them back with
+    /// <see cref="RecordedParallelMetadataAsync"/>.
+    /// </summary>
+    public Dictionary<string, string> ProgramMetadata { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>The metadata of the current parallel snapshot, or <c>null</c> when there is none
+    /// (no snapshot, or a serial one).</summary>
+    public ValueTask<IReadOnlyDictionary<string, string>?> RecordedParallelMetadataAsync(CancellationToken cancellationToken = default) =>
+        ParallelSnapshot.ReadMetadataAsync(_fs, cancellationToken);
+
     /// <summary>The worker count of the current checkpoint (1 for a serial program), or
     /// <c>null</c> when none has been written.</summary>
     public ValueTask<int?> RecordedWorkersAsync(CancellationToken cancellationToken = default) =>
@@ -131,13 +144,14 @@ public sealed class SnapshotCheckpointStore : ICheckpointStore, IParallelCheckpo
         return new CheckpointState(circuit.TickCount, ParseOffsets(metadata));
     }
 
-    private static Dictionary<string, string> OffsetsMetadata(IReadOnlyList<SourceCheckpoint> offsets)
+    private Dictionary<string, string> OffsetsMetadata(IReadOnlyList<SourceCheckpoint> offsets)
     {
         ArgumentNullException.ThrowIfNull(offsets);
-        return new Dictionary<string, string>(StringComparer.Ordinal)
+        var metadata = new Dictionary<string, string>(ProgramMetadata, StringComparer.Ordinal)
         {
             [OffsetsMetadataKey] = JsonSerializer.Serialize(offsets),
         };
+        return metadata;
     }
 
     // A snapshot without connector offsets (e.g. one written by a non-connector path): engine
