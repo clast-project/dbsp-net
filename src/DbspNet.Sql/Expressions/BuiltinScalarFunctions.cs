@@ -1423,7 +1423,11 @@ internal static class SqlBuiltinRuntime
     internal static Utf8String SubstringCore(Utf8String s, int start1, int? length)
     {
         var span = s.Span;
-        var n = CodePointCount(span);
+
+        // All ASCII (the usual case, checked vectorised): a code point is a byte, so positions are
+        // byte offsets and nothing needs walking.
+        var ascii = System.Text.Ascii.IsValid(span);
+        var n = ascii ? span.Length : CodePointCount(span);
 
         // First selected code point (1-based, clipped to the string start).
         var first = Math.Max(1, start1);
@@ -1444,8 +1448,8 @@ internal static class SqlBuiltinRuntime
             return Utf8String.Empty;
         }
 
-        var byteStart = CpToByte(span, first - 1);
-        var byteEnd = CpToByte(span, lastExclusive - 1);
+        var byteStart = ascii ? first - 1 : CpToByte(span, first - 1);
+        var byteEnd = ascii ? lastExclusive - 1 : CpToByte(span, lastExclusive - 1);
         if (byteStart >= byteEnd)
         {
             return Utf8String.Empty;
@@ -1455,6 +1459,22 @@ internal static class SqlBuiltinRuntime
     }
 
     internal static Utf8String TrimCore(Utf8String s, Utf8String? chars, int side)
+    {
+        // Trimming only ASCII characters (TRIM(s), or a character list that is all ASCII) works on
+        // bytes, whatever s holds: in UTF-8 a byte below 0x80 is always a whole code point, and every
+        // byte of a multi-byte one is 0x80 or above, so it is never in the set and stops the trim
+        // exactly where the decoding loop below would (invalid bytes too: they decode to U+FFFD).
+        if (chars is null || System.Text.Ascii.IsValid(chars.Value.Span))
+        {
+            return TrimAscii(s, chars is null ? " "u8 : chars.Value.Span, side);
+        }
+
+        return TrimDecoded(s, chars, side);
+    }
+
+    // The general trim: decode s and test each code point against the set (tests compare
+    // TrimAscii against it).
+    internal static Utf8String TrimDecoded(Utf8String s, Utf8String? chars, int side)
     {
         var set = new HashSet<Rune>();
         if (chars is null)
@@ -1513,6 +1533,35 @@ internal static class SqlBuiltinRuntime
         var byteStart = offsets[lo];
         var byteEnd = offsets[hi];
         return byteStart >= byteEnd ? Utf8String.Empty : Utf8String.FromBytes(span[byteStart..byteEnd].ToArray());
+    }
+
+    private static Utf8String TrimAscii(Utf8String s, ReadOnlySpan<byte> set, int side)
+    {
+        var span = s.Span;
+        var lo = 0;
+        var hi = span.Length;
+        if (side is 0 or 2)
+        {
+            while (lo < hi && set.Contains(span[lo]))
+            {
+                lo++;
+            }
+        }
+
+        if (side is 1 or 2)
+        {
+            while (hi > lo && set.Contains(span[hi - 1]))
+            {
+                hi--;
+            }
+        }
+
+        if (lo == 0 && hi == span.Length)
+        {
+            return s;
+        }
+
+        return lo >= hi ? Utf8String.Empty : Utf8String.FromBytes(span[lo..hi].ToArray());
     }
 
     internal static Utf8String ReplaceCore(Utf8String s, Utf8String from, Utf8String to)

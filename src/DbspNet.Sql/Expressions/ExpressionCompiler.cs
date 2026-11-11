@@ -568,18 +568,23 @@ public static class ExpressionCompiler
         }
         else if (srcClr == typeof(Utf8String) && IsNumeric(dstClr))
         {
+            // Parsed from the UTF-8 bytes (SqlCasts.Parse*Utf8), with no .NET string in between.
             var unboxed = Expression.Convert(operand, typeof(Utf8String));
-            var asString = Expression.Call(unboxed,
-                typeof(Utf8String).GetMethod(nameof(Utf8String.ToStringDecoded))!);
             var method = dstClr switch
             {
-                var t when t == typeof(int) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt32))!,
-                var t when t == typeof(long) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt64))!,
-                var t when t == typeof(float) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseSingle))!,
-                var t when t == typeof(double) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDouble))!,
+                var t when t == typeof(int) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt32Utf8))!,
+                var t when t == typeof(long) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseInt64Utf8))!,
+                var t when t == typeof(float) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseSingleUtf8))!,
+                var t when t == typeof(double) => typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDoubleUtf8))!,
                 _ => throw new InvalidOperationException($"no string-to-{dstClr} parser"),
             };
-            converted = Expression.Convert(Expression.Call(method, asString), typeof(object));
+            converted = Expression.Convert(Expression.Call(method, unboxed), typeof(object));
+        }
+        else if (srcClr == typeof(Utf8String) && dstClr == typeof(Date32))
+        {
+            var unboxed = Expression.Convert(operand, typeof(Utf8String));
+            converted = Expression.Convert(
+                Expression.Call(typeof(SqlCasts).GetMethod(nameof(SqlCasts.ParseDateUtf8))!, unboxed), typeof(object));
         }
         else if (srcClr == typeof(Utf8String) && IsTemporal(dstClr))
         {
@@ -903,6 +908,58 @@ internal static class SqlCasts
     }
 
     public static float ParseSingle(string s) => float.Parse(s, CultureInfo.InvariantCulture);
+
+    // VARCHAR casts parse the UTF-8 bytes directly with the same NumberStyles the string parsers
+    // default to, and fall back to the string path whenever the fast parse fails, so every value it
+    // accepts and every error it raises (rounded integers, exponents, overflow, FormatException) stays
+    // the string path's. Invalid UTF-8 fails both ways: the string path sees U+FFFD, this one a byte
+    // at or above 0x80, neither of which is a digit, sign or separator.
+    public static int ParseInt32Utf8(Utf8String s) =>
+        int.TryParse(s.Span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value : ParseInt32(s.ToStringDecoded());
+
+    public static long ParseInt64Utf8(Utf8String s) =>
+        long.TryParse(s.Span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value : ParseInt64(s.ToStringDecoded());
+
+    public static float ParseSingleUtf8(Utf8String s) =>
+        float.TryParse(s.Span, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var value)
+            ? value : ParseSingle(s.ToStringDecoded());
+
+    public static double ParseDoubleUtf8(Utf8String s) =>
+        double.TryParse(s.Span, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var value)
+            ? value : ParseDouble(s.ToStringDecoded());
+
+    /// <summary>CAST(varchar AS DATE): the strict <c>yyyy-MM-dd</c> form read from the bytes; anything
+    /// else (or an impossible date) goes to <see cref="Date32.Parse"/>, which decides.</summary>
+    public static Date32 ParseDateUtf8(Utf8String s)
+    {
+        var b = s.Span;
+        if (b.Length == 10 && b[4] == (byte)'-' && b[7] == (byte)'-'
+            && TryDigits(b[..4], out var year) && TryDigits(b.Slice(5, 2), out var month) && TryDigits(b.Slice(8, 2), out var day)
+            && year >= 1 && month is >= 1 and <= 12 && day >= 1 && day <= DateTime.DaysInMonth(year, month))
+        {
+            return Date32.FromDateOnly(new DateOnly(year, month, day));
+        }
+
+        return Date32.Parse(s.ToStringDecoded());
+
+        static bool TryDigits(ReadOnlySpan<byte> digits, out int value)
+        {
+            value = 0;
+            foreach (var d in digits)
+            {
+                if (d is < (byte)'0' or > (byte)'9')
+                {
+                    return false;
+                }
+
+                value = (value * 10) + (d - '0');
+            }
+
+            return true;
+        }
+    }
 
     public static double ParseDouble(string s) => double.Parse(s, CultureInfo.InvariantCulture);
 

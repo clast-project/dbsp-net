@@ -1,7 +1,7 @@
 # TPC-DI batch 1 at twelve workers: where the time goes, and the plan
 
-Status: in progress. §1–§2 were measured at `2798958`. Broadcast joins (§4a) and smallest-first input
-order (§4c) have shipped; batch 1 is now within ~4% of Feldera locally (§4c).
+Status: in progress. §1–§2 were measured at `2798958`. Broadcast joins (§4a), smallest-first input
+order (§4c) and byte-level string functions (§4d) have shipped; batch 1 is now within ~5% of Feldera locally.
 
 ## 0. Why, and the target
 
@@ -140,6 +140,41 @@ the long-run per-row difference. A–D work inside the current design.
 5. **Profile tick 18 alone (lever F)** once A–D have landed, then re-rank what's left.
 6. **Re-pin ivm-bench** when the local A/B shows a net gain against `f02030d`, the current upstream
    pin. Drop the Dockerfile's `git submodule update --init` step in the same commit.
+
+## 4d. The finwire parse: byte-level TRIM, SUBSTRING and casts (2026-11-11)
+
+§4c's guess, a regex compiled per row, was wrong: a constant `RLIKE` pattern is already compiled
+once. The cost was in the string functions. `finwire_financial` cuts ~17 fields out of each
+~550-byte line with `TRIM(SUBSTRING(line, …))`, then `CAST`s most of them.
+
+- **`TRIM`** built a `HashSet<Rune>` and two lists holding every code point of its input on every
+  call. Now it trims ASCII characters (plain `TRIM`, or an all-ASCII list) on the bytes. That's exact
+  for any input: in UTF-8 a byte below 0x80 is always a whole code point, and every byte of a
+  multi-byte code point is 0x80 or above.
+- **`SUBSTRING`** walked the line from the start to count code points, three times per call. On
+  all-ASCII strings (checked vectorised) positions are now byte offsets.
+- **VARCHAR → INT/BIGINT/REAL/DOUBLE/DATE casts** decoded the bytes into a .NET `string` first. They now
+  parse the UTF-8 bytes with the same `NumberStyles`. DATE reads the strict `yyyy-MM-dd` form, and
+  anything the fast parse rejects falls back to the string path, so every accepted value and every
+  error stays the same.
+
+The parse operator went from 4.9 CPU-s and 1,536 MiB to 1.6 CPU-s and 273 MiB. `StringFastPathTests`
+checks each fast path against the path it skips on random input, including multi-byte and malformed
+UTF-8; four mutants each fail it.
+
+The rows are spread evenly across workers, so the wall-clock gain is small. Three arms over five
+rotated rounds, all three batches, views identical in all 15 runs (broadcast ≤ 1,000 and smallest
+first wherever the build has them):
+
+| | batch-1 drain | output | drain + output | alloc | batches 2 / 3 (with output) |
+|---|---|---|---|---|---|
+| `f02030d` (ivm-bench pin) | 15.42 s | 1.43 s | 16.85 s | 54.87 GiB | 0.12 / 0.13 s |
+| `bb7a0ac` (§4c) | 13.04 s | 1.67 s | 14.72 s | 46.56 GiB | 0.13 / 0.13 s |
+| **string fixes** | **12.92 s** | 1.63 s | **14.61 s** | **45.31 GiB** | 0.12 / 0.11 s |
+
+Against the pin: drain −16%, drain + output −13%, allocation −17%. An earlier two-arm A/B that always
+ran the string build second showed it 1.3% slower. With the order rotated it's level or ahead, so
+read sub-2% wall differences from fixed-order pairs as noise.
 
 ## 4c. Input order: load the dimensions first (2026-11-11)
 
