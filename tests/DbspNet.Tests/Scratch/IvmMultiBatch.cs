@@ -34,6 +34,8 @@
 //   IVM_CHECKPOINT_REPEAT=1   after batch 1's checkpoint, write a second one straight away (same
 //                     tick, so a fresh generation directory) and profile it the same way
 //   IVM_CHECKPOINT_PREGC=1    force a full compacting GC (untimed) before every checkpoint
+//   IVM_STEP_PROFILE=1  (parallel) per batch, each worker's step as exchange split / barrier wait / gather / other
+//                     (StepProfiler; STEPPROF lines). Pair with IVM_GC_EVENTS=1 for the GC share.
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -60,6 +62,27 @@ public class IvmMultiBatch
             : TraceFamily.Flat;
 
     public IvmMultiBatch(ITestOutputHelper output) => _out = output;
+
+    private void WriteStepProfile(int batch, int workers)
+    {
+        double Ms(long ticks) => ticks * 1000.0 / DbspNet.Core.Circuit.StepProfiler.Frequency;
+        double sStep = 0, sSplit = 0, sWait = 0, sGather = 0, maxBusy = 0, minBusy = double.MaxValue;
+        for (var w = 0; w < workers; w++)
+        {
+            var step = Ms(DbspNet.Core.Circuit.StepProfiler.StepTicksOf(w));
+            var split = Ms(DbspNet.Core.Circuit.StepProfiler.SplitTicksOf(w));
+            var wait = Ms(DbspNet.Core.Circuit.StepProfiler.WaitTicksOf(w));
+            var gather = Ms(DbspNet.Core.Circuit.StepProfiler.GatherTicksOf(w));
+            sStep += step; sSplit += split; sWait += wait; sGather += gather;
+            maxBusy = Math.Max(maxBusy, step - wait);
+            minBusy = Math.Min(minBusy, step - wait);
+            _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"STEPPROF batch={batch} worker={w} step_ms={step:F0} split_ms={split:F0} wait_ms={wait:F0} gather_ms={gather:F0} other_ms={step - split - wait - gather:F0} split_rows={DbspNet.Core.Circuit.StepProfiler.SplitRowsOf(w)} gather_rows={DbspNet.Core.Circuit.StepProfiler.GatherRowsOf(w)}"));
+        }
+
+        _out.WriteLine(string.Create(CultureInfo.InvariantCulture,
+            $"STEPPROF batch={batch} mean steps={DbspNet.Core.Circuit.StepProfiler.Steps} step_ms={sStep / workers:F0} split_ms={sSplit / workers:F0} wait_ms={sWait / workers:F0} gather_ms={sGather / workers:F0} other_ms={(sStep - sSplit - sWait - sGather) / workers:F0} busy_max_ms={maxBusy:F0} busy_min_ms={minBusy:F0}"));
+    }
 
     [Fact]
     public async Task RunThreeBatches_Local()
@@ -141,6 +164,9 @@ public class IvmMultiBatch
         List<IOutputConnector> outputs = spec.Output_Bindings
             .Select(o => (IOutputConnector)new DeltaOutputConnector(o.View, Path.Combine(outRoot, o.View), mode))
             .ToList();
+        // IVM_STEP_PROFILE=1 (parallel): per batch, each worker's step split into exchange split / barrier
+        // wait / gather / everything else (StepProfiler); STEPPROF lines.
+        var stepProfile = workers > 1 && Environment.GetEnvironmentVariable("IVM_STEP_PROFILE") == "1";
         // IVM_GC_EVENTS=1: every GC pause during batch 1 (suspend → restart), by generation.
         using var gcEvents = Environment.GetEnvironmentVariable("IVM_GC_EVENTS") == "1" ? new GcPauseListener() : null;
 
@@ -367,6 +393,12 @@ public class IvmMultiBatch
             {
                 DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = null;
             }
+            if (stepProfile)
+            {
+                DbspNet.Core.Circuit.StepProfiler.Configure(workers);
+                DbspNet.Core.Circuit.StepProfiler.Enabled = true;
+            }
+
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
             var pause0 = GC.GetTotalPauseDuration();
             var gen2Before = GC.CollectionCount(2);
@@ -609,6 +641,12 @@ public class IvmMultiBatch
             if (DbspNet.Core.Operators.Stateful.Blocks.StepSpillProfile.Enabled)
             {
                 _out.WriteLine($"{DbspNet.Core.Operators.Stateful.Blocks.StepSpillProfile.TakeReport()} batch={batch}");
+            }
+
+            if (stepProfile)
+            {
+                DbspNet.Core.Circuit.StepProfiler.Enabled = false;
+                WriteStepProfile(batch, workers);
             }
 
             _out.WriteLine(string.Create(
@@ -983,6 +1021,14 @@ public class IvmMultiBatch
         private int _reason;
 
         // SUSPEND_REASON (gcinterface.h): why the runtime stopped every thread.
+        // GCStart_V2 Reason (runtime gc_reason): why this GC ran.
+        private static readonly string[] GcStartReasons =
+        [
+            "alloc_soh", "induced", "low_memory", "empty", "alloc_loh", "oos_soh", "oos_loh", "induced_noforce",
+            "gc_stress", "induced_low_memory", "induced_compacting", "lowmemory_host", "pm_full_gc",
+            "lowmemory_host_blocking", "bgc_tuning_soh", "bgc_tuning_loh", "bgc_stepping",
+        ];
+
         private static readonly string[] SuspendReasons =
             ["other", "gc", "appdomain-shutdown", "code-pitching", "shutdown", "debugger", "gc-prep", "debugger-sweep", "profiler", "rejit"];
         private string? _kind;
@@ -1040,6 +1086,8 @@ public class IvmMultiBatch
                         var depth = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Depth")], CultureInfo.InvariantCulture);
                         var type = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Type")], CultureInfo.InvariantCulture);
                         _kind = "gen" + depth + (type == 1 ? " background" : type == 2 ? " foreground" : " blocking");
+                        var why = Convert.ToInt32(e.Payload![e.PayloadNames!.IndexOf("Reason")], CultureInfo.InvariantCulture);
+                        _kind += " " + (why < GcStartReasons.Length ? GcStartReasons[why] : why.ToString(CultureInfo.InvariantCulture));
                         _gcStart = e.TimeStamp;
                         break;
                     case "GCMarkWithType":
