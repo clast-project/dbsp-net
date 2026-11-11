@@ -329,7 +329,9 @@ the parallel `ProgramRunner.CreateAsync` overload takes the latter. A persistent
 A checkpoint also pins the **broadcast-join choice** (docs/design-tpcdi-batch1.md §4a). A parallel
 deploy broadcasts dimensions of at most `DBSPNET_BROADCAST_MAX_ROWS` rows (default 1,000; `0` or
 `off` disables), sized from the inputs' Delta-log row counts at deploy. Zero and unknown counts
-count as large. A broadcast side's state is replicated, so the choice is part of the plan. The
+count as large. Views have no size at deploy; `DBSPNET_BROADCAST_VIEWS=a,b` names relations to
+count as small anyway (recorded as row count 1; docs/design-bounded-memory.md §5.44). INNER and LEFT
+joins broadcast. A broadcast side's state is replicated, so the choice is part of the plan. The
 server records `{max_rows, row_counts}` under `compile.broadcast` in every snapshot's metadata
 (`SnapshotCheckpointStore.ProgramMetadata`), and a restore compiles with the recorded values, never
 fresh counts. Without that, a dimension grown past the threshold would compile a hash join and the

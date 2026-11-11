@@ -39,6 +39,11 @@ public sealed class DbspNetEngine
     private static readonly long BroadcastMaxRowsSetting =
         BroadcastJoins.ConfiguredMaxRows(Environment.GetEnvironmentVariable("DBSPNET_BROADCAST_MAX_ROWS"));
 
+    // DBSPNET_BROADCAST_VIEWS: views to broadcast as small dimensions too (comma-separated), for
+    // dimensions that are views and so have no size at deploy. See BroadcastJoins.
+    private static readonly IReadOnlyList<string> BroadcastViewsSetting =
+        BroadcastJoins.ConfiguredViews(Environment.GetEnvironmentVariable("DBSPNET_BROADCAST_VIEWS"));
+
     // DBSPNET_INPUT_ORDER: size (default) reads inputs smallest first; spec keeps the spec's order.
     // See InputOrder.
     private static readonly bool InputsBySizeSetting =
@@ -53,6 +58,7 @@ public sealed class DbspNetEngine
     private readonly int _workers;
     private readonly CheckpointPolicy? _checkpointPolicy;
     private readonly long _broadcastMaxRows;
+    private readonly IReadOnlyList<string> _broadcastViews;
     private readonly bool _inputsBySize;
 
     /// <summary>The parallel program of the last deploy, if it runs parallel (tests inspect its circuit).</summary>
@@ -77,14 +83,17 @@ public sealed class DbspNetEngine
     /// null. Small dimensions are broadcast in parallel joins up to <paramref name="broadcastMaxRows"/>
     /// rows, or <c>DBSPNET_BROADCAST_MAX_ROWS</c> when it is null (<see cref="BroadcastJoins"/>). Inputs
     /// are read smallest first unless <paramref name="inputsBySize"/> is false, or, when it is null,
-    /// <c>DBSPNET_INPUT_ORDER</c> is <c>spec</c> (<see cref="InputOrder"/>).</summary>
-    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null, long? broadcastMaxRows = null, bool? inputsBySize = null)
+    /// <c>DBSPNET_INPUT_ORDER</c> is <c>spec</c> (<see cref="InputOrder"/>). <paramref name="broadcastViews"/>
+    /// (or <c>DBSPNET_BROADCAST_VIEWS</c> when null) names views to broadcast as small dimensions too.</summary>
+    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null, long? broadcastMaxRows = null, bool? inputsBySize = null,
+        IReadOnlyList<string>? broadcastViews = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(broadcastMaxRows ?? 0);
         _workers = workers;
         _checkpointPolicy = checkpointPolicy;
         _broadcastMaxRows = broadcastMaxRows ?? BroadcastMaxRowsSetting;
+        _broadcastViews = broadcastViews ?? BroadcastViewsSetting;
         _inputsBySize = inputsBySize ?? InputsBySizeSetting;
     }
 
@@ -180,13 +189,13 @@ public sealed class DbspNetEngine
             ? await InputOrder.ReadRowCountsAsync(spec.Inputs.Select(i => (i.Table, i.Uri)), cancellationToken).ConfigureAwait(false)
             : new Dictionary<string, long>();
         var broadcast = workers > 1
-            ? await BroadcastJoins.ChooseAsync(rowCounts, _broadcastMaxRows, checkpoint, cancellationToken)
+            ? await BroadcastJoins.ChooseAsync(BroadcastJoins.WithHints(rowCounts, _broadcastViews), _broadcastMaxRows, checkpoint, cancellationToken)
                 .ConfigureAwait(false)
             : null;
         if (broadcast is not null)
         {
             Console.Error.WriteLine(
-                $"dbspnet: broadcast joins on dimensions of at most {broadcast.MaxRows} rows; inputs that small: " +
+                $"dbspnet: broadcast joins on dimensions of at most {broadcast.MaxRows} rows; relations that small: " +
                 (broadcast.Small().Any() ? string.Join(", ", broadcast.Small().Select(kv => $"{kv.Key}={kv.Value}")) : "(none)"));
         }
 

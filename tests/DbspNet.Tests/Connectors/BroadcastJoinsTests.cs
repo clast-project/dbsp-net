@@ -90,6 +90,45 @@ public sealed class BroadcastJoinsTests : IDisposable
         await AssertTotals();
     }
 
+    [Theory]
+    [InlineData(null, new string[0])]
+    [InlineData(" ", new string[0])]
+    [InlineData("dim_a", new[] { "dim_a" })]
+    [InlineData(" dim_a , dim_b,,dim_a ", new[] { "dim_a", "dim_b" })]
+    public void ConfiguredViews_ParsesTheSetting(string? setting, string[] expected) =>
+        Assert.Equal(expected, BroadcastJoins.ConfiguredViews(setting));
+
+    /// <summary>
+    /// DBSPNET_BROADCAST_VIEWS: a hinted relation is broadcast though its size is over the threshold
+    /// (the case it exists for is a view, which has no size at deploy). The hint is recorded with the
+    /// counts, so a restore without the hint keeps the broadcast plan.
+    /// </summary>
+    [Fact]
+    public async Task HintedRelation_IsBroadcast_AndTheRestoreKeepsIt()
+    {
+        var snapshotDir = Path.Combine(_root, "snap-hint");
+        await Seed(dimRows: 3, factRows: 6);
+        var unhinted = new DbspNetEngine(workers: 4, broadcastMaxRows: 2);
+        Assert.Empty((await unhinted.DeployAsync(Spec(snapshotDir: null))).BroadcastInputs ?? []);
+        Assert.Equal(0, BroadcastExchanges(unhinted));
+
+        var first = new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch, broadcastMaxRows: 2, broadcastViews: ["dim"]);
+        Assert.Equal(["dim"], (await first.DeployAsync(Spec(snapshotDir))).BroadcastInputs);
+        Assert.Equal(1, BroadcastExchanges(first));
+        await RunBatch(first);
+        await AssertTotals();
+        Assert.Equal(BroadcastJoins.HintedRows, (await RecordedChoice(snapshotDir))!.RowCounts["dim"]);
+
+        await AppendDim(2);
+        await AppendFact(4);
+        var second = new DbspNetEngine(workers: 2, CheckpointPolicy.EveryBatch, broadcastMaxRows: 2, broadcastViews: []);
+        var redeploy = await second.DeployAsync(Spec(snapshotDir));
+        Assert.True(redeploy.RestoredTick > 0);
+        Assert.Equal(1, BroadcastExchanges(second));
+        await RunBatch(second);
+        await AssertTotals();
+    }
+
     [Fact]
     public async Task EmptyAtDeploy_CountsAsLarge()
     {

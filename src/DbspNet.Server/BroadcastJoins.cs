@@ -51,6 +51,40 @@ internal sealed record BroadcastJoins(
             : throw new FormatException($"DBSPNET_BROADCAST_MAX_ROWS must be a non-negative row count or 'off', not '{setting}'");
     }
 
+    /// <summary>The count a hinted view is recorded with: small enough for any threshold.</summary>
+    public const long HintedRows = 1;
+
+    /// <summary>
+    /// <c>DBSPNET_BROADCAST_VIEWS</c>: comma-separated relations (normally views, whose size the
+    /// compiler cannot know at deploy) to broadcast as small dimensions. Unset or blank is none.
+    /// </summary>
+    public static IReadOnlyList<string> ConfiguredViews(string? setting) =>
+        string.IsNullOrWhiteSpace(setting)
+            ? []
+            : [.. setting.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// <paramref name="rowCounts"/> with each of <paramref name="views"/> counted as
+    /// <see cref="HintedRows"/>: the compiler keeps a supplied view count instead of estimating it,
+    /// so a hinted view is broadcast where it is a join's right side, and the hint is recorded with
+    /// the choice like any count.
+    /// </summary>
+    public static IReadOnlyDictionary<string, long> WithHints(IReadOnlyDictionary<string, long> rowCounts, IReadOnlyList<string> views)
+    {
+        if (views.Count == 0)
+        {
+            return rowCounts;
+        }
+
+        var merged = new Dictionary<string, long>(rowCounts, StringComparer.Ordinal);
+        foreach (var v in views)
+        {
+            merged[v] = HintedRows;
+        }
+
+        return merged;
+    }
+
     /// <summary>
     /// The choice for this deploy: the one <paramref name="checkpoint"/>'s current parallel snapshot
     /// recorded (null if it recorded none), or, on a fresh start, one made from
@@ -103,7 +137,8 @@ internal sealed record BroadcastJoins(
         JsonSerializer.Deserialize<BroadcastJoins>(json)
         ?? throw new InvalidDataException($"{MetadataKey} metadata deserialized to null");
 
-    /// <summary>The inputs at or under the threshold, smallest first (for the deploy log).</summary>
+    /// <summary>The relations (inputs, and hinted views) at or under the threshold, smallest first
+    /// (for the deploy log).</summary>
     public IEnumerable<KeyValuePair<string, long>> Small() =>
         RowCounts.Where(kv => kv.Value <= MaxRows).OrderBy(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal);
 }

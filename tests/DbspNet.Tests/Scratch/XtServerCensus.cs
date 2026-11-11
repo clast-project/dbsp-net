@@ -125,11 +125,32 @@ public class XtServerCensus
         app.MapGet("/stats", () => Results.Ok(engine.GetStats()));
 
         var nextCensus = stepGib;
+        var opProfile = Environment.GetEnvironmentVariable("XT_OP_PROFILE") == "1";
+        var prof = new System.Collections.Concurrent.ConcurrentDictionary<(long Tick, int Op), long[]>();
+        var profNames = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
+        var profLast = new ThreadLocal<(long Tick, long Ts, long Alloc)>(() => (-1, 0, 0));
         var checkpointAt = long.TryParse(Environment.GetEnvironmentVariable("XT_CHECKPOINT_AT_TICK"), out var ca) ? ca : -1;
         DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = drainTick =>
         {
             var t = drainTick + tickBase;
             var (runner, replicas) = Locate(engine);
+            if (opProfile)
+            {
+                // The tick's operators by summed wall, then by allocation (top 40 each, a line per op).
+                var cells = prof.Where(kv => kv.Value[2] > 0).Select(kv => (kv.Key.Op, Ms: kv.Value[0] * 1000.0 / Stopwatch.Frequency, Mib: kv.Value[1] >> 20, Calls: kv.Value[2])).ToList();
+                var totalMs = cells.Sum(c => c.Ms);
+                var totalMib = cells.Sum(c => c.Mib);
+                log.WriteLine(string.Create(CultureInfo.InvariantCulture, $"OPPROFTOTAL tick={t} ops={cells.Count} worker_ms={totalMs:F0} alloc_mib={totalMib}"));
+                foreach (var c in cells.OrderByDescending(c => c.Ms).Take(40).Union(cells.OrderByDescending(c => c.Mib).Take(40)).OrderByDescending(c => c.Ms))
+                {
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"OPPROF tick={t} op={c.Op} worker_ms={c.Ms:F0} pct={100 * c.Ms / Math.Max(1, totalMs):F1} alloc_mib={c.Mib} calls={c.Calls} {profNames.GetValueOrDefault(c.Op)}"));
+                }
+
+                prof.Clear();
+                log.Flush();
+            }
+
             var before = GC.GetGCMemoryInfo(GCKind.Any).HeapSizeBytes;
             var allocated = GC.GetTotalAllocatedBytes(precise: false);
             System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
@@ -310,6 +331,25 @@ public class XtServerCensus
         var described = 0;
         RootCircuit.AfterOperatorStep = (circuit, i) =>
         {
+            // XT_OP_PROFILE=1: each operator's wall time and allocation on each worker thread (the time
+            // since that thread's previous operator of the same tick, so an exchange's includes its
+            // barrier wait), summed over workers; OPPROF lines at the tick's end. No lock, no walk.
+            if (opProfile)
+            {
+                var ts = Stopwatch.GetTimestamp();
+                var a = GC.GetAllocatedBytesForCurrentThread();
+                var (pt, pts, pa) = profLast.Value;
+                profLast.Value = (circuit.TickCount, ts, a);
+                if (pt == circuit.TickCount)
+                {
+                    var cell = prof.GetOrAdd((circuit.TickCount, i), _ => new long[3]);
+                    Interlocked.Add(ref cell[0], ts - pts);
+                    Interlocked.Add(ref cell[1], a - pa);
+                    Interlocked.Increment(ref cell[2]);
+                    profNames.TryAdd(i, $"{circuit.Operators[i].GetType().Name.Split('`')[0]} view={circuit.OperatorLabel(i) ?? "-"}");
+                }
+            }
+
             if (describeFrom >= 0 && Interlocked.Exchange(ref described, 1) == 0)
             {
                 lock (gate)

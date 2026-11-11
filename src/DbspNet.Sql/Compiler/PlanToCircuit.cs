@@ -647,7 +647,9 @@ public static partial class PlanToCircuit
                 return false;
             }
 
-            if (options.BroadcastMaxRows > 0)
+            // A count the deployment supplied for a view is a hint (DBSPNET_BROADCAST_VIEWS) and
+            // stands; otherwise estimate it from its inputs.
+            if (options.BroadcastMaxRows > 0 && options.RelationRowCounts?.ContainsKey(v.ViewName) != true)
             {
                 rowCounts[v.ViewName] = CardinalityEstimator.Estimate(optimized, CountLookup);
             }
@@ -1113,7 +1115,7 @@ public static partial class PlanToCircuit
     }
 
     /// <summary>
-    /// Whether an INNER join with right side <paramref name="right"/> should be
+    /// Whether an INNER or LEFT join with right side <paramref name="right"/> should be
     /// compiled as a broadcast join (replicate the right dimension) rather than a
     /// hash join. True only at W&gt;1 when the right is a leaf relation and either
     /// the unconditional experimental override
@@ -3778,7 +3780,17 @@ public static partial class PlanToCircuit
         // left-key partition below. The non-preserved side is shuffled by the same
         // key inside ExchangeIndex. At W<=1 `Exchange` is the input itself and
         // `ExchangeIndex` is the GroupProject emitted before, so W=1 is byte-identical.
-        left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
+        //
+        // Broadcast (ShouldBroadcastRight): a small right dimension on a low-cardinality key would
+        // put the whole preserved side on a handful of workers. Instead the left stays on its
+        // incoming partition and the right is replicated; each worker holds every right row, so
+        // its left rows' matches and NULL pads are exactly the serial ones.
+        var broadcastRight = ShouldBroadcastRight(plan.Right, ctx);
+        var leftIncoming = left;
+        if (!broadcastRight)
+        {
+            left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
+        }
 
         // NULL-keyed left rows can never find a match (NULL = anything is
         // NULL, not TRUE), so they bypass the join and go straight to the
@@ -3793,10 +3805,15 @@ public static partial class PlanToCircuit
             validKeyLeft,
             row => ExtractKey(codec, leftKeySchema, row, leftIndices),
             row => row);
-        var rightIndexed = builder.ExchangeIndex(
-            validKeyRight,
-            row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema),
-            row => ExtractKey(codec, rightKeySchema, row, rightIndices));
+        var rightIndexed = broadcastRight
+            ? builder.GroupProject(
+                builder.BroadcastExchange(validKeyRight),
+                row => ExtractKey(codec, rightKeySchema, row, rightIndices),
+                static row => row)
+            : builder.ExchangeIndex(
+                validKeyRight,
+                row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema),
+                row => ExtractKey(codec, rightKeySchema, row, rightIndices));
 
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
@@ -3811,8 +3828,10 @@ public static partial class PlanToCircuit
             joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
             nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
-            leftReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(leftKeySchema) : null,
-            rightReshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(rightKeySchema) : null,
+            leftReshard: ctx.Workers <= 1 ? null
+                : broadcastRight ? ReshardPlacement.Anywhere : ReshardPlacement.WholeRow(leftKeySchema),
+            rightReshard: ctx.Workers <= 1 ? null
+                : broadcastRight ? ReshardPlacement.OnEveryWorker : ReshardPlacement.WholeRow(rightKeySchema),
             leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema),
             residual: pairResidual is null ? null : (_, l, r) => pairResidual(l, r));
 
@@ -3827,10 +3846,13 @@ public static partial class PlanToCircuit
 
         // Every output row (matched, padded by the operator, or NULL-key bypass)
         // carries its left row's key columns at the same indices and sits on the
-        // worker that key hashed to: partitioned by the left equi-key.
+        // worker that key hashed to: partitioned by the left equi-key. A broadcast
+        // join leaves each output row where its left row arrived.
         if (ctx.Workers > 1)
         {
-            ctx.SetPartition(result, new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
+            ctx.SetPartition(result, broadcastRight
+                ? ctx.GetPartition(leftIncoming) with { ShardDisjoint = false }
+                : new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
         }
 
         return result;
