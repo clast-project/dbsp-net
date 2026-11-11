@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **§5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **§5.43: a blocked rank steps a huge delta in partition-hash slices (D5 for rank, 11958f7); issue #2's calibrated 25 GB extended TPC-DS (201.6M source rows) batch 1 now completes and validates at W=12 in a 48 GiB heap (70.6 min), where a0196d2 runs out of memory in the rank at tick 17. §5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -3151,3 +3151,55 @@ slower.
 
 **Lesson.** Bounded-memory work changed default paths that ivm-bench exercises, and nothing re-measured
 ivm-bench across 78 commits. Before re-pinning, run the local A/B against the current pin.
+
+### 5.43 D5 for rank: a huge step in partition slices (2026-11-11, 11958f7)
+
+**The report.** Issue #2's reporter ran a larger population than §5.24's SF1: the *calibrated* extended
+TPC-DS profile at a 25 GB source target (base SF 2.0, 201.6M source rows against SF1's ~88M; the largest
+input, `ext_engagement_status_events`, 36.2M rows), with this doc's settings (W=12, 48 GiB heap,
+`DBSPNET_SPILL=on`, `DBSPNET_STEP_SPILL_ROWS=262144`, 1 GiB block cache). On b580b7f batch 1 ran out of
+memory after ~1h45m with all twelve workers in `PartitionedRankOp.Step` → `OrderedPartitionStore.Integrate`
+(`Load`, `ApplySmall`), memory going Low → Critical in six seconds.
+
+**Why spilling did not reach it.** S1–S3 bound state between steps and D1–D4 bound the deltas between
+operators; nothing bounded an operator's own working set *inside* a step (D5 in the table above, never
+built). A rank step held, for the whole delta at once: every touched partition's old rows (`touched`), the
+delta as one integrate list, the same grouped by key (`byKey`), and every touched partition loaded into the
+write-back cache, which the budget (§5.8) only drops at `EndTick`.
+
+**Fix.** With step spilling on and blocked state, a delta past the step chunk (`DBSPNET_STEP_SPILL_ROWS`;
+the forced chunk in forced mode) is stepped in partition-hash slices, at most 256 of them. One pass hashes
+each row's partition key into its slice (the hash is mixed first: workers already split by `hash % W`); each
+slice then takes one pass over the delta for its rows and runs the old step on them, `EndTick` included, so
+the cache can drop between slices. Partitions rank independently, so the output is the slices' sum. Off
+with step spilling off, so TPC-DI and Nexmark are untouched. TOP-K and the window operators share the
+store and the same shape; they are not sliced yet.
+
+**Tests.** `RankSliceTests`: sliced and forced-sliced runs equal an unsliced twin every tick (ROW_NUMBER,
+RANK, DENSE_RANK; inserts, deletes, weights above one); a 20,000-partition step caches at most about a
+slice's partitions (≤ 1,500 at 1,000-row slices) where the unsliced twin caches all 20,000
+(`OrderedPartitionStore.PeakCachedPartitions`). Mutants caught: no slicing, a slice's rows repeated, no
+cache drop per slice. Suites: default, forced and forced+critical, 3,629 each.
+
+**Measured, natively** (the reporter's ivm-bench commit b228f90, data generated with DuckDB 1.2.1 at base
+SF 2.0: 201,620,651 source rows, as theirs; their settings; ~/xtpcds/scripts/xtrun25.sh):
+
+| batch 1 | a0196d2 (before) | 11958f7 (after) |
+|---|---|---|
+| outcome | **out of memory**, tick 17 (`ext_entity_registry`), rank `Integrate` → `Load` | **completed, validates against DuckDB** |
+| wall | 476 s to the failure | 4,233 s (drain 3,895 s) |
+| tick 17 step | — | 410 s |
+| tick 18 step (36.2M rows) | — | 2,858 s, GC pauses 875 s |
+| peak RSS | 49 GiB | 43 GiB |
+| spill disk peak | — | 84 GB |
+
+Both runs read inputs smallest first (bb7a0ac), so the 36.2M-row source is the last tick; the reporter's
+b580b7f read them in spec order. The before run fails with the reporter's stack, so slicing is the
+difference.
+
+*Instrument landmine:* the xt harness's per-op census (`XT_OP_TICK`) walks every replica's state from one
+worker's thread while the others step; with rank caches now changing mid-step it threw "Collection was
+modified" in `SmallManaged`. xtrun25.sh leaves it off (`XT_OP_TICK=999`).
+
+**Next.** Tick 18 is now the cost: 48 minutes, 31% of it GC pauses. Slice TOP-K and the window operators
+the same way, then profile tick 18.
