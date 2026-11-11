@@ -383,7 +383,13 @@ internal sealed class OrderedPartitionStore
         {
             Interlocked.Add(ref _cacheBytes, added);
         }
+
+        PeakCachedPartitions = Math.Max(PeakCachedPartitions, _small.Count);
     }
+
+    /// <summary>The most partitions the cache held at the end of any <see cref="Integrate"/> (tests:
+    /// what a step held at once).</summary>
+    internal int PeakCachedPartitions { get; private set; }
 
     // A partition's raw content: the record's entries for it plus its queued changes (a cached
     // partition that emptied leaves the cache with its changes still queued).

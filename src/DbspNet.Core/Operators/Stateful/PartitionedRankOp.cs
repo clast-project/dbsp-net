@@ -193,6 +193,95 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             return;
         }
 
+        var builder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
+        var slices = SliceCount(delta.Count);
+        if (slices <= 1)
+        {
+            StepPartitions(delta, builder);
+        }
+        else
+        {
+            StepSliced(delta, builder, slices);
+        }
+
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
+    }
+
+    /// <summary>Steps that ran in partition-hash slices (diagnostics, tests).</summary>
+    internal static long SlicedSteps;
+
+    private const int MaxSlices = 256;
+
+    // With in-step spilling on and blocked state, a delta past the step chunk is processed a slice of
+    // partitions at a time (docs/design-bounded-memory.md §5.43, D5 for rank): a slice's old rows,
+    // integrate lists and cached partitions are all the step holds, and the store's write-back budget
+    // can drop its cache between slices instead of only at the step's end. Partitions rank
+    // independently, so the output is the sum of the slices' outputs.
+    private int SliceCount(int deltaRows)
+    {
+        if (_store is null || Blocks.SpillSettings.StepSpillRows is not { } rows)
+        {
+            return 1;
+        }
+
+        // Each slice is one pass over the delta, so past MaxSlices the slices grow instead.
+        var per = rows == 0 ? Blocks.SpillSettings.ForcedChunkRows : rows;
+        return (int)Math.Min(MaxSlices, (deltaRows + per - 1) / per);
+    }
+
+    // A partition key's slice: its hash mixed (workers already split by hash % W, which slicing by the
+    // same low bits would repeat), then reduced to [0, slices).
+    private int SliceOf(TKey key, int slices)
+    {
+        var h = (uint)(_partitionComparer?.GetHashCode(key) ?? key.GetHashCode()) * 0x9E3779B1u;
+        return (int)(((ulong)h * (uint)slices) >> 32);
+    }
+
+    // One pass hashes every row's partition into its slice; then each slice takes one pass over the
+    // delta for its rows, which are stepped as a delta of their own. The delta is immutable and
+    // enumerates in the same order every pass.
+    private void StepSliced(ZSet<TInRow, Z64> delta, ZSetBuilder<TOutRow, Z64> builder, int slices)
+    {
+        Interlocked.Increment(ref SlicedSteps);
+        var sliceOf = new byte[delta.Count];
+        var n = 0;
+        foreach (var (row, _) in delta)
+        {
+            sliceOf[n++] = (byte)SliceOf(_partitionOf(row), slices);
+        }
+
+        var part = new List<KeyValuePair<TInRow, Z64>>();
+        for (var s = 0; s < slices; s++)
+        {
+            part.Clear();
+            var i = 0;
+            foreach (var kv in delta)
+            {
+                if (sliceOf[i++] == s)
+                {
+                    part.Add(kv);
+                }
+            }
+
+            if (part.Count > 0)
+            {
+                StepPartitions(part, builder);
+            }
+        }
+
+        if (part.Capacity > Blocks.OrderedPartitionStore.KeepCapacity)
+        {
+            part.Clear();
+            part.TrimExcess();
+        }
+    }
+
+    // A set of partitions' rows of the delta (all of it, or one slice): integrate them and emit the
+    // change in their rankings.
+    private void StepPartitions(IEnumerable<KeyValuePair<TInRow, Z64>> delta, ZSetBuilder<TOutRow, Z64> builder)
+    {
         // Only the partitions a tick touches can change their ranking: each one's rows before the
         // delta, read now (in order, as the next read after the delta will be).
         var touched = new Dictionary<TKey, List<(TInRow Row, long Weight)>>(_partitionComparer);
@@ -243,7 +332,6 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             }
         }
 
-        var builder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         foreach (var (key, before) in touched)
         {
             var after = Current(key);
@@ -269,9 +357,6 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
 
         _store?.EndTick();
-        var result = builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
     }
 
     // A partition's rows after this tick, in order, consolidated.
