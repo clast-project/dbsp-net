@@ -51,7 +51,8 @@ public sealed record OutputSpec(string View, string Uri, string? Mode = null);
 /// the program runs on (1 = the serial program); <paramref name="SerialFallback"/> says why a
 /// deploy asked for more workers ran serially, and is null otherwise. <paramref name="BroadcastMaxRows"/>
 /// is the broadcast-join threshold the program was compiled with (0: none), and
-/// <paramref name="BroadcastInputs"/> the inputs whose recorded size was within it.</summary>
+/// <paramref name="BroadcastInputs"/> the inputs whose recorded size was within it.
+/// <paramref name="InputOrder"/> is the order the inputs are read in, one tick per new version.</summary>
 public sealed record DeployResult(
     double CompileTimeS,
     int InputCount,
@@ -61,7 +62,8 @@ public sealed record DeployResult(
     int Workers = 1,
     string? SerialFallback = null,
     long BroadcastMaxRows = 0,
-    IReadOnlyList<string>? BroadcastInputs = null);
+    IReadOnlyList<string>? BroadcastInputs = null,
+    IReadOnlyList<string>? InputOrder = null);
 
 /// <summary>Result of resume: the epoch second the batch timer started.</summary>
 public sealed record ResumeResult(long ResumedAtEpochS);

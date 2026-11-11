@@ -4,7 +4,6 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DbspNet.Connectors.Abstractions;
-using DbspNet.Connectors.EngineeredWood;
 
 namespace DbspNet.Server;
 
@@ -13,7 +12,7 @@ namespace DbspNet.Server;
 /// side is a small dimension is compiled to replicate that side on every worker instead of hash-sharding
 /// both sides on the join key. A key with a handful of values would otherwise put the whole fact side on
 /// a handful of workers (ivm-bench's trades_history: 982k trades on 5- and 6-value codes, −6.8% batch 1).
-/// <para>Sizes come from the inputs' Delta-log row counts at deploy (<see cref="DeltaRowCounts"/>). An
+/// <para>Sizes come from the inputs' Delta-log row counts at deploy (<see cref="InputOrder.ReadRowCountsAsync"/>). An
 /// unknown or zero count counts as large: an empty table has nothing to skew, and a fact table staged
 /// after deploy must not be mistaken for a dimension. <c>DBSPNET_BROADCAST_MAX_ROWS</c> sets the
 /// threshold (default 1,000; <c>0</c> or <c>off</c> disables).</para>
@@ -54,12 +53,14 @@ internal sealed record BroadcastJoins(
 
     /// <summary>
     /// The choice for this deploy: the one <paramref name="checkpoint"/>'s current parallel snapshot
-    /// recorded (null if it recorded none), or, on a fresh start, one made from the inputs' row counts
-    /// at <paramref name="maxRows"/> (null if <paramref name="maxRows"/> is 0). Records the result in
-    /// <paramref name="checkpoint"/> so every later snapshot carries it.
+    /// recorded (null if it recorded none), or, on a fresh start, one made from
+    /// <paramref name="rowCounts"/> (the inputs' known, non-zero counts:
+    /// <see cref="InputOrder.ReadRowCountsAsync"/>) at <paramref name="maxRows"/> (null if
+    /// <paramref name="maxRows"/> is 0). Records the result in <paramref name="checkpoint"/> so every
+    /// later snapshot carries it.
     /// </summary>
     public static async Task<BroadcastJoins?> ChooseAsync(
-        IEnumerable<(string Table, string Uri)> inputs,
+        IReadOnlyDictionary<string, long> rowCounts,
         long maxRows,
         SnapshotCheckpointStore? checkpoint,
         CancellationToken cancellationToken)
@@ -72,16 +73,7 @@ internal sealed record BroadcastJoins(
         }
         else if (maxRows > 0)
         {
-            var counts = new Dictionary<string, long>(StringComparer.Ordinal);
-            foreach (var (table, uri) in inputs)
-            {
-                if (await TryCountAsync(uri, cancellationToken).ConfigureAwait(false) is { } n and > 0)
-                {
-                    counts[table] = n;
-                }
-            }
-
-            choice = new BroadcastJoins(maxRows, counts);
+            choice = new BroadcastJoins(maxRows, new Dictionary<string, long>(rowCounts, StringComparer.Ordinal));
         }
         else
         {
@@ -114,17 +106,4 @@ internal sealed record BroadcastJoins(
     /// <summary>The inputs at or under the threshold, smallest first (for the deploy log).</summary>
     public IEnumerable<KeyValuePair<string, long>> Small() =>
         RowCounts.Where(kv => kv.Value <= MaxRows).OrderBy(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal);
-
-    private static async Task<long?> TryCountAsync(string uri, CancellationToken cancellationToken)
-    {
-        try
-        {
-            return await DeltaRowCounts.TryReadAsync(uri, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            // Unreadable here (missing, not yet a table): unknown, which is the safe hash-join default.
-            return null;
-        }
-    }
 }

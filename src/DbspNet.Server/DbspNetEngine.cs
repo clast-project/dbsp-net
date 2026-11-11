@@ -39,6 +39,11 @@ public sealed class DbspNetEngine
     private static readonly long BroadcastMaxRowsSetting =
         BroadcastJoins.ConfiguredMaxRows(Environment.GetEnvironmentVariable("DBSPNET_BROADCAST_MAX_ROWS"));
 
+    // DBSPNET_INPUT_ORDER: size (default) reads inputs smallest first; spec keeps the spec's order.
+    // See InputOrder.
+    private static readonly bool InputsBySizeSetting =
+        InputOrder.BySize(Environment.GetEnvironmentVariable("DBSPNET_INPUT_ORDER"));
+
     // Worker count W. DBSPNET_WORKERS > 1 compiles the program data-parallel across W
     // replicas when every view shards, and falls back to the serial program (logged) when
     // one does not. Default 1: the serial program, today's behaviour.
@@ -48,6 +53,7 @@ public sealed class DbspNetEngine
     private readonly int _workers;
     private readonly CheckpointPolicy? _checkpointPolicy;
     private readonly long _broadcastMaxRows;
+    private readonly bool _inputsBySize;
 
     /// <summary>The parallel program of the last deploy, if it runs parallel (tests inspect its circuit).</summary>
     internal ParallelCompiledProgram? DeployedParallel { get; private set; }
@@ -69,14 +75,17 @@ public sealed class DbspNetEngine
     /// they shard (see <see cref="DeployAsync"/>). A persistent deploy commits batches by
     /// <paramref name="checkpointPolicy"/>, or by <c>DBSPNET_CHECKPOINT_INTERVAL_SECS</c> when it is
     /// null. Small dimensions are broadcast in parallel joins up to <paramref name="broadcastMaxRows"/>
-    /// rows, or <c>DBSPNET_BROADCAST_MAX_ROWS</c> when it is null (<see cref="BroadcastJoins"/>).</summary>
-    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null, long? broadcastMaxRows = null)
+    /// rows, or <c>DBSPNET_BROADCAST_MAX_ROWS</c> when it is null (<see cref="BroadcastJoins"/>). Inputs
+    /// are read smallest first unless <paramref name="inputsBySize"/> is false, or, when it is null,
+    /// <c>DBSPNET_INPUT_ORDER</c> is <c>spec</c> (<see cref="InputOrder"/>).</summary>
+    public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null, long? broadcastMaxRows = null, bool? inputsBySize = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(broadcastMaxRows ?? 0);
         _workers = workers;
         _checkpointPolicy = checkpointPolicy;
         _broadcastMaxRows = broadcastMaxRows ?? BroadcastMaxRowsSetting;
+        _inputsBySize = inputsBySize ?? InputsBySizeSetting;
     }
 
     /// <summary>Compile the program, wire its Delta connectors, and validate each source
@@ -166,9 +175,12 @@ public sealed class DbspNetEngine
 
         // Broadcast joins for small dimensions (BroadcastJoins): chosen from the inputs' sizes on a
         // fresh start, or the choice the checkpoint recorded on a restore.
+        // Both choices below work from the inputs' sizes at deploy, read once.
+        var rowCounts = _inputsBySize || (workers > 1 && _broadcastMaxRows > 0)
+            ? await InputOrder.ReadRowCountsAsync(spec.Inputs.Select(i => (i.Table, i.Uri)), cancellationToken).ConfigureAwait(false)
+            : new Dictionary<string, long>();
         var broadcast = workers > 1
-            ? await BroadcastJoins.ChooseAsync(
-                spec.Inputs.Select(i => (i.Table, i.Uri)), _broadcastMaxRows, checkpoint, cancellationToken)
+            ? await BroadcastJoins.ChooseAsync(rowCounts, _broadcastMaxRows, checkpoint, cancellationToken)
                 .ConfigureAwait(false)
             : null;
         if (broadcast is not null)
@@ -216,7 +228,16 @@ public sealed class DbspNetEngine
                 numericStringCoercion: true, nullCollation: NullCollation.Low)
             : null;
 
-        var inputs = spec.Inputs
+        // Smallest first (InputOrder): dimensions are loaded before the facts that join to them.
+        var inputSpecs = _inputsBySize ? InputOrder.Order(spec.Inputs, i => i.Table, rowCounts) : spec.Inputs.ToList();
+        if (_inputsBySize)
+        {
+            Console.Error.WriteLine(
+                "dbspnet: reading inputs smallest first: " +
+                string.Join(", ", inputSpecs.Select(i => rowCounts.TryGetValue(i.Table, out var n) ? $"{i.Table}={n}" : $"{i.Table}=?")));
+        }
+
+        var inputs = inputSpecs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, i.Uri))
             .ToList();
         var outputs = spec.Outputs
@@ -269,7 +290,8 @@ public sealed class DbspNetEngine
             sw.Elapsed.TotalSeconds, inputs.Count, outputs.Count, persistent, restoredTick,
             runner.Workers, fallback,
             parallel is null ? 0 : broadcast?.MaxRows ?? 0,
-            parallel is null ? null : broadcast?.Small().Select(kv => kv.Key).ToList());
+            parallel is null ? null : broadcast?.Small().Select(kv => kv.Key).ToList(),
+            inputs.Select(i => i.Name).ToList());
     }
 
     /// <summary>Start ingesting the current batch (all source versions available now) in

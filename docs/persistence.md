@@ -337,6 +337,11 @@ restore would refuse the snapshot (plan fingerprint mismatch). A snapshot with n
 without broadcast. Re-sharding copies the metadata forward, and broadcast state is placed
 `OnEveryWorker`.
 
+The **input order** is deliberately not pinned (docs/design-tpcdi-batch1.md §4c). The server reads
+inputs smallest first by the same deploy-time counts (`DBSPNET_INPUT_ORDER=size`, the default;
+`spec` keeps the spec's order). Order changes neither results nor state layout, and the tick
+journal replays by source name, so a restore may read its inputs in a different order.
+
 `Snapshot.Exists(store)` returns true iff `current.txt` exists and names a snap-T whose manifest
 exists. `Snapshot.PointerExists(store)` is the "was anything ever committed" test:
 `SnapshotCheckpointStore` treats only a missing pointer as a fresh start. A pointer naming an

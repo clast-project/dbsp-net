@@ -35,6 +35,7 @@
 //                     tick, so a fresh generation directory) and profile it the same way
 //   IVM_CHECKPOINT_PREGC=1    force a full compacting GC (untimed) before every checkpoint
 //   IVM_BCAST_MAXROWS=N (parallel) broadcast join right sides estimated at <= N rows (Delta-log counts)
+//   IVM_INPUT_ORDER   size (default, as the server: smallest input first, DbspNet.Server.InputOrder) | spec
 //   IVM_STEP_PROFILE=1  (parallel) per batch, each worker's step as exchange split / barrier wait / gather / other
 //                     (StepProfiler; STEPPROF lines). Pair with IVM_GC_EVENTS=1 for the GC share.
 using System.Diagnostics;
@@ -181,7 +182,16 @@ public class IvmMultiBatch
 
         var parallel = workers > 1 ? CompileParallel() : null;
 
-        List<IInputConnector> Inputs() => spec.Inputs
+        // IVM_INPUT_ORDER: the server's default (smallest input first) unless spec.
+        var inputSpecs = spec.Inputs.ToList();
+        if (DbspNet.Server.InputOrder.BySize(Environment.GetEnvironmentVariable("IVM_INPUT_ORDER")))
+        {
+            var sizes = await DbspNet.Server.InputOrder.ReadRowCountsAsync(spec.Inputs.Select(i => (i.Table, InUri(i.Uri))), CancellationToken.None);
+            inputSpecs = DbspNet.Server.InputOrder.Order(spec.Inputs, i => i.Table, sizes);
+        }
+
+        _out.WriteLine("INPUT order " + string.Join(" ", inputSpecs.Select(i => i.Table)));
+        List<IInputConnector> Inputs() => inputSpecs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))
             .ToList();
         var inputs = Inputs();

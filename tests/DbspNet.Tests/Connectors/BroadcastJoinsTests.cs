@@ -19,7 +19,7 @@ using SqlSchema = DbspNet.Sql.Plan.Schema;
 namespace DbspNet.Tests.Connectors;
 
 /// <summary>
-/// Broadcast joins for small dimensions in a parallel deploy (<see cref="BroadcastJoins"/>,
+/// Input order (<see cref="InputOrder"/>, smallest first) and broadcast joins for small dimensions in a parallel deploy (<see cref="BroadcastJoins"/>,
 /// docs/design-tpcdi-batch1.md §4a): sizes come from Delta-log row counts on a fresh start, and a
 /// persistent deploy records the choice so a restore rebuilds the same plan even after the tables grow.
 /// </summary>
@@ -167,6 +167,85 @@ public sealed class BroadcastJoinsTests : IDisposable
         Assert.True(redeploy.RestoredTick > 0);
         Assert.Equal(0, redeploy.BroadcastMaxRows);
         Assert.Equal(0, BroadcastExchanges(second));
+        await RunBatch(second);
+        await AssertTotals();
+    }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData("", true)]
+    [InlineData(" size ", true)]
+    [InlineData("SIZE", true)]
+    [InlineData("spec", false)]
+    [InlineData("Spec", false)]
+    public void InputOrder_ParsesTheSetting(string? setting, bool bySize) =>
+        Assert.Equal(bySize, InputOrder.BySize(setting));
+
+    [Fact]
+    public void InputOrder_RefusesNonsense() =>
+        Assert.Throws<FormatException>(() => InputOrder.BySize("alphabetical"));
+
+    /// <summary>Known sizes first, smallest first; unknown sizes after, in their original order.</summary>
+    [Fact]
+    public void InputOrder_PutsKnownSizesFirst_SmallestFirst_ThenTheRestInOrder()
+    {
+        var counts = new Dictionary<string, long> { ["big"] = 900, ["tiny"] = 5, ["mid"] = 40, ["tie"] = 40 };
+        string[] spec = ["unknown1", "big", "mid", "unknown2", "tiny", "tie"];
+        Assert.Equal(["tiny", "mid", "tie", "big", "unknown1", "unknown2"], InputOrder.Order(spec, t => t, counts));
+    }
+
+    /// <summary>The spec lists the fact first; the deploy reads the three-row dimension first.</summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task Deploy_ReadsInputsSmallestFirst(int workers)
+    {
+        await Seed(dimRows: 3, factRows: 6);
+        var engine = new DbspNetEngine(workers, broadcastMaxRows: 0);
+        Assert.Equal(["dim", "fact"], (await engine.DeployAsync(Spec(snapshotDir: null))).InputOrder);
+        await RunBatch(engine);
+        await AssertTotals();
+    }
+
+    [Fact]
+    public async Task Deploy_KeepsTheSpecOrder_WhenAsked()
+    {
+        await Seed(dimRows: 3, factRows: 6);
+        var engine = new DbspNetEngine(workers: 4, inputsBySize: false);
+        Assert.Equal(["fact", "dim"], (await engine.DeployAsync(Spec(snapshotDir: null))).InputOrder);
+        await RunBatch(engine);
+        await AssertTotals();
+    }
+
+    /// <summary>An input empty at deploy has no known size, so it goes after the inputs that have one.</summary>
+    [Fact]
+    public async Task Deploy_PutsAnInputEmptyAtDeployLast()
+    {
+        await Seed(dimRows: 0, factRows: 6);
+        var engine = new DbspNetEngine(workers: 4);
+        Assert.Equal(["fact", "dim"], (await engine.DeployAsync(Spec(snapshotDir: null))).InputOrder);
+        await AppendDim(3);
+        await RunBatch(engine);
+        await AssertTotals();
+    }
+
+    /// <summary>The order is not part of the snapshot: a restore that reads the inputs in another order
+    /// resumes, and stays correct.</summary>
+    [Fact]
+    public async Task Restore_UnderTheOtherOrder_StaysCorrect()
+    {
+        var snapshotDir = Path.Combine(_root, "snap-order");
+        await Seed(dimRows: 3, factRows: 6);
+        var first = new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch, inputsBySize: true);
+        Assert.Equal(["dim", "fact"], (await first.DeployAsync(Spec(snapshotDir))).InputOrder);
+        await RunBatch(first);
+
+        await AppendDim(2);
+        await AppendFact(4);
+        var second = new DbspNetEngine(workers: 4, CheckpointPolicy.EveryBatch, inputsBySize: false);
+        var redeploy = await second.DeployAsync(Spec(snapshotDir));
+        Assert.True(redeploy.RestoredTick > 0);
+        Assert.Equal(["fact", "dim"], redeploy.InputOrder);
         await RunBatch(second);
         await AssertTotals();
     }

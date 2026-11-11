@@ -1,6 +1,7 @@
 # TPC-DI batch 1 at twelve workers: where the time goes, and the plan
 
-Status: design pass, 2026-11-10. Measurements below are at `2798958`. Nothing has been built yet.
+Status: in progress. §1–§2 were measured at `2798958`. Broadcast joins (§4a) and smallest-first input
+order (§4c) have shipped; batch 1 is now within ~4% of Feldera locally (§4c).
 
 ## 0. Why, and the target
 
@@ -139,6 +140,52 @@ the long-run per-row difference. A–D work inside the current design.
 5. **Profile tick 18 alone (lever F)** once A–D have landed, then re-rank what's left.
 6. **Re-pin ivm-bench** when the local A/B shows a net gain against `f02030d`, the current upstream
    pin. Drop the Dockerfile's `git submodule update --init` step in the same commit.
+
+## 4c. Input order: load the dimensions first (2026-11-11)
+
+Chasing the financials skew left over from §4a turned up a different cause. `financials` left-joins
+`finwire_financial` to `companies` twice: on CIK for half the FIN records, and on company name for
+the other half. Each half has a NULL key in the other join, and the CIK join never matches anyway
+(`CAST(81 AS VARCHAR)` is `'81'`, the company IDs are `'0000000081'`). So ~49k rows get a NULL
+`company_id`. That is the same SQL Feldera runs. But per-op tracing showed the window ops getting all
+98,576 rows in **one** partition on one tick, then 102k rows of retractions and re-inserts on the
+next. `companies` was still empty when `finwire` arrived.
+
+That's the input order. Batch 1 ingests one source version per tick, in spec order. ivm-bench's spec
+lists `staging_*` first and then `batch1_*` alphabetically, so `industry`, `status_type`, and the
+five-row `trade_type` arrive at ticks 13, 14 and 18, after 2.3M fact rows. Until a dimension arrives,
+every left join pads the facts and every inner join builds fact-sized state. When it lands, all of
+that is retracted and recomputed, along with the windows and aggregates downstream. Ticks 14 and 18
+(1.9 s and 3.1 s) were mostly this.
+
+**Built (server, default on).** `DbspNetEngine` reads inputs smallest first, by the same Delta-log
+counts broadcast uses (now read once). Inputs of unknown or zero size go last, in spec order.
+`DBSPNET_INPUT_ORDER=spec` keeps the spec's order (`InputOrder`). The order isn't recorded with a
+checkpoint: it changes no result and no state layout, and the tick journal replays by source name.
+`DeployResult.InputOrder` reports it, and `IvmMultiBatch` follows the same default
+(`IVM_INPUT_ORDER=spec` to compare).
+
+Interleaved A/B, five runs per arm, broadcast ≤ 1,000 in both, all three batches, views identical in
+all ten runs and to §4a's:
+
+| | batch-1 drain median | output | drain + output | alloc | batches 2 / 3 |
+|---|---|---|---|---|---|
+| spec order | 14.30 s | 1.48 s | 15.76 s | 53.74 GiB | ~0.10 / 0.11 s |
+| **smallest first** | **12.92 s (−9.7%; 5 of 5 pairs)** | 1.66 s | **14.43 s (−8.4%)** | **46.58 GiB (−13%)** | unchanged |
+
+Against Feldera's 13.9 s (§4b), batch 1 is now 1.04× locally, down from 1.24× before §4a. Output
+writes went up ~0.2 s; that's unexplained.
+
+**Tried, not built: one engine step per batch.** Pushing every source and then stepping once gave a
+drain of 11.74 s and 42.3 GiB in one run, with identical views. Drain plus output (13.9 s) was about
+the same as smallest first, though, because output rose to 2.2 s. Batches 2 and 3 doubled to ~0.25 s.
+And one tick holding the whole batch works against the bounded-memory work, whose spilling assumes a
+tick per source. Smallest first gets most of the gain and keeps the per-source ticks.
+
+**Still open in financials:** the NULL-`company_id` window partition (~0.3 s, once, on one worker)
+comes from the SQL itself. Op 470, the `finwire_financial` parse, takes 4.9 CPU-s and 1.5 GiB for
+102k lines (~48 µs and ~15 KB per line). It's balanced across workers, but that much per row looks
+like a per-call cost, such as compiling the `RLIKE` regex on every call.
 
 ## 4b. Step 1 result: Feldera at SF=3 on the M4 (2026-11-11)
 
