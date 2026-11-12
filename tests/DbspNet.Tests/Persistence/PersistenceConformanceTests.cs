@@ -274,6 +274,8 @@ public class PersistenceConformanceTests : IDisposable
             ["PartitionedTopKNarrowOp"] = "a narrowed variant the planner picks by shape; not selectable from SQL directly",
             ["LinearAggregateOp"] = "typed single-query path only (the program path compiles structurally); " +
                                     "LinearAggregateTests restores it mid-stream and from a legacy-operator snapshot",
+            ["StarLeftJoinOp"] = "forms only when compile options give row counts (a small-dimension run); " +
+                                 "StarJoinTests restores it in all four write/read layouts and continues it against the chain",
             ["PartitionedTopKOp"] = "the Legacy state arm (PartitionedTopKStateMode); the default is " +
                                     "PartitionedTopKCompactOp. PartitionedTopKSnapshotTests restores across both arms",
         };

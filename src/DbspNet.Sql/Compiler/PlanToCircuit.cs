@@ -3943,6 +3943,12 @@ public static partial class PlanToCircuit
         CompileContext ctx,
         LinearStage? post = null)
     {
+        // A run of LEFT joins against small dimensions compiles as one star operator (§5.48).
+        if (TryCompileStarJoin(builder, plan, ctx, post) is { } star)
+        {
+            return star;
+        }
+
         // A residual makes match-presence per (key, left row); the operator handles it (§3.30)
         // except where ResidualInOperator says the anti-join rewrite must.
         if (!ResidualInOperator(plan, ctx))

@@ -3829,3 +3829,74 @@ large-member index it needs is already in stage 2. Do not build the reorder now.
 drops the large-member index to shrink the op, or if another workload shows interleaved runs with no
 view to hint. The soundness argument above stands either way, and side condition 2 is the check any
 future join reordering here has to make.
+
+#### 5.48.9 Stage 2: the operator and the compiler
+
+**Built.** `StarLeftJoinOp` (Core) and `TryCompileStarJoin` (`PlanToCircuit.StarJoin.cs`), on by default,
+`DBSPNET_STAR_JOIN=off` (or `StarJoinMode.Enabled`) compiles the chain.
+
+*The match.* `CompileLeftOuterJoin` first tries the star. From the join it was called for, the compiler walks
+down the left spine through projections and inlined references, collecting members. A member is a LEFT join
+with an equi-key, no null-safe keys, a residual the operator takes (`ResidualInOperator`), no join-key GC,
+and a leaf right side that is small: broadcast at W>1 (`ShouldBroadcastRight`), or at W=1 the same size test
+on `RelationRowCounts`. No node on the way may be shared (`SharedPlanNodes`) or already compiled. Every
+expression of the run is then rewritten, by `SubstituteViaProjection` through the projections between the
+members, over one *combined row*: the run's input row, then each member's dimension row, bottom member
+first. A member's key must read only the input row; its residual, the input row and its own dimension. A
+member whose key reads an earlier member's column (`split` in the tests) cuts the run. The run restarts
+above it, and the joins up to it become the run's input, where a run of their own may form. A run needs two
+members. The top member's consumer projection (the §5.47 fold) is the output. It reads the top join's left
+columns lazily, as expressions over the combined row, so a projection that drops most columns never
+evaluates them. Without a projection, the output is the top join's row. No intermediate row is built.
+
+*The operator.* Its state is one fact trace keyed by the tuple of every member's key (nullable columns, a
+NULL component pads that member), valued by the run's input row, and one trace per dimension, as a join's
+right trace. Its input is the run's input stream with its Filter/Project chain fused in, and each member's
+right side, NULL keys dropped and broadcast at W>1. The step implements §5.48.4's
+`Σ_{ΔF} g(r, D′) + Σ_{F affected} (g(r, D′) − g(r, D))`. A residual decides match presence per (row,
+member): some row of the key passes it, as `ResidualOuterJoin` decides. A dimension's groups are cached per
+key, kept while the dimension does not change, and reset past 2¹⁷ entries, because unmatched keys cache too.
+The fact's indexed delta is built in the trace's block format (`DeltaSpillGroups.For`), so a huge one spills
+as it is built and the trace adopts its runs, as an index pass's does.
+
+*The directory, changed from §5.48.2.* Stage 1 showed the 72K-key `dim_household` is cheaper *inside* the
+tuple than as a per-key index, so v1 has no per-key indexes: every member joins the tuple. The directory is
+then a set of the tuples the trace may hold, a superset filled as rows arrive. It is capped at 2¹⁶ tuples a
+worker (with `dim_household` in the tuple, ~2.7M would be a managed set of GBs), and it is not persisted. With
+no directory (past the cap, or after a restore), a dimension change scans the fact trace's keys (blocked:
+`StreamEntries`, keys only), re-evaluates the affected groups, and rebuilds the directory if it fits. That tick
+also adds its own delta's tuples, which the scan of the old fact cannot see: the checkpoint test caught that
+case. In this workload no dimension changes while the fact is non-empty, so the scan never runs.
+
+*Placement and snapshot.* At W>1 the fact never moves; every member is replicated. `fact.arrows` is
+`ReshardPlacement.Anywhere` and each `dimN.arrows` is `OnEveryWorker`. The output claims no partition. A new
+operator type, so checkpoints from before do not restore unless `DBSPNET_STAR_JOIN=off`. Each op's delegates
+are made in methods of their own: a lambda in `TryCompileStarJoin` would share a closure with the one that
+captures the builder (the §5.47 landmine).
+
+**Tests** (`StarJoinTests`, 14, plus a conformance exemption: the conformance shapes compile without row
+counts, so no star forms there). Over 16 ticks of signed streams in which every dimension changes while the
+fact holds rows (a key gaining and losing its only row, a key with two rows, NULL keys on both sides,
+duplicate fact rows, deletes, a pair residual `f.amt >= d3.lo`, two-column and computed `COALESCE` keys):
+- star ≡ chain on every tick, managed and blocked, and ≡ a from-scratch recompute of all inputs in one tick;
+- the runs form where they should: four members; two with no consumer projection; the `split` view as two
+  runs of two around the join whose key reads a member's column; none across a filter on the padded side;
+  none without row counts;
+- W=2/4/8 ≡ the serial chain;
+- the four checkpoint write/read layouts continue ≡ the chain, through the directory-less key scan;
+- past a directory cap of 3, dimension changes scan the keys and stay right;
+- each star reaches exactly its k+2 streams, serial and in every replica.
+
+**Mutants**, each run against `StarJoinTests`:
+
+| mutant | result |
+|---|---|
+| affected rows not re-evaluated | 11 fail |
+| old dimensions used for ΔF | 11 fail |
+| ΔF tuples not added to the directory | 11 fail |
+| a dimension's cache not renewed after it changes | 11 fail |
+| the residual ignored | 11 fail |
+| a rebuilt directory missing its tick's delta (the bug above) | 4 fail (the checkpoint tests) |
+| a NULL fact key looked up; or the right side keeping NULL keys | 0 fail each: equivalent, either guard alone keeps a NULL from matching. Both removed: 11 fail |
+
+**Suites:** default, forced and forced+critical, 3,689 each (3,688 pass, 1 skipped as before).

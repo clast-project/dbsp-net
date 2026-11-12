@@ -956,6 +956,24 @@ public static class StatefulOperators
         return output;
     }
 
+    /// <summary>A run of LEFT joins against small dimensions as one operator
+    /// (<see cref="StarLeftJoinOp"/>, docs/design-bounded-memory.md §5.48).</summary>
+    internal static Stream<ZSet<StructuralRow, Z64>> StarLeftJoin(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> fact,
+        Func<StructuralRow, StructuralRow?>? pre,
+        Func<StructuralRow, StructuralRow> tupleOf,
+        StarMember[] members,
+        Func<StructuralRow, StructuralRow?[], StructuralRow> build,
+        IGroupTrace<StructuralRow, StructuralRow, Z64> factTrace,
+        IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64>? factCodec)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new StarLeftJoinOp(fact, pre, tupleOf, members, build, factTrace, factCodec, output));
+        return output;
+    }
+
     /// <summary>The structural LEFT OUTER join with a residual ON conjunct, managed traces
     /// (docs/design-flat-trace-state.md §3.30).</summary>
     internal static Stream<ZSet<StructuralRow, Z64>> ResidualLeftJoin(
