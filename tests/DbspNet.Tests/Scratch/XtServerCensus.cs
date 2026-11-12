@@ -148,6 +148,31 @@ public class XtServerCensus
                 }
 
                 prof.Clear();
+
+                // Ranks by phase (PartitionedRankOp.Phase), summed over replicas, then reset.
+                var phases = new Dictionary<int, long[]>();
+                foreach (var replica in replicas)
+                {
+                    for (var k = 0; k < replica.Operators.Count; k++)
+                    {
+                        if (replica.Operators[k].GetType().GetField("Phase", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(replica.Operators[k]) is long[] ph)
+                        {
+                            var sum = phases.TryGetValue(k, out var acc) ? acc : phases[k] = new long[ph.Length];
+                            for (var q = 0; q < ph.Length; q++)
+                            {
+                                sum[q] += ph[q];
+                                ph[q] = 0;
+                            }
+                        }
+                    }
+                }
+
+                foreach (var (k, ph) in phases.Where(kv => kv.Value.Take(6).Sum() >= (1L << 30)).OrderByDescending(kv => kv.Value.Take(6).Sum()))
+                {
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"RANKPHASE tick={t} op={k} slicing_mib={ph[0] >> 20} old_mib={ph[1] >> 20} integrate_mib={ph[2] >> 20} new_mib={ph[3] >> 20} emit_mib={ph[4] >> 20} endtick_mib={ph[5] >> 20} delta_rows={ph[6]} slices={ph[7]} touched={ph[8]} rows_read={ph[9]}"));
+                }
+
                 log.Flush();
             }
 

@@ -59,6 +59,20 @@ internal static class DeltaSpill
 
         return Unsafe.As<ZSetBuilder<TKey, TWeight>>(Rows(format, capacity));
     }
+
+    /// <summary>As <see cref="For{TKey, TWeight}(object?, int)"/>, for one of <paramref name="parts"/>
+    /// builders filled side by side (<see cref="Rows(object?, int, int)"/>).</summary>
+    public static ZSetBuilder<TKey, TWeight> For<TKey, TWeight>(object? format, int capacity, int parts)
+        where TKey : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        if (format is null || typeof(TKey) != typeof(StructuralRow) || typeof(TWeight) != typeof(Z64))
+        {
+            return new ZSetBuilder<TKey, TWeight>(capacity);
+        }
+
+        return Unsafe.As<ZSetBuilder<TKey, TWeight>>(Rows(format, capacity, parts));
+    }
 }
 
 /// <summary>

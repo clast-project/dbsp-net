@@ -195,6 +195,8 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
         var builder = Blocks.DeltaSpill.For<TOutRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         var slices = SliceCount(delta.Count);
+        Phase[6] += delta.Count;
+        Phase[7] += slices;
         if (slices <= 1)
         {
             StepPartitions(delta, builder);
@@ -211,6 +213,22 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
     /// <summary>Steps that ran in partition-hash slices (diagnostics, tests).</summary>
     internal static long SlicedSteps;
+
+    /// <summary>Non-empty slices stepped (diagnostics, tests).</summary>
+    internal static long SliceSteps;
+
+    /// <summary>Diagnostics (the xt harness): bytes this operator allocated by phase, summed over steps
+    /// until reset: 0 slicing passes, 1 old rows, 2 integrate, 3 new rows, 4 emit, 5 end tick; then
+    /// 6 delta rows, 7 slices, 8 touched partitions, 9 rows read (old + new).</summary>
+    internal readonly long[] Phase = new long[10];
+
+    private static long Mark(ref long since)
+    {
+        var now = GC.GetAllocatedBytesForCurrentThread();
+        var d = now - since;
+        since = now;
+        return d;
+    }
 
     private const int MaxSlices = 256;
 
@@ -239,43 +257,44 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         return (int)(((ulong)h * (uint)slices) >> 32);
     }
 
-    // One pass hashes every row's partition into its slice; then each slice takes one pass over the
-    // delta for its rows, which are stepped as a delta of their own. The delta is immutable and
-    // enumerates in the same order every pass.
+    // One pass splits the delta into its slices, each a builder that spills its share of the step chunk
+    // (the delta's own format), so every row is decoded from the delta once rather than once per slice:
+    // on issue #2's calibrated extended TPC-DS a 36M-row delta in 144 slices spent half its rank's
+    // allocation re-reading the delta (§5.45). A slice no row reaches costs nothing.
     private void StepSliced(ZSet<TInRow, Z64> delta, ZSetBuilder<TOutRow, Z64> builder, int slices)
     {
         Interlocked.Increment(ref SlicedSteps);
-        var sliceOf = new byte[delta.Count];
-        var n = 0;
-        foreach (var (row, _) in delta)
+        var t0 = GC.GetAllocatedBytesForCurrentThread();
+        long inner0 = Phase[1] + Phase[2] + Phase[3] + Phase[4] + Phase[5];
+        var parts = new ZSetBuilder<TInRow, Z64>?[slices];
+        foreach (var (row, weight) in delta)
         {
-            sliceOf[n++] = (byte)SliceOf(_partitionOf(row), slices);
+            var s = SliceOf(_partitionOf(row), slices);
+            (parts[s] ??= Blocks.DeltaSpill.For<TInRow, Z64>(_input.DeltaFormat, 0, slices)).Add(row, weight);
         }
 
-        var part = new List<KeyValuePair<TInRow, Z64>>();
+        // Each slice is decoded once, into a list its step enumerates as often as it needs (a spilled
+        // slice would decode again on every pass).
+        var rows = new List<KeyValuePair<TInRow, Z64>>();
         for (var s = 0; s < slices; s++)
         {
-            part.Clear();
-            var i = 0;
-            foreach (var kv in delta)
+            if (parts[s] is { } part)
             {
-                if (sliceOf[i++] == s)
-                {
-                    part.Add(kv);
-                }
-            }
-
-            if (part.Count > 0)
-            {
-                StepPartitions(part, builder);
+                parts[s] = null;
+                Interlocked.Increment(ref SliceSteps);
+                rows.Clear();
+                rows.AddRange(part.Build());
+                StepPartitions(rows, builder);
             }
         }
 
-        if (part.Capacity > Blocks.OrderedPartitionStore.KeepCapacity)
+        if (rows.Capacity > Blocks.OrderedPartitionStore.KeepCapacity)
         {
-            part.Clear();
-            part.TrimExcess();
+            rows.Clear();
+            rows.TrimExcess();
         }
+
+        Phase[0] += GC.GetAllocatedBytesForCurrentThread() - t0 - (Phase[1] + Phase[2] + Phase[3] + Phase[4] + Phase[5] - inner0);
     }
 
     // A set of partitions' rows of the delta (all of it, or one slice): integrate them and emit the
@@ -284,6 +303,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     {
         // Only the partitions a tick touches can change their ranking: each one's rows before the
         // delta, read now (in order, as the next read after the delta will be).
+        var since = GC.GetAllocatedBytesForCurrentThread();
         var touched = new Dictionary<TKey, List<(TInRow Row, long Weight)>>(_partitionComparer);
         foreach (var (row, _) in delta)
         {
@@ -298,6 +318,13 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
                 // A partition with a stored output needs no copy of its old rows.
                 touched[key] = _window.ContainsKey(key) ? null! : Current(key);
             }
+        }
+
+        Phase[1] += Mark(ref since);
+        Phase[8] += touched.Count;
+        foreach (var b in touched.Values)
+        {
+            Phase[9] += b?.Count ?? 0;
         }
 
         if (_store is not null)
@@ -332,9 +359,17 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             }
         }
 
+        Phase[2] += Mark(ref since);
+        long readNew = 0, emit = 0;
         foreach (var (key, before) in touched)
         {
+            var at = GC.GetAllocatedBytesForCurrentThread();
             var after = Current(key);
+            Phase[9] += after.Count;
+            var mid = GC.GetAllocatedBytesForCurrentThread();
+            readNew += mid - at;
+            try
+            {
             if (before is not null && before.Count <= _storedOutputRows && after.Count <= _storedOutputRows)
             {
                 EmitDiff(builder, before, after);
@@ -354,9 +389,18 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             {
                 _window[key] = newWindow;
             }
+            }
+            finally
+            {
+                emit += GC.GetAllocatedBytesForCurrentThread() - mid;
+            }
         }
 
+        Phase[3] += readNew;
+        Phase[4] += emit;
+        Mark(ref since);
         _store?.EndTick();
+        Phase[5] += Mark(ref since);
     }
 
     // A partition's rows after this tick, in order, consolidated.

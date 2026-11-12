@@ -5,6 +5,8 @@
 // between slices. Required: every tick's outputs equal an unsliced twin's (ROW_NUMBER, RANK and
 // DENSE_RANK, inserts, deletes and multiplicities), and a huge step holds only a slice's partitions.
 using System.Reflection;
+using DbspNet.Core.Collections;
+using DbspNet.Core.Operators.Stateful;
 using DbspNet.Core.Operators.Stateful.Blocks;
 using DbspNet.Persistence;
 using DbspNet.Sql.Compiler;
@@ -105,6 +107,55 @@ public class RankSliceTests
 
     [Fact]
     public void Forced_step_spill_slices_and_matches() => Run(stepRows: 0, forcedChunk: 7);
+
+    // Two partitions fill at most two slices of a sliced step: the step reads the delta once and
+    // steps only the slices a row reached (§5.45).
+    [Fact]
+    public void A_step_runs_only_the_slices_its_rows_reach()
+    {
+        string[] sql =
+        [
+            "CREATE TABLE g (a INT NOT NULL, b INT NOT NULL)",
+            "CREATE VIEW gr AS SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a % 2 ORDER BY b, a) AS r FROM g",
+        ];
+        var views = new HashSet<string>(["gr"], StringComparer.Ordinal);
+        CompiledProgram Make()
+        {
+            using var blocks = TraceBlocksMode.Use(join: true, freezeEntries: 16, blockEntries: 4, window: true);
+            using var writeBack = SpillSettings.UseWindowWriteBack(0);
+            return SqlProgram.Compile(sql, views, ArrowSqlSnapshotCodecs.Instance);
+        }
+
+        var plain = Make();
+        CompiledProgram sliced;
+        using (SpillSettings.UseStepSpill(100))
+        {
+            sliced = Make();
+        }
+
+        for (var tick = 0; tick < 3; tick++)
+        {
+            foreach (var (p, rows) in new[] { (plain, (long?)null), (sliced, 100L) })
+            {
+                using var _ = SpillSettings.UseStepSpill(rows);
+                for (var a = 0; a < 2_000; a++)
+                {
+                    p.Table("g").Insert(a + (tick * 10_000), (a * 7919) % 1_000);
+                }
+
+                var (steps, slices) = (PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SlicedSteps, PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SliceSteps);
+                p.Step();
+                if (rows is not null)
+                {
+                    Assert.Equal(1, PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SlicedSteps - steps);
+                    Assert.InRange(PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SliceSteps - slices, 1, 2);
+                }
+            }
+
+            var rowsOf = (CompiledProgram p) => string.Join(";", p.Outputs["gr"].CurrentView.Select(e => $"{e.Key[0]}|{e.Key[1]}|{e.Key[2]}#{e.Value.Value}").Order(StringComparer.Ordinal));
+            Assert.Equal(rowsOf(plain), rowsOf(sliced));
+        }
+    }
 
     [Fact]
     public void A_huge_step_holds_only_a_slices_partitions()
