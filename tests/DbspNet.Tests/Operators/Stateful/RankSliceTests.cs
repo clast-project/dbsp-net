@@ -143,12 +143,13 @@ public class RankSliceTests
                     p.Table("g").Insert(a + (tick * 10_000), (a * 7919) % 1_000);
                 }
 
-                var (steps, slices) = (PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SlicedSteps, PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SliceSteps);
+                var rank = p.Circuit.Operators.OfType<PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>>().Single();
+                var (steps, slices) = (rank.SlicedSteps, rank.SliceSteps);
                 p.Step();
                 if (rows is not null)
                 {
-                    Assert.Equal(1, PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SlicedSteps - steps);
-                    Assert.InRange(PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>.SliceSteps - slices, 1, 2);
+                    Assert.Equal(1, rank.SlicedSteps - steps);
+                    Assert.InRange(rank.SliceSteps - slices, 1, 2);
                 }
             }
 

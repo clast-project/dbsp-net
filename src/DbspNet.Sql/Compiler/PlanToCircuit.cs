@@ -143,7 +143,10 @@ public static partial class PlanToCircuit
                 var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
                 var ctx = new CompileContext(
                     streams, tableSchemas, codec, snapshotCodecs, options, monotonicity,
-                    emptyFrontiers, emptyShareable, workers, options.RelationRowCounts);
+                    emptyFrontiers, emptyShareable, workers, options.RelationRowCounts)
+                {
+                    SharedPlans = SharedPlanNodes(plan),
+                };
 
                 foreach (var (name, info) in tables)
                 {
@@ -295,6 +298,7 @@ public static partial class PlanToCircuit
                     streams, tableSchemas, codec, snapshotCodecs, options, monotonicity, frontiers, shareable)
                 {
                     SingleUseCtes = SingleUseCtes(plan),
+                    SharedPlans = SharedPlanNodes(plan),
                 };
                 queryStream = CompilePlan(builder, plan, ctx);
             }
@@ -487,6 +491,7 @@ public static partial class PlanToCircuit
                     {
                         InlineViews = inlineViews,
                         SingleUseCtes = SingleUseCtes(optimizedQuery, inlineViews),
+                        SharedPlans = SharedPlanNodes(optimizedQuery, inlineViews),
                     };
                     // Tag every operator this view creates with its name, so a runtime
                     // profile can attribute per-operator cost to the view (observability).
@@ -704,6 +709,7 @@ public static partial class PlanToCircuit
                         emptyFrontiers, emptyShareable, workers, rowCounts)
                     {
                         Reshard = reshard,
+                        SharedPlans = SharedPlanNodes(optimized),
                     };
                     // The scan streams (this program's tables) are whole-row-hashed
                     // inputs → shard-disjoint. A view-scan resolves to that view's
@@ -1301,6 +1307,11 @@ public static partial class PlanToCircuit
         /// <summary>CTEs referenced exactly once in this compile (and not recursive), which
         /// compile inline at that reference (<see cref="InlineSingleUseMode"/>).</summary>
         public IReadOnlySet<CteRef>? SingleUseCtes { get; init; }
+
+        /// <summary>Plan nodes this compile reaches by more than one parent (by reference, as
+        /// <see cref="Optimizer.PlanCse"/> shares them), from <see cref="SharedPlanNodes"/>.
+        /// Null where not computed: a join then never folds its consumer's projection.</summary>
+        public IReadOnlySet<LogicalPlan>? SharedPlans { get; init; }
 
         /// <summary>Optimized bodies of inlined CTEs, so each is optimized once.</summary>
         public Dictionary<CteRef, LogicalPlan> InlinedCteBodies { get; } = new();
@@ -1978,6 +1989,51 @@ public static partial class PlanToCircuit
                     break;
                 case RecursiveCtePlan r:
                     recursive.Add(r.SelfRef);
+                    ForEachChild(r, Walk);
+                    break;
+                default:
+                    ForEachChild(p, Walk);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The plan nodes reached through more than one parent under <paramref name="root"/>, by
+    /// reference, walking into inlined view bodies and each CTE body once (as
+    /// <see cref="CountReferences"/> does). A node reached twice is not walked twice.
+    /// </summary>
+    internal static IReadOnlySet<LogicalPlan> SharedPlanNodes(
+        LogicalPlan root, IReadOnlyDictionary<string, LogicalPlan>? inlineViews = null)
+    {
+        var seen = new HashSet<LogicalPlan>(ReferenceEqualityComparer.Instance);
+        var shared = new HashSet<LogicalPlan>(ReferenceEqualityComparer.Instance);
+        var ctes = new HashSet<CteRef>();
+        Walk(root);
+        return shared;
+
+        void Walk(LogicalPlan p)
+        {
+            if (!seen.Add(p))
+            {
+                shared.Add(p);
+                return;
+            }
+
+            switch (p)
+            {
+                case ScanPlan s when inlineViews is not null && inlineViews.TryGetValue(s.TableName, out var view):
+                    Walk(view);
+                    break;
+                case CteScanPlan c:
+                    if (ctes.Add(c.Cte))
+                    {
+                        Walk(c.Cte.Plan);
+                    }
+
+                    break;
+                case RecursiveCtePlan r:
+                    ctes.Add(r.SelfRef);
                     ForEachChild(r, Walk);
                     break;
                 default:
@@ -3158,7 +3214,22 @@ public static partial class PlanToCircuit
         CompileContext ctx)
     {
         var (inputPlan, stages) = CollectLinearStages(plan, ctx);
-        var input = CompilePlan(builder, inputPlan, ctx);
+        var hasMap = stages.Exists(st => st.Kind == LinearStageKind.Map);
+        Stream<ZSet<StructuralRow, Z64>> input;
+        if (TryFoldJoinProjection(builder, plan, inputPlan, stages, ctx) is { } folded)
+        {
+            // The join built the first projection's rows; the rest of the chain runs as before.
+            input = folded;
+            stages.RemoveAt(0);
+            if (stages.Count == 0)
+            {
+                return input;
+            }
+        }
+        else
+        {
+            input = CompilePlan(builder, inputPlan, ctx);
+        }
 
         // No runtime stages (e.g. a chain of identity projections) → pass through.
         if (stages.Count == 0)
@@ -3199,16 +3270,6 @@ public static partial class PlanToCircuit
         // above), so a pure rename still propagates.
         if (ctx.Workers > 1)
         {
-            var hasMap = false;
-            foreach (var s in stages)
-            {
-                if (s.Kind == LinearStageKind.Map)
-                {
-                    hasMap = true;
-                    break;
-                }
-            }
-
             if (!hasMap)
             {
                 ctx.SetPartition(result, ctx.GetPartition(input));
@@ -3384,10 +3445,21 @@ public static partial class PlanToCircuit
 
         Stream<ZSet<StructuralRow, Z64>> input;
         LinearStage[] chain = [];
+        var projects = false;
         if (plan is FilterPlan or ProjectPlan && !ctx.PlanCache.ContainsKey(plan))
         {
             var (inputPlan, stages) = CollectLinearStages(plan, ctx);
-            input = CompilePlan(builder, inputPlan, ctx);
+            projects = stages.Exists(st => st.Kind == LinearStageKind.Map);
+            if (TryFoldJoinProjection(builder, plan, inputPlan, stages, ctx) is { } folded)
+            {
+                input = folded;
+                stages.RemoveAt(0);
+            }
+            else
+            {
+                input = CompilePlan(builder, inputPlan, ctx);
+            }
+
             chain = stages.ToArray();
         }
         else
@@ -3403,7 +3475,108 @@ public static partial class PlanToCircuit
             (_, null) => row => RunStages(chain, row, codec),
             (_, { } idx) => row => RunStages(chain, row, codec) is { } m && HasNoNullKey(m, idx) ? m : null,
         };
-        return (input, pre, chain.Any(st => st.Kind == LinearStageKind.Map));
+        return (input, pre, projects);
+    }
+
+    /// <summary>
+    /// A LEFT join whose rows a projection consumes, and nothing else, builds the projected
+    /// row straight from its two input rows (docs/design-bounded-memory.md §5.47): the joined
+    /// row, as wide as both sides, is never built only to be read once and dropped. Issue #2's
+    /// extended TPC-DS chains 15 LEFT joins over 36M fact rows, each projecting (join column
+    /// pruning) before the next. Folds only when <paramref name="stages"/> starts with that
+    /// projection (no filter between) and no node from <paramref name="top"/> down to the join
+    /// has another parent, so the join compiles exactly once. Null when it does not fold.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>>? TryFoldJoinProjection(
+        CircuitBuilder builder, LogicalPlan top, LogicalPlan inputPlan, List<LinearStage> stages, CompileContext ctx)
+    {
+        if (!JoinProjectionFoldMode.Enabled
+            || stages.Count == 0
+            || stages[0].Kind != LinearStageKind.Map
+            || inputPlan is not JoinPlan { JoinType: DbspNet.Sql.Parser.Ast.JoinType.LeftOuter } join
+            || ctx.SharedPlans is not { } shared
+            || ctx.PlanCache.ContainsKey(join)
+            || shared.Contains(join))
+        {
+            return null;
+        }
+
+        // The walk CollectLinearStages took: every node on it must have only this parent.
+        var node = top;
+        while (!ReferenceEquals(node, join))
+        {
+            if (shared.Contains(node))
+            {
+                return null;
+            }
+
+            node = Unwrap(node, ctx) ?? node switch
+            {
+                FilterPlan f => f.Input,
+                ProjectPlan p => p.Input,
+                _ => throw new InvalidOperationException($"unexpected {node.GetType().Name} on a linear chain"),
+            };
+        }
+
+        return CompileLeftOuterJoin(builder, join, ctx, stages[0]);
+    }
+
+    /// <summary>A joined row read in place: the left row's columns, then the right row's
+    /// (all NULL for a padded row). Only an expression's column reads see it.</summary>
+    private sealed class JoinedRowView : IReadOnlyList<object?>
+    {
+        [ThreadStatic]
+        private static JoinedRowView? _cached;
+
+        private StructuralRow _left = null!;
+        private StructuralRow? _right;
+        private int _leftCount;
+        private int _count;
+
+        public int Count => _count;
+
+        public object? this[int index] =>
+            index < _leftCount ? _left[index]
+            : (uint)index < (uint)_count ? _right?[index - _leftCount]
+            : throw new ArgumentOutOfRangeException(nameof(index));
+
+        /// <summary>The thread's view, aimed at one joined row. Not reentrant: the projection
+        /// that reads it builds its output before the next row is aimed.</summary>
+        public static JoinedRowView Of(StructuralRow left, StructuralRow? right, int leftCount, int rightCount)
+        {
+            var v = _cached ??= new JoinedRowView();
+            v._left = left;
+            v._right = right;
+            v._leftCount = leftCount;
+            v._count = leftCount + rightCount;
+            return v;
+        }
+
+        public IEnumerator<object?> GetEnumerator()
+        {
+            for (var i = 0; i < _count; i++)
+            {
+                yield return this[i];
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary><paramref name="stage"/>'s row for the join of <paramref name="left"/> and
+    /// <paramref name="right"/> (null: the NULL-padded row), without building the joined row.</summary>
+    private static StructuralRow ApplyMapJoined(
+        LinearStage stage, StructuralRow left, StructuralRow? right, int leftCount, int rightCount, IRowCodec<StructuralRow> codec)
+    {
+        var delegates = stage.Delegates!;
+        var values = new object?[delegates.Length];
+        var view = JoinedRowView.Of(left, right, leftCount, rightCount);
+        for (var i = 0; i < delegates.Length; i++)
+        {
+            values[i] = delegates[i](view);
+        }
+
+        return codec.BuildRow(stage.OutSchema!, values);
     }
 
     private static StructuralRow ApplyMap(
@@ -3762,16 +3935,32 @@ public static partial class PlanToCircuit
             combine, residual);
     }
 
+    /// <param name="post">A projection of the joined row to build in its place
+    /// (<see cref="TryFoldJoinProjection"/>); the output is then that projection's rows.</param>
     private static Stream<ZSet<StructuralRow, Z64>> CompileLeftOuterJoin(
         CircuitBuilder builder,
         JoinPlan plan,
-        CompileContext ctx)
+        CompileContext ctx,
+        LinearStage? post = null)
     {
         // A residual makes match-presence per (key, left row); the operator handles it (§3.30)
         // except where ResidualInOperator says the anti-join rewrite must.
         if (!ResidualInOperator(plan, ctx))
         {
-            return CompileOuterJoinWithResidual(builder, plan, ctx);
+            var rewritten = CompileOuterJoinWithResidual(builder, plan, ctx);
+            if (post is not { } residualMap)
+            {
+                return rewritten;
+            }
+
+            // Never capture ctx in an operator's delegate: the release planner walks closures for the
+            // streams an operator reads, and ctx reaches every stream compiled so far (it would hold
+            // them all to this operator's step).
+            AttachDeltaFormat(rewritten, plan.Schema);
+            var residualCodec = ctx.Codec;
+            var projected = builder.MapRows(rewritten, row => ApplyMap(residualMap, row, residualCodec));
+            AttachDeltaFormat(projected, residualMap.OutSchema!);
+            return projected;
         }
 
         var pairResidual = PairResidual(plan);
@@ -3872,8 +4061,12 @@ public static partial class PlanToCircuit
             builder, ctx,
             leftIndexed,
             rightIndexed,
-            joinCombine: (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
-            nullPadCombine: (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
+            joinCombine: post is { } map
+                ? (_, lrow, rrow) => ApplyMapJoined(map, lrow, rrow, leftCount, rightCount, codec)
+                : (_, lrow, rrow) => MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount),
+            nullPadCombine: post is { } padMap
+                ? (_, lrow) => ApplyMapJoined(padMap, lrow, null, leftCount, rightCount, codec)
+                : (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers <= 1 ? null
                 : broadcastRight ? ReshardPlacement.Anywhere : ReshardPlacement.WholeRow(leftKeySchema),
@@ -3884,12 +4077,23 @@ public static partial class PlanToCircuit
 
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
-        AttachDeltaFormat(joined, joinedSchema);
+        var outSchema = post?.OutSchema ?? joinedSchema;
+        AttachDeltaFormat(joined, outSchema);
         var result = nullKeyLeft is null
             ? joined
-            : builder.Union(joined, builder.MapRows(
+            : builder.Union(joined, builder.MapRows<StructuralRow, StructuralRow, Z64>(
                 nullKeyLeft,
-                row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount)));
+                post is { } nullMap
+                    ? row => ApplyMapJoined(nullMap, row, null, leftCount, rightCount, codec)
+                    : row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount)));
+        AttachDeltaFormat(result, outSchema);
+
+        // A folded projection may move or drop the key columns: no partition claim (as
+        // CompileLinearChain records none past a projection).
+        if (post is not null)
+        {
+            return result;
+        }
 
         // Every output row (matched, padded by the operator, or NULL-key bypass)
         // carries its left row's key columns at the same indices and sits on the

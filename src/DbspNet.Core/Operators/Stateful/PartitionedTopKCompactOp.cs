@@ -217,12 +217,66 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
     }
 
     // The blocked step: each touched partition's window read from the store before the delta and
-    // after it, then diffed.
+    // after it, then diffed. A delta past the step chunk is stepped a slice of partitions at a time
+    // (§5.47, D5 as for rank, §5.43): on issue #2's extended TPC-DS a 36M-row tick-18 delta collected
+    // whole and every touched partition loaded at once ran the TOP-K out of memory at the 48 GiB cap.
     private void StepBlocked(ZSet<TRow, Z64> delta)
     {
         _touched.Clear();
         _oldWindows.Clear();
-        var changes = new List<(StructuralRow Key, StructuralRow Row, long Weight)>(delta.Count);
+        var builder = Blocks.DeltaSpill.For<TRow, Z64>(_output.DeltaFormat, _lastOutputSize);
+        var slices = Blocks.PartitionSlicing.Count(blocked: true, delta.Count);
+        if (slices <= 1)
+        {
+            StepBlockedPartitions(delta, delta.Count, builder);
+        }
+        else
+        {
+            SlicedSteps++;
+
+            // One pass splits the delta, each slice a builder that spills its share; each slice is
+            // decoded once, into a list (a spilled slice would decode again on every pass).
+            var parts = new ZSetBuilder<TRow, Z64>?[slices];
+            foreach (var (row, weight) in delta)
+            {
+                var key = _partitionOf(row);
+                var s = Blocks.PartitionSlicing.Of(_partitionComparer?.GetHashCode(key) ?? key!.GetHashCode(), slices);
+                (parts[s] ??= Blocks.DeltaSpill.For<TRow, Z64>(_input.DeltaFormat, 0, slices)).Add(row, weight);
+            }
+
+            var rows = new List<KeyValuePair<TRow, Z64>>();
+            for (var s = 0; s < slices; s++)
+            {
+                if (parts[s] is { } part)
+                {
+                    parts[s] = null;
+                    SliceSteps++;
+                    rows.Clear();
+                    rows.AddRange(part.Build());
+                    StepBlockedPartitions(rows, rows.Count, builder);
+                    _touched.Clear();
+                    _oldWindows.Clear();
+                }
+            }
+        }
+
+        var result = builder.Build();
+        _lastOutputSize = result.Count;
+        _output.SetCurrent(result);
+        TrimScratch();
+    }
+
+    /// <summary>This operator's steps that ran in partition-hash slices (diagnostics, tests).</summary>
+    internal long SlicedSteps;
+
+    /// <summary>This operator's non-empty slices stepped (diagnostics, tests).</summary>
+    internal long SliceSteps;
+
+    // A set of partitions' rows of the delta (all of it, or one slice): integrate them and emit the
+    // change in their windows; the store may then drop its cache (EndTick, per slice).
+    private void StepBlockedPartitions(IEnumerable<KeyValuePair<TRow, Z64>> delta, int count, ZSetBuilder<TRow, Z64> builder)
+    {
+        var changes = new List<(StructuralRow Key, StructuralRow Row, long Weight)>(count);
         foreach (var (row, dw) in delta)
         {
             var key = _partitionOf(row);
@@ -238,7 +292,6 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         }
 
         _store!.Integrate(changes);
-        var builder = Blocks.DeltaSpill.For<TRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         var oldAll = CollectionsMarshal.AsSpan(_oldWindows);
         foreach (var (key, range) in _touched)
         {
@@ -248,10 +301,6 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         }
 
         _store.EndTick();
-        var result = builder.Build();
-        _lastOutputSize = result.Count;
-        _output.SetCurrent(result);
-        TrimScratch();
     }
 
     // A partition's window from the store: its rows in order, cut by the rank function.

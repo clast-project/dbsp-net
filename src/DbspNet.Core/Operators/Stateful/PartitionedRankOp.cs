@@ -211,11 +211,12 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         _output.SetCurrent(result);
     }
 
-    /// <summary>Steps that ran in partition-hash slices (diagnostics, tests).</summary>
-    internal static long SlicedSteps;
+    /// <summary>This operator's steps that ran in partition-hash slices (diagnostics, tests). Per
+    /// operator: a static counter is bumped by every rank a concurrent test runs.</summary>
+    internal long SlicedSteps;
 
-    /// <summary>Non-empty slices stepped (diagnostics, tests).</summary>
-    internal static long SliceSteps;
+    /// <summary>This operator's non-empty slices stepped (diagnostics, tests).</summary>
+    internal long SliceSteps;
 
     /// <summary>Diagnostics (the xt harness): bytes this operator allocated by phase, summed over steps
     /// until reset: 0 slicing passes, 1 old rows, 2 integrate, 3 new rows, 4 emit, 5 end tick; then
@@ -230,32 +231,12 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         return d;
     }
 
-    private const int MaxSlices = 256;
-
     // With in-step spilling on and blocked state, a delta past the step chunk is processed a slice of
-    // partitions at a time (docs/design-bounded-memory.md §5.43, D5 for rank): a slice's old rows,
-    // integrate lists and cached partitions are all the step holds, and the store's write-back budget
-    // can drop its cache between slices instead of only at the step's end. Partitions rank
-    // independently, so the output is the sum of the slices' outputs.
-    private int SliceCount(int deltaRows)
-    {
-        if (_store is null || Blocks.SpillSettings.StepSpillRows is not { } rows)
-        {
-            return 1;
-        }
+    // partitions at a time (docs/design-bounded-memory.md §5.43, D5 for rank; Blocks.PartitionSlicing).
+    private int SliceCount(int deltaRows) => Blocks.PartitionSlicing.Count(_store is not null, deltaRows);
 
-        // Each slice is one pass over the delta, so past MaxSlices the slices grow instead.
-        var per = rows == 0 ? Blocks.SpillSettings.ForcedChunkRows : rows;
-        return (int)Math.Min(MaxSlices, (deltaRows + per - 1) / per);
-    }
-
-    // A partition key's slice: its hash mixed (workers already split by hash % W, which slicing by the
-    // same low bits would repeat), then reduced to [0, slices).
-    private int SliceOf(TKey key, int slices)
-    {
-        var h = (uint)(_partitionComparer?.GetHashCode(key) ?? key.GetHashCode()) * 0x9E3779B1u;
-        return (int)(((ulong)h * (uint)slices) >> 32);
-    }
+    private int SliceOf(TKey key, int slices) =>
+        Blocks.PartitionSlicing.Of(_partitionComparer?.GetHashCode(key) ?? key.GetHashCode(), slices);
 
     // One pass splits the delta into its slices, each a builder that spills its share of the step chunk
     // (the delta's own format), so every row is decoded from the delta once rather than once per slice:
@@ -263,7 +244,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // allocation re-reading the delta (§5.45). A slice no row reaches costs nothing.
     private void StepSliced(ZSet<TInRow, Z64> delta, ZSetBuilder<TOutRow, Z64> builder, int slices)
     {
-        Interlocked.Increment(ref SlicedSteps);
+        SlicedSteps++;
         var t0 = GC.GetAllocatedBytesForCurrentThread();
         long inner0 = Phase[1] + Phase[2] + Phase[3] + Phase[4] + Phase[5];
         var parts = new ZSetBuilder<TInRow, Z64>?[slices];
@@ -281,7 +262,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             if (parts[s] is { } part)
             {
                 parts[s] = null;
-                Interlocked.Increment(ref SliceSteps);
+                SliceSteps++;
                 rows.Clear();
                 rows.AddRange(part.Build());
                 StepPartitions(rows, builder);

@@ -149,6 +149,7 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var leftOld = _leftTrace;
         var rightOld = _rightTrace;
 
+        var clock0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var t0 = GC.GetAllocatedBytesForCurrentThread();
         var inner0 = Phase[1] + Phase[2] + Phase[3] + Phase[4];
         var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
@@ -231,9 +232,12 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         _output.SetCurrent(result);
         Phase[10] += result.Count;
         Phase[5] += Mark(ref t1);
+        var clock1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        Phase[11] += clock1 - clock0;
 
         _leftTrace.Integrate(dl);
         Phase[6] += Mark(ref t1);
+        Phase[12] += System.Diagnostics.Stopwatch.GetTimestamp() - clock1;
         _rightTrace.Integrate(dr);
         Phase[7] += Mark(ref t1);
         CollectGarbage();
@@ -242,8 +246,9 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
     /// <summary>Diagnostics (the xt harness): bytes allocated by phase, summed over steps until reset:
     /// 0 touched-key walk (the deltas' enumeration and grouping), 1 right groups, 2 old left groups,
     /// 3 join combine and output adds, 4 NULL pads, 5 output build, 6 left integrate, 7 right integrate;
-    /// then 8 left delta rows, 9 touched keys, 10 output rows.</summary>
-    internal readonly long[] Phase = new long[11];
+    /// then 8 left delta rows, 9 touched keys, 10 output rows; 11 Stopwatch ticks for the join and
+    /// output build, 12 for the left integrate.</summary>
+    internal readonly long[] Phase = new long[13];
 
     private static long Mark(ref long since)
     {
