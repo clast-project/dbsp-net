@@ -33,6 +33,12 @@ if (args.Length > 0 && args[0] == "r3par")
     return DbspNet.Benchmarks.ParallelStateBenchmark.Run(args);
 }
 
+// §5.50 stage 1: range-partitioned global rank stand-in: `dotnet run -c Release -- globalrank [rows] [runs] [arms] [workers]`
+if (args.Length > 0 && args[0] == "globalrank")
+{
+    return DbspNet.Benchmarks.GlobalRankStandIn.Run(args);
+}
+
 // §5.48 stage 1: star join stand-in: `dotnet run -c Release -- starjoin [factRows] [runs] [arms]`
 if (args.Length > 0 && args[0] == "starjoin")
 {

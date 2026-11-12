@@ -240,6 +240,24 @@ public sealed class CircuitBuilder
     }
 
     /// <summary>
+    /// A shared W×W rendezvous for an operator that coordinates across workers itself (a
+    /// range-partitioned rank's count all-gather, docs/design-bounded-memory.md §5.50), with this
+    /// replica's worker id and the circuit's abort signal. Null outside a parallel build or at
+    /// W ≤ 1. Like <see cref="Exchange{TKey,TWeight}"/>, every replica must ask at the same point
+    /// of its build.
+    /// </summary>
+    internal (ExchangeCoordinator<T> Coordinator, int Worker, CancellationToken Abort)? Rendezvous<T>()
+    {
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return null;
+        }
+
+        var workers = _parallel.Workers;
+        return (_parallel.NextCoordinator(() => new ExchangeCoordinator<T>(workers)), _parallel.WorkerId, _parallel.Abort);
+    }
+
+    /// <summary>
     /// The all-gather (broadcast) exchange: replicate a sharded Z-set stream so
     /// every worker holds the union of all shards. Used to broadcast a small
     /// dimension for a broadcast join — the large fact side keeps its balanced

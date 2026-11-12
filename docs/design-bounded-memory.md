@@ -4029,3 +4029,248 @@ sampled on the first large tick), rank locally, and offset by the row counts of 
 exchanged each tick. A change in range w shifts every rank after it, so the output stays O(rows after the
 change) as the serial rank's does. Worth ~80–90 s of tick 18 wall (~7%), at a size like §5.48's. Not
 started.
+
+### 5.50 A global rank in ranges of its order key (2026-11-12, design)
+
+§5.49 ends on the largest wait left on tick 18. `fact_engagement_status_monthly_snapshot` ends in
+`ROW_NUMBER() OVER (ORDER BY dim_date_key, household_key, …)` with no `PARTITION BY`. A rank like that has
+one partition, so it runs on one worker. This section designs a rank that splits the work by ranges of the
+order key, then checks it with a stand-in before any compiler work.
+
+#### 5.50.1 What it costs now
+
+From xt25split9 (§5.49's setup, `XT_PROF_OPS` over the view), tick 18:
+
+| op | what | worker 8 | the other eleven |
+|---|---|---|---|
+| 1277 `ExchangeOp` | gather to worker 0 (`GatherToWorkerZero`) | 8.4 s | ~1.1 s each (sending) |
+| 1278 `PartitionedRankOp` | the global rank, 15,159,841 rows in, 1 partition | **79.7 s**, 24.7 GiB | 0 |
+| 1279 `ApplyOp` | `TRY_CAST(ROW_NUMBER() …)`, the output projection | 11.7 s, 16.3 GiB | 0 |
+| 1280 `IntegrateOp` | the view's integrated output | 2.7 s | 0 |
+
+The view's tail spans 1,358.8 → 1,459.9 s, 101 s of wall. For that whole time the other eleven workers
+wait in the next exchange: op 1304, 1.15M worker-ms (8.3% of the tick). The rank's `RANKPHASE`: one
+partition touched, 15.16M rows read. Its allocation is 8.4 GiB old rows, 9.2 integrate, 0.5 new, and 5.4
+emit. The partition was empty before the tick, so "old" is the delta decoded by the touched-partition
+pass. The time has no phase split. Most of it, *estimate*, is 15.2M `SortedDictionary` inserts at ~24
+comparisons each, every comparison a boxed ten-column `SortKeyComparer`.
+
+The global rank's state is deliberately managed. `CompilePartitionedRank` gives a rank with no
+`PARTITION BY` no block format, because "its one partition is touched every tick on worker 0". The
+operator also keeps the widened output of a partition larger than `PromoteRows` (`_window`). So worker 0
+holds two managed copies of 15.2M rows, one sorted and one widened. Every tick that touches the partition
+recomputes the whole ranking (`ComputeWindow` over all of it) on that one worker.
+
+**It is a pattern, not one view.** 23 of the 96 models use `ROW_NUMBER() OVER (ORDER BY …)` with no
+`PARTITION BY`, the dbt surrogate-key idiom (`primary_key`). Their outputs total 18.15M rows at SF25. This
+view has 15.16M of them. The others are `fact_purchase_quantity_monthly_snapshot` 1.95M,
+`fact_purchase_activity_monthly_snapshot` 0.67M and `fact_customer_status_monthly_snapshot` 0.17M, and the
+rest are at most 72K (`dim_household`). All 23 are `ROW_NUMBER`. In this view the ORDER BY columns are
+exactly the `GROUP BY` columns, so its rows are distinct in the order key. The design must not depend on
+that.
+
+**Other engines.** Feldera's `row_number_custom_order` (`crates/dbsp/src/operator/dynamic/group/row_number.rs`)
+shards by the partition key (`dyn_shard_accumulate`). `RankAggregate` indexes the input by the `PARTITION
+BY` keys, so with none there is one key and one worker. Its trace stores `(value, (row_number, num_rows))`
+and walks the delta and trace together, the same per-group shape as ours. Spark moves an unpartitioned
+window to a single partition and logs a warning that it does so. Neither engine has a range-partitioned
+rank, so there is no Feldera assumption to adopt here.
+The closest precedent is Spark RDD's `sortBy` followed by `zipWithIndex`. `sortBy` range-partitions on
+sampled splitters. `zipWithIndex` first counts every partition, then numbers each one from the sum of the
+counts before it. This design does the same thing incrementally.
+
+#### 5.50.2 The idea
+
+Number the rows by ranges of the order key. Every worker owns one range. For a row r in range w:
+
+    rank(r) = local rank of r within range w + (rows in ranges 0 … w−1)
+
+The first term is today's single-partition rank over 1/W of the rows. The second is a prefix sum of W
+counts that every worker can hold, because each tick's change to every range's count is known when the
+delta is routed. **The result is correct for any choice of boundaries.** Boundaries affect only how evenly
+the work is spread, so choosing them is a performance decision that can be revisited at any tick.
+
+- **Boundaries compare the ORDER BY keys only** (`sortKeyOnly`, not the total order with its whole-row
+  tie-break). A tie group then never straddles two ranges, which makes `RANK` correct with the same offset
+  (1 + the rows strictly before). `ROW_NUMBER` breaks ties by the total order inside the range, as it does
+  today. `DENSE_RANK` would need a count of each range's distinct tie groups. The routing pass cannot know
+  that count without the state, so `DENSE_RANK` keeps the gather in v1. A giant tie group stays on one
+  worker, which is inherent.
+- **Range of a row:** the number of splitters `s` with `sortKeyOnly(s, r) ≤ 0`, by binary search. That is
+  ⌈log₂ W⌉ = 4 comparisons at W = 12, against the ~24 a `SortedDictionary` insert makes into 15.2M rows.
+  Multiplicities count as rows: a weight-w row takes w positions, as `Ranker.Next` gives them.
+
+#### 5.50.3 The per-tick protocol
+
+One operator, `RangeRankOp`, replaces the `GatherToWorkerZero` exchange and the rank. It owns its
+exchange coordinators (`ParallelBuildContext.NextCoordinator`, like `ExchangeOp`). Every replica holds the
+same splitters and the same vector of W range counts.
+
+1. **Count barrier** (every tick, W longs). Each worker publishes its delta's net weight. Every replica
+   now has the new total N′ and applies the same rule. It re-splits when `N′ ≥ T_min` and
+   `N′ ≥ 2·N_split`, where `N_split` is the total at the last split.
+2. **Sample barrier** (only on a re-split tick). Each worker samples k rows from its delta's inserts and
+   its own state, each weighted by its count / k (k = 1,024, *to be set by the stand-in*). Every replica
+   merges the samples in worker order, sorts them with the total order and takes the same W−1 weighted
+   quantiles. The merge and pick after the all-gather must be deterministic. The sampling itself need not
+   be, since every replica reads the same gathered sample. Every worker then hands its whole state to the
+   routing step and retracts its whole old output.
+3. **Route barrier** (every tick). Delta rows go to their range's owner, and on a re-split tick so do the
+   moved state rows. Each cell of the W×W grid also carries the sender's net weight for that destination.
+   Every worker reads all W² counts (with `Read`, not `Take`) and its own column of rows. So each replica
+   learns every range's count change without a fourth barrier.
+4. **Local step.** Integrate. `offset_old` = Σ count_old over v < w, and `offset_new` from the new
+   counts. Emit the diff of (local rank + offset):
+   - offsets equal: today's `EmitDiff` / window diff, only the rows whose local rank changed;
+   - offsets differ by d: every row of the range changes rank and re-emits. The serial rank emits those
+     same rows, since they sit after the change in the global order. Output volume is the serial rank's,
+     and the work is spread across the workers.
+
+Before the first split the splitters are empty (`N_split = 0`, one range on worker 0), which is today's
+behaviour exactly. `T_min` (*default 65,536, to be set by the stand-in*) keeps small global ranks gathered.
+That includes most of the 23 above: below it, one worker ranking costs less than moving the rows. On issue
+#2's tick 18, N goes from 0 to 15.2M in one tick. The rule splits on that tick, on a sample of the delta,
+and has nothing to move.
+
+**Re-split cost.** Every row moves and every output row is retracted and re-emitted, 2N output rows that
+tick. The doubling rule bounds the total across all re-splits to under 2× the final N, the same amortized
+argument as a growing array. It also handles drift. Here the leading key is a month and new data lands at
+the end of the order, so the last range grows. Its growth is still part of N, so a later doubling
+re-balances it. A rank that only shrinks never re-splits. Its ranges get emptier and stay correct.
+
+**Barriers.** A steady tick takes two barriers (counts, route) where today's gather takes one. The route
+barrier follows the count barrier almost at once, with no work between them, so the extra cost is one
+barrier latency, not a second wait for stragglers. The count barrier exists only so the re-split rule can
+see this tick's N′. Deciding a tick late would drop it, but it would also send tick 18's 15.2M rows to
+worker 0 first.
+
+#### 5.50.4 State, checkpoints and placement
+
+- **State per worker:** its range's rows, managed as today's global rank is, in 1/W of the size: ~1.26M
+  rows each on tick 18 instead of 15.2M on one. The view's tick-end live set is the same in total, but
+  worker 0's share of the in-step peak is spread. Partition slicing (§5.43) does not apply, since a range
+  is one partition. The managed `SortedDictionary` and `_window` stay as they are.
+- **Checkpoint:** `trace.arrows` (the range's rows, same codec), plus a small file holding W, the
+  splitters (input rows, same codec), the W range counts and `N_split`. A restore at the same W is exact.
+- **Re-sharding** (§1d): `trace.arrows` is placed `Worker0`. On load the operator sees a different W and
+  resets: splitters empty, `N_split = 0`. That is a valid state (one range on worker 0), and the next tick
+  with any delta re-splits it. The worker that ends up retracting an output row is often not the replica
+  whose view holds it. This is fine because views are `Anywhere` (`Linear`): consumers read the sum over
+  workers.
+- **Partition claim:** none in v1. Today's `MarkGathered` claim (empty key, `Gathered`) lets a downstream
+  aggregate skip its shuffle. Range output loses that, so such a consumer adds an exchange. `ShardDisjoint`
+  would hold at tick boundaries, but a re-split tick moves a row from one worker to another within the
+  tick. Claiming it is left for when a consumer needs it.
+- **Off switch:** `DBSPNET_RANGE_RANK=off` restores the gather. W = 1 is untouched.
+
+#### 5.50.5 What it would save on tick 18 (*estimate*)
+
+Per worker: 1.26M rows. If the local rank costs n log n, its time is 79.7 s × 1/12 × (log 1.26M / log
+15.2M ≈ 0.85) ≈ **5.6 s**. The projection would take ~1.0 s and the integrate ~0.2 s. Routing costs about
+what a hash exchange of the same rows does, ~1–1.5 s per worker by op 1277's senders. The tail's span
+would fall from 101 s to ~8–10 s: **~90 s off tick 18** (1,149 → ~1,060 s, −8%). The ~1.1M worker-ms
+of waiting in op 1304 goes with it. Allocation stays about 25 GiB plus the projection's 16 GiB, spread
+over the workers rather than reduced. Peak RSS is not expected to move: the rows are the same, only on
+more workers.
+
+The view's later batches (2 and 3 insert into `ext_engagement_status_events`) were not measured. There
+the change is from O(N) per touched tick on one worker (today's `ComputeWindow`) to O(N/W) per touched
+range. Ranges whose offset is unchanged and that saw no delta do no work.
+
+#### 5.50.6 Out of scope for v1
+
+- `DENSE_RANK` (§5.50.2), global TOP-K (`ORDER BY … LIMIT`, cheap with a small limit) and global window
+  aggregates, which gather the same way.
+- A **partitioned** rank with a few huge partitions: the key would become (partition, range). The same
+  operator would do it, but nothing measured needs it.
+- Re-splitting for imbalance alone (re-split on growth only); Feldera's adaptive balancer
+  (`operator/dynamic/balance`) is the reference if it matters.
+
+#### 5.50.7 Proposed stages
+
+1. **Stand-in** (`globalrank [rows] [runs] [arms]`, DbspNet.Benchmarks), at W = 12. The source is
+   N = 15.16M rows shaped like the view's aggregate output: ten integer keys, distinct as tuples, with the
+   leading key ~13 months and the second ~72K households, plus two value columns. They arrive hash-sharded
+   as the aggregate's output does. Both arms are hand-built circuits from the same pieces, with the same
+   `PartitionedRank`, the same projection and an integrated output:
+   - **gather**: `Exchange(_ => 0)` → rank → projection → integrate, today's plan;
+   - **range**: `Exchange(range)` on splitters sampled from the data → rank of the range → an offset
+     operator (count all-gather through its own coordinator; on an offset change it re-emits its range)
+     → projection → integrate.
+
+   The prototype keeps its own integrated copy of the local output to re-emit from. The real operator would
+   use the rank's `_window`, so the prototype overstates the range arm's cost. Sampling for the splitters is
+   not timed. Ticks: (1) the bulk load; (2) 1,000 value updates, each a retraction and an insert at the same
+   key (net count 0, no offsets move); (3) 1,000 inserts at the front of the order, which shift every range.
+   Each tick's summed output must equal the gather arm's. Report per-tick wall, allocation and per-worker
+   busy time (`CollectOperatorProfilePerWorker`). A `sql` arm compiles the real view at W = 12 to check
+   that the hand-built gather matches today's plan. **Pass:** tick 1's wall at least 5× better than gather.
+2. Operator + compiler (§5.50.3–4). Tests: range ≡ serial on every tick at W = 2/3/4/8 for `ROW_NUMBER`
+   and `RANK`. Cases: a bulk first tick; inserts at the front, middle and end; deletes; weights above one;
+   tie groups larger than a range; NULLs first and last; DESC keys; a tiny first tick followed by a large
+   one (a re-split that moves state); a shrinking rank. Also checkpoints at the same W and re-sharded
+   (W = 4→3, 2→5), and the off switch. Mutants: the offset taken from the wrong range (an off-by-one
+   prefix), splitters compared with the total order (a tie group split, caught by `RANK`), no retraction on
+   a re-split, counts not updated from the grid, and a re-split decided from local counts (divergent
+   splitters). Suites: default, forced, and forced+critical.
+3. Measure from scratch, xt25hot9's setup: tick 18, the view's `OPRANGE` span and `OPWORKER` balance,
+   op 1304's wait, batch wall, peak RSS, and the 96 views identical.
+
+Size, *estimate*: operator ~450 lines (the single-partition ranker extracted from `PartitionedRankOp` and
+given an offset, plus routing, the protocol and the snapshot), compiler ~80, tests ~600.
+
+#### 5.50.8 Stage 1: the stand-in, measured
+
+`dotnet run -c Release -- globalrank [rows] [runs] [arms] [workers]` (`GlobalRankStandIn`; it needs the new
+internal hook `CircuitBuilder.Rendezvous<T>()`, a shared W×W coordinator for an operator that does its
+own all-gather). 15,159,841 rows, W = 12, Mac mini M4, server GC, one run per arm. **All three arms have
+identical output checksums on every tick**, in both settings below. A 200K-row W = 4 smoke run agreed too.
+
+| | gather (today, hand built) | range (prototype) | range / gather | `sql` (the real view at W = 12) |
+|---|---|---|---|---|
+| tick 1, bulk 15.2M, managed | 71.9 s, 10.1 GiB | **10.5 s**, 14.7 GiB | **6.8×** | 86.2 s, 15.4 GiB |
+| tick 2, 1,000 value updates | 9.8 s | **1.2 s** | 8.3× | 10.0 s |
+| tick 3, 1,000 inserts at the front | 26.3 s, 13.0 GiB | **5.6 s**, 14.3 GiB | 4.7× | 55.1 s, 29.7 GiB |
+| tick 1, xt spill env | 73.1 s | 10.5 s | 6.9× | 100.6 s, 53.8 GiB |
+
+**The stage passes** (≥ 5× on the bulk tick).
+
+**Fidelity.** In the xt setting the `sql` arm's operators reproduce production's tick 18 closely. The rank
+takes 75.2 s and 23.7 GiB (production 79.7 s and 24.7 GiB), the projection 17.7 s and 16.0 GiB (11.7 s,
+16.3 GiB), and the integrate 2.8 s (2.7 s). The hand-built arms' streams carry no delta format, so the
+spill env does not reach them (gather's numbers are the same in both settings). Their rank therefore
+reads managed rows, at 4.99 GiB where `sql` pays 23.7 for decoding block-backed deltas. That decode is
+per row and spreads across workers like the rest, so the ratio should carry over. The hand-built gather
+is ~15–25% cheaper than the real plan, which lowers both arms alike.
+
+**Where the range arm's tick 1 goes** (per worker, max / median):
+
+| op | gather (one worker) | range |
+|---|---|---|
+| exchange | 1.9 s | 0.49 / 0.48 s |
+| rank | 63.9 s | **6.7 / 6.4 s** |
+| prototype offset op | — | 2.9 / 2.6 s |
+| projection | 5.0 s | 2.0 / 0.9 s |
+| integrate | 1.1 s | 0.21 / 0.10 s |
+
+The splitters (1,024 samples per worker) balance the rank within 4%. Its per-worker time, 6.4–6.7 s, is
+§5.50.5's n log n estimate (5.6 s) plus ~15%. Summed over the workers it is 77 s against gather's 64 s, so
+the range costs little extra work. The offset op's 2.6–2.9 s and most of the +45% allocation (it allocates
+3.8 GiB) are the prototype's own: a second integrated copy of the local ranking, and a row copy per output
+row to shift its rank. The real operator widens with the offset in `Ranker`/`ComputeWindow` and keeps no
+second copy. Tick 1 would then be ~7.5–8 s, ~9× gather.
+
+Tick 3 is the shift case. Every range after the first re-emits, 30.3M output rows in both arms (the serial
+rank's volume, as §5.50.3 says). In gather that is 10.0 s of rank on one worker, then 11.8 s of projection
+and 4.5 s of integrate on that same worker. In range the per-worker cost is 2.8 s of offset op (the prototype
+re-emitting from its copy), 2.5 s of projection and ≤ 1.1 s of integrate. Tick 2, value updates with no
+count change, is today's whole-window recompute on one worker (9.8 s) against 1.1–1.2 s on each.
+
+**Applied to tick 18** (*estimate*, from the xt `sql` arm's operators divided by 12 and the measured
+balance): rank ~6–7 s, projection ~1.5 s, integrate ~0.3 s and the range exchange ~1.5–2.5 s. The view's
+tail would take ~10 s instead of 101 s, **~90 s off tick 18 (−8%)**, as §5.50.5 estimated.
+
+Not measured: the count and sample barriers' latency (one W-long all-gather here), a re-split that moves
+state, block-backed deltas in the range arm, and W ≠ 12.
+
+**Next:** stage 2 (§5.50.7).
