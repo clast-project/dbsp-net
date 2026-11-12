@@ -34,7 +34,13 @@ public abstract record ReshardPlacement
     /// workers, so where an entry sits does not change the result.</summary>
     public sealed record Linear : ReshardPlacement;
 
+    /// <summary>All of it to worker 0, from whichever workers hold it: an operator that places its own
+    /// state again after a re-shard (a range rank, docs/design-bounded-memory.md §5.50).</summary>
+    public sealed record Gather : ReshardPlacement;
+
     public static ReshardPlacement OnWorker0 { get; } = new Worker0();
+
+    public static ReshardPlacement ToWorker0 { get; } = new Gather();
 
     public static ReshardPlacement OnEveryWorker { get; } = new Replicated();
 
@@ -65,6 +71,10 @@ public sealed record IndexedReshardFile(
 public sealed record KeyedBlobsReshardFile(
     string Name, ReshardPlacement Placement, IIndexedZSetTraceCodec<StructuralRow, StructuralRow, Z64> Codec)
     : ReshardFile(Name, Placement);
+
+/// <summary>A file a re-shard drops: state valid only at the worker count that wrote it, which the
+/// operator rebuilds when it is missing (a range rank's splitters, docs/design-bounded-memory.md §5.50).</summary>
+public sealed record DroppedReshardFile(string Name) : ReshardFile(Name, ReshardPlacement.Anywhere);
 
 /// <summary>Every file one stateful operator writes, or why it cannot be re-sharded.</summary>
 public sealed record ReshardSpec(string OperatorType, IReadOnlyList<ReshardFile> Files, string? Unsupported = null);

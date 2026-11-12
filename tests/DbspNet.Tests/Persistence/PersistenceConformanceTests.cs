@@ -276,6 +276,8 @@ public class PersistenceConformanceTests : IDisposable
                                     "LinearAggregateTests restores it mid-stream and from a legacy-operator snapshot",
             ["StarLeftJoinOp"] = "forms only when compile options give row counts (a small-dimension run); " +
                                  "StarJoinTests restores it in all four write/read layouts and continues it against the chain",
+            ["RangeRankOp"] = "forms only in a parallel (W>1) compile; RangeRankTests restores it at the same W and " +
+                              "re-sharded, and continues it against the serial program",
             ["PartitionedTopKOp"] = "the Legacy state arm (PartitionedTopKStateMode); the default is " +
                                     "PartitionedTopKCompactOp. PartitionedTopKSnapshotTests restores across both arms",
         };

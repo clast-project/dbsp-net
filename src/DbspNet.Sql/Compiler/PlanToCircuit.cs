@@ -2876,6 +2876,28 @@ public static partial class PlanToCircuit
         // per-partition operator (identity passthrough at W<=1). A global (no
         // PARTITION BY) window has no key to shard on: gather it whole onto
         // worker 0 (GatherToWorkerZero), where the serial operator runs.
+        // The snapshot codec is over the base (input) rows; the operator recovers
+        // the widened output from them on load.
+        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
+
+        // A global ROW_NUMBER / RANK at W>1 ranks in ranges of its ORDER BY keys, one per worker
+        // (docs/design-bounded-memory.md §5.50). Its output claims no partition. A re-shard gathers its
+        // rows to worker 0 and drops the splitters; the operator re-splits.
+        if (ctx.Workers > 1 && plan.PartitionKeys.Count == 0 && plan.Function != RankFunction.DenseRank && RangeRankMode.Enabled)
+        {
+            var minRows = RangeRankMode.MinRows;
+            var ranged = Recorded(
+                builder,
+                ctx,
+                () => builder.RangeRank(input, PartitionOf, order, sortKeyOnly, plan.Function, codec, minRows)
+                    ?? throw new InvalidOperationException("a range rank needs a parallel build"),
+                Z("trace.arrows", ReshardPlacement.ToWorker0, codec),
+                codec is null ? null : new DroppedReshardFile(RangeRankOp.MetaFile),
+                codec is null ? null : new DroppedReshardFile(RangeRankOp.SplittersFile));
+            Interlocked.Increment(ref RangeRankMode.Built);
+            return ranged;
+        }
+
         // Where each persisted row lives, for re-sharding (§1d): the exchange's own function.
         ReshardPlacement? reshardPlace = null;
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
@@ -2891,9 +2913,6 @@ public static partial class PlanToCircuit
             reshardPlace = ReshardPlacement.OnWorker0;
         }
 
-        // The snapshot codec is over the base (input) rows; the operator recovers
-        // the widened output from them on load.
-        var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Input.Schema);
         // DBSPNET_TRACE_BLOCKS=window: the partitions as blocks (docs/design-flat-trace-state.md §3.29).
         // Not a global rank: its one partition is touched every tick on worker 0, where reading it
         // out of the store costs more than the few references it would save.

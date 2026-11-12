@@ -290,6 +290,52 @@ public static class StatefulOperators
     }
 
     /// <summary>
+    /// A global <c>ROW_NUMBER</c> / <c>RANK</c> (no <c>PARTITION BY</c>) in ranges of its ORDER BY keys, one
+    /// range per worker (docs/design-bounded-memory.md §5.50, <see cref="RangeRankOp"/>). Null outside a
+    /// parallel build or at W ≤ 1: the caller gathers to one worker instead. <paramref name="partitionOf"/>
+    /// is the constant key of the rank's single partition (as a gathered rank uses).
+    /// </summary>
+    internal static Stream<ZSet<StructuralRow, Z64>>? RangeRank(
+        this CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, StructuralRow> partitionOf,
+        IComparer<StructuralRow> order,
+        IComparer<StructuralRow> sortKeyOnly,
+        RankFunction function,
+        IZSetTraceCodec<StructuralRow, Z64>? snapshotCodec,
+        long minRows)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        if (function == RankFunction.DenseRank
+            || builder.Rendezvous<long[]>() is not { } sizes)
+        {
+            return null;
+        }
+
+        var samples = builder.Rendezvous<(List<StructuralRow> Rows, long Population)>()!.Value;
+        var route = builder.Rendezvous<(List<KeyValuePair<StructuralRow, Z64>>? Rows, long[] Nets)>()!.Value;
+        var output = new Stream<ZSet<StructuralRow, Z64>>(ZSet<StructuralRow, Z64>.Empty);
+        builder.AddRawOperator(new RangeRankOp(
+            input, output, partitionOf, order, sortKeyOnly, function, WidenRank, snapshotCodec,
+            sizes.Coordinator, samples.Coordinator, route.Coordinator, sizes.Worker, minRows, sizes.Abort));
+        return output;
+    }
+
+    // Append the rank as a trailing BIGINT column.
+    private static StructuralRow WidenRank(StructuralRow row, long rank)
+    {
+        var n = row.Count;
+        var vs = new object?[n + 1];
+        for (var i = 0; i < n; i++)
+        {
+            vs[i] = row[i];
+        }
+
+        vs[n] = rank;
+        return new StructuralRow(vs);
+    }
+
+    /// <summary>
     /// Incremental partitioned window aggregate — <c>agg(x) OVER (PARTITION BY p
     /// [ORDER BY o RANGE …])</c> emitted as new column(s) appended to every row.
     /// <paramref name="orderValueOf"/> null ⇒ a whole-partition frame;

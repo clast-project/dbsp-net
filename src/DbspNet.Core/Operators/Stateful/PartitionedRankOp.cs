@@ -92,6 +92,25 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // dictionary-resize churn (fresh alloc, no reuse; §16.7). Perf hint only.
     private int _lastOutputSize;
 
+    // A range-partitioned global rank (docs/design-bounded-memory.md §5.50, RangeRankOp) adds to
+    // every rank the rows of the ranges before this worker's: the offset the last output was
+    // emitted with, and the one this step emits with. Both zero otherwise.
+    private long _offsetOld;
+    private long _offsetNew;
+
+    /// <summary>The offsets this step's old and new rankings are shifted by (§5.50). A change re-emits
+    /// every partition, delta or not. Managed state only.</summary>
+    internal void SetOffsets(long old, long now)
+    {
+        if (_store is not null && (old != 0 || now != 0))
+        {
+            throw new InvalidOperationException("Rank offsets need managed state.");
+        }
+
+        _offsetOld = old;
+        _offsetNew = now;
+    }
+
     public PartitionedRankOp(
         Stream<ZSet<TInRow, Z64>> input,
         Stream<ZSet<TOutRow, Z64>> output,
@@ -185,7 +204,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     {
         var delta = _input.Current;
         _changes.Record(delta);
-        if (delta.IsEmpty)
+        if (delta.IsEmpty && _offsetOld == _offsetNew)
         {
             // An idle tick: the store may freeze its record (§3.22).
             _store?.Freeze();
@@ -301,6 +320,19 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             }
         }
 
+        // A changed offset moves every rank this worker holds (§5.50): every partition is touched.
+        if (_offsetOld != _offsetNew)
+        {
+            PromoteAll();
+            foreach (var key in _accum.Keys)
+            {
+                if (!touched.ContainsKey(key))
+                {
+                    touched[key] = _window.ContainsKey(key) ? null! : Current(key);
+                }
+            }
+        }
+
         Phase[1] += Mark(ref since);
         Phase[8] += touched.Count;
         foreach (var b in touched.Values)
@@ -359,10 +391,10 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
             // Large (or was): diff the whole widened partition against the stored output, or
             // against the old rows' output when there is none yet.
-            var newWindow = ComputeWindow(after);
+            var newWindow = ComputeWindow(after, _offsetNew);
             if (!_window.Remove(key, out var oldWindow))
             {
-                oldWindow = ComputeWindow(before!);
+                oldWindow = ComputeWindow(before!, _offsetOld);
             }
 
             EmitWindowDiff(builder, newWindow, oldWindow);
@@ -502,8 +534,8 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
             }
 
             // (Previous is read above before Next moves it on.)
-            var oldRank = was > 0 ? old.Next(_function, row, was, oldStarts) : 0;
-            var newRank = isNow > 0 ? now.Next(_function, row, isNow, newStarts) : 0;
+            var oldRank = was > 0 ? old.Next(_function, row, was, oldStarts) + _offsetOld : 0;
+            var newRank = isNow > 0 ? now.Next(_function, row, isNow, newStarts) + _offsetNew : 0;
             if (was == isNow && oldRank == newRank)
             {
                 continue;
@@ -575,7 +607,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
     /// <summary>A partition's widened output: every row with its rank, keyed by the widened row
     /// (ROW_NUMBER: one row of weight 1 per copy; RANK / DENSE_RANK: the row's whole weight).</summary>
-    private Dictionary<TOutRow, long> ComputeWindow(List<(TInRow Row, long Weight)> rows)
+    private Dictionary<TOutRow, long> ComputeWindow(List<(TInRow Row, long Weight)> rows, long offset)
     {
         var result = new Dictionary<TOutRow, long>(rows.Count);
         var ranker = default(Ranker);
@@ -588,7 +620,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
             var starts = _function != RankFunction.RowNumber
                 && (ranker.Previous is null || _sortKeyOnly.Compare(ranker.Previous, row) != 0);
-            var rank = ranker.Next(_function, row, weight, starts);
+            var rank = ranker.Next(_function, row, weight, starts) + offset;
             if (_function == RankFunction.RowNumber)
             {
                 for (long k = 1; k <= weight; k++)
@@ -603,6 +635,73 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Give up every row (a range rank re-splitting, §5.50): retract the whole output, last emitted
+    /// with the old offset, into <paramref name="retract"/>, and return the rows in order. The
+    /// operator is empty afterwards. Managed state only.
+    /// </summary>
+    internal List<(TInRow Row, long Weight)> Evict(ZSetBuilder<TOutRow, Z64> retract)
+    {
+        if (_store is not null)
+        {
+            throw new InvalidOperationException("Evict needs managed state.");
+        }
+
+        PromoteAll();
+        var rows = new List<(TInRow Row, long Weight)>(_accum.Values.Sum(b => b.Count));
+        foreach (var key in _accum.Keys)
+        {
+            var current = Current(key);
+            var window = _window.Remove(key, out var stored) ? stored : ComputeWindow(current, _offsetOld);
+            foreach (var (row, weight) in window)
+            {
+                retract.Add(row, new Z64(-weight));
+            }
+
+            rows.AddRange(current);
+        }
+
+        _accum.Clear();
+        _window.Clear();
+        if (rows.Count > 0)
+        {
+            _changes.Record(ZSet.FromEntries(rows.Select(e => (e.Row, new Z64(-e.Weight)))));
+        }
+
+        return rows;
+    }
+
+    /// <summary>Every row and its weight, partition by partition (a range rank's re-split sample, §5.50).
+    /// Managed state only.</summary>
+    internal IEnumerable<(TInRow Row, long Weight)> Rows()
+    {
+        if (_store is not null)
+        {
+            throw new InvalidOperationException("Rows needs managed state.");
+        }
+
+        PromoteAll();
+        foreach (var bucket in _accum.Values)
+        {
+            foreach (var (row, weight) in bucket)
+            {
+                yield return (row, weight);
+            }
+        }
+    }
+
+    /// <summary>The sum of every row's weight (a range rank restored without its count, §5.50).</summary>
+    internal long TotalWeight()
+    {
+        if (_store is not null)
+        {
+            throw new InvalidOperationException("TotalWeight needs managed state.");
+        }
+
+        PromoteAll();
+        return _accum.Values.Sum(b => b.Values.Sum());
     }
 
     // A fresh object even when empty: the shared ZSet.Empty must never carry checkpoint tracking.

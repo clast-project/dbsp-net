@@ -352,6 +352,9 @@ public static class ParallelReshard
                     return;
                 }
 
+            case DroppedReshardFile:
+                return;
+
             case KeyedBlobsReshardFile kb:
                 {
                     var buckets = NewBuckets(newW, () => new List<(StructuralRow Key, byte[] Blob)>());
@@ -460,6 +463,9 @@ public static class ParallelReshard
                         $"operator {op} '{file}' is stated to live on worker 0, but worker {w} holds state");
                 }
 
+                return [0];
+
+            case ReshardPlacement.Gather:
                 return [0];
 
             case ReshardPlacement.Replicated:

@@ -4274,3 +4274,49 @@ Not measured: the count and sample barriers' latency (one W-long all-gather here
 state, block-backed deltas in the range arm, and W ≠ 12.
 
 **Next:** stage 2 (§5.50.7).
+
+#### 5.50.9 Stage 2: the operator and the compiler
+
+Built as §5.50.3–4 describe, default on. `DBSPNET_RANGE_RANK=off` gathers; `DBSPNET_RANGE_RANK_MIN_ROWS`
+(default 65,536) is `T_min`.
+
+- **`RangeRankOp`** (Core) does the routing and the three rendezvous itself. It gets its coordinators from
+  `CircuitBuilder.Rendezvous<T>()`: sizes every tick, samples on a re-split, route every tick. It steps a
+  private single-partition `PartitionedRankOp`, which is not registered with the circuit, with the
+  gathered rank's constant key. Ranks are offset inside that operator: `SetOffsets(old, new)` shifts the
+  old and new rankings in `EmitDiff` and `ComputeWindow`. A changed offset touches every partition, delta
+  or not. `Evict` retracts the whole output and hands the rows over for a re-split. `Rows` feeds the
+  sample, and `TotalWeight` recounts after a re-shard.
+- **The sizes barrier also carries `_rowsAtSplit` and the splitter count.** If replicas disagree, the
+  operator throws instead of deadlocking. That disagreement is the failure mode the mutants below expose: a
+  replica that re-splits alone waits at the sample barrier while the rest wait at the route barrier. The
+  re-split decision reads only values every replica has from the sizes barrier, so a decision made from
+  local counts is a hang, not a wrong answer (see the mutants).
+- **Old counts come from the sizes barrier every tick, not from persisted state.** Each worker publishes
+  its own row count, so a restore needs only the splitters, `_rowsAtSplit` and W (`range.meta`,
+  `splitters.arrows`).
+- **Re-shard:** `trace.arrows` uses a new placement, `ReshardPlacement.Gather` (every worker's rows to
+  worker 0, wherever they were). The other two files are a new `DroppedReshardFile` that the rewrite skips.
+  Without `range.meta` the operator restores to one range on worker 0, recounts, and re-splits on the next
+  step. A `range.meta` for another W is refused.
+- **Compiler** (`CompilePartitionedRank`): W > 1, no `PARTITION BY`, not `DENSE_RANK` → `builder.RangeRank`,
+  with no partition claim. Everything else is unchanged.
+
+**Tests** (`RangeRankTests`, 12). Parallel W = 2/3/4/8 ≡ serial on every tick over 18 ticks. The ticks:
+a 5-row first tick (below the threshold: one range, asserted), a first split, the table doubling twice
+(re-splits that move rows), a shrink to six rows and regrowth. Inserts at the front, middle and end,
+deletes, weights of two, NULLs first and last, DESC keys, RANK with tie groups larger than a range, an
+aggregate over a range rank, and DENSE_RANK gathered. Every replica records the same number of re-splits
+(≥ 3), and rows spread to more than one worker. Checkpoints: same W (4→4 at ticks 3 and 8) and re-sharded
+(4→3, 2→5, 3→2). The off switch matches. Each range rank reaches exactly four streams (`ScanReaders`).
+`PersistenceConformanceTests` exempts `RangeRankOp` with its reason (it forms only at W > 1).
+
+Mutants caught: the offset summed one range too far (9 fail), routing by the total order rather than the
+ORDER BY keys (9, by RANK's ties), no retraction on a re-split (9), range counts not taken from the route
+grid (9), no re-emit on an offset change (4). The re-split decided from local counts hangs the suite (a
+replica alone at the sample barrier), as above. A decision skewed by one row survives: it diverges only when
+the total lands exactly on a threshold, which no test reaches.
+
+Suites: default, forced and forced+critical, 3,716 of 3,717 pass, 1 skipped. The one failure was the
+conformance guard's missing exemption, fixed and re-run with the rank, snapshot and conformance tests
+(91 of 91).
