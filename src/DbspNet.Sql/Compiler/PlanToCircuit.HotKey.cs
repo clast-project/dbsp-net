@@ -53,15 +53,23 @@ public static partial class PlanToCircuit
         return ctx.Codec.BuildRow(leftKeySchema, values);
     }
 
-    // Column `column` of `plan` as an expression over the first node below it that is not a projection.
+    // Column `column` of `plan` as an expression over the first node below it that is not a projection,
+    // looking into CTE bodies (the parallel program compile does not inline them; an analysis only, so
+    // the body is read, never compiled here). A CTE seen twice (recursion) ends the walk.
     private static (ResolvedExpression Expr, LogicalPlan Below) ColumnSource(LogicalPlan plan, int column, CompileContext ctx)
     {
         ResolvedExpression expr = new ResolvedColumn(column, plan.Schema[column].Type);
+        HashSet<CteRef>? seen = null;
         while (true)
         {
             if (Unwrap(plan, ctx) is { } inlined)
             {
                 plan = inlined;
+            }
+            else if (plan is CteScanPlan c && (seen ??= new(ReferenceEqualityComparer.Instance)).Add(c.Cte)
+                     && c.Cte.Plan.Schema.Count == c.Schema.Count)
+            {
+                plan = c.Cte.Plan;
             }
             else if (plan is ProjectPlan p)
             {

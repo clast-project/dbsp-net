@@ -39,12 +39,16 @@ public class HotKeySplitTests
             "(SELECT f.id, CASE WHEN f.amt = 0 THEN NULL ELSE LOWER(COALESCE(lk.cp, 'NOT APPLICABLE')) END AS cp " +
             "FROM f LEFT JOIN lk ON f.a = lk.a) x LEFT JOIN prof ON x.cp = prof.cp",
 
+        // The key computed in a CTE (the parallel program compile does not inline CTEs).
+        "CREATE VIEW cte AS WITH bf AS (SELECT f.id, LOWER(COALESCE(lk.cp, 'NOT APPLICABLE')) AS cp FROM f LEFT JOIN lk ON f.a = lk.a) " +
+            "SELECT bf.id, bf.cp, prof.p FROM bf LEFT JOIN prof ON bf.cp = prof.cp",
+
         // A key that is NULL when its source is: no hot value, no split.
         "CREATE VIEW plain AS SELECT x.id, prof.p FROM " +
             "(SELECT f.id, LOWER(lk.cp) AS cp FROM f LEFT JOIN lk ON f.a = lk.a) x LEFT JOIN prof ON x.cp = prof.cp",
     ];
 
-    private static readonly string[] Views = ["hot", "resid", "agg", "nullk", "plain"];
+    private static readonly string[] Views = ["hot", "resid", "agg", "nullk", "cte", "plain"];
 
     private static T With<T>(bool split, Func<T> compile)
     {
@@ -181,6 +185,7 @@ public class HotKeySplitTests
     [InlineData("hot", 1)]
     [InlineData("resid", 1)]
     [InlineData("nullk", 1)]
+    [InlineData("cte", 1)]
     [InlineData("plain", 0)]
     public void The_split_forms_where_the_key_has_a_hot_value(string view, int extra)
     {
