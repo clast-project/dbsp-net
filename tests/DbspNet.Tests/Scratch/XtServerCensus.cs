@@ -129,6 +129,10 @@ public class XtServerCensus
         var prof = new System.Collections.Concurrent.ConcurrentDictionary<(long Tick, int Op), long[]>();
         var profNames = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
         var profLast = new ThreadLocal<(long Tick, long Ts, long Alloc)>(() => (-1, 0, 0));
+        var profRange = (Environment.GetEnvironmentVariable("XT_PROF_OPS") ?? "").Split('-', StringSplitOptions.RemoveEmptyEntries);
+        var profFrom = profRange.Length == 2 ? int.Parse(profRange[0], CultureInfo.InvariantCulture) : -1;
+        var profTo = profRange.Length == 2 ? int.Parse(profRange[1], CultureInfo.InvariantCulture) : -2;
+        var profSpan = new System.Collections.Concurrent.ConcurrentDictionary<int, long[]>(); // op -> [first start, last end] ticks since sw
         var checkpointAt = long.TryParse(Environment.GetEnvironmentVariable("XT_CHECKPOINT_AT_TICK"), out var ca) ? ca : -1;
         DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = drainTick =>
         {
@@ -147,6 +151,16 @@ public class XtServerCensus
                         $"OPPROF tick={t} op={c.Op} worker_ms={c.Ms:F0} pct={100 * c.Ms / Math.Max(1, totalMs):F1} alloc_mib={c.Mib} calls={c.Calls} {profNames.GetValueOrDefault(c.Op)}"));
                 }
 
+                // XT_PROF_OPS=a-b: every operator in the range (not just the top 40), with the wall-clock
+                // span from its first start to its last end on any worker (t_s since the server started).
+                foreach (var c in cells.Where(c => c.Op >= profFrom && c.Op <= profTo).OrderBy(c => c.Op))
+                {
+                    var span = profSpan.TryGetValue(c.Op, out var sp) ? sp : new long[2];
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"OPRANGE tick={t} op={c.Op} worker_ms={c.Ms:F0} alloc_mib={c.Mib} calls={c.Calls} first_s={span[0] / (double)Stopwatch.Frequency:F1} last_s={span[1] / (double)Stopwatch.Frequency:F1} {profNames.GetValueOrDefault(c.Op)}"));
+                }
+
+                profSpan.Clear();
                 prof.Clear();
 
                 // Ranks by phase (PartitionedRankOp.Phase), summed over replicas, then reset.
@@ -378,6 +392,16 @@ public class XtServerCensus
                     Interlocked.Add(ref cell[1], a - pa);
                     Interlocked.Increment(ref cell[2]);
                     profNames.TryAdd(i, $"{circuit.Operators[i].GetType().Name.Split('`')[0]} view={circuit.OperatorLabel(i) ?? "-"}");
+                    if (i >= profFrom && i <= profTo)
+                    {
+                        var origin = ts - sw.ElapsedTicks; // Stopwatch timestamp of the server's start
+                        var span = profSpan.GetOrAdd(i, _ => [long.MaxValue, 0]);
+                        lock (span)
+                        {
+                            span[0] = Math.Min(span[0], pts - origin);
+                            span[1] = Math.Max(span[1], ts - origin);
+                        }
+                    }
                 }
             }
 
