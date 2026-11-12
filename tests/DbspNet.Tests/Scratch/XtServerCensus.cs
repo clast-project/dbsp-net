@@ -167,7 +167,13 @@ public class XtServerCensus
                     }
                 }
 
-                foreach (var (k, ph) in phases.Where(kv => kv.Value.Take(6).Sum() >= (1L << 30)).OrderByDescending(kv => kv.Value.Take(6).Sum()))
+                foreach (var (k, ph) in phases.Where(kv => kv.Value.Length == 11 && kv.Value.Take(8).Sum() >= (1L << 30)).OrderByDescending(kv => kv.Value.Take(8).Sum()))
+                {
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"LJPHASE tick={t} op={k} walk_mib={ph[0] >> 20} right_mib={ph[1] >> 20} oldleft_mib={ph[2] >> 20} join_mib={ph[3] >> 20} pad_mib={ph[4] >> 20} build_mib={ph[5] >> 20} intl_mib={ph[6] >> 20} intr_mib={ph[7] >> 20} dl_rows={ph[8]} keys={ph[9]} out_rows={ph[10]}"));
+                }
+
+                foreach (var (k, ph) in phases.Where(kv => kv.Value.Length == 10 && kv.Value.Take(6).Sum() >= (1L << 30)).OrderByDescending(kv => kv.Value.Take(6).Sum()))
                 {
                     log.WriteLine(string.Create(CultureInfo.InvariantCulture,
                         $"RANKPHASE tick={t} op={k} slicing_mib={ph[0] >> 20} old_mib={ph[1] >> 20} integrate_mib={ph[2] >> 20} new_mib={ph[3] >> 20} emit_mib={ph[4] >> 20} endtick_mib={ph[5] >> 20} delta_rows={ph[6]} slices={ph[7]} touched={ph[8]} rows_read={ph[9]}"));

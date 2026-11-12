@@ -3358,7 +3358,19 @@ public static partial class PlanToCircuit
         CompileIndexInput(CircuitBuilder builder, LogicalPlan plan, CompileContext ctx, int[]? nullKeyIndices)
     {
         System.Diagnostics.Debug.Assert(ctx.Workers <= 1, "index-input fusion is W<=1 only");
+        var (input, pre, _) = CompileIndexInputCore(builder, plan, ctx, nullKeyIndices);
+        return (input, pre);
+    }
 
+    /// <summary>
+    /// <see cref="CompileIndexInput"/>, plus whether the fused chain projects (any Map stage). A
+    /// caller at W&gt;1 that indexes without an exchange (a broadcast join's preserved side) uses it
+    /// for the partition the unfused chain would have recorded: a filters-only chain keeps its
+    /// input's, a projection drops it (as <c>CompileLinearChain</c> does).
+    /// </summary>
+    private static (Stream<ZSet<StructuralRow, Z64>> Input, Func<StructuralRow, StructuralRow?>? Pre, bool Projects)
+        CompileIndexInputCore(CircuitBuilder builder, LogicalPlan plan, CompileContext ctx, int[]? nullKeyIndices)
+    {
         // A NULL check on NOT NULL key columns can never drop a row.
         if (nullKeyIndices is not null && nullKeyIndices.All(i => !plan.Schema[i].Type.Nullable))
         {
@@ -3391,7 +3403,7 @@ public static partial class PlanToCircuit
             (_, null) => row => RunStages(chain, row, codec),
             (_, { } idx) => row => RunStages(chain, row, codec) is { } m && HasNoNullKey(m, idx) ? m : null,
         };
-        return (input, pre);
+        return (input, pre, chain.Any(st => st.Kind == LinearStageKind.Map));
     }
 
     private static StructuralRow ApplyMap(
@@ -3764,14 +3776,47 @@ public static partial class PlanToCircuit
 
         var pairResidual = PairResidual(plan);
 
-        var left = CompilePlan(builder, plan.Left, ctx);
-        var right = CompilePlan(builder, plan.Right, ctx);
-
         var (leftIndices, rightIndices) = ExtractEquiKeyIndices(plan);
         var leftCount = plan.Left.Schema.Count;
         var rightCount = plan.Right.Schema.Count;
         var leftKeySchema = plan.Left.Schema.SubsetByIndex(leftIndices);
         var rightKeySchema = plan.Right.Schema.SubsetByIndex(rightIndices);
+        var joinedSchema = plan.Schema;
+        var codec = ctx.Codec;
+
+        // Broadcast (ShouldBroadcastRight): a small right dimension on a low-cardinality key would
+        // put the whole preserved side on a handful of workers. Instead the left stays on its
+        // incoming partition and the right is replicated; each worker holds every right row, so
+        // its left rows' matches and NULL pads are exactly the serial ones.
+        var broadcastRight = ShouldBroadcastRight(plan.Right, ctx);
+
+        // GC license requires the equi-key be monotone on BOTH sides (not just
+        // the preserved left side): a future row on the non-monotone right side
+        // could still flip a left key from unmatched to matched below the frontier.
+        var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
+
+        // Where the preserved side is not exchanged (W<=1, or a broadcast right), its own
+        // Filter/Project chain runs inside the pass that indexes it, and NULL-keyed rows are
+        // indexed too (§5.46): the right side drops its NULL keys, so a NULL left key never
+        // matches and the operator pads it, as the bypass below would. On issue #2's extended
+        // TPC-DS this removes, per join in a 15-join chain over 36M rows, a projection, two
+        // filters and a union, each a full decode and re-encode of a spilled delta. Not with
+        // join-key GC, whose monotone key need not accept a NULL.
+        var fuseLeft = (ctx.Workers <= 1 || broadcastRight) && IndexFusionMode.Enabled && gcFrontier is null;
+
+        Stream<ZSet<StructuralRow, Z64>> left;
+        Func<StructuralRow, StructuralRow?>? leftPre = null;
+        var leftProjects = false;
+        if (fuseLeft)
+        {
+            (left, leftPre, leftProjects) = CompileIndexInputCore(builder, plan.Left, ctx, nullKeyIndices: null);
+        }
+        else
+        {
+            left = CompilePlan(builder, plan.Left, ctx);
+        }
+
+        var right = CompilePlan(builder, plan.Right, ctx);
 
         // Parallel: shuffle the WHOLE preserved side by its equi-key hash, before the
         // NULL-key split, so the NULL-keyed bypass rows land by key too (a NULL key
@@ -3780,31 +3825,37 @@ public static partial class PlanToCircuit
         // left-key partition below. The non-preserved side is shuffled by the same
         // key inside ExchangeIndex. At W<=1 `Exchange` is the input itself and
         // `ExchangeIndex` is the GroupProject emitted before, so W=1 is byte-identical.
-        //
-        // Broadcast (ShouldBroadcastRight): a small right dimension on a low-cardinality key would
-        // put the whole preserved side on a handful of workers. Instead the left stays on its
-        // incoming partition and the right is replicated; each worker holds every right row, so
-        // its left rows' matches and NULL pads are exactly the serial ones.
-        var broadcastRight = ShouldBroadcastRight(plan.Right, ctx);
-        var leftIncoming = left;
+        // The partition a broadcast output inherits: the preserved side's, after its chain.
+        var leftPartition = ctx.Workers > 1 && !leftProjects ? ctx.GetPartition(left) : default;
         if (!broadcastRight)
         {
             left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
         }
 
         // NULL-keyed left rows can never find a match (NULL = anything is
-        // NULL, not TRUE), so they bypass the join and go straight to the
+        // NULL, not TRUE), so unfused they bypass the join and go straight to the
         // NULL-padded branch. NULL-keyed right rows are simply dropped.
-        var nullKeyLeft = builder.Filter(left, row => !HasNoNullKey(row, leftIndices));
-        var validKeyLeft = builder.Filter(left, row => HasNoNullKey(row, leftIndices));
-        var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
+        Stream<ZSet<StructuralRow, Z64>>? nullKeyLeft = null;
+        Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed;
+        if (fuseLeft)
+        {
+            StructuralRow LeftKeyOf(StructuralRow row) => ExtractKey(codec, leftKeySchema, row, leftIndices);
+            leftIndexed = leftPre is null
+                ? builder.GroupProject(left, LeftKeyOf, static row => row)
+                : builder.MapFilterGroupProject<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                    left, leftPre, LeftKeyOf, static row => row);
+        }
+        else
+        {
+            nullKeyLeft = builder.Filter(left, row => !HasNoNullKey(row, leftIndices));
+            var validKeyLeft = builder.Filter(left, row => HasNoNullKey(row, leftIndices));
+            leftIndexed = builder.GroupProject(
+                validKeyLeft,
+                row => ExtractKey(codec, leftKeySchema, row, leftIndices),
+                row => row);
+        }
 
-        var joinedSchema = plan.Schema;
-        var codec = ctx.Codec;
-        var leftIndexed = builder.GroupProject(
-            validKeyLeft,
-            row => ExtractKey(codec, leftKeySchema, row, leftIndices),
-            row => row);
+        var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
         var rightIndexed = broadcastRight
             ? builder.GroupProject(
                 builder.BroadcastExchange(validKeyRight),
@@ -3817,10 +3868,6 @@ public static partial class PlanToCircuit
 
         var leftCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(leftKeySchema, plan.Left.Schema);
         var rightCodec = ctx.SnapshotCodecs?.CreateIndexedZSetTraceCodec(rightKeySchema, plan.Right.Schema);
-        // GC license requires the equi-key be monotone on BOTH sides (not just
-        // the preserved left side): a future row on the non-monotone right side
-        // could still flip a left key from unmatched to matched below the frontier.
-        var (gcFrontier, gcMonotoneKey) = ResolveJoinKeyFrontier(plan, ctx);
         var joined = EmitLeftJoin(
             builder, ctx,
             leftIndexed,
@@ -3838,11 +3885,11 @@ public static partial class PlanToCircuit
         // NULL-keyed left rows contribute directly to the output, each as
         // a NULL-padded row (never matched).
         AttachDeltaFormat(joined, joinedSchema);
-        var nullKeyPadded = builder.MapRows(
-            nullKeyLeft,
-            row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount));
-
-        var result = builder.Union(joined, nullKeyPadded);
+        var result = nullKeyLeft is null
+            ? joined
+            : builder.Union(joined, builder.MapRows(
+                nullKeyLeft,
+                row => NullPadRight(codec, joinedSchema, row, leftCount, rightCount)));
 
         // Every output row (matched, padded by the operator, or NULL-key bypass)
         // carries its left row's key columns at the same indices and sits on the
@@ -3851,7 +3898,7 @@ public static partial class PlanToCircuit
         if (ctx.Workers > 1)
         {
             ctx.SetPartition(result, broadcastRight
-                ? ctx.GetPartition(leftIncoming) with { ShardDisjoint = false }
+                ? leftPartition with { ShardDisjoint = false }
                 : new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
         }
 

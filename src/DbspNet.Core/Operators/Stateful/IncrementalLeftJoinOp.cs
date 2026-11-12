@@ -149,13 +149,19 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
         var leftOld = _leftTrace;
         var rightOld = _rightTrace;
 
+        var t0 = GC.GetAllocatedBytesForCurrentThread();
+        var inner0 = Phase[1] + Phase[2] + Phase[3] + Phase[4];
         var builder = Blocks.DeltaSpill.For<TOut, TWeight>(_output.DeltaFormat, _lastOutputSize);
 
         // Every key that could have a non-zero delta this tick shows up in dl or dr, each once (§5.34).
         foreach (var (key, dlK, drK) in TouchedKeys.Of(dl, dr))
         {
+            Phase[9]++;
+            Phase[8] += dlK.Count;
+            var since = GC.GetAllocatedBytesForCurrentThread();
             var oldR = rightOld.GroupFor(key);
             var newR = oldR + drK;
+            Phase[1] += Mark(ref since);
 
             // The key's old left group, read from the trace only where a branch needs it, and its new one
             // formed only where a match changes (§5.35): on a coarse key the left group is millions of rows,
@@ -165,6 +171,7 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
                 var oldL = leftOld.GroupFor(key);
                 ResidualOuterJoin.JoinInto(builder, key, oldL, dlK, drK, newR, residual, _joinCombine);
                 ResidualOuterJoin.PadInto(builder, key, oldL, dlK, oldR, drK, newR, residual, _nullPadCombine);
+                Phase[3] += Mark(ref since);
                 continue;
             }
 
@@ -177,9 +184,13 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
                 // asymmetric form: dlK ⋈ newR absorbs both dlK ⋈ oldR and
                 // the cross term dlK ⋈ drK; oldL ⋈ drK is empty without a right delta.
                 JoinInto(builder, key, dlK, newR);
+                Phase[3] += Mark(ref since);
                 if (!drK.IsEmpty)
                 {
-                    JoinInto(builder, key, leftOld.GroupFor(key), drK);
+                    var oldL = leftOld.GroupFor(key);
+                    Phase[2] += Mark(ref since);
+                    JoinInto(builder, key, oldL, drK);
+                    Phase[3] += Mark(ref since);
                 }
             }
             else if (!oldMatched && !newMatched)
@@ -187,32 +198,59 @@ internal sealed class IncrementalLeftJoinOp<TKey, TLeft, TRight, TOut, TWeight> 
                 // Still no right match for this key: the left delta becomes
                 // NULL-padded output deltas 1:1.
                 NullPadInto(builder, key, dlK);
+                Phase[4] += Mark(ref since);
             }
             else if (!oldMatched && newMatched)
             {
                 // Key gained a match this tick. Retract every NULL-padded
                 // row that was present (oldL), emit the full join on newL × newR.
                 var oldL = leftOld.GroupFor(key);
+                Phase[2] += Mark(ref since);
                 NullPadInto(builder, key, oldL.Negate());
+                Phase[4] += Mark(ref since);
                 JoinInto(builder, key, oldL + dlK, newR);
+                Phase[3] += Mark(ref since);
             }
             else
             {
                 // Key lost all matches this tick. Retract the prior joined
                 // rows, emit newL × NULL.
                 var oldL = leftOld.GroupFor(key);
+                Phase[2] += Mark(ref since);
                 JoinInto(builder, key, oldL.Negate(), oldR);
+                Phase[3] += Mark(ref since);
                 NullPadInto(builder, key, oldL + dlK);
+                Phase[4] += Mark(ref since);
             }
         }
 
+        var t1 = GC.GetAllocatedBytesForCurrentThread();
+        Phase[0] += t1 - t0 - (Phase[1] + Phase[2] + Phase[3] + Phase[4] - inner0);
         var result = builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
+        Phase[10] += result.Count;
+        Phase[5] += Mark(ref t1);
 
         _leftTrace.Integrate(dl);
+        Phase[6] += Mark(ref t1);
         _rightTrace.Integrate(dr);
+        Phase[7] += Mark(ref t1);
         CollectGarbage();
+    }
+
+    /// <summary>Diagnostics (the xt harness): bytes allocated by phase, summed over steps until reset:
+    /// 0 touched-key walk (the deltas' enumeration and grouping), 1 right groups, 2 old left groups,
+    /// 3 join combine and output adds, 4 NULL pads, 5 output build, 6 left integrate, 7 right integrate;
+    /// then 8 left delta rows, 9 touched keys, 10 output rows.</summary>
+    internal readonly long[] Phase = new long[11];
+
+    private static long Mark(ref long since)
+    {
+        var now = GC.GetAllocatedBytesForCurrentThread();
+        var d = now - since;
+        since = now;
+        return d;
     }
 
     // Frontier-driven GC: when the join key is monotone on BOTH sides, no

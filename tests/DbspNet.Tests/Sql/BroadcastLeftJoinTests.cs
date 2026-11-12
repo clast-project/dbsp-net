@@ -30,9 +30,15 @@ public class BroadcastLeftJoinTests
         // Grouped on the broadcast join's own key: only right if the join does not claim its
         // output is partitioned by that key (the fact never moved).
         "CREATE VIEW keyed AS SELECT f.code, COUNT(*) AS n, SUM(t.rank_) AS r FROM fact f LEFT JOIN tiers t ON f.code = t.rank_ GROUP BY f.code",
+        // A preserved side partitioned by (id, code), then projected so those indices hold other
+        // columns, then broadcast-joined (fused, §5.46) and grouped on the columns now at those
+        // indices: only right if the join's output does not claim the stale partition.
+        "CREATE VIEW per AS SELECT id, code, COUNT(*) AS c FROM fact GROUP BY id, code",
+        "CREATE VIEW reord AS SELECT * FROM (SELECT c, COALESCE(code, 0) % 2 AS code2, id FROM per) p LEFT JOIN tiers t ON p.id % 3 = t.rank_",
+        "CREATE VIEW reagg AS SELECT c, code2, COUNT(*) AS n, SUM(rank_) AS r FROM reord GROUP BY c, code2",
     ];
 
-    private static readonly string[] Outputs = ["joined", "rollup", "keyed"];
+    private static readonly string[] Outputs = ["joined", "rollup", "keyed", "reagg"];
 
     private static readonly Dictionary<string, long> Counts = new(StringComparer.Ordinal)
     {
@@ -91,7 +97,19 @@ public class BroadcastLeftJoinTests
     private static void AssertMatchesSerial(int workers, IReadOnlyDictionary<string, long> counts, int expectedBroadcasts)
     {
         var outputs = new HashSet<string>(Outputs, StringComparer.Ordinal);
-        var serial = SqlProgram.Compile(Sql, outputs);
+        // The oracle compiles unfused: its preserved sides' NULL keys bypass the join (§5.46).
+        CompiledProgram serial;
+        var prev = IndexFusionMode.Enabled;
+        IndexFusionMode.Enabled = false;
+        try
+        {
+            serial = SqlProgram.Compile(Sql, outputs);
+        }
+        finally
+        {
+            IndexFusionMode.Enabled = prev;
+        }
+
         Assert.True(SqlProgram.TryCompileParallel(
             Sql, outputs, workers, out var parallel,
             options: new CompileOptions { BroadcastMaxRows = 100, RelationRowCounts = counts }));
@@ -119,7 +137,7 @@ public class BroadcastLeftJoinTests
     [InlineData(4)]
     [InlineData(8)]
     public void A_left_join_broadcasts_a_small_input_and_matches_serial(int workers) =>
-        AssertMatchesSerial(workers, Counts, expectedBroadcasts: 2);
+        AssertMatchesSerial(workers, Counts, expectedBroadcasts: 3);
 
     // A supplied count for dim_v stands, so its LEFT join broadcasts too.
     [Theory]
@@ -127,12 +145,41 @@ public class BroadcastLeftJoinTests
     [InlineData(4)]
     [InlineData(8)]
     public void A_view_hinted_small_broadcasts_and_matches_serial(int workers) =>
-        AssertMatchesSerial(workers, new Dictionary<string, long>(Counts, StringComparer.Ordinal) { ["dim_v"] = 1 }, expectedBroadcasts: 3);
+        AssertMatchesSerial(workers, new Dictionary<string, long>(Counts, StringComparer.Ordinal) { ["dim_v"] = 1 }, expectedBroadcasts: 4);
 
     // Without counts, nothing broadcasts: still the serial answer.
     [Fact]
     public void Without_counts_both_joins_hash() =>
         AssertMatchesSerial(4, new Dictionary<string, long>(StringComparer.Ordinal), expectedBroadcasts: 0);
+
+    // The broadcast LEFT joins' preserved sides are indexed in one pass with their chains (§5.46):
+    // fewer pointwise operators than the unfused layout.
+    [Fact]
+    public void Broadcast_left_joins_fuse_the_preserved_sides_chain()
+    {
+        int ApplyOps(bool fused)
+        {
+            var prev = IndexFusionMode.Enabled;
+            IndexFusionMode.Enabled = fused;
+            try
+            {
+                Assert.True(SqlProgram.TryCompileParallel(
+                    Sql, new HashSet<string>(Outputs, StringComparer.Ordinal), 4, out var p,
+                    options: new CompileOptions { BroadcastMaxRows = 100, RelationRowCounts = Counts }));
+                using (p)
+                {
+                    return p!.Circuit.Replicas[0].Operators.Count(o => o.GetType().Name.StartsWith("ApplyOp", StringComparison.Ordinal));
+                }
+            }
+            finally
+            {
+                IndexFusionMode.Enabled = prev;
+            }
+        }
+
+        var (fusedOps, unfusedOps) = (ApplyOps(true), ApplyOps(false));
+        Assert.True(fusedOps < unfusedOps - 3, $"fused {fusedOps} ApplyOps, unfused {unfusedOps}");
+    }
 
     private static Dictionary<string, long> Materialize(ZSet<StructuralRow, Z64> zset, int width)
     {

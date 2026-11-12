@@ -49,6 +49,19 @@ public class IndexFusionTests
         // The same right relation and key in two joins: the shared-arrangement branch.
         "SELECT t.a, u.c FROM t JOIN u ON t.k = u.k " +
         "UNION ALL SELECT n.a, u.c FROM n JOIN u ON n.k = u.k",
+        // LEFT joins (§5.46): the preserved side's NULL keys are indexed and padded by the
+        // operator instead of bypassing it. NULLable keys on both sides, no chain.
+        "SELECT n.a, m.c FROM n LEFT JOIN m ON n.k = m.k",
+        // Under a chain that projects (the key column survives at a new index).
+        "SELECT x.a, m.c FROM (SELECT a * 2 AS a, k FROM n WHERE a <> 1) x LEFT JOIN m ON x.k = m.k",
+        // A computed, NULLable key.
+        "SELECT x.a, m.c FROM (SELECT k + 1 AS k1, a FROM n) x LEFT JOIN m ON x.k1 = m.k",
+        // A chain of LEFT joins, the second keyed on a NULL-padded column of the first.
+        "SELECT n.a, m.c, u.c FROM n LEFT JOIN m ON n.k = m.k LEFT JOIN u ON m.c = u.k",
+        // A pair residual in the operator.
+        "SELECT n.a, m.c FROM n LEFT JOIN m ON n.k = m.k AND m.c > n.a",
+        // An aggregate over the padded rows.
+        "SELECT m.c, COUNT(*) AS cnt, SUM(n.a) AS s FROM n LEFT JOIN m ON n.k = m.k GROUP BY m.c",
     };
 
     [Theory]
@@ -113,6 +126,17 @@ public class IndexFusionTests
             "JOIN (SELECT k, c FROM u WHERE d < 2) y ON x.k = y.k";
         Assert.True(
             ApplyOps(sql, fused: true) < ApplyOps(sql, fused: false),
+            $"fused {ApplyOps(sql, fused: true)} ApplyOps, unfused {ApplyOps(sql, fused: false)}");
+    }
+
+    [Fact]
+    public void Fusion_RemovesTheLeftJoinsNullKeySplit()
+    {
+        // Unfused: the chain, the two NULL-key filters, the index, the bypass's pad and the union.
+        // Fused: the index, with the chain inside it (§5.46).
+        const string sql = "SELECT x.a, m.c FROM (SELECT a * 2 AS a, k FROM n WHERE a <> 1) x LEFT JOIN m ON x.k = m.k";
+        Assert.True(
+            ApplyOps(sql, fused: true) <= ApplyOps(sql, fused: false) - 4,
             $"fused {ApplyOps(sql, fused: true)} ApplyOps, unfused {ApplyOps(sql, fused: false)}");
     }
 

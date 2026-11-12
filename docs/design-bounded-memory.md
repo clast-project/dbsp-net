@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **§5.45: a sliced rank reads its delta once instead of once per slice; on issue #2's SF25 tick 18 the two big ranks allocate 45% less (998 → 546 GiB), tick 18 −4.5%, step unchanged. §5.44: LEFT joins broadcast a small right side, and `DBSPNET_BROADCAST_VIEWS` hints dimension views small; on issue #2's SF25 batch 1, hinting eight 1–4-row dimensions cuts tick 18 by 31% (2,858 → 1,973 s) and the batch by 24%, at a peak RSS of 48 GiB (from 43). §5.43: a blocked rank steps a huge delta in partition-hash slices (D5 for rank, 11958f7); issue #2's calibrated 25 GB extended TPC-DS (201.6M source rows) batch 1 now completes and validates at W=12 in a 48 GiB heap (70.6 min), where a0196d2 runs out of memory in the rank at tick 17. §5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **§5.46: a LEFT join that does not exchange its preserved side indexes it in one pass with its chain, NULL keys padded by the operator; on issue #2's SF25 batch 1 (hinted) tick 18 1,973 → 1,683 s (−15%), allocation −16%, batch 3,065 → 2,792 s, 96 views unchanged. §5.45: a sliced rank reads its delta once instead of once per slice; on issue #2's SF25 tick 18 the two big ranks allocate 45% less (998 → 546 GiB), tick 18 −4.5%, step unchanged. §5.44: LEFT joins broadcast a small right side, and `DBSPNET_BROADCAST_VIEWS` hints dimension views small; on issue #2's SF25 batch 1, hinting eight 1–4-row dimensions cuts tick 18 by 31% (2,858 → 1,973 s) and the batch by 24%, at a peak RSS of 48 GiB (from 43). §5.43: a blocked rank steps a huge delta in partition-hash slices (D5 for rank, 11958f7); issue #2's calibrated 25 GB extended TPC-DS (201.6M source rows) batch 1 now completes and validates at W=12 in a 48 GiB heap (70.6 min), where a0196d2 runs out of memory in the rank at tick 17. §5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -3293,3 +3293,54 @@ The two ranks lose 452 GiB (−45%); the step does not move, because tick 18's t
 `int_engagement_status_transaction` exchanges and left-join chain (§5.44), not the rank. Tests:
 `RankSliceTests.A_step_runs_only_the_slices_its_rows_reach` (two partitions reach at most two slices, the
 output equals the unsliced op's on every tick). Suites: default, forced and forced+critical, 3,642 each.
+
+### 5.46 A LEFT join that does not exchange its preserved side indexes it in one pass (2026-11-11)
+
+With the dimensions hinted (§5.44), `int_engagement_status_transaction` is 15 LEFT joins in a chain, each over
+the full 36.1M-row status delta, and the view is ~29% of tick 18's allocation. `IncrementalLeftJoinOp` now
+counts allocation by phase (`Phase`, printed by the xt harness as `LJPHASE`), and `XT_DESCRIBE_OPS=a-b` names
+each operator's delegates. Restored from a hinted tick-17 point (xt25lj): the 15 joins allocate 1,192 GiB
+(output rows 464, left-trace integrate 319, the touched-key walk 263), and the `ApplyOp`s between them at
+least as much again (≥1,176 GiB, 5.0M worker-ms). One step of the chain was a projection (`MapRows`, 66 GiB),
+a NULL-key filter and a valid-key filter (44 GiB; it passes every row), the index (`GroupProject`), the join,
+then a NULL pad and a union for the bypass. At 3M rows a worker every one of those is a spilled delta, so
+each pass decodes and re-encodes all of it.
+
+**Built.** Where the preserved side is not exchanged (W≤1, or a broadcast right side), `CompileLeftOuterJoin`
+indexes it with `CompileIndexInputCore` (§9.9's fusion, until now inner joins and aggregates at W≤1 only): its
+Filter/Project chain runs inside the indexing pass, and NULL-keyed rows are indexed with the rest. The right
+side still drops its NULL keys, so a NULL left key never matches and the operator pads it in its
+stayed-unmatched branch, which reads no old state: the same rows the bypass produced. The cost is that
+NULL-keyed preserved rows now sit in the join's left trace (none here: every join sees all 36,091,821 rows).
+Not with join-key GC (a monotone key need not accept a NULL), and `DBSPNET_INDEX_FUSION=off` restores the old
+layout. A fused chain that projects drops the output's partition claim, as the unfused chain did. The plan
+shape changes, so checkpoints from before do not restore.
+
+**Tests.** `IndexFusionTests`: six LEFT JOIN queries (NULLable keys both sides, a projecting chain, a computed
+key, a chain keyed on a padded column, a pair residual, an aggregate over pads), fused ≡ unfused ≡ batch over
+200 signed streams each, and the split is gone from the circuit. `LeftJoinNullKeyStateTests`: fused ≡ unfused
+every tick, managed and blocked; NULL-keyed left groups survive a checkpoint in all four write/read layouts
+and continue as an unfused twin. `BroadcastLeftJoinTests`: unfused serial oracle, a projected, partitioned
+preserved side grouped on the columns now at its old key indices, fewer operators fused. Mutants caught:
+the fused pass dropping NULL keys (18 fail), the right side keeping them (12), never fusing (2). Not caught:
+claiming the stale partition after a projection; an aggregate's input projection clears it first in every
+plan tried, so the rule is kept as the safe one. Suites: default, forced and forced+critical, 3,656 each.
+
+**Measured** live, from scratch, hinted (§5.44's setup):
+
+| batch 1 | xt25bv (62d8b6f) | xt25fuse |
+|---|---|---|
+| batch duration | 3,065 s | **2,792 s (−9%)** |
+| tick 18 step | 1,973 s | **1,683 s (−15%)** |
+| tick 18 GC pauses | 1,023 s | 810 s |
+| tick 18 allocation | 8,834 GiB | **7,419 GiB (−16%)** |
+| tick 18 worker time | 23.7M ms | 20.2M ms |
+| operators | 2,221 | 2,037 |
+| peak RSS | 48 GiB | 48 GiB |
+| spill disk | 98 GB | 99 GB |
+
+All 96 views have the same row counts as xt25bv. (xt25fuse also carries §5.45's rank change, worth ~0.4 TiB
+of the allocation and none of the time.) What is left in the chain: the joins themselves (1.2 TiB, 3.0M
+worker-ms: the joined row, built by `MergeRows`, and each join's own left trace, a copy of the fact delta
+per join), the indexing passes that now carry the projections (~0.9 TiB), and op 895's re-shard of the fact
+(1.29M worker-ms, an exchange wait, before the broadcast joins). Peak RSS is still at the cap.
