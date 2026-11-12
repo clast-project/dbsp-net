@@ -4013,6 +4013,14 @@ public static partial class PlanToCircuit
 
         var right = CompilePlan(builder, plan.Right, ctx);
 
+        // A hashed join whose left key has a hot default value splits on it, so the rows sharing it are
+        // not all sent to one worker (§5.49).
+        if (ctx.Workers > 1 && !broadcastRight && gcFrontier is null && HotKeySplitMode.Enabled
+            && HotLeftKey(plan, leftIndices, leftKeySchema, ctx) is { } hot)
+        {
+            return CompileHotSplitLeftJoin(builder, ctx, plan, left, right, hot, post, pairResidual);
+        }
+
         // Parallel: shuffle the WHOLE preserved side by its equi-key hash, before the
         // NULL-key split, so the NULL-keyed bypass rows land by key too (a NULL key
         // hashes to a fixed sentinel). Every output row then sits on the worker its

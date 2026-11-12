@@ -133,6 +133,11 @@ public class XtServerCensus
         var profFrom = profRange.Length == 2 ? int.Parse(profRange[0], CultureInfo.InvariantCulture) : -1;
         var profTo = profRange.Length == 2 ? int.Parse(profRange[1], CultureInfo.InvariantCulture) : -2;
         var profSpan = new System.Collections.Concurrent.ConcurrentDictionary<int, long[]>(); // op -> [first start, last end] ticks since sw
+        // XT_PROF_OPS also: each in-range operator's time on each worker (replicas numbered as first seen),
+        // to see skew: an exchange that only waits is waiting for the slowest worker's operators before it.
+        var profWorker = new System.Collections.Concurrent.ConcurrentDictionary<(int Op, int Worker), long>();
+        var replicaIds = new System.Collections.Concurrent.ConcurrentDictionary<RootCircuit, int>(ReferenceEqualityComparer.Instance);
+        var replicaCount = 0;
         var checkpointAt = long.TryParse(Environment.GetEnvironmentVariable("XT_CHECKPOINT_AT_TICK"), out var ca) ? ca : -1;
         DbspNet.Connectors.Abstractions.ProgramRunner.AfterTick = drainTick =>
         {
@@ -160,6 +165,16 @@ public class XtServerCensus
                         $"OPRANGE tick={t} op={c.Op} worker_ms={c.Ms:F0} alloc_mib={c.Mib} calls={c.Calls} first_s={span[0] / (double)Stopwatch.Frequency:F1} last_s={span[1] / (double)Stopwatch.Frequency:F1} {profNames.GetValueOrDefault(c.Op)}"));
                 }
 
+                foreach (var op in profWorker.Keys.Select(k => k.Op).Distinct().Order())
+                {
+                    var ms = Enumerable.Range(0, replicaIds.Count)
+                        .Select(w => profWorker.GetValueOrDefault((op, w)) * 1000.0 / Stopwatch.Frequency).ToArray();
+                    var sorted = ms.Order().ToArray();
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"OPWORKER tick={t} op={op} max_ms={sorted[^1]:F0} median_ms={sorted[sorted.Length / 2]:F0} min_ms={sorted[0]:F0} ms={string.Join(',', ms.Select(m => m.ToString("F0", CultureInfo.InvariantCulture)))} {profNames.GetValueOrDefault(op)}"));
+                }
+
+                profWorker.Clear();
                 profSpan.Clear();
                 prof.Clear();
 
@@ -395,6 +410,8 @@ public class XtServerCensus
                     if (i >= profFrom && i <= profTo)
                     {
                         var origin = ts - sw.ElapsedTicks; // Stopwatch timestamp of the server's start
+                        var w = replicaIds.GetOrAdd(circuit, _ => Interlocked.Increment(ref replicaCount) - 1);
+                        profWorker.AddOrUpdate((i, w), ts - pts, (_, v) => v + ts - pts);
                         var span = profSpan.GetOrAdd(i, _ => [long.MaxValue, 0]);
                         lock (span)
                         {

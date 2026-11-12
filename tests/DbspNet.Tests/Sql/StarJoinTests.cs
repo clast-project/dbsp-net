@@ -333,6 +333,52 @@ public class StarJoinTests
         Assert.Contains(restored.Circuit.Operators.OfType<StarLeftJoinOp>(), o => o.KeyScans > 0);
     }
 
+    // At W>1 the fact is linear (Anywhere) and every dimension replicated (OnEveryWorker): a checkpoint
+    // re-sharded to another worker count continues as the serial chain does.
+    [Theory]
+    [InlineData(4, 4)]
+    [InlineData(4, 3)]
+    [InlineData(2, 5)]
+    public async Task A_parallel_star_survives_a_resharded_checkpoint(int from, int to)
+    {
+        var fs = new InMemoryTableFileSystem();
+        var serial = Compile(star: false);
+        ParallelCompiledProgram Parallel(int w) => With(true, () =>
+        {
+            Assert.True(SqlProgram.TryCompileParallel(
+                Sql, new HashSet<string>(Views, StringComparer.Ordinal), w, out var p, ArrowSqlSnapshotCodecs.Instance, options: Options));
+            return p!;
+        });
+
+        using (var producer = Parallel(from))
+        {
+            Assert.True(Stars(producer.Circuit.Replicas[0].Operators) >= 3);
+            for (var tick = 0; tick < 6; tick++)
+            {
+                Step(serial, tick);
+                Push(producer.Table, Tick(tick));
+                producer.Step();
+            }
+
+            await ParallelSnapshot.WriteAsync(producer.Circuit, fs);
+        }
+
+        using var restored = Parallel(to);
+        if (from != to)
+        {
+            Assert.True(await ParallelReshard.RewriteAsync(fs, restored) > 0);
+        }
+
+        await ParallelSnapshot.ReadAsync(restored.Circuit, fs);
+        for (var tick = 6; tick < 13; tick++)
+        {
+            Step(serial, tick);
+            Push(restored.Table, Tick(tick));
+            restored.Step();
+            Assert.Equal(Digest(serial), Digest(restored));
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

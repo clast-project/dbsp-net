@@ -110,9 +110,21 @@ public class BroadcastLeftJoinTests
             IndexFusionMode.Enabled = prev;
         }
 
-        Assert.True(SqlProgram.TryCompileParallel(
-            Sql, outputs, workers, out var parallel,
-            options: new CompileOptions { BroadcastMaxRows = 100, RelationRowCounts = counts }));
+        // Counts the size-based broadcasts only: a hot-key split (§5.49) broadcasts its hot group too.
+        var prevSplit = HotKeySplitMode.Enabled;
+        HotKeySplitMode.Enabled = false;
+        ParallelCompiledProgram? parallel;
+        try
+        {
+            Assert.True(SqlProgram.TryCompileParallel(
+                Sql, outputs, workers, out parallel,
+                options: new CompileOptions { BroadcastMaxRows = 100, RelationRowCounts = counts }));
+        }
+        finally
+        {
+            HotKeySplitMode.Enabled = prevSplit;
+        }
+
         using (parallel)
         {
             Assert.Equal(expectedBroadcasts, Broadcasts(parallel!));
