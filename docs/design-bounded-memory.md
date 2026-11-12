@@ -3640,7 +3640,15 @@ columns (below, not v1).
 
 Size, *estimate*: op ~500 lines, compiler ~400, tests ~800.
 
-**Open for review:** (1) option C as described, or plain A (one unindexed trace, full rescan on a
+**Decided (2026-11-12, Curt):** build option C (stages 1–3 above); in parallel, a feasibility study of
+the `dim_household` reorder (soundness of `(L ⟕p A) ⟕q B = (L ⟕q B) ⟕p A` under multiplicities, NULLs and
+residuals; where it would go in the planner; cost against simply hinting the view), as a short note here.
+The two are independent: the reorder is a logical-plan rewrite before compilation, the star match runs in
+`CompileLeftOuterJoin`, and without the reorder the star just gets two runs. The hashed-head question (3)
+is deferred: those operators (781–835) are upstream and independent of v1; revisit if stage 1 comes in
+under estimate, since they are as large as the star's whole saving.
+
+**Was open for review:** (1) option C as described, or plain A (one unindexed trace, full rescan on a
 dimension change, simpler and free on this workload); (2) whether hinting `dim_household` is acceptable or
 the reorder should be built; (3) whether this is worth doing before the items in the hashed head (the
 818/813 skew waits, 1.5M ms, and the redundant `account_id` re-exchange), which are as large and
