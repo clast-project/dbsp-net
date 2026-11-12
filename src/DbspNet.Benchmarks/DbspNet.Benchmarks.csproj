@@ -17,5 +17,6 @@
     <ProjectReference Include="..\DbspNet.Core\DbspNet.Core.csproj" />
     <ProjectReference Include="..\DbspNet.Sql\DbspNet.Sql.csproj" />
     <ProjectReference Include="..\DbspNet.Arrow\DbspNet.Arrow.csproj" />
+    <ProjectReference Include="..\DbspNet.Persistence\DbspNet.Persistence.csproj" />
   </ItemGroup>
 </Project>

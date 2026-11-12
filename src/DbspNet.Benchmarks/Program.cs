@@ -33,6 +33,12 @@ if (args.Length > 0 && args[0] == "r3par")
     return DbspNet.Benchmarks.ParallelStateBenchmark.Run(args);
 }
 
+// §5.48 stage 1: star join stand-in: `dotnet run -c Release -- starjoin [factRows] [runs] [arms]`
+if (args.Length > 0 && args[0] == "starjoin")
+{
+    return DbspNet.Benchmarks.StarJoinStandIn.Run(args);
+}
+
 // State-variant census of an ivm-bench program spec: `dotnet run -- statecensus program.json`
 if (args.Length > 0 && args[0] == "statecensus")
 {

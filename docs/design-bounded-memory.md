@@ -1,6 +1,6 @@
 # Bounded memory: keeping cold blocks on disk
 
-Status: **§5.48 (design, not built, for review): a star join for a run of broadcast LEFT joins (one fact trace keyed by the tuple of the run's keys, every dimension looked up per row, the row built once); on issue #2's SF25 tick 18 it would save an *estimated* 1.7–2.75M of 18.5M worker-ms and 760–1,135 of 6,710 GiB, and nothing of peak RSS (the chain is the tick's lowest-committed segment); in this workload no dimension changes while the fact is non-empty. §5.47: a LEFT join whose rows only a projection reads builds the projected row directly, and a blocked TOP-K steps a huge delta in partition slices; on issue #2's SF25 batch 1 (hinted) tick 18 1,683 → 1,457 s (−13%), allocation −9.6%, batch 2,792 → 2,552 s, 96 views unchanged, peak RSS still 48 GiB. §5.46: a LEFT join that does not exchange its preserved side indexes it in one pass with its chain, NULL keys padded by the operator; on issue #2's SF25 batch 1 (hinted) tick 18 1,973 → 1,683 s (−15%), allocation −16%, batch 3,065 → 2,792 s, 96 views unchanged. §5.45: a sliced rank reads its delta once instead of once per slice; on issue #2's SF25 tick 18 the two big ranks allocate 45% less (998 → 546 GiB), tick 18 −4.5%, step unchanged. §5.44: LEFT joins broadcast a small right side, and `DBSPNET_BROADCAST_VIEWS` hints dimension views small; on issue #2's SF25 batch 1, hinting eight 1–4-row dimensions cuts tick 18 by 31% (2,858 → 1,973 s) and the batch by 24%, at a peak RSS of 48 GiB (from 43). §5.43: a blocked rank steps a huge delta in partition-hash slices (D5 for rank, 11958f7); issue #2's calibrated 25 GB extended TPC-DS (201.6M source rows) batch 1 now completes and validates at W=12 in a 48 GiB heap (70.6 min), where a0196d2 runs out of memory in the rank at tick 17. §5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
+Status: **§5.48.7 stage 1 (stand-in, 3M-row fact, nine LEFT-joined dimensions, xt spill setting): the prototype star costs 14.7% of the chain's time and 8.9% of its allocation (1,854 vs 12,583 ns/row, 1,779 vs 20,038 B/row), on §5.48.3's estimate; half of the star is its one integrate. §5.48.8: the dim_household reorder is sound under side conditions but not worth building now; hint the view for stage 3. §5.48 (design, building option C): a star join for a run of broadcast LEFT joins (one fact trace keyed by the tuple of the run's keys, every dimension looked up per row, the row built once); on issue #2's SF25 tick 18 it would save an *estimated* 1.7–2.75M of 18.5M worker-ms and 760–1,135 of 6,710 GiB, and nothing of peak RSS (the chain is the tick's lowest-committed segment); in this workload no dimension changes while the fact is non-empty. §5.47: a LEFT join whose rows only a projection reads builds the projected row directly, and a blocked TOP-K steps a huge delta in partition slices; on issue #2's SF25 batch 1 (hinted) tick 18 1,683 → 1,457 s (−13%), allocation −9.6%, batch 2,792 → 2,552 s, 96 views unchanged, peak RSS still 48 GiB. §5.46: a LEFT join that does not exchange its preserved side indexes it in one pass with its chain, NULL keys padded by the operator; on issue #2's SF25 batch 1 (hinted) tick 18 1,973 → 1,683 s (−15%), allocation −16%, batch 3,065 → 2,792 s, 96 views unchanged. §5.45: a sliced rank reads its delta once instead of once per slice; on issue #2's SF25 tick 18 the two big ranks allocate 45% less (998 → 546 GiB), tick 18 −4.5%, step unchanged. §5.44: LEFT joins broadcast a small right side, and `DBSPNET_BROADCAST_VIEWS` hints dimension views small; on issue #2's SF25 batch 1, hinting eight 1–4-row dimensions cuts tick 18 by 31% (2,858 → 1,973 s) and the batch by 24%, at a peak RSS of 48 GiB (from 43). §5.43: a blocked rank steps a huge delta in partition-hash slices (D5 for rank, 11958f7); issue #2's calibrated 25 GB extended TPC-DS (201.6M source rows) batch 1 now completes and validates at W=12 in a 48 GiB heap (70.6 min), where a0196d2 runs out of memory in the rank at tick 17. §5.39: the +17% at 262,144-row chunks is mid-sized deltas going to blocks (every reader decodes them, +468 GiB; merges, encodes, probes the rest) and that setting is 22% FASTER (2,536 vs 3,268 s restored); decode for readers is 33–40% of tick 18 in both. §5.38: a giant group's file blocks are capped at 16 MiB (b50feb2); xt134–xt137 full batch 1 at 262,144-row chunks validate 4 of 4 (~3,480 s), against 5 of 7 before. §5.38: step chunks capped by bytes (`DBSPNET_STEP_SPILL_MIB`, off by default) match 262,144-row chunks (2 of 3 full runs validate; tick 18 +17% allocation either way, the cost of block-backed deltas); the one failure, now named, is a 59 MiB block load failing with 17.5 GB live in 48.9 GB committed. §5.37: a block-backed delta hands a giant group out streamed, so the giant joins (ops 1683–1703) no longer each materialize a 7.2M-row left group; xt118 restored batch 1 completes, tick 18 allocation 6,712 → 6,087 GiB. §5.36: ops 2153–2177 (a rolling eligibility view, per-row cost, no skew): merges copy entries, aggregates and joins read each spilled group once, surrogate keys (`MD5(CONCAT_WS(...))`) format and hash in one buffer; −29% allocation in a local stand-in. The restored batch 1 at W=12 completes (xt102, xt109, §5.35): ops 1680–1705, where one join key per worker carried 7.2M rows, no longer decode and re-encode in giant merges and exchange gathers (−18% allocation there, −6% for tick 18). Before that, tick 18 completed restored once (xt99, §5.34) and failed in its ops 1689–1700 in other runs; the end-of-batch view count no longer forms the views (§5.34). §5.33: stored views kept each tick's delta managed (~10 GB). S3 (pressure thresholds) BUILT 2026-11-06, default on (§5.28); xt82 reaches tick 18 op 1733 and still OOMs (§5.29). A restart point after tick 17 (§5.30) halves an iteration; it fixed a checkpoint that pinned every spilled body until commit. A census of what a restore leaves behind (§5.31) found ~4–5 GB of empty `Dictionary` capacity in the window stores; releasing it takes the live run past op 1733 to op 1994 (`ExchangeIndexOp`, live 48 GB), the same wall as the restored run, so the restart point is now a faithful stand-in for it. Phase 1 (census) done 2026-11-03. Design agreed: fixed per-worker budget, persisted blocks only; batch-1 spilling deferred (§1.4). Increment 1 BUILT 2026-11-03, opt-in (`DBSPNET_BLOCK_CACHE_MIB`), §3.5; miss cost apportioned and cut ~8× (§3.6). Increment 2 BUILT: window state backed and evictable (§3.7). The output row index is spilled too (§3.9): 0.51 GB live at 128 MiB. Mid-batch spilling: design proposed 2026-11-04 (§5); decisions §5.4, knobs §5.5; extended TPC-DS census §5.6 reorders it: R0 tick-0 release, S2 window write-back by bytes, S1, S3. R0 BUILT (§5.7), S2 BUILT (§5.8, default 1 GiB), S1a BUILT opt-in (§5.9, scratch spill), inputs released (§5.10); TOP-K state blocked (§5.12); next is tick 18's in-step peak on extended TPC-DS; S1b, S3 not built.** Follows
 [design-flat-trace-state.md](design-flat-trace-state.md) §3.34. That arc made trace state
 reference-free blocks: at the SF=3 W=12 checkpoint the heap is ~5.8 GB of bytes, with 1.01M
 references. This arc asks how much of those bytes needs to be in memory at all.
@@ -3653,3 +3653,179 @@ dimension change, simpler and free on this workload); (2) whether hinting `dim_h
 the reorder should be built; (3) whether this is worth doing before the items in the hashed head (the
 818/813 skew waits, 1.5M ms, and the redundant `account_id` re-exchange), which are as large and
 untouched.
+
+#### 5.48.7 Stage 1: the stand-in
+
+`dotnet run -c Release -- starjoin [factRows] [runs] [arms]` (`StarJoinStandIn`, DbspNet.Benchmarks, which
+now references DbspNet.Persistence so block formats load). A fact of 3M rows, one worker's share of tick 18,
+LEFT-joins the nine dimensions of runs A and B in the view's order (`dim_household`, 72,002 rows, 7th), with
+every key a `COALESCE` over a fact column and the view's 12 output columns. The arms run one after another
+in one process (Mac mini M4, server GC), with tick 0 loading the dimensions and tick 1 the fact:
+
+- **chain**: the compiled program at W=1, as the real broadcast joins run (fused index passes, §5.46;
+  folded projections, §5.47; blocked traces);
+- **base**: the same source and output with no joins (`1 AS ..._key`), which a star pays too;
+- **star**: a prototype pass. Per fact row it computes nine keys and makes nine dictionary lookups, then
+  builds the output row once into the output's delta builder (spilling when on). After that it does one
+  integrate of the fact into a `BlockedGroupTrace` keyed by the tuple of the nine keys;
+- **star8**: the same, with `dim_household` out of the tuple and in a per-key index of its own (option B for
+  a large member), so two integrates.
+
+Chain cost is the chain step minus the base step. The star's cost is its pass measured directly. Medians of 3:
+
+| 3M-row fact | chain − base | star | star / chain | star8 | star8 / chain |
+|---|---|---|---|---|---|
+| managed deltas, ns/row | 7,510 | 1,731 | 23% | 2,078 | 28% |
+| managed deltas, B/row | 5,562 | 1,664 | 30% | 1,701 | 31% |
+| **`STEP_SPILL_ROWS=262144` + spill (xt), ns/row** | **12,583** | **1,854** | **14.7%** | 2,166 | 17.2% |
+| **same, B/row** | **20,038** | **1,779** | **8.9%** | 1,812 | 9.0% |
+
+In the xt setting every intermediate delta of the chain is block backed. Each of its nine joins then costs
+2.3–4.3 s and 3.2–4.5 GiB, and each index pass between two joins 1.3–2.1 s and 2.5–3.5 GiB. The star's
+costs barely move with spilling, because it has no intermediate deltas. §5.48.3 estimated the star at 8–13%
+of the segment's worker-ms and ~10% of its allocation. The stand-in gives 14.7% and 8.9%: allocation is on
+the estimate, time a little over it. Applied to the restored tick's 836–887 (3.01M worker-ms, 1,258 GiB),
+one run of nine would save about **2.57M worker-ms and 1,145 GiB** (*estimate*, from these ratios), close to
+§5.48.3's 2.6–2.75M and 1,120–1,135 GiB. The stage passes, so stage 2 is justified as estimated.
+
+Where the star's own cost goes (xt setting, per run): the row build is 2.7 s and 2.9 GiB (0.9 µs, ~1 KB a
+row), and the integrate 2.9 s and 2.2 GiB. **The integrate is half the star.** The prototype keys the trace by
+the tuple and stores the whole fact row as the value, so every key column is encoded twice. It also builds
+the indexed delta managed and lets the trace freeze it, where a real index pass gives the trace block runs to
+adopt (D4, §5.22). Stage 2 should store the value without the tuple's columns, or build the indexed delta
+with the trace's format.
+
+Two findings for stage 2's design:
+
+- **A 72K-key member is cheaper inside the tuple on the steady tick.** star (1 integrate, 2.68M distinct
+  tuples of 3M rows) beats star8 (2 integrates, 3,600 tuples) by 0.3 µs a row. The price is the tuple
+  directory: with `dim_household` in the tuple it holds ~2.7M entries a worker instead of a few thousand,
+  and a household change reads its groups through the directory, not an index. v1 keeps §5.48.2's rule (a
+  large member gets its own index). Its cost on the steady tick is the 17% vs 15% above.
+- **The input arrives managed here.** In the real run the star's input is a block-backed delta from the
+  hashed head, decoded once. That costs about one index pass, ~0.8 µs and 0.6 KB a row by the chain's
+  first `ApplyOp` here, which §5.48.3's estimate already counted.
+
+Not measured: dimensions changing (the affected-row path), W>1, and the real fact's width.
+
+#### 5.48.8 The dim_household reorder (feasibility)
+
+The question from §5.48.1: move `dim_household` (op 874) out of the broadcast runs with
+`(L ⟕p A) ⟕q B = (L ⟕q B) ⟕p A`, so that 840–866 and 882–887 become one run of eight, or hint it
+(`DBSPNET_BROADCAST_VIEWS`) and make one run of nine. Code read at b41830f; anything not read is marked.
+
+**Soundness.** Write a LEFT join's output for one left row l as
+`g_A(l) = Σ_a w_A(a)·[p(l,a)]·(l,a) + [¬m_A(l)]·(l,⊥_A)`, where the sum runs over A's support,
+`m_A(l)` is "some row of A with l's key passes p" (presence; NULL left key: false, NULL right keys dropped),
+and ⊥_A is A's NULL pad. Then `L ⟕p A = Σ_l w_L(l)·g_A(l)`, linear in L for fixed A. For the chain,
+`(L ⟕p A) ⟕q B = Σ_l w_L(l) Σ_{x ∈ g_A(l)} w_x·g_B(x)`. If q reads only x's L-part (and B), `g_B(x)` is
+`g_B(l)` with x's A-part carried along, so the whole is `Σ_l w_L(l)·(g_A(l) ⊗ g_B(l))`: every pair of one
+A-outcome and one B-outcome, weights multiplied. ⊗ is symmetric up to column order, so the other order
+gives the same rows with `[L|B|A]` instead of `[L|A|B]`. Duplicates: if l matches a₁..aₘ (weights αᵢ) and
+b₁..bₙ (βⱼ), both orders emit the m·n rows `(l,aᵢ,bⱼ)` with weight `w_L(l)·αᵢ·βⱼ`; one side unmatched
+replaces its factor with the single pad of coefficient 1, in either order. Nothing in the argument uses
+positive weights, so it holds for any signed Z-sets L, A, B. The operators are incremental, but each
+computes the delta of this function of its integrated inputs (what the incremental ≡ batch PBTs check), so
+two plans that agree on the integrated relations at every tick agree on every output delta. The presence
+test for A is evaluated against A and l in both orders, so a key whose A-rows sum to zero weight behaves
+identically in both (the cancellation caveat on padded-side narrowing in `PruneJoinInputs` is orthogonal).
+
+The rewrite is valid when all of these hold:
+
+1. Both joins are `JoinPlan { JoinType: LeftOuter }` (an INNER p also commutes with a LEFT q under the
+   same conditions; RIGHT/FULL do not, since they pad the L side).
+2. q's left equi-key columns and q's residual, traced through any projections between the joins, read
+   only L's columns (and, for the residual, B's). This is the one real condition. A key or residual that
+   reads any A column, **including inside `COALESCE(a.x, l.y)` or `a.x IS NULL`**, depends on whether A
+   padded and does not commute. p never reads B (B is not below it in the original). A `COALESCE` over a
+   column an *earlier* join padded is fine: that column is part of L, unchanged by the swap. Here every
+   broadcast key is such a `COALESCE` (`mhmv`, `idlmv`, `smv`, §5.48.1), and 874's key
+   (`tilmv.household_id`) reads 824's column, so the condition holds for 874 against all eight.
+3. Keys and residuals are deterministic (no `NOW()`; temporal filters are their own plan node anyway).
+4. Only projections between the two joins (no filter, aggregate, TOP-K). A filter on L-only columns could
+   be pushed below first; v1 stops instead.
+5. The intermediate `L ⟕p A` has no other parent (`SharedPlanNodes`/`PlanCse` sharing), or the rewrite
+   would compile it twice.
+6. Each join keeps its own `AllowNullKeys` and residual; the residuals are re-indexed: p's from `[L|A]` to
+   `[L|B|A]` (A columns +|B|), q's from `[L|A|B]` to `[L|B]` (B columns −|A|).
+7. A projection on top restores `[L|A|B]` order. Nullability needs no fix: A's and B's columns are
+   nullable in both orders (`MakeSideNullable`, Resolver.cs:2472).
+
+**Where it would go.** Logical plans are built in `Resolver.ResolveJoin` (src/DbspNet.Sql/Plan/Resolver.cs
+~l.2372–2500). A computed key such as a `COALESCE` is hoisted into a synthetic `__jkl` column by a
+widening `ProjectPlan` on the left input, and a stripping projection goes above the join (l.2418–2499), so
+after `PlanOptimizer` composes projections each link is `Project(Join(Project(prev), dim))`; join keys are
+column indices only (`JoinEquality(int LeftIndex, int RightIndex, SqlType)`, LogicalPlan.cs:428). The pass
+therefore matches `Join_B(π(Join_A(L', A)), B)`, substitutes π into B's key columns and residual
+(`ExpressionRewriter.CollectColumnIndices` for the check, the substitution the projection composition
+already uses), and emits `σ(Join_A'(Join_B'(Widen_eB(L'), B), A))`, with `Widen` hoisting B's key
+expressions over L' as the Resolver does and σ the restoring projection. Repeated, it carries 874 past
+the six joins of run A, to just after 833.
+
+It cannot live inside `PlanOptimizer.Optimize` (Optimizer/PlanOptimizer.cs:52): that runs without sizes
+(its own doc lists join reordering as not applied), and which joins are "small" decides the rewrite. The
+sizes exist only in `TryCompileProgramParallel` (Compiler/PlanToCircuit.cs:579): base counts from
+`CompileOptions.RelationRowCounts` (the deploy's Delta-log counts, plus hinted views at 1 row,
+`BroadcastJoins.WithHints`, Server/BroadcastJoins.cs), and view estimates from
+`CardinalityEstimator.Estimate` (max of a join's sides, `Unknown` when any input is unknown), filled in
+dependency order at PlanToCircuit.cs:649–659. The pass would sit right there: after `Optimize` and the
+view's estimate, classify each LEFT join's right side with the same test as `ShouldBroadcastRight`
+(PlanToCircuit.cs:1133, leaf relation and estimate ≤ `BroadcastMaxRows`), reorder so small members are
+contiguous, then run `Optimize` again so `PruneJoinInputs` (PlanOptimizer.cs:554, LEFT joins without a
+residual included) narrows the new join inputs and the projections compose. The serial `CompileProgram`
+(l.338, Optimize at l.476) has no counts, and `DbspNetEngine` passes `CompileOptions` only at W>1
+(Server/DbspNetEngine.cs:~202), so the rewrite is parallel-only unless the star's W-independent size test
+(§5.48.5) gets counts at W=1 too.
+
+So the planner never knows `dim_household` is 72K rows; it knows only "not ≤ 1,000 or unknown" (which of
+the two on issue #2's deploy is not verified). The reorder needs no more than that: it moves the joins
+the broadcast test calls large out of the way of the ones it calls small.
+
+Interactions: `PruneJoinInputs` is re-run, as above. The §5.47 fold (`TryFoldJoinProjection`,
+PlanToCircuit.cs:3490) and `SharedPlanNodes` (l.2006) are computed per view at compile, after the pass,
+so they see the new plan; σ is the top join's consumer projection and folds like any other. Broadcast is
+unchanged per join (the same right sides, the same test). Checkpoints: the broadcast choice is recorded
+in checkpoint metadata (`compile.broadcast`) and a restore compiles with it, so a deterministic rewrite
+of plan + recorded counts reproduces on restore. A checkpoint from before the rewrite has a different
+operator sequence and schemas (each join's left row is now a different width) and will not restore
+(operators carry a `SchemaFingerprint`; matching by build position is my reading, not verified); a
+`DBSPNET_JOIN_REORDER=off` switch, recorded in the same metadata, keeps old checkpoints restorable.
+
+**Cost against hinting.** From §5.48.3 (restored tick 18): runs A and B are 2.05M + 0.47M worker-ms and
+815 + 227 GiB; the `dim_household` segment 867–876 is 0.50M / 216 GiB; a star run is *estimated* at
+0.25–0.4M / 125–140 GiB.
+
+| tick 18 (*estimate*) | worker-ms saved | GiB saved |
+|---|---|---|
+| two runs, no reorder, no hint | 1.7–2.0M | 760–840 |
+| reorder: one run of eight, 874 hashed (868 stays) | 2.1–2.3M | ~900–920 |
+| hint: one run of nine | 2.6–2.75M, less one per-key index integrate (~45K ms, ~23 GiB) | ~1,100 |
+
+The reorder recovers about half of what the hint adds over two runs (~0.4M of ~0.9M worker-ms,
+~35 s of wall at W=12). The hint's remainder is exchange 868 and 874's own left trace, which a hashed
+874 keeps wherever it sits. Moving 874 to just after 833 rather than after 887 means 868 ships the
+narrower pre-dimension row; that it is then cheaper than today's 0.50M is not measured.
+
+What the hint costs: `dim_household` replicated, 72,002 × 12 = 864K rows, pruned to the columns the view
+reads. At 100–300 B a row that is ~0.1–0.25 GB in all (*estimate*, width not measured), held and
+checkpointed once per worker, against a 48.9 GB peak that sits elsewhere (§5.48.3). Inside the star a
+72K-key member makes tuples nearly unique, so it needs its own per-key index of the fact (§5.48.2,
+option B for that member). That index is already in stage 2's scope (§5.48.4 "a large member also has its
+own per-key index of F"), so the hint adds no build work beyond what is decided.
+
+What the reorder buys that the hint does not: no hint to maintain (one goes stale if the view grows),
+no replicated 72K dimension, and, if it is built *instead of* the large-member index, a v1 star whose
+members are all tuple members. How general: it applies wherever a chain of LEFT joins interleaves small
+and large right sides and the later keys come from the chain's input, the common shape of a dbt-style
+staging view. But it has no cost model; it only sorts by the broadcast test, which an unknown count turns
+off. Size, *estimate*: the rewrite ~200–250 lines (match, the condition-2 check through projections,
+substitution, residual re-indexing, σ), wiring and a recorded switch ~50, tests ~300–400 (reordered ≡
+original ≡ batch PBT over signed streams with duplicates both sides, NULL keys both sides, pair
+residuals, and refusal mutants: a `COALESCE` over A's column in q, a filter between, a shared
+intermediate).
+
+**Recommendation.** Hint `dim_household` for the stage 3 measurement: no code, the largest saving, and the
+large-member index it needs is already in stage 2. Do not build the reorder now. Build it only if stage 2
+drops the large-member index to shrink the op, or if another workload shows interleaved runs with no
+view to hint. The soundness argument above stands either way, and side condition 2 is the check any
+future join reordering here has to make.
