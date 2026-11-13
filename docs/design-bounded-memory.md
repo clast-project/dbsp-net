@@ -4843,7 +4843,7 @@ every bulk tick is N1.
 
 Since b587769 (xt25fts2): batch 2,552 → 1,992 s (−21.9%), tick 18 1,457 → 927 s (−36%).
 
-### 5.53 One record run per step for the bulk-load fast path (2026-11-12, built)
+### 5.53 One record run per step for the bulk-load fast path (2026-11-12, built, measured)
 
 §5.52.7 left op 1266's integrate phase at 53% of the operator (174.7K worker-ms, 64 GiB): the sort, the
 record's run writes, and the merges of those runs. A sliced step (144 slices, 12 per worker) gave the
@@ -4941,3 +4941,54 @@ Lesson re-learned: a zsh `env $F` does not split `$F`, so a "forced" run that fi
 default env. The first reruns of this test in isolation "passed" that way.
 
 Suites: default, forced and forced+critical each pass 3,735 of 3,736, with 1 skipped.
+
+#### 5.53.4 Stage 3: measured from scratch
+
+xt25bulk9's setup (nine dimensions hinted, 262,144-row step chunk, W = 12, 48 GiB cap, `XT_OP_PROFILE=1`,
+`XT_PROF_OPS=0-2000`) on 2760520 (`~/xtpcds/bin-steprun`). The off arm is the same binary with
+`DBSPNET_STEP_RUN=off`, so it is the control:
+
+| batch 1 | xt25bulk9 (57f40c1) | **off** (xt25steprunoff9) | on, 1st (xt25steprun9) | **on** (xt25steprun9b) |
+|---|---|---|---|---|
+| batch duration | 1,992 s | 1,990 s | 2,130 s | **1,955 s (−35 s)** |
+| tick 17 step | 330 s | 333 s | 332 s | 319 s |
+| tick 18 step | 927 s | 945 s | 1,023 s | **930 s (−15 s, −1.6%)** |
+| tick 18 GC pauses | 458 s | 472 s | 542 s | 473 s |
+| tick 18 worker time | 11.12M ms | 11.33M | 12.26M | **11.15M (−0.18M)** |
+| tick 18 allocation | 5,063 GiB | 5,067 GiB | 4,962 GiB | **4,964 GiB (−2.0%)** |
+| five TOP-Ks | 658K ms, 266 GiB | 677K ms, 266 GiB | 465K, 166 | **462K ms (−32%), 166 GiB (−38%)** |
+| peak RSS | 48 GiB | 48 GiB | 46 GiB | 48 GiB |
+
+All 96 views have the same row counts in every run (`work/batch1.json`, `model_rows`).
+
+**The first "on" run was disturbed, not slower.** Its tick 18 came in 96 s over the baseline, but the time
+was in operators the change does not touch. The `stg_engagement_status_events` ApplyOp, the left joins of
+`int_engagement_status_transaction` and the eligibility view's aggregate were each 20–110 s slower at
+byte-identical allocation. Meanwhile the TOP-Ks it does touch came in at the stand-in's ratio. Right
+after the run, `fseventsd` was using ~1.1 cores, and it dropped to 0 a few minutes later. Spill traffic
+was lower than the baseline's (382 vs 408 GiB spilled), so the change did not cause it. The off arm and
+the second on arm ran with a 30 s `fseventsd` sampler (`~/xtpcds/runs/fsevents-*.txt`): 0 of 71 samples
+over 20% in the on rerun. **Lesson:** when untouched operators move at identical allocation, suspect the
+machine. Record `fseventsd` (or the top CPU process) alongside an xt run.
+
+**Per operator (on vs off, TOP-K phases):**
+
+| op | worker-ms | MiB | integrate ms / MiB |
+|---|---|---|---|
+| 1266 | 330K → 214K | 135,303 → 80,019 | 174,726 / 64,402 → 52,705 / 9,023 |
+| 171 | 225K → 180K | 97,045 → 60,353 | 128,684 / 48,673 → 54,428 / 11,954 |
+| 1390 | 44K → 32K | 16,699 → 13,056 | 17,383 / 5,124 → 6,219 / 1,459 |
+| 181 | 56K → 35K | 22,490 → 15,159 | 24,587 / 8,992 → 6,544 / 1,626 |
+
+(Before: xt25bulk9's `TOPKPHASE`. After: xt25steprun9's, the same code as 9b.) The wall gain is 15 s of tick
+18 and 35 s of the batch, the low end of the §5.53.2 estimate. The worker-time saving (−215K ms on the
+TOP-Ks) is spread over 12 workers and partly hidden by the operators running beside them.
+
+**What is left in these operators:** slicing (1266: 118K ms, 59.9 GiB; 171: 102K ms, 43.5 GiB) is now the
+largest phase, more than integrate and emit together. It splits the delta into spilling slice builders and
+decodes each slice once (§5.45). That is the next item for them. The fast path keeps no partition across
+slices, so a slice only needs to bound the sort's working set. A bulk (N1) step could sort the whole
+worker's delta by hash in one pass of the decoded rows, with no slice builders at all, if the sort itself
+spills.
+
+Since b587769 (xt25fts2): batch 2,552 → 1,955 s (−23.4%), tick 18 1,457 → 930 s (−36%).
