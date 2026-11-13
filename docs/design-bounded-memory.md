@@ -5293,3 +5293,149 @@ Mutants, all caught:
 - the output is given the input's delta format.
 
 Suites: default, forced and forced+critical (`forced-suite-env`) each 3,757 passed, 1 skipped.
+
+### 5.57 Co-partitioning: one exchange per eligibility view (2026-11-13, built, measured, not adopted)
+
+`fact_engagement_status_channel_eligibility_28d_rolling_hist_12m` exchanged its input five times on tick
+18. Its shape is `a LEFT JOIN m`:
+- `a` aggregates `int_hist_unpivoted_28d` (24.1M rows) by 11 columns G.
+- `m` aggregates, also by G, a `SELECT DISTINCT` of G plus 3 columns over the same input.
+- The join is on G: 7 bare equalities, `household_id IS NOT DISTINCT FROM` (in the residual) and three
+  `COALESCE(x, '') =` keys (projected `__jk` columns).
+
+The five exchanges: `a`'s, the DISTINCT's, `m`'s, and the join's two. Each hashes a different key.
+
+#### 5.57.1 The prize
+
+From xt25pxfuse9's tick-18 census (`OPRANGE`/`OPWORKER`) and the deployed program (`XtViewOps`,
+`XT_ROW_COUNTS` as in §5.56; new scratch `XtViewPlan` dumps a view's optimized plan):
+
+| exchange (op) | worker-ms | GiB |
+|---|---|---|
+| `a`'s `ExchangeIndexOp` (1155) | 246K | 65 |
+| DISTINCT's `ExchangeStepOp` (1158) | 163K | 46 |
+| `m`'s `ExchangeIndexStepOp` (1160) | 154K | 52 |
+| join left (1163) | 151K | 47 |
+| join right (1164) | 171K | 45 |
+| **total** | **885K** | **256** |
+
+That is 8.8% of tick 18's 10.03M worker-ms, with no skew (each op's max/min worker within 5%). The same
+shape is 18 views: {channel_eligibility, active, evaluated} × {28d, 7d, daily} × {rolling, hist_12m}.
+Their exchanges total **1.39M worker-ms (13.9%) and 423 GiB** on tick 18. Most of it is in three views:
+eligibility 28d hist (885K), active 28d hist (291K) and eligibility 7d hist (161K).
+
+**K, the common key.** Every consumer's key contains the join's bare equi-key columns:
+`report_as_of_date, channel, eligibility_status, household_key, product_version_key, product_tier_key,
+preference_key` (the non-hist and active/evaluated variants have subsets of these). On the SF1 DuckDB
+reference K has exactly G's cardinality in every family:
+- `int_hist_unpivoted_28d`: 28.6M groups over 65M rows, largest 489.
+- `int_hist_active_28d`: 6.2M groups, largest 632.
+- the pit views: the same pattern.
+
+`household_key` ↔ `household_id` is 1:1, and the three COALESCE columns are functionally dependent on the
+rest. So partitioning on K costs no balance.
+
+**Feldera.** It shards each indexed stream by its own full key, with a per-stream cache of the sharded
+version (`try_sharded_version`/`mark_sharded`). It has no coarser, consumer-chosen key. This goes
+beyond Feldera, so the adopt-Feldera policy does not apply.
+
+#### 5.57.2 The change
+
+- **Hash-exact claims.** A `PartitionInfo` with a `KeySchema` now means the stream sits at
+  `OfRow(row, PartitionKey, KeySchema) % W`. Two fixes were needed for that:
+  - An elided aggregate claimed `Iota(groupCount)` over its own key. That was true as co-location but
+    false as a hash, so a second elided aggregate below it would have re-sharded its state by the wrong
+    hash. It now claims its input's columns at their group-key positions (`ElidedAggregatePartition`).
+  - A DISTINCT now records its whole-row claim.
+- **Claims through projections.** `LinearStage` carries each output column's bare source column
+  (`Sources`). `CompileLinearChain` and the fused index/exchange inputs (`CompileIndexInputSources`) move
+  a claim through a projection, and lose it only when a claim column is computed or dropped. The §5.55
+  agg3 stale-claim trap is the computed case.
+- **Requests (`PlanCoPartition`, per view, W > 1).** For each hashed LEFT join (not broadcast), the pass
+  traces each equi-key pair through filters and bare projections. The pairs that reach a group-key column
+  of an aggregate (or a column of a DISTINCT) on both sides form the request: the left operator
+  partitions on its columns, the right on its own, in pair order. A request also travels down an
+  operator's input chain to an aggregate/DISTINCT that feeds it (`m` → the DISTINCT), and that operator
+  then elides through the ordinary subset rule. An operator asked for two different keys gets neither.
+- **Shared exchange.** Requested operators whose chains bottom out on the same input node, on the same
+  columns, share one `Exchange` of that input (`SharedExchange`, cached per stream and key). Each runs
+  its chain locally and elides on the shared claim. Here `a` and the DISTINCT share the exchange of
+  `int_hist_unpivoted_28d` on K.
+- **Join elision (`CoPartitioned`).** Both sides' claims must:
+  - name the same number of columns;
+  - pair column i with column i through one equi-key;
+  - hash as the same type (decimal scale too);
+  - not be gathered.
+
+  When they do, each side is indexed locally with its chain fused (`MapFilterGroupProject`), the right
+  side's NULL keys dropped and the left side's padded by the operator, as in §5.55. The traces re-shard
+  by the claim's columns in the key row, and the output claims the left claim. Only the §5.55 fused form
+  elides (no GC frontier, not broadcast, not hot-split).
+- **Knob.** On by default, `DBSPNET_COPARTITION=off`. A requested DISTINCT goes this way only where
+  §5.56 fuses.
+
+In issue #2's deployed program at W = 12, those 18 views go from 5 exchanges to 1 each and nothing else
+changes: hashed exchanges 330 → 258, operators 1,191 → 1,209 (the elided index passes are their own
+`ApplyOp`s). In the eligibility view, one `ExchangeOp` of the input on K feeds `a`'s index pass and the
+DISTINCT's map/filter. `m` indexes the DISTINCT's output, and the join indexes both sides, all locally.
+
+#### 5.57.4 Tests
+
+`CoPartitionTests` (17 tests) cover six views:
+- `elig` (the shape above, with IS NOT DISTINCT FROM and COALESCE keys);
+- `aa` (two aggregates over one table, one shared exchange);
+- `ad` (a DISTINCT joined to an aggregate of another table);
+- `comp` (one computed and one bare equi-key);
+- `chain3` (aggregates elided twice through projections);
+- `cross_pair`: an aggregate hashed on (a, b) joined to an inner join's output hashed on (b, a). Equal
+  pairs need not share a worker, and the join must not elide.
+
+Each view equals serial at W = 2/3/4/8 on, and at W = 4 off. The same holds with block-backed deltas
+(`UseStepSpill(16, 4096)` and `(0, 2)`). Exchange counts are pinned on and off. Checkpoints restore 4 → 4
+and reshard 4 → 3 and 3 → 5. `ExchangeFusionTests.The_fused_layout_is_built` now runs with co-partitioning
+off (it counts fusion alone).
+
+Mutants, all caught:
+- the old Iota claim on an elided aggregate (4 tests);
+- the join traces placed by their whole key;
+- the elided DISTINCT placed by its whole row;
+- a requested aggregate placed by its whole key;
+- the pairing check ignoring the right column (only `cross_pair` catches it);
+- claims not moved through projections (14 tests).
+
+`SameHash` (the type check) has no test that reaches it: no view joins two bare key columns of
+different types. It is defensive.
+
+Suites: default, forced and forced+critical (`forced-suite-env`) each 3,774 passed, 1 skipped.
+
+#### 5.57.5 Measured
+
+SF25 batch 1, same binary (`~/xtpcds/bin-copart`), 9 broadcast hints as in §5.56, `DBSPNET_COPARTITION`
+on vs off. All 96 views have identical row counts in every run.
+
+The first pair (xt25copart9 / xt25copartoff9) ran with fseventsd pegged for the whole on arm and only part
+of the off arm, so its wall times are not comparable (on 2,121 s vs off 1,938 s). After a reboot, with
+fseventsd at 0.3–0.8% in every arm, two interleaved pairs:
+
+| run | co-part | batch 1 | tick-18 step | tick-18 alloc |
+|---|---|---|---|---|
+| xt25copart9b | on | 1,890 s | 753 s | 6,734 GiB |
+| xt25copartoff9b | off | 1,877 s | 764 s | 6,711 GiB |
+| xt25copart9c | on | 1,882 s | 761 s | 6,736 GiB |
+| xt25copartoff9c | off | 1,847 s | 757 s | 6,704 GiB |
+
+Means: batch 1 on 1,886 s vs off 1,862 s (+1.3%); tick 18 757 vs 760 s; allocation +0.5%. Both are
+within the clean run-to-run spread (~20–40 s on batch 1; the ±100 s quoted in §5.56 was fseventsd).
+
+The exchanges disappear, but the local index passes that replace them cost what the fused exchange-indexes
+did: the transport was cheap and the per-row encode/index work is the same either way. Co-partitioning
+would pay only together with consumer-fused indexing (the aggregate or join building its trace straight
+from row deltas), which is not started.
+
+#### 5.57.6 Verdict
+
+Not adopted. The code is kept on branch `copartition-5.57` (4eb9afa) and reverted from main. One part
+landed on main on its own, unconditionally: an elided aggregate claims its input's partition columns at
+their group-key positions instead of `Iota(groupCount)`. The old claim was true as co-location but false as
+a hash, so an aggregate elided below an elided aggregate re-sharded its state by the wrong hash on a
+checkpoint restore with a different worker count (`ElidedAggregateClaimTests`).
