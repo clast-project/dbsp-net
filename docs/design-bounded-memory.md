@@ -4547,7 +4547,7 @@ fast path" in the batch-1 plan. Not started.
 
 Since b587769 (xt25fts2): batch 2,552 → 2,058 s (−19.4%), tick 18 1,457 → 978 s (−33%).
 
-### 5.52 A bulk-load fast path for partitioned TOP-K and rank (2026-11-12, design)
+### 5.52 A bulk-load fast path for partitioned TOP-K and rank (2026-11-12, built)
 
 On xt25ranktopk9's tick 18 the two largest single operators are `PartitionedTopKCompactOp`s whose
 partitions are all new that tick: op 1266 (`fact_engagement_status_monthly_snapshot`, 551K worker-ms,
@@ -4792,3 +4792,53 @@ Mutants (the four test classes `PartitionedBulkTests`, `TopKSliceTests`, `RankSl
 | (d) negative entries dropped from the run | 5 of 5 fail |
 
 Suites: default, forced and forced+critical each pass 3,727 of 3,728, with 1 skipped.
+
+#### 5.52.7 Stage 3: measured from scratch
+
+**xt25bulk9**: xt25ranktopk9's setup (nine dimensions hinted, 262,144-row step chunk, W = 12, 48 GiB cap,
+`XT_OP_PROFILE=1`, `XT_PROF_OPS=0-2000`) on 57f40c1 (`~/xtpcds/bin-bulk`), from scratch.
+
+| batch 1 | xt25ranktopk9 | xt25bulk9 |
+|---|---|---|
+| batch duration | 2,058 s | **1,992 s (−3.2%)** |
+| tick 17 step | 347 s | 330 s |
+| tick 18 step | 978 s | **927 s (−51 s, −5.2%)** |
+| tick 18 GC pauses | 488 s | 458 s |
+| tick 18 worker time | 11.71M ms | 11.12M ms (−0.60M) |
+| tick 18 allocation | 5,389 GiB | 5,063 GiB (−6.0%) |
+| tick 18 end live / RSS | 22.7 / 39.6 GB | 23.0 / 43.2 GB |
+| peak RSS (sampler) | 48 GiB | 48 GiB |
+
+All 96 views have the same row counts. Tick 17's 17 s is spread across operators the fast path does not
+touch (its TOP-Ks have empty deltas there), so it is run-to-run spread.
+
+**The five TOP-Ks on tick 18.** Every one of them is N1. The store was empty, so every partition took
+the fast path, with no probes and no flushes:
+
+| op | view | rows / partitions | before | after | wall span |
+|---|---|---|---|---|---|
+| 1266 | `fact_engagement_status_monthly_snapshot` | 36.1M / 32.2M | 551K ms, 385 GiB | **330K ms (−40%), 132 GiB (−66%)** | 49.1 → 28.6 s |
+| 171 | `int_engagement_assessment_key_latest` | 36.1M / 9.7M | 286K, 141 GiB | 225K (−21%), 95 GiB (−33%) | 24.3 → 19.4 s |
+| 1390 | `int_hist_active_28d` | 8.9M / 8.0M | 81K, 23 GiB | 44K (−46%), 16 GiB | 7.0 → 3.9 s |
+| 181 | `int_engagement_assessment_key_latest` | 9.7M / 9.7M | 72K, 32 GiB | 56K (−22%), 22 GiB | 6.5 → 5.0 s |
+| 1466 | `int_hist_active_7d` | 2.3M / 2.2M | 4.7K, 3.8 GiB | 3.4K, 1.5 GiB | |
+| | total | | 994K ms, 585 GiB | **658K ms (−34%), 267 GiB (−54%)** | |
+
+That is −337K worker-ms, about half the −0.6M that §5.52.5 estimated from the stand-in. **What is left
+(op 1266's `TOPKPHASE`):** integrate 174.7K ms / 64 GiB (the sort and the record's run writes and
+merges), slicing 103.6K / 59 GiB, emit 39.6K / 7 GiB, classification 8.9K / 3 GiB. In the stand-in,
+integrate was 1.6× slicing. In prod it is 1.7×, and 53% of the operator. With 144 slices the record
+gets 12 runs per worker and merges them factor-4 geometrically. That is the one-run-per-step item of
+§5.52.2 (contiguous hash-range slices whose runs concatenate), now measured to be the largest piece.
+Op 171 has 3.7 rows per partition and the same split (integrate 128.7K ms, slicing 80.6K).
+
+**Next for these operators**, by size:
+
+1. One record run per step (integrate ~175K + 129K ms on the two big ops).
+2. Slicing's encode, spill and decode (~104K + 81K ms). The fast path holds no partitions across a slice,
+   so the slice size only bounds the sort's working set.
+
+The N2 follow-ups of §5.52.5 (a tighter filter, one probe per false positive) don't matter for xt, where
+every bulk tick is N1.
+
+Since b587769 (xt25fts2): batch 2,552 → 1,992 s (−21.9%), tick 18 1,457 → 927 s (−36%).
