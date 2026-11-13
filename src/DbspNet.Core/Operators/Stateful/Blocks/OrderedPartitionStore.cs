@@ -97,6 +97,9 @@ internal sealed class OrderedPartitionStore
     // this tick is read from the tick's own rows instead of probed for (§3.17).
     private KeyFilter _keys = new();
 
+    // §5.53: the fast path's pieces go to one run per step (StepRunMode, read when built).
+    private readonly bool _stepRuns;
+
 
     private static readonly StructuralRow NoKey = new([]);
 
@@ -132,6 +135,7 @@ internal sealed class OrderedPartitionStore
         _chunkRows = Math.Max(1, chunkRows);
         _coldFormat = coldFormat;
         _cold = coldFormat is null ? null : new BlockedIndexedTrace(coldFormat, TraceBlocksMode.FreezeEntries, blockEntries: TraceBlocksMode.BlockEntries);
+        _stepRuns = StepRunMode.Enabled;
         if (_cold is not null && _writeBackBudget != long.MaxValue)
         {
             lock (Live)
@@ -522,7 +526,15 @@ internal sealed class OrderedPartitionStore
             return;
         }
 
-        _cold!.IntegrateEntries(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
+        if (_stepRuns)
+        {
+            _cold!.AppendStepRun(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
+        }
+        else
+        {
+            _cold!.IntegrateEntries(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
+        }
+
         foreach (var key in keys)
         {
             _keys.Add(key);
@@ -531,6 +543,21 @@ internal sealed class OrderedPartitionStore
         BulkPartitions += keys.Count;
         BulkEntries += entries.Count;
     }
+
+    /// <summary>
+    /// The step's end for the bulk-load fast path (docs/design-bounded-memory.md §5.53): the slices'
+    /// new partitions, appended by <see cref="AppendNew"/> as pieces of one run in ascending hash
+    /// order, become that run of the record. Call once the step's slices are all done (also when it
+    /// wrote none). Until then the pieces are not in the record, which is safe because a step touches
+    /// a partition in one slice only and a new partition's window is emitted from its sorted rows.
+    /// </summary>
+    internal void EndStep() => _cold?.PublishStepRun();
+
+    /// <summary>The record's runs (diagnostics, tests; 0 without a record).</summary>
+    internal int RecordRuns => _cold?.Runs.Count ?? 0;
+
+    /// <summary>Step-run pieces that did not follow the pending run's hashes (diagnostics, tests).</summary>
+    internal long StepRunBreaks => _cold?.StepRunBreaks ?? 0;
 
     /// <summary>Partitions and entries the fast path wrote (diagnostics, tests). Per store, never reset.</summary>
     internal long BulkPartitions;

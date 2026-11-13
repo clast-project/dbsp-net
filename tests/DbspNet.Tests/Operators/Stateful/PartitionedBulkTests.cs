@@ -46,9 +46,10 @@ public class PartitionedBulkTests
 
     // Blocked (window stores on blocks, a zero write-back budget so caches drop every step) or managed;
     // the fast path on or off. The sliced arms step under UseStepSpill, set by the caller.
-    private static CompiledProgram Compile(bool bulk, bool blocked = true)
+    private static CompiledProgram Compile(bool bulk, bool blocked = true, bool stepRun = true)
     {
         PartitionedBulkMode.Enabled = bulk;
+        StepRunMode.Enabled = stepRun;
         try
         {
             using var blocks = TraceBlocksMode.Use(join: blocked, freezeEntries: 16, blockEntries: 4, window: blocked);
@@ -58,6 +59,7 @@ public class PartitionedBulkTests
         finally
         {
             PartitionedBulkMode.Reset();
+            StepRunMode.Reset();
         }
     }
 
@@ -66,6 +68,9 @@ public class PartitionedBulkTests
 
     private static List<PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>> Ranks(IEnumerable<Core.Circuit.IOperator> ops) =>
         [.. ops.OfType<PartitionedRankOp<StructuralRow, StructuralRow, StructuralRow>>()];
+
+    private static long StepRunBreaks(IEnumerable<Core.Circuit.IOperator> ops) =>
+        TopKs(ops).Sum(o => o.StepRunBreaks) + Ranks(ops).Sum(o => o.StepRunBreaks);
 
     private static long BulkPartitions(IEnumerable<Core.Circuit.IOperator> ops) =>
         TopKs(ops).Sum(o => o.BulkPartitions) + Ranks(ops).Sum(o => o.BulkPartitions);
@@ -281,10 +286,11 @@ public class PartitionedBulkTests
     [InlineData(64L, 4096)] // sliced past 64 rows
     public void Fast_path_equals_off_unsliced_managed_and_a_recompute_on_every_tick(long stepRows, int forcedChunk)
     {
-        CompiledProgram on, off, plain, managed;
+        CompiledProgram on, perSlice, off, plain, managed;
         using (SpillSettings.UseStepSpill(stepRows, forcedChunk))
         {
             on = Compile(bulk: true);
+            perSlice = Compile(bulk: true, stepRun: false);
             off = Compile(bulk: false);
         }
 
@@ -299,6 +305,9 @@ public class PartitionedBulkTests
         Assert.All(TopKs(on.Circuit.Operators), op => Assert.True(op.IsBlocked && op.BulkEnabled));
         Assert.All(Ranks(on.Circuit.Operators), op => Assert.True(op.IsBlocked && op.BulkEnabled));
         Assert.All(TopKs(off.Circuit.Operators), op => Assert.False(op.BulkEnabled));
+        Assert.All(TopKs(on.Circuit.Operators), op => Assert.True(op.StepRunEnabled));
+        Assert.All(Ranks(on.Circuit.Operators), op => Assert.True(op.StepRunEnabled));
+        Assert.All(TopKs(perSlice.Circuit.Operators), op => Assert.False(op.StepRunEnabled));
         Assert.All(TopKs(managed.Circuit.Operators), op => Assert.False(op.IsBlocked));
 
         var live = new Dictionary<string, (object?[] Row, long Weight)>(StringComparer.Ordinal);
@@ -311,6 +320,7 @@ public class PartitionedBulkTests
             using (SpillSettings.UseStepSpill(stepRows, forcedChunk))
             {
                 Push(on, delta);
+                Push(perSlice, delta);
                 Push(off, delta);
             }
 
@@ -324,7 +334,14 @@ public class PartitionedBulkTests
             Assert.Equal(expected, Digest(managed));
             Assert.Equal(expected, Digest(off));
             Assert.Equal(expected, Digest(on));
+            Assert.Equal(expected, Digest(perSlice));
             Assert.Equal(expected, Digest(plain));
+            if (tick == 0)
+            {
+                // N1, sliced: each operator's record is the one run the step published (§5.53).
+                Assert.All(TopKs(on.Circuit.Operators), op => Assert.Equal(1, op.RecordRuns));
+                Assert.All(Ranks(on.Circuit.Operators), op => Assert.Equal(1, op.RecordRuns));
+            }
             if (tick is 0 or 2)
             {
                 // Both bulk ticks take the fast path (tick 2 alongside the old path for existing partitions).
@@ -339,6 +356,7 @@ public class PartitionedBulkTests
 
         Assert.Equal(Queries.Length, nonEmpty.Count);
         Assert.Equal(0, BulkPartitions(off.Circuit.Operators));
+        Assert.Equal(0, StepRunBreaks(on.Circuit.Operators));
         Assert.All(TopKs(on.Circuit.Operators), op => Assert.True(op.SlicedSteps > 0));
     }
 

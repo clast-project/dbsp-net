@@ -161,6 +161,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
         _storedOutputRows = _store is null ? Blocks.TraceBlocksMode.PromoteRows : int.MaxValue;
         _bulk = PartitionedBulkMode.Enabled;
+        _stepRun = StepRunMode.Enabled;
     }
 
     // The bulk-load fast path (docs/design-bounded-memory.md §5.52), blocked state only: this step's
@@ -168,6 +169,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // lazily restored (they are not in the store yet), or between steps.
     private readonly bool _bulk;
     private Blocks.OrderedPartitionStore.NewPartitions? _fresh;
+    private readonly bool _stepRun;
 
     private static StructuralRow S<T>(T value) => (StructuralRow)(object)value!;
 
@@ -243,6 +245,7 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
         finally
         {
+            _store?.EndStep();
             _fresh = null;
         }
 
@@ -250,6 +253,15 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
     }
+
+    /// <summary>The record's runs (diagnostics, tests; 0 without a record).</summary>
+    internal int RecordRuns => _store?.RecordRuns ?? 0;
+
+    /// <summary>Step-run pieces out of the record's hash order (§5.53; diagnostics, tests).</summary>
+    internal long StepRunBreaks => _store?.StepRunBreaks ?? 0;
+
+    /// <summary>Whether this operator's slices are hash ranges whose bulk runs make one run per step (§5.53).</summary>
+    internal bool StepRunEnabled => _stepRun;
 
     /// <summary>This operator's steps that ran in partition-hash slices (diagnostics, tests). Per
     /// operator: a static counter is bumped by every rank a concurrent test runs.</summary>
@@ -275,8 +287,11 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // partitions at a time (docs/design-bounded-memory.md §5.43, D5 for rank; Blocks.PartitionSlicing).
     private int SliceCount(int deltaRows) => Blocks.PartitionSlicing.Count(_store is not null, deltaRows);
 
-    private int SliceOf(TKey key, int slices) =>
-        Blocks.PartitionSlicing.Of(_partitionComparer?.GetHashCode(key) ?? key.GetHashCode(), slices);
+    // §5.53: a range of the hash the record orders by, so the slices' bulk runs concatenate; mixed
+    // (§5.43) with step runs off.
+    private int SliceOf(TKey key, int slices) => _stepRun
+        ? Blocks.PartitionSlicing.Range(S(key).GetHashCode(), slices)
+        : Blocks.PartitionSlicing.Of(_partitionComparer?.GetHashCode(key) ?? key.GetHashCode(), slices);
 
     // One pass splits the delta into its slices, each a builder that spills its share of the step chunk
     // (the delta's own format), so every row is decoded from the delta once rather than once per slice:

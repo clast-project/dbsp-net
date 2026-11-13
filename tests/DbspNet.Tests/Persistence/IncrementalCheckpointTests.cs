@@ -244,11 +244,18 @@ public class IncrementalCheckpointTests
         await Snapshot.WriteAsync(resumed.Circuit, fs);
 
         var chains = await ChainsAsync(fs);
-        var extended = chains.Where(c => c.Value.Length == 2).ToList();
+        // Extended: longer than its chain at the base checkpoint, which it keeps as its prefix. The resumed
+        // tick's merges may instead rewrite a chain whole (a run merged into the base, as a store record
+        // whose base held two runs does under forced pressure, §5.53); nothing else is allowed, such as
+        // a chain that keeps some base files but not as its prefix.
+        var extended = chains.Where(c => bases.TryGetValue(c.Key, out var b) && c.Value.Length > b.Length && c.Value.Take(b.Length).SequenceEqual(b)).ToList();
         Assert.True(extended.Count > 0, "the resumed program rewrote every chain");
-        foreach (var (file, chain) in extended)
+        foreach (var (file, chain) in chains.Where(c => bases.ContainsKey(c.Key)))
         {
-            Assert.Equal(bases[file][0], chain[0]);
+            var kept = chain.Intersect(bases[file], StringComparer.Ordinal).Count();
+            Assert.True(
+                kept == 0 || (kept == bases[file].Length && chain.Take(kept).SequenceEqual(bases[file])),
+                $"{file}: base [{string.Join(", ", bases[file])}], now [{string.Join(", ", chain)}]");
         }
 
         await AssertRunsAreExactlyTheReferencedOnesAsync(fs);

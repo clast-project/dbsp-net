@@ -27,6 +27,11 @@ internal static class PartitionSlicing
         return (int)Math.Min(MaxSlices, (deltaRows + per - 1) / per);
     }
 
+    /// <summary>A partition key's slice as a contiguous range of its hash (§5.53): monotone in the
+    /// hash as unsigned, so slices stepped in index order write their bulk runs in the record's own hash
+    /// order and they concatenate. The top bits, not the low ones workers split by.</summary>
+    internal static int Range(int hash, int slices) => (int)(((ulong)(uint)hash * (uint)slices) >> 32);
+
     /// <summary>A partition key's slice from its hash: mixed (workers already split by hash % W, which
     /// slicing by the same low bits would repeat), then reduced to [0, slices).</summary>
     internal static int Of(int hash, int slices)

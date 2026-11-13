@@ -244,6 +244,15 @@ internal sealed class BlockedIndexedTrace
     /// <summary>Forget every level (a restore replaces the state).</summary>
     public void Clear()
     {
+        if (_stepRun is { } pending)
+        {
+            _stepRun = null;
+            if (pending.Finish() is { } abandoned)
+            {
+                Retire(abandoned);
+            }
+        }
+
         _managed.Clear();
         foreach (var run in _runs)
         {
@@ -341,7 +350,26 @@ internal sealed class BlockedIndexedTrace
 
         var t0 = BlockTraceProfile.Now();
         _materialized = null;
+        var (blocks, entries, _, tHashed) = BuildEntries(count, key, value, weight);
+        if (blocks.Count > 0)
+        {
+            _runs.Insert(0, new Run([.. blocks], entries));
+        }
 
+        if (BlockTraceProfile.Enabled)
+        {
+            BlockTraceProfile.Section(3, t0);
+            BlockTraceProfile.Section(7, tHashed);
+            BlockTraceProfile.Freeze(t0, entries);
+        }
+
+        Compact();
+    }
+
+    // IntegrateEntries' sort and encode: the entries as blocks in hash order.
+    private (List<ITraceBlock> Blocks, long Entries, long Bytes, long THashed) BuildEntries(
+        int count, Func<int, StructuralRow> key, Func<int, StructuralRow> value, Func<int, long> weight)
+    {
         // Hash above index: one primitive sort orders by hash, ties by arrival. A large batch is cut
         // into hash ranges (the top bits) that sort and encode in parallel; a range's blocks are a
         // contiguous stretch of the run, so the run is their concatenation in range order. Visiting
@@ -377,7 +405,7 @@ internal sealed class BlockedIndexedTrace
         }
 
         var tHashed = BlockTraceProfile.Now();
-        var parts = new (List<ITraceBlock> Blocks, long Entries)[buckets];
+        var parts = new (List<ITraceBlock> Blocks, long Entries, long Bytes)[buckets];
         Parallel.For(0, buckets, b =>
         {
             Array.Sort(order, sizes[b], sizes[b + 1] - sizes[b]);
@@ -385,26 +413,139 @@ internal sealed class BlockedIndexedTrace
         });
 
         var blocks = new List<ITraceBlock>();
-        long entries = 0;
-        foreach (var (partBlocks, partEntries) in parts)
+        long entries = 0, bytes = 0;
+        foreach (var (partBlocks, partEntries, partBytes) in parts)
         {
             blocks.AddRange(partBlocks);
             entries += partEntries;
+            bytes += partBytes;
         }
 
-        if (blocks.Count > 0)
+        return (blocks, entries, bytes, tHashed);
+    }
+
+    /// <summary>
+    /// The step run (docs/design-bounded-memory.md §5.53): entries a step writes in pieces of ascending,
+    /// disjoint hash ranges (a partitioned operator's bulk-load slices) as ONE run, published by
+    /// <see cref="PublishStepRun"/>, instead of a run per piece merged up the levels. Until then the
+    /// piece's entries are not in the trace: the caller must not read them back this step. A piece is
+    /// sorted and encoded as <see cref="IntegrateEntries"/> does; its blocks stream to one run file
+    /// past the spiller's threshold, as a merge's output does (§5.23). A piece whose first hash does
+    /// not follow the run's last publishes what is pending first (correct, one more run).
+    /// </summary>
+    internal void AppendStepRun(int count, Func<int, StructuralRow> key, Func<int, StructuralRow> value, Func<int, long> weight)
+    {
+        if (count == 0)
         {
-            _runs.Insert(0, new Run([.. blocks], entries));
+            return;
         }
 
+        var t0 = BlockTraceProfile.Now();
+        var (blocks, entries, bytes, _) = BuildEntries(count, key, value, weight);
+        if (blocks.Count == 0)
+        {
+            return;
+        }
+
+        if (_stepRun is { } pending && blocks[0].FirstHash <= pending.LastHash)
+        {
+            StepRunBreaks++;
+            PublishStepRun();
+        }
+
+        (_stepRun ??= new StepRun(this)).Append(blocks, entries, bytes);
         if (BlockTraceProfile.Enabled)
         {
-            BlockTraceProfile.Section(3, t0);
-            BlockTraceProfile.Section(7, tHashed);
             BlockTraceProfile.Freeze(t0, entries);
         }
+    }
 
-        Compact();
+    /// <summary>Publish the step run (<see cref="AppendStepRun"/>), if any, as the newest run.</summary>
+    internal void PublishStepRun()
+    {
+        if (_stepRun is not { } pending)
+        {
+            return;
+        }
+
+        _stepRun = null;
+        if (pending.Finish() is { } run)
+        {
+            _materialized = null;
+            _runs.Insert(0, run);
+            StepRunsPublished++;
+            Compact();
+        }
+    }
+
+    /// <summary>Whether a step run is pending (tests).</summary>
+    internal bool StepRunPending => _stepRun is not null;
+
+    /// <summary>Step runs published, and pieces that did not follow the pending run's hashes and so
+    /// started another (diagnostics, tests). Per trace, never reset.</summary>
+    internal long StepRunsPublished;
+
+    /// <inheritdoc cref="StepRunsPublished"/>
+    internal long StepRunBreaks;
+
+    private StepRun? _stepRun;
+
+    // The pending step run's blocks: in memory, or streamed to a file once past the spiller's
+    // threshold (RunBuilder's own switch, §5.23).
+    private sealed class StepRun(BlockedIndexedTrace trace)
+    {
+        private readonly List<ITraceBlock> _blocks = new();
+        private IRunSink? _sink;
+        private bool _noSink;
+        private long _bytes;
+        private long _entries;
+
+        public uint LastHash { get; private set; }
+
+        public void Append(List<ITraceBlock> blocks, long entries, long bytes)
+        {
+            _entries += entries;
+            _bytes += bytes;
+            LastHash = blocks[^1].LastHash;
+            foreach (var block in blocks)
+            {
+                if (_sink is not null)
+                {
+                    _sink.Append(block);
+                    continue;
+                }
+
+                _blocks.Add(block);
+            }
+
+            if (_sink is null && !_noSink && BlockAccess.Spiller is { } spiller && _bytes >= spiller.StreamAtBytes)
+            {
+                _sink = spiller.BeginRun(trace);
+                _noSink = _sink is null;
+                if (_sink is not null)
+                {
+                    foreach (var made in _blocks)
+                    {
+                        _sink.Append(made);
+                    }
+
+                    _blocks.Clear();
+                }
+            }
+        }
+
+        public Run? Finish()
+        {
+            if (_sink is not null)
+            {
+                var (blocks, file, lease) = _sink.Finish();
+                _sink = null;
+                Interlocked.Increment(ref StreamedRuns);
+                return new Run(blocks, _entries) { Persisted = file, Lease = lease };
+            }
+
+            return _blocks.Count == 0 ? null : new Run([.. _blocks], _entries);
+        }
     }
 
     /// <summary>
@@ -483,7 +624,7 @@ internal sealed class BlockedIndexedTrace
     private const int HashChunk = 1 << 14;
 
     // Entries order[from..to) (sorted, hash above index) as blocks.
-    private (List<ITraceBlock> Blocks, long Entries) BuildRange(
+    private (List<ITraceBlock> Blocks, long Entries, long Bytes) BuildRange(
         ulong[] order, int from, int to, Func<int, StructuralRow> key, Func<int, StructuralRow> value, Func<int, long> weight)
     {
         var run = new RunBuilder(this);
@@ -566,7 +707,8 @@ internal sealed class BlockedIndexedTrace
             i = j;
         }
 
-        return run.Finish() is { } built ? ([.. built.Blocks], entries) : (new List<ITraceBlock>(), 0);
+        var bytes = run.FlushedBytes;
+        return run.Finish() is { } built ? ([.. built.Blocks], entries, bytes) : (new List<ITraceBlock>(), 0, 0);
     }
 
     private void Push(Managed level)
@@ -2495,6 +2637,9 @@ internal sealed class BlockedIndexedTrace
         private bool _copying;
         private ITraceBlock[] _sources = [];
         private int[] _indexes = [];
+
+        /// <summary>Encoded entry bytes flushed so far (an estimate, the format's own).</summary>
+        public long FlushedBytes => _flushedBytes + _bytes;
 
         /// <summary>A merge writing every entry by <see cref="AddCopy"/> (§5.36).</summary>
         public bool CopyMerge { get; set; }

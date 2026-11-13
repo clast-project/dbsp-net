@@ -21,7 +21,8 @@ namespace DbspNet.Benchmarks;
 /// into existing partitions and new partitions; 3 a second bulk of new partitions onto the non-empty store.
 /// Prints the TOP-K's phase split (TOPKPHASE) and an output checksum per tick, so arms can be compared.
 /// <c>dotnet run -c Release -- topkbulk [rows] [runs] [workers] [arms]</c>; arms <c>base</c> (the fast path
-/// off) and <c>bulk</c> (on).
+/// off), <c>bulk</c> (on, a record run per slice, §5.52) and <c>steprun</c> (on, one record run per step,
+/// mixed-hash slices replaced by hash ranges, §5.53).
 /// </summary>
 internal static class TopKBulkStandIn
 {
@@ -68,8 +69,10 @@ internal static class TopKBulkStandIn
                 var name = arm;
                 Settle();
                 PartitionedBulkMode.Enabled = arm != "base";
+                StepRunMode.Enabled = arm is not ("base" or "bulk");
                 var (ms, bytes, check) = RunSql(ticks, workers);
                 PartitionedBulkMode.Reset();
+                StepRunMode.Reset();
                 (results.TryGetValue(name, out var l) ? l : results[name] = []).Add(ms);
                 checks.TryAdd(name, check);
                 Console.WriteLine(
@@ -195,6 +198,9 @@ internal static class TopKBulkStandIn
     private static IEnumerable<long[]> Phases(Core.Circuit.ParallelCircuit pc) =>
         pc.Replicas.SelectMany(r => r.Operators).OfType<PartitionedTopKCompactOp<StructuralRow, StructuralRow>>().Select(op => op.Phase);
 
+    private static int RecordRuns(Core.Circuit.ParallelCircuit pc) =>
+        pc.Replicas.SelectMany(r => r.Operators).OfType<PartitionedTopKCompactOp<StructuralRow, StructuralRow>>().Sum(op => op.RecordRuns);
+
     private static void ResetPhases(Core.Circuit.ParallelCircuit pc)
     {
         foreach (var ph in Phases(pc))
@@ -233,7 +239,7 @@ internal static class TopKBulkStandIn
         Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"    TOPKPHASE tick={tick} slicing_mib={sum[0] >> 20} old_mib={sum[1] >> 20} integrate_mib={sum[2] >> 20} new_mib={sum[3] >> 20} emit_mib={sum[4] >> 20} endtick_mib={sum[5] >> 20} " +
             $"slicing_ms={Ms(sum[10])} old_ms={Ms(sum[11])} integrate_ms={Ms(sum[12])} new_ms={Ms(sum[13])} emit_ms={Ms(sum[14])} endtick_ms={Ms(sum[15])} " +
-            $"delta_rows={sum[6]} slices={sum[7]} touched={sum[8]} rows_read={sum[9]} probes={sum[16]} probes_empty={sum[17]} flushes={sum[18]} flushed={sum[19]} bulk_parts={sum[20]} bulk_rows={sum[21]}"));
+            $"delta_rows={sum[6]} slices={sum[7]} touched={sum[8]} rows_read={sum[9]} probes={sum[16]} probes_empty={sum[17]} flushes={sum[18]} flushed={sum[19]} bulk_parts={sum[20]} bulk_rows={sum[21]} record_runs={RecordRuns(pc)}"));
     }
 
     private static (long, long, ulong) Checksum(ZSet<StructuralRow, Z64> z)

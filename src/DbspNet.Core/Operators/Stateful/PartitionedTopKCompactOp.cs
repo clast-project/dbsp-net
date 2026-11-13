@@ -99,6 +99,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         _limit = limit;
         _snapshotCodec = snapshotCodec;
         _bulk = PartitionedBulkMode.Enabled;
+        _stepRun = StepRunMode.Enabled;
         _parts = new Dictionary<TKey, Partition>(partitionComparer);
         _touched = new Dictionary<TKey, (int, int)>(partitionComparer);
         _partitionComparer = partitionComparer;
@@ -126,6 +127,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
     // newness test, taken before the step changes the store; null when off or between steps.
     private readonly bool _bulk;
     private Blocks.OrderedPartitionStore.NewPartitions? _fresh;
+    private readonly bool _stepRun;
 
     private static StructuralRow S<T>(T value) => (StructuralRow)(object)value!;
 
@@ -260,7 +262,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
             foreach (var (row, weight) in delta)
             {
                 var key = _partitionOf(row);
-                var s = Blocks.PartitionSlicing.Of(_partitionComparer?.GetHashCode(key) ?? key!.GetHashCode(), slices);
+                var s = SliceOf(key, slices);
                 (parts[s] ??= Blocks.DeltaSpill.For<TRow, Z64>(_input.DeltaFormat, 0, slices)).Add(row, weight);
             }
 
@@ -290,12 +292,31 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         Phase[19] += _store.FlushedEntries - probes0.FlushedEntries;
         Phase[20] += _store.BulkPartitions - bulk0.BulkPartitions;
         Phase[21] += _store.BulkEntries - bulk0.BulkEntries;
+        var endBytes = GC.GetAllocatedBytesForCurrentThread();
+        var endTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        _store.EndStep();
+        Mark(5, ref endBytes, ref endTicks);
         _fresh = null;
         var result = builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
         TrimScratch();
     }
+
+    // A partition's slice (§5.53): a range of the hash the record orders by, so the slices' bulk runs
+    // concatenate; mixed (§5.47) with step runs off.
+    private int SliceOf(TKey key, int slices) => _stepRun
+        ? Blocks.PartitionSlicing.Range(S(key).GetHashCode(), slices)
+        : Blocks.PartitionSlicing.Of(_partitionComparer?.GetHashCode(key) ?? key!.GetHashCode(), slices);
+
+    /// <summary>The record's runs (diagnostics, tests; 0 without a record).</summary>
+    internal int RecordRuns => _store?.RecordRuns ?? 0;
+
+    /// <summary>Step-run pieces out of the record's hash order (§5.53; diagnostics, tests).</summary>
+    internal long StepRunBreaks => _store?.StepRunBreaks ?? 0;
+
+    /// <summary>Whether this operator's slices are hash ranges whose bulk runs make one run per step (§5.53).</summary>
+    internal bool StepRunEnabled => _stepRun;
 
     /// <summary>This operator's steps that ran in partition-hash slices (diagnostics, tests).</summary>
     internal long SlicedSteps;

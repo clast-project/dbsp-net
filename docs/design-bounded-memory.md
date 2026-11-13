@@ -4842,3 +4842,102 @@ The N2 follow-ups of §5.52.5 (a tighter filter, one probe per false positive) d
 every bulk tick is N1.
 
 Since b587769 (xt25fts2): batch 2,552 → 1,992 s (−21.9%), tick 18 1,457 → 927 s (−36%).
+
+### 5.53 One record run per step for the bulk-load fast path (2026-11-12, built)
+
+§5.52.7 left op 1266's integrate phase at 53% of the operator (174.7K worker-ms, 64 GiB): the sort, the
+record's run writes, and the merges of those runs. A sliced step (144 slices, 12 per worker) gave the
+record a run per slice. Slices are cut by a mixed hash (`PartitionSlicing.Of`), so every run covered the
+whole hash range, and the factor-4 policy (`Compact`) merged nearly every new run into the one before it.
+On an N1 tick that rewrote the step's rows about four times over.
+
+#### 5.53.1 The change
+
+- **Slices are hash ranges.** With step runs on, a partition's slice is `PartitionSlicing.Range`: the
+  record's own key hash (`StructuralRow.GetHashCode` of the partition key, which the record orders by) times
+  the slice count, top 32 bits. That is monotone in the hash as unsigned, so slice *s* holds only hashes in
+  [*s*·2³²/*S*, (*s*+1)·2³²/*S*). Workers split by hash mod W, so the top bits are still uniform within a
+  worker. Slices are stepped in index order, as before.
+- **The step run.** `BlockedIndexedTrace.AppendStepRun` sorts and encodes a piece as `IntegrateEntries`
+  does (the shared `BuildEntries`) and appends its blocks to the trace's pending step run instead of
+  inserting a run. Past the spiller's threshold the pending blocks stream to one run file
+  (`IRunSpiller.BeginRun`, the switch a merge's `RunBuilder` makes, §5.23), so a step's bulk rows never sit
+  in memory whole. `PublishStepRun` inserts the run as the newest and compacts once. On an N1 tick there is
+  nothing to merge it with.
+- **The store.** `OrderedPartitionStore.AppendNew` appends to the step run, and `EndStep` publishes it. Both
+  operators call `EndStep` once the step's slices are done. TOP-K counts it in the end-tick phase.
+- **A guard, not an assumption.** If a piece's first hash is not above the pending run's last hash, the
+  pending run is published first and the piece starts a new one (`StepRunBreaks`). That is correct, only
+  one more run. Hash-range slices never take it.
+- `DBSPNET_STEP_RUN=off` (`StepRunMode`, read when the operator and its store are built) restores the
+  mixed-hash slices and a run per slice.
+
+**Why holding the run back is safe.** Until `EndStep` the pieces are not in the record. Three things read
+the record during a step: a later slice's existing partitions (old windows and `Integrate` loads), the
+probes of key-filter false positives, and the write-back flush. A step touches a partition in one slice
+only, and a fast-path partition was new at the step's start, so none of them is looking for a pending
+key. The fast path emits a new partition's window from its sorted rows, not from the record. A checkpoint
+runs between steps, after `EndStep`. `Clear` (a restore) retires an abandoned pending run and its file.
+
+#### 5.53.2 Stage 1: measured in the stand-in
+
+`topkbulk 12000000 2 4 bulk,steprun` (new arm `steprun`: fast path on, step runs on; `bulk` is §5.52 with
+step runs off), xt spill env, write-back 341 MiB, server GC. TOP-K operator, summed over the 4 workers, two
+runs per arm. Checksums are equal on every tick across arms:
+
+| | 128 MiB, bulk | 128 MiB, **steprun** | 1 GiB, bulk | 1 GiB, **steprun** |
+|---|---|---|---|---|
+| tick 1 TOP-K worker-ms | 50,699 / 38,679 | **25,850 / 25,347** | 50,136 / 39,161 | **26,648 / 27,300** |
+| tick 1 TOP-K MiB | 34,213 | **23,035 (−33%)** | 33,422 | **22,982 (−31%)** |
+| tick 1 integrate MiB / ms | 13,645 / 17,959–29,807 | **2,438 / 4,570–5,360** | 13,620 / 20,245–27,226 | **2,458 / 4,312–5,152** |
+| record runs after tick 1 | 6 | **4 (one per worker)** | 6 | 4 |
+| tick 3 (N2) TOP-K worker-ms | 49,090 / 50,362 | 33,869 / 30,934 | 14,267 / 14,470 | 9,124 / 9,608 |
+| step, tick 1 (median) | 16.9 s | 9.6 s | 16.7 s | 9.7 s |
+
+Integrate is now the sort and one encode: −82% of its bytes, −70–80% of its time. Slicing (17.4 GiB,
+13–15 s) is the largest phase left, then emit (~5–6 s). Tick 3 gains too. Its key-filter false positives
+(12%) still probe twice, but now through one bulk run instead of a run per slice (old windows 25.5 → 14.5
+GiB at 128 MiB). The run-to-run spread of `bulk` (39–51 s) is in its merges. `steprun` is stable to 3%.
+
+**Expected on SF25 tick 18.** Op 1266's integrate is 174.7K ms and op 171's 128.7K. At the stand-in's ratio
+(integrate −75%) that is about −230K worker-ms on the two, plus ~−40K on ops 1390/181. That is about 2.4%
+of tick 18's 11.12M worker-ms, and perhaps 10–15 s of wall.
+
+#### 5.53.3 Stage 2: tests
+
+- `StepRunTests` (trace level): ascending pieces publish as exactly one run onto an empty trace (1, 12 and
+  200 pieces, and a forced-collision hash with several keys per hash), invisible until published, and
+  consolidated (`CheckRuns`) and equal to the summed entries; a step run onto existing state sums with it
+  (including entries that cancel old ones); pieces in descending order break into four runs, still equal;
+  `Clear` abandons a pending run; past the spiller's threshold (min 0) the step run is one file, held by
+  the run's lease and deleted with it.
+- `PartitionedBulkTests`: a fifth program, fast path on with step runs off, joins the per-tick equality
+  (on ≡ per-slice ≡ off ≡ unsliced ≡ managed ≡ recompute). After the N1 tick every blocked TOP-K and rank
+  holds exactly one record run, and no step run breaks across the ten ticks. The parallel and checkpoint
+  tests run with step runs on (the default).
+
+Mutants (`StepRunTests`, `PartitionedBulkTests`, `RankSliceTests`, `TopKSliceTests`,
+`TopKBlockedCheckpointTests`):
+
+| mutant | result |
+|---|---|
+| (a) `EndStep` publishes nothing | 5 bulk tests fail on output |
+| (b) range slices replaced by the mixed hash | 7 fail (one-run and no-break assertions) |
+| (c) no break on a piece out of hash order | `A_piece_out_of_hash_order_starts_another_run` fails |
+
+**A test that assumed one-run chains.** Under forced+critical, `IncrementalCheckpointTests.ARestoredChain_IsExtended_NotRewritten`
+failed with step runs on and passed with them off, deterministically. A rank store's record held two runs
+at the base checkpoint (`store.record`, `store.record.1`). In the resumed tick the store's newest run merged
+with them (factor-4 `Compact`), so the next checkpoint rewrote the chain whole, still two files. The test
+took every two-file chain to be "extended" (it assumed base chains have one file) and asserted its first
+file unchanged. With mixed slices the same tick left small runs that never reached the base. With step
+runs off the chain is also rewritten under forced+critical, as three files, which the test's
+length-two filter happened to skip. The test now says what it means: some chain grows with its base
+as an unchanged prefix, and every chain is either that or rewritten whole (no base file kept out of
+place). The restore and digest checks after it are unchanged. It passes in all six settings (default,
+forced, forced+critical; step runs on and off).
+
+Lesson re-learned: a zsh `env $F` does not split `$F`, so a "forced" run that finishes in 1.5 min ran the
+default env. The first reruns of this test in isolation "passed" that way.
+
+Suites: default, forced and forced+critical each pass 3,735 of 3,736, with 1 skipped.
