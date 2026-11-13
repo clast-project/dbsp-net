@@ -1941,7 +1941,7 @@ public static partial class PlanToCircuit
                                     && !ctx.CteCache.ContainsKey(c.Cte):
                 if (!ctx.InlinedCteBodies.TryGetValue(c.Cte, out var body))
                 {
-                    body = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(c.Cte.Plan);
+                    body = DbspNet.Sql.Optimizer.PlanOptimizer.OptimizeCteBody(c.Cte.Plan);
                     ctx.InlinedCteBodies[c.Cte] = body;
                 }
 
@@ -2518,7 +2518,7 @@ public static partial class PlanToCircuit
                     // would compile un-optimized). Optimize is a pass-through on
                     // recursive plans, so a recursive CTE body is left intact.
                     cached = CompilePlan(
-                        builder, DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(c.Cte.Plan), ctx);
+                        builder, DbspNet.Sql.Optimizer.PlanOptimizer.OptimizeCteBody(c.Cte.Plan), ctx);
                     ctx.CteCache[c.Cte] = cached;
                 }
 

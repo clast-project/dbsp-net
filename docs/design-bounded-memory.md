@@ -4362,3 +4362,110 @@ so treat that as one run's reading, not a result: worker 0 no longer holds the g
 copies of 15.2M rows, but the in-step peak is elsewhere.
 
 Since b587769 (xt25fts2): batch 2,552 → 2,204 s (−13.6%), tick 18 1,457 → 1,078 s (−26%).
+
+### 5.51 A rank read only through `rn = 1` is a TOP-K (2026-11-12, design)
+
+xt25range9's tick 18 has two full `PartitionedRankOp`s as its largest single operators. Each one ranks
+every row of its input, but the query keeps only the first row of each partition:
+
+| op | view | where the rank is | where `rn = 1` is | tick 18 |
+|---|---|---|---|---|
+| 1272 | `fact_engagement_status_monthly_snapshot` | CTE `latest` | CTE `deduped`, `FROM latest WHERE rn = 1` | 605K worker-ms, 408 GiB |
+| 175 | `int_engagement_assessment_key_latest` | derived table `isf` | the `WHERE` after `isf INNER JOIN acd` | 362K worker-ms, 157 GiB |
+
+`PartitionedTopKPlan` keeps only the first k rows of each partition. Its operator stores the same input
+rows as the rank does, but it emits only the rows that enter or leave the first k. The rank re-emits every
+row whose position moved. The resolver lowers a rank to a TOP-K only in one spelling: a `WHERE` directly over
+the derived table that holds the rank (`TryResolvePartitionedTopK`, Resolver.cs ~l.969–1140). Both views
+spell it differently, so both compile `PartitionedRankPlan` → `FilterPlan`.
+
+#### 5.51.1 The rewrite rules
+
+Let R = `PartitionedRankPlan(X, P, O, f)` with schema X ⧺ [rn], and let r be the index of rn. A conjunct
+*bounds the rank* when it is `rn = 1`, `rn <= k`, `rn < k` (limit k−1), or the reversed `1 = rn`, `k >= rn`,
+`k > rn`, with k an integer literal and the resulting limit ≥ 1. `rn` here is the bare `ResolvedColumn(r)`.
+Literal casts are looked through, column casts are not.
+
+    (1)  σ[rn = 1 ∧ q](R)   ≡  σ[q'](π[X, 1 AS rn](TopK(X, P, O, f, 1)))
+    (2)  σ[rn ≤ k ∧ q](R)   ≡  σ[q](Rank(TopK(X, P, O, f, k), P, O, f))        k > 1
+
+Here q' is q with rn replaced by 1, which the projection does. **Neither rule needs to know who else reads
+rn.** Every row the filter passes has rn = 1 in (1), so the projection puts that same value back into the
+row. In (2) the rank is recomputed over the kept rows, and it gives the same values:
+
+- `ROW_NUMBER`: TOP-K keeps positions 1..k under the same total order the rank uses (`SortKeyComparer` over
+  O, tie-broken by `StructuralRowComparer` on the whole X row, in both compilers and in the batch
+  evaluator). A row with weight w covers w positions in both operators. Ranking positions 1..k again
+  gives 1..k.
+- `RANK` / `DENSE_RANK`: TOP-K keeps whole tie groups with rank ≤ k. A kept row's rank counts only the rows
+  strictly before it (or the distinct groups before it), and all of those rows have smaller ranks, so they
+  are kept too.
+
+So the rewrite is a local equivalence. It is sound wherever it matches, and "the rank is read otherwise"
+is covered by the projection in (1) and the re-rank in (2). What a match does need is that the filter sits
+directly on the rank. Getting it there is the job of the existing predicate pushdown, which already
+handles the soundness questions. A filter moves past a projection by substitution and into the preserved
+side of an outer join only. It never moves across a TOP-K, a window or a rank, because each of those is a
+pushdown barrier.
+
+Rule (2) costs a rank over at most k rows per partition. Both xt views and 27 of the 96 models that filter a
+rank use k = 1. A `rn = k` for k > 1, `rn >= k`, `rn BETWEEN` and `rn <> 1` stay as they are.
+
+#### 5.51.2 Getting the filter onto the rank
+
+**Below an INNER JOIN (op 175).** The resolver gives σ[isf.rn = 1](isf ⋈ acd). `PushFilterPastJoin` sends
+the left-only conjunct into the left input, and `SimplifyFilter` substitutes it through `isf`'s projection
+until it reaches the rank. There it stops today (`default: return filter`). Rule (1)/(2) becomes a new
+`SimplifyFilter` case for `PartitionedRankPlan`. Above a LEFT JOIN, a filter on the nullable side is not
+pushed (it would drop padded rows), so it never reaches a rank there, and the rewrite does not form.
+
+**Across a CTE (op 1272).** `deduped` is `π(σ[rn = 1](CteScan(latest)))`. A CTE scan is a leaf to the
+optimizer: the compiler optimizes each CTE body separately and inlines a single-use CTE only at compile time
+(`Unwrap`), which is after pushdown. So the filter cannot reach the rank. The fix is a pass,
+`RankTopK.InlineRankCtes`, that runs inside `PlanOptimizer.Optimize` after the fixpoint. When it finds
+σ[c](CteScan(cte)) it inlines that one scan of the CTE body, if all of these hold:
+
+1. the CTE is referenced once in the whole plan being optimized (`PlanToCircuit.CountReferences`, which
+   counts a nested CTE's references once per body, the same counting the compiler's single-use inlining
+   uses) and is not recursive;
+2. some conjunct of c bounds a column that traces through the body's projections and filters to the rank
+   column of a `PartitionedRankPlan` (a `ResolvedColumn` at every step).
+
+The scan becomes `π[scan schema](body)`. The projection keeps the scan's column qualifiers. The fixpoint
+then runs again and pushes the filter down to the rank. The pass walks into CTE bodies, which is how it
+finds `deduped`'s filter on `latest` inside the body of `agg`. It optimizes a body before looking at it,
+which the compiler would do anyway. A rewritten body gets a new `CteRef`, and every scan of the old ref is
+pointed at the new one. A body with no match keeps its original ref.
+
+**Why this is sound.** A non-recursive CTE scan equals its body. Inlining it is what `Unwrap` does at
+compile time for the same single-use CTEs. Condition 1 only keeps the rank from being computed twice; it is
+not needed for soundness. That matters because the compiler re-optimizes CTE bodies one at a time
+(`Unwrap`, `CteCache`), and there a body-local count would be wrong. So those two call sites use
+`PlanOptimizer.OptimizeCteBody`, which skips the inlining pass. By then, the top-level pass has already
+inlined every scan it should.
+
+**Not covered:**
+
+- A rank in another *view*. `stg_entity_registry` outputs `rn`, and eight models read it as `acd.rn = 1`.
+  The view is itself an output, so its rank must exist anyway.
+- A CTE referenced more than once.
+- A predicate that wraps rn (`TRY_CAST(rn AS INT) = 1`).
+- The resolver's own pattern is left in place, because it already produces the TOP-K.
+
+#### 5.51.3 Switch and tests
+
+`RankTopKMode`: on by default, `DBSPNET_RANK_TOPK=off`, and a thread-static override for tests. Tests
+(`RankTopKTests`):
+
+- **Equivalence.** Serial with the rewrite on equals serial with it off on every tick. Both equal a batch
+  recompute of the *unoptimized* plan (`BatchPlanEvaluator`) over the integrated inputs. Parallel at W = 4
+  equals serial.
+- **Shapes covered:** the CTE pair; below an INNER JOIN; rn selected after `rn = 1`; `rn <= 2` with rn
+  selected (rule 2); `RANK` / `DENSE_RANK` with ties; a global rank; a CTE scanned twice (no inline); a
+  filter above a LEFT JOIN on the ranked nullable side (no rewrite); `rn = 2` (no rewrite).
+- **The data:** inserts, deletes, weight-2 rows, NULL keys, and ties that differ only in the tie-break
+  columns.
+- **Structure:** `PartitionedRankOp` count per view with the rewrite on and off.
+- **Mutants:** (a) rule (1) without the projected 1, i.e. rn read as NULL; (b) rule (2) dropping the
+  re-rank, i.e. rn read as 1 for k > 1; (c) inlining a CTE scanned twice and dropping the second scan's rank.
+  Each one applies the rewrite where rn is read otherwise, and each must fail tests.

@@ -53,7 +53,38 @@ public static class PlanOptimizer
     public static LogicalPlan Optimize(LogicalPlan plan)
     {
         ArgumentNullException.ThrowIfNull(plan);
+        var current = Fixpoint(plan);
 
+        // A single-use CTE whose rank a filter bounds is inlined, so the next fixpoint
+        // pushes the filter onto the rank and it becomes a TOP-K (docs/design-bounded-memory.md
+        // §5.51). Only from the top of a plan: the reference counts need the whole plan.
+        var inlined = RankTopK.InlineRankCtes(current, Fixpoint);
+        if (!ReferenceEquals(inlined, current))
+        {
+            current = Fixpoint(inlined);
+        }
+
+        // Final pass: common-subexpression elimination by hash-consing. The rewrite
+        // rules above produce fresh instances each iteration and never share, so CSE
+        // runs once at the fixed point — it collapses structurally-identical subtrees
+        // (e.g. a subquery spelled twice, like Nexmark q5's windowed count) to a
+        // single shared instance the plan→circuit compiler compiles once.
+        return PlanCse.Eliminate(current);
+    }
+
+    /// <summary>
+    /// <see cref="Optimize"/> for a CTE body the compiler optimizes on its own. It skips the
+    /// CTE-inlining pass, whose reference counts would see only this body; the optimize of the
+    /// plan the body belongs to has already inlined what it should.
+    /// </summary>
+    internal static LogicalPlan OptimizeCteBody(LogicalPlan plan)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        return PlanCse.Eliminate(Fixpoint(plan));
+    }
+
+    private static LogicalPlan Fixpoint(LogicalPlan plan)
+    {
         // Apply rules iteratively to a fixed point. Most queries converge in
         // 1–3 iterations; the guard prevents any accidental infinite rewrite
         // cycle from hanging the compiler.
@@ -70,12 +101,7 @@ public static class PlanOptimizer
             current = next;
         }
 
-        // Final pass: common-subexpression elimination by hash-consing. The rewrite
-        // rules above produce fresh instances each iteration and never share, so CSE
-        // runs once at the fixed point — it collapses structurally-identical subtrees
-        // (e.g. a subquery spelled twice, like Nexmark q5's windowed count) to a
-        // single shared instance the plan→circuit compiler compiles once.
-        return PlanCse.Eliminate(current);
+        return current;
     }
 
     private static LogicalPlan OptimizeNode(LogicalPlan plan)
@@ -247,6 +273,10 @@ public static class PlanOptimizer
             case DistinctPlan dist:
                 // Filter(Distinct(x), p) ≡ Distinct(Filter(x, p)).
                 return new DistinctPlan(OptimizeNode(new FilterPlan(dist.Input, filter.Predicate)));
+
+            case PartitionedRankPlan rank when RankTopK.TryRewrite(filter.Predicate, rank) is { } topK:
+                // σ[rn = 1](rank) / σ[rn <= k](rank) → a TOP-K (§5.51).
+                return OptimizeNode(topK);
 
             case DifferencePlan diff:
                 // Filter is linear over Z-set subtraction:
