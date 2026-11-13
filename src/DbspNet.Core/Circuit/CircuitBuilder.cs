@@ -240,6 +240,52 @@ public sealed class CircuitBuilder
     }
 
     /// <summary>
+    /// <see cref="Exchange{TKey,TWeight}"/> with a fused pointwise pre-step (docs/design-bounded-memory.md
+    /// §5.56): <paramref name="step"/> rewrites each input row or drops it (<c>Keep = false</c>) in the
+    /// sender, before it is partitioned, so the upstream map/filter never materialises its own Z-set. The
+    /// output has no delta format: the caller gives it the mapped rows' one. With a single worker (or
+    /// outside a parallel build) it is just the map/filter.
+    /// </summary>
+    public Stream<ZSet<TKey, TWeight>> ExchangeStep<TIn, TKey, TWeight>(
+        Stream<ZSet<TIn, TWeight>> input,
+        Func<TIn, (bool Keep, TKey Row)> step,
+        Func<TKey, int> partition)
+        where TIn : notnull
+        where TKey : notnull
+        where TWeight : struct, IZRing<TWeight>
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(step);
+        ArgumentNullException.ThrowIfNull(partition);
+
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return this.Apply(input, z =>
+            {
+                var b = new ZSetBuilder<TKey, TWeight>(z.Count);
+                foreach (var kv in z)
+                {
+                    var (keep, row) = step(kv.Key);
+                    if (keep)
+                    {
+                        b.Add(row, kv.Value);
+                    }
+                }
+
+                return b.Build();
+            });
+        }
+
+        var workers = _parallel.Workers;
+        var coordinator = _parallel.NextCoordinator(
+            () => new ExchangeCoordinator<IReadOnlyList<KeyValuePair<TKey, TWeight>>>(workers));
+        var output = new Stream<ZSet<TKey, TWeight>>(ZSet<TKey, TWeight>.Empty);
+        _root.AddOperator(new ExchangeStepOp<TIn, TKey, TWeight>(
+            input, output, step, partition, coordinator, _parallel.WorkerId, _parallel.Abort));
+        return output;
+    }
+
+    /// <summary>
     /// A shared W×W rendezvous for an operator that coordinates across workers itself (a
     /// range-partitioned rank's count all-gather, docs/design-bounded-memory.md §5.50), with this
     /// replica's worker id and the circuit's abort signal. Null outside a parallel build or at

@@ -79,6 +79,49 @@ internal static class ExchangeBuckets
     }
 
     /// <summary>
+    /// <see cref="SplitSpilling{TKey,TWeight}"/> with a fused pointwise pre-step (docs/design-bounded-memory.md
+    /// §5.56): each decoded row is first rewritten or dropped by <paramref name="step"/>, then partitioned by its
+    /// rewritten form into one builder per destination in the OUTPUT's layout (<paramref name="format"/>), each
+    /// spilling at its share of the step chunk. Two rows the step maps to one merge in their builder or the gather.
+    /// </summary>
+    public static long SplitSpilling<TIn, TKey, TWeight>(
+        ZSet<TIn, TWeight> input,
+        IReadOnlyList<KeyValuePair<TKey, TWeight>>?[] buckets,
+        Func<TIn, (bool Keep, TKey Row)> step,
+        Func<TKey, int> partition,
+        object format)
+        where TIn : notnull
+        where TKey : notnull
+        where TWeight : struct, DbspNet.Core.Algebra.IZRing<TWeight>
+    {
+        var workers = buckets.Length;
+        var builders = new ZSetBuilder<TKey, TWeight>?[workers];
+        long rows = 0;
+        foreach (var kv in input)
+        {
+            var (keep, row) = step(kv.Key);
+            if (!keep)
+            {
+                continue;
+            }
+
+            var j = ((partition(row) % workers) + workers) % workers;
+            (builders[j] ??= DbspNet.Core.Operators.Stateful.Blocks.DeltaSpill.For<TKey, TWeight>(format, 0, workers)).Add(row, kv.Value);
+            rows++;
+        }
+
+        for (var j = 0; j < workers; j++)
+        {
+            if (builders[j] is { } b && b.Build() is { IsEmpty: false } set)
+            {
+                buckets[j] = new SetBucket<TKey, TWeight>(set);
+            }
+        }
+
+        return rows;
+    }
+
+    /// <summary>
     /// Split a block-backed delta into one grouping builder per destination (docs/design-bounded-memory.md
     /// §5.41): each row keyed by <paramref name="keyOf"/> here, where it is decoded anyway, so the gather
     /// unions the grouped runs (<see cref="GatherGrouped"/>) instead of decoding every row a second time to

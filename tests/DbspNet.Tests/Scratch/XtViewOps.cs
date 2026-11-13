@@ -35,7 +35,19 @@ public class XtViewOps
         var outputs = all
             ? doc.RootElement.GetProperty("outputs").EnumerateArray().Select(e => e.GetProperty("view").GetString()!).ToHashSet(StringComparer.Ordinal)
             : new HashSet<string>([view], StringComparer.Ordinal);
-        Assert.True(SqlProgram.TryCompileParallel(program, outputs, workers, out var p, numericStringCoercion: true, nullCollation: NullCollation.Low));
+        // XT_ROW_COUNTS (a=1,b=1,...): the deploy's broadcast row counts (its "relations that small" log line),
+        // so the plan — and its operator numbering — matches the run's census.
+        var counts = Environment.GetEnvironmentVariable("XT_ROW_COUNTS");
+        var options = string.IsNullOrEmpty(counts)
+            ? null
+            : new CompileOptions
+            {
+                BroadcastMaxRows = 1000,
+                RelationRowCounts = counts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(kv => kv.Split('='))
+                    .ToDictionary(kv => kv[0], kv => long.Parse(kv[1], CultureInfo.InvariantCulture), StringComparer.Ordinal),
+            };
+        Assert.True(SqlProgram.TryCompileParallel(program, outputs, workers, out var p, options: options, numericStringCoercion: true, nullCollation: NullCollation.Low));
         using (p)
         {
             var c = p!.Circuit.Replicas[0];

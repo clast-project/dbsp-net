@@ -2566,19 +2566,14 @@ public static partial class PlanToCircuit
                 {
                     var distinctCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(d.Schema);
                     var (gcFrontier, gcMonotoneKey) = ResolveDistinctFrontier(d, ctx);
-                    var distinctInput = CompilePlan(builder, d.Input, ctx);
-
                     // Parallel: re-shard by the whole row (DISTINCT's key) so
                     // identical rows co-locate and dedup on one worker; the gather
                     // then unions the disjoint survivors. `Exchange` is an
                     // identity passthrough at W<=1, so W=1 is byte-identical.
-                    if (ctx.Workers > 1)
-                    {
-                        var distinctSchema = d.Schema;
-                        distinctInput = builder.Exchange(
-                            distinctInput,
-                            row => StablePartitionHash.OfWholeRow(row, distinctSchema));
-                    }
+                    // The input's Filter/Project chain runs in the sender (§5.56).
+                    var distinctInput = ctx.Workers > 1
+                        ? CompileExchangedInput(builder, d.Input, ctx, WholeRowPartition(d.Schema))
+                        : CompilePlan(builder, d.Input, ctx);
 
                     return EmitDistinct(
                         builder, ctx, distinctInput, d.Schema, distinctCodec,
@@ -2737,7 +2732,9 @@ public static partial class PlanToCircuit
         PartitionedTopKPlan plan,
         CompileContext ctx)
     {
-        var input = CompilePlan(builder, plan.Input, ctx);
+        // Exchanged below (W>1, a PARTITION BY): its Filter/Project chain then runs in the sender (§5.56).
+        var exchanges = ctx.Workers > 1 && plan.PartitionKeys.Count > 0;
+        var input = exchanges ? null! : CompilePlan(builder, plan.Input, ctx);
 
         var keys = new Func<StructuralRow, object?>[plan.SortKeys.Count];
         var descending = new bool[plan.SortKeys.Count];
@@ -2786,8 +2783,8 @@ public static partial class PlanToCircuit
         if (ctx.Workers > 1 && plan.PartitionKeys.Count > 0)
         {
             var partitionSchema = SyntheticKeySchema(plan.PartitionKeys);
-            input = builder.Exchange(
-                input, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
+            input = CompileExchangedInput(
+                builder, plan.Input, ctx, row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
             reshardPlace = new ReshardPlacement.Hash(row => StablePartitionHash.OfWholeRow(PartitionOf(row), partitionSchema));
         }
         else if (ctx.Workers > 1)
@@ -3425,6 +3422,40 @@ public static partial class PlanToCircuit
     /// NULL-key check) inside the exchange's sender pass (docs/design-bounded-memory.md §5.55).</summary>
     private static bool FusesExchange(CompileContext ctx) =>
         ctx.Workers > 1 && ExchangeFusionMode.Enabled && IndexFusionMode.Enabled;
+
+    /// <summary>A whole-row partition function over <paramref name="schema"/> (DISTINCT's key). Its own
+    /// method so the delegate captures only the schema (never a compiler context).</summary>
+    private static Func<StructuralRow, int> WholeRowPartition(Schema schema) =>
+        row => StablePartitionHash.OfWholeRow(row, schema);
+
+    /// <summary>
+    /// Compile <paramref name="plan"/> and re-shard it by <paramref name="partition"/> with a plain exchange
+    /// (W&gt;1). With plain-exchange fusion (docs/design-bounded-memory.md §5.56) the plan's own
+    /// Filter/Project chain runs in the exchange's sender: each row is mapped or dropped, then partitioned
+    /// by its mapped form, so the chain never builds a delta of its own. Exact for the reason
+    /// <see cref="ExchangeIndexFused"/> is. The caller must not elide the exchange from the input's
+    /// partition (a fused projection would hide the claim it read): DISTINCT and partitioned TOP-K always
+    /// exchange, and the output's placement is the exchange's own.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> CompileExchangedInput(
+        CircuitBuilder builder, LogicalPlan plan, CompileContext ctx, Func<StructuralRow, int> partition)
+    {
+        if (!(FusesExchange(ctx) && PlainExchangeFusionMode.Enabled))
+        {
+            return builder.Exchange(CompilePlan(builder, plan, ctx), partition);
+        }
+
+        var (input, pre, _) = CompileIndexInputCore(builder, plan, ctx, nullKeyIndices: null);
+        if (pre is null)
+        {
+            return builder.Exchange(input, partition);
+        }
+
+        var output = builder.ExchangeStep<StructuralRow, StructuralRow, Z64>(
+            input, row => pre(row) is { } mapped ? (true, mapped) : (false, null!), partition);
+        AttachDeltaFormat(output, plan.Schema);
+        return output;
+    }
 
     /// <summary>
     /// Exchange and index <paramref name="input"/>; with a fused <paramref name="pre"/> (§5.55) the sender
