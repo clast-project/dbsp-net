@@ -209,9 +209,22 @@ public class ExchangeFusionTests
                 ops.Count(n => n.StartsWith("Exchange", StringComparison.Ordinal)));
         }
 
-        using var on = Parallel(4, fusion: true);
-        using var off = Parallel(4, fusion: false);
-        var (a, b) = (Shape(on), Shape(off));
+        // Co-partitioning (§5.57) removes exchanges from the fused layout only (elig): off here, so the
+        // count compares fusion alone.
+        var prev = CoPartitionMode.Enabled;
+        CoPartitionMode.Enabled = false;
+        (int Steps, int Applies, int Exchanges) a, b;
+        try
+        {
+            using var on = Parallel(4, fusion: true);
+            using var off = Parallel(4, fusion: false);
+            (a, b) = (Shape(on), Shape(off));
+        }
+        finally
+        {
+            CoPartitionMode.Enabled = prev;
+        }
+
         Assert.Equal(0, b.Steps);
         Assert.True(a.Steps >= 8, $"{a.Steps} fused exchanges");
         Assert.True(a.Applies <= b.Applies - 8, $"fused {a.Applies} ApplyOps, unfused {b.Applies}");

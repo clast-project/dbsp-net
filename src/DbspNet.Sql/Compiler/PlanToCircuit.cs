@@ -147,6 +147,7 @@ public static partial class PlanToCircuit
                 {
                     SharedPlans = SharedPlanNodes(plan),
                 };
+                ctx.CoPartition = PlanCoPartition(plan, ctx);
 
                 foreach (var (name, info) in tables)
                 {
@@ -711,6 +712,7 @@ public static partial class PlanToCircuit
                         Reshard = reshard,
                         SharedPlans = SharedPlanNodes(optimized),
                     };
+                    ctx.CoPartition = PlanCoPartition(optimized, ctx);
                     // The scan streams (this program's tables) are whole-row-hashed
                     // inputs → shard-disjoint. A view-scan resolves to that view's
                     // already-built stream, whose partition state was recorded when
@@ -871,6 +873,20 @@ public static partial class PlanToCircuit
         }
 
         return new ReshardPlacement.Hash(key => StablePartitionHash.OfRow(key, positions, keySchema));
+    }
+
+    /// <summary>The partition an elided aggregate's output carries: its input's columns, at their group-key
+    /// positions (the output's first columns), hashed as the input's exchange hashed them.</summary>
+    private static PartitionInfo ElidedAggregatePartition(PartitionInfo upstream, int[] groupIndices)
+    {
+        var pk = upstream.PartitionKey!;
+        var positions = new int[pk.Length];
+        for (var i = 0; i < pk.Length; i++)
+        {
+            positions[i] = Array.IndexOf(groupIndices, pk[i]);
+        }
+
+        return new PartitionInfo(ShardDisjoint: false, positions, upstream.KeySchema, upstream.Gathered);
     }
 
     private static bool IsKeySubset(int[] sub, int[] super)
@@ -1312,6 +1328,14 @@ public static partial class PlanToCircuit
         /// <see cref="Optimizer.PlanCse"/> shares them), from <see cref="SharedPlanNodes"/>.
         /// Null where not computed: a join then never folds its consumer's projection.</summary>
         public IReadOnlySet<LogicalPlan>? SharedPlans { get; init; }
+
+        /// <summary>Co-partitioning requests (docs/design-bounded-memory.md §5.57), from
+        /// <see cref="PlanCoPartition"/>; null when there are none.</summary>
+        public CoPartitionPlan? CoPartition { get; set; }
+
+        /// <summary>Shared exchanges by input stream and key columns (<see cref="SharedExchange"/>).</summary>
+        public Dictionary<(Stream<ZSet<StructuralRow, Z64>> Input, string Columns), Stream<ZSet<StructuralRow, Z64>>> SharedExchanges { get; }
+            = new(new SharedExchangeKeyComparer());
 
         /// <summary>Optimized bodies of inlined CTEs, so each is optimized once.</summary>
         public Dictionary<CteRef, LogicalPlan> InlinedCteBodies { get; } = new();
@@ -2562,6 +2586,11 @@ public static partial class PlanToCircuit
                     return result;
                 }
 
+            // A requested DISTINCT (§5.57) runs its chain in its sender or index pass, so only where §5.56 fuses.
+            case DistinctPlan d when FusesExchange(ctx) && PlainExchangeFusionMode.Enabled
+                                     && ctx.CoPartition?.RequestFor(d) is { } distinctRequest:
+                return CompileCoPartitionedDistinct(builder, d, ctx, distinctRequest);
+
             case DistinctPlan d:
                 {
                     var distinctCodec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(d.Schema);
@@ -2575,10 +2604,18 @@ public static partial class PlanToCircuit
                         ? CompileExchangedInput(builder, d.Input, ctx, WholeRowPartition(d.Schema))
                         : CompilePlan(builder, d.Input, ctx);
 
-                    return EmitDistinct(
+                    var distinct = EmitDistinct(
                         builder, ctx, distinctInput, d.Schema, distinctCodec,
                         gcFrontier, gcMonotoneKey,
                         reshard: ctx.Workers > 1 ? ReshardPlacement.WholeRow(d.Schema) : null);
+
+                    // Exchanged by the whole row: hash-partitioned on every column (§5.57).
+                    if (ctx.Workers > 1 && CoPartitionMode.Enabled)
+                    {
+                        ctx.SetPartition(distinct, new PartitionInfo(ShardDisjoint: false, Iota(d.Schema.Count), d.Schema));
+                    }
+
+                    return distinct;
                 }
 
             case DifferencePlan diff:
@@ -3204,7 +3241,8 @@ public static partial class PlanToCircuit
         LinearStageKind Kind,
         Func<IReadOnlyList<object?>, bool>? Predicate,
         Func<IReadOnlyList<object?>, object?>[]? Delegates,
-        Schema? OutSchema);
+        Schema? OutSchema,
+        int[]? Sources = null);
 
     /// <summary>
     /// Compiles a maximal run of consecutive <see cref="FilterPlan"/> /
@@ -3280,15 +3318,19 @@ public static partial class PlanToCircuit
         }
 
         // Partition state survives a filters-only chain unchanged (filters touch
-        // no columns); any projection may drop or reorder columns and invalidate
-        // the partition-key indices, so it drops the tracking (docs §2). Only
-        // meaningful at W>1. Identity projections emit no Map stage (stripped
+        // no columns); a projection moves the partition columns it passes through
+        // bare and loses the claim if it computes or drops one (docs §2, §5.57).
+        // Only meaningful at W>1. Identity projections emit no Map stage (stripped
         // above), so a pure rename still propagates.
         if (ctx.Workers > 1)
         {
             if (!hasMap)
             {
                 ctx.SetPartition(result, ctx.GetPartition(input));
+            }
+            else if (CoPartitionMode.Enabled)
+            {
+                ctx.SetPartition(result, MapPartition(ctx.GetPartition(input), ComposeSources(stages)));
             }
         }
 
@@ -3345,7 +3387,15 @@ public static partial class PlanToCircuit
                     delegates[i] = ExpressionCompiler.CompileScalar(p.Projections[i].Expression);
                 }
 
-                stages.Add(new LinearStage(LinearStageKind.Map, null, delegates, p.Schema));
+                // Which input column each output column passes through bare (-1 when computed), so a
+                // partition claim can follow the columns it is over (§5.57).
+                var sources = new int[p.Projections.Count];
+                for (var i = 0; i < sources.Length; i++)
+                {
+                    sources[i] = p.Projections[i].Expression is ResolvedColumn rc ? rc.Index : -1;
+                }
+
+                stages.Add(new LinearStage(LinearStageKind.Map, null, delegates, p.Schema, sources));
                 node = p.Input;
             }
             else
@@ -3504,6 +3554,18 @@ public static partial class PlanToCircuit
     private static (Stream<ZSet<StructuralRow, Z64>> Input, Func<StructuralRow, StructuralRow?>? Pre, bool Projects)
         CompileIndexInputCore(CircuitBuilder builder, LogicalPlan plan, CompileContext ctx, int[]? nullKeyIndices)
     {
+        var (input, pre, projects, _) = CompileIndexInputSources(builder, plan, ctx, nullKeyIndices);
+        return (input, pre, projects);
+    }
+
+    /// <summary>
+    /// <see cref="CompileIndexInputCore"/>, plus, for each column of the fused chain's output, the column of
+    /// the returned input stream it passes through bare (-1 when computed; null when the chain projects
+    /// nothing), so a caller can follow the input's partition through the chain (§5.57).
+    /// </summary>
+    private static (Stream<ZSet<StructuralRow, Z64>> Input, Func<StructuralRow, StructuralRow?>? Pre, bool Projects, int[]? Sources)
+        CompileIndexInputSources(CircuitBuilder builder, LogicalPlan plan, CompileContext ctx, int[]? nullKeyIndices)
+    {
         // A NULL check on NOT NULL key columns can never drop a row.
         if (nullKeyIndices is not null && nullKeyIndices.All(i => !plan.Schema[i].Type.Nullable))
         {
@@ -3547,7 +3609,7 @@ public static partial class PlanToCircuit
             (_, null) => row => RunStages(chain, row, codec),
             (_, { } idx) => row => RunStages(chain, row, codec) is { } m && HasNoNullKey(m, idx) ? m : null,
         };
-        return (input, pre, projects);
+        return (input, pre, projects, ComposeSources(chain));
     }
 
     /// <summary>
@@ -4098,9 +4160,10 @@ public static partial class PlanToCircuit
         Stream<ZSet<StructuralRow, Z64>> left;
         Func<StructuralRow, StructuralRow?>? leftPre = null;
         var leftProjects = false;
+        int[]? leftSources = null;
         if (fuseLeft)
         {
-            (left, leftPre, leftProjects) = CompileIndexInputCore(builder, plan.Left, ctx, nullKeyIndices: null);
+            (left, leftPre, leftProjects, leftSources) = CompileIndexInputSources(builder, plan.Left, ctx, nullKeyIndices: null);
         }
         else
         {
@@ -4109,9 +4172,10 @@ public static partial class PlanToCircuit
 
         Stream<ZSet<StructuralRow, Z64>> right;
         Func<StructuralRow, StructuralRow?>? rightPre = null;
+        int[]? rightSources = null;
         if (fuseExchange)
         {
-            (right, rightPre, _) = CompileIndexInputCore(builder, plan.Right, ctx, rightIndices);
+            (right, rightPre, _, rightSources) = CompileIndexInputSources(builder, plan.Right, ctx, rightIndices);
         }
         else
         {
@@ -4139,12 +4203,30 @@ public static partial class PlanToCircuit
             left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
         }
 
+        // Co-partitioned (§5.57): both sides already arrive hash-partitioned alike on some of the key's
+        // pairs, so equal keys share a worker and neither side is exchanged. Each side's chain (and the
+        // right side's NULL-key drop) runs in the pass that indexes it; NULL left keys are indexed and
+        // padded by the operator, as in the exchanged form.
+        var leftClaim = fuseExchange && CoPartitionMode.Enabled ? MapPartition(ctx.GetPartition(left), leftSources) : default;
+        var rightClaim = fuseExchange && CoPartitionMode.Enabled ? MapPartition(ctx.GetPartition(right), rightSources) : default;
+        var pairPositions = Array.Empty<int>();
+        var coPartitioned = fuseExchange && CoPartitionMode.Enabled
+            && CoPartitioned(leftClaim, rightClaim, leftIndices, rightIndices, out pairPositions);
+
         // NULL-keyed left rows can never find a match (NULL = anything is
         // NULL, not TRUE), so unfused they bypass the join and go straight to the
         // NULL-padded branch. NULL-keyed right rows are simply dropped.
         Stream<ZSet<StructuralRow, Z64>>? nullKeyLeft = null;
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed;
-        if (fuseExchange)
+        if (coPartitioned)
+        {
+            StructuralRow LeftKeyOf(StructuralRow row) => ExtractKey(codec, leftKeySchema, row, leftIndices);
+            leftIndexed = leftPre is null
+                ? builder.GroupProject(left, LeftKeyOf, static row => row)
+                : builder.MapFilterGroupProject<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                    left, leftPre, LeftKeyOf, static row => row);
+        }
+        else if (fuseExchange)
         {
             leftIndexed = ExchangeIndexFused(
                 builder,
@@ -4172,7 +4254,13 @@ public static partial class PlanToCircuit
         }
 
         var validKeyRight = fuseExchange ? right : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
-        var rightIndexed = broadcastRight
+        StructuralRow RightKeyOf(StructuralRow row) => ExtractKey(codec, rightKeySchema, row, rightIndices);
+        var rightIndexed = coPartitioned
+            ? rightPre is null
+                ? builder.GroupProject(validKeyRight, RightKeyOf, static row => row)
+                : builder.MapFilterGroupProject<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
+                    validKeyRight, rightPre, RightKeyOf, static row => row)
+            : broadcastRight
             ? builder.GroupProject(
                 builder.BroadcastExchange(validKeyRight),
                 row => ExtractKey(codec, rightKeySchema, row, rightIndices),
@@ -4198,8 +4286,10 @@ public static partial class PlanToCircuit
                 : (_, lrow) => NullPadRight(codec, joinedSchema, lrow, leftCount, rightCount),
             leftCodec, rightCodec, gcFrontier, gcMonotoneKey,
             leftReshard: ctx.Workers <= 1 ? null
+                : coPartitioned ? HashPlacement(pairPositions, leftClaim.KeySchema!)
                 : broadcastRight ? ReshardPlacement.Anywhere : ReshardPlacement.WholeRow(leftKeySchema),
             rightReshard: ctx.Workers <= 1 ? null
+                : coPartitioned ? HashPlacement(pairPositions, rightClaim.KeySchema!)
                 : broadcastRight ? ReshardPlacement.OnEveryWorker : ReshardPlacement.WholeRow(rightKeySchema),
             leftShape: (leftKeySchema, plan.Left.Schema), rightShape: (rightKeySchema, plan.Right.Schema),
             residual: pairResidual is null ? null : (_, l, r) => pairResidual(l, r));
@@ -4232,6 +4322,7 @@ public static partial class PlanToCircuit
         {
             ctx.SetPartition(result, broadcastRight
                 ? leftPartition with { ShardDisjoint = false }
+                : coPartitioned ? leftClaim
                 : new PartitionInfo(ShardDisjoint: false, PartitionKey: leftIndices, KeySchema: leftKeySchema));
         }
 
@@ -5353,22 +5444,40 @@ public static partial class PlanToCircuit
         Stream<ZSet<StructuralRow, Z64>> input;
         Func<StructuralRow, StructuralRow?>? pre = null;
         var preProjects = false;
+        int[]? preSources = null;
         if (ctx.Workers <= 1 && IndexFusionMode.Enabled)
         {
             (input, pre) = CompileIndexInput(builder, plan.Input, ctx, nullKeyIndices: null);
         }
         else if (FusesExchange(ctx))
         {
-            (input, pre, preProjects) = CompileIndexInputCore(builder, plan.Input, ctx, nullKeyIndices: null);
+            (input, pre, preProjects, preSources) = CompileIndexInputSources(builder, plan.Input, ctx, nullKeyIndices: null);
         }
         else
         {
             input = CompilePlan(builder, plan.Input, ctx);
         }
 
-        // The partition the unfused chain's output would carry: its input's through filters only, none
-        // past a projection (as CompileLinearChain records).
-        var inputPartition = ctx.Workers <= 1 || preProjects ? default : ctx.GetPartition(input);
+        // Co-partitioning (§5.57): the group-key positions a downstream join asked this aggregate to
+        // partition by, and whether its input is exchanged once for it and another requested operator.
+        var bareGroupIndices = BareColumnIndices(plan.GroupKeys);
+        var request = ctx.Workers > 1 ? ctx.CoPartition?.RequestFor(plan) : null;
+        if (request is not null
+            && ctx.CoPartition!.Shared.Contains(plan)
+            && bareGroupIndices is { } sharedGroup
+            && ThroughSources([.. request.Select(r => sharedGroup[r])], preSources) is { } baseColumns)
+        {
+            input = SharedExchange(
+                builder, ctx, input, baseColumns,
+                plan.Input.Schema.SubsetByIndex([.. request.Select(r => sharedGroup[r])]));
+        }
+
+        // The partition the unfused chain's output would carry: its input's, moved through the chain's
+        // bare-column projections (as CompileLinearChain records).
+        var inputPartition = ctx.Workers <= 1 ? default
+            : CoPartitionMode.Enabled ? MapPartition(ctx.GetPartition(input), preSources)
+            : preProjects ? default
+            : ctx.GetPartition(input);
 
         // Group-key extractors. A key is any scalar expression (bare column,
         // CAST(ts AS DATE), a + b, …), compiled once to a delegate run per row —
@@ -5426,18 +5535,21 @@ public static partial class PlanToCircuit
         // subset of the (bare-column) group key (docs/design-structural-parallel.md
         // §2). At W<=1 `ExchangeIndex` degrades to the same `GroupProject` this
         // emitted before parallelism, so W=1 is byte-identical either branch.
-        var bareGroupIndices = BareColumnIndices(plan.GroupKeys);
         var needsExchange = ctx.Workers > 1
             && !(bareGroupIndices is { } gi
                  && inputPartition.PartitionKey is { } pk
                  && IsKeySubset(pk, gi));
 
+        // A requested aggregate partitions by those group-key columns only.
+        var requestSchema = request is null ? null : groupKeySchema.SubsetByIndex(request);
         var indexed = needsExchange
             ? ExchangeIndexFused(
                 builder,
                 input,
                 pre,
-                row => StablePartitionHash.OfWholeRow(KeyRowOf(row), groupKeySchema),
+                request is null
+                    ? row => StablePartitionHash.OfWholeRow(KeyRowOf(row), groupKeySchema)
+                    : row => StablePartitionHash.OfRow(KeyRowOf(row), request, requestSchema!),
                 KeyRowOf)
             : pre is null
                 ? builder.GroupProject(input, KeyRowOf, row => row)
@@ -5455,7 +5567,7 @@ public static partial class PlanToCircuit
         // monotone column sits at its group-key index.
         var (gcFrontier, gcMonotoneKey) = ResolveGroupKeyFrontier(plan, ctx);
         var reshard = ctx.Workers <= 1 ? null
-            : needsExchange ? ReshardPlacement.WholeRow(groupKeySchema)
+            : needsExchange ? (request is null ? ReshardPlacement.WholeRow(groupKeySchema) : HashPlacement(request, requestSchema!))
             : ElidedAggregatePlacement(inputPartition, bareGroupIndices!);
 
         var groupCount = plan.GroupKeys.Count;
@@ -5497,10 +5609,17 @@ public static partial class PlanToCircuit
 
         // The output lays the group key out as the first groupCount columns and
         // every group is co-located on one worker, so the result is partitioned by
-        // iota(groupCount) — record it for a downstream aggregate to elide on.
+        // iota(groupCount) — record it for a downstream aggregate to elide on. The
+        // claim names the columns the placement was hashed from (a join pairs two
+        // claims, §5.57): the requested ones, or for an elided aggregate its input's,
+        // moved to their group-key positions.
         if (ctx.Workers > 1)
         {
-            ctx.SetPartition(mapped, new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount), KeySchema: groupKeySchema));
+            ctx.SetPartition(mapped, !needsExchange && CoPartitionMode.Enabled
+                ? ElidedAggregatePartition(inputPartition, bareGroupIndices!)
+                : request is not null
+                    ? new PartitionInfo(ShardDisjoint: false, PartitionKey: request, KeySchema: requestSchema)
+                    : new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount), KeySchema: groupKeySchema));
         }
 
         return mapped;
