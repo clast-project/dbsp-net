@@ -5264,7 +5264,7 @@ The fused region saves 82 GiB (−13%) and 61K worker-ms. The two largest target
 201K → 162K ms and 70 → 46 GiB. The rest of the tick is slower in the "on" arm by ~0.5M worker-ms at
 **identical** allocation (aggregates +162K, exchange-indexes +198K, LEFT joins +97K). That is the machine,
 not the code (§5.53's lesson). The noise is large: the "off" arm compiles the same plan as xt25xfuse9 and
-allocates the same 4,101 GiB, yet ran 160 s faster (1,802 vs 1,962 s).
+allocates the same (4,005 vs 4,004 GiB), yet ran 160 s faster (1,802 vs 1,962 s).
 
 Verdict: a small, deterministic allocation win (−2% of tick 18, −13% of the region it touches). Its time
 effect is below this machine's run-to-run noise, and this pair's wall cannot show it. It stays on by
