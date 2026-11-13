@@ -4469,3 +4469,80 @@ inlined every scan it should.
 - **Mutants:** (a) rule (1) without the projected 1, i.e. rn read as NULL; (b) rule (2) dropping the
   re-rank, i.e. rn read as 1 for k > 1; (c) inlining a CTE scanned twice and dropping the second scan's rank.
   Each one applies the rewrite where rn is read otherwise, and each must fail tests.
+
+#### 5.51.4 Built (e013536) and measured from scratch
+
+**Built as designed.** The new code is `RankTopK.TryRewrite`, a `SimplifyFilter` case, and
+`RankTopK.InlineRankCtes`, which runs after `PlanOptimizer.Optimize`'s fixpoint and is followed by a
+second fixpoint. The compiler's two optimizes of a single CTE body now call `OptimizeCteBody`.
+
+**Tests** (`RankTopKTests`, 5, over 11 view shapes) are as §5.51.3 lists. Every view is non-empty on some
+tick, so none is equal vacuously. Mutants:
+
+| mutant | failing tests |
+|---|---|
+| (a) rule (1) projects NULL for rn | 3 (both equivalence tests, both W) |
+| (b) rule (2) without the re-rank (rn read as 1 for k > 1) | 4 |
+| (c) a filter on one scan of a twice-scanned CTE pushed into the shared body | 4 |
+| (d) `rn = k` read as `rn <= k` | 4 |
+
+Each mutant fails the equivalence tests themselves, not only the shape test. Suites: default, forced and
+forced+critical each pass 3,721 of 3,722, with 1 skipped.
+
+**What it rewrites in the SF25 program** (`XtRankTopKCensus` over xt25range9's `program.json`): 8
+rewrites in 6 views. Ranks 35 → 27, TOP-Ks 24 → 32. The six views are both targets,
+`fact_customer_status_monthly_snapshot`, `int_account` (two), `int_engagement_effective_units` (two) and
+`int_household_best_match`. Each of the two monthly snapshots keeps one rank: its global `primary_key`
+`ROW_NUMBER`.
+
+**xt25ranktopk9**: xt25range9's setup (nine dimensions hinted, 262,144-row step chunk, W = 12, 48 GiB cap,
+`XT_OP_PROFILE=1`) on e013536 (`~/xtpcds/bin-ranktopk`), from scratch, with `XT_PROF_OPS=0-2000` so that
+every operator is listed.
+
+| batch 1 | xt25range9 | xt25ranktopk9 |
+|---|---|---|
+| batch duration | 2,204 s | **2,058 s (−6.6%)** |
+| tick 17 step | 357 s | 347 s |
+| tick 18 step | 1,078 s | **978 s (−100 s, −9.3%)** |
+| tick 18 GC pauses | 556 s | 488 s |
+| tick 18 worker time | 12.92M ms | 11.71M ms (−1.20M) |
+| tick 18 allocation | 5,466 GiB | 5,389 GiB (−1.4%) |
+| operators | 1,865 | 1,858 |
+| tick 18 end live / RSS | 24.1 / 42.1 GB | 22.7 / 39.6 GB |
+| peak RSS (sampler) | 43 GiB | 48 GiB |
+
+All 96 views have the same row counts.
+
+**The two operators.** On tick 18 the TOP-K costs almost what the rank did:
+
+| op | xt25range9 (rank) | xt25ranktopk9 (TOP-K) |
+|---|---|---|
+| `fact_engagement_status_monthly_snapshot` | op 1272, 605K ms, 398 GiB | op 1266, 551K ms (−9%), 385 GiB (−3%) |
+| `int_engagement_assessment_key_latest` | op 175, 362K ms, 153 GiB | op 171, 286K ms (−21%), 141 GiB (−8%) |
+
+Tick 18 is the fact table's bulk load. All 36.1M rows arrive in one delta, so every partition is new.
+TOP-K and rank both have to slice that delta and integrate every row into the partition stores, because
+a later retraction can promote any row. The rank's own split (`RANKPHASE`, §5.45) was slicing 59 GiB,
+old 124 GiB and integrate 132 GiB out of 398. Its emit was only 14 GiB. So the cost that §5.51 removes, the
+re-emitting of every moved row, was never most of the rank on this tick. The design's premise that "the
+rank re-emits every row" holds, but the stored input dominates when everything is new.
+
+**Where the rest of the 1.2M worker-ms went.** Part of it is downstream of the ranks, which no longer
+carry 36M widened rows:
+
+- In the assessment view, the exchange after the inner rank (op 174 → 180) fell from 124K to 18K ms.
+- In the monthly snapshot, the projection over the rank's output (op 1273, 89K ms, 42 GiB) is gone.
+- The monthly snapshot's full view is now 1.26M ms. Before, the 11 of its operators inside op range
+  1230–1320 alone came to 1.41M ms.
+
+GC pauses fell by 68 s. The rest is spread across views the rewrite did not touch, in both directions:
+`int_engagement_status_transaction` rose 228K ms in the top-40 sums, and the 28-day eligibility view fell
+by 328K. Treat that part as run-to-run spread, not as a result. The sampler's peak RSS (48 vs 43 GiB) is one
+reading, like §5.50.10's. RSS and live heap at the end of tick 18 are both lower.
+
+**Next for these two operators** is the bulk case itself. When a partition is empty before the tick, the
+TOP-K could sort that partition's slice of the delta once and keep its rows as a sorted run, instead of
+integrating them row by row. That applies to rank and TOP-K alike. It is the same item as the "bulk-load
+fast path" in the batch-1 plan. Not started.
+
+Since b587769 (xt25fts2): batch 2,552 → 2,058 s (−19.4%), tick 18 1,457 → 978 s (−33%).
