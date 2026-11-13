@@ -98,6 +98,7 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         _function = function;
         _limit = limit;
         _snapshotCodec = snapshotCodec;
+        _bulk = PartitionedBulkMode.Enabled;
         _parts = new Dictionary<TKey, Partition>(partitionComparer);
         _touched = new Dictionary<TKey, (int, int)>(partitionComparer);
         _partitionComparer = partitionComparer;
@@ -121,12 +122,23 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
 
     private readonly IEqualityComparer<TKey>? _partitionComparer;
 
+    // The bulk-load fast path (docs/design-bounded-memory.md §5.52), blocked state only: this step's
+    // newness test, taken before the step changes the store; null when off or between steps.
+    private readonly bool _bulk;
+    private Blocks.OrderedPartitionStore.NewPartitions? _fresh;
+
     private static StructuralRow S<T>(T value) => (StructuralRow)(object)value!;
 
     private static T As<T>(StructuralRow row) => (T)(object)row;
 
     /// <summary>Whether the state is held as blocks (tests).</summary>
     internal bool IsBlocked => _store is not null;
+
+    /// <summary>Whether the bulk-load fast path is on for this operator (§5.52; tests).</summary>
+    internal bool BulkEnabled => _bulk && _store is not null;
+
+    /// <summary>Partitions the fast path has written since the operator was built (tests).</summary>
+    internal long BulkPartitions => _store?.BulkPartitions ?? 0;
 
     public string MetricName => "PartitionedTopK";
 
@@ -226,6 +238,11 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         _oldWindows.Clear();
         var builder = Blocks.DeltaSpill.For<TRow, Z64>(_output.DeltaFormat, _lastOutputSize);
         var slices = Blocks.PartitionSlicing.Count(blocked: true, delta.Count);
+        Phase[6] += delta.Count;
+        Phase[7] += slices;
+        var probes0 = (_store!.ColdProbes, _store.ColdProbesEmpty, _store.Flushes, _store.FlushedEntries);
+        var bulk0 = (_store.BulkPartitions, _store.BulkEntries);
+        _fresh = _bulk ? _store.BeginStep() : null;
         if (slices <= 1)
         {
             StepBlockedPartitions(delta, delta.Count, builder);
@@ -233,6 +250,9 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
         else
         {
             SlicedSteps++;
+            var b0 = GC.GetAllocatedBytesForCurrentThread();
+            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var inner0 = InnerPhases();
 
             // One pass splits the delta, each slice a builder that spills its share; each slice is
             // decoded once, into a list (a spilled slice would decode again on every pass).
@@ -258,8 +278,19 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
                     _oldWindows.Clear();
                 }
             }
+
+            var inner = InnerPhases();
+            Phase[0] += GC.GetAllocatedBytesForCurrentThread() - b0 - (inner.Bytes - inner0.Bytes);
+            Phase[10] += System.Diagnostics.Stopwatch.GetTimestamp() - t0 - (inner.Ticks - inner0.Ticks);
         }
 
+        Phase[16] += _store.ColdProbes - probes0.ColdProbes;
+        Phase[17] += _store.ColdProbesEmpty - probes0.ColdProbesEmpty;
+        Phase[18] += _store.Flushes - probes0.Flushes;
+        Phase[19] += _store.FlushedEntries - probes0.FlushedEntries;
+        Phase[20] += _store.BulkPartitions - bulk0.BulkPartitions;
+        Phase[21] += _store.BulkEntries - bulk0.BulkEntries;
+        _fresh = null;
         var result = builder.Build();
         _lastOutputSize = result.Count;
         _output.SetCurrent(result);
@@ -272,14 +303,46 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
     /// <summary>This operator's non-empty slices stepped (diagnostics, tests).</summary>
     internal long SliceSteps;
 
+    /// <summary>Diagnostics (the xt harness, TOPKPHASE; blocked state only), summed over steps until reset.
+    /// Bytes allocated by phase: 0 slicing passes, 1 old windows (and the change list), 2 integrate,
+    /// 3 new windows, 4 emit, 5 end tick; 6 delta rows, 7 slices, 8 touched partitions, 9 rows read
+    /// (old + new windows' rows); 10–15 stopwatch ticks of phases 0–5; 16 cold-record probes, 17 of them
+    /// that found nothing (key-filter false positives), 18 write-back flushes, 19 entries flushed; 20
+    /// partitions and 21 rows the bulk-load fast path took (§5.52).</summary>
+    internal readonly long[] Phase = new long[22];
+
+    private (long Bytes, long Ticks) InnerPhases() =>
+        (Phase[1] + Phase[2] + Phase[3] + Phase[4] + Phase[5], Phase[11] + Phase[12] + Phase[13] + Phase[14] + Phase[15]);
+
+    // Bytes and stopwatch ticks since the last mark, into phase `p`.
+    private void Mark(int p, ref long bytes, ref long ticks)
+    {
+        var b = GC.GetAllocatedBytesForCurrentThread();
+        var t = System.Diagnostics.Stopwatch.GetTimestamp();
+        Phase[p] += b - bytes;
+        Phase[p + 10] += t - ticks;
+        bytes = b;
+        ticks = t;
+    }
+
     // A set of partitions' rows of the delta (all of it, or one slice): integrate them and emit the
     // change in their windows; the store may then drop its cache (EndTick, per slice).
     private void StepBlockedPartitions(IEnumerable<KeyValuePair<TRow, Z64>> delta, int count, ZSetBuilder<TRow, Z64> builder)
     {
-        var changes = new List<(StructuralRow Key, StructuralRow Row, long Weight)>(count);
+        var bytes = GC.GetAllocatedBytesForCurrentThread();
+        var ticks = System.Diagnostics.Stopwatch.GetTimestamp();
+        var changes = new List<(StructuralRow Key, StructuralRow Row, long Weight)>(_fresh is { AllNew: true } ? 0 : count);
+        List<(StructuralRow Key, StructuralRow Row, long Weight)>? fresh = null;
         foreach (var (row, dw) in delta)
         {
             var key = _partitionOf(row);
+            if (_fresh is not null && _fresh.IsNew(S(key)))
+            {
+                // New this step (§5.52): no old window, no probe; sorted and written below.
+                (fresh ??= new List<(StructuralRow, StructuralRow, long)>(count)).Add((S(key), S(row), dw.Value));
+                continue;
+            }
+
             ref var range = ref CollectionsMarshal.GetValueRefOrAddDefault(_touched, key, out var seen);
             if (!seen)
             {
@@ -291,16 +354,64 @@ internal sealed class PartitionedTopKCompactOp<TRow, TKey> : IOperator, ISnapsho
             changes.Add((S(key), S(row), dw.Value));
         }
 
+        Phase[8] += _touched.Count;
+        Phase[9] += _oldWindows.Count;
+        Mark(1, ref bytes, ref ticks);
         _store!.Integrate(changes);
+        Mark(2, ref bytes, ref ticks);
         var oldAll = CollectionsMarshal.AsSpan(_oldWindows);
+        long readNew = 0, readTicks = 0;
         foreach (var (key, range) in _touched)
         {
             _newWindow.Clear();
+            var b = GC.GetAllocatedBytesForCurrentThread();
+            var t = System.Diagnostics.Stopwatch.GetTimestamp();
             StoreWindow(key, _newWindow);
+            readNew += GC.GetAllocatedBytesForCurrentThread() - b;
+            readTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t;
+            Phase[9] += _newWindow.Count;
             EmitDiff(builder, oldAll.Slice(range.Start, range.Length), CollectionsMarshal.AsSpan(_newWindow));
         }
 
+        Mark(4, ref bytes, ref ticks);
+        if (fresh is not null)
+        {
+            StepNew(fresh, builder, ref bytes, ref ticks);
+        }
+
+        Phase[3] += readNew;
+        Phase[13] += readTicks;
+        Phase[4] -= readNew;
+        Phase[14] -= readTicks;
         _store.EndTick();
+        Mark(5, ref bytes, ref ticks);
+    }
+
+    // The fast path's partitions (§5.52.2), all new this step: sorted once by (key hash, row order), each
+    // partition a contiguous run whose window is emitted whole (its old window is empty), and the rows
+    // written to the record as one run.
+    private void StepNew(List<(StructuralRow Key, StructuralRow Row, long Weight)> rows, ZSetBuilder<TRow, Z64> builder, ref long bytes, ref long ticks)
+    {
+        var keys = Blocks.PartitionRuns.Sort(rows, (IComparer<StructuralRow>)(object)_order, out var runs);
+        Mark(2, ref bytes, ref ticks);
+        foreach (var (start, length) in runs)
+        {
+            _newWindow.Clear();
+            if (_limit > 0)
+            {
+                var acc = new WindowCut(_function, _limit, _sortKeyOnly, _newWindow);
+                for (var i = start; i < start + length && acc.Offer(As<TRow>(rows[i].Row), rows[i].Weight); i++)
+                {
+                }
+            }
+
+            EmitDiff(builder, ReadOnlySpan<Entry>.Empty, CollectionsMarshal.AsSpan(_newWindow));
+        }
+
+        Phase[8] += keys.Count;
+        Mark(4, ref bytes, ref ticks);
+        _store!.AppendNew(rows, keys);
+        Mark(2, ref bytes, ref ticks);
     }
 
     // A partition's window from the store: its rows in order, cut by the rank function.

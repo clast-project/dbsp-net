@@ -39,6 +39,12 @@ if (args.Length > 0 && args[0] == "globalrank")
     return DbspNet.Benchmarks.GlobalRankStandIn.Run(args);
 }
 
+// §5.52: bulk-load TOP-K stand-in: `dotnet run -c Release -- topkbulk [rows] [runs] [workers] [arms]`
+if (args.Length > 0 && args[0] == "topkbulk")
+{
+    return DbspNet.Benchmarks.TopKBulkStandIn.Run(args);
+}
+
 // §5.48 stage 1: star join stand-in: `dotnet run -c Release -- starjoin [factRows] [runs] [arms]`
 if (args.Length > 0 && args[0] == "starjoin")
 {

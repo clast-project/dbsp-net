@@ -400,6 +400,11 @@ internal sealed class OrderedPartitionStore
         {
             var visitor = new Collect(raw, this);
             _cold!.Probe(key, ref visitor);
+            ColdProbes++;
+            if (raw.Count == 0)
+            {
+                ColdProbesEmpty++;
+            }
         }
 
         if (_pending.TryGetValue(key, out var queued))
@@ -454,8 +459,98 @@ internal sealed class OrderedPartitionStore
         }
 
         Release(_pending);
+        Flushes++;
+        FlushedEntries += entries.Count;
         _cold!.IntegrateEntries(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
     }
+
+    /// <summary>
+    /// The bulk-load fast path (docs/design-bounded-memory.md §5.52): which partitions this store held
+    /// nothing for when a step began, decided before the step changes anything. Null without a cold
+    /// record (the managed map is the record, and nothing is probed).
+    /// </summary>
+    internal NewPartitions? BeginStep()
+    {
+        if (_cold is null)
+        {
+            return null;
+        }
+
+        var empty = _cold.IsEmpty && _pending.Count == 0 && _small.Count == 0 && _large.Count == 0 && _unloaded.Count == 0;
+        return new NewPartitions(this, empty ? null : _keys.Snapshot());
+    }
+
+    /// <summary>A step's newness test (§5.52.2): N1 when the store was empty, else N2 against the key
+    /// filter as it was when the step began. Never says new for a partition the store held.</summary>
+    internal sealed class NewPartitions
+    {
+        private readonly OrderedPartitionStore _store;
+        private readonly KeyFilter? _keysAtStart;
+
+        internal NewPartitions(OrderedPartitionStore store, KeyFilter? keysAtStart)
+        {
+            _store = store;
+            _keysAtStart = keysAtStart;
+        }
+
+        /// <summary>Whether the store held nothing at all (N1).</summary>
+        public bool AllNew => _keysAtStart is null;
+
+        public bool IsNew(StructuralRow key)
+        {
+            if (_keysAtStart is null)
+            {
+                return true;
+            }
+
+            var s = _store;
+            return !_keysAtStart.MayContain(key) && !s._small.ContainsKey(key) && !s._pending.ContainsKey(key)
+                && !s._large.ContainsKey(key) && (s._unloaded.Count == 0 || !s._unloaded.ContainsKey((uint)key.GetHashCode()));
+        }
+    }
+
+    /// <summary>
+    /// The bulk-load fast path's write (§5.52.2): new partitions' rows, (partition key, row, weight)
+    /// with weights as they are, into the record as one run, and their keys into the key filter. Every
+    /// key must be one <see cref="NewPartitions.IsNew"/> said was new this step, and each partition's
+    /// rows must all be here: nothing is cached or queued.
+    /// </summary>
+    internal void AppendNew(List<(StructuralRow Key, StructuralRow Row, long Weight)> entries, List<StructuralRow> keys)
+    {
+        if (entries.Count == 0)
+        {
+            return;
+        }
+
+        _cold!.IntegrateEntries(entries.Count, i => entries[i].Key, i => entries[i].Row, i => entries[i].Weight);
+        foreach (var key in keys)
+        {
+            _keys.Add(key);
+        }
+
+        BulkPartitions += keys.Count;
+        BulkEntries += entries.Count;
+    }
+
+    /// <summary>Partitions and entries the fast path wrote (diagnostics, tests). Per store, never reset.</summary>
+    internal long BulkPartitions;
+
+    /// <inheritdoc cref="BulkPartitions"/>
+    internal long BulkEntries;
+
+    /// <summary>Diagnostics (TOPKPHASE): probes of the cold record for a partition's rows, those that
+    /// found none (key-filter false positives, or a partition emptied since), write-back flushes and
+    /// the entries they wrote. Per store, never reset.</summary>
+    internal long ColdProbes;
+
+    /// <inheritdoc cref="ColdProbes"/>
+    internal long ColdProbesEmpty;
+
+    /// <inheritdoc cref="ColdProbes"/>
+    internal long Flushes;
+
+    /// <inheritdoc cref="ColdProbes"/>
+    internal long FlushedEntries;
 
     private void ApplySmall(StructuralRow key, List<(StructuralRow Row, long Weight, long Value)> change)
     {
@@ -1190,7 +1285,7 @@ internal sealed class OrderedPartitionStore
 
     // A scalable Bloom filter over partition-key hashes: reference-free bit arrays, a new one twice
     // as large once the newest is full; a key is absent only if every filter says so.
-    private sealed class KeyFilter
+    internal sealed class KeyFilter
     {
         private const int BitsPerKey = 10;
         private const int Probes = 4;
@@ -1217,6 +1312,23 @@ internal sealed class OrderedPartitionStore
             }
 
             _inNewest++;
+        }
+
+        /// <summary>This filter as it is now (§5.52.2): older stages are shared (only the newest
+        /// changes), the newest copied.</summary>
+        public KeyFilter Snapshot()
+        {
+            var f = new KeyFilter();
+            f._filters.Clear();
+            for (var i = 0; i < _filters.Count - 1; i++)
+            {
+                f._filters.Add(_filters[i]);
+            }
+
+            var (bits, capacity) = _filters[^1];
+            f._filters.Add(((ulong[])bits.Clone(), capacity));
+            f._inNewest = _inNewest;
+            return f;
         }
 
         public bool MayContain(StructuralRow key)

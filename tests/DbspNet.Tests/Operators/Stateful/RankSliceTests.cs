@@ -26,11 +26,19 @@ public class RankSliceTests
 
     private static readonly HashSet<string> Views = new(["rn", "rk", "dr"], StringComparer.Ordinal);
 
-    private static CompiledProgram Compile(long budget)
+    private static CompiledProgram Compile(long budget, bool bulk = true)
     {
-        using var blocks = TraceBlocksMode.Use(join: true, freezeEntries: 16, blockEntries: 4, window: true);
-        using var writeBack = SpillSettings.UseWindowWriteBack(budget);
-        return SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
+        PartitionedBulkMode.Enabled = bulk;
+        try
+        {
+            using var blocks = TraceBlocksMode.Use(join: true, freezeEntries: 16, blockEntries: 4, window: true);
+            using var writeBack = SpillSettings.UseWindowWriteBack(budget);
+            return SqlProgram.Compile(Sql, Views, ArrowSqlSnapshotCodecs.Instance);
+        }
+        finally
+        {
+            PartitionedBulkMode.Reset();
+        }
     }
 
     private static List<OrderedPartitionStore> Stores(CompiledProgram p) =>
@@ -162,16 +170,19 @@ public class RankSliceTests
     public void A_huge_step_holds_only_a_slices_partitions()
     {
         // Budget 0: a store drops its cache whenever a slice (or step) ends. Unsliced, the one step
-        // caches every partition at once; sliced, at most about a slice's.
+        // caches every partition at once; sliced, at most about a slice's. That is the cache path: the
+        // first load's partitions are all new, which the bulk-load fast path (§5.52) writes to the record
+        // without caching any, so it is off here, and on in a third program that must cache nothing.
         const int Partitions = 20_000;
-        var plain = Compile(0);
-        CompiledProgram sliced;
+        var plain = Compile(0, bulk: false);
+        CompiledProgram sliced, fast;
         using (SpillSettings.UseStepSpill(1000))
         {
-            sliced = Compile(0);
+            sliced = Compile(0, bulk: false);
+            fast = Compile(0, bulk: true);
         }
 
-        foreach (var (p, rows) in new[] { (plain, (long?)null), (sliced, 1000L) })
+        foreach (var (p, rows) in new[] { (plain, (long?)null), (sliced, 1000L), (fast, 1000L) })
         {
             using var _ = SpillSettings.UseStepSpill(rows);
             var t = p.Table("t");
@@ -191,5 +202,9 @@ public class RankSliceTests
         Assert.All(Stores(sliced).Where(s => s.PeakCachedPartitions > 37), s =>
             Assert.InRange(s.PeakCachedPartitions, 1, 1500));
         Assert.Contains(Stores(sliced), s => s.PeakCachedPartitions > 500);
+
+        Assert.Equal(Digest(plain), Digest(fast));
+        Assert.All(Stores(fast), s => Assert.Equal(0, s.PeakCachedPartitions));
+        Assert.Contains(Stores(fast), s => s.BulkPartitions > 0);
     }
 }

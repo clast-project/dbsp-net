@@ -4546,3 +4546,249 @@ integrating them row by row. That applies to rank and TOP-K alike. It is the sam
 fast path" in the batch-1 plan. Not started.
 
 Since b587769 (xt25fts2): batch 2,552 → 2,058 s (−19.4%), tick 18 1,457 → 978 s (−33%).
+
+### 5.52 A bulk-load fast path for partitioned TOP-K and rank (2026-11-12, design)
+
+On xt25ranktopk9's tick 18 the two largest single operators are `PartitionedTopKCompactOp`s whose
+partitions are all new that tick: op 1266 (`fact_engagement_status_monthly_snapshot`, 551K worker-ms,
+385 GiB) and op 171 (`int_engagement_assessment_key_latest`, 286K ms, 141 GiB). Three more TOP-Ks
+(1390, 181, 1466) add 157K ms. Together that is about 994K worker-ms and 597 GiB. No blocked
+`PartitionedRankOp` costs anything on tick 18 any more: §5.50 made the global ranks `RangeRankOp`s, and
+those hold managed state. So rank is covered below for generality, not for this tick.
+
+#### 5.52.1 Where a bulk tick's TOP-K goes
+
+**Counters.** `PartitionedTopKCompactOp.Phase` (20 longs) is the TOP-K's `RANKPHASE`. For each phase
+(0 slicing passes, 1 old windows, 2 integrate, 3 new windows, 4 emit, 5 end tick) it counts allocated
+bytes and stopwatch ticks. It also counts delta rows, slices, touched partitions, rows read, and the
+store's cold-record probes, the probes that found nothing, write-back flushes and flushed entries. The
+xt harness prints it as `TOPKPHASE` (any op past 1 GiB on a tick). It covers blocked state only.
+
+**Stand-in, not a restore.** Every checkpoint since §5.51 has a stale plan shape, so a restore would need a
+new save run first. The stand-in `topkbulk [rows] [runs] [workers]` (Benchmarks) compiles op 1266's own SQL
+(`ROW_NUMBER() OVER (PARTITION BY engagement_path, dim_date_key ORDER BY event_time DESC)`, `rn = 1`) at W
+and feeds it rows of the view's 13 columns. They have tick 18's density, 36.09M rows over 32.22M partitions
+(1.12 rows per partition). The rank's tick-18 `RANKPHASE` gave those counts. W = 4 with 12M rows gives one
+worker prod's share: 3M rows in 12 slices of the 262,144-row step chunk. Ticks: 1 the bulk load; 2 about
+2,000 retractions of partitions' first rows, 2,000 inserts into existing partitions and 2,000 new
+partitions; 3 a second bulk of 3M rows into new partitions, onto the now non-empty store.
+
+The xt spill env (`DBSPNET_SPILL=on`, step spill 262,144, 48 GiB cap, server GC) is used, with the
+write-back budget scaled to 4 of 12 workers (341 MiB). The block cache has to be scaled too. With xt's
+1 GiB the stand-in costs a third of prod per row. At 128 MiB it matches prod, because in prod the cache
+is shared by every operator and the record's blocks are evicted:
+
+| | prod op 1266 (12 workers) | stand-in, 1 GiB cache | stand-in, 128 MiB cache |
+|---|---|---|---|
+| rows | 36.09M | 12M | 12M |
+| per worker | 43–49 s | 18.5 s | 40.0 s |
+| per row | 11.2 KB, 15.3 µs | 3.9 KB, 6.1 µs | 13.0 KB, 13.1 µs |
+
+**The split** (stand-in, 128 MiB cache, tick 1, summed over 4 workers):
+
+| phase | MiB | worker-ms |
+|---|---|---|
+| slicing (split the delta, decode each slice) | 17,403 | 12,646 |
+| old windows | **55,856** | **49,969** |
+| integrate | **62,924** | **67,366** |
+| new windows | 1,828 | 2,258 |
+| emit | 1,743 | 8,499 |
+| end tick (write-back flush, record merges) | 11,977 | 15,288 |
+| total | 151,731 | 156,026 |
+
+Old windows and integrate are 78% of the bytes and 75% of the time, and almost all of it is one thing:
+**2,227,500 probes of the cold record, all of which find nothing.** Every partition is new, so there is
+nothing to find. The probes come from the record's key filter (`OrderedPartitionStore.KeyFilter`, a
+scalable Bloom filter) and are false positives against the keys that *earlier slices of the same tick*
+added. The filter has about 12 stages at about 1.2% each, which measures as 10.4% per probe. A new
+partition is probed twice: once when its old window is read (`Read` → `RecordOf`), and again in
+`Integrate` (`Load` → `RecordOf`). A probe is expensive because `Run.Find` routes by each block's
+first and last hash only. With random keys every run covers every hash, so a probe loads one block body per
+run to look at its `Hashes`. With the blocks evicted that is a read and a decode, about 49 KB per probe.
+The 1 GiB-cache arm makes the same 2.2M probes, but against resident blocks, and its old+integrate is
+15.8 GiB.
+
+The rest of the cost is the cache path itself. Each new partition gets a `SortedDictionary` in the cache
+and a queued list in `_pending`, then is flushed into the record. The record has a new run per slice
+and merges them, factor-4 geometric (`Compact`). That is the end-tick phase.
+
+The rank op that op 1266 replaced had the same shape: old 128 GiB, integrate 138 GiB out of 409, with
+touched = 32.2M and rows read = delta rows. Its "old" was this same probe path.
+
+#### 5.52.2 The fast path
+
+**A partition is *new* if the store held nothing for it when the step began.** The operator decides this
+once per step, before any slice is integrated, from one of:
+
+- **N1, an empty store.** The store holds no row at all: no record entries, no queued changes, no cache,
+  no large or unloaded partition. Then every partition of the delta is new. That is tick 18 for all five
+  TOP-Ks, and any first load.
+- **N2, a definite miss.** Otherwise a key is new when the key filter, as it was at the step's start,
+  says no, and the key is not in the cache, the queue, the large partitions or the unloaded hashes. A Bloom
+  filter has no false negatives. Its false positives (about 10%) take today's path, which is correct, only
+  slower. "As it was at the step's start" is a snapshot: the stage count and a copy of the newest stage's
+  bits (older stages no longer change). Without it, the keys earlier slices add would make the misses
+  false positives again.
+
+**A slice's new partitions are sorted once.** Within each slice, or the whole delta when it is not sliced,
+the rows of new partitions are separated out. Today's path takes the others. The new partitions' rows
+are put in one array, sorted by (partition-key hash, partition key, row order). Each partition is then a
+contiguous run, already in the order its window is cut in. For each run:
+
+- **TOP-K:** `WindowCut` over the run gives the new window. The old window is empty, so the run's whole
+  window is emitted with + weights (`EmitDiff(∅, window)`).
+- **Rank:** the run is the partition's new ranking, and `EmitDiff(∅, after)` gives the widened rows. The
+  emit code is the existing code in both operators, so output is identical by construction.
+
+**They go to the record directly, as one run.** The slice's new-partition entries become one run of the
+record (`BlockedIndexedTrace.IntegrateEntries`, which sorts by hash and encodes once), and their keys
+go into the key filter. They skip the cache and the queue, so they cost the write-back budget nothing, and
+`EndTick` has nothing of theirs to flush.
+
+**Not in this stage: one run per step.** Slices are cut by a mixed hash (`PartitionSlicing.Of`), so each
+slice's run covers the whole hash range, and the record merges them as it does today. If slices were
+contiguous ranges of the record's own key hash, the step's bulk runs could be concatenated into one run
+with no merge, as `IntegrateEntries` already does with its parallel hash buckets. That needs the slice
+boundaries and the record's hash to agree, and the run held unpublished until the step ends. Whether
+that is worth doing depends on what end tick costs once the probes are gone, so it is measured first
+(§5.52.4).
+
+#### 5.52.3 What must hold
+
+The fast path changes how rows get into the store, not what the store holds. After a bulk step the record
+must hold exactly what today's path would leave once its cache is flushed. Five things follow from that:
+
+1. **Newness is exact in one direction.** A partition classified new has no entry in the record, the
+   queue, the cache or the large/unloaded sets. N1 checks all of them. N2 relies on the filter having
+   no false negatives, which holds only if every key that ever reached the record went into the filter.
+   Today that is `Integrate` (cache path), `PromoteWith` and restore (`KeyFilter.Read`). The fast path
+   adds its keys too (point 3). A wrong "new" would drop the partition's old window from the diff, and
+   leave the record with two unmerged halves that a later read still sums correctly. So the output would be
+   wrong while the state stayed right. The tests must catch it on output.
+2. **The entries are the delta's rows, weights unchanged.** A delta is consolidated, so a partition's rows
+   are distinct, but weights can be negative. A partition whose first rows retract (an upstream that
+   briefly overshoots) stores −1. Today's cache path stores it the same way. `WindowCut` skips weight ≤ 0,
+   so the window is the same, and a later +1 cancels it in the record merge (weights summed, zeros
+   dropped). The fast path writes negative entries as they are, and does not filter them.
+3. **The keys are in the filter before the step ends.** A later tick's retraction of a bulk-loaded row
+   reaches the partition only through `RecordOf`, which probes only when `MayContain` says yes. The keys
+   are added when the slice's run is written. The step-start snapshot keeps them from turning this
+   step's later misses into false positives.
+4. **Nothing of a new partition is in the cache.** A later read of the partition must go to the record,
+   which `Read` does when the key is not cached. The fast path never caches, so this holds. If the
+   partition is touched again in the same step, the cache path would load it from the record. That cannot
+   happen, because a delta touches a key once and the slices are disjoint by key hash.
+5. **Checkpoints see the record.** `SaveAsync` drops the cache and writes the record's runs and the
+   key filter. The bulk runs are ordinary runs and their keys are in the filter, so a checkpoint taken
+   right after a bulk tick restores them, and its filter routes later probes to them. The whole-row write
+   (`CanSave` false) reads `All()`, which includes them. Restore by rows goes through `Integrate` into an
+   empty store. That is N1, so the fast path can serve restore too. That is optional, and the tests
+   cover it either way. The rank's incremental-checkpoint tracker (`_changes`) records the delta before
+   either path runs, so it is unaffected.
+
+Managed (non-blocked) state is out of scope. The fast path needs the record, and managed ranks have
+neither the probe nor the flush.
+
+#### 5.52.4 Plan and estimate
+
+**Stage 1 (stand-in, before tests).** Build the fast path in both operators behind `TopKBulkMode`
+(`DBSPNET_TOPK_BULK=off`, read when the operator is built so arms can switch it). Then A/B on `topkbulk`
+at 128 MiB and 1 GiB caches, with tick-for-tick checksums equal across arms. Expected on tick 1: old windows
+and the probes go to ~0, and integrate becomes a sort and a run write, so roughly 150 → 35 GiB and 156 →
+40 s of worker time. Slicing (17 GiB) and the record merges are left. Tick 3 (bulk onto a non-empty store)
+shows what N2 keeps. If end tick is then the largest phase, one-run-per-step comes next.
+
+**Stage 2 (tests).** `TopKBulkTests`, at W = 1 and W = 4, with the fast path on and off:
+
+- **≡ serial:** parallel equals serial on every tick, and fast path on equals fast path off.
+- **A recompute:** a batch recompute of each view over the integrated inputs equals the integrated output.
+- **A checkpoint after a bulk tick:** save after tick 1 (store's own files, and the rows write), restore
+  into a fresh program, then run retractions of partitions' first rows, inserts into bulk-loaded
+  partitions and a second bulk tick. It must equal the un-restored run.
+- **Data:** forced slicing (the forced suite env), a bulk tick into an empty store (N1), a bulk tick into a
+  non-empty store with a mix of new and existing partitions (N2), negative weights in new partitions,
+  weight-2 rows, NULL partition keys, ties under RANK / DENSE_RANK, k = 1 and k > 1, ROW_NUMBER / RANK /
+  DENSE_RANK ranks.
+- **Mutants:** (a) N2 against the live filter instead of the snapshot; (b) N2 ignoring the filter (every
+  key new when the store is non-empty); (c) keys not added to the filter; (d) negative entries dropped.
+  (b) and (c) must fail on output. (a) only costs speed. That is its point: the snapshot is a speed
+  requirement, not a correctness one.
+
+**Stage 3 (from scratch).** xt25ranktopk9's setup on the new build, compared tick for tick: tick 18 step,
+the five TOP-Ks' `OPPROF` and `TOPKPHASE`, and the 96 views' row counts.
+
+#### 5.52.5 Stage 1: measured in the stand-in
+
+Built as designed (`PartitionedBulkMode`, `OrderedPartitionStore.BeginStep` / `NewPartitions` /
+`AppendNew`, `Blocks.PartitionRuns.Sort`). Two additions came out of the code:
+
+- The newness snapshot is `KeyFilter.Snapshot()`: the older stages shared, the newest copied.
+- A rank skips the fast path while partitions are still lazily restored (`_lazy`). Those partitions are
+  not in the store yet, so N1/N2 cannot see them.
+
+The sort orders by key hash with one primitive sort, then by key equality and row order within a stretch
+of equal hashes, so two colliding keys stay apart.
+
+`topkbulk 12000000 1 4 base,bulk` uses the xt env, write-back 341 MiB, server GC. Summed over the 4 workers.
+The checksums are equal on every tick in both runs:
+
+| | 128 MiB cache, base | 128 MiB, **bulk** | 1 GiB cache, base | 1 GiB, **bulk** |
+|---|---|---|---|---|
+| tick 1 TOP-K worker-ms | 162,096 | **38,115 (−76%)** | 74,422 | **42,816 (−42%)** |
+| tick 1 TOP-K MiB | 158,259 | **34,225 (−78%)** | 46,023 | **34,114 (−26%)** |
+| tick 1 per worker | 41.9 s | 9.9 s | 18.9 s | 12.4 s |
+| tick 3 TOP-K worker-ms | 50,858 | 48,447 (−5%) | 18,258 | 13,986 (−23%) |
+
+Tick 1 with the fast path (128 MiB): slicing 17,403 MiB / 12,354 ms, classification 1,098 / 344, the sort
+and the record writes 13,651 / 19,909, emit 1,743 / 4,937. There are no probes, no cache and no flush.
+Slicing is now half the bytes, and the record writes, with their merges, are half the time. The 1 GiB
+arm's "base" had cheap probes to begin with, so it gains less. Prod behaves like the 128 MiB arm.
+
+**Tick 3 (N2) keeps most of its cost.** 2,349,341 of the 2,678,375 touched partitions take the fast path.
+The other 12.3% are key-filter false positives and take today's path: 658,068 probes, two per partition,
+all empty. Each probe now crosses the bulk tick's runs, so those 12% still cost almost what all of tick 1
+did. Prod's bulk ticks are N1, so this does not matter for xt. Two follow-ups would fix it, both outside this
+stage:
+
+- A tighter filter: more bits per key in later stages. That costs about 3% instead of about 12%,
+  and the checkpoint format is unchanged, since each stage stores its own size.
+- One probe per false positive instead of two, by remembering a miss between `Read` and `Load`.
+
+The general fix is a probe that can rule a block out without loading its body. That is a change to the
+trace, not to the store.
+
+**Expected on SF25 tick 18.** Op 1266 is 551K worker-ms. At the stand-in's 128 MiB ratio that becomes about
+130K (−420K). Op 171 becomes about 67K (−220K). Ops 1390 and 181 are not attributed yet. So roughly 0.6M
+of tick 18's 11.71M worker-ms and about 450 GiB of its 5,389 GiB, and about 18 s of the two operators'
+wall spans (49 s and 24 s).
+
+#### 5.52.6 Stage 2: tests
+
+`PartitionedBulkTests` covers 4 TOP-K views (ROW_NUMBER k = 1 and 2, RANK, DENSE_RANK over a nullable
+VARCHAR key) and 3 rank views (ROW_NUMBER, RANK, DENSE_RANK), over 10 ticks. Tick 0 is N1, tick 2 is N2.
+Both carry negative weights in new partitions, weight-2 rows, a NULL partition, and ties. Ticks 1 and 3
+retract the bulk ticks' first rows and cancel the negative rows. Ticks 4–9 are churn. Every view is
+non-empty on some tick.
+
+- **Fast path ≡ off ≡ unsliced ≡ managed ≡ a batch recompute** on every tick, forced (7-row chunks) and
+  sliced past 64 rows. The recompute is `BatchPlanEvaluator` over the live inputs, unoptimized. A TOP-K
+  view is read there as the same query in a CTE, because the resolver lowers the derived-table spelling
+  straight to a TOP-K plan, which the evaluator has no case for. Both bulk ticks must take the fast path.
+- **Parallel (W = 4, fast path on) ≡ serial (off)** on every tick.
+- **A checkpoint right after each bulk tick**, in both state layouts. The restored program then retracts
+  bulk-loaded rows and matches an uninterrupted twin on every tick, and a recompute at the end.
+- `RankSliceTests.A_huge_step_holds_only_a_slices_partitions` measures the cache path on a first load,
+  which the fast path no longer caches. It now pins the fast path off, and adds a third program with the
+  fast path on that must cache nothing (peak 0) and must write bulk partitions.
+
+Mutants (the four test classes `PartitionedBulkTests`, `TopKSliceTests`, `RankSliceTests`,
+`TopKBlockedCheckpointTests`):
+
+| mutant | result |
+|---|---|
+| (a) N2 against the live filter, not the snapshot | passes, as designed: speed only |
+| (b) N2 ignores the filter (every key new) | 5 of 5 bulk tests fail |
+| (c) bulk keys not added to the filter | 5 of 5 fail, plus `TopKBlockedCheckpointTests` (rows layout) |
+| (d) negative entries dropped from the run | 5 of 5 fail |
+
+Suites: default, forced and forced+critical each pass 3,727 of 3,728, with 1 skipped.

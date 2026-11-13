@@ -208,6 +208,16 @@ public class XtServerCensus
                         $"RANKPHASE tick={t} op={k} slicing_mib={ph[0] >> 20} old_mib={ph[1] >> 20} integrate_mib={ph[2] >> 20} new_mib={ph[3] >> 20} emit_mib={ph[4] >> 20} endtick_mib={ph[5] >> 20} delta_rows={ph[6]} slices={ph[7]} touched={ph[8]} rows_read={ph[9]}"));
                 }
 
+                // TOP-Ks by phase (PartitionedTopKCompactOp.Phase, 22 counters): bytes then ms per phase.
+                foreach (var (k, ph) in phases.Where(kv => kv.Value.Length == 22 && kv.Value.Take(6).Sum() >= (1L << 30)).OrderByDescending(kv => kv.Value.Take(6).Sum()))
+                {
+                    static long Ms(long ticks) => ticks * 1000 / Stopwatch.Frequency;
+                    log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                        $"TOPKPHASE tick={t} op={k} slicing_mib={ph[0] >> 20} old_mib={ph[1] >> 20} integrate_mib={ph[2] >> 20} new_mib={ph[3] >> 20} emit_mib={ph[4] >> 20} endtick_mib={ph[5] >> 20} " +
+                        $"slicing_ms={Ms(ph[10])} old_ms={Ms(ph[11])} integrate_ms={Ms(ph[12])} new_ms={Ms(ph[13])} emit_ms={Ms(ph[14])} endtick_ms={Ms(ph[15])} " +
+                        $"delta_rows={ph[6]} slices={ph[7]} touched={ph[8]} rows_read={ph[9]} probes={ph[16]} probes_empty={ph[17]} flushes={ph[18]} flushed={ph[19]} bulk_parts={ph[20]} bulk_rows={ph[21]}"));
+                }
+
                 log.Flush();
             }
 

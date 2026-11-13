@@ -160,7 +160,14 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         }
 
         _storedOutputRows = _store is null ? Blocks.TraceBlocksMode.PromoteRows : int.MaxValue;
+        _bulk = PartitionedBulkMode.Enabled;
     }
+
+    // The bulk-load fast path (docs/design-bounded-memory.md §5.52), blocked state only: this step's
+    // newness test, taken before the step changes the store; null when off, while partitions are still
+    // lazily restored (they are not in the store yet), or between steps.
+    private readonly bool _bulk;
+    private Blocks.OrderedPartitionStore.NewPartitions? _fresh;
 
     private static StructuralRow S<T>(T value) => (StructuralRow)(object)value!;
 
@@ -168,6 +175,12 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
 
     /// <summary>Whether the partitions are held as blocks (tests).</summary>
     internal bool IsBlocked => _store is not null;
+
+    /// <summary>Whether the bulk-load fast path is on for this operator (§5.52; tests).</summary>
+    internal bool BulkEnabled => _bulk && _store is not null;
+
+    /// <summary>Partitions the fast path has written since the operator was built (tests).</summary>
+    internal long BulkPartitions => _store?.BulkPartitions ?? 0;
 
     public string MetricName => "PartitionedRank";
 
@@ -216,13 +229,21 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         var slices = SliceCount(delta.Count);
         Phase[6] += delta.Count;
         Phase[7] += slices;
-        if (slices <= 1)
+        _fresh = _bulk && _store is not null && _lazy is null && _offsetOld == _offsetNew ? _store.BeginStep() : null;
+        try
         {
-            StepPartitions(delta, builder);
+            if (slices <= 1)
+            {
+                StepPartitions(delta, builder);
+            }
+            else
+            {
+                StepSliced(delta, builder, slices);
+            }
         }
-        else
+        finally
         {
-            StepSliced(delta, builder, slices);
+            _fresh = null;
         }
 
         var result = builder.Build();
@@ -301,6 +322,37 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
     // change in their rankings.
     private void StepPartitions(IEnumerable<KeyValuePair<TInRow, Z64>> delta, ZSetBuilder<TOutRow, Z64> builder)
     {
+        if (_fresh is not null)
+        {
+            // New partitions this step (§5.52) take the fast path; the rest, if any, today's.
+            List<(StructuralRow Key, StructuralRow Row, long Weight)>? fresh = null;
+            List<KeyValuePair<TInRow, Z64>>? rest = null;
+            foreach (var kv in delta)
+            {
+                var key = S(_partitionOf(kv.Key));
+                if (_fresh.IsNew(key))
+                {
+                    (fresh ??= []).Add((key, S(kv.Key), kv.Value.Value));
+                }
+                else
+                {
+                    (rest ??= []).Add(kv);
+                }
+            }
+
+            if (fresh is not null)
+            {
+                StepNew(fresh, builder);
+            }
+
+            if (rest is null)
+            {
+                return;
+            }
+
+            delta = rest;
+        }
+
         // Only the partitions a tick touches can change their ranking: each one's rows before the
         // delta, read now (in order, as the next read after the delta will be).
         var since = GC.GetAllocatedBytesForCurrentThread();
@@ -414,6 +466,33 @@ internal sealed class PartitionedRankOp<TInRow, TOutRow, TKey> : IOperator, ISna
         Mark(ref since);
         _store?.EndTick();
         Phase[5] += Mark(ref since);
+    }
+
+    // The fast path's partitions (§5.52.2), all new this step: sorted once by (key hash, row order), each
+    // partition's ranking emitted whole against an empty old one, and the rows written to the record as
+    // one run.
+    private void StepNew(List<(StructuralRow Key, StructuralRow Row, long Weight)> rows, ZSetBuilder<TOutRow, Z64> builder)
+    {
+        var since = GC.GetAllocatedBytesForCurrentThread();
+        var keys = Blocks.PartitionRuns.Sort(rows, (IComparer<StructuralRow>)(object)_order, out var runs);
+        Phase[2] += Mark(ref since);
+        var none = new List<(TInRow Row, long Weight)>();
+        var after = new List<(TInRow Row, long Weight)>();
+        foreach (var (start, length) in runs)
+        {
+            after.Clear();
+            for (var i = start; i < start + length; i++)
+            {
+                after.Add((As<TInRow>(rows[i].Row), rows[i].Weight));
+            }
+
+            EmitDiff(builder, none, after);
+        }
+
+        Phase[4] += Mark(ref since);
+        Phase[8] += keys.Count;
+        _store!.AppendNew(rows, keys);
+        Phase[2] += Mark(ref since);
     }
 
     // A partition's rows after this tick, in order, consolidated.
