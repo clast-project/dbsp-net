@@ -127,6 +127,62 @@ internal static class ExchangeBuckets
         return rows;
     }
 
+    /// <summary>
+    /// <see cref="SplitGrouping{TKey,TRow,TWeight}"/> with a fused pointwise pre-step (docs/design-bounded-memory.md
+    /// §5.55): each decoded row is first rewritten or dropped by <paramref name="step"/>, then partitioned, keyed and
+    /// grouped by its rewritten form, so the upstream map/filter never builds a delta of its own. Two input rows the
+    /// step maps to one row land in the same builder (they partition alike) and merge there, or in the gather's union.
+    /// Null, and nothing published, under the same conditions.
+    /// </summary>
+    public static long? SplitGrouping<TKey, TIn, TRow, TWeight>(
+        ZSet<TIn, TWeight> input,
+        IReadOnlyList<KeyValuePair<TRow, TWeight>>?[] buckets,
+        Func<TIn, (bool Keep, TRow Row)> step,
+        Func<TRow, int> partition,
+        Func<TRow, TKey> keyOf,
+        object? format)
+        where TKey : notnull
+        where TIn : notnull
+        where TRow : notnull
+        where TWeight : struct, DbspNet.Core.Algebra.IZRing<TWeight>
+    {
+        if (!GroupedSplits || typeof(TKey) != typeof(StructuralRow) || typeof(TRow) != typeof(StructuralRow) || typeof(TWeight) != typeof(Z64)
+            || format is not DbspNet.Core.Operators.Stateful.Blocks.ITraceBlockFormat
+            || DbspNet.Core.Operators.Stateful.Blocks.SpillSettings.StepSpillRows is null)
+        {
+            return null;
+        }
+
+        var workers = buckets.Length;
+        var builders = new IndexedZSetBuilder<TKey, TRow, TWeight>?[workers];
+        var counts = new int[workers];
+        long rows = 0;
+        foreach (var kv in input)
+        {
+            var (keep, row) = step(kv.Key);
+            if (!keep)
+            {
+                continue;
+            }
+
+            var j = ((partition(row) % workers) + workers) % workers;
+            (builders[j] ??= DbspNet.Core.Operators.Stateful.Blocks.DeltaSpillGroups.For<TKey, TRow, TWeight>(format, workers))
+                .Add(keyOf(row), row, kv.Value);
+            counts[j]++;
+            rows++;
+        }
+
+        for (var j = 0; j < workers; j++)
+        {
+            if (builders[j] is { } b && b.Build() is { IsEmpty: false } set)
+            {
+                buckets[j] = new GroupedBucket<TKey, TRow, TWeight>(set, counts[j]);
+            }
+        }
+
+        return rows;
+    }
+
     /// <summary>Whether an exchange-index split keys and groups a block-backed delta's rows (§5.41). Off
     /// for A/B (<c>DBSPNET_GROUPED_SPLITS=off</c>).</summary>
     internal static bool GroupedSplits { get; set; } =

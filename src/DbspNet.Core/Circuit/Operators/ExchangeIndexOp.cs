@@ -142,7 +142,20 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         {
             var bucket = column[src];
             column[src] = null; // released once read, as before
-            if (bucket is ExchangeBuckets.SetBucket<TRow, TWeight> set)
+            if (bucket is GroupedBucket<TKey, TRow, TWeight> managed)
+            {
+                // A grouped split's bucket kept managed: every bucket of this column was small, so
+                // GatherGrouped had nothing block backed to union (it is not a list for Items).
+                foreach (var (key, group) in managed.Set)
+                {
+                    foreach (var (row, weight) in group)
+                    {
+                        indexed.Add(key, row, weight);
+                        gatherRows++;
+                    }
+                }
+            }
+            else if (bucket is ExchangeBuckets.SetBucket<TRow, TWeight> set)
             {
                 foreach (var (row, weight) in set.Set)
                 {

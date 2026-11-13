@@ -3421,6 +3421,28 @@ public static partial class PlanToCircuit
         return (StructuralRow)current;
     }
 
+    /// <summary>Whether an input exchanged and indexed at W&gt;1 runs its own Filter/Project chain (and
+    /// NULL-key check) inside the exchange's sender pass (docs/design-bounded-memory.md §5.55).</summary>
+    private static bool FusesExchange(CompileContext ctx) =>
+        ctx.Workers > 1 && ExchangeFusionMode.Enabled && IndexFusionMode.Enabled;
+
+    /// <summary>
+    /// Exchange and index <paramref name="input"/>; with a fused <paramref name="pre"/> (§5.55) the sender
+    /// maps or drops each row before partitioning and keying it, so the chain never builds a delta of its
+    /// own. Exact for the reason <see cref="CompileIndexInput"/> is: the step is a pure row function, and
+    /// two rows it maps to one land in the same bucket and merge.
+    /// </summary>
+    private static Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> ExchangeIndexFused(
+        CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> input,
+        Func<StructuralRow, StructuralRow?>? pre,
+        Func<StructuralRow, int> partition,
+        Func<StructuralRow, StructuralRow> keyOf) =>
+        pre is null
+            ? builder.ExchangeIndex(input, partition, keyOf)
+            : builder.ExchangeIndexStep<StructuralRow, StructuralRow, StructuralRow, Z64>(
+                input, row => pre(row) is { } mapped ? (true, mapped) : (false, null!), partition, keyOf);
+
     /// <summary>
     /// Compiles a join or aggregate input that is about to be indexed, letting the
     /// indexing pass absorb the input's pointwise work (docs/design-state-representation.md
@@ -3661,12 +3683,21 @@ public static partial class PlanToCircuit
         // At W<=1 each input's pointwise work (its own Filter/Project chain and the
         // NULL-key check) runs inside the indexing pass instead of as separate operators
         // that each build a throwaway Z-set (docs/design-state-representation.md §9.9).
+        // At W>1 the same work runs in each side's exchange sender (§5.55), unless the sides are
+        // indexed in place (a broadcast) or exchanged together (coalesced barriers).
         var fuseIndexing = ctx.Workers <= 1 && IndexFusionMode.Enabled;
+        var fuseExchange = FusesExchange(ctx)
+            && !ctx.Options.CoalesceJoinExchange
+            && !(ShouldBroadcastRight(plan.Right, ctx) || (leftIndices.Length == 0 && IsAtMostOneRow(plan.Right)));
         Stream<ZSet<StructuralRow, Z64>> left;
         Func<StructuralRow, StructuralRow?>? leftPre = null;
         if (fuseIndexing)
         {
             (left, leftPre) = CompileIndexInput(builder, plan.Left, ctx, plan.AllowNullKeys ? null : leftIndices);
+        }
+        else if (fuseExchange)
+        {
+            (left, leftPre, _) = CompileIndexInputCore(builder, plan.Left, ctx, plan.AllowNullKeys ? null : leftIndices);
         }
         else
         {
@@ -3678,7 +3709,7 @@ public static partial class PlanToCircuit
         // joins (INTERSECT/EXCEPT) this is overridden: NULLs are equal to
         // each other for deduplication-style matching. (Fused into the
         // indexing pre-step at W<=1.)
-        var leftFiltered = plan.AllowNullKeys || fuseIndexing
+        var leftFiltered = plan.AllowNullKeys || fuseIndexing || fuseExchange
             ? left
             : builder.Filter(left, row => HasNoNullKey(row, leftIndices));
 
@@ -3697,15 +3728,17 @@ public static partial class PlanToCircuit
         StructuralRow Combine(StructuralRow _, StructuralRow lrow, StructuralRow rrow) =>
             MergeRows(codec, joinedSchema, lrow, rrow, leftCount, rightCount);
 
-        // Exchange-and-index one side; with a fused pre-step (W<=1 only), index straight
-        // from the unmapped input in one pass.
+        // Exchange-and-index one side; with a fused pre-step, index straight from the unmapped
+        // input in one pass (W<=1), or map in the exchange's sender (W>1, §5.55). A local, not
+        // ctx: a closure capturing ctx holds every stream compiled so far (§5.47's landmine).
+        var exchanges = ctx.Workers > 1;
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> IndexSide(
             Stream<ZSet<StructuralRow, Z64>> side,
             Func<StructuralRow, StructuralRow?>? pre,
             Func<StructuralRow, int> part,
             Func<StructuralRow, StructuralRow> keyOf) =>
-            pre is null
-                ? builder.ExchangeIndex(side, part, keyOf)
+            pre is null || exchanges
+                ? ExchangeIndexFused(builder, side, pre, part, keyOf)
                 : builder.MapFilterGroupProject<StructuralRow, StructuralRow, StructuralRow, StructuralRow, Z64>(
                     side, pre, keyOf, static row => row);
 
@@ -3757,12 +3790,16 @@ public static partial class PlanToCircuit
             {
                 (right, rightPre) = CompileIndexInput(builder, plan.Right, ctx, plan.AllowNullKeys ? null : rightIndices);
             }
+            else if (fuseExchange)
+            {
+                (right, rightPre, _) = CompileIndexInputCore(builder, plan.Right, ctx, plan.AllowNullKeys ? null : rightIndices);
+            }
             else
             {
                 right = CompilePlan(builder, plan.Right, ctx);
             }
 
-            var rightFiltered = plan.AllowNullKeys || fuseIndexing
+            var rightFiltered = plan.AllowNullKeys || fuseIndexing || fuseExchange
                 ? right
                 : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
             int RightPart(StructuralRow row) => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema);
@@ -4016,7 +4053,16 @@ public static partial class PlanToCircuit
         // TPC-DS this removes, per join in a 15-join chain over 36M rows, a projection, two
         // filters and a union, each a full decode and re-encode of a spilled delta. Not with
         // join-key GC, whose monotone key need not accept a NULL.
-        var fuseLeft = (ctx.Workers <= 1 || broadcastRight) && IndexFusionMode.Enabled && gcFrontier is null;
+        //
+        // A hashed join (W>1, not broadcast, not hot-split) does the same in its exchanges (§5.55): the
+        // preserved side is exchanged and indexed by one operator whose sender runs the chain, NULL keys
+        // indexed too (a NULL key hashes to its fixed sentinel, as the plain exchange sent it), and the
+        // other side's chain and NULL-key drop run in its exchange's sender.
+        var hot = ctx.Workers > 1 && !broadcastRight && gcFrontier is null && HotKeySplitMode.Enabled
+            ? HotLeftKey(plan, leftIndices, leftKeySchema, ctx)
+            : null;
+        var fuseExchange = FusesExchange(ctx) && !broadcastRight && gcFrontier is null && hot is null;
+        var fuseLeft = ((ctx.Workers <= 1 || broadcastRight) && IndexFusionMode.Enabled && gcFrontier is null) || fuseExchange;
 
         Stream<ZSet<StructuralRow, Z64>> left;
         Func<StructuralRow, StructuralRow?>? leftPre = null;
@@ -4030,12 +4076,20 @@ public static partial class PlanToCircuit
             left = CompilePlan(builder, plan.Left, ctx);
         }
 
-        var right = CompilePlan(builder, plan.Right, ctx);
+        Stream<ZSet<StructuralRow, Z64>> right;
+        Func<StructuralRow, StructuralRow?>? rightPre = null;
+        if (fuseExchange)
+        {
+            (right, rightPre, _) = CompileIndexInputCore(builder, plan.Right, ctx, rightIndices);
+        }
+        else
+        {
+            right = CompilePlan(builder, plan.Right, ctx);
+        }
 
         // A hashed join whose left key has a hot default value splits on it, so the rows sharing it are
         // not all sent to one worker (§5.49).
-        if (ctx.Workers > 1 && !broadcastRight && gcFrontier is null && HotKeySplitMode.Enabled
-            && HotLeftKey(plan, leftIndices, leftKeySchema, ctx) is { } hot)
+        if (hot is not null)
         {
             return CompileHotSplitLeftJoin(builder, ctx, plan, left, right, hot, post, pairResidual);
         }
@@ -4049,7 +4103,7 @@ public static partial class PlanToCircuit
         // `ExchangeIndex` is the GroupProject emitted before, so W=1 is byte-identical.
         // The partition a broadcast output inherits: the preserved side's, after its chain.
         var leftPartition = ctx.Workers > 1 && !leftProjects ? ctx.GetPartition(left) : default;
-        if (!broadcastRight)
+        if (!broadcastRight && !fuseExchange)
         {
             left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
         }
@@ -4059,7 +4113,16 @@ public static partial class PlanToCircuit
         // NULL-padded branch. NULL-keyed right rows are simply dropped.
         Stream<ZSet<StructuralRow, Z64>>? nullKeyLeft = null;
         Stream<IndexedZSet<StructuralRow, StructuralRow, Z64>> leftIndexed;
-        if (fuseLeft)
+        if (fuseExchange)
+        {
+            leftIndexed = ExchangeIndexFused(
+                builder,
+                left,
+                leftPre,
+                row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema),
+                row => ExtractKey(codec, leftKeySchema, row, leftIndices));
+        }
+        else if (fuseLeft)
         {
             StructuralRow LeftKeyOf(StructuralRow row) => ExtractKey(codec, leftKeySchema, row, leftIndices);
             leftIndexed = leftPre is null
@@ -4077,14 +4140,16 @@ public static partial class PlanToCircuit
                 row => row);
         }
 
-        var validKeyRight = builder.Filter(right, row => HasNoNullKey(row, rightIndices));
+        var validKeyRight = fuseExchange ? right : builder.Filter(right, row => HasNoNullKey(row, rightIndices));
         var rightIndexed = broadcastRight
             ? builder.GroupProject(
                 builder.BroadcastExchange(validKeyRight),
                 row => ExtractKey(codec, rightKeySchema, row, rightIndices),
                 static row => row)
-            : builder.ExchangeIndex(
+            : ExchangeIndexFused(
+                builder,
                 validKeyRight,
+                rightPre,
                 row => StablePartitionHash.OfRow(row, rightIndices, rightKeySchema),
                 row => ExtractKey(codec, rightKeySchema, row, rightIndices));
 
@@ -5253,16 +5318,26 @@ public static partial class PlanToCircuit
     {
         // At W<=1 the input's Filter/Project chain runs inside the indexing pass
         // (docs/design-state-representation.md §9.9).
+        // At W>1 it runs in the exchange's sender instead (§5.55), when the aggregate exchanges.
         Stream<ZSet<StructuralRow, Z64>> input;
         Func<StructuralRow, StructuralRow?>? pre = null;
+        var preProjects = false;
         if (ctx.Workers <= 1 && IndexFusionMode.Enabled)
         {
             (input, pre) = CompileIndexInput(builder, plan.Input, ctx, nullKeyIndices: null);
+        }
+        else if (FusesExchange(ctx))
+        {
+            (input, pre, preProjects) = CompileIndexInputCore(builder, plan.Input, ctx, nullKeyIndices: null);
         }
         else
         {
             input = CompilePlan(builder, plan.Input, ctx);
         }
+
+        // The partition the unfused chain's output would carry: its input's through filters only, none
+        // past a projection (as CompileLinearChain records).
+        var inputPartition = ctx.Workers <= 1 || preProjects ? default : ctx.GetPartition(input);
 
         // Group-key extractors. A key is any scalar expression (bare column,
         // CAST(ts AS DATE), a + b, …), compiled once to a delegate run per row —
@@ -5323,12 +5398,14 @@ public static partial class PlanToCircuit
         var bareGroupIndices = BareColumnIndices(plan.GroupKeys);
         var needsExchange = ctx.Workers > 1
             && !(bareGroupIndices is { } gi
-                 && ctx.GetPartition(input).PartitionKey is { } pk
+                 && inputPartition.PartitionKey is { } pk
                  && IsKeySubset(pk, gi));
 
         var indexed = needsExchange
-            ? builder.ExchangeIndex(
+            ? ExchangeIndexFused(
+                builder,
                 input,
+                pre,
                 row => StablePartitionHash.OfWholeRow(KeyRowOf(row), groupKeySchema),
                 KeyRowOf)
             : pre is null
@@ -5348,7 +5425,7 @@ public static partial class PlanToCircuit
         var (gcFrontier, gcMonotoneKey) = ResolveGroupKeyFrontier(plan, ctx);
         var reshard = ctx.Workers <= 1 ? null
             : needsExchange ? ReshardPlacement.WholeRow(groupKeySchema)
-            : ElidedAggregatePlacement(ctx.GetPartition(input), bareGroupIndices!);
+            : ElidedAggregatePlacement(inputPartition, bareGroupIndices!);
 
         var groupCount = plan.GroupKeys.Count;
         var aggCount = plan.Aggregates.Count;
