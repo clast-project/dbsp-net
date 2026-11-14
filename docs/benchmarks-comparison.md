@@ -23,6 +23,73 @@ Stream: 1,000,000 events (20,000 person, 60,000 auction, 920,000 bid). Host: .NE
 >
 > Queries q5 / q7 / q8 (tumbling / sliding event-time windows) are omitted: they require TUMBLE / HOP windowing table functions that DbspNet does not yet expose. q9 uses `ROW_NUMBER() OVER (PARTITION … ORDER …)` which compiles to a partitioned incremental TOP-K.
 
+## Nexmark regression check — M4 Pro, 2026-11-13 (DbspNet only)
+
+DbspNet at `86d0ce1` against the 11-02 run's `43923c0`, 192 commits later (bounded-memory and extended
+TPC-DS work: spilling, exchange fusion, broadcast, star join, range rank, rank→TOP-K, and others).
+Feldera was not re-run. Generator `NEXMARK_GEN=feldera`, `NEXMARK_STRINGS=utf8`. **Verdict: no
+regression.**
+
+**Allocation (`w1profile 1000000 10000 5`, B/ev, W=1).** Identical on all 10 queries. This instrument is
+deterministic and host-independent, so any added per-row work would show up here.
+
+| q0 | q1 | q2 | q22 | q3 | q20 | q4 | q9 | q18 | q19 |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 391 | 507 | 244 | 618 | 38 | 659 | 1269 | 557 | 526 | 553 |
+
+**Throughput, 10M events, W=14.** Two alternating pairs of full runs (base, head, base, head; median of 3
+each). The table gives the mean of each arm's two medians.
+
+| Query | base W=14 | head W=14 | head ÷ base |
+|:--|--:|--:|--:|
+| q0 | 12.50M | 12.50M | 1.00 |
+| q1 | 10.71M | 10.70M | 1.00 |
+| q2 | 11.92M | 11.97M | 1.00 |
+| q3 | 12.45M | 12.28M | 0.99 |
+| q4 | 4.88M | 4.59M | 0.94 (0.99 in a later 3-round re-measure) |
+| q5 | 2.68M | 2.82M | 1.05 |
+| q8 | 9.97M | 9.39M | 0.94 |
+| q9 | 4.18M | 4.54M | 1.09 (one slow base run) |
+| q12 | 9.33M | 9.31M | 1.00 |
+| q15 | 4.89M | 4.96M | 1.01 |
+| q16 | 5.50M | 5.42M | 0.98 |
+| q17 | 8.23M | 8.10M | 0.98 |
+| q18 | 5.21M | 5.78M | 1.11 (one slow base run) |
+| q19 | 5.49M | 5.50M | 1.00 |
+| q20 | 4.37M | 5.06M | 1.16 (one slow base run) |
+| q22 | 9.19M | 9.19M | 1.00 (bimodal in both arms: ≈6.1M or ≈9M per run) |
+
+q7 is single-circuit only: 1.06M vs 1.03M at W=1. All of these are within this box's W=14 noise.
+
+**W=1: the small dips come from tiered PGO, not engine code.** With PGO on, q2 and q22 (run in one
+process, both arms built at the same path, alternated) came out:
+- q2: base 7.35–7.49M, head 7.27–7.45M (about −1.5%).
+- q22: base 2.64–2.73M, head 2.42–2.52M, with one head run at 2.65M (about −7%).
+
+Three bisects each blamed a commit that could not cause it (two docs-only, one compile-time change that
+runs only at W>1). The same commit read either about 2.65M or about 2.45M on q22 depending on the
+session. With `DOTNET_TieredPGO=0`, base and head match:
+
+| | q2 base | q2 head | q22 base | q22 head |
+|:--|--:|--:|--:|--:|
+| PGO off (3 runs) | 6.03–6.07M | 6.02–6.07M | 1.96–2.00M | 1.96–1.98M |
+| PGO on (3 runs) | 7.34–7.45M | 7.27–7.30M | 2.63–2.67M | 2.43–2.57M |
+
+The compiled code costs the same. What differs is which mode PGO lands in per process (fast ≈2.65M or
+slow ≈2.45M on q22), and recent builds land slow more often. No commit is responsible, so reverting
+would not help.
+
+**Measurement traps found on the way:**
+- **Build path.** Identical code runs 2–6% apart depending on the directory it was built in (main
+  checkout vs a scratch worktree, about 300 differing bytes of embedded paths and IDs). Build both arms
+  at the same path.
+- **Runner context.** The runner's W=1 number depends on the worker argument (`nexmark … 3 1` vs `… 3 14`:
+  with 14, the W=1 pass shares its process with the W=14 passes). It also depends on which queries ran
+  earlier in the process: q22 alone 3.1M, after q2 2.65M. That is a one-time drop; five earlier queries
+  cost no more than one. Compare only like with like.
+- **Bisects.** Single-sample bisect steps mislead, so take the max of 3. Before bisecting a small
+  PGO-on delta, re-run both arms with `DOTNET_TieredPGO=0`; if they match, stop.
+
 ## Nexmark head-to-head vs Feldera — M4 Pro, 2026-11-02 (after the flat-trace-state arc)
 
 DbspNet at `1e3a232`, Feldera at `78afc9077` (unchanged). The same settings as 10-31: 10M events,
