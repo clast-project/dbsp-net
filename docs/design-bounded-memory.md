@@ -5293,3 +5293,28 @@ Mutants, all caught:
 - the output is given the input's delta format.
 
 Suites: default, forced and forced+critical (`forced-suite-env`) each 3,757 passed, 1 skipped.
+
+### 5.57 Co-partitioning: one exchange per eligibility view (2026-11-13, measured, not adopted)
+
+A pre-pass asked the aggregate / DISTINCT under each hashed LEFT join to partition on the join's bare key
+columns. The join then elided both exchanges, and the operators over one input shared one exchange. In
+issue #2's program, 18 views went from 5 exchanges to 1 each, and all 96 views stayed identical. The full
+design, tests and measurements are on branch `copartition-5.57` (4eb9afa code, c22a35c doc).
+
+Measured on SF25 batch 1, two clean interleaved pairs (fseventsd idle): batch 1 on 1,886 s vs off 1,862 s
+(mean), tick 18 757 vs 760 s, allocation +0.5%. Neutral: the local index passes that replaced the
+exchanges cost what the fused exchange-indexes did, and the transport itself was cheap. It would pay only
+with consumer-fused indexing (an aggregate or join building its trace straight from row deltas), which is
+not started. Reverted from main.
+
+#### 5.57.6 What landed: an elided aggregate's claim
+
+One fix from that work is on main, unconditionally. An aggregate that elides its exchange sits where its
+input's exchange hashed it, but it claimed `Iota(groupCount)` over its own group key. That is true as
+co-location but false as a hash. An aggregate elided below it took its re-shard placement from that claim,
+so a checkpoint restored at a different worker count put its state on the wrong workers. It now claims its
+input's partition columns at their group-key positions (`ElidedAggregatePartition`).
+
+`ElidedAggregateClaimTests`: three stacked aggregates (one exchange, two elisions) equal serial after a
+checkpoint at 4 → 3, 3 → 5 and 4 → 4. Mutant (the old Iota claim) fails both resharded cases.
+Suites: default, forced and forced+critical (`forced-suite-env`) each 3,761 passed, 1 skipped.

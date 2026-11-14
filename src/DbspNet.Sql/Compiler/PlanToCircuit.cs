@@ -873,6 +873,20 @@ public static partial class PlanToCircuit
         return new ReshardPlacement.Hash(key => StablePartitionHash.OfRow(key, positions, keySchema));
     }
 
+    /// <summary>The partition an elided aggregate's output carries: its input's columns, at their group-key
+    /// positions (the output's first columns), hashed as the input's exchange hashed them.</summary>
+    private static PartitionInfo ElidedAggregatePartition(PartitionInfo upstream, int[] groupIndices)
+    {
+        var pk = upstream.PartitionKey!;
+        var positions = new int[pk.Length];
+        for (var i = 0; i < pk.Length; i++)
+        {
+            positions[i] = Array.IndexOf(groupIndices, pk[i]);
+        }
+
+        return new PartitionInfo(ShardDisjoint: false, positions, upstream.KeySchema, upstream.Gathered);
+    }
+
     private static bool IsKeySubset(int[] sub, int[] super)
     {
         foreach (var c in sub)
@@ -5497,10 +5511,17 @@ public static partial class PlanToCircuit
 
         // The output lays the group key out as the first groupCount columns and
         // every group is co-located on one worker, so the result is partitioned by
-        // iota(groupCount) — record it for a downstream aggregate to elide on.
+        // iota(groupCount) — record it for a downstream aggregate to elide on. The
+        // claim names the columns the placement was hashed from: an elided
+        // aggregate's are its input's, moved to their group-key positions. Iota
+        // would be true as co-location but false as a hash, so an aggregate elided
+        // below this one would re-shard its state by the wrong hash
+        // (docs/design-bounded-memory.md §5.57.6).
         if (ctx.Workers > 1)
         {
-            ctx.SetPartition(mapped, new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount), KeySchema: groupKeySchema));
+            ctx.SetPartition(mapped, needsExchange
+                ? new PartitionInfo(ShardDisjoint: false, PartitionKey: Iota(groupCount), KeySchema: groupKeySchema)
+                : ElidedAggregatePartition(inputPartition, bareGroupIndices!));
         }
 
         return mapped;
