@@ -992,8 +992,21 @@ internal sealed class LazyTraceBlock : ITraceBlock
         }
     }
 
+    private static long _largeLoads, _largeLoadBytes;
+
+    /// <summary>Loads since the last call whose message is a large-object allocation (at least 85,000
+    /// bytes), and their bytes (docs/design-bounded-memory.md §5.59); resets.</summary>
+    internal static (long Loads, long Bytes) TakeLargeLoads() =>
+        (Interlocked.Exchange(ref _largeLoads, 0), Interlocked.Exchange(ref _largeLoadBytes, 0));
+
     private TraceBlock LoadCore()
     {
+        if (_index.MessageLength >= 85_000)
+        {
+            Interlocked.Increment(ref _largeLoads);
+            Interlocked.Add(ref _largeLoadBytes, _index.MessageLength);
+        }
+
         var prof = BlockCache.Profile;
         var t0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (_store is IO.Local.LocalTableFileSystem localFs)

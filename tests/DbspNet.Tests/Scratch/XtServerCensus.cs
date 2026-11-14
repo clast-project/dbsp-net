@@ -391,6 +391,30 @@ public class XtServerCensus
             }) { IsBackground = true, Name = "xt-gc-timeline" }.Start();
         }
 
+        // XT_LOH_PROFILE=SECS (§5.59): large- and pinned-object-heap allocation by type, from the runtime's
+        // GCAllocationTick events (each carries the bytes of its kind allocated on its heap since the last
+        // one, ~100 KB, and the type of the object that tipped it), plus block loads of a large-object
+        // message (LazyTraceBlock.LargeLoads), as one LOHALLOC line every SECS seconds.
+        using var lohListener = int.TryParse(Environment.GetEnvironmentVariable("XT_LOH_PROFILE"), CultureInfo.InvariantCulture, out var lohSecs) && lohSecs > 0
+            ? new LohAllocationListener() : null;
+        if (lohListener is not null)
+        {
+            new Thread(() =>
+            {
+                while (!timelineStop.IsCancellationRequested)
+                {
+                    Thread.Sleep(lohSecs * 1000);
+                    var line = lohListener.Take();
+                    var (loads, loadBytes) = DbspNet.Persistence.Blocks.LazyTraceBlock.TakeLargeLoads();
+                    lock (gate)
+                    {
+                        log.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"LOHALLOC t_s={sw.Elapsed.TotalSeconds:F1} secs={lohSecs} large_block_loads={loads} large_block_load_mib={loadBytes >> 20} {line}"));
+                    }
+                }
+            }) { IsBackground = true, Name = "xt-loh-profile" }.Start();
+        }
+
         // Per-op allocation (§5.35): each worker steps on its own thread, so the thread's allocated bytes
         // since its previous operator are that operator's on that worker. OPALLOC when >= 512 MiB.
         var lastAlloc = new ThreadLocal<long>(() => GC.GetAllocatedBytesForCurrentThread());
@@ -653,5 +677,68 @@ public class XtServerCensus
         static double M(long b) => b / 1048576.0;
         return string.Create(CultureInfo.InvariantCulture,
             $"SPILLMIX {where} files={files} state_mib={M(state):F0} delta_mib={M(delta):F0} reader_mib={M(reader):F0} dead_mib={M(dead):F0} swept_mib={M(freed):F0}");
+    }
+}
+
+/// <summary>XT_LOH_PROFILE (docs/design-bounded-memory.md §5.59): large- and pinned-object-heap allocation by
+/// type, from GCAllocationTick (GC keyword, verbose). Small-object ticks are dropped on arrival.</summary>
+internal sealed class LohAllocationListener : System.Diagnostics.Tracing.EventListener
+{
+    private readonly object _gate = new();
+    private Dictionary<string, (long Bytes, long Events)> _large = new();
+    private long _pinned;
+
+    protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+    {
+        if (source.Name == "Microsoft-Windows-DotNETRuntime")
+        {
+            EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Verbose, (System.Diagnostics.Tracing.EventKeywords)0x1);
+        }
+    }
+
+    protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+    {
+        if (e.EventId != 10 || e.Payload is not { } p || e.PayloadNames is not { } names)
+        {
+            return; // GCAllocationTick only
+        }
+
+        var kind = Convert.ToInt32(p[names.IndexOf("AllocationKind")], CultureInfo.InvariantCulture);
+        if (kind == 0)
+        {
+            return;
+        }
+
+        var at = names.IndexOf("AllocationAmount64");
+        var bytes = at >= 0 ? Convert.ToInt64(p[at], CultureInfo.InvariantCulture) : Convert.ToInt64(p[names.IndexOf("AllocationAmount")], CultureInfo.InvariantCulture);
+        if (kind == 2)
+        {
+            Interlocked.Add(ref _pinned, bytes);
+            return;
+        }
+
+        var tn = names.IndexOf("TypeName");
+        var type = tn >= 0 ? p[tn] as string ?? "?" : "?";
+        lock (_gate)
+        {
+            _large[type] = _large.TryGetValue(type, out var v) ? (v.Bytes + bytes, v.Events + 1) : (bytes, 1);
+        }
+    }
+
+    /// <summary>Since the last call: total large-object MiB, the top types, pinned MiB; resets.</summary>
+    public string Take()
+    {
+        Dictionary<string, (long Bytes, long Events)> taken;
+        lock (_gate)
+        {
+            taken = _large;
+            _large = new();
+        }
+
+        var total = taken.Values.Sum(v => v.Bytes);
+        var top = string.Join(' ', taken.OrderByDescending(kv => kv.Value.Bytes).Take(6)
+            .Select(kv => string.Create(CultureInfo.InvariantCulture, $"[{kv.Key.Replace(' ', '_')}]={kv.Value.Bytes >> 20}/{kv.Value.Events}")));
+        return string.Create(CultureInfo.InvariantCulture,
+            $"loh_mib={total >> 20} poh_mib={Interlocked.Exchange(ref _pinned, 0) >> 20} types(mib/ticks)={top}");
     }
 }

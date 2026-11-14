@@ -5365,3 +5365,189 @@ that cannot be handed to a 32 MiB large-object region without fresh commit, whic
 (Raising the limit would not obviously help: committed memory pins at whatever the limit is.) One run with
 the segments GC (`DOTNET_GCName=libclrgc.dylib`, `libclrgc.so` on Linux) passed that point and completed
 batch 1 in 2,612 s (regions runs 2,712–2,768 s). One pass at a 3-in-5 base rate is suggestive only.
+
+### 5.59 Block read buffers: pool them, or make no large block reads (2026-11-14, design, not built)
+
+§5.58.1's out-of-memory has a fix that is a GC setting (the segments GC). This section asks whether the
+engine can stop needing it, starting with pooling the arrays block loads read into. Every run below used
+the reporter's settings (§5.58.1), the regions GC, and batch 1 only.
+
+#### 5.59.1 What one block load allocates
+
+From the code (`LazyTraceBlock.LoadCore` → `BlockSchema.Adopt` → `TraceBlock.TryParseHeader`), a load makes:
+
+| allocation | size at the failing site | heap |
+|---|---|---|
+| the message, `new byte[MessageLength]`, adopted zero-copy by the `TraceBlock` | 16.4 MB | large object |
+| the stored (compressed) bytes, `ArrayPool<byte>.Shared.Rent(Length)` | ~3.1 MB (zstd ~5.3:1) | large object on a pool miss |
+| column offsets and header arrays | < 1 KB | small |
+| zstd: a per-thread `Decompressor`, one-shot into the message | none per load | — |
+
+Some readers then allocate more per loaded block: value hashes (`int[Count]`, 255 KB at 63,842 entries,
+large) when a merge or a streamed group needs them, and `KeysAliased` (`StructuralRow[]` and
+`object[][]`, 510 KB each, large) for the output stream. `CountTied`, the failing frame, needs neither: it
+reads keys and weights one entry at a time. The write side builds no large message: a giant span goes to
+its file through the codec in a stream (`RunStreamWriter.AppendConcatAsync`). Only a giant group's span
+makes a large block. An ordinary block is cut at 60,000 bytes (`BlockedIndexedTrace.BlockBytes`), under
+the 85,000-byte large-object threshold, and only a hash that fills whole blocks is concatenated, up to
+`RunFile.MaxSpanBlockBytes`, into one file block.
+
+**Measured** (xt25loh1, `XT_LOH_PROFILE=10`: the runtime's `GCAllocationTick` events, which carry each
+heap's large-object bytes since the last event, by the type that tipped it; plus a count of loads whose
+message is ≥ 85,000 bytes):
+
+xt25loh1 failed at §5.58.1's site at 2,060 s: a 16,438,648-byte block of 63,842 entries (one group),
+28,673 MiB in use and 48,865 MiB committed after a compacting gen 2. That makes 3 failures in 6 runs at
+these settings.
+
+| | ticks 0–17 (0–1,025 s) | tick 18 to the failure (1,025–2,060 s) |
+|---|---|---|
+| large-object allocation | 175 GiB, 179 MiB/s | 231 GiB, 231 MiB/s |
+| of which block messages ≥ 85,000 B | 97 GiB (55%), 8,106 loads | 205 GiB (**89%**), 47,240 loads, 4.4 MiB each on average |
+| next largest type | `UInt32[]` 30 GiB (17%) | `UInt32[]` 12 GiB (5%) |
+| busiest 10 s | 15.8 GiB | 19.3 GiB (4,968 block loads) |
+
+Block loads come in bursts of up to ~2 GiB/s and stop for minutes in between. The failure itself is not
+a burst: over the last 30 s the large object heap took only 40–60 MiB/s. The GC timeline shows what
+happened instead. Live memory rose from 11 GiB at 1,981 s to 28.7 GiB at 2,041 s. Then seven gen-2
+collections ran back to back, one every ~2 s, each compacting and promoting everything, each leaving
+28.6–28.8 GiB in use, 48.4–48.9 GiB committed and a large object heap of only 1.7–2.2 GiB. The run
+then threw. Each retry found ~20 GiB committed and free, and still could not place a 16 MB array.
+This is the regions explanation of §5.58.1, now seen happening rather than inferred: free space in
+small-object regions does not become a large-object region at the commit limit. The live set was not
+the limit. Two consequences for the design:
+
+- The failing request is always a block message. Other large-object allocations (5% of tick 18's
+  bytes: `UInt32[]`, `ValueTuple` builder arrays, under 1 MiB per allocation event on average; the profile
+  records sums, not object sizes) never failed in six runs, nor in §5.38's. Likely reason, not verified
+  in the GC source: a 16 MB array needs 16 MB free in one large-object region or a new region, while a
+  small one fits in what is left of the current one.
+- What is needed is no *large* request at the limit, not fewer large-object bytes. A pool helps only if
+  it always has a buffer ready at that moment.
+
+#### 5.59.2 Who can still read a block's bytes after eviction
+
+The block cache's safety rule today is reachability (`BlockCache` remarks): eviction clears
+`LazyTraceBlock._loaded` and nothing else, and whoever still holds the body keeps it alive. A pooled
+buffer is handed to the next load, so returning it while anything can still read it means a reader sees
+another block's bytes. Nothing would detect that: the rows would decode as valid rows of the wrong block.
+Holders of a body, or of memory inside it, after the cache drops it:
+
+1. **Enumerators that yield `(block, i)`.** `BlockedGroups.At` (used by `CountTied`, `Resolve` and the
+   streamed giant group's k-way walk, whose enumerators live across yields to the consuming join), the
+   trace's run cursors, merges and compaction. The consumer runs arbitrary code between `MoveNext` calls,
+   including loads that make this thread evict.
+2. **Spans.** `Hashes` is a `ReadOnlySpan<uint>` over the message. So are the `At(column, i, w)` reads
+   inside `TraceBlock`. A span keeps the array alive, but not the `TraceBlock`. The JIT may treat the
+   block as dead while a span taken from it is still in use.
+3. **Aliased strings.** `Utf8String` cells decoded with `aliasStrings: true` hold `ReadOnlyMemory<byte>`
+   over the message. They come from `KeysAliased` in `BlockedIndexedTrace.StreamRunsCore`, the output view's
+   row stream (`BlockedZSetTrace`), which yields them to the Arrow output writer, so they leave the trace
+   for as long as the consumer keeps them, and from the value-hash computation (transient).
+4. **Async writes.** `BlockWriter.ConcatToAsync` writes `part.Bytes.AsMemory(...)` across `await`s. Its
+   parts can be `LazyTraceBlock` bodies (`Materialized`), which another thread can evict mid-write.
+5. **Other workers.** An exchange gather's `BlockedGroups` reads other workers' runs (§5.41), so one
+   `LazyTraceBlock` has readers on several threads. Two threads can load it at once, and the loser of
+   `Install`'s compare-exchange holds a body that was never published. That body alone is safe to return
+   at once.
+
+**An explicit reference count** would need a lease around every use of a body: 192 references to
+`ITraceBlock` across Core and Persistence, every enumerator's lifetime (an iterator's `finally` runs only
+when it is disposed), and every aliased string, which cannot be leased at all without copying it or tying
+it to its consumer's lifetime. A single missed lease is a silent wrong answer. I don't think this can be
+made safe at a cost worth paying.
+
+**A reachability-owned buffer** keeps the existing rule. The message belongs to an owner object (a
+`MemoryManager<byte>`) whose finalizer returns the array to the pool. The `TraceBlock` holds the owner,
+aliased strings and async writes take their `Memory<byte>` from it (so they keep it alive), and the
+buffer goes back to the pool only once the GC has proved nothing references the owner. That is safe by
+construction for (1), (3), (4) and (5). It is not safe for (2): a span into the array does not keep the
+owner alive, so every span-returning member and every caller that holds a span would need a
+`GC.KeepAlive` of the block after its last use. That rule is easy to break and no test checks it.
+(A debug mode that poisons returned buffers would catch most breaks in the forced suites.) The buffer
+also returns late: an owner that has reached gen 2 is finalized only after a gen-2 collection, and the
+collection the runtime runs just before it throws `OutOfMemoryException` queues finalizers without
+running them. So the pool is emptiest exactly when it is needed, and the arrays it keeps are live memory
+the pressure monitor counts.
+
+#### 5.59.3 Alternatives
+
+| option | removes the failing request? | cost | risk |
+|---|---|---|---|
+| **A. Pooled message buffers** (reachability-owned, §5.59.2) | only when the pool holds a free buffer; refills lag a gen 2 | `TraceBlock._bytes` behind an owner in `TraceBlock`, `BlockSchema`, `BlockWriter`, `ViewArrow`, aliased strings; `KeepAlive` discipline on spans; the pool's arrays are live memory | silent wrong rows on a missed `KeepAlive`; does not touch the other 11% |
+| **B. Native message memory** (`NativeMemory.Alloc`, owner frees) | yes, no managed request at all | the same ownership change as A; the pressure monitor must add native bytes (block cache budget + loads in flight), because `GCHeapHardLimit` stops counting them and the limit then means "managed heap", not "process" | a missed `KeepAlive` becomes a use-after-free: garbage or a crash |
+| **C. File blocks under 85,000 bytes** (`MaxSpanBlockBytes` default 80,000: a giant's span is written as its 60,000-byte in-memory blocks, one per file block) | yes, every block load is a small-object allocation | a default; no reader changes (the suites already pass at an 8 KB cap, §5.18). Giant groups get ~270× more file blocks: ~36 B of index + one `LazyTraceBlock` (~80 B) per 60 KB, ~0.2%; more `pread`s; zstd on 60 KB frames compresses somewhat worse | measured below; the other large-object allocations stay |
+| **C′. Chunked block arrays** (one block over several sub-85,000-byte arrays) | yes | `TraceBlock` cell access, spans and aliasing across chunk boundaries; the whole zero-copy layout | large rewrite for what C gets from a default |
+| **D. Recommend the segments GC** (`DOTNET_GCName=libclrgc.so`) | yes, empirically (1 pass in 1) | none in code; ships in the .NET 10 runtime | a legacy GC the runtime may drop; changes every allocation's behaviour, not one site; leaves the engine's reliability depending on a setting |
+
+`GCHeapHardLimitLOH` (a separate large-object commit budget) is another setting of the same kind as D and
+is not pursued for the same reason. The checkpoint compactor still cuts a giant by entries (2^18,
+§5.38), so a compacted giant can be up to ~67 MB at these row widths; ivm-bench writes no checkpoints, but
+C should cap it by bytes too.
+
+#### 5.59.4 Reproducing it cheaply
+
+Not cheaply. §5.38's standalone repro never failed, and this one depends on the whole run's heap
+history: live climbing to ~29 GiB within a minute of the giant group's loads. A restore just before the site
+would save ticks 0–17 (~1,025 s of the ~2,060 s to the failure), but there is no checkpoint at the
+current plan shape (every saved one predates §5.48 or later, so none restores). Saving one costs a run,
+and §5.44 found restored tick 18 faithful for time but not for memory (49 against 43 GiB peak). That is
+the wrong trade for a memory failure. Two things make the full run enough:
+
+- **A deterministic check per run.** `large_block_loads` in the LOHALLOC lines counts the failing class
+  of request exactly. Under C it should be 0 for the whole batch, whether or not the run would have
+  failed, so one run shows that the request is gone.
+- **Reliability needs several runs.** At 3 failures in 6, five clean runs in a row would happen by
+  chance about 8% of the time (0.5^5 = 3%, or 0.6^5 = 8% at the earlier 2-in-5 rate). Five runs of
+  ~45 min (batch 1 only) are the minimum for a claim, and three batches are not
+  needed for it.
+
+#### 5.59.5 Proposal
+
+**C measured once** (xt25loh2: same binary as xt25loh1, `DBSPNET_RUN_SPAN_BLOCK_BYTES=80000`, regions GC):
+
+| | regions passes at the 16 MiB cap (xt25ila3, xt25ila3q, xt25upk) | xt25loh2, 80,000 B cap |
+|---|---|---|
+| batch 1 | completed, 2,711–2,767 s | completed, 2,741 s; 96 views' `model_rows` identical to xt25tws |
+| tick 18 step | 1,751–1,781 s | 1,856 s (+4–6%, one sample) |
+| cumulative allocation at tick 18's end | 8,356–8,360 GiB | 8,426 GiB (+0.8%) |
+| large block loads, whole batch | 55,346 (xt25loh1) | **0** |
+| large-object allocation, tick 18 | 231 MiB/s (xt25loh1) | 85 MiB/s |
+| spill disk | 86–89 GB | 100 GB (+12%) |
+| peak RSS | 47–48 GiB | 49 GiB |
+
+The failing class of request is gone, deterministically. The 89% of large-object bytes that block messages
+were is gone too. What is left (`UInt32[]`, builder arrays) is what never failed. The cost is the extra
+spill disk and possibly some tick-18 time; one run cannot separate +4–6% from noise on this host. One pass
+says nothing yet about reliability (§5.59.4).
+
+**Proposal: build C, not A or B.**
+
+1. `RunFile.MaxSpanBlockBytes` defaults to 80,000. A giant's span is then written as its in-memory blocks,
+   one per file block, and every block load is a small-object allocation. `DBSPNET_RUN_SPAN_BLOCK_BYTES`
+   stays as the override. The doc comment says why (this section): the 16 MiB "half a region" reasoning
+   of §5.38 was not enough.
+2. The checkpoint compactor (`RunCompactor`) cuts a hash run by bytes as well as by entries, so a
+   compacted giant obeys the same bound.
+3. A test that, at the default caps, every file block a giant group spills to (in-step spill, merge
+   output and compaction) has a message under 85,000 bytes, i.e. `LazyTraceBlock` records no large loads.
+   Mutants: the old 16 MiB default; compaction by entries only.
+4. Suites: default, forced and forced+critical. The forced caps (8 KB) are unchanged, so they already
+   cover small span blocks.
+5. Reliability: five batch-1 runs at the reporter's settings on the regions GC (~45 min each), each
+   checked for `large_block_loads=0`, views against xt25tws, tick-18 time against the three passes above.
+   Then the reply on issue #2 can drop the GC setting, or keep it as an option only.
+
+Not proposed:
+- **A (pooling).** It fixes only block messages and depends on a `KeepAlive` rule nothing checks; its
+  arrays come back latest exactly when the heap is at the limit.
+- **B (native).** It has the same ownership work and turns a mistake into a use-after-free.
+- **C′ (chunked arrays).** It is the rewrite C avoids.
+- **D (segments GC) as the fix.** It stays as advice until step 5 is done.
+
+The remaining large-object allocations (5% of tick 18) are left alone until one of them fails.
+
+Two side findings, not pursued here. `CountTied` loads every block of a giant group to learn each key's
+signs, and the streamed group then walks the same blocks again. A per-block "all weights one sign" bit
+in the run index would let the count skip them on a bulk insert. Separately, live memory rose 17.6 GiB
+in the minute before the failure (1,981 → 2,041 s), and nothing yet says which operator holds it.
