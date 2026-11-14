@@ -5366,7 +5366,7 @@ that cannot be handed to a 32 MiB large-object region without fresh commit, whic
 the segments GC (`DOTNET_GCName=libclrgc.dylib`, `libclrgc.so` on Linux) passed that point and completed
 batch 1 in 2,612 s (regions runs 2,712–2,768 s). One pass at a 3-in-5 base rate is suggestive only.
 
-### 5.59 Block read buffers: pool them, or make no large block reads (2026-11-14, design, not built)
+### 5.59 Block read buffers: pool them, or make no large block reads (2026-11-14, built: option C)
 
 §5.58.1's out-of-memory has a fix that is a GC setting (the segments GC). This section asks whether the
 engine can stop needing it, starting with pooling the arrays block loads read into. Every run below used
@@ -5551,3 +5551,24 @@ Two side findings, not pursued here. `CountTied` loads every block of a giant gr
 signs, and the streamed group then walks the same blocks again. A per-block "all weights one sign" bit
 in the run index would let the count skip them on a bulk insert. Separately, live memory rose 17.6 GiB
 in the minute before the failure (1,981 → 2,041 s), and nothing yet says which operator holds it.
+
+#### 5.59.6 Built
+
+`RunFile.MaxSpanBlockBytes` defaults to 80,000 (`RunFile.DefaultMaxSpanBlockBytes`), proposal step 1. The
+override and the forced suites' 8 KB cap are unchanged.
+
+Step 2 is dropped, deliberately. `RunCompactor` serves only managed traces' checkpoints
+(`RunCheckpoint`). It cuts *every* block at `RunFile.DefaultBlockEntries` (1,024) entries, ~260 KB at this
+site's row width, not only giants. A byte cut on its giant runs alone would not give the bound. A byte
+cut on all its blocks would change managed checkpoints' layout (restore, cold-group probes) for state the
+in-step path never writes. ivm-bench writes no checkpoints, and blocked traces, the default for large
+state, write through the capped path. So the bound this section establishes is: **no block a blocked
+trace writes (freeze spill, merge, checkpoint) is a large-object load.** A managed trace's checkpoint
+can still be one.
+
+Test: `At_the_default_span_cap_no_file_block_is_a_large_object` (RunSpillerTests) runs a join whose giant
+group (~160 KB) spills at every freeze and merges for 12 ticks, against a twin that never spills. Every
+file block must be under 85,000 bytes and the giant must span several, before and after a checkpoint
+restore. Mutants caught: the 16 MiB default (a 108,992-byte block at tick 1), and the writer ignoring
+the cap (`Capped` passing every piece whole).
+Suites: default, forced and forced+critical, 3,769 passed each.

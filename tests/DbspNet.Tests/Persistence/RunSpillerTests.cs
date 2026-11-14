@@ -456,6 +456,52 @@ public class RunSpillerTests
         }
     }
 
+    // §5.59: at the default span cap no file block is a large-object allocation to load (85,000 bytes or
+    // more): the giant group (1,200 rows of ~100-byte strings, ~160 KB) is written as several file blocks,
+    // whether spilled at a freeze, written by a merge, or written by a checkpoint and restored. Under the
+    // old 16 MiB default it was one file block of ~160 KB.
+    [Fact]
+    public async Task At_the_default_span_cap_no_file_block_is_a_large_object()
+    {
+        const int Ticks = 12;
+        const int LargeObject = 85_000;
+        var expected = TwinDigests(Ticks);
+        await WithSpillerAsync(0, async (spiller, dir) =>
+        {
+            var giant = (uint)new StructuralRow([0]).GetHashCode();
+            var p = Compile();
+            var spans = 0;
+            void Check(CompiledProgram q, string where)
+            {
+                foreach (var run in Left(q).Runs)
+                {
+                    var lazy = run.Blocks.OfType<LazyTraceBlock>().ToList();
+                    Assert.All(lazy, b => Assert.True(b.Location.Index.MessageLength < LargeObject,
+                        $"{where}: a {b.Location.Index.MessageLength}-byte file block ({b.Count} entries, {b.Groups} groups)"));
+                    spans += lazy.Count(b => b.FirstHash == giant && b.LastHash == giant) > 1 ? 1 : 0;
+                }
+            }
+
+            for (var tick = 0; tick < Ticks; tick++)
+            {
+                Tick(p, tick);
+                Assert.Equal(expected[tick], Digest(p));
+                Check(p, $"tick {tick}");
+            }
+
+            Assert.True(spans > 0, "the giant group should span several file blocks");
+
+            var fs = new InMemoryTableFileSystem();
+            await Snapshot.WriteAsync(p.Circuit, fs, retainCount: 1);
+            var restored = Compile();
+            await Snapshot.ReadAsync(restored.Circuit, fs);
+            Assert.Equal(Digest(p), Digest(restored));
+            spans = 0;
+            Check(restored, "restored");
+            Assert.True(spans > 0, "the restored giant group should span several file blocks");
+        });
+    }
+
     [Fact]
     public async Task A_streamed_runs_written_blocks_are_not_held_until_its_finish()
     {

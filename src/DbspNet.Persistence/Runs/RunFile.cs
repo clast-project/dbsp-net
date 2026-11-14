@@ -49,12 +49,18 @@ internal static class RunFile
     internal const int OldestReadableVersion = 3;
 
     /// <summary>The most bytes a giant group's file block holds before the group continues in the next
-    /// block (§5.18): a block is one record-batch message read into one array. 16 MiB keeps that array
-    /// inside one of the GC's 32 MiB large-object regions (§5.38): a 59 MiB block load failed at the
-    /// 48 GiB hard limit with 17.5 GB in use, an array past the region size needing a fresh region of its
-    /// own and fresh commit. A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_BYTES</c> sets it for a suite run.</summary>
+    /// block (§5.18): a block is one record-batch message read into one array. 80,000 keeps that array
+    /// under the 85,000-byte large-object threshold, so a giant's span is written as its in-memory blocks
+    /// (<c>BlockedIndexedTrace.BlockBytes</c>, 60,000), one per file block, and no block load is a
+    /// large-object allocation (docs/design-bounded-memory.md §5.59). §5.38's 16 MiB (half a large-object
+    /// region) was not enough: under the regions GC, at the hard limit, a 16 MB load still failed with
+    /// ~20 GiB committed and free, which small-object allocations can use and a large one cannot.
+    /// <c>DBSPNET_RUN_SPAN_BLOCK_BYTES</c> overrides it (and sets it small for the forced suites).</summary>
     internal static long MaxSpanBlockBytes =
-        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_BYTES"), out var cap) && cap > 0 ? cap : 16L << 20;
+        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_RUN_SPAN_BLOCK_BYTES"), out var cap) && cap > 0 ? cap : DefaultMaxSpanBlockBytes;
+
+    /// <summary>The default of <see cref="MaxSpanBlockBytes"/>: under the large-object threshold (§5.59).</summary>
+    internal const long DefaultMaxSpanBlockBytes = 80_000;
 
     /// <summary>The most entries of one hash a compacted block holds before the hash continues in the
     /// next block (§5.18; compaction cuts by entries). A test seam; <c>DBSPNET_RUN_SPAN_BLOCK_ENTRIES</c>.</summary>
