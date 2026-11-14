@@ -158,8 +158,6 @@ public sealed class ParallelProgramOutput
     private long _cachedTick = -1;
     private ZSet<StructuralRow, Z64>? _cachedDelta;
     private long _cachedDeltaTick = -1;
-    private long _rowCount;
-    private long _rowCountTick = -1;
 
     internal ParallelProgramOutput(
         Schema schema,
@@ -196,79 +194,38 @@ public sealed class ParallelProgramOutput
     }
 
     /// <summary>
-    /// The number of distinct rows in <see cref="CurrentView"/>, without forming it on
-    /// every tick. The first read counts the formed view; from then on
-    /// <see cref="ParallelCompiledProgram.Step"/> keeps the count current from each tick's
-    /// delta — O(|delta| · W) lookups in the shard integrals instead of an O(|view|) sum
-    /// per read. A program nobody asks for counts pays nothing.
+    /// The number of rows in <see cref="CurrentView"/> counting duplicates (its weights summed,
+    /// SQL <c>COUNT(*)</c>), without forming it: the sum of the W shard integrals' totals, each
+    /// kept current by its own worker's step (<c>IntegrateOp.TotalWeight</c>), so a read is O(W).
+    /// The first read sums every shard once, on the workers in parallel. Weights add across
+    /// workers, so unlike a distinct count it needs no lookups of a delta's rows: a distinct count
+    /// looked each changed row up in all W shards, serially, which cost ivm-bench's extended
+    /// TPC-DS batch 2 ~440 s of a ~450 s tick.
     /// </summary>
     public long RowCount
     {
         get
         {
-            if (_shards.Count == 1)
+            if (_shards.Count > 1 && _shards.Any(static s => !s.TotalWeightTracked))
             {
-                return _shards[0].Count;
+                // Workers are parked between steps; each sums its own shard.
+                var totals = new long[_shards.Count];
+                _circuit.RunDataParallel((w, _) => totals[w] = _shards[w].TotalWeight);
             }
 
-            var tick = _circuit.TickCount;
-            if (_rowCountTick != tick)
-            {
-                // Counted from a view formed for this read only: caching it would keep a decoded
-                // copy of every row alive, which a blocked view (and its sink's index) otherwise
-                // holds as bytes (docs/design-flat-trace-state.md §3.10).
-                // Blocked shards are counted by one merge of their runs, never formed (§5.34).
-                _rowCount = _cached is not null && _cachedTick == tick ? _cached.Count
-                    : ShardTraces is { } traces && DbspNet.Core.Operators.Stateful.Blocks.BlockedIndexedTrace.CountRowsAcross(traces) is { } n ? n
-                    : FormView().Count;
-                _rowCountTick = tick;
-            }
-
-            return _rowCount;
-        }
-    }
-
-    /// <summary>
-    /// Advance <see cref="RowCount"/> past the tick just stepped: each row the delta
-    /// touched entered the view if its summed weight is now non-zero and was zero before
-    /// (<c>after - delta</c>), and left it in the opposite case. Skipped until the count is
-    /// first read, and when it is stale (a tick was missed), which leaves the next read to
-    /// recount; at <c>W == 1</c> the read is already O(1).
-    /// </summary>
-    internal void AfterStep()
-    {
-        // The formed view is stale once the circuit steps; let it go rather than hold every row
-        // until the next read.
-        _cached = null;
-        var tick = _circuit.TickCount;
-        if (_shards.Count == 1 || _rowCountTick < 0 || _rowCountTick != tick - 1)
-        {
-            return;
-        }
-
-        var count = _rowCount;
-        foreach (var (row, delta) in CurrentDelta)
-        {
-            var after = 0L;
+            long total = 0;
             foreach (var shard in _shards)
             {
-                after += shard.WeightOf(row).Value;
+                total += shard.TotalWeight;
             }
 
-            if (after != 0)
-            {
-                count++;
-            }
-
-            if (after - delta.Value != 0)
-            {
-                count--;
-            }
+            return total;
         }
-
-        _rowCount = count;
-        _rowCountTick = tick;
     }
+
+    /// <summary>After a step: the formed view is stale; let it go rather than hold every row
+    /// until the next read.</summary>
+    internal void AfterStep() => _cached = null;
 
     /// <summary>The full current view contents (valid until the next
     /// <see cref="ParallelCompiledProgram.Step"/>).</summary>

@@ -5318,3 +5318,50 @@ input's partition columns at their group-key positions (`ElidedAggregatePartitio
 `ElidedAggregateClaimTests`: three stacked aggregates (one exchange, two elisions) equal serial after a
 checkpoint at 4 → 3, 3 → 5 and 4 → 4. Mutant (the old Iota claim) fails both resharded cases.
 Suites: default, forced and forced+critical (`forced-suite-env`) each 3,761 passed, 1 skipped.
+
+### 5.58 Batches 2 and 3: output row counts kept as COUNT(*) (2026-11-14, built)
+
+Issue #2's reporter runs all three batches (100% / 1% / 0.01%), which no local run had done at SF25. With
+the reporter's exact compose settings (no broadcast-view hints, `DBSPNET_STEP_SPILL_ROWS=262144`,
+`DBSPNET_MEMORY_LIMIT_MIB=49152`, 48 GiB heap, W = 12) on 86d0ce1, every batch validated, but batch 2 took
+472–481 s for ~362K new status events, and one tick of it (`ext_engagement_status_events`) 448 s.
+
+The per-operator profile put that tick's operators inside 12 s of wall time (144K worker-ms in all).
+Instrumented, the tick split into circuit 12.7 s and **output row-count upkeep 439.5 s**.
+`/wait` reports each view's row count, and since 9c092d9 the parallel program kept it as a distinct count
+from each tick's delta: each delta row looked up in all W shard integrals, serially on the driver thread.
+Batch 1 never paid it, because a count is untracked until first read, and the first read is batch 1's
+`/wait`. In batch 2 three 36M-row views, `stg_engagement_status_events`, `int_hist_raw_engagement_status`
+and `int_engagement_status_transaction`, took 362,370 delta rows × 12 lookups each into spilled integrals
+(~33 µs a lookup), ~145 s apiece. Batch 3: 23.0 s of upkeep against a 2.0 s step.
+
+**The change.** The count is now the view's weights summed, SQL `COUNT(*)`, not its distinct rows. Each
+output's `IntegrateOp` keeps `TotalWeight` once it is first read: the first read sums the view, each later
+step adds its delta's weights (O(|delta|), beside the integrate), and a snapshot load resets it. A parallel
+view's count is the sum of its W shards' totals, so it needs no lookups at all. The first read sums the
+shards on the workers in parallel. Serial programs report the same quantity. This changes the reported
+figure for views with duplicate rows, and it is now the figure ivm-bench's own `count(*)` over the written
+output gives: at SF25 batch 2 the old distinct counts disagreed with it on 13 of 96 views
+(`stg_customer_status_events` 209,771 against 1,974,862), the new ones on none. It also accounts for the
+TPC-DI `fact_watches` discrepancy (373,251 reported against 456,028 rows).
+
+Measured (xt25tws, segments GC, see below): batch 2 478 → 33.8 s, its slow tick 452 → 12.1 s, validated.
+
+Tests: `ViewRowCountTests` (a duplicate counts twice; serial and W = 1/2/4/7 counts equal the view's
+weights after every tick, read from tick 0 or later; a restore at 4 → 4 and 4 → 3, read once before the
+load). `ParallelOuterSemiJoinTests` and `ParallelArrowIngestTests` now compare against the weight sum.
+Mutants caught: a step not adding its delta, a load keeping a stale total, a parallel count reading one
+shard. Suites: default, forced and forced+critical each 3,768 passed, 1 skipped.
+
+#### 5.58.1 The batch-1 out-of-memory, again
+
+Under the reporter's settings, 2 of 5 full runs failed in batch 1's tick 18 at ~1,976 s, both at one site:
+three workers in `GroupProject` → `IndexedZSetBuilder.Build` → `BlockedGroups.Create` → `CountTied` → `At`
+→ `LazyTraceBlock.Load`, loading ~16.4 MB blocks (63,842 entries, one giant group), with 27.8–29.3 GiB in
+use and 48.9 GiB committed right after a compacting gen-2 collection. These are §5.38's failure, and the
+blocks are at the 16 MiB cap §5.38 introduced, so a block above a large-object region was not the whole
+cause. Leading explanation, unverified: under the regions GC the free space sits in small-object regions
+that cannot be handed to a 32 MiB large-object region without fresh commit, which the hard limit refuses.
+(Raising the limit would not obviously help: committed memory pins at whatever the limit is.) One run with
+the segments GC (`DOTNET_GCName=libclrgc.dylib`, `libclrgc.so` on Linux) passed that point and completed
+batch 1 in 2,612 s (regions runs 2,712–2,768 s). One pass at a 3-in-5 base rate is suggestive only.

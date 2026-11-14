@@ -88,6 +88,38 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
     /// <summary>The number of rows in <see cref="View"/>.</summary>
     public int ViewCount => _view.Count;
 
+    // The view's weights summed (SQL COUNT(*) of the view), kept once first read: until then a
+    // step pays nothing for it, so a program nobody counts never re-reads its deltas.
+    private long _totalWeight;
+    private bool _totalTracked;
+
+    /// <summary>Whether <see cref="TotalWeight"/> is kept current (so reading it is O(1)).</summary>
+    internal bool TotalWeightTracked => _totalTracked;
+
+    /// <summary>The sum of the view's weights — its row count with duplicates, SQL's
+    /// <c>COUNT(*)</c>. The first read sums the whole view; from then on each step adds its delta's
+    /// weights, O(|delta|). Read between steps, on the thread that steps the circuit or while it
+    /// is parked.</summary>
+    public long TotalWeight
+    {
+        get
+        {
+            if (!_totalTracked)
+            {
+                long total = 0;
+                foreach (var (_, weight) in _view.EnumerateWhole())
+                {
+                    total += weight.Value;
+                }
+
+                _totalWeight = total;
+                _totalTracked = true;
+            }
+
+            return _totalWeight;
+        }
+    }
+
     /// <summary>A row's weight in <see cref="View"/>.</summary>
     public Z64 WeightOf(TRow row) => _view.WeightOf(row);
 
@@ -127,6 +159,13 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
 
         _view.Integrate(delta);      // O(|delta|): fold the tick's delta into the view.
         _output.SetCurrent(delta);   // the delta flows through unchanged.
+        if (_totalTracked)
+        {
+            foreach (var (_, weight) in delta)
+            {
+                _totalWeight += weight.Value;
+            }
+        }
     }
 
     // §5.33: a kept delta lives to the end of the tick, so a large managed one (a view's whole tick of
@@ -178,6 +217,7 @@ internal sealed class IntegrateOp<TRow> : IOperator, ISnapshotable, IIntrospecta
         }
 
         // Lazily (increment 6): a row-ordered chain stays cold until rows are asked for.
+        _totalTracked = false;
         await _view.LoadAsync(_snapshotCodec, reader, "view.arrows", LazyViews, cancellationToken).ConfigureAwait(false);
     }
 

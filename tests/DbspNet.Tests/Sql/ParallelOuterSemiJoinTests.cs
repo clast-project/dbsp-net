@@ -213,13 +213,14 @@ public class ParallelOuterSemiJoinTests
                             + $"parallel: {string.Join(", ", actual.OrderBy(kv => kv.Key).Select(kv => $"[{kv.Key}]x{kv.Value}"))}");
                     }
 
-                    // The delta-maintained row count, first read at a seed-dependent tick
-                    // (before it the count is untracked), then advanced by every Step.
+                    // The delta-maintained row count (weights summed, SQL COUNT(*)), first read at a
+                    // seed-dependent tick (before it the count is untracked), then advanced by every Step.
                     if (t >= seed % 3)
                     {
+                        var weights = s.CurrentView.Sum(kv => kv.Value.Value);
                         Assert.True(
-                            s.CurrentView.Count == p.RowCount,
-                            $"view {name}, W={workers}, seed={seed}, tick {t}: RowCount {p.RowCount} != {s.CurrentView.Count}");
+                            weights == p.RowCount && weights == s.RowCount,
+                            $"view {name}, W={workers}, seed={seed}, tick {t}: RowCount {p.RowCount} (serial {s.RowCount}) != {weights}");
                     }
                 }
             }

@@ -63,7 +63,7 @@ public class ParallelArrowIngestTests
                     var expected = Materialize(serial.Outputs[view].CurrentView);
                     Assert.NotEmpty(expected);
                     Assert.Equal(expected, Materialize(parallel.Outputs[view].CurrentView));
-                    Assert.Equal(serial.Outputs[view].CurrentView.Count, parallel.Outputs[view].RowCount);
+                    Assert.Equal(serial.Outputs[view].CurrentView.Sum(kv => kv.Value.Value), parallel.Outputs[view].RowCount);
                 }
             }
         }

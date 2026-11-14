@@ -46,6 +46,13 @@ public sealed class IntegratedViewHandle<TRow>
     /// <summary>The number of rows in <see cref="Current"/>, without forming it.</summary>
     public int Count => _op.ViewCount;
 
+    /// <summary>The sum of the view's weights (SQL <c>COUNT(*)</c>, duplicates counted), kept current
+    /// once first read: the first read sums the view, later ones are O(1).</summary>
+    public long TotalWeight => _op.TotalWeight;
+
+    /// <summary>Whether <see cref="TotalWeight"/> is kept current, so reading it is O(1).</summary>
+    internal bool TotalWeightTracked => _op.TotalWeightTracked;
+
     /// <summary>A row's weight in <see cref="Current"/>, without forming it.</summary>
     public Z64 WeightOf(TRow row) => _op.WeightOf(row);
 
