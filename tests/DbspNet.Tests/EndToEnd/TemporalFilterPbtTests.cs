@@ -148,6 +148,118 @@ public class TemporalFilterPbtTests
             iter: 300);
     }
 
+    // Program arm (docs/design-program-temporal.md): the same windows split across views. Each shape
+    // is the program's views (the last one is checked), and the single query it must equal with the
+    // views written inline. Intermediate views are randomly outputs (own stream, seeded verdicts) or
+    // single-use (inlined into the consumer). The two-window union is the frontier-identity case;
+    // the filter over an aggregate view is the elided-exchange case on the parallel path.
+    private static readonly (string[] Views, string Single)[] ProgramShapes =
+    [
+        (["SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '3' SECOND",
+          "SELECT ts, COUNT(*) AS c FROM v0 GROUP BY ts"],
+         "SELECT ts, COUNT(*) AS c FROM (SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '3' SECOND) v0 GROUP BY ts"),
+        (["SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '2' SECOND",
+          "SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '5' SECOND",
+          "SELECT ts, COUNT(*) AS c FROM (SELECT ts FROM v0 UNION ALL SELECT ts FROM v1) u GROUP BY ts"],
+         "SELECT ts, COUNT(*) AS c FROM (SELECT ts FROM a WHERE ts > NOW() - INTERVAL '2' SECOND "
+            + "UNION ALL SELECT ts FROM a WHERE ts > NOW() - INTERVAL '5' SECOND) u GROUP BY ts"),
+        (["SELECT ts, SUM(v) AS s FROM a GROUP BY ts",
+          "SELECT ts, s FROM v0 WHERE ts > NOW() - INTERVAL '3' SECOND",
+          "SELECT ts, MAX(s) AS m FROM v1 GROUP BY ts"],
+         "SELECT ts, MAX(s) AS m FROM (SELECT ts, s FROM (SELECT ts, SUM(v) AS s FROM a GROUP BY ts) v0 "
+            + "WHERE ts > NOW() - INTERVAL '3' SECOND) v1 GROUP BY ts"),
+        (["SELECT ts, v FROM a WHERE ts BETWEEN NOW() - INTERVAL '4' SECOND AND NOW()",
+          "SELECT DISTINCT ts FROM v0"],
+         "SELECT DISTINCT ts FROM (SELECT ts, v FROM a WHERE ts BETWEEN NOW() - INTERVAL '4' SECOND AND NOW()) v0"),
+        (["SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '3' SECOND AND v > 0",
+          "SELECT x.ts, x.v, y.v AS w FROM v0 x JOIN v0 y ON x.ts = y.ts"],
+         "SELECT x.ts, x.v, y.v AS w FROM (SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '3' SECOND AND v > 0) x "
+            + "JOIN (SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '3' SECOND AND v > 0) y ON x.ts = y.ts"),
+        (["SELECT ts, v FROM a WHERE ts <= NOW()",
+          "SELECT v, COUNT(*) AS c FROM v0 GROUP BY v"],
+         "SELECT v, COUNT(*) AS c FROM (SELECT ts, v FROM a WHERE ts <= NOW()) v0 GROUP BY v"),
+    ];
+
+    private const string ProgramDdl = "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)";
+
+    private static (string[] Sql, HashSet<string> Outputs, string Last) ProgramOf(string[] views, bool intermediatesAreOutputs)
+    {
+        var sql = new List<string> { ProgramDdl };
+        var outputs = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < views.Length; i++)
+        {
+            sql.Add($"CREATE VIEW v{i} AS {views[i]}");
+            if (i == views.Length - 1 || intermediatesAreOutputs)
+            {
+                outputs.Add($"v{i}");
+            }
+        }
+
+        return ([.. sql], outputs, $"v{views.Length - 1}");
+    }
+
+    [Fact]
+    public void ProgramTemporalFilterEqualsSingleQueryAndBatch()
+    {
+        Gen.Select(Gen.Int[0, ProgramShapes.Length - 1], Gen.Bool, GenRun).Sample(
+            (shape, outs, run) => CheckProgram(ProgramShapes[shape], outs, run),
+            iter: 1000);
+    }
+
+    private static bool CheckProgram((string[] Views, string Single) shape, bool intermediatesAreOutputs, (InputEvent[] Events, long ClockDelta)[] run)
+    {
+        var (sql, outputs, last) = ProgramOf(shape.Views, intermediatesAreOutputs);
+        var program = SqlProgram.Compile(sql, outputs);
+
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement(ProgramDdl));
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(shape.Single))).Query;
+        var single = PlanToCircuit.Compile(plan);
+
+        var accumulated = ZSet<StructuralRow, Z64>.Empty;
+        var allEvents = new List<InputEvent>();
+        long clock = 0;
+        for (var t = 0; t < run.Length; t++)
+        {
+            clock += run[t].ClockDelta;
+            program.AdvanceClock(clock);
+            single.AdvanceClock(clock);
+            foreach (var ev in run[t].Events)
+            {
+                program.Table("a").Insert(ev.Row);
+                single.Table("a").Insert(ev.Row);
+                allEvents.Add(ev);
+            }
+
+            program.Step();
+            single.Step();
+            accumulated += single.Current;
+            if (!program.Outputs[last].CurrentView.Equals(accumulated))
+            {
+                Console.Error.WriteLine($"program: {string.Join("; ", sql)}  outputs={string.Join(",", outputs)}  tick {t}  clock={clock}");
+                Console.Error.WriteLine("single:  " + accumulated);
+                Console.Error.WriteLine("program: " + program.Outputs[last].CurrentView);
+                return false;
+            }
+        }
+
+        var ctx = new BatchEvalContext(
+            new Dictionary<string, ZSet<StructuralRow, Z64>>(StringComparer.Ordinal) { ["a"] = IncrementalOracle.NetTable(allEvents, "a") },
+            new Dictionary<CteRef, ZSet<StructuralRow, Z64>>(),
+            now: clock);
+        var batch = BatchPlanEvaluator.Evaluate(plan, ctx);
+        if (!accumulated.Equals(batch))
+        {
+            Console.Error.WriteLine($"single vs batch: {shape.Single}  finalClock={clock}");
+            Console.Error.WriteLine("single: " + accumulated);
+            Console.Error.WriteLine("batch:  " + batch);
+            return false;
+        }
+
+        return true;
+    }
+
     private static bool CheckParallel(
         string sql, string ddl, string table, (InputEvent[] Events, long ClockDelta)[] run, long start = 0)
     {

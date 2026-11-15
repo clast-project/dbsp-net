@@ -9,9 +9,10 @@ using DbspNet.Sql.TypeSystem;
 namespace DbspNet.Sql.Plan;
 
 /// <summary>
-/// Identity of a declared <c>LATENESS</c> source: a base-table column. The
-/// compiler creates one frontier per source; a derived monotone column carries
-/// the set of sources whose frontiers jointly bound it.
+/// Identity of a frontier source: a declared <c>LATENESS</c> base-table column, or a temporal
+/// filter's window (<see cref="MonotonicityAnalyzer.TemporalSource"/>). The compiler creates one
+/// frontier per source; a derived monotone column carries the set of sources whose frontiers
+/// jointly bound it.
 /// </summary>
 public readonly record struct LatenessSource(string Table, int Column);
 
@@ -194,24 +195,20 @@ public static class MonotonicityAnalyzer
                 // Schema is the input's; monotonicity passes through. A disappear
                 // (upper) bound additionally means the advancing clock bounds the
                 // time-key column from below — rows whose key falls below
-                // clock − offset are expired and never re-emitted — so when the
-                // time key is a base-table column scanned directly below, mark it
-                // monotone. Its source identity reuses the column's
-                // LatenessSource; PlanToCircuit registers the matching clock-driven
+                // clock − offset are expired and never re-emitted — so mark that
+                // column monotone, whatever the input is: the bound comes from the
+                // clock alone. Its source is the filter's window
+                // (TemporalSource); PlanToCircuit registers the matching clock-driven
                 // frontier so downstream GROUP BY / join / DISTINCT can GC.
                 var input = Visit(tf.Input, memo);
                 var cols = (MonotoneColumn?[])input.Clone();
-                if (tf.DisappearOffset is not null
-                    && tf.Input is ScanPlan scan
-                    && TemporalKeySource(tf.TimeKey) is { } src
-                    && src.Column >= 0 && src.Column < cols.Length)
+                if (TemporalSourceOf(tf) is { } source && source.Column < cols.Length)
                 {
                     // Mark the *source* column monotone (identity transform); the
                     // frontier PlanToCircuit registers for it is already in that
                     // column's value space, and a derived key like
                     // CAST(ts AS DATE) picks up its own transform via FromExpr.
-                    cols[src.Column] = new MonotoneColumn(
-                        new HashSet<LatenessSource> { new(scan.TableName, src.Column) }, null);
+                    cols[source.Column] = new MonotoneColumn(new HashSet<LatenessSource> { source }, null);
                 }
 
                 return cols;
@@ -374,6 +371,26 @@ public static class MonotonicityAnalyzer
     /// source-bearing — the filter is still correct, it just advertises no
     /// frontier. Shared with <c>PlanToCircuit</c> so the two stay in lockstep.</summary>
     internal readonly record struct TemporalKeySourceInfo(int Column, bool CastTimestampToDate);
+
+    /// <summary>
+    /// The frontier source a disappear-bounded temporal filter advertises on the input column its
+    /// time key reduces to, or null when it advertises none (docs/design-program-temporal.md §2 Q2).
+    /// The frontier's value is <c>transform(clock) − offset</c> in that column's space, so its
+    /// identity is the window — clock unit, offset, whether the key is <c>CAST(ts AS DATE)</c> —
+    /// not the table: two filters with the same window share one frontier, and two with different
+    /// windows get two, which a union then combines by minimum. (Keying it by the base column let
+    /// the first window registered stand for every other on that column.)
+    /// </summary>
+    internal static LatenessSource? TemporalSourceOf(TemporalFilterPlan tf) =>
+        tf.DisappearOffset is { } offset && TemporalKeySource(tf.TimeKey) is { Column: >= 0 } src
+            ? TemporalSource(tf.Clock, offset, src.CastTimestampToDate, src.Column)
+            : null;
+
+    // The \u0001 prefix keeps a window source from ever equalling a declared LATENESS column.
+    private static LatenessSource TemporalSource(TemporalClock clock, long offset, bool castTimestampToDate, int column) =>
+        new(string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"\u0001now:{clock}:{offset}:{(castTimestampToDate ? "date" : "key")}"), column);
 
     internal static TemporalKeySourceInfo? TemporalKeySource(ResolvedExpression key) => key switch
     {

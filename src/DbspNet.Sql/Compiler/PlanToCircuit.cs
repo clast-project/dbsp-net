@@ -235,11 +235,11 @@ public static partial class PlanToCircuit
     }
 
     /// <summary>
-    /// Register each temporal filter's clock-driven frontier (clock − offset) on its time-key
-    /// column, so downstream stateful operators GC the same way they do for a declared LATENESS
-    /// column. A column already bounded by LATENESS keeps that frontier (skip on collision) — the
-    /// late-drop bound is sound on its own. On a parallel build every replica reads its own copy of
-    /// the clock, which <c>ParallelCircuit.AdvanceTime</c> sets identically.
+    /// Register each temporal filter's clock-driven frontier (clock − offset), keyed by its window
+    /// (<see cref="MonotonicityAnalyzer.TemporalSourceOf"/>), so downstream stateful operators GC
+    /// the same way they do for a declared LATENESS column. A source already registered is the same
+    /// window, so the same value: registering it once is enough. On a parallel build every replica
+    /// reads its own copy of the clock, which <c>ParallelCircuit.AdvanceTime</c> sets identically.
     /// </summary>
     private static void RegisterTemporalFrontiers(
         CircuitBuilder builder,
@@ -532,6 +532,11 @@ public static partial class PlanToCircuit
                     }
 
                     var optimizedQuery = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(viewQuery);
+
+                    // This view's temporal filters' clock frontiers, into the program-wide set
+                    // (docs/design-program-temporal.md §2 Q2) — an inlined view's too, since its
+                    // body compiles under its consumer.
+                    RegisterTemporalFrontiers(builder, CollectScans(optimizedQuery).Temporal, frontiers);
 
                     // An inlined view builds no stream of its own: its consumer compiles
                     // this plan in place of the reference (its operators carry the
@@ -2002,13 +2007,13 @@ public static partial class PlanToCircuit
     private sealed record ScanInfo(Schema Schema, IReadOnlyDictionary<int, long>? Lateness);
 
     /// <summary>
-    /// A clock-driven frontier a temporal filter advertises on the base-scan
-    /// source column its time-key reduces to: the column's
-    /// <see cref="LatenessSource"/>, the disappear offset, the clock value space
-    /// (<see cref="Clock"/>), and whether the key was <c>CAST(ts AS DATE)</c> (so
-    /// the source column is the µs timestamp while the filter ran in day units).
-    /// The GC frontier is <c>transform(clock) − Offset</c> mapped into the source
-    /// column's space (see <see cref="ClockOffsetTransform"/>).
+    /// A clock-driven frontier a temporal filter advertises on the input column its time key
+    /// reduces to: its window <see cref="LatenessSource"/>
+    /// (<see cref="MonotonicityAnalyzer.TemporalSourceOf"/>), the disappear offset, the clock value
+    /// space (<see cref="Clock"/>), and whether the key was <c>CAST(ts AS DATE)</c> (so the column is
+    /// the µs timestamp while the filter ran in day units). The GC frontier is
+    /// <c>transform(clock) − Offset</c> mapped into the column's space (see
+    /// <see cref="ClockOffsetTransform"/>).
     /// </summary>
     private readonly record struct TemporalFrontierSpec(
         LatenessSource Source, long Offset, TemporalClock Clock, bool CastTimestampToDate);
@@ -2264,16 +2269,15 @@ public static partial class PlanToCircuit
                     Walk(f.Input);
                     break;
                 case TemporalFilterPlan tf:
-                    // A disappear-bounded temporal filter whose time-key reduces to
-                    // a base-scan column (bare, or CAST(ts AS DATE)) advertises a
-                    // clock-driven GC frontier on that source column. Matches the
-                    // source MonotonicityAnalyzer marks for the same node.
-                    if (tf.DisappearOffset is { } off
-                        && tf.Input is ScanPlan tfScan
+                    // A disappear-bounded temporal filter whose time key reduces to an
+                    // input column (bare, or CAST(ts AS DATE)) advertises a clock-driven
+                    // GC frontier, identified by its window. Matches the source
+                    // MonotonicityAnalyzer marks for the same node.
+                    if (MonotonicityAnalyzer.TemporalSourceOf(tf) is { } source
                         && MonotonicityAnalyzer.TemporalKeySource(tf.TimeKey) is { } src)
                     {
                         temporal.Add(new TemporalFrontierSpec(
-                            new LatenessSource(tfScan.TableName, src.Column), off, tf.Clock, src.CastTimestampToDate));
+                            source, tf.DisappearOffset!.Value, tf.Clock, src.CastTimestampToDate));
                     }
 
                     Walk(tf.Input);
