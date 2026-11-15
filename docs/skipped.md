@@ -787,8 +787,10 @@ reflect that shape, not a backlog.
   (incremental output at the final clock == batch with `NOW` = that clock); the
   clock doubles as a watermark so a windowed (disappear-bounded) filter GCs both
   its own state and a downstream `GROUP BY`/join/`DISTINCT` on the time-key. See
-  [`now-and-temporal-filters.md`](now-and-temporal-filters.md). Deferred:
-  `CURRENT_DATE`/`CURRENT_TIME`; spine sibling; a transition-time index (per-tick
+  [`now-and-temporal-filters.md`](now-and-temporal-filters.md). `CURRENT_DATE`
+  is **implemented** as a day-granular form of the same clock; `CURRENT_TIME`
+  is rejected by design (it wraps at midnight, so it is not monotone).
+  Deferred: spine sibling; a transition-time index (per-tick
   recompute is O(state)); monotone-expression time-keys / non-direct-scan inputs
   for downstream GC; typed fast path; WAL per-tick clock recording.
 - **[P3]** `WATERMARK` (experimental in Feldera).
@@ -840,12 +842,9 @@ Feldera. Each is enforced by `DbspNet.Sql.Plan.Resolver` with an explicit
   running compiled key delegates. A monotone key (e.g. `CAST(ts AS DATE)`) picks
   up a temporal filter's day-space GC frontier directly — no derived-table
   workaround.
-- **Outer joins** (`LEFT` / `RIGHT [OUTER] JOIN`) still require at least one
-  equi-key conjunct in `ON`; their keyed match-presence tracking has no
-  keyless operator. `INNER JOIN` no longer has this restriction — pure-
-  inequality joins (`ON a.x > b.y`) and cross joins (`ON TRUE` / `CROSS JOIN`)
-  are supported via the unit-key nested-loop path (see the `CROSS JOIN` /
-  non-equi `INNER JOIN` entry under SQL surface → Query constructs).
+- ~~Outer joins require an equi-key~~ — **lifted.** `LEFT` / `RIGHT` / `FULL`
+  joins accept a non-equi residual and need no equi-key at all (see the
+  `[DONE]` outer-join entry under SQL surface → Query constructs).
 - **[P1]** `SELECT *` is forbidden with `GROUP BY` / aggregates. Feldera
   (via Calcite) rewrites to an explicit column list during resolution.
 - **[P1]** Scalar function library. Currently supported:

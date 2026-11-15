@@ -1,427 +1,325 @@
 # DbspNet
 
-A research-grade C# / .NET 10 reimplementation of the DBSP (Database Stream
-Processor) incremental-computation model, as described in Budiu et al.,
+DbspNet is a C# / .NET 10 implementation of DBSP, the incremental view
+maintenance model from Budiu et al.,
 *DBSP: Automatic Incremental View Maintenance for Rich Query Languages*
-(VLDB 2023), and as exhibited in [Feldera](https://github.com/feldera/feldera)'s
-Rust runtime. The code is written from the paper, not translated from Rust.
+(VLDB 2023). [Feldera](https://github.com/feldera/feldera)'s Rust runtime is the
+reference implementation. DbspNet was written from the paper, not translated
+from Rust.
 
-DBSP turns SQL queries into circuits that process input *changes* and emit
-output *changes* — so a view can be kept up-to-date at a cost proportional
-to the size of the change, not the size of the data.
+DBSP compiles SQL views into circuits that consume input *changes* and emit
+output *changes*. Each update costs time proportional to the change, not to the
+size of the data.
 
-This repository is a **prototype**: it targets a small, honest slice of SQL
-end-to-end (CREATE TABLE / CREATE VIEW, SELECT with projection, filter, inner
-join, group-by aggregates). It is not a production system and makes no
-attempt at feature parity with Feldera. Features deferred from v1 are tracked
-in [`docs/skipped.md`](docs/skipped.md) against Feldera's real surface.
+It is a research project. It is not production software, and it does not aim
+for full parity with Feldera. Still, it runs a wide slice of SQL end to end on
+real benchmarks:
 
-For a map of the codebase — how a SQL query flows through the system,
-what each operator does, where to plug in — see
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+- **Nexmark.** On a 14-core M4 Pro with 10M events, DbspNet at 14 workers beats
+  Feldera on all 13 queries that both run, by 1.1× to 20× (2026-11-02). See
+  [`docs/benchmarks-comparison.md`](docs/benchmarks-comparison.md).
+- **TPC-DI.** This is the ivm-bench benchmark, which keeps 50 views up to date
+  with 12 workers at SF10. Batch 1 is at parity with Feldera (2026-11-14). See
+  [`docs/design-tpcdi-batch1.md`](docs/design-tpcdi-batch1.md).
 
-## Layout
+[`ARCHITECTURE.md`](ARCHITECTURE.md) maps the codebase.
+[`docs/skipped.md`](docs/skipped.md) lists what is deliberately missing.
 
-```
-src/
-  DbspNet.Core         algebra, Z-sets, circuit runtime, operators
-                       (both flat and spine/LSM trace families)
-  DbspNet.Sql          SQL parser, logical plan, plan→circuit compiler
-                       (structural + typed-row fast path),
-                       expression compiler, plan optimizer
-  DbspNet.Arrow        Arrow IPC boundary (RecordBatch ↔ Z-set delta)
-  DbspNet.Persistence  WAL, end-of-tick snapshots, snapshot+WAL hybrid
-                       over an IBlobStore abstraction
-  DbspNet.Demo         runnable end-to-end scenarios
-  DbspNet.Benchmarks   regenerates docs/benchmarks.md; also hosts the
-                       Feldera-compatible comparison workloads (Nexmark, fraud)
-tests/
-  DbspNet.Tests        unit + property-based tests
-ARCHITECTURE.md        codebase map: pipeline, operators, extension points
-docs/
-  design-notes.md      DBSP primer and implementation notes
-  persistence.md       persistence/recovery design and what shipped
-  benchmarks.md        regenerated; cold-batch vs incremental latency
-  benchmarks-comparison.md  Feldera-compatible Nexmark + fraud-detection runs
-  skipped.md           deferred features tracked against Feldera
-```
+## Build and test
 
-## Build & test
+You need the .NET 10 SDK. Package versions are pinned in `Directory.Packages.props`,
+and everything restores from nuget.org.
 
 ```
 dotnet build
-dotnet test
-dotnet run --project src/DbspNet.Demo
-dotnet run --project src/DbspNet.Benchmarks -c Release
+dotnet test                                  # ~2,300 tests, a few minutes
+dotnet run --project src/DbspNet.Demo        # five annotated scenarios
 ```
 
-Requires .NET 10 SDK. See [`docs/benchmarks.md`](docs/benchmarks.md) for
-performance numbers (cold-batch vs. steady-state incremental latency across
-four query shapes).
+## Quick start
 
-### Feldera comparison workloads
-
-Feldera-compatible workloads for cross-system performance comparison (the
-plan lives in `research/dbsp/performance_test.md`). Both systems run the
-same SQL over in-process generated data:
-
-```
-# Nexmark throughput (q0–q9, q12, q15–q22; q11 session-windows still unsupported):
-# events, batch size, runs, [workers]
-dotnet run --project src/DbspNet.Benchmarks -c Release -- nexmark 1000000 10000 3 8
-
-# Fraud detection rolling-window features: history txns, customers, batch, [workers]
-dotnet run --project src/DbspNet.Benchmarks -c Release -- fraud 500000 10000 10000 8
-
-# Both, with defaults, into docs/benchmarks-comparison.md
-dotnet run --project src/DbspNet.Benchmarks -c Release -- comparison
-```
-
-The optional trailing `workers` arg (default: host core count) runs the
-data-parallel path (`ParallelCircuit`) alongside W=1 and reports the speedup —
-pin it to Feldera's worker count for an apples-to-apples comparison. Each
-parallel result is cross-checked against the W=1 replica run; queries with no
-correct parallel form (a global TOP-K, or the fraud window-aggregate feature
-view) are reported as *single-only*, and for fraud the parallelizable
-`transactions ⋈ customers` slice is measured instead.
-
-See [`docs/benchmarks-comparison.md`](docs/benchmarks-comparison.md) for the
-DbspNet-side numbers and the queries that do / don't yet compile.
-
-## Walkthrough: one SQL query, running incrementally
-
-The pipeline is `SQL text → Parser → Resolver → LogicalPlan → PlanToCircuit
-→ CompiledQuery`. The `CompiledQuery` exposes input handles for each source
-table and an output handle exposing the current *delta* Z-set after every
-`Step()`. Push `INSERT`/`DELETE` deltas, call `Step()`, read the output —
-that's the whole loop.
+A query compiles to a `CompiledQuery`. To use it:
+1. Push inserts and deletes into its tables.
+2. Call `Step()`.
+3. Read `Current`, which holds this tick's output delta.
 
 ```csharp
 using DbspNet.Sql.Compiler;
+using DbspNet.Sql.Optimizer;
 using DbspNet.Sql.Parser;
 using DbspNet.Sql.Plan;
 
-var catalog = new Catalog();
-var resolver = new Resolver(catalog);
-
-// Register schema (populates the catalog so the query can resolve `orders`).
+var resolver = new Resolver(new Catalog());
 resolver.Resolve(Parser.ParseStatement(
     "CREATE TABLE orders (cust INT NOT NULL, amount INT NOT NULL)"));
 
-// Parse + resolve the query into a logical plan, then compile to a circuit.
 var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(
     "SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust"))).Query;
-var query = PlanToCircuit.Compile(plan);
+var query = PlanToCircuit.Compile(PlanOptimizer.Optimize(plan));
 
-// Tick 1: two orders land.
 query.Table("orders").Insert(1, 100);
 query.Table("orders").Insert(2, 50);
-query.Step();
-// query.Current is the delta emitted this tick:
-//   +1  (1, 100)
-//   +1  (2, 50)
+query.Step();          // Current: +1 (1, 100), +1 (2, 50)
 
-// Tick 2: customer 1 places another order. Incremental output retracts the
-// previous total for customer 1 and emits the new one — customer 2 is
-// untouched.
 query.Table("orders").Insert(1, 25);
-query.Step();
-// query.Current:
-//   -1  (1, 100)
-//   +1  (1, 125)
+query.Step();          // Current: -1 (1, 100), +1 (1, 125); customer 2 untouched
 ```
 
-`query.Current` is a `ZSet<StructuralRow, Z64>` — a weighted multiset of
-rows. Positive weights are insertions, negative weights are retractions.
-Summing the deltas tick-by-tick reconstructs the full view; the cost of each
-`Step()` is proportional to the delta, not the size of `orders`.
+`Current` is a `ZSet<StructuralRow, Z64>`, a multiset of rows with integer
+weights. A positive weight is an insert and a negative weight is a retraction.
 
-The five scenarios in [`src/DbspNet.Demo/Program.cs`](src/DbspNet.Demo/Program.cs)
-run this loop with explicit printouts and an end-of-run assertion that the
-accumulated output matches a batch re-computation. The first four cover filter,
-inner join, group-by, and joined group-by; the fifth streams a monotone
-event-time series under `LATENESS` and prints `CollectStats()` each tick, so you
-can watch the aggregate's retained state plateau (bounded memory) while the input
-grows and the GC frontier climbs.
+For several views over shared tables, compile them together as a **program**.
+`SqlProgram.Compile` turns a list of `CREATE TABLE` / `CREATE VIEW` statements
+into one circuit. Every view is optimized and built once and shared by the
+views that read it. Each output view is materialized in the circuit:
 
-## What works today
+```csharp
+var program = SqlProgram.Compile(
+    [
+        "CREATE TABLE orders (cust INT NOT NULL, amount INT NOT NULL)",
+        "CREATE VIEW totals AS SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust",
+        "CREATE VIEW big AS SELECT cust FROM totals WHERE total > 100",
+    ],
+    outputViews: new HashSet<string> { "big" });
+program.Table("orders").Insert(1, 125);
+program.Step();        // program.Outputs["big"].CurrentView holds (1)
+```
 
-- DDL: `CREATE TABLE` (with `NOT NULL`/`NULL`; `PRIMARY KEY` parsed but ignored;
-  per-column `LATENESS`; and a table-level `WITH ('append_only' = 'true')` property
-  declaring that rows are only inserted — which lets the optimizer narrow the input
-  of MIN/MAX/DISTINCT aggregates, see
-  [`design-row-representation.md`](docs/design-row-representation.md) §18.6),
-  `CREATE VIEW`.
-- Types: `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `DECIMAL(p,s)`,
-  `VARCHAR`, `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP`, `INTERVAL`. `DECIMAL` is Arrow-
-  aligned `Decimal128` (Int128 mantissa) via `Clast.DatabaseDecimal` with
-  native arithmetic and SQL-Server/Substrait result-type promotion;
-  `VARCHAR` is `Utf8String` (Arrow-aligned `ReadOnlyMemory<byte>`) with
-  native UTF-8 equality, ordering, hashing, code-point `LENGTH`, and
-  `Rune`-based invariant `UPPER`/`LOWER`. Temporal types use Arrow's
-  `Date32` / `Time64[microsecond]` / `Timestamp[microsecond]` (naive).
-  `INTERVAL` (`'…' YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`, `YEAR TO
-  MONTH`, `DAY TO SECOND`) is a `(months, microseconds)` value supporting
-  `date`/`time`/`timestamp ± interval` (calendar-aware month add; DATE
-  arithmetic is day-granular), `interval ± interval`, `interval ×/÷ numeric`,
-  and `date − date` / `ts − ts` → interval.
-- Queries: `SELECT` (list or `*`, with optional `DISTINCT`) with aliases and
-  scalar expressions, `FROM`
-  (single table, derived tables `(SELECT …) AS x`, `INNER JOIN … ON …`, or
-  `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN … ON …`, with `ON` or
-  `USING (cols)`), `WHERE`, `GROUP BY`,
-  `HAVING`, set operations `UNION ALL` / `UNION` / `INTERSECT` / `EXCEPT`
-  with per-column type unification (INTERSECT binds tighter; NULL=NULL for
-  matching), `WITH … AS (…)` CTEs (a CTE referenced twice compiles
-  to one shared subcircuit), and `WITH RECURSIVE … AS (base UNION ALL step)`
-  for transitive-closure-style queries (fully incremental — semi-naïve on
-  inserts, delete-and-re-derive on deletes — on both flat and spine traces).
-  `ORDER BY … LIMIT [OFFSET]` (and `FETCH FIRST n ROWS ONLY`) compile
-  to an incremental TOP-K operator; a bare `ORDER BY` (no limit) is a no-op
-  since row order is unobservable in the output Z-set. The ranking window
-  functions `ROW_NUMBER` / `RANK` / `DENSE_RANK` are supported in the
-  partitioned TOP-K filter pattern — `SELECT … FROM (SELECT …, ROW_NUMBER()
-  OVER (PARTITION BY p ORDER BY o) AS rn FROM …) WHERE rn <= k` — compiling to
-  a per-partition TOP-K operator (`RANK`/`DENSE_RANK` keep whole tie groups; an
-  empty `PARTITION BY` is a single global partition).
-- Window aggregates `SUM` / `COUNT` / `AVG` / `MIN` / `MAX` `OVER (PARTITION BY p
-  [ORDER BY o RANGE …])`, emitted as a new column on every row, for the three
-  `RANGE` frame shapes: whole-partition (no `ORDER BY`), running (the default
-  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`), and bounded
-  (`RANGE BETWEEN <const | day-time INTERVAL> PRECEDING AND CURRENT ROW`). Lowered
-  to a `PartitionedWindowAggregateOp` that recomputes only the rows whose frame a
-  tick changed (RANGE peer-group semantics; a bounded ascending frame over a
-  `LATENESS` / temporal-filter key GCs old rows). The offset / value functions
-  `LAG`/`LEAD(expr [, offset [, default]])` and `FIRST_VALUE`/`LAST_VALUE(expr)`
-  `OVER (PARTITION BY p ORDER BY o)` are also supported (positional, via
-  `PartitionedOffsetOp`; FIRST/LAST span the whole partition). `ROWS`/`GROUPS`
-  frames and `FOLLOWING` bounds are deferred.
-- Event-time windowing (TUMBLE / HOP). Tumbling windows via the
-  `GROUP BY TUMBLE(t, INTERVAL '…' …)` form with the `TUMBLE_START` / `TUMBLE_END`
-  projection functions, and sliding (and tumbling) windows via the
-  `TABLE(HOP(TABLE t, DESCRIPTOR(timecol), slide, size))` /
-  `TABLE(TUMBLE(…))` table-valued functions, which expose `window_start` /
-  `window_end` columns. Both are **pure lowering — no new operator**: window
-  assignment is an internal monotone bucket-floor scalar (`tumble_start`, the
-  arbitrary-interval generalisation of `DATE_TRUNC`), so a tumbling window is a
-  `GROUP BY` over that expression and a HOP fans each row out to its `size/slide`
-  overlapping windows as a `UNION ALL` of shifted projections. A tumbling
-  `GROUP BY` on the window start is GC-able under `LATENESS` / clock watermarks
-  exactly like `date_trunc` (a window is dropped only once the watermark passes
-  its end); these queries compile on the typed / data-parallel path. Unlocks
-  Nexmark q5 / q7 / q8 / q12. **Deferred**: SESSION (gap-merged) windows; HOP-window
-  GC (correct but unbounded state today); a `(SELECT …)` subquery as a TVF source.
-- Scalar subqueries (uncorrelated, exactly one column) in `WHERE`, `SELECT`,
-  and `HAVING` expressions. Empty subquery → `NULL`; changing subquery
-  value correctly retracts and re-emits outer rows.
-- Expressions: literals, column refs, arithmetic (`+ - * / %`), comparison
-  (`= <> < <= > >= IS [NOT] NULL`), boolean (`AND OR NOT`) with SQL three-valued
-  logic, `CAST`, and `CASE WHEN ... THEN ... [ELSE ...] END` (both the
-  searched and the simple `CASE x WHEN v ...` form). CASE branches evaluate
-  lazily and an arm is taken only on a definite TRUE (NULL/FALSE fall through).
-  The conditional functions `IIF(c, a, b)` and `DECODE(...)` desugar to CASE
-  (DECODE matches `NULL = NULL`, per Oracle). `[NOT] BETWEEN` desugars to a
-  comparison conjunction. The `||` string-concatenation operator propagates
-  NULL (unlike PG-style `CONCAT`, which skips NULLs). `IS [NOT] DISTINCT
-  FROM` gives NULL-safe (in)equality (always a definite boolean). `IS [NOT]
-  TRUE` / `FALSE` / `UNKNOWN` are definite-boolean tests over a boolean
-  operand (NULL never leaks through).
-- Scalar functions: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `UPPER`,
-  `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING`/`SUBSTR`, `TRIM`/`LTRIM`/`RTRIM`
-  (whitespace or a custom char set), `REPLACE`, `POSITION(x IN y)`/`STRPOS`,
-  `SPLIT_INDEX`/`SPLIT_PART`,
-  `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`,
-  `LOG` (base-10, or `LOG(b, x)`), `EXP`. String functions are native UTF-8
-  with code-point semantics. NULL semantics follow PostgreSQL (most propagate;
-  `CONCAT`/`GREATEST`/`LEAST` skip NULLs).
-- Aggregates: `SUM`, `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT x)` (exact),
-  `MIN`, `MAX`, `AVG`,
-  `APPROX_COUNT_DISTINCT` (HyperLogLog; bounded state, exact in the
-  small-cardinality regime), and approximate quantiles —
-  `APPROX_PERCENTILE(x, f)`, `MEDIAN(x)`, and the ANSI ordered-set spellings
-  `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)` / `PERCENTILE_DISC` (DDSketch;
-  bounded state, ~1% relative error, fully invertible). NULL skipping per SQL
-  semantics; `COUNT(*)` counts all. Any aggregate accepts a
-  `FILTER (WHERE …)` clause (e.g. `COUNT(*) FILTER (WHERE price < 10000)`).
-- `LATENESS` bounded-history GC: a column declared `LATENESS d` in
-  `CREATE TABLE` (e.g. `ts TIMESTAMP NOT NULL LATENESS 10000000`) promises no
-  future row's value falls more than `d` below the running maximum. The engine
-  drops late rows at the input and advertises a monotone frontier
-  (`max_seen − d`); a monotonicity analysis (`MonotonicityAnalyzer`) propagates
-  it through filters, projections, joins, aggregates, and set ops, and every
-  keyed stateful operator — `IncrementalAggregateOp`, inner / `LEFT` / `RIGHT`
-  join, `DistinctOp`, and their spine siblings — garbage-collects trace state
-  below the frontier. GC reduces *state*, never *output*: the last value of a
-  collected group stays downstream. The frontier source (`max_seen`) is
-  persisted, so a restored circuit resumes its late-drop consistently with the
-  GC'd traces. This is what keeps long-running, append-mostly pipelines
-  bounded-memory. On the spine traces, GC is compaction-folded — each batch
-  records its min/max monotone-key projection, so `DropKeysBelow` dispatches
-  per batch (whole-batch drop / keep-in-place / mask-filter) at O(touched
-  batches) and preserves batch / level layout. The bound is written in
-  native units (µs for `TIMESTAMP`, days for `DATE`, the integer itself for
-  `BIGINT`); duration-literal sugar (`'1' HOUR`) and a first-class
-  `INTERVAL` type are deferred.
-- Temporal filters (`NOW()` / `CURRENT_TIMESTAMP`): the `mz_now()`-style
-  advancing-clock feature. `NOW()` is an injected, monotone, persisted logical
-  clock (host-driven via `RootCircuit.AdvanceTime` / `CompiledQuery.AdvanceClock`,
-  microseconds — never the wall clock, so replay is deterministic), legal only
-  in WHERE predicates of the form `ts {<|<=|>|>=} NOW() [± constant day-time
-  INTERVAL]` (e.g. `WHERE ts > NOW() - INTERVAL '1' HOUR`; both operand orders;
-  `BETWEEN` folds into one window). These lower to a time-driven
-  `TemporalFilterOp` that emits inserts and retractions as the clock advances
-  *with no new input* — a row is retracted on the tick the clock crosses its
-  upper bound. `NOW()` anywhere else is a resolve error. The clock doubles as a
-  watermark: a windowed (disappear-bounded) filter bounds both its own state and
-  a downstream `GROUP BY` / join / `DISTINCT` on the time-key, reusing the
-  LATENESS frontier machinery. Correctness is the redefined incremental≡batch
-  oracle (output accumulated at the final clock equals the batch evaluated with
-  `NOW` = that clock). Deferred: `CURRENT_DATE` / `CURRENT_TIME`, a spine
-  sibling, and the typed fast path. See `docs/now-and-temporal-filters.md`.
-- Plan optimizer (`DbspNet.Sql.Optimizer.PlanOptimizer`, explicit pass):
-  predicate pushdown (through Project / Join / UnionAll / Distinct /
-  Difference, respecting outer-join restrictions), projection
-  composition, and aggregate-input column pruning. Apply with
-  `Compile(Optimize(plan))`.
-- Typed-row fast path: `PlanToCircuit.Compile` tries `TypedPlanCompiler`
-  first — when in scope, every stage's stream carries a per-schema
-  emitted struct rather than a boxed `StructuralRow`, with only the
-  input/output boundary paying a structural↔typed conversion. Falls back
-  to the structural compile transparently on anything out of scope.
-- Arrow boundary (`DbspNet.Arrow`): `CompiledQuery.ToArrowDelta()` and
-  `TableInput.PushArrow(RecordBatch[, weights])` for column-major,
-  type-dispatched I/O; opt-in `PushArrowZeroCopy` aliases Arrow buffers
-  without copying. Z-set weights ride on the wire as a trailing
-  `__weight : Int64` column. IPC streaming via `WriteArrowStream` /
-  `ReadArrowStream` (one-shot snapshots) and `OpenArrowDeltaWriter` /
-  `ReadArrowStreamBatches` (multi-batch pipelines).
-- Persistence (`DbspNet.Persistence`): WAL of input deltas (approach A),
-  end-of-tick snapshots (B), and snapshot+WAL hybrid (C) — all layered
-  on an `IBlobStore` abstraction modelled on S3 / GCS / Azure Blob, with
-  built-in `LocalFileBlobStore` and `InMemoryBlobStore`. Every stateful
-  SQL operator (`DistinctOp`, `IncrementalAggregateOp`,
-  `IncrementalJoinOp`, `IncrementalLeftJoinOp`, `SemiNaiveFixpointOperator`)
-  round-trips its trace as Arrow IPC; manifests carry plan + schema
-  fingerprints so drift is caught on `Load`. See
-  [`docs/persistence.md`](docs/persistence.md).
-- Spine (`DbspNet.Core.Operators.Stateful.Spine`): LSM-style sibling
-  trace family — `SpineZSetTrace` / `SpineIndexedZSetTrace` hold the
-  integral as a tiered sequence of immutable sorted-columnar batches
-  with configurable compaction, per-batch Arrow IPC snapshot, and
-  optional disk spill via `SpineSpillConfig`. Every flat operator has
-  a spine-backed counterpart (`SpineDistinctOp`,
-  `SpineIncrementalAggregateOp`, `SpineIncrementalJoinOp`,
-  `SpineIncrementalLeftJoinOp`). Emitted by the SQL compiler via
-  `PlanToCircuit.Compile(plan, snapshotCodecs, new CompileOptions {
-  TraceFamily = TraceFamily.Spine })` — on both compiler paths: the
-  structural compile supplies `StructuralRowComparer` for the sorted
-  batches; the typed-row fast path closes the spine operators over
-  emitted struct row types whose `IComparable<TSelf>` is generated by
-  `TypedRowEmitter`, so `Comparer<TRow>.Default` drives the sort
-  without a per-schema comparer object. Snapshot round-trips and the
-  random-query equivalence PBT both run green on the spine path.
-  Recursive CTEs honour spine too: the nested fixpoint circuit's
-  import-relation integrals use a `SpineZSetTrace` in spine mode (its loop
-  body is stateless, so the import integral is the only trace).
-- Runtime observability (`RootCircuit.CollectStats()` /
-  `CompiledQuery.CollectStats()`): an opt-in, on-demand per-operator metrics
-  snapshot over the registered operators — each stateful operator reports its
-  retained-state size, last-tick output size, current GC frontier and cumulative
-  GC drops (as an `OperatorStat` keyed by the operator's registration index).
-  The headline use is watching trace state stay bounded as a `LATENESS` / clock
-  watermark advances — you can see groups GC'd and the frontier climb.
-  `RootCircuit.LastStepDuration` exposes the most recent tick's wall-clock cost
-  for throughput tracking. Stateless operators are omitted; reads never touch the
-  hot `Step` path (a spine trace's count materialises only when asked).
-- Correctness: 840+ unit tests plus property-based tests (≥3000 CsCheck
-  iterations) across 40 query templates, run both with and without the
-  optimizer and on both trace families — semantic equivalence is
-  continuously verified. A dedicated `LATENESS` property test checks that
-  the incremental run with trace GC equals a batch evaluation over the
-  non-late input. Persistence has end-to-end snapshot round-trip coverage
-  for every stateful operator (in isolation and in compositions, including
-  the `LATENESS` frontier), plus crash-point coverage for the atomic-write
-  protocol.
+To run on W workers, use `SqlProgram.TryCompileParallel(..., workers, out var p)`.
+The single-query form is `PlanToCircuit.TryCompileParallel`. Both return `false`
+when the plan can't be sharded soundly; compile serially in that case, and use
+`SqlProgram.ParallelBlockers` to see why.
 
-## What's deferred
+## SQL support
 
-See [`docs/skipped.md`](docs/skipped.md). The short list of v1 restrictions
-beyond "Feldera is much bigger":
+The dialect follows PostgreSQL by default. It has switches for Feldera and Spark
+behaviour, such as NULL collation and numeric↔string coercion.
 
-- `INNER JOIN` supports any `ON` predicate, including non-equi
-  (`ON a.x > b.y`) and `CROSS JOIN` — with no equi-key the join runs as a
-  unit-key nested-loop cross product with the `ON` predicate applied as a
-  residual filter. `LEFT` / `RIGHT` / `FULL [OUTER] JOIN` require at least one
-  equi-key in `ON` and reject non-equi residual conjuncts (keyed
-  match-presence tracking). Comma-join (`FROM a, b`, implicit cross join) is
-  supported; `NATURAL JOIN` is not yet parsed.
-- Subqueries cover all the row-filter shapes — scalar (one column),
-  `IN (subquery)`, `NOT IN (subquery)` (full SQL 3VL including
-  nullable operands), `EXISTS (subquery)`, and `NOT EXISTS (subquery)`
-  — both uncorrelated AND **correlated** (single level; the resolver
-  decorrelates against an inner-WHERE equi-predicate referencing an
-  outer column). Correlated `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS`
-  lift to a multi-key `SemiJoinPlan` (with `IsAnti=true` for the
-  NOT-forms; compiled as `outer − SemiJoin(outer, sq)` via the
-  existing Z-set subtraction). Nullable `NOT IN` adds a hidden
-  per-correlation-group null-count column (via
-  `CorrelatedScalarSubqueryJoinPlan` or `ScalarSubqueryJoinPlan`)
-  filtered on `probe IS NOT NULL AND (null_count IS NULL OR = 0)`
-  before the anti-semi-join. Correlated scalar lifts to a
-  `CorrelatedScalarSubqueryJoinPlan` whose inner aggregate is
-  augmented with a GROUP BY on the correlation columns.
-  `IN (literal_list)` / `NOT IN (literal_list)` are flat-AST.
-  In SELECT / HAVING / nested-boolean positions, the resolver lifts
-  `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` to a hidden
-  per-correlation-group `COUNT(*)` column layered via
-  `CorrelatedScalarSubqueryJoinPlan`; the bound AST node rewrites to
-  `COALESCE(count, 0) > 0` (or `= 0` when negated). Nullable-operand
-  `IN` / `NOT IN` in these positions get the full SQL three-valued
-  result: the resolver layers per-group match / total / null counts and
-  emits a `CASE` (`match>0 → TRUE`, empty group → `FALSE`,
-  NULL probe or a NULL subquery value with no match → `NULL`), with
-  `NOT IN` the three-valued negation.
-  **Deferred**: nested correlation (subquery-inside-subquery
-  referencing grand-outer columns).
-- `WITH RECURSIVE` evaluation is fully incremental (semi-naïve on inserts,
-  delete-and-re-derive on deletes), but the body may reference only base tables
-  and the self-ref — no aggregates, subqueries, outer joins, or nested recursion
-  inside the body.
-- Set ops: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` all supported;
-  `INTERSECT ALL` / `EXCEPT ALL` (bag-semantics variants) are deferred.
-- `CROSS JOIN` / non-equi `INNER JOIN` (unit-key nested loop) and
-  `FULL OUTER JOIN` (symmetric both-sides match-presence tracking) are
-  supported. `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH FIRST` compile to
-  incremental TOP-K — including ordering by non-selected columns / expressions
-  (carried as hidden columns). Windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` in
-  the partitioned TOP-K filter pattern are supported, as are window aggregates
-  (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER` with whole-partition / running / bounded
-  `RANGE` frames) and the offset / value functions `LAG`/`LEAD`/`FIRST_VALUE`/
-  `LAST_VALUE`; the general windowed *rank*-column form (a rank emitted on every
-  row) and `ROWS`/`GROUPS` frames are deferred. `LIKE` / `ILIKE` / `SIMILAR TO` (with optional `ESCAPE`, default
-  backslash) are supported — pattern matching lowered to a `Regex`, with the
-  contextual keywords leaving `like`/`to`/`escape` usable as identifiers.
-  `JOIN … USING` is supported (equi-join on the
-  named columns + merged-column projection; FULL merges via `COALESCE`); the
-  `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING|TRAILING| BOTH … FROM …)`
-  keyword spellings are not (use the comma / char-set forms).
-- Scalar function library covers the common arithmetic / string set
-  listed above plus temporal functions `EXTRACT(field FROM …)` /
-  `DATE_PART`, `DATE_TRUNC`, `DATEADD`, `DATEDIFF` (dispatched through an
-  `IScalarFunction` registry; `DATEADD`/`DATEDIFF` take a string-literal unit,
-  not SQL Server's bare keyword) and the POSIX-regex functions `REGEXP_LIKE` /
-  `REGEXP_REPLACE` / `REGEXP_SUBSTR` (optional `flags`, PostgreSQL replace
-  semantics). Missing pieces include other math (`SIN`/`COS`/`TAN`, `MOD`). `NOW`/`CURRENT_TIMESTAMP` is not in the registry —
-  being non-deterministic, it ships instead as advancing temporal filters (see
-  the streaming-features list above).
-- `NULL` literal has a concrete type (`INTEGER NULL`) rather than the
-  polymorphic "unknown" of PostgreSQL.
-- `INTERVAL` (core) and date/time arithmetic are supported on both the
-  structural and the typed fast path (temporal±interval, interval±interval,
-  interval×/÷numeric, temporal−temporal, and `CAST(string ↔ INTERVAL)` all lower
-  typed, so a temporal-arithmetic query keeps its data-parallel form); deferred
-  pieces are `INTERVAL` *stored columns* through the Arrow codec (intervals are
-  intermediate-only today) and `interval × decimal`.
+**DDL**
+- `CREATE TABLE`, with `NOT NULL` and per-column `LATENESS`. `PRIMARY KEY` is
+  parsed but ignored.
+- `WITH ('append_only' = 'true')` declares that a table only receives inserts,
+  which lets MIN, MAX and DISTINCT keep less state.
+- `CREATE VIEW`.
+- Nested `ROW(...)` column types, flattened to dotted leaf columns (`t.a.b`).
+
+**Types**
+- `INTEGER` (and `TINYINT` / `SMALLINT`, which widen to `INTEGER`), `BIGINT`,
+  `REAL`, `DOUBLE`.
+- `DECIMAL(p,s)`, stored as Arrow-aligned `Decimal128`.
+- `VARCHAR` / `CHAR` / `TEXT`, stored as native UTF-8 with code-point semantics.
+- `BOOLEAN`.
+- `DATE`, `TIME` and `TIMESTAMP`, using Arrow's microsecond layouts.
+- `INTERVAL`, holding year-month and day-time values with calendar-aware
+  arithmetic.
+
+**Queries**
+- `SELECT [DISTINCT]`, `WHERE`, `GROUP BY` (on any expression), `HAVING`, and
+  derived tables.
+- CTEs: a CTE used twice is built once. `WITH RECURSIVE` is fully incremental:
+  semi-naive on inserts, delete-and-re-derive on deletes.
+- Joins: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` and comma joins, with `ON`
+  (equi, computed-key or non-equi) or `USING`.
+- Set operations: `UNION [ALL]`, `INTERSECT`, `EXCEPT`.
+- Subqueries: scalar, `[NOT] IN`, and `[NOT] EXISTS`, both uncorrelated and
+  single-level correlated, with full three-valued `NOT IN`.
+- `ORDER BY … LIMIT / OFFSET / FETCH` runs as an incremental TOP-K. `NULLS FIRST`
+  and `NULLS LAST` are supported.
+- Window functions:
+  - `ROW_NUMBER`, `RANK` and `DENSE_RANK`, either as a column or filtered with
+    `rn <= k`, which compiles to a per-partition TOP-K.
+  - `SUM`, `COUNT`, `AVG`, `MIN` and `MAX` `OVER` whole-partition, running, or
+    bounded `RANGE` frames.
+  - `LAG`, `LEAD`, `FIRST_VALUE` and `LAST_VALUE` (`IGNORE NULLS` on the last two).
+  - Named `WINDOW` clauses.
+- Event-time windows: `GROUP BY TUMBLE(...)` with `TUMBLE_START` / `TUMBLE_END`,
+  and the `TABLE(TUMBLE(...))` / `TABLE(HOP(...))` table functions.
+
+**Expressions and functions**
+- Arithmetic, comparison and three-valued logic.
+- `CASE` (searched and simple), `IIF`, `DECODE`, `[NOT] BETWEEN`.
+- `IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE/FALSE/UNKNOWN`.
+- `CAST`, `TRY_CAST`, and typed literals (`DATE '…'`).
+- Pattern matching: `LIKE` / `ILIKE` / `SIMILAR TO` (with `ESCAPE`), `RLIKE`, and
+  `REGEXP_LIKE` / `REGEXP_REPLACE` / `REGEXP_SUBSTR`.
+- Strings: `||`, `CONCAT`, `CONCAT_WS`, `UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`,
+  `TRIM` / `LTRIM` / `RTRIM`, `REPLACE`, `POSITION` / `STRPOS`, `SPLIT_PART`,
+  `MD5`, `JSON_EXTRACT_STRING`.
+- Numeric: `ABS`, `FLOOR`, `CEIL`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `LN`, `LOG`, `EXP`.
+- General: `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`.
+- Temporal: `EXTRACT` / `DATE_PART`, `DATE_TRUNC`, `DATEADD`, `DATEDIFF`,
+  `[TRY_]STRPTIME`, and date/time ± interval arithmetic.
+
+**Aggregates**
+- `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, and exact `COUNT(DISTINCT)`.
+- The `STDDEV` and `VARIANCE` families.
+- `APPROX_COUNT_DISTINCT` (HyperLogLog).
+- `APPROX_PERCENTILE`, `MEDIAN`, and `PERCENTILE_CONT` / `PERCENTILE_DISC …
+  WITHIN GROUP` (DDSketch; exact for dates and timestamps).
+- Any aggregate accepts `FILTER (WHERE …)`.
+
+**Streaming**
+- `LATENESS d` on a column promises that values never fall more than `d` behind
+  the maximum seen. Late rows are dropped, and joins, aggregates and DISTINCT
+  garbage-collect state below the resulting frontier, which keeps long-running
+  pipelines in bounded memory.
+- `NOW()`, `CURRENT_TIMESTAMP` and `CURRENT_DATE` read a logical clock that the
+  host advances (`AdvanceClock`). It is persisted and deterministic. `WHERE ts >
+  NOW() - INTERVAL '1' HOUR` emits retractions as the clock moves, even on ticks
+  with no input.
+
+### Not supported (highlights)
+
+The full list is in [`docs/skipped.md`](docs/skipped.md).
+
+- `ROWS` / `GROUPS` frames and `FOLLOWING` bounds.
+- SESSION windows. HOP windows work but are not garbage-collected.
+- `NATURAL JOIN`, `INTERSECT ALL` and `EXCEPT ALL`.
+- Correlation more than one level deep. `WITH RECURSIVE` bodies are limited to
+  filters, projections, inner joins and `UNION ALL`.
+- Trigonometric functions and `MOD`. Use `%` instead of `MOD`.
+- The `SUBSTRING(s FROM a FOR b)` and `TRIM(LEADING … FROM …)` keyword forms.
+- `INTERVAL` as a stored (Arrow) column.
+- An interval `LATENESS` bound. The bound must be written in native units:
+  µs for `TIMESTAMP`, days for `DATE`.
+- `CURRENT_TIME`, which is rejected because it wraps at midnight.
+- DML, transactions, `ALTER`, `CREATE INDEX` and bind parameters. Data enters
+  through `Table(...).Push` or connectors.
+- `LATENESS` is not yet enforced on the program path. State there is
+  unbounded, but results are correct.
+
+## Engine
+
+- **Two compilers.** A typed fast path uses a struct emitted per schema. A
+  structural path uses boxed rows; it is the canonical path and handles
+  everything. A query falls back to structural without anything breaking.
+- **Optimizer.**
+  - Predicate pushdown and projection composition.
+  - Aggregate-input narrowing and join column pruning.
+  - Semi-join narrowing, plan-level CSE, and rank→TOP-K rewriting.
+  - Operator fusion and other compile-time rewrites (star joins, hot-key splits).
+- **Data-parallel execution.** `ParallelCircuit` hash-shards the input across W
+  workers. Exchanges repartition streams, small dimensions are broadcast, and a
+  global rank is computed by key range.
+- **State.**
+  - Trace state is held by default as reference-free byte blocks, so the GC sees
+    bytes, not object graphs.
+  - An LSM-style spine trace family is available through `TraceFamily.Spine`.
+  - Bounded-memory machinery: pressure levels, a block cache, and mid-batch and
+    in-step spilling to compressed run files. Most of it is opt-in.
+- **Persistence.**
+  - Crash-safe end-of-tick snapshots with plan and schema fingerprints.
+  - A WAL and snapshot+WAL hybrid.
+  - A tick journal of source offsets.
+  - One-commit parallel checkpoints.
+  - Re-sharding a checkpoint to another worker count.
+  - An opt-in run-file layout with incremental checkpoints and lazy restore.
+  
+  See [`docs/persistence.md`](docs/persistence.md).
+- **Arrow.** `TableInput.PushArrow` / `CompiledQuery.ToArrowDelta()` and IPC
+  streaming. Weights travel as a trailing `__weight` column.
+- **Connectors.** Delta Lake input (change data feed) and output (truncate,
+  changelog, or incremental with deletion vectors), and Parquet input. All run
+  through `PipelineRunner` / `ProgramRunner` with checkpoint policies.
+- **Observability.** `CollectStats()` reports each stateful operator's state
+  size, output size and GC frontier. `LastStepDuration`, and
+  `DBSPNET_PROFILE=1` for a per-batch phase and operator profile.
+
+## Server
+
+`DbspNet.Server` is a small HTTP control service that deploys a SQL program
+between Delta tables. ivm-bench uses it as its engine container. It plays the
+role of Feldera's pipeline manager.
+
+```
+docker build -f src/DbspNet.Server/Dockerfile -t dbspnet-server .   # listens on :8080
+```
+
+| Endpoint | What it does |
+|---|---|
+| `GET /healthz` | health check |
+| `POST /compile` | a dry run |
+| `POST /deploy` | takes a `ProgramSpec`: SQL statements, Delta inputs and outputs, optional snapshot directory and stored views |
+| `POST /resume` | starts the run |
+| `POST /wait` | returns when the inputs are drained and the outputs written |
+| `POST /pause` | |
+| `GET /stats` | |
+
+Configuration is all environment variables. The main ones:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DBSPNET_WORKERS` | 1 | worker count; falls back to serial, with a logged reason, if a view won't shard |
+| `DBSPNET_SNAPSHOT_DIR` | off | enables checkpoints and restore |
+| `DBSPNET_CHECKPOINT_INTERVAL_SECS` | 60 | snapshot interval; `batch` = every batch, `none` = journal only |
+| `DBSPNET_OUTPUT_MODE` | incremental | `truncate` rewrites each view every batch |
+| `DBSPNET_BROADCAST_MAX_ROWS` | 1000 | broadcast dimensions this small in parallel joins; `off` disables |
+| `DBSPNET_MEMORY_LIMIT_MIB` | GC limit | memory budget behind the pressure levels |
+| `DBSPNET_BLOCK_CACHE_MIB`, `DBSPNET_SPILL`, `DBSPNET_STEP_SPILL_ROWS` | off | bounded-memory eviction and spilling (see [`design-bounded-memory.md`](docs/design-bounded-memory.md)) |
+| `DBSPNET_PROFILE` | off | per-batch phase and operator profile |
+
+Many more `DBSPNET_*` switches exist. They are A/B opt-outs and measurement
+seams, documented where they are read.
+
+## Benchmarks
+
+```
+cd src/DbspNet.Benchmarks
+dotnet run -c Release                                   # latency report → docs/benchmarks.md
+dotnet run -c Release -- nexmark 10000000 10000 3 14    # events batch runs [workers] → docs/benchmarks-nexmark.md
+dotnet run -c Release -- fraud 500000 10000 10000 14    # history customers batch [workers] → docs/benchmarks-fraud.md
+```
+
+- **Nexmark.** The supported queries are q0–q5, q7–q9, q12, q15–q20 and q22.
+  SESSION windows block q11.
+- **Head-to-head.** `scripts/compare-nexmark.sh` runs DbspNet and Feldera on the
+  same host and prints a merged events/s table. Feldera needs
+  `scripts/feldera-nexmark-pregen.patch`. The checked-in head-to-head results
+  are hand-written sections of `docs/benchmarks-comparison.md`. The
+  `comparison` subcommand overwrites that file.
+- **Instruments.** The project also hosts about 40 measurement subcommands. For
+  example, `w1profile` measures bytes allocated per event, which stays stable
+  across hosts; see `Program.cs`.
+
+## Repository layout
+
+```
+src/
+  DbspNet.Core                      Z-sets, circuits, operators, parallel runtime, trace state
+  DbspNet.Sql                       parser, resolver, optimizer, compilers, programs
+  DbspNet.Arrow                     Arrow boundary
+  DbspNet.Persistence               checkpoints, WAL, journal, run files, block cache, spill
+  DbspNet.Connectors.Abstractions   connector interfaces, pipeline/program runners
+  DbspNet.Connectors.EngineeredWood Delta Lake + Parquet connectors
+  DbspNet.Server                    HTTP control service (ivm-bench engine)
+  DbspNet.Demo                      walkthrough scenarios
+  DbspNet.Benchmarks                benchmarks and measurement instruments
+tests/DbspNet.Tests                 unit, property-based (CsCheck) and conformance tests
+scripts/                            Nexmark head-to-head, checkpoint/ingest measurement
+docs/                               design notes, decisions, benchmark results
+```
+
+## Documentation guide
+
+`docs/` holds several kinds of document:
+- **Design notes** (`design-*.md`) are long-running journals. Each starts with a
+  design and then records measurements section by section. The newest sections
+  are the current state.
+- **Decisions** (`decision-*.md`, `comparison-feldera-decisions.md`).
+- **Research** (`research-*`).
+- **Dated benchmark results** (`*-bench.md`, `*.txt`).
+
+Start with:
+
+- [`design-notes.md`](docs/design-notes.md): a DBSP primer and the core implementation notes.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the codebase map and extension points.
+- [`persistence.md`](docs/persistence.md): checkpoints and recovery.
+- [`design-flat-trace-state.md`](docs/design-flat-trace-state.md): block-held trace state.
+- [`design-bounded-memory.md`](docs/design-bounded-memory.md): residency and spilling.
+- [`design-structural-parallel.md`](docs/design-structural-parallel.md): parallel compilation.
+- [`ivm-bench-gap-analysis.md`](docs/ivm-bench-gap-analysis.md): TPC-DI coverage.
+- [`benchmarks-comparison.md`](docs/benchmarks-comparison.md): Nexmark and fraud versus Feldera.
+- [`skipped.md`](docs/skipped.md): deferred features, with their Feldera counterparts.
 
 ## License
 

@@ -1,13 +1,20 @@
 # Persistence and recovery — design sketch
 
-Approaches (A), (B), and (C) below are implemented in
-`DbspNet.Persistence`. (D) — the log-structured trace itself — also
-ships, in `DbspNet.Core.Operators.Stateful.Spine`, with per-batch
-snapshotting and optional disk spill, and is now emitted by the SQL
-compiler on demand via `CompileOptions { TraceFamily = TraceFamily.Spine }`
-(the structural compile path; the typed-row fast path still emits the
-flat family). The historical design discussion follows; see "Current
-state" at the bottom for what shipped.
+All four approaches below have shipped: (A), (B) and (C) in
+`DbspNet.Persistence`, and (D), the log-structured spine trace, in
+`DbspNet.Core.Operators.Stateful.Spine` (selected with
+`CompileOptions { TraceFamily = TraceFamily.Spine }` on both compiler
+paths). The design discussion is kept for history. "Current state" at the
+bottom describes what ships today.
+
+Later work goes beyond this sketch. It added a tick journal, crash-safe
+parallel checkpoints, re-sharding to another worker count, a run-file
+state layout with incremental checkpoints and lazy restore, and
+block-held trace state that checkpoints from its own blocks. Those are
+summarised under "Current state". Their full designs are in
+[`design-durable-state.md`](design-durable-state.md),
+[`design-incremental-persistence.md`](design-incremental-persistence.md)
+and [`design-flat-trace-state.md`](design-flat-trace-state.md).
 
 The natural checkpoint point is a **step boundary**: between ticks every
 operator is in a consistent "end-of-tick T" state.
@@ -78,12 +85,8 @@ sequence of immutable batches in order of age/size.
   `RecursiveCteOp`) reads traces, so all of them would move onto the
   new abstraction.
 
-The Core-side rewrite of (D) has landed (see "What ships in (D) —
-spine" below): every flat operator has a spine-backed sibling, with
-per-batch snapshot and optional disk spill. The remaining piece is
-making the SQL compiler emit them — i.e. a `PlanToCircuit` toggle
-that builds a spine circuit instead of the flat one. Until then the
-SQL persistence layer (A/B/C) snapshots the flat traces.
+(D) has landed, including SQL compiler integration; see "What ships
+in (D) — spine" below. Flat traces remain the default.
 
 ## Could we build the spine on a generic LSM (RocksDB, etc.)?
 
@@ -155,71 +158,47 @@ out of (A) + (B) naturally.
 
 ## Current state
 
-| Approach | Status | Entry points |
-|---|---|---|
-| (A) input replay | Shipped | `WalRecorder(compiled, walStore)` |
-| (B) end-of-tick snapshot | Shipped | `Snapshot.Write` / `Snapshot.Read` |
-| (C) snapshot + WAL hybrid | Shipped | `WalRecorder(compiled, walStore, snapshotStore)` + `WalRecorder.WriteSnapshot()` |
-| (D) log-structured trace | Shipped in Core and emitted by the SQL compiler via `CompileOptions { TraceFamily = TraceFamily.Spine }` | `DbspNet.Core.Operators.Stateful.Spine.*` (`SpineDistinct`, `SpineIncrementalAggregate`, `SpineIncrementalJoin`, `SpineIncrementalLeftJoin`); see "Spine" below |
+| Piece | Entry points |
+|---|---|
+| (A) input replay | `WalRecorder.CreateAsync(compiled, walFs)` |
+| (B) end-of-tick snapshot | `Snapshot.WriteAsync` / `Snapshot.ReadAsync` |
+| (C) snapshot + WAL hybrid | `WalRecorder.CreateAsync(compiled, walFs, snapshotFs)` + `WriteSnapshotAsync` |
+| (D) log-structured trace | `CompileOptions { TraceFamily = TraceFamily.Spine }`; `DbspNet.Core.Operators.Stateful.Spine.*` |
+| Tick journal (offsets per batch, snapshot by policy) | `TickJournal`; `CheckpointPolicy` in `DbspNet.Connectors.Abstractions` (default: journal every batch, snapshot every 60 s) |
+| Parallel checkpoint (one commit for W workers) | `ParallelSnapshot.WriteAsync` / `ReadAsync` |
+| Re-shard a parallel snapshot to another W | `ParallelReshard.RewriteAsync` |
+| Run-file layout: incremental checkpoints, lazy restore, background compaction | `DBSPNET_STATE_LAYOUT=runs` (opt-in); `DbspNet.Persistence/Runs/` |
+| Block-held traces checkpoint as run chains from their blocks, restore lazily | `BlockedTraceCheckpoint`; on wherever `DBSPNET_TRACE_BLOCKS` holds a trace as blocks (default: all) |
+| Connector-driven checkpoints (state + source offsets) | `SnapshotCheckpointStore` (keeps 2 snapshots) |
 
 ### Storage abstraction
 
-The persistence layer is built on `IBlobStore` — a thin abstraction
-modeled on cloud object stores (S3 / GCS / Azure Blob):
+Persistence is written against `ITableFileSystem`
+(`DbspNet.Core/IO/ITableFileSystem.cs`), an async, path-keyed file
+abstraction: `ListAsync`, `OpenReadAsync` (random access), `CreateAsync`
+(sequential write), `RenameAsync`, `DeleteAsync`, `ExistsAsync`,
+`ReadAllBytesAsync`, and `WriteAllBytesAsync`. A store that also implements
+`IDurableTableFileSystem` gets explicit fsyncs during a commit. A store
+without it (an object store, `InMemoryTableFileSystem`) must make each
+write durable on return, and its `WriteAllBytesAsync` must be atomic.
 
-```csharp
-interface IBlobStore {
-    Stream OpenWrite(string key);   // atomic on Dispose
-    Stream OpenRead(string key);
-    bool Exists(string key);
-    void Delete(string key);
-    IEnumerable<string> ListKeys(string prefix);
-}
-```
+Multi-file state is replaced by writing every new file first and then
+committing a small pointer (`current.txt`) last. Partial state stays
+invisible until the pointer commits (see the commit protocol below).
 
-Keys are slash-delimited (`"snap-5/op-3/trace.arrows"`). The single
-durability primitive is **atomic single-blob write**: until
-`Dispose`, the blob doesn't exist (or has its old value); on
-`Dispose`, the new value appears atomically. This contract is true
-of S3/GCS/Azure PUTs and is implemented locally by
-`LocalFileBlobStore` via tmp+rename.
-
-There are no directory operations, no atomic rename, no batched
-multi-blob commits. To replace state across many blobs, callers
-write all the new blobs first under their final keys, then commit by
-writing a small pointer blob (`current.txt`) last — the partial
-intermediate state is invisible until the pointer commits.
-
-**Convenience overloads.** Every public entry point has both an
-`IBlobStore` form and a `string`-path form; the string form opens a
-`LocalFileBlobStore` rooted at the given directory. New callers
-should prefer the explicit `IBlobStore` form so a future cloud impl
-swaps in without a code change.
-
-**Built-in impls.** `LocalFileBlobStore` (filesystem) and
-`InMemoryBlobStore` (process-lifetime; useful as a test double for
-cloud-shaped backends and where filesystem I/O would slow tests
-down). Both pass the same `BlobStoreContractTests` conformance suite
-— including the cloud-relevant cases like "reads during in-flight
-write see the prior value."
-
-**Cloud impls.** Out-of-the-box this ships only the local + in-memory
-impls; cloud-flavored stores (S3, GCS, Azure) are expected to live in
-separate projects that depend on `DbspNet.Persistence` and implement
-`IBlobStore`. The `OpenWrite` stream is the natural place to back a
-multipart upload — each `Write` queues a part, `Dispose` finalizes
-and the blob becomes visible. Any cloud impl that passes
-`BlobStoreContractTests` will work with the rest of the persistence
-layer end-to-end.
+Built-in stores, all in `DbspNet.Persistence/IO/`: `LocalTableFileSystem`,
+`InMemoryTableFileSystem` (a test double), and `PrefixedTableFileSystem`
+(a sub-tree view of another store). Most entry points also have a
+`string`-path overload that opens a `LocalTableFileSystem`.
 
 ### What ships in (B)
 
-Six stateful operators implement `ISnapshotable`: `DistinctOp`,
-`IncrementalAggregateOp`, `IncrementalJoinOp`,
-`IncrementalLeftJoinOp`, `RecursiveCteOp`, and `LatenessOperator`. The
-first five own Z-set / indexed-Z-set traces (and, for the aggregate,
-per-group caches that bootstrap from the trace on `Load`); the
-`LatenessOperator` is the odd one out — it serialises only its scalar
+Every stateful operator implements `ISnapshotable` (about 26 classes:
+joins, aggregates, DISTINCT, TOP-K and rank, window operators, the
+recursive fixpoint operators, temporal filters, stored views, and so on).
+Most own Z-set / indexed-Z-set traces (and, for the aggregate, per-group
+caches that bootstrap from the trace on `Load`); the `LatenessOperator`
+is the odd one out — it serialises only its scalar
 `max_seen` watermark (9 bytes in `frontier.bin`, a schemaless `""`
 fingerprint), and on `Load` re-advances the shared `MutableFrontier` to
 `max_seen − d` so the input-side late-drop resumes consistently with the
@@ -265,12 +244,12 @@ no state file, so accepting it would silently re-enter the buggy path.
 **Layout and retention.** Each snapshot lives under its own key prefix — `snap-{tick}/`, or
 `snap-{tick}.{gen}/` when a directory for that tick already exists — with the per-op `op-{i}/`
 contents and the snapshot's `manifest.json`. A top-level `{snapshotDir}/current.txt` names the
-committed snapshot and is the source of truth — `Snapshot.Read` reads it to find the loadable
-snapshot. `Snapshot.Write(circuit, dir, retainCount: N)` keeps the current snapshot plus the
+committed snapshot and is the source of truth — `Snapshot.ReadAsync` reads it to find the loadable
+snapshot. `Snapshot.WriteAsync(circuit, fs, retainCount: N)` keeps the current snapshot plus the
 newest N−1 complete ones before it, and deletes everything else after the commit, including
-orphans of crashed writes. `Snapshot.Write`'s own default `retainCount` is 1;
+orphans of crashed writes. `Snapshot.WriteAsync`'s own default `retainCount` is 1;
 `SnapshotCheckpointStore` (the connector path) defaults to 2, as Feldera does.
-`Snapshot.ListSnapshots(dir)` returns retained ticks in ascending order.
+`Snapshot.ListSnapshotsAsync(fs)` returns retained ticks in ascending order.
 
 **Commit protocol (crash-safe since the durable-state arc, increment 0).** A write never touches a
 directory a committed snapshot occupies — a second snapshot at the same tick (an idle batch) goes
@@ -344,8 +323,8 @@ inputs smallest first by the same deploy-time counts (`DBSPNET_INPUT_ORDER=size`
 `spec` keeps the spec's order). Order changes neither results nor state layout, and the tick
 journal replays by source name, so a restore may read its inputs in a different order.
 
-`Snapshot.Exists(store)` returns true iff `current.txt` exists and names a snap-T whose manifest
-exists. `Snapshot.PointerExists(store)` is the "was anything ever committed" test:
+`Snapshot.ExistsAsync(fs)` returns true iff `current.txt` exists and names a snap-T whose manifest
+exists. `Snapshot.PointerExistsAsync(fs)` is the "was anything ever committed" test:
 `SnapshotCheckpointStore` treats only a missing pointer as a fresh start. A pointer naming an
 unreadable snapshot fails the restore instead of silently re-ingesting from scratch.
 
@@ -374,23 +353,22 @@ program, replay restoring every output view, snapshot+WAL and snapshot-only
 recovery, input-schema drift and table-set mismatch refused, and a view-body
 refactor still replaying — the fingerprint covers input schemas only).
 
-`WalRecorder` accepts an optional `snapshotDir`. On reopen, the
-recorder loads the snapshot first (via `Snapshot.Exists` so the
-`.old`-recovery case is handled), then replays only WAL ticks past
+`WalRecorder.CreateAsync` accepts an optional snapshot store. On reopen,
+the recorder loads the snapshot first (if `Snapshot.ExistsAsync`), then
+replays only WAL ticks past
 the snapshot's tick. `WalSegment` carries `StartTick` (manifest schema
 v2, with v1 → v2 cumulative-reconstruction on read) so whole segments
 below the snapshot tick are skipped without opening their files;
 straddling segments read-and-discard ticks below.
 
-`WalRecorder.WriteSnapshot(snapshotRetainCount: N)` takes an
+`WalRecorder.WriteSnapshotAsync(snapshotRetainCount: N)` takes an
 end-of-tick snapshot, optionally retaining the N most-recent ones,
 and prunes WAL segments fully covered by the latest snapshot.
 The WAL is always pruned against the *latest* snapshot tick — older
 retained snapshots are point-in-time-only and can't be rolled forward
 with the current WAL. Operations are ordered for crash safety:
 
-1. `Snapshot.Write` (atomic via the snap-T rename + `current.txt`
-   commit).
+1. `Snapshot.WriteAsync` (atomic via the `current.txt` commit).
 2. WAL manifest is rewritten with the pruned segments removed
    (tmp+rename atomic at the manifest level).
 3. Best-effort delete of the now-orphaned `.arrows` files.
@@ -401,7 +379,7 @@ segments, and replay just skips already-applied ticks; during step 3,
 the manifest no longer references the orphan files so replay never
 opens them, and the next `WriteSnapshot` cleans the leftovers.
 
-`Snapshot.Read` also restores `RootCircuit.TickCount` to the snapshot's
+`Snapshot.ReadAsync` also restores `RootCircuit.TickCount` to the snapshot's
 tick so absolute tick numbers stay consistent across the
 snapshot/WAL boundary. The recorder validates the pairing on open:
 if the snapshot's tick exceeds the WAL's coverage, it throws
@@ -445,13 +423,13 @@ pass against the batch oracle, and the persistence suite covers spine
 snapshot round-trips for distinct / aggregate / inner / left-join
 compositions (`tests/.../Persistence/SpineSnapshotTests.cs`).
 
-Two limits remain. `RecursiveCteOp` has no spine sibling, so recursive
-CTEs always use a flat trace. And the typed-row fast path still emits
-the flat family, so a spine-mode query compiles structurally — pushing
-the spine onto the typed pipeline (per-schema comparers for the emitted
-structs) is the remaining integration step. The bigger architectural
-win flagged in the original (D) sketch — *cheap* checkpointing because
-each batch is already a file — is now reachable from SQL.
+Both earlier limits are gone. Recursive CTEs honour spine mode: the
+fixpoint's import-relation integral is a `SpineZSetTrace`. The typed-row
+fast path also emits the spine family, using the emitted structs'
+generated `IComparable<TSelf>`. Spine is still not the default
+([`decision-trace-family.md`](decision-trace-family.md) explains why). The
+cheap file-per-batch checkpointing that (D) promised arrived on the flat
+side instead, through the run-file layout and block-held traces.
 
 ### Test coverage
 
@@ -460,8 +438,11 @@ covers each stateful operator's snapshot round-trip in isolation, the
 snapshot-foundation contracts (manifest, plan fingerprint, schema
 version), the WAL recorder's input-replay path, the snapshot+WAL
 hybrid (snapshot-only, WAL-only, both, mid-session checkpoints, prune
-behavior, error paths), atomic-write semantics (mid-Save crash, stale
-`.tmp` cleanup, `.old` recovery), and multi-stateful-op compositions
+behavior, error paths), crash safety (`CrashSafeCheckpointTests` and
+`ParallelCrashSafeCheckpointTests` crash before every mutation of a
+commit, as process crash and as power loss), re-sharding, the run-file
+layout and incremental checkpoints, lazy restore, block-held trace
+checkpoints, and multi-stateful-op compositions
 (JOIN+GROUP BY, three-way JOIN, UNION+GROUP BY, LEFT JOIN+GROUP BY,
 recursive CTE+GROUP BY, plus a manifest assertion that
 `SnapshottedIndices` records every stateful op in plan order).

@@ -1,435 +1,428 @@
 # DbspNet architecture
 
-A map of the codebase: how a SQL query flows through the system, what
-each piece does, and where to plug in when you want to add something.
-For the *why* behind the choices on this map, see
-[`docs/design-notes.md`](docs/design-notes.md); for what's deliberately
-left out, [`docs/skipped.md`](docs/skipped.md).
+This is a map of the codebase. It covers how SQL becomes a running circuit,
+what each subsystem does, and where to plug in new pieces. Rationale lives in
+[`docs/design-notes.md`](docs/design-notes.md) and the `docs/design-*.md`
+notes. Deliberate omissions are tracked in [`docs/skipped.md`](docs/skipped.md).
 
-## Project layout
+## Projects
 
-Dependencies point downward — `Core` knows nothing about SQL, `Sql`
-knows nothing about Arrow IPC or persistence, etc.
+All projects target `net10.0` (`Directory.Build.props`, warnings as errors).
+Package versions are pinned centrally in `Directory.Packages.props`.
 
 ```
-                    DbspNet.Core
-                   (algebra, Z-sets, circuit runtime,
-                    linear + stateful operators, spine)
-                        ▲       ▲
-                        │       │
-                  DbspNet.Sql   │
-            (parser, resolver,  │
-            logical plan, plan  │
-            optimizer, two      │
-            plan→circuit paths) │
-                        ▲       │
-                        │       │
-                DbspNet.Arrow   │       DbspNet.Benchmarks
-            (RecordBatch ↔      │       (regenerates
-             Z-set delta;       │        docs/benchmarks.md)
-             IPC streaming)     │
-                        ▲       │
-                        │       │
-              DbspNet.Persistence  ──── DbspNet.Demo
-              (WAL, snapshot,           (canonical end-
-               snapshot+WAL hybrid       to-end scenarios)
-               over IBlobStore)
+DbspNet.Core                    algebra, Z-sets, circuits, operators, parallel runtime,
+  ▲                             trace families (flat / blocks / spine), Core/IO file abstraction
+  │
+DbspNet.Sql                     parser, resolver, logical plan, optimizer, plan→circuit
+  ▲                             compilers (structural + typed), programs, batch oracle
+  │
+DbspNet.Arrow                   Arrow RecordBatch ↔ Z-set delta, IPC streaming
+  ▲
+  │
+DbspNet.Persistence             snapshots, WAL, tick journal, parallel checkpoints, re-shard,
+  ▲                             run files, block format, block cache, spill
+  │
+DbspNet.Connectors.Abstractions input/output connector interfaces, PipelineRunner,
+  ▲                             ProgramRunner, checkpoint stores and policy
+  │
+DbspNet.Connectors.EngineeredWood  Delta Lake input/output, Parquet input
+  ▲
+  │
+DbspNet.Server                  ASP.NET control service (deploy/resume/wait/stats); Dockerfile
+
+DbspNet.Demo        → Core, Sql                    end-to-end walkthrough scenarios
+DbspNet.Benchmarks  → Core, Sql, Arrow, Persistence  latency, Nexmark, fraud, probes
 ```
 
-External: `DbspNet.Core` depends on `Clast.BloomFilter` (per-batch
-blooms in the spine); `DbspNet.Sql` depends on `Clast.DatabaseDecimal`
-(`Decimal128`); Arrow is Apache Arrow's .NET package.
+External packages:
+- Core: `Clast.BloomFilter` and `Clast.DatabaseDecimal` (`Decimal128`).
+- Sql: `System.IO.Hashing`.
+- Arrow: `Apache.Arrow`.
+- Persistence: `ZstdSharp.Port` and `K4os.Compression.LZ4` (run-block compression).
+- Connectors: `EngineeredWood.DeltaLake.Table` and `EngineeredWood.Parquet`, from NuGet.
+
+One edge points the other way at runtime. Persistence installs the trace block
+format into Core through a module initializer
+(`Persistence/Blocks/BlockFormatRegistration.cs`), and the tests force that load
+in `TestAssemblyInit.cs`.
 
 ## Compile pipeline
 
-A SQL string becomes a runnable circuit through five stages. Every
-stage has an explicit, named output that the next stage consumes —
-there's no hidden state passed under the table.
-
 ```
 SQL text
-   │  Parser.ParseStatement
-   ▼
-SqlStatement AST                   ── DbspNet.Sql/Parser/{Lexer,Parser,Token,Ast/*}
-   │  Resolver.Resolve
-   ▼
-PlanStatement                      ── DbspNet.Sql/Plan/{Resolver,LogicalPlan,
-   │  (SelectPlan, CreateTablePlan,    ResolvedExpression,Schema,TypeInference}
-   │   CreateViewPlan)
-   │
-   │  PlanOptimizer.Optimize          ── DbspNet.Sql/Optimizer/PlanOptimizer
-   │  (explicit, opt-in)              (predicate pushdown, projection
-   │                                   composition, aggregate-input pruning)
-   ▼
+  │ Parser.ParseStatement                 Sql/Parser/{Lexer,Parser,Ast/*}
+  ▼
+SqlStatement AST
+  │ Resolver.Resolve (against a Catalog)  Sql/Plan/{Resolver*,LogicalPlan,TypeInference}
+  ▼
 LogicalPlan
-   │
-   │  PlanToCircuit.Compile           ── DbspNet.Sql/Compiler/PlanToCircuit
-   │     │
-   │     ├─ TypedPlanCompiler         ── DbspNet.Sql/Compiler/TypedPlanCompiler
-   │     │  .TryCompileWith…             — per-schema emitted struct rows
-   │     │                                 (TypedRowEmitter); falls back
-   │     │                                 on out-of-scope subtrees
-   │     │
-   │     └─ structural compile           — ZSet<StructuralRow, Z64> on every
-   │        (CompilePlan)                  stream; the canonical path
-   ▼
-CompiledQuery                       ── DbspNet.Sql/Compiler/{CompiledQuery,
-   │  query.Table("…").Insert/Delete   TypedCompiledQuery}
-   │  query.Step()
-   │  query.Current
-   ▼
-ZSet<StructuralRow, Z64> delta
+  │ PlanOptimizer.Optimize                Sql/Optimizer/
+  ▼
+  │ PlanToCircuit                         Sql/Compiler/
+  │   ├─ TypedPlanCompiler  (per-schema emitted struct rows; null ⇒ fall back)
+  │   └─ structural compile (ZSet<StructuralRow, Z64> on every stream)
+  ▼
+CompiledQuery / CompiledProgram / Parallel*  →  Table(…).Insert/Delete, Step(), Current
 ```
 
-### Stage details
+There are two front doors:
 
-**Parser** (`DbspNet.Sql/Parser/`). Hand-written recursive-descent over
-a hand-written lexer. The lexer emits a `Token` stream; the parser
-walks it into a `SqlStatement` AST (records under
-`Parser/Ast/SqlStatements.cs` and `Parser/Ast/Expressions.cs`). The AST
-mirrors SQL surface 1:1 — joins, projections, expressions are recorded
-as written, no semantic flattening.
+- **Single query.** Use `PlanToCircuit.Compile(plan[, codecs, options])`, which
+  returns a `CompiledQuery`. It does *not* optimize, so callers write
+  `Compile(PlanOptimizer.Optimize(plan))`.
+- **Program.** Use `SqlProgram.Compile(statements, outputViews[, codecs, options])`,
+  which returns a `CompiledProgram`. This is a DAG of `CREATE TABLE` / `CREATE VIEW`
+  statements compiled into one circuit. Each view is optimized and built once and
+  shared by its readers, dead views are skipped, and each output is integrated in
+  the circuit (`ProgramOutput.CurrentView`, `RowCount`). The Server and
+  `ProgramRunner` use this path. `SqlProgram.TryCompileParallel` is its
+  data-parallel form, described below.
 
-**Resolver** (`DbspNet.Sql/Plan/Resolver.cs`). Takes a `SqlStatement`
-and a `Catalog` of declared schemas and emits a `PlanStatement`. This
-is where every name resolves to a column index, every expression gets
-a `SqlType`, every `*` expands, aggregates are split into
-group-key/agg-call buckets, scalar subqueries are lifted into
-`ScalarSubqueryJoinPlan`s, CTEs become `CteRef`s, and resolver
-restrictions fire (e.g. equi-key required on outer joins, `GROUP BY` bare
-columns only). Errors throw `ResolveException` with explicit
-messages.
+**Parser.** A hand-written lexer feeds a recursive-descent parser. The AST
+mirrors the SQL surface 1:1. Variadic syntax (IN-lists, CASE, GROUPING-style
+lists) uses flat nodes, not nested binary ones, which avoids deep recursion.
 
-**LogicalPlan** (`DbspNet.Sql/Plan/LogicalPlan.cs`). A small algebra of
-records: `ScanPlan`, `FilterPlan`, `ProjectPlan`, `JoinPlan`,
-`AggregatePlan`, `UnionAllPlan`, `DistinctPlan`, `DifferencePlan`,
-`CteScanPlan`, `RecursiveCtePlan`, `ScalarSubqueryJoinPlan`. Every
-plan node carries its output `Schema`. Statement-level wrappers
-(`CreateTablePlan`, `CreateViewPlan`, `SelectPlan`) sit outside the
-relational tree.
+**Resolver.** It binds names to column indices and types every expression. It
+expands `*` and splits aggregates. It lifts subqueries into semi-join and
+scalar-subquery-join plans, including decorrelation, and recognises the
+window, rank, TOP-K and temporal-filter shapes. Errors throw `ResolveException`.
 
-**Plan optimizer** (`DbspNet.Sql/Optimizer/PlanOptimizer.cs`). Bottom-
-up rewrite to a fixed point. Three rule families today: predicate
-pushdown (through Project / Join / UnionAll / Distinct / Difference,
-respecting outer-join restrictions; adjacent filters merge),
-projection composition (adjacent `ProjectPlan`s fuse via expression
-substitution), and aggregate-input column pruning (narrows the input
-to just the columns the aggregate references). Opt-in — callers wrap
-with `Compile(Optimize(plan))`.
+**Logical plan.** A record algebra in `LogicalPlan.cs`. It covers Scan, Filter,
+Project, Join, Aggregate, UnionAll, Distinct, Difference, SemiJoin,
+(Correlated)ScalarSubqueryJoin, CteScan, RecursiveCte, TopK, PartitionedTopK,
+PartitionedRank, WindowAggregate, WindowOffset and TemporalFilter. Every node
+carries its output `Schema`.
 
-**Plan→circuit** (`DbspNet.Sql/Compiler/PlanToCircuit.cs`). Walks the
-logical plan and builds a `RootCircuit`. Two parallel paths:
+**Optimizer** (`Sql/Optimizer/`). It rewrites bottom-up to a fixed point.
+- Predicate pushdown (respecting outer-join rules) and filter merging.
+- Projection composition.
+- Aggregate-input narrowing, including non-linear aggregates when the input's
+  weights are provably positive.
+- Join column pruning, through inner joins and residual-free outer joins.
+- Semi-join subquery narrowing.
+- Rank-CTE inlining, so a filtered rank compiles as a TOP-K.
+- A final hash-consing CSE (`PlanCse`).
+- Program-level dead-column elimination (`PlanColumnLiveness`), opt-in via
+  `CompileOptions.EliminateDeadColumns`.
 
-- *Typed-row fast path* — `TypedPlanCompiler.TryCompileWithStructural-
-  Boundary` is tried first. When the plan and every subexpression are
-  in scope, internal stages run typed: streams carry per-schema
-  emitted structs from `TypedRowEmitter`, expressions compile through
-  `TypedExpressionCompiler` / `TypedBuiltinScalarFunctions`,
-  aggregates use `TypedSqlAggregators`. Only the input/output
-  boundaries pay a `StructuralRow` ↔ typed conversion. Snapshot
-  codecs flow through via `TypedTraceCodecAdapters` so on-disk format
-  stays identical.
-- *Structural compile* — the fallback. Every stream is
-  `ZSet<StructuralRow, Z64>`; expressions compile through
-  `ExpressionCompiler` / `BuiltinScalarFunctions`; aggregates use
-  `SqlAggregators`. This is the canonical path and the only one that
-  honours a custom `IRowCodec<StructuralRow>` (e.g.
-  `EmittedEqualityCodec`).
+**Compile-time lowering.** These rewrites happen in the compilers, not in the
+plan. Each is a `*Mode.cs` switch, default on, with a `DBSPNET_*=off` opt-out
+for A/B work.
+- Adjacent Filter/Project steps fuse into one `MapFilterRows` / `ApplyOp` pass.
+- A join residual is pushed into the join's combine step.
+- A join input's Filter/Project chain runs in its indexing pass (index fusion).
+- A view or CTE used once is compiled inline.
+- A LEFT join builds its consumer's projection directly.
+- A run of LEFT joins against small dimensions becomes one `StarLeftJoinOp`.
+- A LEFT join on a hot default key is split (hot-key split).
 
-Both paths share the same operator catalog below and the same
-snapshot/codec interfaces. When any scanned table declares `LATENESS`, the
-typed path is skipped and the structural compile runs — the frontier-driven
-trace GC is wired only there (see [*LATENESS*](#lateness--bounded-history-trace-gc)
-below).
+**Typed vs structural.** The single-query path tries `TypedPlanCompiler` first.
+On that path streams carry structs emitted per schema by `TypedRowEmitter`
+(with a generated `IComparable<TSelf>`), and only the input and output
+boundaries convert to and from `StructuralRow`. Any node without a typed arm
+returns null, and the whole query compiles structurally. The current fallbacks
+are:
+- semi-joins, correlated scalar subqueries, and rank-in-output;
+- unpartitioned windows and window MIN/MAX;
+- `LATENESS` inputs, temporal filters, and a custom row codec.
 
-## Runtime mechanics
+The structural path is canonical. Block-held traces are wired only there, and
+program views compile structurally (`TypeEligibleProgramViews` was measured
+and left off).
 
-A `RootCircuit` is a directed graph of operators connected by typed
-streams. Construction is one-shot via `RootCircuit.Build(builder =>
-…)`: the action wires inputs, operators, and outputs through a
-`CircuitBuilder`; after `Build` returns the topology is frozen.
+**`CompileOptions`** (`Sql/Compiler/CompileOptions.cs`):
+- `TraceFamily` (Flat or Spine) and spine compaction settings.
+- `StoredOutput`, which integrates the output in the circuit.
+- The broadcast-join settings (`BroadcastSmallDimensionJoins`, `BroadcastMaxRows`,
+  `RelationRowCounts`).
+- `ShareArrangements`, `CoalesceJoinExchange` and `EliminateDeadColumns`.
+- Order-key monomorphization switches for windows and TOP-K.
 
-**Streams** (`DbspNet.Core/Circuit/Stream.cs`) are edges. Each stream
-holds one value — the *current tick's* value. Operators write their
-output stream during `Step()`; downstream operators read it in the
-same step. There's no buffering across ticks.
+## Runtime
 
-**`Step()`** (`RootCircuit.Step`) advances one logical tick:
+A `RootCircuit` is built once with `RootCircuit.Build(builder => …)` and its
+topology is frozen afterwards. Streams hold exactly one value, the current
+tick's.
 
-1. Commit every queued input push (`InputHandle.Push` enqueues; the
-   value lands on the input stream when `Commit` runs).
-2. Fire every operator in registration order. Registration order is
-   topological by construction — `CircuitBuilder` registers an
-   operator only after its inputs already exist as streams.
-3. Increment `TickCount`.
+`Step()` runs one tick under the circuit's lock:
+1. Commit queued input pushes.
+2. Fire operators in registration order, which is topological by construction.
+3. Release each stream value after its last reader (`StreamRelease`, default on),
+   and run memory-pressure relief at operator boundaries.
+4. Increment `TickCount`.
 
-Each tick is atomic under `SyncRoot`; external threads may
-`InputHandle.Push` concurrently, but pushes serialise against the
-step. Output is read via `OutputHandle.Current` — the latest delta
-emitted on the output stream.
+`InputHandle.Push` may be called from other threads; it serialises against the
+step.
 
-**Persistence interception.** `RootCircuit.Operators` exposes the
-registered list in order; `DbspNet.Persistence` uses positional
-indices as stable operator IDs (paired with a plan-fingerprint
-manifest entry that catches structural drift). `RootCircuit.Restore-
-TickCount` lets a snapshot reposition the tick counter to T so
-absolute tick numbers stay consistent across snapshot/WAL boundaries.
+Other circuit-level features:
+- **Clock.** `RootCircuit.AdvanceTime` / `CompiledQuery.AdvanceClock` set a
+  monotone logical clock in µs (`Clock`, `LogicalTime`). It drives `NOW()`, is
+  persisted, and doubles as an `IFrontier`.
+- **Observability.** `CollectStats()` returns one `OperatorStat` per stateful
+  operator that implements `IIntrospectable` (`Circuit/OperatorStat.cs`): retained
+  state, last output size, GC frontier and GC drops. It is read on demand and is
+  never on the step path. `LastStepDuration` times the last tick.
+  `ProfileOperators` / `CollectOperatorProfile` and `StepProfiler` give
+  per-operator timings.
+- **Persistence hooks.** `Operators` (positional IDs plus a plan fingerprint)
+  and `RestoreTickCount`.
 
-**Observability.** `RootCircuit.CollectStats()` (and the
-`CompiledQuery.CollectStats()` convenience) walks the same `Operators` list and
-returns an `OperatorStat` per stateful operator: its registration index, a
-kind label, retained-state size, last-tick output size, current GC frontier, and
-cumulative GC drops. Operators opt in by implementing the internal
-`IIntrospectable` interface (`Circuit/OperatorStat.cs`); stateless linear
-operators don't, and are simply absent from the result. Reads are on-demand and
-never on the `Step` path — an O(1) field read for flat traces, O(state) for a
-spine trace (which materialises to count). `RootCircuit.LastStepDuration` records
-the most recent tick's operator-loop wall-clock (one `Stopwatch.GetTimestamp`
-pair per `Step`). The headline use is watching trace state stay bounded as a
-LATENESS / clock watermark advances. To instrument a new stateful operator,
-implement `IIntrospectable` (use `Metric.Frontier(...)` for the nullable frontier
-and bump a `_gcDropped` counter where the operator drops state).
+### Data-parallel execution
 
-## Operator catalog
+`ParallelCircuit.Build(workers, …)` (`Core/Circuit/`) replicates one circuit
+across W workers.
+- Inputs are hash-sharded (`ShardedInputHandle`, `StablePartitionHash`), and
+  outputs are gathered.
+- Exchange operators (`Circuit/Operators/Exchange*`, `BroadcastExchangeOp`)
+  repartition streams at a barrier coordinated by `ExchangeCoordinator`.
+- The SQL compilers insert exchanges where a keyed operator needs
+  co-partitioned input.
+- Small dimensions in INNER and LEFT joins can be broadcast instead of
+  exchanged. This is size-gated by `BroadcastMaxRows` and `CardinalityEstimator`.
+- An exchange sender runs the pointwise chain that precedes it, including
+  DISTINCT and TOP-K chains (exchange fusion).
+- A global rank is computed in ranges of its order key across workers
+  (`RangeRankOp`).
 
-DBSP operators split cleanly into two families.
+The entry points are:
+- `PlanToCircuit.TryCompileParallel`, which returns a `ParallelStructuralCompiledQuery`.
+- `TypedPlanCompiler.TryCompileParallel`, which returns a `ParallelTypedCompiledQuery`.
+- `SqlProgram.TryCompileParallel`, which returns a `ParallelCompiledProgram`.
 
-### Linear operators (stateless)
+Each one returns `false` when the plan can't shard soundly, and the caller then
+compiles serially. `SqlProgram.ParallelBlockers` explains the refusal. Current
+blockers include `LATENESS`, temporal filters, recursive CTEs and some semi-join
+or difference shapes. Design notes:
+[`design-structural-parallel.md`](docs/design-structural-parallel.md) and
+[`design-tpcdi-batch1.md`](docs/design-tpcdi-batch1.md).
 
-`DbspNet.Core/Operators/Linear/LinearOperators.cs`. Each satisfies
-`Q(a + b) = Q(a) + Q(b)` — incremental form is identical to batch
-form. Deltas flow straight through.
+## Operators
 
-| Operator | What it does |
+### Linear (stateless)
+
+These are in `Core/Operators/Linear/LinearOperators.cs`. Each satisfies
+`Q(a+b) = Q(a)+Q(b)`, so deltas flow straight through.
+
+| Operator | Role |
 |---|---|
-| `MapRows(input, projection)` | Pointwise row transform; same-key rows accumulate weights. |
-| `Filter(input, predicate)` | Drops rows that fail the predicate. |
-| `Union(left, right)` | Tick-wise Z-set addition. |
-| `Difference(left, right)` | Tick-wise Z-set subtraction. |
-| `FlatMap(input, expand)` | One row in, zero-or-more out. |
-| `IndexBy(input, keyOf)` | Re-shape a flat Z-set into an indexed one. |
-| `GroupProject(input, keyOf, valueOf)` | Same, but also drops a value selector for aggregation. |
-| `ZSetInput()` | Create an input stream (Z-set, additive merge). |
+| `MapRows` / `FlatMapRows` | pointwise and one-to-many row transforms |
+| `Filter` | drops rows failing a predicate |
+| `MapFilterRows` | fused Filter/Project chain (one pass) |
+| `Union` / `Difference` / `Negate` | Z-set addition / subtraction / negation |
+| `ZSetInput` | an input stream |
 
-### Stateful operators (with traces)
+`IndexBy`, `GroupProject` and their fused forms (in `StatefulOperators.cs`)
+reshape a Z-set into an indexed Z-set. `Apply`, `Delay` and the exchange
+operators are `CircuitBuilder` methods.
 
-`DbspNet.Core/Operators/Stateful/`. Each carries a `Trace` (the
-running integral of all deltas seen so far) and incrementalises
-against it. Every stateful operator implements `ISnapshotable` for
-the persistence layer.
+### Stateful
 
-| Operator | File | State | What it does |
-|---|---|---|---|
-| `DistinctOp` | `DistinctOp.cs` | one `Trace` over input keys | Emits a row at weight +1 the first tick its cumulative weight goes strictly positive, weight −1 when it returns to zero. SQL `DISTINCT` and the set-semantics half of `UNION` / `INTERSECT`. |
-| `IncrementalAggregateOp` | `IncrementalAggregateOp.cs` | indexed `Trace` over (group key → value multiset), plus per-key last-emitted aggregate cache and an opaque per-key scratch state | Per touched group: hand the aggregator its prior cache, the per-key delta, and the post-delta multiset. Retracts old aggregate and emits new when the result changed. SUM / COUNT / AVG fold incrementally; MIN / MAX maintain a per-group sorted set of distinct positive-weight values for O(log n) extremum lookup. |
-| `IncrementalJoinOp` | `IncrementalJoinOp.cs` | two indexed `Trace`s (one per side) | Bilinear inner-join factoring: `delta = dl ⋈ R + L ⋈ dr + dl ⋈ dr` against the *prior* integrated states, then both traces integrate the new deltas. A non-equi / `CROSS JOIN` (no equi-key) routes both sides through a single unit key, so the same operator yields the full cross product and the `ON` predicate applies as a residual filter. |
-| `IncrementalLeftJoinOp` | `IncrementalLeftJoinOp.cs` | two indexed `Trace`s | LEFT OUTER per-key case analysis on match-presence transitions (stayed-matched / stayed-unmatched / gained-match / lost-match). NULL-padded rows ride the same Z-set. `RIGHT JOIN` is a swap-wrapper at the SQL layer. |
-| `IncrementalFullJoinOp` | `IncrementalFullJoinOp.cs` | two indexed `Trace`s | FULL OUTER: the LEFT-join case analysis (inner + left-pad, keyed on right-presence) plus a symmetric right-pad pass keyed on left-presence. Independent decompositions, so both-side match flips compose to the exact per-key delta. NULL-keyed rows on either side bypass to their NULL-padded branch at the SQL layer. |
-| `TopKOp` | `TopKOp.cs` | the integrated input as a `SortedDictionary` under a total-order `SortKeyComparer`, plus the last-emitted window | Incremental `ORDER BY … LIMIT [OFFSET]` (TOP-K). Recomputes the rows at sort positions `[offset, offset+limit)` each tick — honouring per-row multiplicity at the window edge — and emits the delta against the previously-emitted window, so rows entering/leaving under retraction get the right ±weights. The comparer orders by the `ORDER BY` keys then a full-row tiebreak (`StructuralRowComparer` / `Comparer<TRow>.Default`) for a stable boundary. Global partition; no spine variant. |
-| `PartitionedTopKOp` | `PartitionedTopKOp.cs` | one `SortedDictionary` window per `PARTITION BY` key (in a `Dictionary<TKey, …>`), plus the last-emitted window per partition | Incremental windowed `ROW_NUMBER` / `RANK` / `DENSE_RANK` in the `… OVER (PARTITION BY p ORDER BY o) <= k` filter pattern — the per-partition generalisation of `TopKOp`. Only the partitions a tick touches are recomputed. `ROW_NUMBER` cuts at the limit position (multiplicity-counted); `RANK` / `DENSE_RANK` keep whole tie groups, detected with a keys-only comparer (`ConstantZeroComparer` tiebreak). The rank value is never materialised, so the output schema is the input's. The SQL resolver recognises the derived-table-plus-outer-filter shape (`PartitionedTopKPlan`); no spine variant. |
-| `PartitionedWindowAggregateOp` | `PartitionedWindowAggregateOp.cs` | one sorted integrated input per `PARTITION BY` key, plus the last-emitted widened output per base row | Incremental window aggregate — `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER (PARTITION BY p [ORDER BY o RANGE …])` emitted as a new column on every row. Three frame shapes (whole-partition / running `UNBOUNDED PRECEDING` / bounded `<const> PRECEDING`) share the operator. A tick recomputes only the output rows whose frame the delta touched (a bounded value range for bounded frames; the suffix from the earliest change for running; the whole partition otherwise), feeds each frame multiset to the SQL `CompositeAggregator`, and diffs against the last emitted output. RANGE peer-group semantics fall out of value-range frames. A bounded ascending frame over a monotone key GCs rows below `frontier − preceding`. The SQL resolver recognises top-level window-aggregate select items (`WindowAggregatePlan`); structural compile only; no spine variant. |
-| `PartitionedOffsetOp` | `PartitionedOffsetOp.cs` | one sorted integrated input per `PARTITION BY` key, plus the last-emitted widened output per partition | Incremental window offset / value functions — `LAG`/`LEAD(expr [, offset [, default]])` and `FIRST_VALUE`/`LAST_VALUE(expr)` `OVER (PARTITION BY p ORDER BY o)` — emitted as a new column. Each partition is sorted by a total order (ORDER BY key then full-row tiebreak) and expanded into weight-aware positions; per `OffsetKind`, each row reads its value from the row `offset` positions before (LAG) / after (LEAD), or the partition's first (FIRST_VALUE) / last (LAST_VALUE) row. Recompute-and-diff the touched partition. The SQL resolver shares the window-function recognition (`WindowOffsetPlan`); structural compile only; no spine variant; no GC yet. |
-| `RecursiveCteOp` | `DbspNet.Sql/Compiler/RecursiveCteOp.cs` | materialised CTE result `R`, last per-tick base inputs, last full closure | Semi-naïve incremental recursion: preserves `R` across outer ticks; for an insert-only tick, propagates only newly-derivable rows through the recursive body to fixed-point. On any retraction-containing tick, falls back to full batch recomputation. |
-| `LatenessOperator` | `LatenessOperator.cs` | scalar `max_seen` + a shared `MutableFrontier` | Input-side `LATENESS` enforcement: drops rows whose monotone value is below the start-of-tick frontier (late rows), and advances the frontier to `max_seen − d` — the watermark downstream operators GC against. See *LATENESS* below. |
+These are in `Core/Operators/Stateful/`. Each keeps an integral (a trace) and
+incrementalises against it. All of them implement `ISnapshotable`.
 
-### Spine variants
+| Operator | Role |
+|---|---|
+| `DistinctOp` | set semantics (`DISTINCT`, `UNION`, `INTERSECT`) |
+| `IncrementalAggregateOp` | grouped aggregates; an `IAggregator` per call; a lazy before+delta group view (`LazyMergeMultiset`) |
+| `LinearAggregateOp` | trace-free path for linear aggregates (SUM/COUNT/AVG) |
+| `IncrementalJoinOp` | inner join, `ΔL⋈R + L⋈ΔR + ΔL⋈ΔR`; unit key for CROSS / non-equi |
+| `IncrementalLeftJoinOp` / `IncrementalFullJoinOp` | outer joins via match-presence transitions; RIGHT is a swap |
+| `ResidualOuterJoin` | outer joins with a non-equi `ON` residual |
+| `StarLeftJoinOp` | a run of LEFT joins against small dimensions as one operator |
+| `IncrementalJoinSharedRightOp`, `Arrangement` | joins sharing one indexed arrangement |
+| `TopKOp` | `ORDER BY … LIMIT/OFFSET` (recompute-and-diff of the window) |
+| `PartitionedTopKOp` (+ `…CompactOp`, `…NarrowOp`) | `ROW_NUMBER/RANK/DENSE_RANK … <= k` per partition |
+| `PartitionedRankOp` | a rank emitted as a column on every row |
+| `RangeRankOp` | a global rank split across workers by key range |
+| `PartitionedWindowAggregateOp` | `agg OVER (PARTITION BY … ORDER BY … RANGE …)` |
+| `PartitionedOffsetOp` | `LAG` / `LEAD` / `FIRST_VALUE` / `LAST_VALUE` |
+| `TemporalFilterOp` | `NOW()` windows; rows age in and out as the clock advances |
+| `LatenessOperator` | drops late rows; advances the `LATENESS` frontier |
+| `IntegrateOp` | stored output (the full view, not just deltas) |
 
-`DbspNet.Core/Operators/Stateful/Spine/`. Sibling family —
-`SpineDistinctOp`, `SpineIncrementalAggregateOp`,
-`SpineIncrementalJoinOp`, `SpineIncrementalLeftJoinOp`,
-`SpineIncrementalFullJoinOp` — with the same
-external behaviour, but backed by `SpineZSetTrace` /
-`SpineIndexedZSetTrace` (tiered immutable sorted-columnar batches with
-configurable compaction) instead of a flat dictionary. Per-batch
-Arrow IPC snapshot via `SpineSnapshot`; optional disk spill via
-`SpineSpillConfig`. Exposed through `SpineStatefulOperators`
-extensions, and emitted by the SQL compiler when
-`PlanToCircuit.Compile` is given `CompileOptions { TraceFamily =
-TraceFamily.Spine }` — the structural compile routes the four stateful
-sites through the spine builders and supplies a `StructuralRowComparer`
-(`Core/Collections/`) for the sorted batches. The typed-row fast path
-still emits the flat family, so a spine-mode query compiles
-structurally. See [`docs/persistence.md`](docs/persistence.md).
+Recursion uses the nested-circuit fixpoint primitives in `Core/Operators/Nested/`
+(`SemiNaiveFixpointOperator`, `FixpointOperator`, `NestedScopeBuilder`).
+Inserts are semi-naive and deletes use delete-and-re-derive (DRED). Only
+multiset (non-set) input deltas fall back to recompute.
 
-### LATENESS / bounded-history trace GC
+Semi-joins and anti-joins are compiled in SQL from these operators. They have
+no dedicated operator.
 
-A column declared `LATENESS d` in `CREATE TABLE` bounds the state of every
-operator keyed (transitively) on that column, so long-running pipelines stay
-bounded-memory. The mechanism spans the plan and the runtime:
+**Aggregators** (`Stateful/Aggregators/`):
+- SUM, COUNT, AVG and MIN/MAX.
+- Sketches: `HyperLogLog` behind `APPROX_COUNT_DISTINCT`, and `DdSketch` /
+  `OrderedQuantileSketch` behind the approximate quantiles.
+- The `ILinearAggregator` / `IPartialAggregator` capabilities.
 
-- **Plan.** `ScanPlan.ColumnLateness` carries the per-column bound (native
-  units) from the catalog. `MonotonicityAnalyzer` (`DbspNet.Sql/Plan/`) walks
-  the plan and records, per node/column, which `LatenessSource`s prove it
-  monotone — propagating through filters, projections, equi-joins,
-  group-key inheritance, and set ops (monotone iff monotone in *every* branch).
-  A projection stays monotone not only for a bare column but through a monotone
-  scalar function (`date_trunc`, `dateadd`, `tumble_start` — the event-time
-  window-start floor — via the `IScalarFunction.Monotonicity` hook) or a forward
-  shift (`ts + interval`); such a column also carries a `Func<long,long>`
-  **frontier transform**. Because `date_trunc` (and `tumble_start`) lower values,
-  the group-key GC site wraps its frontier in a `TransformedFrontier` so the
-  bound is mapped into the key space before it thresholds keys — which is what
-  makes a tumbling-window `GROUP BY` bounded-state; forward shifts
-  use an identity transform (the raw frontier stays sound, just conservative).
-  (A HOP sliding window's per-branch `window_start − k·slide` is *not* yet followed
-  here, so HOP `GROUP BY`s are unbounded — see `docs/skipped.md`.)
-  Soundness over completeness: anything unproven is non-monotone, so GC just
-  doesn't engage.
-- **Input side.** `PlanToCircuit` interposes a `LatenessOperator` per
-  declared-lateness column. It drops rows below the frontier as of the *start*
-  of the tick (late rows — a contract violation that would touch
-  already-collected state), tracks `max_seen`, and advances a shared
-  `MutableFrontier` to `max_seen − d`.
-- **State side.** Each keyed stateful operator takes opt-in
-  `(IFrontier, monotoneKey)` constructor parameters; after integrating a tick
-  it drops trace keys strictly below the frontier. **GC reduces *state*, never
-  *output*** — the last-emitted value of a collected group stays downstream,
-  and the input-side drop guarantees no future delta can resurrect it.
-  `IncrementalAggregateOp` GCs on a monotone group key; `DistinctOp` on a
-  monotone column of the row; the joins on the equi-key, but only when it is
-  monotone on *both* sides (a future row on a non-monotone side could still
-  flip a match below the frontier). Multiple sources combine via `MinFrontier`.
-  On the spine traces, GC is compaction-folded: each spine batch carries
-  its `(min, max)` monotone-key projection (computed when the batch is
-  built), so `SpineZSetTrace.DropKeysBelow` and `SpineIndexedZSetTrace.
-  DropKeysBelow` dispatch per batch — whole-batch drop when the max
-  projection is below the frontier (spill file deleted), keep-in-place
-  when the min projection is at or above, and mask-filter when the batch
-  is mixed. Batch ordering and level layout are preserved, so the
-  tiered compaction strategy's insertion-order assumption stays intact
-  and above-frontier batches consolidate on the normal compaction
-  schedule rather than via a global rebuild on every frontier advance.
-  Cost is O(touched batches) per call instead of O(total retained state).
-- **Persistence.** `LatenessOperator` snapshots `max_seen`; on restore it
-  re-advances the frontier so the late-drop stays consistent with the GC'd
-  traces restored alongside it.
+The SQL layer wraps these for NULL handling and result types in
+`SqlAggregators` and `TypedSqlAggregators`, including the exact
+`COUNT(DISTINCT)`.
 
-The frontier carrier is a generic `Int64` (`Timestamp` µs, `Date32` days, or
-`BIGINT` directly, via `MonotoneKey.Extract`). `LATENESS` forces the structural
-compile — GC is wired only there. Equivalence is held by a property test: the
-incremental run with GC equals a batch evaluation over the non-late input,
-across both trace families.
+### Trace state
 
-### Temporal filters (`NOW()` / advancing logical clock)
+There are three representations behind the same operator contracts.
 
-`NOW()` / `CURRENT_TIMESTAMP` is **not** a scalar function (it is not pure in the
-row) — it is an advancing logical clock, the `mz_now()` model. The clock is a
-per-circuit `Int64` (microseconds since epoch), set by the host via
-`RootCircuit.AdvanceTime` before each `Step`, monotone non-decreasing, persisted
-in the snapshot manifest (`logical_time`) and exposed as an `IFrontier`
-(`RootCircuit.Clock`) — the same kind of object as a LATENESS frontier.
+- **Blocks** (default). Code in `Stateful/Blocks/`: `BlockedIndexedTrace`,
+  `BlockedZSetTrace`, `BlockedGroupTrace`, `BlockedJoinOp`, `OrderedPartitionStore`,
+  and others. Trace state is held as reference-free byte blocks: sorted,
+  hash-ordered runs merged geometrically. The GC sees bytes, not object graphs,
+  and a checkpoint writes the blocks directly. `DBSPNET_TRACE_BLOCKS` selects
+  which operators use blocks: `join`, `agg`, `distinct`, `view`, `window`;
+  unset means all, `off` means none. Structural path only. See
+  [`design-flat-trace-state.md`](docs/design-flat-trace-state.md).
+- **Flat managed.** Hash-indexed Z-sets on `ChunkedMap` (`Core/Collections/`,
+  default; `DBSPNET_ZSET_MAP=dictionary` opts out). This is the typed path's
+  state, and the fallback for anything blocks don't cover.
+- **Spine.** `Stateful/Spine/` is an LSM-style sibling family (`SpineZSetTrace`,
+  `SpineIndexedZSetTrace`, `Spine*Op`) with tiered compaction, per-batch Bloom
+  filters and optional spill. It is opt-in through `TraceFamily.Spine` on both
+  compiler paths and is not the default; see
+  [`decision-trace-family.md`](docs/decision-trace-family.md).
 
-- **Grammar / plan.** `NOW()` is a dedicated `NowExpression` AST node (it never
-  reaches `ScalarFunctionRegistry`). The resolver recognises WHERE conjuncts of
-  the form `key {<|<=|>|>=} NOW() [± constant day-time INTERVAL]` (both operand
-  orders; `BETWEEN` folds into one window) and lowers them to a
-  `TemporalFilterPlan` — a per-row validity window affine in the `TIMESTAMP`
-  time-key. `NOW()` in any other position is a resolve error.
-- **Operator.** `TemporalFilterOp` integrates the input and each tick recomputes
-  the set of rows valid at the current clock, emitting the delta against the
-  set it emitted last tick — so rows age in and out, *including on ticks with no
-  new input*, exactly like `TopKOp`'s recompute-and-diff. It self-GCs rows once
-  the clock passes their upper bound (the monotone clock guarantees they can't
-  return). `ISnapshotable`; the typed fast path falls back to structural.
-- **Clock as watermark.** A disappear-bounded filter on a bare time-key column
-  advertises a clock-driven frontier (`clock − offset`, a `TransformedFrontier`
-  over `RootCircuit.Clock`) on that column, registered under the column's
-  `LatenessSource` and marked monotone by `MonotonicityAnalyzer` — so the
-  *same* GC plumbing as LATENESS bounds a downstream `GROUP BY` / join /
-  `DISTINCT` on the time-key, with no new GC code paths.
-- **Correctness.** The redefined oracle: a temporal filter at logical time `t`
-  equals the relational filter with `NOW = t`. `BatchPlanEvaluator` takes a
-  `Now`; the property test drives the circuit advancing the clock per tick and
-  checks the accumulated output equals the batch at the run's final clock (the
-  emitted deltas telescope to `validAt(finalClock)`).
+### Bounded memory
 
-See `docs/now-and-temporal-filters.md`.
+All of this lives in `Stateful/Blocks/` and `Persistence/Blocks/`. Only stream
+release and pressure levels are on by default; the rest is opt-in.
+- `StreamRelease` frees values early.
+- `MemoryPressure` / `PressureRelief` implement Feldera-style pressure levels
+  (`DBSPNET_PRESSURE`, `DBSPNET_MEMORY_LIMIT_MIB`).
+- A CLOCK `BlockCache` evicts persisted blocks (`DBSPNET_BLOCK_CACHE_MIB`).
+- Mid-batch run spilling (`DBSPNET_SPILL`) and in-step delta spilling
+  (`DBSPNET_STEP_SPILL_ROWS` / `_MIB`) write zstd-compressed run files.
 
-### Aggregators
+The design and measurement journal is
+[`design-bounded-memory.md`](docs/design-bounded-memory.md).
 
-`DbspNet.Core/Operators/Stateful/Aggregators/`. The
-`IncrementalAggregateOp` is generic over an `IAggregator<TValue,
-TOut>` strategy. Built-ins: `SumAggregator`, `CountAggregator`,
-`AvgAggregator`, `MinMaxAggregator`, plus two bounded-state sketch
-primitives — `HyperLogLog` (distinct-count, behind
-`APPROX_COUNT_DISTINCT`) and `DdSketch` (relative-error quantiles,
-behind `APPROX_PERCENTILE` / `MEDIAN` / `PERCENTILE_CONT`). The SQL
-layer adds typed SQL-shaped wrappers in
-`DbspNet.Sql/Compiler/{SqlAggregators, TypedSqlAggregators}.cs` that
-handle NULL skipping, the linear-emission gate, and per-aggregate
-result types.
+### `LATENESS` (bounded-history GC)
+
+A column declared `LATENESS d` promises that no future value falls more than
+`d` below the running max.
+
+- **Input.** A `LatenessOperator` per such column drops late rows and advances a
+  `MutableFrontier` to `max_seen − d`. `max_seen` is persisted.
+- **Plan.** `MonotonicityAnalyzer` (`Sql/Plan/`) proves which columns stay
+  monotone. Monotonicity carries through filters, projections, joins, group keys
+  and set ops, and through monotone scalar functions (`date_trunc`, `tumble_start`,
+  `dateadd`, via `IScalarFunction.Monotonicity`). Each such function comes with a
+  frontier transform. Anything unproven is treated as non-monotone.
+- **State.** Keyed stateful operators take an optional `(IFrontier, monotoneKey)`
+  and drop trace keys below it. GC reduces *state*, never *output*. Joins GC only
+  when the key is monotone on both sides. Spine batches GC per batch, using
+  each batch's min/max key range.
+
+Two limits apply. `LATENESS` forces the structural compile, and the program
+path does not enforce it yet (state stays unbounded there, which is sound).
+
+### Temporal filters (`NOW()`)
+
+`NOW()` / `CURRENT_TIMESTAMP` is the advancing logical clock (the `mz_now()`
+model), not a scalar function.
+
+- The resolver accepts `key {<,<=,>,>=} NOW() [± day-time INTERVAL]` in WHERE and
+  lowers it to a `TemporalFilterPlan`. A `BETWEEN` folds into one window.
+- `TemporalFilterOp` emits inserts and retractions as the clock moves, including
+  on ticks with no input. It self-GCs.
+- A bounded window advertises `clock − offset` as a frontier, so a downstream
+  GROUP BY, join or DISTINCT on the time key GCs through the `LATENESS`
+  machinery.
+
+The oracle is the batch query with `NOW` set to the final clock. See
+[`now-and-temporal-filters.md`](docs/now-and-temporal-filters.md).
+
+## Persistence
+
+This lives in `DbspNet.Persistence`, over the `ITableFileSystem` abstraction in
+`Core/IO`. Built-in stores are `LocalTableFileSystem`, `InMemoryTableFileSystem`
+and `PrefixedTableFileSystem`. A store that implements `IDurableTableFileSystem`
+gets explicit fsyncs.
+
+The checkpointing pieces:
+- `Snapshot.WriteAsync` / `ReadAsync` write end-of-tick snapshots, committed
+  crash-safely by a `current.txt` pointer. They carry plan and schema
+  fingerprints.
+- `WalRecorder` provides input replay and the snapshot+WAL hybrid.
+- `TickJournal` records source offsets every batch, with snapshots taken by
+  policy.
+- `ParallelSnapshot` commits all W workers in one step.
+- `ParallelReshard` rewrites a snapshot for another W.
+- `Runs/` holds the run-file format (hash-ordered blocks, index, Bloom filter),
+  incremental run chains, lazy restore and background compaction. The run
+  layout is opt-in (`DBSPNET_STATE_LAYOUT=runs`). Block-held traces always
+  checkpoint as run chains from their own blocks.
+
+See [`docs/persistence.md`](docs/persistence.md) and
+[`design-durable-state.md`](docs/design-durable-state.md).
+
+## Connectors and server
+
+**`DbspNet.Connectors.Abstractions`:**
+- Interfaces: `IInputConnector`, `IOutputConnector`, `ISchemaMapper`, and the
+  checkpoint stores (`SnapshotCheckpointStore` keeps two snapshots plus source
+  offsets).
+- `CheckpointPolicy`: the default journals every batch and snapshots every 60 s.
+- `PipelineRunner` drives one `CompiledQuery`, one tick per source version.
+- `ProgramRunner` drives a serial or parallel program. Each batch drains every
+  available source version and then writes the outputs.
+
+**`DbspNet.Connectors.EngineeredWood`** has three connectors:
+- `DeltaInputConnector` reads the change data feed, one Delta version per tick.
+- `DeltaOutputConnector` writes in truncate, changelog or incremental mode;
+  incremental uses deletion vectors.
+- `ParquetInputConnector` reads a Parquet file once.
+
+**`DbspNet.Server`** is the engine container for the ivm-bench TPC-DI
+benchmark. It is an ASP.NET minimal API with these endpoints: `GET /healthz`,
+`POST /compile`, `POST /deploy` (a `ProgramSpec` of SQL, inputs, outputs and an
+optional snapshot directory), `POST /resume`, `POST /wait`, `POST /pause`, and
+`GET /stats`. It is configured entirely through `DBSPNET_*` environment
+variables. The README lists the user-facing ones.
 
 ## Extension points
 
-If you want to add…
-
-- **A SQL scalar function (e.g. `SUBSTRING`).** One `IScalarFunction` entry
-  (`Resolve` + `BuildStructural` + `BuildTyped`) registered in
-  `DbspNet.Sql/Expressions/ScalarFunctionRegistry.cs`. Self-contained entries
-  (e.g. the temporal functions) live in their own file; entries that reuse the
-  existing helper bodies delegate to the internal `ResolveXxx`/`BuildXxx`
-  methods in `BuiltinScalarFunctions` / `TypedBuiltinScalarFunctions`. Return
-  null from `BuildTyped` to fall the query back to the structural pipeline.
-  Test coverage convention: a fact per arity / per type-coercion edge
-  in `tests/DbspNet.Tests/Sql/ScalarFunctionTests.cs`.
-
-- **A SQL aggregate (e.g. `STDDEV`).** A new
-  `IAggregator<TValue, TOut>` under
-  `DbspNet.Core/Operators/Stateful/Aggregators/`, a typed wrapper in
-  `DbspNet.Sql/Compiler/SqlAggregators.cs` and a sibling in
-  `TypedSqlAggregators.cs`, plus a new `AggregateKind` and the
-  matching arm in `Resolver.cs` and both compilers. If state can be
-  recomputed from the trace (the SUM/COUNT/AVG pattern), follow
-  `IncrementalAggregateOp.Load`'s replay strategy — no per-state codec
-  needed.
-
-- **A SQL type (e.g. `BINARY`).** A new `SqlType` record in
-  `DbspNet.Sql/TypeSystem/SqlType.cs`, parser arm for the keyword,
-  resolver/inference edges in `TypeInference.cs`, expression-compiler
-  support, and Arrow mapping in `DbspNet.Arrow/`. The snapshot layer
-  picks it up automatically through the Arrow codecs once the Arrow
-  mapping exists.
-
-- **A logical plan node (e.g. `OrderByPlan`).** Record in
-  `LogicalPlan.cs`, resolver-side construction, plan-optimizer arm
-  (at minimum, the no-op recurse-into-children case in
-  `OptimizeNode`), and a compile arm in both `PlanToCircuit.CompilePlan`
-  and `TypedPlanCompiler.TryCompileNode`. If the typed compiler can't
-  handle it, `return null` there and the structural fallback takes
-  over.
-
-- **A new operator.** Implement `IOperator` (and `ISnapshotable` if it
-  carries state), wire a `CircuitBuilder` extension in
-  `StatefulOperators.cs` or `LinearOperators.cs`. If it holds a trace
-  and you want a spine variant, the existing spine operators are the
-  template — `SpineZSetTrace` / `SpineIndexedZSetTrace` are drop-in
-  replacements for the flat counterparts at the snapshot-codec
-  interface.
-
-- **A new storage backend (e.g. S3).** Implement `IBlobStore`
-  (`DbspNet.Persistence/IO/`). The contract is *atomic single-blob
-  write only* — no directory ops, no multi-blob commits. Validate
-  against `BlobStoreContractTests`; if it passes, every persistence
-  entry point works.
+- **Scalar function.** Add one `IScalarFunction` (`Resolve`, `BuildStructural`,
+  `BuildTyped`) registered in `Sql/Expressions/ScalarFunctionRegistry.cs`. Return
+  null from `BuildTyped` to fall back to structural. Tests go in
+  `tests/DbspNet.Tests/Sql/ScalarFunctionTests.cs`. See
+  [`scalar-function-registry.md`](docs/scalar-function-registry.md).
+- **Aggregate.** Add an `IAggregator` under `Stateful/Aggregators/`, wrappers in
+  `SqlAggregators.cs` / `TypedSqlAggregators.cs`, an `AggregateKind`, and resolver
+  plus compiler arms. Persist state only if folding the trace can't reproduce it
+  exactly (see `CanPersistState`; `double` sums can't be refolded exactly).
+- **SQL type.** Add a `SqlType` record (`Sql/TypeSystem/SqlType.cs`), a parser
+  arm, `TypeInference` edges (`Sql/Plan/`), expression-compiler support, and an
+  Arrow mapping in `DbspNet.Arrow`.
+- **Plan node.** Add the record in `LogicalPlan.cs` and its resolver
+  construction. Add arms in the optimizer (including `PlanCse` and
+  `PlanColumnLiveness`), in both compilers (`return null` in `TypedPlanCompiler`
+  to fall back), in `BatchPlanEvaluator` (the oracle), and in the parallel
+  blocker analysis (`PlanToCircuit.ProgramBlockers.cs`).
+- **Operator.** Implement `IOperator`, plus `ISnapshotable` if it is stateful and
+  `IIntrospectable` for stats. Wire it through a `CircuitBuilder` extension. Add
+  a case to `PersistenceConformanceTests`; its coverage guard reflects over every
+  `ISnapshotable`.
+- **Storage backend.** Implement `ITableFileSystem` (and `IDurableTableFileSystem`
+  if it needs explicit syncs). `WriteAllBytesAsync` must be atomic.
+- **Connector.** Implement `IInputConnector` / `IOutputConnector`; the
+  EngineeredWood project is the template.
 
 ## Testing
 
-`tests/DbspNet.Tests/` mirrors the source tree:
+`tests/DbspNet.Tests/` mirrors the source tree: `Algebra/`, `Collections/`,
+`Circuit/`, `Operators/` (including `Nested/` and `Stateful/Spine/`), `Sql/`,
+`Arrow/`, `Persistence/`, `Connectors/`, `Observability/` and `EndToEnd/`. It
+holds about 2,300 xUnit facts and theories. `Scratch/` holds probes and
+measurement harnesses, and `Spike/` holds retired experiments.
 
-- `Algebra/`, `Collections/`, `Circuit/` — Core unit tests.
-- `Operators/` — per-operator behaviour, including a parallel
-  `Stateful/Spine/` subtree for the spine family.
-- `Sql/` — parser / resolver / compiler / optimizer, plus per-feature
-  suites (CTEs, recursive CTEs, set ops, scalar subqueries, scalar
-  functions, temporal, Decimal128, typed pipeline).
-- `Arrow/` — round-trip tests for the Arrow IPC boundary.
-- `Persistence/` — snapshot round-trip per operator, WAL replay,
-  hybrid snapshot+WAL, atomic-write crash points, schema-drift
-  detection, retention.
-- `EndToEnd/RandomQueryPbtTests.cs` — CsCheck property-based tests:
-  generate a random query from one of 40 templates, run it both with
-  and without the optimizer, and assert semantic equivalence against a
-  batch oracle (`IncrementalOracle`) over the same input deltas. This
-  is the test of record for "incremental ≡ batch".
-- `Spike/` — feature-flag experiments (emitted equality codec, typed-
-  row spike) that have since landed in main code paths.
+The tests of record:
+- **`EndToEnd/RandomQueryPbtTests.cs`.** CsCheck property tests over about 70
+  generated query templates (`RandomQuery.cs`), 3,000 iterations each. They run
+  unoptimized, optimized-vs-original, and on spine, and each run is checked
+  against `BatchPlanEvaluator`. This is the "incremental ≡ batch" check.
+- **Feature property suites.** LATENESS, temporal filters, TUMBLE, recursive
+  CTEs, CSE, TOP-K variants, the four DBSP laws, and parallel global operators.
+- **`Persistence/PersistenceConformanceTests`.** Checks that save → restore →
+  step equals an uninterrupted run, across the `flat`, `spine` and `blocks`
+  families.
+- **Crash-safety matrices.** `CrashSafeCheckpointTests` and
+  `ParallelCrashSafeCheckpointTests`.
