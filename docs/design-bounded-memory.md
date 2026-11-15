@@ -5597,10 +5597,26 @@ read at the end of batch 1 also did the distinct row-count upkeep, ~120 s after 
 `duration_s` (2,718–2,767 s) therefore matches the old ones' (2,711–2,767) only by that coincidence. The drain
 is the fair figure, and it is 3–5% slower.
 
-Tick 18's GC pause *fell* by 20–40 s, so the extra ~80 s there is mutator time. That is consistent with a
-giant group's span now being read as ~270 60,000-byte blocks instead of one: more header parses, cache
-lookups and k-way-walk steps per group. Spill grows ~12% because each span block now carries its own header and
-compresses alone. Two things confound the step-time comparison: the new runs had the LOH-profile
-EventListener on (Verbose GC events) and the old ones didn't, and the binaries differ (86d0ce1 vs 81d352f).
-A paired A/B (xt25abo/abn 1–2: same binary, segments GC so the old-cap arm doesn't fail, no profiling,
-interleaved, only `DBSPNET_RUN_SPAN_BLOCK_BYTES` differs) separates them; results below when it lands.
+Two things confound that +3–5%. The new runs had the LOH-profile EventListener (Verbose GC events) on and the
+old ones didn't, and the binaries differ (86d0ce1 vs 81d352f). §5.59.8 separates them: the cap itself costs
+nothing measurable.
+
+#### 5.59.8 Measured: paired A/B (2026-11-14)
+
+xt25abo1/abn1/abo2/abn2, interleaved, same binary (bin-spancap, 81d352f), reporter env, **segments GC**
+(so the old-cap arm doesn't hit the regions OOM), no LOH profile or GC timeline. Only
+`DBSPNET_RUN_SPAN_BLOCK_BYTES` differs: o = 16,777,216 (the old default), n = unset (80,000).
+
+| run | cap | drain | tick 18 (GC pause) | ticks 0–17 | spill |
+|---|---|---|---|---|---|
+| abo1 | 16 MiB | 2,625 s | 1,775 s (474) | 525 s | 99 GB |
+| abn1 | 80,000 | 2,591 s | 1,790 s (461) | 509 s | 99 GB |
+| abo2 | 16 MiB | 2,566 s | 1,765 s (460) | 511 s | 99 GB |
+| abn2 | 80,000 | 2,568 s | 1,761 s (435) | 516 s | 99 GB |
+
+All four completed, and all four match xt25tws on the 96 views' `model_rows`. The arms overlap. Mean drain is
+2,596 s for the old cap and 2,580 s for the new, within noise, and spill is the same. So §5.59.7's +3–5%
+drain and +12% spill are **not the cap**. They come from the profiling instrument and from what changed
+between 86d0ce1 and 81d352f. The explanation offered there, that more, smaller blocks cost mutator time and
+per-block headers cost spill, is falsified. Option C stands at no measured cost.
+
