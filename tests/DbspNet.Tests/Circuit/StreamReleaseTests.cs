@@ -56,6 +56,26 @@ public class StreamReleaseTests
         public void Step() => Seen.Add(((Stream<object>)_inputs[^1]).Current);
     }
 
+    // Holds a query plan's columns, as compiled closures do (issue #8): more than the scan walks, but
+    // of a namespace its assembly declares stream-free.
+    private sealed class PlanHolder(Stream<object> input) : IOperator
+    {
+        private readonly object _columns = Enumerable.Range(0, 70_000)
+            .Select(i => new DbspNet.Sql.Plan.SchemaColumn("c" + i, new DbspNet.Sql.TypeSystem.SqlIntegerType(false))).ToList();
+        public readonly List<object?> Seen = [];
+
+        public void Step() => Seen.Add(input.Current);
+    }
+
+    // Holds more trace blocks than the scan walks, as a restored trace does (issue #8).
+    private sealed class BlockHolder(Stream<object> input) : IOperator
+    {
+        private readonly object _blocks = new List<DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock?>(new DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock?[70_000]);
+        public readonly List<object?> Seen = [];
+
+        public void Step() => Seen.Add(input.Current);
+    }
+
     private static RootCircuit Build(params IOperator[] ops) =>
         RootCircuit.Build(builder =>
         {
@@ -147,6 +167,20 @@ public class StreamReleaseTests
         // Without the opaque rule the value is released after r, and the huge list's reader reads null.
         Assert.Equal([1, 2, 3], huge.Seen.Cast<int>());
         Assert.Null(p.Out.Current); // still released, after it
+    }
+
+    [Fact]
+    public void A_query_plan_or_trace_blocks_are_not_walked()
+    {
+        // Each holder's state is past the scan's element limit, so walking it would mark the holder
+        // opaque; the stream-free rules skip it, and its reader is still found through its field.
+        var p = new Producer();
+        var plan = new PlanHolder(p.Out);
+        var blocks = new BlockHolder(p.Out);
+        var readers = StreamRelease.ScanReaders([p, plan, blocks]);
+
+        Assert.Empty(readers.Opaque);
+        Assert.Equal([1, 2], readers.ByStream[p.Out].Where(i => i != 0)); // 0: the producer's own field
     }
 
     // Emits a list of tick-many items: a value with a Count.

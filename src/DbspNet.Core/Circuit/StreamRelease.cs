@@ -369,6 +369,29 @@ internal static class StreamRelease
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, bool> MayHold = new();
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Assembly, string[]> FreeNamespaces = new();
+
+    // A namespace its assembly declares stream-free (StreamFreeNamespaceAttribute), or one nested in it.
+    private static bool InStreamFreeNamespace(Type t)
+    {
+        if (t.Namespace is not { } ns)
+        {
+            return false;
+        }
+
+        var free = FreeNamespaces.GetOrAdd(t.Assembly, static a =>
+            [.. a.GetCustomAttributes<StreamFreeNamespaceAttribute>().Select(x => x.Namespace)]);
+        foreach (var f in free)
+        {
+            if (ns == f || (ns.Length > f.Length && ns[f.Length] == '.' && ns.StartsWith(f, StringComparison.Ordinal)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Assembly, bool> AssemblySees = new();
 
     // Whether an assembly is DbspNet.Core or references it.
@@ -400,6 +423,16 @@ internal static class StreamRelease
         {
             // A spilled file's holders (bounded-memory §5.20): no wiring, and its delete closure reaches
             // the process-wide spiller, whose leases other threads' traces change while this walks.
+            result = false;
+        }
+        else if (typeof(DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock).IsAssignableFrom(t))
+        {
+            // A trace block is bytes, a schema and a file handle: no wiring. A restored trace holds tens
+            // of thousands of them, which the walk otherwise entered one by one (issue #8).
+            result = false;
+        }
+        else if (InStreamFreeNamespace(t))
+        {
             result = false;
         }
         else if (t.IsPrimitive || t.IsEnum || t.IsPointer || t == typeof(string) || t == typeof(decimal)

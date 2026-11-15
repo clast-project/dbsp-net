@@ -1295,6 +1295,42 @@ Fresh-process restart, SF=3, W=12, 5 alternating runs per arm from one batch-1 s
   Interning on every small cold read was worse still (drain median 1387 ms before the ≥ 256-row
   threshold).
 
+### The first batch after restore, re-measured and apportioned (2026-11-15, issue #8)
+
+Same recipe at e42ebb1, block-held traces now the default (raw: `docs/fresh-restart-w12-20261115.txt`):
+restore **0.20 s**; batch-2 drain **589 ms** [584–678] vs 105 ms [102–119] without a restart — 5.6×,
+a worse *ratio* than 11-01's 4.3× because the no-restart batch got faster. Batch 3: 1.7×.
+
+Where the ~485 ms went (batch-2 drain, fresh process unless stated):
+
+| arm | drain | removes |
+|---|--:|---|
+| as shipped | ~600 ms | — |
+| `DBSPNET_STREAM_RELEASE=0` | ~437 ms | the first tick's stream-release reader scan, ~170 ms |
+| in-process restart, release off | ~180 ms | fresh-process JIT / tier-0 code, ~255 ms |
+| no restart | 105 ms | restored state itself, ~75 ms |
+
+- **The reader scan** (`StreamRelease.ScanReaders`) runs on every new program's first tick, on every
+  worker — after a restore, inside batch 2 (without one, inside batch 1's 15 s). It visited 1.19M
+  objects over 12 workers: ~900k SQL plan nodes captured by compiled closures (`SchemaColumn`,
+  `ResolvedColumn`, `ProjectionItem`, …) and 84k restored `LazyTraceBlock`s plus their partition
+  indexes. **Fixed:** an assembly may declare a namespace stream-free
+  (`StreamFreeNamespaceAttribute`; `DbspNet.Sql.Plan` does — plans are built before any stream
+  exists), and trace blocks are never walked. Scan 157–217 → 33–56 ms, same plan (401 released,
+  0 opaque). Test: `StreamReleaseTests.A_query_plan_or_trace_blocks_are_not_walked` (fails without
+  either rule).
+- **After the fix**, 5 alternating runs: batch-2 drain **462 ms** [452–481] vs 119 ms [108–140] —
+  3.9×; batch 3 217 vs 121 ms. Still not met.
+- **What remains is mostly JIT.** Single runs with the release scan off: `DOTNET_TieredPGO=0` 363 ms,
+  `DOTNET_TieredCompilation=0` 466 ms. ReadyToRun (lever 3) is the next measurement.
+- **Profiling trap:** `DBSPNET_PROFILE`'s `StepProfiled` path skips the release plan, so the
+  per-operator profile never shows the scan; and `RangeRank` time there is mostly exchange-barrier
+  wait. In a fresh process the window and rank operators look 5–20× slower, but with JIT-warm code
+  (in-process restart) they match the no-restart run.
+- Lever 2 (a cache of open run files and recent blocks) is superseded: block-held traces read a
+  block once on first use and keep it; the old `ColdStats` counters read 0, and
+  `DBSPNET_RESTORE=eager` is a no-op for them.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
