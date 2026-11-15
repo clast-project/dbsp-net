@@ -657,3 +657,59 @@ on reading `dbt_to_program.py`. The deploy path binds outputs from `output_bindi
 in `dbspnet_client.py:45` (`"outputs": prog["output_bindings"]`); the spec's own 18-name `outputs`
 list is compile-only validation (`:57`) and includes the two unbound views.
 
+
+## Cross-engine content validation, SF=3 (2026-11-15, issue #6)
+
+The harness never compares engines (see *Correctness is not enforced on this path*), so this
+check runs out of band: one ivm-bench run of both engines with `PRESERVE_RESULTS=1`, then
+ivm-bench's `src/.scripts/compare_outputs.py` and `diff_columns.py` over every gold view. The
+previous check was July 2026 (pin `355ef65`). This run used `experiments/dbspnet.json`
+(SF=3, batches 100/1/1), Feldera's `latest` image, on the M4. It is the baseline the next
+check compares against.
+
+### The diff scripts were misreading both engines
+
+The July scripts read each table's raw Parquet files. Both engines' retractions survive there:
+
+- **DbspNet** retracts with Delta deletion vectors, which a plain Parquet read ignores.
+  Incremental output came after July. `market_volatility` read 3,678 rows, not 1,796.
+- **Feldera's output is a change log.** Each row carries `__feldera_op` (`'i'` or `'d'`), so
+  its `'d'` rows are deletes, not rows. `market_volatility` read 5,550 rows for 1,796 live.
+- Feldera writes UTC-adjusted `timestamp` and we write `timestamp_ntz`. That makes every
+  timestamp column differ textually.
+
+**Two July verdicts were artifacts of this.** The first was "Feldera over-produces
+`market_volatility` with ×3/×5 copies of each symbol". Those copies were its delete rows; net,
+Feldera has one row per symbol. The second was the "SCD-2 same-timestamp tie" extras in
+`dim_trade` / `fact_watches`, and those were its delete rows too; net, both views match ours.
+ivm-bench `fix/gold-diff-reads-change-logs` (`397ec46`) fixes the scripts: new `gold_tables.py`
+reads through DuckDB `delta_scan`, which applies deletion vectors, and nets Feldera's log.
+They need `duckdb<2`.
+
+### Results
+
+At `792e8ac`, read correctly, 13 of 16 views were identical. Two of the three residuals were
+DbspNet differences, fixed in `fdaa90a` under `NumericDialect.Feldera`, which `DbspNetEngine`
+compiles with. Both behaviours are implementation-defined in SQL:
+
+| View | Diff at `792e8ac` | Cause | At `fdaa90a` |
+|---|---|---|---|
+| `dim_account`, `dim_customer` `effective_timestamp` | 4 + 4 rows | `CAST(cdc_dsn AS TIMESTAMP)` (BIGINT): we read µs, Feldera reads ms | 0 |
+| `market_volatility.pct_market_volume` | 8 rows, +0.0001 | DECIMAL division: we rounded the scale-6 quotient half-even, Feldera truncates, and the later `ROUND(…, 4)` then double-rounded ours (exact 0.058449981… → 0.0585). Feldera's values are the exact ones | 0 |
+| `market_volatility.volume_volatility` | 7 symbols | float `STDDEV`, last digit (≤ 0.0001) | 7, accepted |
+| `dim_customer` `phone1`/`2`/`3` | 11,866 rows | **Feldera bug**, below | unchanged |
+
+`trade_volume_stats` and `broker_performance` are now identical. July's 56 + 2
+fourth-decimal residuals are gone.
+
+**The phone columns are Feldera's bug.** The raw `C_PHONE_n.C_CTRY_CODE` is a BIGINT, and it is
+genuinely NULL for most customers (4,565 of 6,012 for phone 1), never empty. Standard
+`CONCAT_WS` skips NULL arguments, so `767-4707` is right. Feldera lowers `CONCAT_WS` as a left
+fold from a NULL accumulator, and `concat_ws_NN(sep, NULL, NULL)` returns `''` rather than NULL
+(`crates/sqllib/src/string.rs`; still so on Feldera main, 2026-11-14). Its result for that
+customer is `-767-4707`. Stripping the leading `-` from Feldera's phones makes `dim_customer`
+identical (0 diffs). `ScalarFunctionTests.ConcatWs_LeadingNullValues_NoLeadingSeparator`
+pins our behaviour.
+
+**Net: no DbspNet difference from Feldera remains on TPC-DI** except float last digits and
+Feldera's `CONCAT_WS` bug.
