@@ -65,10 +65,12 @@ never advances).
 
 **Deferred follow-ons:** a `CURRENT_TIME` frozen-constant feature (a separate
 design, see below); a spine sibling operator; a per-row transition-time index
-(the operator's per-tick recompute is O(integral size)); filters not directly
-over a scan, for the downstream-GC frontier; the typed fast path; and WAL
-(approach A) per-tick clock recording for pure-log replay (the snapshot path is
-correct today). **Done since:** `CAST(timestamp ↔ date)` casts and the
+(the operator's per-tick recompute is O(integral size)); and the typed fast path.
+**Done 2026-11-15** (`design-program-temporal.md`): programs, where the runner
+drives the clock from wall time and journals it per tick for replay; filters not
+directly over a scan, for the downstream-GC frontier; the frontier identified by
+its window instead of its base column, which fixed a single-query soundness bug
+with two windows over one column; and the program-parallel path. **Done since:** `CAST(timestamp ↔ date)` casts and the
 monotone-*expression* time-key downstream-GC frontier for `CAST(ts AS DATE)` (see
 "`CAST(timestamp ↔ date)` and the expression-key GC frontier" below).
 

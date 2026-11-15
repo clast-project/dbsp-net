@@ -1,6 +1,6 @@
 # Design: temporal filters (`NOW()`) on the program path
 
-**Status: DESIGN, 2026-11-15.** Kickoff: `docs/next-arc-program-temporal-prompt.md`. Companions:
+**Status: BUILT, 2026-11-15** (§5 has the results). Kickoff: `docs/next-arc-program-temporal-prompt.md`. Companions:
 `docs/now-and-temporal-filters.md` (the single-query feature), `docs/design-parallel-frontier.md`
 (LATENESS on the parallel paths, §5 "Left open"), `docs/design-durable-state.md` §1c (journal) and §1d
 (reshard).
@@ -215,3 +215,76 @@ See the kickoff prompt; it is reproduced in §2 Q4's tests.
   pre-existing and serial.
 - The per-tick recompute is O(|integral|) (`now-and-temporal-filters.md`, deferred).
 - Typed paths: a temporal filter forces structural, as before.
+
+## 5. Results (2026-11-15)
+
+**Built**, in three commits on `main`:
+
+| commit | what |
+|---|---|
+| `2964c84` | §2 Q1: the clock |
+| `b04bd68` | §2 Q2: the window identity and serial GC |
+| `af748f5` | §2 Q3: parallel |
+
+**Correctness.**
+- **The clock.** `ProgramRunnerClockTests` covers:
+  - the default-runner test that failed on `main`;
+  - a clock-only tick retracting aged-out rows, and no tick when time did not move;
+  - the resolution rounding down;
+  - a program without `NOW()` never clocked;
+  - backward time held;
+  - the parallel runner clocking every replica;
+  - journal replay at a much later wall time landing on the journaled clock, tick and view, both
+    journal-only and snapshot + journal;
+  - a restore on a host whose clock is behind the snapshot, which holds the clock.
+- **GC.** `ProgramTemporalFilterTests` covers:
+  - the collision fix, on the single-query path and across two program views;
+  - bounded GC in the filtering view, across a view boundary (output and inlined), and above a
+    filter over an aggregate view;
+  - serial program equals single query, tick by tick.
+- **PBT.** `TemporalFilterPbtTests` has two new arms:
+  - program vs single query, tick by tick, and vs the batch oracle at the final clock, over seven
+    shapes. These include the two-window union, a filter over an aggregate view, DISTINCT, a self
+    join, an appear-only filter, and the one-view nested-aggregate shape. Intermediate views are
+    randomly outputs or inlined.
+  - parallel program vs **serial** program at W ∈ {2, 3, 4}, flat and spine, with deletes.
+- **Checkpoint.** `ParallelTemporalCheckpointTests` covers:
+  - same-W restore (flat and spine, W = 2, 3, 4) and reshard 2→3, 3→2, 4→2, 2→4, each continued
+    for 8 ticks with deletes against an uninterrupted serial run;
+  - the stated placements;
+  - exchange elision above a filter over an aggregate;
+  - `Unsupported` after a projection: the reshard refuses, while same-W restore works.
+- **Full suite** after a clean rebuild: 3875 pass, 1 skipped, run twice.
+
+**Mutation checks** (each reverted after the run):
+
+| mutant | fails |
+|---|---|
+| window identity without the offset (all windows on a column share one) | the PBT program arm; both collision tests |
+| keyed placement → `Anywhere` | all 4 reshard runs (rows diverge after the reshard); the placement test |
+| no partition passthrough | the elision test |
+
+**A correction to §2 Q3, found while building.** The program-parallel compile builds a fresh
+`CompileContext` per view, so partition info does **not** cross a view boundary: a view-scan arrives
+unpartitioned, which is conservative. The table in Q3 therefore applies within a view. A filter
+over a *view* scan records `Unsupported`:
+- the filter itself is correct;
+- same-W restore works;
+- a reshard refuses.
+
+The elided-exchange case only arises inside one view (the nested shape). Carrying partitions across
+views would change existing parallel circuits, ivm-bench's included, so it is left open.
+
+**No regression without `NOW()`.**
+- A program without a temporal filter builds the same circuit as before: no frontier is
+  registered and no partition is recorded on a filter.
+- The runner checks a cached `UsesClock` and never samples the clock.
+- The journal format is unchanged, because `clock` is omitted when null.
+- No benchmark was re-run, because nothing on those paths changed.
+
+**Left open.**
+- Cross-view partition passthrough on the parallel program (above).
+- Alternatively, a whole-row exchange in front of a filter whose input is not reproducibly placed,
+  which would make every shape reshardable (§2 Q3).
+- The crash matrix (`ParallelCrashSafeCheckpointTests`) does not yet carry a `NOW()` view.
+- The `_accum` leak of a delete after expiry (§4).

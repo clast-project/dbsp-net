@@ -164,10 +164,13 @@ behaviour, such as NULL collation and numeric↔string coercion.
   the maximum seen. Late rows are dropped, and joins, aggregates and DISTINCT
   garbage-collect state below the resulting frontier, which keeps long-running
   pipelines in bounded memory.
-- `NOW()`, `CURRENT_TIMESTAMP` and `CURRENT_DATE` read a logical clock that the
-  host advances (`AdvanceClock`). It is persisted and deterministic. `WHERE ts >
-  NOW() - INTERVAL '1' HOUR` emits retractions as the clock moves, even on ticks
-  with no input.
+- `NOW()`, `CURRENT_TIMESTAMP` and `CURRENT_DATE` read a logical clock. A
+  library host advances it (`AdvanceClock`). The program runner and the server
+  advance it from wall time once per step, at a 1 s resolution by default
+  (`ProgramClock`, `DBSPNET_CLOCK_RESOLUTION_USECS`), as Feldera does. The clock is
+  persisted and journaled, so replay is deterministic. `WHERE ts > NOW() -
+  INTERVAL '1' HOUR` emits retractions as the clock moves, even on ticks with no
+  input, and runs on every serial and parallel path.
 
 ### Not supported (highlights)
 
@@ -186,9 +189,6 @@ The full list is in [`docs/skipped.md`](docs/skipped.md).
 - `CURRENT_TIME`, which is rejected because it wraps at midnight.
 - DML, transactions, `ALTER`, `CREATE INDEX` and bind parameters. Data enters
   through `Table(...).Push` or connectors.
-- Temporal filters (`NOW()`) on the parallel *program* path. A program that
-  uses one compiles serially (a `ParallelBlockers` entry). The single-query
-  parallel path does run them, and both parallel paths run `LATENESS`.
 
 ## Engine
 

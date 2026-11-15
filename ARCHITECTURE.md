@@ -156,9 +156,11 @@ tick's.
 step.
 
 Other circuit-level features:
-- **Clock.** `RootCircuit.AdvanceTime` / `CompiledQuery.AdvanceClock` set a
-  monotone logical clock in µs (`Clock`, `LogicalTime`). It drives `NOW()`, is
-  persisted, and doubles as an `IFrontier`.
+- **Clock.** `RootCircuit.AdvanceTime` / `CompiledQuery.AdvanceClock` /
+  `CompiledProgram.AdvanceClock` set a monotone logical clock in µs (`Clock`,
+  `LogicalTime`). It drives `NOW()`, is persisted, and doubles as an `IFrontier`.
+  `ProgramRunner` samples it from a `ProgramClock` before each step of a program
+  that `UsesClock`.
 - **Observability.** `CollectStats()` returns one `OperatorStat` per stateful
   operator that implements `IIntrospectable` (`Circuit/OperatorStat.cs`): retained
   state, last output size, GC frontier and GC drops. It is read on demand and is
@@ -192,8 +194,7 @@ The entry points are:
 
 Each one returns `false` when the plan can't shard soundly, and the caller then
 compiles serially. `SqlProgram.ParallelBlockers` explains the refusal. Current
-blockers include temporal filters on the program path, recursive CTEs and some
-semi-join or difference shapes. `LATENESS` runs on both structural parallel
+blockers include recursive CTEs and some semi-join or difference shapes. `LATENESS` runs on both structural parallel
 paths. Design notes:
 [`design-structural-parallel.md`](docs/design-structural-parallel.md) and
 [`design-tpcdi-batch1.md`](docs/design-tpcdi-batch1.md).
@@ -354,10 +355,20 @@ model), not a scalar function.
   on ticks with no input. It self-GCs.
 - A bounded window advertises `clock − offset` as a frontier, so a downstream
   GROUP BY, join or DISTINCT on the time key GCs through the `LATENESS`
-  machinery.
+  machinery. The frontier is identified by its window (clock unit, offset, cast),
+  not by the base column, so two windows over one column never share one. It
+  crosses program view boundaries like a `LATENESS` source.
+- **Programs.** `ProgramRunner` advances the clock from wall time once per step,
+  rounded down to its resolution and held, not rewound, if the time source steps
+  back. It takes a clock-only tick at the end of a batch when time moved, and
+  journals each tick's clock for replay.
+- **Parallel.** The filter's state stays where its input's partition put each row,
+  and the partition passes through. A re-shard places the rows by that partition's
+  hash, or refuses when the hash is not reproducible.
 
 The oracle is the batch query with `NOW` set to the final clock. See
-[`now-and-temporal-filters.md`](docs/now-and-temporal-filters.md).
+[`now-and-temporal-filters.md`](docs/now-and-temporal-filters.md) and
+[`design-program-temporal.md`](docs/design-program-temporal.md).
 
 ## Persistence
 

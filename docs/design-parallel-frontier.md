@@ -252,8 +252,8 @@ race on `Current`), seen only under load.
 | stream-release scan not excluding the registries | `StreamReleaseScan_StaysInsideItsOwnReplica` |
 
 **Left open.**
-- Temporal filters on the program-parallel path. This needs a `TemporalFilterOp` reshard placement
-  equal to its input's partition.
+- ~~Temporal filters on the program-parallel path.~~ Done 2026-11-15: `docs/design-program-temporal.md`
+  §2 Q3 (the placement is the input's partition, or `Unsupported`).
 - The typed paths' LATENESS (refused or GC-less, as before).
 - Feldera's one-waterline-per-table drop rule versus our per-column chain (§1). This is a serial
   difference that the parallel arc does not change.
