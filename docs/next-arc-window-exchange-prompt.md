@@ -1,5 +1,8 @@
 # Starting prompt — next arc: what `dim_customer`'s window exchanges cost (measure first)
 
+> **CLOSED 2026-11-15 at step 1.** The 22 skippable exchanges cost 0.5–0.6% of the batch-1 W=12
+> step (6 runs), under the 5% stop line. See `docs/xview-census/README.md`.
+
 > Kickoff written 2026-11-15, after the program-path `NOW()` arc (`docs/design-program-temporal.md`)
 > and a compile-only exchange census of the ivm-bench program. Paste the block below into a new
 > session.

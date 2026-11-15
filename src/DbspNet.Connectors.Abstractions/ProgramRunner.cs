@@ -1009,11 +1009,13 @@ public sealed class ProgramRunner
 
             if (exchanges.Count > 0)
             {
+                // DBSPNET_PROFILE_TOP=<n> lists more, as for the operator table.
+                var top = int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_PROFILE_TOP"), out var n) && n > 0 ? n : 30;
                 var allWait = exchanges.Sum(e => e.Wait);
                 sb.AppendLine();
                 sb.AppendLine(FormattableString.Invariant(
-                    $"-- exchanges by barrier wait (summed over workers; all {exchanges.Count} exchanges wait {allWait:F0} ms of {exchanges.Sum(e => e.Total):F0} ms; top 30) --"));
-                foreach (var e in exchanges.OrderByDescending(e => e.Wait).Take(30))
+                    $"-- exchanges by barrier wait (summed over workers; all {exchanges.Count} exchanges wait {allWait:F0} ms of {exchanges.Sum(e => e.Total):F0} ms; top {top}) --"));
+                foreach (var e in exchanges.OrderByDescending(e => e.Wait).Take(top))
                 {
                     sb.AppendLine(FormattableString.Invariant(
                         $"  [{e.Op.Index,4}] {e.Op.Name,-22} wait {e.Wait,8:F0} ms ({(allWait > 0 ? e.Wait / allWait * 100 : 0),4:F1}%)  of {e.Total,8:F0} ms  rows {e.Rows,9}  recv max/mean {e.GatherSkew,5:F2}  sent max/mean {e.SplitSkew,5:F2}  {e.Op.Label}"));

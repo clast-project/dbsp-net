@@ -713,3 +713,14 @@ pins our behaviour.
 
 **Net: no DbspNet difference from Feldera remains on TPC-DI** except float last digits and
 Feldera's `CONCAT_WS` bug.
+
+## Window-site exchanges in `dim_customer` — measured, not worth building (2026-11-15)
+
+A compile-only census found that `dim_customer`'s 22 `PARTITION BY customer_id, x_grp` windows
+each re-exchange input that is already partitioned on `customer_id`. Under the subset rule those
+exchanges could be skipped: 22 of the program's 138, about 16%.
+
+Six profiled batch-1 runs at W=12 (SF=3, `99ecf1c`) put their cost at **74 ms of a 13.0 s step
+(0.5–0.6%)**, and 76% of that is barrier wait. `dim_customer` is 6,440 rows, so each exchange is a
+cheap barrier, not a row copy (28.7 MiB of 62.7 GiB allocation in total). The whole view is 3.2%
+of the step. The idea is closed. Numbers and harness: `docs/xview-census/README.md`.
