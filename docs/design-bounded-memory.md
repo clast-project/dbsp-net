@@ -5592,6 +5592,16 @@ with the GC timeline and `XT_LOH_PROFILE=10` on. Run back to back.
 At a 50% failure rate, five passes in a row would happen by chance 3% of the time. The deterministic
 check, zero large block loads, held in all five.
 
+**These are this Mac's settings, not the reporter's hardware.** The 48 GiB `DOTNET_GCHeapHardLimit`,
+`DBSPNET_MEMORY_LIMIT_MIB=49152` and `DBSPNET_WORKERS=12` were sized for the 64 GiB M4 Mac mini. They went to the
+reporter in issue #2 on 2026-11-11 as "the settings my local runs use", and the reporter's SF25 compose file
+copied them verbatim into a container with `cpus: 32` and `mem_limit: 120g`. The original SF1 report set no
+heap limit and ran serially. "Mirroring the reporter's run" here therefore mirrors our own advice. The
+failure rates (3 of 6 old, 0 of 5 new) were measured at a heap pinned at 48 GiB on 64 GiB of RAM. The fix
+removes the failure at any limit, but how often the old build failed with a ~90 GiB heap (the .NET default
+for a 120 GiB container) is unmeasured. Their last reported failure was a different one (`PartitionedRankOp`
+on b580b7f). Neither a heap above 48 GiB nor more than 12 workers has been tested at SF25.
+
 **The batch totals are not comparable.** The old passes ran on 86d0ce1, before §5.58. There the first `/wait`
 read at the end of batch 1 also did the distinct row-count upkeep, ~120 s after the drain. The new runs'
 `duration_s` (2,718–2,767 s) therefore matches the old ones' (2,711–2,767) only by that coincidence. The drain
