@@ -1323,6 +1323,14 @@ Where the ~485 ms went (batch-2 drain, fresh process unless stated):
   3.9×; batch 3 217 vs 121 ms. Still not met.
 - **What remains is mostly JIT.** Single runs with the release scan off: `DOTNET_TieredPGO=0` 363 ms,
   `DOTNET_TieredCompilation=0` 466 ms. ReadyToRun (lever 3) is the next measurement.
+- **ReadyToRun (lever 3)**, 5 interleaved rounds, both arms published from the same project
+  (`-r osx-arm64 -p:PublishReadyToRun=true|false`): batch-2 drain after restore **264 ms** [250–283]
+  vs 473 ms JIT; no restart 98 vs 128 ms — **2.7×**, still not met (2× = 196 ms). Steady state is
+  not hurt (batch 1 15.2 vs 15.6 s). But the first output write after restore gets slower (3.24 vs
+  2.99 s), so restart → first output is ~3.65 s either way. With `DOTNET_TieredPGO=0` on top
+  (3 runs, a hint) the drain is unchanged and the write drops to ~2.6 s. Batch 2 still JITs
+  614–877 ms (summed over threads) under R2R — most likely Expression-compiled delegates, which
+  R2R cannot precompile. Shipping it needs a RID in both server Dockerfiles (they publish with none).
 - **Profiling trap:** `DBSPNET_PROFILE`'s `StepProfiled` path skips the release plan, so the
   per-operator profile never shows the scan; and `RangeRank` time there is mostly exchange-barrier
   wait. In a fresh process the window and rank operators look 5–20× slower, but with JIT-warm code
