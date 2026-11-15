@@ -146,7 +146,7 @@ public class ProgramRunnerClockTests
         Assert.Equal(2, program.Outputs["recent"].RowCount);
     }
 
-    [Fact(Skip = "the program-parallel path refuses NOW() until docs/design-program-temporal.md §2 Q3")]
+    [Fact]
     public async Task ParallelRunner_DrivesTheClockOnEveryReplica()
     {
         var time = new ManualTime(100 * Sec);

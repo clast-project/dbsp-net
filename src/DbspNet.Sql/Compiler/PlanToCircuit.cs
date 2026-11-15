@@ -117,7 +117,7 @@ public static partial class PlanToCircuit
         // it against the global frontier), and so are temporal filters: the logical
         // clock is the same on every replica and the filter is per row
         // (docs/design-parallel-frontier.md).
-        if (!CanCompileParallel(plan, allowTemporalFilter: true))
+        if (!CanCompileParallel(plan))
         {
             return false;
         }
@@ -160,6 +160,7 @@ public static partial class PlanToCircuit
                     // The input is split by whole-row hash, so equal rows co-locate:
                     // the scan stream is shard-disjoint (not usefully key-partitioned).
                     ctx.SetPartition(stream, new PartitionInfo(ShardDisjoint: true, PartitionKey: null));
+                    ctx.WholeRowStreams[stream] = info.Schema;
                 }
 
                 RegisterTemporalFrontiers(builder, temporalFrontierSpecs, frontiers);
@@ -791,7 +792,12 @@ public static partial class PlanToCircuit
                     foreach (var t in tables)
                     {
                         ctx.SetPartition(streams[t.TableName], new PartitionInfo(ShardDisjoint: true, PartitionKey: null));
+                        ctx.WholeRowStreams[streams[t.TableName]] = t.Schema;
                     }
+
+                    // This view's clock frontiers, into this replica's program-wide set, as
+                    // CompileProgram does (docs/design-program-temporal.md §2 Q2).
+                    RegisterTemporalFrontiers(builder, CollectScans(optimized).Temporal, frontiers);
 
                     builder.BuildLabel = v.ViewName;
                     var stream = CompilePlan(builder, optimized, ctx);
@@ -982,8 +988,8 @@ public static partial class PlanToCircuit
     /// scalar-subquery join, a set difference, a recursive CTE, a temporal
     /// filter — is refused so the caller falls back to the serial single circuit.
     /// </summary>
-    private static bool CanCompileParallel(LogicalPlan plan, bool allowTemporalFilter = false) =>
-        CollectParallelBlockers(plan, blockers: null, allowTemporalFilter);
+    private static bool CanCompileParallel(LogicalPlan plan) =>
+        CollectParallelBlockers(plan, blockers: null);
 
     /// <summary>
     /// Every construct in <paramref name="plan"/> (an optimized view plan) that keeps the
@@ -1000,10 +1006,7 @@ public static partial class PlanToCircuit
 
     // With blockers == null this short-circuits on the first blocker (CanCompileParallel);
     // with a list it records each blocker and keeps walking.
-    // allowTemporalFilter: the single-query path shards a temporal filter (a per-row filter over a
-    // clock every replica shares); the program path still refuses it, because its TemporalFilterOp
-    // state has no re-shard placement yet (docs/design-parallel-frontier.md §2 Q5).
-    private static bool CollectParallelBlockers(LogicalPlan plan, List<string>? blockers, bool allowTemporalFilter = false)
+    private static bool CollectParallelBlockers(LogicalPlan plan, List<string>? blockers)
     {
         bool Block(string why)
         {
@@ -1011,7 +1014,7 @@ public static partial class PlanToCircuit
             return false;
         }
 
-        bool Walk(LogicalPlan child) => CollectParallelBlockers(child, blockers, allowTemporalFilter);
+        bool Walk(LogicalPlan child) => CollectParallelBlockers(child, blockers);
 
         // A node-level verdict, then (when it passed, or when collecting) its children.
         bool Then(bool ok, params LogicalPlan[] children)
@@ -1047,7 +1050,9 @@ public static partial class PlanToCircuit
             case ScanPlan:
                 return true;
 
-            case TemporalFilterPlan tf when allowTemporalFilter:
+            // A per-row filter over a clock every replica shares; its state sits where its input's
+            // partition puts each row (docs/design-program-temporal.md §2 Q3).
+            case TemporalFilterPlan tf:
                 return Walk(tf.Input);
 
             case CteScanPlan c:
@@ -1168,7 +1173,6 @@ public static partial class PlanToCircuit
                     CorrelatedScalarSubqueryJoinPlan => "correlated scalar subquery",
                     DifferencePlan => "EXCEPT / set difference",
                     RecursiveCtePlan => "recursive CTE",
-                    TemporalFilterPlan => "temporal filter (NOW())",
                     _ => plan.GetType().Name,
                 };
                 Block(why);
@@ -1340,6 +1344,16 @@ public static partial class PlanToCircuit
         /// (docs/design-durable-state.md §1d). Null elsewhere.
         /// </summary>
         public ReshardRecorder? Reshard { get; set; }
+
+        /// <summary>
+        /// Parallel (W&gt;1) only: streams whose rows sit on <c>OfWholeRow(row, schema) % W</c> — a
+        /// table's sharded input, and filters-only chains or temporal filters over one (they keep
+        /// rows identical). Lets a temporal filter state a reproducible re-shard placement
+        /// (docs/design-program-temporal.md §2 Q3). Kept apart from <see cref="PartitionInfo"/>, whose
+        /// <c>with</c> copies would carry it onto rows that are not the table's.
+        /// </summary>
+        public Dictionary<Stream<ZSet<StructuralRow, Z64>>, Schema> WholeRowStreams { get; } =
+            new(ReferenceEqualityComparer.Instance);
 
         /// <summary>
         /// Replica count W when this compile targets a <see cref="ParallelCircuit"/>;
@@ -2734,7 +2748,8 @@ public static partial class PlanToCircuit
         }
 
         var codec = ctx.SnapshotCodecs?.CreateZSetTraceCodec(plan.Schema);
-        return builder.TemporalFilter(
+        var mark = ReshardRecorder.Mark(builder);
+        var output = builder.TemporalFilter(
             input,
             timeKey,
             plan.AppearOffset,
@@ -2743,6 +2758,61 @@ public static partial class PlanToCircuit
             plan.DisappearInclusive,
             clock,
             codec);
+
+        if (ctx.Workers > 1)
+        {
+            // The operator keeps, on each worker, the rows that arrived there and emits a subset of
+            // them, so its output is partitioned exactly as its input: pass the partition through, so
+            // a downstream aggregate on the same key can elide its exchange.
+            var inputPartition = ctx.GetPartition(input);
+            ctx.SetPartition(output, inputPartition);
+            var wholeRow = ctx.WholeRowStreams.TryGetValue(input, out var wholeRowSchema) ? wholeRowSchema : null;
+            if (wholeRow is not null)
+            {
+                ctx.WholeRowStreams[output] = wholeRow;
+            }
+
+            // Its integrated rows must re-shard to where the input will deliver each row's future
+            // deltas: ComputeValid skips non-positive weights, so a row's +1 and its later −1 must
+            // meet on one worker, and an elided downstream exchange trusts the placement.
+            if (ctx.Reshard is { } reshard)
+            {
+                if (TemporalFilterPlacement(inputPartition, wholeRow) is { } placement)
+                {
+                    reshard.Record(builder, mark, Z("trace.arrows", placement, codec));
+                }
+                else
+                {
+                    reshard.RecordUnsupported(
+                        builder,
+                        mark,
+                        "a temporal filter whose input is not placed by a reproducible hash (after a projection, "
+                        + "a union or a broadcast join) cannot be re-sharded (docs/design-program-temporal.md §2 Q3)");
+                }
+            }
+        }
+
+        return output;
+    }
+
+    /// <summary>
+    /// Where a temporal filter's integrated rows live at W&gt;1: where its input stream puts each row
+    /// (docs/design-program-temporal.md §2 Q3), or null when that is not a reproducible hash.
+    /// </summary>
+    private static ReshardPlacement? TemporalFilterPlacement(PartitionInfo input, Schema? wholeRow)
+    {
+        if (input.Gathered)
+        {
+            return ReshardPlacement.OnWorker0;
+        }
+
+        if (input.PartitionKey is { } key && input.KeySchema is { } keySchema)
+        {
+            // The hash the upstream exchange used, from the key columns the row still carries.
+            return new ReshardPlacement.Hash(row => StablePartitionHash.OfRow(row, key, keySchema));
+        }
+
+        return wholeRow is not null ? ReshardPlacement.WholeRow(wholeRow) : null;
     }
 
     // ---- TOP-K (ORDER BY ... LIMIT/OFFSET) ----
@@ -3382,6 +3452,10 @@ public static partial class PlanToCircuit
             if (!hasMap)
             {
                 ctx.SetPartition(result, ctx.GetPartition(input));
+                if (ctx.WholeRowStreams.TryGetValue(input, out var wholeRowSchema))
+                {
+                    ctx.WholeRowStreams[result] = wholeRowSchema;
+                }
             }
         }
 

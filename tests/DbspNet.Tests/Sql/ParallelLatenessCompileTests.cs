@@ -47,17 +47,18 @@ public class ParallelLatenessCompileTests
     }
 
     [Fact]
-    public void SingleQueryParallel_TakesATemporalFilter_ButTheProgramPathStillRefusesIt()
+    public void BothParallelPaths_TakeATemporalFilter()
     {
         const string Ddl = "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)";
         const string Query = "SELECT ts, v FROM a WHERE ts > NOW() - INTERVAL '3' SECOND";
         Assert.True(PlanToCircuit.TryCompileParallel(Plan(Ddl, Query), 2, out var q));
         q!.Dispose();
 
+        // The program path too, since docs/design-program-temporal.md §2 Q3.
         string[] program = [Ddl, "CREATE VIEW recent AS " + Query];
         var views = new HashSet<string>(["recent"], StringComparer.Ordinal);
-        Assert.False(SqlProgram.TryCompileParallel(program, views, 2, out _));
-        var (_, blockers) = Assert.Single(SqlProgram.ParallelBlockers(program, views));
-        Assert.Contains(blockers, b => b.Contains("temporal filter", StringComparison.Ordinal));
+        Assert.Empty(SqlProgram.ParallelBlockers(program, views));
+        Assert.True(SqlProgram.TryCompileParallel(program, views, 2, out var p));
+        p!.Dispose();
     }
 }

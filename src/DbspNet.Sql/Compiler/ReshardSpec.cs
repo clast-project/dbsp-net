@@ -101,7 +101,15 @@ internal sealed class ReshardRecorder
 
     public static int Mark(CircuitBuilder builder) => builder.OperatorCount;
 
-    public void Record(CircuitBuilder builder, int mark, params ReshardFile?[] files)
+    public void Record(CircuitBuilder builder, int mark, params ReshardFile?[] files) =>
+        Record(builder, mark, unsupported: null, files);
+
+    /// <summary>Record that the one snapshotable operator a build site added cannot be re-sharded, and
+    /// why: a re-shard then refuses rather than guessing where its state goes.</summary>
+    public void RecordUnsupported(CircuitBuilder builder, int mark, string why) =>
+        Record(builder, mark, why);
+
+    private void Record(CircuitBuilder builder, int mark, string? unsupported, params ReshardFile?[] files)
     {
         if (!Active)
         {
@@ -125,7 +133,9 @@ internal sealed class ReshardRecorder
 
         var type = builder.OperatorAt(added[0]).GetType().Name;
         var present = files.Where(f => f is not null).Cast<ReshardFile>().ToList();
-        _specs[added[0]] = type.StartsWith("Spine", StringComparison.Ordinal)
+        _specs[added[0]] = unsupported is not null
+            ? new ReshardSpec(type, present, unsupported)
+            : type.StartsWith("Spine", StringComparison.Ordinal)
             ? new ReshardSpec(type, present, "spine traces cannot be re-sharded yet (docs/design-durable-state.md §1d)")
             : new ReshardSpec(type, present);
     }

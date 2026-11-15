@@ -178,6 +178,12 @@ public class TemporalFilterPbtTests
         (["SELECT ts, v FROM a WHERE ts <= NOW()",
           "SELECT v, COUNT(*) AS c FROM v0 GROUP BY v"],
          "SELECT v, COUNT(*) AS c FROM (SELECT ts, v FROM a WHERE ts <= NOW()) v0 GROUP BY v"),
+        // One view: the filter sits on the inner aggregate's output and passes its partition through,
+        // so at W>1 the outer aggregate elides its exchange.
+        (["SELECT ts, MAX(s) AS m, COUNT(*) AS c FROM (SELECT ts, s FROM (SELECT ts, SUM(v) AS s FROM a GROUP BY ts) x "
+            + "WHERE ts > NOW() - INTERVAL '3' SECOND) y GROUP BY ts"],
+         "SELECT ts, MAX(s) AS m, COUNT(*) AS c FROM (SELECT ts, s FROM (SELECT ts, SUM(v) AS s FROM a GROUP BY ts) x "
+            + "WHERE ts > NOW() - INTERVAL '3' SECOND) y GROUP BY ts"),
     ];
 
     private const string ProgramDdl = "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)";
@@ -204,6 +210,77 @@ public class TemporalFilterPbtTests
         Gen.Select(Gen.Int[0, ProgramShapes.Length - 1], Gen.Bool, GenRun).Sample(
             (shape, outs, run) => CheckProgram(ProgramShapes[shape], outs, run),
             iter: 1000);
+    }
+
+    // Parallel program arm: every shape at W = 2, 3, 4, flat and spine, equals the SERIAL program tick
+    // by tick (memory parallel-view-in-circuit: parallel-vs-batch can pass while wrong). Deletes are
+    // mixed in, so a retraction must meet its insert on one worker.
+    [Fact]
+    public void ProgramTemporalFilterParallelEqualsSerial()
+    {
+        Gen.Select(Gen.Int[0, ProgramShapes.Length - 1], Gen.Bool, Gen.Bool, GenRun).Sample(
+            (shape, outs, spine, run) => CheckProgramParallel(ProgramShapes[shape], outs, spine, run),
+            iter: 150);
+    }
+
+    private static bool CheckProgramParallel(
+        (string[] Views, string Single) shape, bool intermediatesAreOutputs, bool spine, (InputEvent[] Events, long ClockDelta)[] run)
+    {
+        var (sql, outputs, _) = ProgramOf(shape.Views, intermediatesAreOutputs);
+        var options = new CompileOptions { TraceFamily = spine ? TraceFamily.Spine : TraceFamily.Flat };
+        var serial = SqlProgram.Compile(sql, outputs, options: options);
+        var parallels = new List<ParallelCompiledProgram>();
+        try
+        {
+            foreach (var w in new[] { 2, 3, 4 })
+            {
+                Assert.True(SqlProgram.TryCompileParallel(sql, outputs, w, out var p, options: options), $"parallel compile refused: {string.Join("; ", sql)}");
+                parallels.Add(p!);
+            }
+
+            // Each tick also deletes the first event of the tick two back, if there was one.
+            long clock = 0;
+            for (var t = 0; t < run.Length; t++)
+            {
+                clock += run[t].ClockDelta;
+                serial.AdvanceClock(clock);
+                parallels.ForEach(p => p.AdvanceClock(clock));
+                foreach (var ev in run[t].Events)
+                {
+                    serial.Table("a").Insert(ev.Row);
+                    parallels.ForEach(p => p.Table("a").Insert(ev.Row));
+                }
+
+                if (t >= 2 && run[t - 2].Events.Length > 0)
+                {
+                    var row = run[t - 2].Events[0].Row;
+                    serial.Table("a").Delete(row);
+                    parallels.ForEach(p => p.Table("a").Delete(row));
+                }
+
+                serial.Step();
+                foreach (var p in parallels)
+                {
+                    p.Step();
+                    foreach (var view in outputs)
+                    {
+                        if (!p.Outputs[view].CurrentView.Equals(serial.Outputs[view].CurrentView))
+                        {
+                            Console.Error.WriteLine($"program: {string.Join("; ", sql)}  view {view}  W={p.Workers}  spine={spine}  tick {t}  clock={clock}");
+                            Console.Error.WriteLine("serial:   " + serial.Outputs[view].CurrentView);
+                            Console.Error.WriteLine("parallel: " + p.Outputs[view].CurrentView);
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            parallels.ForEach(p => p.Dispose());
+        }
     }
 
     private static bool CheckProgram((string[] Views, string Single) shape, bool intermediatesAreOutputs, (InputEvent[] Events, long ClockDelta)[] run)
