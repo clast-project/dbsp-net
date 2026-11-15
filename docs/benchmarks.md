@@ -5,7 +5,7 @@ Each row: load the circuit fresh, measure the full compile-load-step time ("batc
 
 Every measurement uses the plan optimizer (`PlanOptimizer.Optimize`).
 
-Host: .NET 10.0.8, 24 cores.
+Host: .NET 10.0.8, 14 cores, macOS 27.2.0 (Arm64). Generated 2026-11-15.
 
 ## Filter — `WHERE value > 500 AND status = 'active'`
 
@@ -13,10 +13,10 @@ Pipelined filter over a flat table. No stateful operators — the per-update cos
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 132.1 µs | 1.60 µs | 82.6× |
-|       1000 | 1.20 ms | 1.70 µs | 705× |
-|      10000 | 10.27 ms | 1.50 µs | 6849× |
-|     100000 | 76.38 ms | 1.00 µs | 76377× |
+|        100 | 69.0 µs | 1.20 µs | 57.5× |
+|       1000 | 585.1 µs | 1.40 µs | 418× |
+|      10000 | 3.72 ms | 1.40 µs | 2654× |
+|     100000 | 19.93 ms | 1.00 µs | 19935× |
 
 ## Operator fusion — `map → filter → map` chain
 
@@ -24,10 +24,10 @@ A three-stage linear chain (`MapRows` → `Filter` → `MapRows`) wired as three
 
 | N (batch)  | Unfused       | Fused          | Speedup | Unfused alloc | Fused alloc | Alloc saved |
 |-----------:|--------------:|---------------:|--------:|--------------:|------------:|------------:|
-|        100 | 27.70 µs | 10.20 µs | 2.72× |   33.1 KB |    9.2 KB | 72% |
-|       1000 | 172.50 µs | 75.60 µs | 2.28× |  334.4 KB |   93.9 KB | 72% |
-|      10000 | 1.23 ms | 303.20 µs | 4.05× |    3.1 MB |  909.6 KB | 72% |
-|     100000 | 47.85 ms | 10.42 ms | 4.59× |   29.6 MB |    8.5 MB | 71% |
+|        100 | 24.10 µs | 7.70 µs | 3.13× |   24.5 KB |    6.8 KB | 72% |
+|       1000 | 216.50 µs | 75.60 µs | 2.86× |  221.2 KB |   62.9 KB | 72% |
+|      10000 | 751.50 µs | 185.20 µs | 4.06× |    2.2 MB |  677.0 KB | 71% |
+|     100000 | 5.42 ms | 1.79 ms | 3.03× |   20.9 MB |    6.3 MB | 70% |
 
 ## Multi-aggregate — `SUM / COUNT / MIN / MAX` over 100 groups
 
@@ -35,10 +35,10 @@ Stateful composite aggregator with retractions on every group-key hit. All four 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 196.3 µs | 3.80 µs | 51.7× |
-|       1000 | 1.10 ms | 4.70 µs | 234× |
-|      10000 | 13.12 ms | 9.40 µs | 1395× |
-|     100000 | 138.61 ms | 18.50 µs | 7492× |
+|        100 | 130.1 µs | 2.80 µs | 46.5× |
+|       1000 | 521.0 µs | 3.10 µs | 168× |
+|      10000 | 2.72 ms | 3.70 µs | 734× |
+|     100000 | 22.89 ms | 10.50 µs | 2180× |
 
 ## Joined GROUP BY — `SUM(amount)` per region over `orders ⋈ customers`
 
@@ -46,32 +46,32 @@ Inner join feeding a SUM aggregator. Per-update cost = probing the fixed custome
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 183.0 µs | 7.00 µs | 26.1× |
-|       1000 | 1.27 ms | 15.80 µs | 80.3× |
-|      10000 | 6.74 ms | 63.30 µs | 106× |
-|     100000 | 58.32 ms | 102.10 µs | 571× |
+|        100 | 119.6 µs | 3.60 µs | 33.2× |
+|       1000 | 774.5 µs | 3.70 µs | 209× |
+|      10000 | 3.95 ms | 3.50 µs | 1127× |
+|     100000 | 26.46 ms | 3.80 µs | 6964× |
 
 ## Joined GROUP BY — flat vs spine trace family
 
-The same query and data as the Joined GROUP BY benchmark above, compiled once onto the flat dictionary traces and once onto the spine (LSM) traces via `CompileOptions { TraceFamily = TraceFamily.Spine }`. Both run through the structural compile (spine mode skips the typed fast path), so the delta is the trace family alone: the spine pays a per-batch bloom + binary search on each probe where the flat trace does one dictionary lookup, in exchange for immutable batches that snapshot per-file and spill to disk. Operators: `IncrementalJoinOp` + `IncrementalAggregateOp` (flat) vs `SpineIncrementalJoinOp` + `SpineIncrementalAggregateOp`.
+The same query and data as the Joined GROUP BY benchmark above, compiled once onto the flat dictionary traces and once onto the spine (LSM) traces via `CompileOptions { TraceFamily = TraceFamily.Spine }`. Both go through the same compiler, so the delta is the trace family alone: the spine pays a per-batch bloom + binary search on each probe where the flat trace does one dictionary lookup, in exchange for immutable batches that snapshot per-file and spill to disk. Operators: `IncrementalJoinOp` + `IncrementalAggregateOp` (flat) vs `SpineIncrementalJoinOp` + `SpineIncrementalAggregateOp`.
 
 | N          | Flat batch    | Flat incr      | Spine batch   | Spine incr     | Spine incr vs flat |
 |-----------:|--------------:|---------------:|--------------:|---------------:|-------------------:|
-|        100 | 180.3 µs | 6.70 µs | 236.7 µs | 17.80 µs | 2.66× |
-|       1000 | 1.08 ms | 14.40 µs | 1.65 ms | 46.10 µs | 3.20× |
-|      10000 | 9.26 ms | 65.40 µs | 10.29 ms | 141.80 µs | 2.17× |
-|     100000 | 51.91 ms | 64.50 µs | 75.49 ms | 126.10 µs | 1.96× |
+|        100 | 123.2 µs | 3.80 µs | 145.7 µs | 8.70 µs | 2.29× |
+|       1000 | 733.9 µs | 3.90 µs | 852.0 µs | 25.10 µs | 6.44× |
+|      10000 | 3.84 ms | 3.70 µs | 3.90 ms | 118.10 µs | 31.9× |
+|     100000 | 24.68 ms | 3.60 µs | 24.95 ms | 183.80 µs | 51.1× |
 
 ## Joined GROUP BY (nullable `amount`) — same query shape
 
-Identical query to Benchmark 3, but `orders.amount` is nullable and ~10% of input rows have `NULL amount`. Exercises the typed pipeline's nullable-arg SUM path (Phase N4): per-row `HasValue` check, `DistinctNonNullRows` bookkeeping for the linear gate, and `Nullable<long>`-typed aggregate output slot. Compare to Benchmark 3 to read off the per-row overhead of the nullable wrapper versus the non-null fast path.
+Identical query to the Joined GROUP BY benchmark, but `orders.amount` is nullable and ~10% of input rows have `NULL amount`. Exercises the typed pipeline's nullable-arg SUM path (Phase N4): per-row `HasValue` check, `DistinctNonNullRows` bookkeeping for the linear gate, and `Nullable<long>`-typed aggregate output slot. Compare to the non-null Joined GROUP BY to read off the per-row overhead of the nullable wrapper versus the non-null fast path.
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 182.2 µs | 5.80 µs | 31.4× |
-|       1000 | 1.43 ms | 14.90 µs | 95.9× |
-|      10000 | 9.62 ms | 65.20 µs | 147× |
-|     100000 | 60.22 ms | 72.70 µs | 828× |
+|        100 | 123.1 µs | 3.60 µs | 34.2× |
+|       1000 | 834.5 µs | 3.70 µs | 226× |
+|      10000 | 4.89 ms | 3.50 µs | 1396× |
+|     100000 | 31.69 ms | 3.90 µs | 8125× |
 
 ## Joined GROUP BY (`EmittedEqualityCodec`) — same query shape
 
@@ -79,21 +79,21 @@ Identical query and circuit shape as the preceding Joined GROUP BY benchmark, bu
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 268.5 µs | 5.80 µs | 46.3× |
-|       1000 | 2.42 ms | 9.90 µs | 245× |
-|      10000 | 23.75 ms | 32.60 µs | 728× |
-|     100000 | 82.00 ms | 19.60 µs | 4184× |
+|        100 | 220.1 µs | 5.20 µs | 42.3× |
+|       1000 | 1.61 ms | 6.30 µs | 256× |
+|      10000 | 9.64 ms | 11.70 µs | 824× |
+|     100000 | 63.99 ms | 18.60 µs | 3440× |
 
 ## Joined GROUP BY (typed rows, hand-wired) — same query shape
 
-Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in the Core using `readonly record struct` rows — no `StructuralRow`, no `object?[]`, no SQL compilation. Establishes the perf ceiling for a future typed-row pipeline.
+Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in the Core using `readonly record struct` rows — no `StructuralRow`, no `object?[]`, no SQL compilation: the ceiling the SQL compilers are measured against.
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|        100 | 99.7 µs | 4.20 µs | 23.7× |
-|       1000 | 827.2 µs | 10.70 µs | 77.3× |
-|      10000 | 3.42 ms | 43.40 µs | 78.8× |
-|     100000 | 12.25 ms | 56.40 µs | 217× |
+|        100 | 124.2 µs | 4.00 µs | 31.1× |
+|       1000 | 878.5 µs | 3.90 µs | 225× |
+|      10000 | 4.24 ms | 4.20 µs | 1009× |
+|     100000 | 13.82 ms | 4.00 µs | 3454× |
 
 ## Transitive closure — recursive CTE over a path graph
 
@@ -101,10 +101,10 @@ Identical circuit to the preceding Joined GROUP BY benchmark, but hand-wired in 
 
 | N          | Batch         | Incremental    | Speedup |
 |-----------:|--------------:|---------------:|--------:|
-|         50 | 4.14 ms | 212.20 µs | 19.5× |
-|        100 | 27.33 ms | 635.00 µs | 43.0× |
-|        200 | 186.54 ms | 10.97 ms | 17.0× |
-|        500 | 3.62 s | 31.83 ms | 114× |
+|         50 | 3.05 ms | 217.60 µs | 14.0× |
+|        100 | 20.80 ms | 624.30 µs | 33.3× |
+|        200 | 95.96 ms | 1.60 ms | 59.9× |
+|        500 | 1.43 s | 10.79 ms | 132× |
 
 ## Pure-trace microbench — `ZSetTrace` vs `SpineZSetTrace`
 
@@ -112,22 +112,22 @@ Direct comparison between the flat in-place trace and the LSM-style `SpineZSetTr
 
 | N          | Op                 | Flat        | Spine(N=4)  | Spine(N=2)  |
 |-----------:|:-------------------|------------:|------------:|------------:|
-|       1000 | WeightOf(present)  | 29.4 ns | 326.5 ns | 281.4 ns |
-|       1000 | WeightOf(absent)   | 17.2 ns | 246.8 ns | 214.5 ns |
-|       1000 | Integrate(1)       | 200.0 ns | 500.0 ns | 1.10 µs |
-|       1000 | Integrate(100)     | 14.60 µs | 15.60 µs | 16.90 µs |
-|      10000 | WeightOf(present)  | 25.7 ns | 268.0 ns | 296.6 ns |
-|      10000 | WeightOf(absent)   | 14.3 ns | 204.6 ns | 232.0 ns |
-|      10000 | Integrate(1)       | 200.0 ns | 600.0 ns | 1.10 µs |
-|      10000 | Integrate(100)     | 12.20 µs | 13.70 µs | 14.50 µs |
-|     100000 | WeightOf(present)  | 2.9 ns | 64.9 ns | 67.7 ns |
-|     100000 | WeightOf(absent)   | 2.4 ns | 33.0 ns | 29.9 ns |
-|     100000 | Integrate(1)       | 100.0 ns | 200.0 ns | 400.0 ns |
-|     100000 | Integrate(100)     | 1.40 µs | 1.50 µs | 2.00 µs |
-|    1000000 | WeightOf(present)  | 3.2 ns | 100.2 ns | 104.8 ns |
-|    1000000 | WeightOf(absent)   | 2.4 ns | 86.6 ns | 81.2 ns |
-|    1000000 | Integrate(1)       | 100.0 ns | 200.0 ns | 400.0 ns |
-|    1000000 | Integrate(100)     | 1.30 µs | 1.50 µs | 2.00 µs |
+|       1000 | WeightOf(present)  | 27.2 ns | 547.8 ns | 446.9 ns |
+|       1000 | WeightOf(absent)   | 21.8 ns | 412.2 ns | 325.5 ns |
+|       1000 | Integrate(1)       | 100.0 ns | 500.0 ns | 1.30 µs |
+|       1000 | Integrate(100)     | 13.60 µs | 15.90 µs | 17.40 µs |
+|      10000 | WeightOf(present)  | 27.4 ns | 442.7 ns | 455.2 ns |
+|      10000 | WeightOf(absent)   | 18.2 ns | 353.5 ns | 348.5 ns |
+|      10000 | Integrate(1)       | 100.0 ns | 600.0 ns | 1.30 µs |
+|      10000 | Integrate(100)     | 12.50 µs | 13.50 µs | 16.70 µs |
+|     100000 | WeightOf(present)  | 8.0 ns | 67.2 ns | 59.7 ns |
+|     100000 | WeightOf(absent)   | 8.3 ns | 39.4 ns | 35.7 ns |
+|     100000 | Integrate(1)       | 0.0 ns | 100.0 ns | 300.0 ns |
+|     100000 | Integrate(100)     | 1.70 µs | 3.20 µs | 2.00 µs |
+|    1000000 | WeightOf(present)  | 7.9 ns | 114.1 ns | 97.2 ns |
+|    1000000 | WeightOf(absent)   | 4.5 ns | 81.7 ns | 84.0 ns |
+|    1000000 | Integrate(1)       | 0.0 ns | 100.0 ns | 300.0 ns |
+|    1000000 | Integrate(100)     | 1.20 µs | 1.50 µs | 1.70 µs |
 
 ## Pure-trace microbench — `IndexedZSetTrace` vs `SpineIndexedZSetTrace`
 
@@ -135,49 +135,92 @@ Same shape, against the indexed trace that `IncrementalAggregateOp` and the join
 
 | N          | Op                 | Flat        | Spine(N=4)  | Spine(N=2)  |
 |-----------:|:-------------------|------------:|------------:|------------:|
-|       1000 | GroupFor(present)  | 35.2 ns | 420.6 ns | 372.2 ns |
-|       1000 | GroupFor(absent)   | 23.1 ns | 250.9 ns | 232.4 ns |
-|       1000 | Integrate(1)       | 300.0 ns | 800.0 ns | 1.20 µs |
-|       1000 | Integrate(100)     | 16.10 µs | 31.60 µs | 34.50 µs |
-|      10000 | GroupFor(present)  | 26.2 ns | 356.8 ns | 392.4 ns |
-|      10000 | GroupFor(absent)   | 24.7 ns | 275.3 ns | 212.5 ns |
-|      10000 | Integrate(1)       | 100.0 ns | 300.0 ns | 500.0 ns |
-|      10000 | Integrate(100)     | 6.20 µs | 16.40 µs | 9.50 µs |
-|     100000 | GroupFor(present)  | 10.6 ns | 131.9 ns | 130.2 ns |
-|     100000 | GroupFor(absent)   | 3.0 ns | 46.7 ns | 37.1 ns |
-|     100000 | Integrate(1)       | 100.0 ns | 300.0 ns | 600.0 ns |
-|     100000 | Integrate(100)     | 4.50 µs | 5.90 µs | 8.90 µs |
-|    1000000 | GroupFor(present)  | 2.8 ns | 167.5 ns | 167.7 ns |
-|    1000000 | GroupFor(absent)   | 1.8 ns | 101.6 ns | 88.2 ns |
-|    1000000 | Integrate(1)       | 100.0 ns | 400.0 ns | 600.0 ns |
-|    1000000 | Integrate(100)     | 14.10 µs | 6.00 µs | 7.10 µs |
+|       1000 | GroupFor(present)  | 39.8 ns | 384.5 ns | 319.9 ns |
+|       1000 | GroupFor(absent)   | 31.5 ns | 248.7 ns | 219.9 ns |
+|       1000 | Integrate(1)       | 400.0 ns | 800.0 ns | 1.30 µs |
+|       1000 | Integrate(100)     | 27.10 µs | 32.70 µs | 34.60 µs |
+|      10000 | GroupFor(present)  | 48.0 ns | 314.0 ns | 349.0 ns |
+|      10000 | GroupFor(absent)   | 29.5 ns | 214.4 ns | 228.3 ns |
+|      10000 | Integrate(1)       | 100.0 ns | 200.0 ns | 400.0 ns |
+|      10000 | Integrate(100)     | 7.00 µs | 10.60 µs | 11.20 µs |
+|     100000 | GroupFor(present)  | 18.6 ns | 127.5 ns | 111.1 ns |
+|     100000 | GroupFor(absent)   | 6.4 ns | 60.0 ns | 50.2 ns |
+|     100000 | Integrate(1)       | 0.0 ns | 200.0 ns | 400.0 ns |
+|     100000 | Integrate(100)     | 4.60 µs | 5.60 µs | 6.20 µs |
+|    1000000 | GroupFor(present)  | 7.7 ns | 168.9 ns | 162.9 ns |
+|    1000000 | GroupFor(absent)   | 4.9 ns | 105.4 ns | 101.8 ns |
+|    1000000 | Integrate(1)       | 0.0 ns | 200.0 ns | 500.0 ns |
+|    1000000 | Integrate(100)     | 4.70 µs | 5.30 µs | 6.20 µs |
 ## DistinctOp — flat vs spine (per-Step latency)
 
-Per-step latency of `DistinctOp` and `SpineDistinctOp` after the trace is pre-loaded with N distinct integer keys. Three delta shapes: a single **new key** (probe miss + integrate), a single **existing key** at +1 (probe hit + no-op integrate), and a **bulk-10** delta of mixed new + existing keys (probe + integrate work scaled 10×, swamping the per-step overhead that obscures the trace cost in singleton-delta measurements). Spine variants are tiered with 4 batches per level (default) and 2 batches per level (leveled-like).
+Per-step latency of `DistinctOp` and `SpineDistinctOp` after the trace is pre-loaded with N distinct integer keys. Three delta shapes: a single **new key** (probe miss + integrate), a single **existing key** at +1 (probe hit + no-op integrate), and a **bulk-10** delta of mixed new + existing keys (probe + integrate work scaled 10×, swamping the per-step overhead that obscures the trace cost in singleton-delta measurements). Spine is tiered with 4 batches per level (default). **Spine·staged** adds the per-tick memtable (capacity 8,192, docs §13): integrate becomes an in-place dict merge, flushed to a sorted batch only every few thousand keys, so a churning `SELECT DISTINCT` stops rebuilding a batch per tick. `staged/spine` < 1 = the memtable speeds spine up; `staged/flat` near 1 = it reaches the flat dictionary.
 
-| N          | Op           | Flat        | Spine(N=4)  | Spine(N=2)  | Spine(4) vs Flat |
-|-----------:|:-------------|------------:|------------:|------------:|-----------------:|
-|       1000 | new key      | 200.0 ns | 400.0 ns | 600.0 ns | 2.00× |
-|       1000 | existing key | 200.0 ns | 400.0 ns | 600.0 ns | 2.00× |
-|       1000 | bulk-10 mixed | 700.0 ns | 1.40 µs | 1.70 µs | 2.00× |
-|      10000 | new key      | 200.0 ns | 400.0 ns | 700.0 ns | 2.00× |
-|      10000 | existing key | 200.0 ns | 500.0 ns | 700.0 ns | 2.50× |
-|      10000 | bulk-10 mixed | 700.0 ns | 1.70 µs | 1.80 µs | 2.43× |
-|     100000 | new key      | 200.0 ns | 500.0 ns | 700.0 ns | 2.50× |
-|     100000 | existing key | 100.0 ns | 400.0 ns | 700.0 ns | 4.00× |
-|     100000 | bulk-10 mixed | 300.0 ns | 1.50 µs | 1.80 µs | 5.00× |
+| N          | Op           | Flat        | Spine       | Spine·staged | staged/spine | staged/flat |
+|-----------:|:-------------|------------:|------------:|-------------:|-------------:|------------:|
+|       1000 | new key      | 100.0 ns | 200.0 ns | 100.0 ns | 0.50× | 1.00× |
+|       1000 | existing key | 100.0 ns | 200.0 ns | 100.0 ns | 0.50× | 1.00× |
+|       1000 | bulk-10 mixed | 500.0 ns | 1.20 µs | 1.00 µs | 0.83× | 2.00× |
+|      10000 | new key      | 100.0 ns | 200.0 ns | 100.0 ns | 0.50× | 1.00× |
+|      10000 | existing key | 100.0 ns | 300.0 ns | 200.0 ns | 0.67× | 2.00× |
+|      10000 | bulk-10 mixed | 500.0 ns | 1.50 µs | 1.00 µs | 0.67× | 2.00× |
+|     100000 | new key      | 100.0 ns | 300.0 ns | 200.0 ns | 0.67× | 2.00× |
+|     100000 | existing key | 100.0 ns | 300.0 ns | 200.0 ns | 0.67× | 2.00× |
+|     100000 | bulk-10 mixed | 600.0 ns | 1.50 µs | 700.0 ns | 0.47× | 1.17× |
+## Parallel scaling — throughput vs worker count
+
+Data-parallel sharding (`ParallelCircuit`): `W` identical replicas, each processing a hash-partition of one large batch. The single-threaded incremental hot path is untouched — this is the throughput axis, so the metric is **rows/second on one big push**, not per-step latency. `W` is capped to the host's core count. Two shapes, measured apart:
+
+- **Filter (exchange-free)** — no key-sensitive operator, so no shuffle and no per-tick barrier. Tests whether the driver + sharded I/O scale.
+- **GROUP BY (exchange)** — an exchange re-shards by group key every tick through a full `Barrier(W)` + mailbox re-bucketing. Tests the exchange tax.
+- **VARCHAR project (exchange-free)** — string columns make the boundary encode/decode the dominant cost, so it shows the parallel ingest/egest win.
+
+Host: .NET 10.0.8, 14 cores.
+
+### Filter (exchange-free) — `WHERE value > 500`
+
+Batch of N=1,000,000 rows, all three phases timed apart. **Split** is ingest — boundary encode plus the hash shard into W buckets, now run on the worker threads (`ParallelIngestor`). **Step** is the parallel operator region. **Gather** is egest — when the compiler proves the output shards are key-disjoint, each worker decodes its own shard and the results concatenate (no serial combine); otherwise it falls back to the serial Z-set sum. Each column shows its own speedup vs W=1, so the ingest/egest scaling is visible alongside the operator scaling.
+
+| W  | Split         | Split↑ | Step          | Step↑ | Gather        | Gather↑ |
+|---:|--------------:|-------:|--------------:|------:|--------------:|--------:|
+|  1 | 41.90 ms | 1.00× | 14.82 ms | 1.00× | 16.58 ms | 1.00× |
+|  2 | 19.64 ms | 2.13× | 7.38 ms | 2.01× | 7.15 ms | 2.32× |
+|  4 | 9.56 ms | 4.38× | 3.90 ms | 3.80× | 5.87 ms | 2.82× |
+|  8 | 6.85 ms | 6.12× | 2.11 ms | 7.03× | 5.17 ms | 3.21× |
+| 14 | 6.24 ms | 6.72× | 1.89 ms | 7.84× | 5.98 ms | 2.77× |
+
+### GROUP BY (exchange) — `SUM(v), COUNT(*)` over 1000 groups
+
+Batch of N=1,000,000 rows, all three phases timed apart. **Split** is ingest — boundary encode plus the hash shard into W buckets, now run on the worker threads (`ParallelIngestor`). **Step** is the parallel operator region. **Gather** is egest — when the compiler proves the output shards are key-disjoint, each worker decodes its own shard and the results concatenate (no serial combine); otherwise it falls back to the serial Z-set sum. Each column shows its own speedup vs W=1, so the ingest/egest scaling is visible alongside the operator scaling.
+
+| W  | Split         | Split↑ | Step          | Step↑ | Gather        | Gather↑ |
+|---:|--------------:|-------:|--------------:|------:|--------------:|--------:|
+|  1 | 43.67 ms | 1.00× | 44.31 ms | 1.00× | 300.8 µs | 1.00× |
+|  2 | 19.60 ms | 2.23× | 26.98 ms | 1.64× | 280.5 µs | 1.07× |
+|  4 | 9.77 ms | 4.47× | 12.95 ms | 3.42× | 253.4 µs | 1.19× |
+|  8 | 5.33 ms | 8.19× | 6.06 ms | 7.32× | 281.5 µs | 1.07× |
+| 14 | 6.13 ms | 7.13× | 6.14 ms | 7.21× | 248.7 µs | 1.21× |
+
+### VARCHAR project (exchange-free) — UTF-8 string rows
+
+Batch of N=1,000,000 rows, all three phases timed apart. **Split** is ingest — boundary encode plus the hash shard into W buckets, now run on the worker threads (`ParallelIngestor`). **Step** is the parallel operator region. **Gather** is egest — when the compiler proves the output shards are key-disjoint, each worker decodes its own shard and the results concatenate (no serial combine); otherwise it falls back to the serial Z-set sum. Each column shows its own speedup vs W=1, so the ingest/egest scaling is visible alongside the operator scaling.
+
+| W  | Split         | Split↑ | Step          | Step↑ | Gather        | Gather↑ |
+|---:|--------------:|-------:|--------------:|------:|--------------:|--------:|
+|  1 | 83.41 ms | 1.00× | 49.66 ms | 1.00× | 85.42 ms | 1.00× |
+|  2 | 42.35 ms | 1.97× | 25.66 ms | 1.93× | 19.85 ms | 4.30× |
+|  4 | 25.42 ms | 3.28× | 18.70 ms | 2.66× | 12.99 ms | 6.57× |
+|  8 | 16.31 ms | 5.11× | 9.84 ms | 5.05× | 10.43 ms | 8.19× |
+| 14 | 23.19 ms | 3.60× | 13.97 ms | 3.55× | 13.96 ms | 6.12× |
+
+**Reading it.** The exchange-free filter's *Step* scales close to linearly in W — the replicas share nothing during a tick, so the driver and isolated operator state deliver the data-parallel win the model promises. The GROUP BY *Step* scales sublinearly: every tick pays one full `Barrier(W)` plus a rebuild of W mailbox buckets, so the exchange tax eats into the gain, though W>1 still beats W=1 on a batch this large. *Split* and *Gather* now scale too — the formerly serial ingest/egest are no longer the wall-clock floor. Ingest encodes and shards on the worker threads; egest, on the exchange-free shapes whose shards are key-disjoint, decodes per-worker and concatenates with no serial combine. The VARCHAR shape carries the widest rows, so it is where both wins show most (with `PARALLEL_STRINGS=string` its Split also pays the string → UTF-8 encode the engine does for .NET-string input). The GROUP BY *Gather* stays flat by design: its aggregate output is not disjoint (it falls back to the serial Z-set sum) but is tiny, so it never gates wall-clock. Allocation-heavy parallel ingest/egest needs Server GC to scale — workstation GC stops every worker on each collection and serializes exactly the work being parallelized.
+
 ## Interpretation
 
 The number to read is the **Speedup** column — how many times faster an incremental update is than a cold recompute. Absolute numbers vary by host; the shape of the curve is the interesting signal.
 
-### What went well
-
-- **Filter** matches the ideal shape exactly: batch scales linearly in N, incremental stays sub-microsecond regardless of N. Speedup grows ~linearly, and by 100k rows the incremental path is ~5 orders of magnitude faster. This is the easy case — a pipelined stateless operator, no trace to maintain.
-- **Operator fusion** turns a `map → filter → map` chain from three operators (each materializing an intermediate Z-set, and the first map allocating a row for every input before the filter can drop it) into one `MapFilterRows` pass. The result is a flat ~2–4.5× per-step speedup and a steady ~72% drop in bytes allocated per step, independent of N — the fused pass allocates one output Z-set and builds a row only for the survivors. This is what the SQL compiler now emits for any run of adjacent Filter/Project plan nodes, on both the structural and typed paths.
-- **Transitive closure** shows the quadratic-speedup shape the DBSP paper advertises: batch is ~O(n³) (n semi-naïve iterations × n² closure size at convergence), incremental is O(n) for one leaf-edge insertion, so speedup grows quadratically. By N=500 edges incremental is ~2500× faster.
-
-### Where the curves end up
-
-- **Joined GROUP BY** (pure SUM) is the cleanest positive result: speedup now climbs past 500× at N=100k. Every hot path is O(|delta|) — SUM folds the per-group delta into running state, and the indexed traces (`IndexedZSetTrace`) integrate in place rather than rebuilding. The residual sub-linear growth in the incremental column is dominated by allocator / cache effects on a larger running state, not an algorithmic scan.
-- **Multi-aggregate** (SUM / COUNT / MIN / MAX) now climbs steeply with N, reaching ~2000× at N=100k. All four aggregators are incremental: SUM / COUNT fold the delta; MIN / MAX maintain a per-group sorted set of distinct positive-weight values for O(log n) extremum lookup. Per-update cost is dominated by trace and aggregate-state dictionary ops at this point — the visible ceiling is now the same allocator / cache effect that limits Joined GROUP BY at scale.
+- **Stateless (Filter, fusion).** Incremental cost is flat in N, about a microsecond, so the speedup grows linearly with the data. Fusing a `map → filter → map` chain into one `MapFilterRows` pass cuts per-step time by roughly 3× and allocation by about 70%, independent of N. That is what the compilers emit for any run of adjacent Filter/Project nodes.
+- **Aggregates and joins.** Joined GROUP BY stays at a few microseconds per update across N, and its nullable and hand-wired typed-row variants track it closely: the SQL path is at the hand-wired ceiling. Multi-aggregate (SUM / COUNT / MIN / MAX) grows slowly with N because MIN / MAX keep a per-group ordered set. The `EmittedEqualityCodec` variant runs on the structural path only, so it is slower than the default, which compiles typed.
+- **Transitive closure.** Batch grows roughly as n³ (n iterations over a closure of n² rows), and one leaf-edge insert costs O(n), so the speedup grows superlinearly with N.
+- **Spine vs flat.** The flat traces win every per-step probe and integrate. The spine's case is immutable batches (per-file snapshots, spill), not step latency; flat stays the default (docs/decision-trace-family.md).
+- **Parallel scaling.** Exchange-free work scales with W. An exchange adds a barrier per tick, so GROUP BY scales less well; see the section notes above.
 

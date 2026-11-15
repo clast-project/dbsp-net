@@ -37,7 +37,7 @@
 --    and ingested data match. Load the two files into the tables below via the CSV
 --    connector appropriate to your Feldera deployment.
 --
--- 2. Match the metric. DbspNet reports two numbers (docs/benchmarks-fraud.md):
+-- 2. Match the metric. DbspNet reports two numbers (the `fraud` subcommand's report):
 --      * per-event incremental latency — load the history, then time ONE
 --        Insert+Step (the per-swipe fraud-scoring latency, DbspNet's headline), and
 --      * sustained micro-batched throughput (events/s).

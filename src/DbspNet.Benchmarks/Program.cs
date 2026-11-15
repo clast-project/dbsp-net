@@ -757,7 +757,11 @@ output.AppendLine(
 output.AppendLine();
 output.AppendLine("Every measurement uses the plan optimizer (`PlanOptimizer.Optimize`).");
 output.AppendLine();
-output.AppendLine($"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores.");
+output.AppendLine(
+    $"Host: .NET {Environment.Version}, {Environment.ProcessorCount} cores, " +
+    $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription} " +
+    $"({System.Runtime.InteropServices.RuntimeInformation.OSArchitecture}). " +
+    $"Generated {DateTime.UtcNow:yyyy-MM-dd}.");
 output.AppendLine();
 
 RunFilterBenchmark(output);
@@ -1086,8 +1090,8 @@ static void RunJoinedGroupBySpineBenchmark(StringBuilder output)
         "The same query and data as the Joined GROUP BY benchmark above, " +
         "compiled once onto the flat dictionary traces and once onto the spine " +
         "(LSM) traces via `CompileOptions { TraceFamily = TraceFamily.Spine }`. " +
-        "Both run through the structural compile (spine mode skips the typed " +
-        "fast path), so the delta is the trace family alone: the spine pays a " +
+        "Both go through the same compiler, so the delta is the trace family " +
+        "alone: the spine pays a " +
         "per-batch bloom + binary search on each probe where the flat trace does " +
         "one dictionary lookup, in exchange for immutable batches that snapshot " +
         "per-file and spill to disk. Operators: `IncrementalJoinOp` + " +
@@ -1240,12 +1244,12 @@ static void RunJoinedGroupByNullableBenchmark(StringBuilder output)
     }
 
     AppendTable(output, "Joined GROUP BY (nullable `amount`) — same query shape",
-        "Identical query to Benchmark 3, but `orders.amount` is nullable " +
+        "Identical query to the Joined GROUP BY benchmark, but `orders.amount` is nullable " +
         "and ~10% of input rows have `NULL amount`. Exercises the typed " +
         "pipeline's nullable-arg SUM path (Phase N4): per-row `HasValue` " +
         "check, `DistinctNonNullRows` bookkeeping for the linear gate, " +
         "and `Nullable<long>`-typed aggregate output slot. Compare to " +
-        "Benchmark 3 to read off the per-row overhead of the nullable " +
+        "the non-null Joined GROUP BY to read off the per-row overhead of the nullable " +
         "wrapper versus the non-null fast path.",
         rows);
 }
@@ -1386,8 +1390,8 @@ static void RunJoinedGroupByTypedBenchmark(StringBuilder output)
     AppendTable(output, "Joined GROUP BY (typed rows, hand-wired) — same query shape",
         "Identical circuit to the preceding Joined GROUP BY benchmark, but " +
         "hand-wired in the Core using `readonly record struct` rows — no " +
-        "`StructuralRow`, no `object?[]`, no SQL compilation. Establishes the " +
-        "perf ceiling for a future typed-row pipeline.",
+        "`StructuralRow`, no `object?[]`, no SQL compilation: the ceiling the " +
+        "SQL compilers are measured against.",
         rows);
 }
 
@@ -1463,47 +1467,30 @@ static void AppendInterpretation(StringBuilder output)
         "incremental update is than a cold recompute. Absolute numbers vary by host; " +
         "the shape of the curve is the interesting signal.");
     output.AppendLine();
-    output.AppendLine("### What went well");
-    output.AppendLine();
     output.AppendLine(
-        "- **Filter** matches the ideal shape exactly: batch scales linearly in N, " +
-        "incremental stays sub-microsecond regardless of N. Speedup grows ~linearly, " +
-        "and by 100k rows the incremental path is ~5 orders of magnitude faster. " +
-        "This is the easy case — a pipelined stateless operator, no trace to maintain.");
+        "- **Stateless (Filter, fusion).** Incremental cost is flat in N, about a " +
+        "microsecond, so the speedup grows linearly with the data. Fusing a " +
+        "`map → filter → map` chain into one `MapFilterRows` pass cuts per-step " +
+        "time by roughly 3× and allocation by about 70%, independent of N. That is " +
+        "what the compilers emit for any run of adjacent Filter/Project nodes.");
     output.AppendLine(
-        "- **Operator fusion** turns a `map → filter → map` chain from three " +
-        "operators (each materializing an intermediate Z-set, and the first map " +
-        "allocating a row for every input before the filter can drop it) into one " +
-        "`MapFilterRows` pass. The result is a flat ~2–4.5× per-step speedup and a " +
-        "steady ~72% drop in bytes allocated per step, independent of N — the fused " +
-        "pass allocates one output Z-set and builds a row only for the survivors. " +
-        "This is what the SQL compiler now emits for any run of adjacent " +
-        "Filter/Project plan nodes, on both the structural and typed paths.");
+        "- **Aggregates and joins.** Joined GROUP BY stays at a few microseconds per " +
+        "update across N, and its nullable and hand-wired typed-row variants track " +
+        "it closely: the SQL path is at the hand-wired ceiling. Multi-aggregate " +
+        "(SUM / COUNT / MIN / MAX) grows slowly with N because MIN / MAX keep a " +
+        "per-group ordered set. The `EmittedEqualityCodec` variant runs on the " +
+        "structural path only, so it is slower than the default, which compiles typed.");
     output.AppendLine(
-        "- **Transitive closure** shows the quadratic-speedup shape the DBSP paper " +
-        "advertises: batch is ~O(n³) (n semi-naïve iterations × n² closure size at " +
-        "convergence), incremental is O(n) for one leaf-edge insertion, so speedup " +
-        "grows quadratically. By N=500 edges incremental is ~2500× faster.");
-    output.AppendLine();
-    output.AppendLine("### Where the curves end up");
-    output.AppendLine();
+        "- **Transitive closure.** Batch grows roughly as n³ (n iterations over a " +
+        "closure of n² rows), and one leaf-edge insert costs O(n), so the speedup " +
+        "grows superlinearly with N.");
     output.AppendLine(
-        "- **Joined GROUP BY** (pure SUM) is the cleanest positive result: speedup " +
-        "now climbs past 500× at N=100k. Every hot path is O(|delta|) — SUM folds " +
-        "the per-group delta into running state, and the indexed traces " +
-        "(`IndexedZSetTrace`) integrate in place rather than rebuilding. The " +
-        "residual sub-linear growth in the incremental column is dominated by " +
-        "allocator / cache effects on a larger running state, not an algorithmic " +
-        "scan.");
+        "- **Spine vs flat.** The flat traces win every per-step probe and integrate. " +
+        "The spine's case is immutable batches (per-file snapshots, spill), not " +
+        "step latency; flat stays the default (docs/decision-trace-family.md).");
     output.AppendLine(
-        "- **Multi-aggregate** (SUM / COUNT / MIN / MAX) now climbs steeply " +
-        "with N, reaching ~2000× at N=100k. All four aggregators are " +
-        "incremental: SUM / COUNT fold the delta; MIN / MAX maintain a " +
-        "per-group sorted set of distinct positive-weight values for " +
-        "O(log n) extremum lookup. Per-update cost is dominated by trace " +
-        "and aggregate-state dictionary ops at this point — the visible " +
-        "ceiling is now the same allocator / cache effect that limits " +
-        "Joined GROUP BY at scale.");
+        "- **Parallel scaling.** Exchange-free work scales with W. An exchange adds " +
+        "a barrier per tick, so GROUP BY scales less well; see the section notes above.");
     output.AppendLine();
     _ = CultureInfo.InvariantCulture;
 }

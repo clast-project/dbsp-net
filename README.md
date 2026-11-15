@@ -271,7 +271,7 @@ seams, documented where they are read.
 cd src/DbspNet.Benchmarks
 dotnet run -c Release                                   # latency report → docs/benchmarks.md
 dotnet run -c Release -- nexmark 10000000 10000 3 14    # events batch runs [workers] → docs/benchmarks-nexmark.md
-dotnet run -c Release -- fraud 500000 10000 10000 14    # history customers batch [workers] → docs/benchmarks-fraud.md
+dotnet run -c Release -- fraud 500000 10000 10000 14    # history customers batch [workers] → docs/benchmarks-fraud.md (not checked in)
 ```
 
 - **Nexmark.** The supported queries are q0–q5, q7–q9, q12, q15–q20 and q22.
@@ -322,7 +322,7 @@ Start with:
 - [`design-bounded-memory.md`](docs/design-bounded-memory.md): residency and spilling.
 - [`design-structural-parallel.md`](docs/design-structural-parallel.md): parallel compilation.
 - [`ivm-bench-gap-analysis.md`](docs/ivm-bench-gap-analysis.md): TPC-DI coverage.
-- [`benchmarks-comparison.md`](docs/benchmarks-comparison.md): Nexmark and fraud versus Feldera.
+- [`benchmarks-comparison.md`](docs/benchmarks-comparison.md): dated Nexmark head-to-heads with Feldera.
 - [`skipped.md`](docs/skipped.md): deferred features, with their Feldera counterparts.
 
 ## License
