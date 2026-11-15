@@ -75,7 +75,7 @@ public class IvmBatchProfile
         };
         var program = SqlProgram.Compile(
             spec.Program, outputViews, options: options,
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         if (typeViews)
         {

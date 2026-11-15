@@ -28,9 +28,10 @@ public static class SqlProgram
         ISqlSnapshotCodecs? snapshotCodecs = null,
         CompileOptions? options = null,
         bool numericStringCoercion = false,
-        NullCollation nullCollation = NullCollation.High)
+        NullCollation nullCollation = NullCollation.High,
+        NumericDialect numericDialect = NumericDialect.Default)
     {
-        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
+        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation, numericDialect);
         return PlanToCircuit.CompileProgram(resolved.Tables, resolved.Views, snapshotCodecs, options);
     }
 
@@ -53,9 +54,10 @@ public static class SqlProgram
         ISqlSnapshotCodecs? snapshotCodecs = null,
         CompileOptions? options = null,
         bool numericStringCoercion = false,
-        NullCollation nullCollation = NullCollation.High)
+        NullCollation nullCollation = NullCollation.High,
+        NumericDialect numericDialect = NumericDialect.Default)
     {
-        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
+        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation, numericDialect);
         return PlanToCircuit.TryCompileProgramParallel(
             resolved.Tables, resolved.Views, workers, out compiled, snapshotCodecs, options);
     }
@@ -71,9 +73,10 @@ public static class SqlProgram
         ISet<string> outputViews,
         CompileOptions? options = null,
         bool numericStringCoercion = false,
-        NullCollation nullCollation = NullCollation.High)
+        NullCollation nullCollation = NullCollation.High,
+        NumericDialect numericDialect = NumericDialect.Default)
     {
-        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation);
+        var resolved = Resolve(statements, outputViews, numericStringCoercion, nullCollation, numericDialect);
         return PlanToCircuit.ProgramParallelBlockers(resolved.Views, options);
     }
 
@@ -86,20 +89,25 @@ public static class SqlProgram
     /// off = PostgreSQL-faithful). <paramref name="nullCollation"/> selects the default NULL
     /// placement for a bare <c>ORDER BY</c> key (<see cref="NullCollation.High"/> =
     /// PostgreSQL/DuckDB default; <see cref="NullCollation.Low"/> = Calcite/Feldera).
+    /// <paramref name="numericDialect"/> selects the implementation-defined numeric
+    /// behaviours (epoch-cast unit, DECIMAL division rounding); see <see cref="NumericDialect"/>.
     /// </summary>
     public static ResolvedProgram Resolve(
         IReadOnlyList<string> statements,
         ISet<string> outputViews,
         bool numericStringCoercion = false,
-        NullCollation nullCollation = NullCollation.High)
+        NullCollation nullCollation = NullCollation.High,
+        NumericDialect numericDialect = NumericDialect.Default)
     {
         ArgumentNullException.ThrowIfNull(statements);
         ArgumentNullException.ThrowIfNull(outputViews);
 
         var previousCoercion = NumericStringCoercionMode.Enabled;
         var previousCollation = NullCollationMode.Collation;
+        var previousDialect = NumericDialectMode.Dialect;
         NumericStringCoercionMode.Enabled = numericStringCoercion;
         NullCollationMode.Collation = nullCollation;
+        NumericDialectMode.Dialect = numericDialect;
         try
         {
             return ResolveCore(statements, outputViews);
@@ -108,6 +116,7 @@ public static class SqlProgram
         {
             NumericStringCoercionMode.Enabled = previousCoercion;
             NullCollationMode.Collation = previousCollation;
+            NumericDialectMode.Dialect = previousDialect;
         }
     }
 

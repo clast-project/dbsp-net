@@ -35,7 +35,7 @@ public class BrokerPlanDump
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputs = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
-        var resolved = SqlProgram.Resolve(spec.Program, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low);
+        var resolved = SqlProgram.Resolve(spec.Program, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         var view = resolved.Views.First(v => string.Equals(v.ViewName, viewName, StringComparison.Ordinal));
         var sb = new StringBuilder();

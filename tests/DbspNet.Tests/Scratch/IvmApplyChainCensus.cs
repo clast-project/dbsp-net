@@ -54,7 +54,7 @@ public class IvmApplyChainCensus
         string InUri(string uri) => Path.Combine(dataRoot, StripPrefix(uri, "/data/raw/delta/"));
         var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
         var program = SqlProgram.Compile(
-            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         var inputs = spec.Inputs
             .Select(i => (IInputConnector)new DeltaInputConnector(i.Table, InUri(i.Uri)))

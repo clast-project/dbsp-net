@@ -99,7 +99,7 @@ internal static class StructuralStateBenchmark
         var program = SqlProgram.Compile(
             shape.Program, outputs,
             options: new CompileOptions { TypeEligibleProgramViews = typed },
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
         if (typed && PlanToCircuit.LastProgramTypedTally.Typed.Count == 0)
         {
             Console.WriteLine($"  (note: {shape.Name} did not compile typed: fell back to structural)");

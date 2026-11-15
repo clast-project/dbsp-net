@@ -73,7 +73,7 @@ public class RollingEligibilityRepro(ITestOutputHelper output)
         };
         Assert.True(SqlProgram.TryCompileParallel(
             statements, new HashSet<string> { "unpivoted", "rolling" }, workers, out var p,
-            snapshotCodecs: ArrowSqlSnapshotCodecs.Instance, numericStringCoercion: true, nullCollation: NullCollation.Low));
+            snapshotCodecs: ArrowSqlSnapshotCodecs.Instance, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera));
         using var program = p!;
 
         // Small first tick (prior state), then the big one, as tick 18 is.

@@ -38,7 +38,7 @@ public class XtRankTopKCensus
             RankTopKMode.Enabled = on;
             try
             {
-                var p = SqlProgram.Compile(program, outputs, snapshotCodecs: null, numericStringCoercion: true, nullCollation: NullCollation.Low);
+                var p = SqlProgram.Compile(program, outputs, snapshotCodecs: null, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
                 var c = p.Circuit;
                 var result = new Dictionary<string, (int, int)>(StringComparer.Ordinal);
                 for (var i = 0; i < c.Operators.Count; i++)

@@ -482,7 +482,7 @@ public class IvmRecoveryProbe
             spec.Program, outputViews,
             snapshotCodecs: ArrowSqlSnapshotCodecs.Instance,
             options: new CompileOptions { TraceFamily = traceFamily },
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
     }
 
     // Order-independent digest of every output view: row count and a weighted sum of row hashes.

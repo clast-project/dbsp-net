@@ -35,6 +35,34 @@ internal static class DecimalRuntime
     public static Decimal128 Divide(Decimal128 left, DecimalType lt, Decimal128 right, DecimalType rt, DecimalType result) =>
         DivideKernel.Divide(left, lt, right, rt, result);
 
+    /// <summary>
+    /// <see cref="Divide"/> with the quotient cut to the result scale <b>toward zero</b>
+    /// (<see cref="NumericDialect.Feldera"/>; Clast.DatabaseDecimal has no such rounding
+    /// mode). The prescale goes on whichever operand keeps it exact, so the one
+    /// <see cref="Int128"/> division is the only place digits drop. That division
+    /// truncates, and it throws <see cref="DivideByZeroException"/> on a zero divisor as
+    /// the kernel does. A quotient wider than the result precision throws
+    /// <see cref="OverflowException"/>, as the kernel's default does.
+    /// </summary>
+    public static Decimal128 DivideTowardZero(Decimal128 left, DecimalType lt, Decimal128 right, DecimalType rt, DecimalType result)
+    {
+        int prescale = result.Scale - lt.Scale + rt.Scale;
+        Int128 dividend = left.Mantissa;
+        Int128 divisor = right.Mantissa;
+        if (prescale > 0)
+        {
+            dividend = ScaleHelper.Rescale128(dividend, 0, prescale); // exact (checked) upscale
+        }
+        else if (prescale < 0)
+        {
+            divisor = ScaleHelper.Rescale128(divisor, 0, -prescale);
+        }
+
+        var quotient = dividend / divisor;
+        DecimalRange.Validate(quotient, result);
+        return new Decimal128(quotient);
+    }
+
     public static Decimal128 Modulus(Decimal128 left, DecimalType lt, Decimal128 right, DecimalType rt, DecimalType result) =>
         ModulusKernel.Modulus(left, lt, right, rt, result);
 

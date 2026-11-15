@@ -175,7 +175,7 @@ public class IvmMultiBatch
                         BroadcastMaxRows = broadcastMaxRows,
                         RelationRowCounts = rowCounts,
                     },
-                    numericStringCoercion: true, nullCollation: NullCollation.Low),
+                    numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera),
                 "parallel compile refused the program");
             return compiled;
         }
@@ -219,7 +219,7 @@ public class IvmMultiBatch
             var typeViews = Environment.GetEnvironmentVariable("IVM_TYPE_VIEWS") == "1";
             var compiled = SqlProgram.Compile(
                 spec.Program, outputViews, codecs, new CompileOptions { TypeEligibleProgramViews = typeViews, TraceFamily = TraceFamily },
-                numericStringCoercion: true, nullCollation: NullCollation.Low);
+                numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
             if (typeViews)
             {
                 var (typed, fellBack) = PlanToCircuit.LastProgramTypedTally;

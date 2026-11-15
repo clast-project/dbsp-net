@@ -71,7 +71,7 @@ public class IvmParallelRestoreProfile
                     Assert.True(
                         SqlProgram.TryCompileParallel(
                             spec.Program, outputViews, workers, out var compiled, codecs,
-                            numericStringCoercion: true, nullCollation: NullCollation.Low),
+                            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera),
                         "parallel compile refused the program");
                     using (compiled)
                     {
@@ -86,7 +86,7 @@ public class IvmParallelRestoreProfile
                 {
                     var compiled = SqlProgram.Compile(
                         spec.Program, outputViews, codecs, new CompileOptions(),
-                        numericStringCoercion: true, nullCollation: NullCollation.Low);
+                        numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
                     await Measure(variant, () => RestoreSerial(compiled.Circuit, fs, current, variant));
                     if (shapes && variant == variants[^1])
                     {

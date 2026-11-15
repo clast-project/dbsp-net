@@ -47,7 +47,7 @@ public class XtViewOps
                     .Select(kv => kv.Split('='))
                     .ToDictionary(kv => kv[0], kv => long.Parse(kv[1], CultureInfo.InvariantCulture), StringComparer.Ordinal),
             };
-        Assert.True(SqlProgram.TryCompileParallel(program, outputs, workers, out var p, options: options, numericStringCoercion: true, nullCollation: NullCollation.Low));
+        Assert.True(SqlProgram.TryCompileParallel(program, outputs, workers, out var p, options: options, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera));
         using (p)
         {
             var c = p!.Circuit.Replicas[0];

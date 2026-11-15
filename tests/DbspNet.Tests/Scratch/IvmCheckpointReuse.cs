@@ -115,7 +115,7 @@ public class IvmCheckpointReuse
             spec.Program, outputViews,
             snapshotCodecs: ArrowSqlSnapshotCodecs.Instance,
             options: options,
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
         compileSw.Stop();
         _out.WriteLine($"compiled {program.Circuit.Operators.Count} operators in {compileSw.ElapsedMilliseconds} ms");
 

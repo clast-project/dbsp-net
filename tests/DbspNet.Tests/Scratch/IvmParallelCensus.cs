@@ -31,7 +31,7 @@ public class IvmParallelCensus
 
         var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
         var outputs = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(b => b.View));
-        var resolved = SqlProgram.Resolve(spec.Program, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low);
+        var resolved = SqlProgram.Resolve(spec.Program, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         var tally = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var v in resolved.Views)

@@ -399,7 +399,7 @@ public static class TypedExpressionCompiler
             case BinOp.Modulo:
                 if (bin.Type is SqlDecimalType decResult)
                 {
-                    return BuildDecimalArith(bin.Operator, l, bin.Left.Type, r, bin.Right.Type, decResult);
+                    return BuildDecimalArith(bin.Operator, l, bin.Left.Type, r, bin.Right.Type, decResult, bin.DecimalDivisionTowardZero);
                 }
 
                 if (IsTemporalOrInterval(bin.Left.Type) || IsTemporalOrInterval(bin.Right.Type))
@@ -571,7 +571,7 @@ public static class TypedExpressionCompiler
     /// </summary>
     private static Expression BuildDecimalArith(
         BinOp op, Expression l, SqlType leftType, Expression r, SqlType rightType,
-        SqlDecimalType resultDec)
+        SqlDecimalType resultDec, bool divisionTowardZero)
     {
         return PropagateBinary(l, r, (lv, rv) =>
         {
@@ -583,7 +583,7 @@ public static class TypedExpressionCompiler
                 BinOp.Add => nameof(DecimalRuntime.Add),
                 BinOp.Subtract => nameof(DecimalRuntime.Subtract),
                 BinOp.Multiply => nameof(DecimalRuntime.Multiply),
-                BinOp.Divide => nameof(DecimalRuntime.Divide),
+                BinOp.Divide => divisionTowardZero ? nameof(DecimalRuntime.DivideTowardZero) : nameof(DecimalRuntime.Divide),
                 BinOp.Modulo => nameof(DecimalRuntime.Modulus),
                 _ => throw Unsupported(),
             };
@@ -778,12 +778,9 @@ public static class TypedExpressionCompiler
 
         if (IsNumericNonDecimal(srcClr) && dstClr == typeof(Timestamp))
         {
-            // CAST(numeric AS timestamp): value is MICROSECONDS since the epoch
-            // (matches the structural compiler; see the note there re: Spark
-            // seconds semantics).
-            return PropagateUnary(operand, op => Expression.New(
-                typeof(Timestamp).GetConstructor([typeof(long)])!,
-                Expression.Convert(op, typeof(long))));
+            // CAST(numeric AS timestamp): microseconds since the epoch, or milliseconds
+            // under NumericDialect.Feldera. Same helper as the structural compiler.
+            return PropagateUnary(operand, op => SqlCasts.NumericToTimestamp(op, cast.NumericEpochMillis));
         }
 
         throw Unsupported();

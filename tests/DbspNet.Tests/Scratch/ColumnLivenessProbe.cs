@@ -39,7 +39,7 @@ public class ColumnLivenessProbe
 
         // Same resolve knobs as DbspNetEngine.DeployAsync / IvmBatchProfile.
         var resolved = SqlProgram.Resolve(
-            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         var live = PlanColumnLiveness.ComputeProgramLiveColumns(resolved.Views);
 

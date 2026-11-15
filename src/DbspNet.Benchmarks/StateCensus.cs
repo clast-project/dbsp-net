@@ -28,7 +28,7 @@ internal static class StateCensus
         var outputs = doc.RootElement.GetProperty("outputs").EnumerateArray().Select(e => e.GetString()!)
             .ToHashSet(StringComparer.Ordinal);
 
-        var resolved = SqlProgram.Resolve(statements, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low);
+        var resolved = SqlProgram.Resolve(statements, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
         var totals = new Dictionary<string, int>(StringComparer.Ordinal);
         var viewsBy = new Dictionary<string, SortedSet<string>>(StringComparer.Ordinal);
 
@@ -116,7 +116,7 @@ internal static class StateCensus
 
         // Compile the program as the DbspNet server does (default options, W=1) and count
         // the operator types actually instantiated, per view label.
-        var program = SqlProgram.Compile(statements, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low);
+        var program = SqlProgram.Compile(statements, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
         var circuit = program.Circuit;
         var ops = circuit.Operators;
         var labels = (List<string?>)typeof(RootCircuit)

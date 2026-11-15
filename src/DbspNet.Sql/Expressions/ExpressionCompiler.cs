@@ -205,7 +205,7 @@ public static class ExpressionCompiler
                 }
 
                 return NullPropagatingNumericOp(
-                    bin.Operator, l, r, bin.Left.Type, bin.Right.Type, bin.Type);
+                    bin.Operator, l, r, bin.Left.Type, bin.Right.Type, bin.Type, bin.DecimalDivisionTowardZero);
             case BinOp.Equal:
             case BinOp.NotEqual:
             case BinOp.Less:
@@ -229,7 +229,7 @@ public static class ExpressionCompiler
 
     private static Expression NullPropagatingNumericOp(
         BinOp op, Expression l, Expression r,
-        SqlType leftType, SqlType rightType, SqlType resultType)
+        SqlType leftType, SqlType rightType, SqlType resultType, bool decimalDivisionTowardZero)
     {
         var isNull = Expression.OrElse(
             Expression.Equal(l, NullObject),
@@ -241,7 +241,7 @@ public static class ExpressionCompiler
             // Decimal arithmetic dispatches to a kernel with operand and
             // result DecimalType baked in as constants. The kernel handles
             // cross-scale rescaling internally via ScaleHelper.
-            compute = EmitDecimalBinaryOp(op, l, leftType, r, rightType, decResult);
+            compute = EmitDecimalBinaryOp(op, l, leftType, r, rightType, decResult, decimalDivisionTowardZero);
         }
         else
         {
@@ -386,7 +386,7 @@ public static class ExpressionCompiler
 
     private static Expression EmitDecimalBinaryOp(
         BinOp op, Expression l, SqlType leftType, Expression r, SqlType rightType,
-        SqlDecimalType resultDec)
+        SqlDecimalType resultDec, bool divisionTowardZero)
     {
         var (lExpr, lType) = ToDecimalOperand(l, leftType);
         var (rExpr, rType) = ToDecimalOperand(r, rightType);
@@ -397,7 +397,8 @@ public static class ExpressionCompiler
             BinOp.Add => nameof(DecimalRuntime.Add),
             BinOp.Subtract => nameof(DecimalRuntime.Subtract),
             BinOp.Multiply => nameof(DecimalRuntime.Multiply),
-            BinOp.Divide => nameof(DecimalRuntime.Divide),
+            // NumericDialect.Feldera truncates the quotient (see ResolvedBinary.DecimalDivisionTowardZero).
+            BinOp.Divide => divisionTowardZero ? nameof(DecimalRuntime.DivideTowardZero) : nameof(DecimalRuntime.Divide),
             BinOp.Modulo => nameof(DecimalRuntime.Modulus),
             _ => throw new InvalidOperationException(),
         };
@@ -655,13 +656,12 @@ public static class ExpressionCompiler
         }
         else if (IsNumeric(srcClr) && dstClr == typeof(Timestamp))
         {
-            // CAST(numeric AS timestamp): interpret the value as MICROSECONDS
-            // since the Unix epoch (Timestamp's native unit; matches DuckDB).
-            // NOTE: Spark/Hive interpret it as SECONDS — to switch, multiply by
-            // Interval.MicrosPerSecond here. The ivm-bench use (cdc_dsn) is a
-            // monotonic ordering key, so either unit preserves its semantics.
-            var micros = Expression.Convert(Expression.Convert(operand, srcClr), typeof(long));
-            var toTs = Expression.New(typeof(Timestamp).GetConstructor([typeof(long)])!, micros);
+            // CAST(numeric AS timestamp): MICROSECONDS since the Unix epoch by default
+            // (Timestamp's native unit); MILLISECONDS under NumericDialect.Feldera, which
+            // ivm-bench needs: cdc_dsn reaches effective_timestamp through this cast (#6).
+            // Spark/Hive read SECONDS. SQL leaves the unit to the implementation.
+            var toTs = SqlCasts.NumericToTimestamp(
+                Expression.Convert(operand, srcClr), cast.NumericEpochMillis);
             converted = Expression.Convert(toTs, typeof(object));
         }
         else
@@ -838,6 +838,45 @@ internal static class SqlCasts
             return Expression.Call(typeof(SqlCasts).GetMethod(nameof(DoubleToSingleChecked))!, operand);
         }
         return Expression.ConvertChecked(operand, target);
+    }
+
+    /// <summary>
+    /// <c>CAST(numeric AS TIMESTAMP)</c> over an already-unboxed numeric
+    /// <paramref name="value"/>. By default the number is microseconds since the epoch
+    /// (<see cref="Timestamp"/>'s native unit, unchecked as before). With
+    /// <paramref name="epochMillis"/> (<see cref="DbspNet.Sql.TypeSystem.NumericDialect.Feldera"/>)
+    /// it is milliseconds. Integers convert exactly and throw on overflow. Floating-point
+    /// values round half-even to the microsecond, as Feldera's sqllib does. Shared by both
+    /// expression compilers.
+    /// </summary>
+    public static Expression NumericToTimestamp(Expression value, bool epochMillis)
+    {
+        if (!epochMillis)
+        {
+            return Expression.New(
+                typeof(Timestamp).GetConstructor([typeof(long)])!, Expression.Convert(value, typeof(long)));
+        }
+
+        var integral = value.Type == typeof(int) || value.Type == typeof(long)
+            || value.Type == typeof(short) || value.Type == typeof(sbyte) || value.Type == typeof(byte);
+        return integral
+            ? Expression.Call(typeof(SqlCasts).GetMethod(nameof(TimestampFromEpochMillis))!,
+                Expression.Convert(value, typeof(long)))
+            : Expression.Call(typeof(SqlCasts).GetMethod(nameof(TimestampFromFloatEpochMillis))!,
+                Expression.Convert(value, typeof(double)));
+    }
+
+    public static Timestamp TimestampFromEpochMillis(long millis) => new(checked(millis * 1000));
+
+    public static Timestamp TimestampFromFloatEpochMillis(double millis)
+    {
+        var micros = Math.Round(millis * 1000.0, MidpointRounding.ToEven);
+        if (!(micros >= long.MinValue && micros < long.MaxValue))
+        {
+            throw new OverflowException($"{millis} milliseconds is out of range for TIMESTAMP");
+        }
+
+        return new((long)micros);
     }
 
     public static double RoundIntegralCast(double value) => Math.Round(value, MidpointRounding.ToEven);

@@ -38,7 +38,7 @@ public class IvmBatchParallelProbe
         // coercion + NULL collation), then report which reachable views the
         // exchange-insertion guard admits.
         var resolved = SqlProgram.Resolve(
-            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+            spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         _out.WriteLine($"program: {resolved.Tables.Count} tables, {resolved.Views.Count} views, {outputViews.Count} outputs");
 
@@ -57,7 +57,7 @@ public class IvmBatchParallelProbe
 
         var parallelOk = SqlProgram.TryCompileParallel(
             spec.Program, outputViews, 4, out var parallel,
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
         parallel?.Dispose();
 
         _out.WriteLine(parallelOk

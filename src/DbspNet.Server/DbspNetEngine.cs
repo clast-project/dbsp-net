@@ -209,10 +209,10 @@ public sealed class DbspNetEngine
                 spec.Program, outputViews, workers, out parallel,
                 snapshotCodecs: snapshotCodecs,
                 options: compileOptions,
-                numericStringCoercion: true, nullCollation: NullCollation.Low))
+                numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera))
         {
             var blockers = SqlProgram.ParallelBlockers(
-                spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low);
+                spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
             fallback = "views that do not shard: " + (blockers.Count == 0
                 ? "(none reported)"
                 : string.Join("; ", blockers.Select(b => b.View + " [" + string.Join(", ", b.Blockers) + "]")));
@@ -234,7 +234,7 @@ public sealed class DbspNetEngine
             ? SqlProgram.Compile(
                 spec.Program, outputViews,
                 snapshotCodecs: snapshotCodecs,
-                numericStringCoercion: true, nullCollation: NullCollation.Low)
+                numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera)
             : null;
 
         // Smallest first (InputOrder): dimensions are loaded before the facts that join to them.
@@ -351,7 +351,7 @@ public sealed class DbspNetEngine
         {
             var program = SqlProgram.Compile(
                 spec.Program, spec.Outputs.ToHashSet(StringComparer.Ordinal),
-                numericStringCoercion: true, nullCollation: NullCollation.Low);
+                numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
             return new CompileResult(true, program.Outputs.Count, null);
         }
         catch (Exception ex)

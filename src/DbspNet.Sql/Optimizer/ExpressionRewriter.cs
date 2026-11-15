@@ -205,17 +205,17 @@ internal static class ExpressionRewriter
         return expr switch
         {
             ResolvedColumn c => new ResolvedColumn(c.Index + delta, c.Type),
-            ResolvedBinary b => new ResolvedBinary(
-                b.Operator,
-                ShiftColumnIndices(b.Left, delta),
-                ShiftColumnIndices(b.Right, delta),
-                b.Type),
+            // `with`, not a fresh node: keeps the dialect flags stamped at resolve time.
+            ResolvedBinary b => b with
+            {
+                Left = ShiftColumnIndices(b.Left, delta),
+                Right = ShiftColumnIndices(b.Right, delta),
+            },
             ResolvedUnary u => new ResolvedUnary(
                 u.Operator, ShiftColumnIndices(u.Operand, delta), u.Type),
             ResolvedIsNull isn => new ResolvedIsNull(
                 ShiftColumnIndices(isn.Operand, delta), isn.Negated, isn.Type),
-            ResolvedCast cast => new ResolvedCast(
-                ShiftColumnIndices(cast.Operand, delta), cast.Type, cast.Safe),
+            ResolvedCast cast => cast with { Operand = ShiftColumnIndices(cast.Operand, delta) },
             ResolvedFunctionCall fn => new ResolvedFunctionCall(
                 fn.FunctionName,
                 ShiftArgs(fn.Arguments, delta),
@@ -277,17 +277,17 @@ internal static class ExpressionRewriter
                     $"RemapColumnIndices: column {c.Index} not covered by remap (length {remap.Length})",
                     nameof(remap))
                 : new ResolvedColumn(remap[c.Index], c.Type),
-            ResolvedBinary b => new ResolvedBinary(
-                b.Operator,
-                RemapColumnIndices(b.Left, remap),
-                RemapColumnIndices(b.Right, remap),
-                b.Type),
+            // `with`, not a fresh node: keeps the dialect flags stamped at resolve time.
+            ResolvedBinary b => b with
+            {
+                Left = RemapColumnIndices(b.Left, remap),
+                Right = RemapColumnIndices(b.Right, remap),
+            },
             ResolvedUnary u => new ResolvedUnary(
                 u.Operator, RemapColumnIndices(u.Operand, remap), u.Type),
             ResolvedIsNull isn => new ResolvedIsNull(
                 RemapColumnIndices(isn.Operand, remap), isn.Negated, isn.Type),
-            ResolvedCast cast => new ResolvedCast(
-                RemapColumnIndices(cast.Operand, remap), cast.Type, cast.Safe),
+            ResolvedCast cast => cast with { Operand = RemapColumnIndices(cast.Operand, remap) },
             ResolvedFunctionCall fn => new ResolvedFunctionCall(
                 fn.FunctionName,
                 RemapArgs(fn.Arguments, remap),
@@ -344,17 +344,17 @@ internal static class ExpressionRewriter
         return expr switch
         {
             ResolvedColumn c => projection[c.Index].Expression,
-            ResolvedBinary b => new ResolvedBinary(
-                b.Operator,
-                SubstituteViaProjection(b.Left, projection),
-                SubstituteViaProjection(b.Right, projection),
-                b.Type),
+            // `with`, not a fresh node: keeps the dialect flags stamped at resolve time.
+            ResolvedBinary b => b with
+            {
+                Left = SubstituteViaProjection(b.Left, projection),
+                Right = SubstituteViaProjection(b.Right, projection),
+            },
             ResolvedUnary u => new ResolvedUnary(
                 u.Operator, SubstituteViaProjection(u.Operand, projection), u.Type),
             ResolvedIsNull isn => new ResolvedIsNull(
                 SubstituteViaProjection(isn.Operand, projection), isn.Negated, isn.Type),
-            ResolvedCast cast => new ResolvedCast(
-                SubstituteViaProjection(cast.Operand, projection), cast.Type, cast.Safe),
+            ResolvedCast cast => cast with { Operand = SubstituteViaProjection(cast.Operand, projection) },
             ResolvedFunctionCall fn => new ResolvedFunctionCall(
                 fn.FunctionName,
                 SubstituteArgs(fn.Arguments, projection),

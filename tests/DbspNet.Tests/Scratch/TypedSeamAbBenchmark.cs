@@ -68,7 +68,7 @@ public class TypedSeamAbBenchmark
 
         // Resolve once (numeric-string coercion + Calcite NULL collation, matching the
         // real deploy) — modes are applied at resolve time and baked into the plans.
-        var resolved = SqlProgram.Resolve(stmts, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low);
+        var resolved = SqlProgram.Resolve(stmts, outputs, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
         var stagingSchema = resolved.Tables.Single(t => t.TableName == "staging_daily_market").Schema;
         var brokPlan = PlanOptimizer.Optimize(resolved.Views.Single(v => v.ViewName == "brokerage_daily_market").Query);
         var dailyPlan = PlanOptimizer.Optimize(resolved.Views.Single(v => v.ViewName == "daily_market").Query);

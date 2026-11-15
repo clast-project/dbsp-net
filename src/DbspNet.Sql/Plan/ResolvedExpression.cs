@@ -39,7 +39,16 @@ public sealed record ResolvedBinary(
     BinaryOperator Operator,
     ResolvedExpression Left,
     ResolvedExpression Right,
-    SqlType Type) : ResolvedExpression(Type);
+    SqlType Type) : ResolvedExpression(Type)
+{
+    /// <summary>
+    /// A DECIMAL division cuts its quotient to the result scale toward zero, rather than
+    /// half-even (<see cref="NumericDialect.Feldera"/>). Captured from the dialect in force
+    /// when the node is built, which is during resolve. Ignored for any other operator or
+    /// result type. A rewriter that rebuilds the node must use <c>with</c> to keep it.
+    /// </summary>
+    public bool DecimalDivisionTowardZero { get; init; } = NumericDialectMode.IsFeldera;
+}
 
 public sealed record ResolvedUnary(
     UnaryOperator Operator,
@@ -48,7 +57,16 @@ public sealed record ResolvedUnary(
 
 public sealed record ResolvedIsNull(ResolvedExpression Operand, bool Negated, SqlType Type) : ResolvedExpression(Type);
 
-public sealed record ResolvedCast(ResolvedExpression Operand, SqlType Type, bool Safe = false) : ResolvedExpression(Type);
+public sealed record ResolvedCast(ResolvedExpression Operand, SqlType Type, bool Safe = false) : ResolvedExpression(Type)
+{
+    /// <summary>
+    /// A numeric-to-TIMESTAMP cast reads its operand as milliseconds since the epoch,
+    /// not microseconds (<see cref="NumericDialect.Feldera"/>). Captured from the dialect
+    /// in force when the node is built, which is during resolve. Ignored for any other
+    /// cast. A rewriter that rebuilds the node must use <c>with</c> to keep it.
+    /// </summary>
+    public bool NumericEpochMillis { get; init; } = NumericDialectMode.IsFeldera;
+}
 
 /// <summary>
 /// A scalar (non-aggregate) function call: <c>COALESCE</c> in v1. The

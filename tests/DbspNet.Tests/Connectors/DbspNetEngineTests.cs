@@ -332,6 +332,51 @@ public sealed class DbspNetEngineTests : IDisposable
         return deploy;
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task FelderaNumericDialect_EpochCastAndDecimalDivision(int workers)
+    {
+        // The server compiles under NumericDialect.Feldera (issue #6): CAST(BIGINT AS TIMESTAMP)
+        // reads milliseconds (ivm-bench's cdc_dsn → effective_timestamp) and DECIMAL division
+        // truncates its quotient. Both serial and parallel compile sites must pass the dialect.
+        var companyDir = Path.Combine(_root, $"d{workers}_company");
+        var outDir = Path.Combine(_root, $"d{workers}_out");
+        Directory.CreateDirectory(outDir);
+        var company = await CreateTable(companyDir, CompanySchema());
+        await Append(company, CompanySchema(), new List<object?[]>(), new object?[] { 1, 2, 6440 });
+
+        var sql = new[]
+        {
+            ProgramSql[0],
+            "CREATE VIEW probe AS SELECT company_id, CAST(effective_ts AS TIMESTAMP) AS ts, " +
+            "CAST(name_code AS DECIMAL(10,0)) / 3 AS q FROM company",
+        };
+        var engine = new DbspNetEngine(workers: workers);
+        await engine.DeployAsync(new ProgramSpec(
+            sql, new[] { new InputSpec("company", companyDir) }, new[] { new OutputSpec("probe", outDir) }));
+        engine.Resume();
+        await engine.WaitAsync();
+
+        var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(outDir), cancellationToken: CancellationToken.None);
+        var rows = new List<(long Micros, string Q)>();
+        await foreach (var batch in table.ReadAllAsync(null, CancellationToken.None))
+        {
+            var ts = (TimestampArray)batch.Column(1);
+            var q = (Decimal128Array)batch.Column(2);
+            for (var i = 0; i < batch.Length; i++)
+            {
+                rows.Add((ts.GetValue(i)!.Value, q.GetString(i)));
+            }
+        }
+
+        table.Dispose();
+        company.Dispose();
+        var row = Assert.Single(rows);
+        Assert.Equal(6_440_000L, row.Micros);       // 6440 ms, not 6440 µs
+        Assert.Matches(@"^0\.6+$", row.Q);          // truncated, not ...7
+    }
+
     /// <summary>
     /// A view declared `+stored: true` with no output connector must still be COMPUTED. ivm-bench
     /// has two (fact_market_history, daily_market_pulse): Feldera computes them and the benchmark

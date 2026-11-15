@@ -55,7 +55,7 @@ public class SpineStepProbe
         var options = new CompileOptions { TraceFamily = traceFamily, SpineStagingCapacity = staging };
         var program = SqlProgram.Compile(
             spec.Program, outputViews, options: options,
-            numericStringCoercion: true, nullCollation: NullCollation.Low);
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
 
         var connectors = spec.Inputs
             .Select(i => new DeltaInputConnector(i.Table, Path.Combine(dataRoot, StripPrefix(i.Uri, "/data/raw/delta/"))))
