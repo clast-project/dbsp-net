@@ -27,9 +27,13 @@ public class ParallelCrashSafeCheckpointTests
         "CREATE VIEW agg AS SELECT k, AVG(v) AS a, COUNT(*) AS c FROM t GROUP BY k",
         "CREATE VIEW j AS SELECT t.k AS k, t.v AS v, u.w AS w FROM t JOIN u ON t.k = u.k",
         "CREATE VIEW d AS SELECT DISTINCT k FROM u",
+        // A LATENESS table (docs/design-parallel-frontier.md): every replica persists the global
+        // maxSeen; phase C sends late rows that only a correctly restored frontier drops.
+        "CREATE TABLE e (ts BIGINT NOT NULL LATENESS 3, v INT NOT NULL)",
+        "CREATE VIEW per_ts AS SELECT ts, SUM(v) AS s FROM e GROUP BY ts",
     ];
 
-    private static readonly HashSet<string> Views = new(["agg", "j", "d"], StringComparer.Ordinal);
+    private static readonly HashSet<string> Views = new(["agg", "j", "d", "per_ts"], StringComparer.Ordinal);
 
     private static ParallelCompiledProgram Compile(string family, int workers = Workers)
     {
@@ -54,6 +58,11 @@ public class ParallelCrashSafeCheckpointTests
             p.Table("t").Insert(4 + i, 2.0 * i);
             p.Table("u").Insert(1, 10L + i);
             p.Table("u").Insert(5 + i, 3L);
+            for (var k = 0; k < 4; k++)
+            {
+                p.Table("e").Insert((long)((10 * i) + k), k + 1);
+            }
+
             p.Step();
         }
     }
@@ -62,6 +71,8 @@ public class ParallelCrashSafeCheckpointTests
     {
         p.Table("t").Insert(1, 1.0);
         p.Table("u").Insert(2, 7L);
+        p.Table("e").Insert(40L, 1);
+        p.Table("e").Insert(30L, 2); // late: max 23 - 3 = 20 admits it
         p.Step();
         p.Table("t").Delete(2, 0.5);
         p.Table("t").Insert(3, 4.25);
@@ -75,6 +86,15 @@ public class ParallelCrashSafeCheckpointTests
         p.Table("t").Insert(6, 1.5);
         p.Table("u").Delete(1, 10L);
         p.Table("u").Insert(3, 1L);
+
+        // Late against either commit point's frontier (20 or 37), on-time against none restored:
+        // spread over every shard by their distinct values.
+        for (var k = 0; k < 8; k++)
+        {
+            p.Table("e").Insert((long)(5 + k), 100 + k);
+        }
+
+        p.Table("e").Insert(41L, 3);
         p.Step();
     }
 
@@ -197,13 +217,13 @@ public class ParallelCrashSafeCheckpointTests
 
     // The operators the parallel restore tests did not reach (inventory brief §6): partitioned
     // top-K, rank, window aggregates and offsets, and an aggregate over a second table, alongside a
-    // join re-keyed by an aggregate. (`e` used to declare LATENESS, but the program path never
-    // enforced it, and now rejects it: issue #3.)
+    // join re-keyed by an aggregate, and a LATENESS aggregate (enforced against the global frontier,
+    // docs/design-parallel-frontier.md).
     private static readonly string[] WideSql =
     [
         "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
         "CREATE TABLE u (a INT NOT NULL, c INT NOT NULL)",
-        "CREATE TABLE e (ts BIGINT NOT NULL, g INT NOT NULL, v INT NOT NULL)",
+        "CREATE TABLE e (ts BIGINT NOT NULL LATENESS 4, g INT NOT NULL, v INT NOT NULL)",
         "CREATE VIEW by_c AS SELECT u.c, SUM(t.b) AS s FROM t JOIN u ON t.a = u.a GROUP BY u.c",
         "CREATE VIEW top2 AS SELECT a, b FROM (" +
         "  SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC) AS rn FROM t) s WHERE rn <= 2",
@@ -234,6 +254,7 @@ public class ParallelCrashSafeCheckpointTests
 
         p.Table("u").Insert(rng.Next(0, 5), rng.Next(0, 4));
         p.Table("e").Insert((long)(tick * 3 + rng.Next(0, 3)), rng.Next(0, 3), rng.Next(1, 9));
+        p.Table("e").Insert((long)(tick * 3 - 9 + rng.Next(0, 3)), rng.Next(0, 3), 50); // late from tick 2 on
         p.Step();
     }
 

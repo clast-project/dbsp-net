@@ -76,6 +76,11 @@ public sealed record KeyedBlobsReshardFile(
 /// operator rebuilds when it is missing (a range rank's splitters, docs/design-bounded-memory.md §5.50).</summary>
 public sealed record DroppedReshardFile(string Name) : ReshardFile(Name, ReshardPlacement.Anywhere);
 
+/// <summary>A small per-worker file every replica holds byte-identically (a LATENESS column's global
+/// <c>maxSeen</c>, docs/design-parallel-frontier.md): the re-shard checks that the old workers agree
+/// and copies it to every new worker.</summary>
+public sealed record IdenticalBlobReshardFile(string Name) : ReshardFile(Name, ReshardPlacement.OnEveryWorker);
+
 /// <summary>Every file one stateful operator writes, or why it cannot be re-sharded.</summary>
 public sealed record ReshardSpec(string OperatorType, IReadOnlyList<ReshardFile> Files, string? Unsupported = null);
 

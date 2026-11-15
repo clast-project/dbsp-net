@@ -556,6 +556,11 @@ public static partial class TypedPlanCompiler
         // Downstream operators (Filter, Join, Aggregate) keep their
         // own gates that bail when they receive a nullable stream
         // until their respective NULL semantics ship in later phases.
+        // A LATENESS table read straight from an input (no structural boundary) would never drop
+        // late rows: the typed pipeline has no EnforceLateness. Refuse, so the caller compiles
+        // structurally. In boundary mode the caller's stream is already enforced.
+        if (ctx.StructuralScans is null && scan.ColumnLateness is { Count: > 0 }) return null;
+
         var rowType = TypedRowEmitter.EmitRowType(scan.Schema);
         if (rowType is null) return null;
 

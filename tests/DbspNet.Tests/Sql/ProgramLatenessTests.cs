@@ -9,8 +9,8 @@ namespace DbspNet.Tests.Sql;
 /// <summary>
 /// LATENESS on the multi-view program path (issue #3): late rows are dropped at the shared table
 /// input, and frontiers cross view boundaries, so a stateful operator in a view that scans another
-/// view GCs exactly as it would with that view written inline. The parallel program path refuses
-/// LATENESS (frontiers are not yet coordinated across workers) so callers fall back to serial.
+/// view GCs exactly as it would with that view written inline. The parallel program path enforces
+/// LATENESS against a frontier agreed by all workers (docs/design-parallel-frontier.md).
 /// The incremental≡batch oracle is <c>ProgramLatenessPbtTests</c>.
 /// </summary>
 public class ProgramLatenessTests
@@ -139,14 +139,65 @@ public class ProgramLatenessTests
     }
 
     [Fact]
-    public void ParallelProgram_RefusesLateness_AndReportsTheBlocker()
+    public void ParallelProgram_CompilesLateness_WithNoBlocker()
     {
-        Assert.False(SqlProgram.TryCompileParallel(Sql, Views, 2, out var compiled));
-        Assert.Null(compiled);
+        Assert.Empty(SqlProgram.ParallelBlockers(Sql, Views));
+        Assert.True(SqlProgram.TryCompileParallel(Sql, Views, 2, out var compiled));
+        compiled!.Dispose();
+    }
 
-        var (view, blockers) = Assert.Single(SqlProgram.ParallelBlockers(Sql, Views));
-        Assert.Equal("per_ts", view);
-        Assert.Contains(blockers, b => b.Contains("LATENESS on e", StringComparison.Ordinal));
+    [Fact]
+    public void ParallelProgram_DropsLateRowsAgainstTheGlobalMax()
+    {
+        Assert.True(SqlProgram.TryCompileParallel(Sql, Views, 4, out var p));
+        using (p)
+        {
+            p!.Table("e").Insert(100L, 1);
+            p.Step();
+
+            // Whichever shard 10 and 96 land on, the frontier they meet is the global one (95).
+            p.Table("e").Insert(10L, 1);
+            p.Table("e").Insert(96L, 1);
+            p.Step();
+            Assert.Equal(2, p.Outputs["per_ts"].RowCount);
+        }
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void ParallelProgram_GcFiresOnEveryWorker(int workers)
+    {
+        string[] sql =
+        [
+            "CREATE TABLE a (ts BIGINT NOT NULL LATENESS 5, v INT NOT NULL)",
+            "CREATE TABLE b (ts BIGINT NOT NULL LATENESS 5, w INT NOT NULL)",
+            "CREATE VIEW per_ts AS SELECT ts, SUM(v) AS s FROM a GROUP BY ts",
+            "CREATE VIEW joined AS SELECT p.ts, p.s, b.w FROM per_ts p JOIN b ON p.ts = b.ts",
+        ];
+        Assert.True(SqlProgram.TryCompileParallel(sql, new HashSet<string>(["per_ts", "joined"]), workers, out var p));
+        using (p)
+        {
+            for (long t = 0; t <= 200; t++)
+            {
+                p!.Table("a").Insert(t, 1);
+                p.Table("b").Insert(t, 1);
+                p.Step();
+            }
+
+            Assert.Equal(201, p!.Outputs["joined"].RowCount);
+            foreach (var replica in p.Circuit.Replicas)
+            {
+                var sites = replica.CollectStats()
+                    .Where(s => s.GcFrontier is not null && s.Name != "Lateness")
+                    .ToList();
+                Assert.Contains(sites, s => s.Name.Contains("Join", StringComparison.Ordinal));
+                Assert.Contains(sites, s => s.Name.Contains("Aggregate", StringComparison.Ordinal));
+                Assert.All(sites, s => Assert.Equal(195, s.GcFrontier));
+                Assert.All(sites, s => Assert.InRange(s.RetainedRows, 0, 16));
+            }
+        }
     }
 
     [Fact]

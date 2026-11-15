@@ -112,13 +112,12 @@ public static partial class PlanToCircuit
 
         var (tables, temporalFrontierSpecs) = CollectScans(plan);
 
-        // The parallel path wires neither LATENESS GC nor temporal-filter
-        // frontiers across the replicas yet (a follow-on), and refuses any plan
-        // node it cannot shard soundly. In every such case the caller falls back
-        // to the serial single circuit.
-        if (temporalFrontierSpecs.Count > 0
-            || tables.Values.Any(t => t.Lateness is { Count: > 0 })
-            || !CanCompileParallel(plan))
+        // Refuse any plan node the pass cannot shard soundly; the caller falls back
+        // to the serial single circuit. LATENESS is supported (each replica enforces
+        // it against the global frontier), and so are temporal filters: the logical
+        // clock is the same on every replica and the filter is per row
+        // (docs/design-parallel-frontier.md).
+        if (!CanCompileParallel(plan, allowTemporalFilter: true))
         {
             return false;
         }
@@ -126,8 +125,6 @@ public static partial class PlanToCircuit
         var codec = StructuralRowCodec.Instance;
         var monotonicity = MonotonicityAnalyzer.Analyze(plan);
         var tableSchemas = tables.ToDictionary(kv => kv.Key, kv => kv.Value.Schema, StringComparer.Ordinal);
-        var emptyFrontiers = (IReadOnlyDictionary<LatenessSource, IFrontier>)
-            new Dictionary<LatenessSource, IFrontier>();
         var emptyShareable = (IReadOnlySet<ArrangementKey>)
             System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
 
@@ -141,9 +138,14 @@ public static partial class PlanToCircuit
             circuit = ParallelCircuit.Build(workers, builder =>
             {
                 var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+
+                // This replica's own frontiers: the build closure runs once per replica, so each
+                // gets its own LatenessOperators and MutableFrontiers, kept equal across replicas by
+                // the step-boundary global max.
+                var frontiers = new Dictionary<LatenessSource, IFrontier>();
                 var ctx = new CompileContext(
                     streams, tableSchemas, codec, snapshotCodecs, options, monotonicity,
-                    emptyFrontiers, emptyShareable, workers, options.RelationRowCounts)
+                    frontiers, emptyShareable, workers, options.RelationRowCounts)
                 {
                     SharedPlans = SharedPlanNodes(plan),
                 };
@@ -152,6 +154,7 @@ public static partial class PlanToCircuit
                 {
                     // Named input port so ShardedInput can find each replica's copy.
                     var (_, stream) = builder.ZSetInput<StructuralRow, Z64>(name);
+                    stream = EnforceDeclaredLateness(builder, stream, name, info.Lateness, frontiers);
                     streams[name] = stream;
                     inputSchemas[name] = info.Schema;
                     // The input is split by whole-row hash, so equal rows co-locate:
@@ -159,6 +162,7 @@ public static partial class PlanToCircuit
                     ctx.SetPartition(stream, new PartitionInfo(ShardDisjoint: true, PartitionKey: null));
                 }
 
+                RegisterTemporalFrontiers(builder, temporalFrontierSpecs, frontiers);
                 var queryStream = CompilePlan(builder, plan, ctx);
                 builder.Output(queryStream, ParallelResultPort);
             });
@@ -179,6 +183,78 @@ public static partial class PlanToCircuit
         var output = circuit.ShardedOutput<StructuralRow, Z64>(ParallelResultPort);
         compiled = new ParallelStructuralCompiledQuery(circuit, inputs, output, plan.Schema);
         return true;
+    }
+
+    /// <summary>A table's declared LATENESS bounds by column index, or null if it declares none.</summary>
+    private static IReadOnlyDictionary<int, long>? DeclaredLateness(Schema schema)
+    {
+        Dictionary<int, long>? result = null;
+        for (var c = 0; c < schema.Count; c++)
+        {
+            if (schema.Columns[c].Lateness is { } bound)
+            {
+                (result ??= [])[c] = bound;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Interpose one EnforceLateness operator per declared LATENESS column of <paramref name="table"/>
+    /// on its input stream: each drops late rows and advances a frontier, registered in
+    /// <paramref name="frontiers"/>, that downstream stateful operators GC against. Shared by the
+    /// serial and parallel compiles; on a parallel build each operator also joins the step-boundary
+    /// global max (docs/design-parallel-frontier.md), and <paramref name="reshard"/> records its
+    /// <c>frontier.bin</c> as identical on every worker.
+    /// </summary>
+    private static Stream<ZSet<StructuralRow, Z64>> EnforceDeclaredLateness(
+        CircuitBuilder builder,
+        Stream<ZSet<StructuralRow, Z64>> stream,
+        string table,
+        IReadOnlyDictionary<int, long>? lateness,
+        Dictionary<LatenessSource, IFrontier> frontiers,
+        ReshardRecorder? reshard = null)
+    {
+        if (lateness is null)
+        {
+            return stream;
+        }
+
+        foreach (var (column, bound) in lateness)
+        {
+            var index = column;
+            var frontier = new MutableFrontier();
+            var mark = ReshardRecorder.Mark(builder);
+            stream = builder.EnforceLateness(stream, row => MonotoneKey.Extract(row[index]), bound, frontier);
+            reshard?.Record(builder, mark, new IdenticalBlobReshardFile("frontier.bin"));
+            frontiers[new LatenessSource(table, column)] = frontier;
+        }
+
+        return stream;
+    }
+
+    /// <summary>
+    /// Register each temporal filter's clock-driven frontier (clock − offset) on its time-key
+    /// column, so downstream stateful operators GC the same way they do for a declared LATENESS
+    /// column. A column already bounded by LATENESS keeps that frontier (skip on collision) — the
+    /// late-drop bound is sound on its own. On a parallel build every replica reads its own copy of
+    /// the clock, which <c>ParallelCircuit.AdvanceTime</c> sets identically.
+    /// </summary>
+    private static void RegisterTemporalFrontiers(
+        CircuitBuilder builder,
+        IEnumerable<TemporalFrontierSpec> specs,
+        Dictionary<LatenessSource, IFrontier> frontiers)
+    {
+        foreach (var spec in specs)
+        {
+            if (!frontiers.ContainsKey(spec.Source))
+            {
+                frontiers[spec.Source] = new TransformedFrontier(
+                    builder.LogicalClock,
+                    ClockOffsetTransform(spec.Clock, spec.Offset, spec.CastTimestampToDate));
+            }
+        }
     }
 
     private static CompiledQuery CompileCore(
@@ -222,35 +298,10 @@ public static partial class PlanToCircuit
                 // For each declared-LATENESS column, interpose an EnforceLateness
                 // operator that drops late rows and advances a frontier the
                 // downstream stateful operators GC against.
-                if (info.Lateness is { } lateness)
-                {
-                    foreach (var (column, bound) in lateness)
-                    {
-                        var index = column;
-                        var frontier = new MutableFrontier();
-                        stream = builder.EnforceLateness(
-                            stream, row => MonotoneKey.Extract(row[index]), bound, frontier);
-                        frontiers[new LatenessSource(name, column)] = frontier;
-                    }
-                }
-
-                streams[name] = stream;
+                streams[name] = EnforceDeclaredLateness(builder, stream, name, info.Lateness, frontiers);
             }
 
-            // Register each temporal filter's clock-driven frontier (clock −
-            // offset) on its time-key column, so downstream stateful operators
-            // GC the same way they do for a declared LATENESS column. A column
-            // already bounded by LATENESS keeps that frontier (skip on collision)
-            // — the late-drop bound is sound on its own.
-            foreach (var spec in temporalFrontierSpecs)
-            {
-                if (!frontiers.ContainsKey(spec.Source))
-                {
-                    frontiers[spec.Source] = new TransformedFrontier(
-                        builder.LogicalClock,
-                        ClockOffsetTransform(spec.Clock, spec.Offset, spec.CastTimestampToDate));
-                }
-            }
+            RegisterTemporalFrontiers(builder, temporalFrontierSpecs, frontiers);
 
             // Fast path: try the typed-row pipeline first. When the
             // plan and every subexpression are within scope, the
@@ -445,18 +496,7 @@ public static partial class PlanToCircuit
                     // that drops late rows and advances the frontier downstream stateful
                     // operators GC against — as CompileCore does. The shared table stream is
                     // the enforced one, so every view sees the same late-row drop.
-                    for (var c = 0; c < t.Schema.Count; c++)
-                    {
-                        if (t.Schema.Columns[c].Lateness is { } bound)
-                        {
-                            var index = c;
-                            var frontier = new MutableFrontier();
-                            stream = builder.EnforceLateness(
-                                stream, row => MonotoneKey.Extract(row[index]), bound, frontier);
-                            frontiers[new LatenessSource(t.TableName, c)] = frontier;
-                        }
-                    }
-
+                    stream = EnforceDeclaredLateness(builder, stream, t.TableName, DeclaredLateness(t.Schema), frontiers);
                     streams[t.TableName] = stream;
                     schemas[t.TableName] = t.Schema;
                 }
@@ -681,8 +721,6 @@ public static partial class PlanToCircuit
             prepared.Add((v, optimized));
         }
 
-        var emptyFrontiers = (IReadOnlyDictionary<LatenessSource, IFrontier>)
-            new Dictionary<LatenessSource, IFrontier>();
         var emptyShareable = (IReadOnlySet<ArrangementKey>)
             System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
 
@@ -709,9 +747,16 @@ public static partial class PlanToCircuit
                 var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
                 var schemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
 
+                // This replica's program-wide frontiers, one per declared LATENESS column (as in
+                // CompileProgram); the step-boundary global max keeps them equal across replicas.
+                var frontiers = new Dictionary<LatenessSource, IFrontier>();
+                var viewMonotonicity = new Dictionary<string, MonotoneColumn?[]>(StringComparer.Ordinal);
+
                 foreach (var t in tables)
                 {
                     var (_, stream) = builder.ZSetInput<StructuralRow, Z64>(t.TableName);
+                    stream = EnforceDeclaredLateness(
+                        builder, stream, t.TableName, DeclaredLateness(t.Schema), frontiers, reshard);
                     streams[t.TableName] = stream;
                     schemas[t.TableName] = t.Schema;
                     inputSchemas[t.TableName] = t.Schema;
@@ -719,13 +764,17 @@ public static partial class PlanToCircuit
 
                 foreach (var (v, optimized) in prepared)
                 {
-                    var monotonicity = MonotonicityAnalyzer.Analyze(optimized);
+                    // Seeded with the upstream views' output-column verdicts, as CompileProgram does,
+                    // so a view scanning a LATENESS-derived view still GCs. (The parallel program
+                    // does not inline single-use views, so there are no inline bodies to walk.)
+                    var monotonicity = MonotonicityAnalyzer.Analyze(optimized, viewMonotonicity, null);
+                    viewMonotonicity[v.ViewName] = monotonicity.RootColumns;
                     // The build closure runs once per replica, so each worker's
                     // operators get their own codec instances — exactly what the
                     // per-worker snapshot subtree expects.
                     var ctx = new CompileContext(
                         streams, schemas, codec, snapshotCodecs, options, monotonicity,
-                        emptyFrontiers, emptyShareable, workers, rowCounts)
+                        frontiers, emptyShareable, workers, rowCounts)
                     {
                         Reshard = reshard,
                         SharedPlans = SharedPlanNodes(optimized),
@@ -928,7 +977,8 @@ public static partial class PlanToCircuit
     /// scalar-subquery join, a set difference, a recursive CTE, a temporal
     /// filter — is refused so the caller falls back to the serial single circuit.
     /// </summary>
-    private static bool CanCompileParallel(LogicalPlan plan) => CollectParallelBlockers(plan, blockers: null);
+    private static bool CanCompileParallel(LogicalPlan plan, bool allowTemporalFilter = false) =>
+        CollectParallelBlockers(plan, blockers: null, allowTemporalFilter);
 
     /// <summary>
     /// Every construct in <paramref name="plan"/> (an optimized view plan) that keeps the
@@ -945,7 +995,10 @@ public static partial class PlanToCircuit
 
     // With blockers == null this short-circuits on the first blocker (CanCompileParallel);
     // with a list it records each blocker and keeps walking.
-    private static bool CollectParallelBlockers(LogicalPlan plan, List<string>? blockers)
+    // allowTemporalFilter: the single-query path shards a temporal filter (a per-row filter over a
+    // clock every replica shares); the program path still refuses it, because its TemporalFilterOp
+    // state has no re-shard placement yet (docs/design-parallel-frontier.md §2 Q5).
+    private static bool CollectParallelBlockers(LogicalPlan plan, List<string>? blockers, bool allowTemporalFilter = false)
     {
         bool Block(string why)
         {
@@ -953,7 +1006,7 @@ public static partial class PlanToCircuit
             return false;
         }
 
-        bool Walk(LogicalPlan child) => CollectParallelBlockers(child, blockers);
+        bool Walk(LogicalPlan child) => CollectParallelBlockers(child, blockers, allowTemporalFilter);
 
         // A node-level verdict, then (when it passed, or when collecting) its children.
         bool Then(bool ok, params LogicalPlan[] children)
@@ -986,15 +1039,11 @@ public static partial class PlanToCircuit
 
         switch (plan)
         {
-            // The parallel path does not combine LATENESS frontiers across workers yet: each
-            // replica would drop late rows against its own shard's max, not the global one, so
-            // results would differ from the serial path. Refuse, so callers fall back to serial
-            // (issue #3).
-            case ScanPlan s when s.ColumnLateness is { Count: > 0 }:
-                return Block($"LATENESS on {s.TableName} (late rows and GC are not coordinated across workers yet)");
-
             case ScanPlan:
                 return true;
+
+            case TemporalFilterPlan tf when allowTemporalFilter:
+                return Walk(tf.Input);
 
             case CteScanPlan c:
                 return Walk(c.Cte.Plan);

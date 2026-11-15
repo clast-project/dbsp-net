@@ -129,6 +129,86 @@ public class TemporalFilterPbtTests
             iter: 2000);
     }
 
+    // Parallel arms (docs/design-parallel-frontier.md §2 Q5): the single-query parallel compile shards a
+    // temporal filter, so it must equal the SERIAL compile tick by tick at W = 2, 3, 4 — including
+    // the GROUP BY shapes, whose GC frontier is the shared clock.
+    [Fact]
+    public void TemporalFilterParallelEqualsSerial()
+    {
+        Gen.Select(GenShape, GenRun).Sample(
+            (sql, run) => CheckParallel(sql, "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)", "a", run),
+            iter: 300);
+    }
+
+    [Fact]
+    public void CastTimestampToDateTemporalFilterParallelEqualsSerial()
+    {
+        Gen.Select(GenCastDateShape, GenCastDateRun).Sample(
+            (sql, run) => CheckParallel(sql, "CREATE TABLE a (ts TIMESTAMP NOT NULL, v INT NOT NULL)", "a", run, start: Hour / 2),
+            iter: 300);
+    }
+
+    private static bool CheckParallel(
+        string sql, string ddl, string table, (InputEvent[] Events, long ClockDelta)[] run, long start = 0)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement(ddl));
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
+        var serial = PlanToCircuit.Compile(plan);
+        var parallels = new List<ParallelStructuralCompiledQuery>();
+        try
+        {
+            foreach (var w in new[] { 2, 3, 4 })
+            {
+                Assert.True(PlanToCircuit.TryCompileParallel(plan, w, out var p), $"parallel compile refused: {sql}");
+                parallels.Add(p!);
+            }
+
+            long clock = start;
+            for (var t = 0; t < run.Length; t++)
+            {
+                clock += run[t].ClockDelta;
+                serial.AdvanceClock(clock);
+                foreach (var p in parallels)
+                {
+                    p.AdvanceClock(clock);
+                }
+
+                foreach (var ev in run[t].Events)
+                {
+                    serial.Table(table).Insert(ev.Row);
+                    foreach (var p in parallels)
+                    {
+                        p.Table(table).Insert(ev.Row);
+                    }
+                }
+
+                serial.Step();
+                foreach (var p in parallels)
+                {
+                    p.Step();
+                    if (!p.Current.Equals(serial.Current))
+                    {
+                        Console.Error.WriteLine($"SQL: {sql}  W={p.Workers}  tick {t}  clock={clock}");
+                        Console.Error.WriteLine("serial:   " + serial.Current);
+                        Console.Error.WriteLine("parallel: " + p.Current);
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            foreach (var p in parallels)
+            {
+                p.Dispose();
+            }
+        }
+    }
+
     private static bool CheckOne(
         string sql, string ddl, string table, (InputEvent[] Events, long ClockDelta)[] run, long start = 0)
     {

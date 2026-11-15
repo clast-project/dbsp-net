@@ -65,6 +65,99 @@ public class ProgramLatenessPbtTests
                 iter: 1000);
     }
 
+    // Parallel arms (docs/design-parallel-frontier.md): the W-replica program must equal the SERIAL
+    // program on every output view after every tick, at W = 2, 3 and 4.
+    [Fact]
+    public void ProgramLatenessParallelEqualsSerial_Flat()
+    {
+        Gen.Select(GenLateness, GenShape, Gen.Bool, GenTicks)
+            .Sample((d, shape, midIsOutput, ticks) => CheckParallel(d, shape, midIsOutput, ticks, options: null), iter: 200);
+    }
+
+    [Fact]
+    public void ProgramLatenessParallelEqualsSerial_Spine()
+    {
+        Gen.Select(GenLateness, GenShape, Gen.Bool, GenTicks)
+            .Sample(
+                (d, shape, midIsOutput, ticks) => CheckParallel(
+                    d, shape, midIsOutput, ticks, new CompileOptions { TraceFamily = TraceFamily.Spine }),
+                iter: 200);
+    }
+
+    private static string[] Program(int lateness, (string Mid, string Out) shape) =>
+    [
+        $"CREATE TABLE a (ts BIGINT NOT NULL LATENESS {lateness}, v INT NOT NULL)",
+        $"CREATE TABLE b (ts BIGINT NOT NULL LATENESS {lateness}, v INT NOT NULL)",
+        $"CREATE VIEW mid AS {shape.Mid}",
+        $"CREATE VIEW out AS {shape.Out}",
+    ];
+
+    private static bool CheckParallel(
+        int lateness,
+        (string Mid, string Out) shape,
+        bool midIsOutput,
+        IReadOnlyList<IReadOnlyList<InputEvent>> ticks,
+        CompileOptions? options)
+    {
+        var sql = Program(lateness, shape);
+        var outputs = midIsOutput
+            ? new HashSet<string>(["mid", "out"], StringComparer.Ordinal)
+            : new HashSet<string>(["out"], StringComparer.Ordinal);
+        var serial = SqlProgram.Compile(sql, outputs, options: options);
+        var parallels = new List<ParallelCompiledProgram>();
+        try
+        {
+            foreach (var w in new[] { 2, 3, 4 })
+            {
+                Assert.True(
+                    SqlProgram.TryCompileParallel(sql, outputs, w, out var p, options: options),
+                    $"parallel compile refused: {shape}");
+                parallels.Add(p!);
+            }
+
+            for (var t = 0; t < ticks.Count; t++)
+            {
+                foreach (var ev in ticks[t])
+                {
+                    serial.Table(ev.Table).Insert(ev.Row);
+                    foreach (var p in parallels)
+                    {
+                        p.Table(ev.Table).Insert(ev.Row);
+                    }
+                }
+
+                serial.Step();
+                foreach (var p in parallels)
+                {
+                    p.Step();
+                    foreach (var name in outputs)
+                    {
+                        var expected = serial.Outputs[name].CurrentView;
+                        var actual = p.Outputs[name].CurrentView;
+                        if (!actual.Equals(expected))
+                        {
+                            Console.Error.WriteLine(
+                                $"mid: {shape.Mid}  out: {shape.Out}  LATENESS {lateness}  midIsOutput={midIsOutput}  " +
+                                $"W={p.Workers}  tick {t}  trace={options?.TraceFamily ?? TraceFamily.Flat}  view={name}");
+                            Console.Error.WriteLine("serial:   " + expected);
+                            Console.Error.WriteLine("parallel: " + actual);
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            foreach (var p in parallels)
+            {
+                p.Dispose();
+            }
+        }
+    }
+
     private static bool CheckOne(
         int lateness,
         (string Mid, string Out) shape,

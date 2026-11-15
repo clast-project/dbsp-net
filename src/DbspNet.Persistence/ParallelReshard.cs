@@ -355,6 +355,41 @@ public static class ParallelReshard
             case DroppedReshardFile:
                 return;
 
+            case IdenticalBlobReshardFile blob:
+                {
+                    // Per-worker scalar state every replica holds identically (a LATENESS column's
+                    // global maxSeen, docs/design-parallel-frontier.md): check that, and give every new
+                    // worker the same copy.
+                    byte[]? bytes = null;
+                    for (var w = 0; w < oldW; w++)
+                    {
+                        var path = OpDir(current, w, op) + "/" + blob.Name;
+                        var mine = await fs.ExistsAsync(path, cancellationToken).ConfigureAwait(false)
+                            ? await fs.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false)
+                            : null;
+                        if (w == 0)
+                        {
+                            bytes = mine;
+                        }
+                        else if ((mine is null) != (bytes is null) || (mine is not null && !mine.AsSpan().SequenceEqual(bytes)))
+                        {
+                            throw new InvalidDataException(
+                                $"operator {op} '{blob.Name}' is stated identical on every worker, but worker {w} differs from worker 0");
+                        }
+                    }
+
+                    if (bytes is not null)
+                    {
+                        for (var w = 0; w < newW; w++)
+                        {
+                            await fs.WriteAllBytesAsync(OpDir(snapName, w, op) + "/" + blob.Name, bytes, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                    }
+
+                    return;
+                }
+
             case KeyedBlobsReshardFile kb:
                 {
                     var buckets = NewBuckets(newW, () => new List<(StructuralRow Key, byte[] Blob)>());

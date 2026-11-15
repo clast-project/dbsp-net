@@ -85,6 +85,98 @@ public class LatenessPbtTests
                 iter: 2000);
     }
 
+    // Parallel arms (docs/design-parallel-frontier.md): the W-replica compile must equal the SERIAL
+    // compile tick by tick — not only the batch oracle — because a parallel-vs-oracle check can pass
+    // while both sides share a bug. Each sample runs W = 2, 3 and 4.
+    [Fact]
+    public void LatenessParallelEqualsSerial_Flat()
+    {
+        Gen.Select(GenLateness, GenShape, GenTicks)
+            .Sample((d, sql, ticks) => CheckParallel(d, sql, ticks, compileOptions: null), iter: 300);
+    }
+
+    [Fact]
+    public void LatenessParallelEqualsSerial_Spine()
+    {
+        Gen.Select(GenLateness, GenShape, GenTicks)
+            .Sample(
+                (d, sql, ticks) => CheckParallel(
+                    d, sql, ticks, new CompileOptions { TraceFamily = TraceFamily.Spine }),
+                iter: 300);
+    }
+
+    private static LogicalPlan Plan(int lateness, string sql)
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement($"CREATE TABLE a (ts BIGINT NOT NULL LATENESS {lateness}, v INT NOT NULL)"));
+        resolver.Resolve(Parser.ParseStatement($"CREATE TABLE b (ts BIGINT NOT NULL LATENESS {lateness}, v INT NOT NULL)"));
+        return ((SelectPlan)resolver.Resolve(Parser.ParseStatement(sql))).Query;
+    }
+
+    private static bool CheckParallel(
+        int lateness,
+        string sql,
+        IReadOnlyList<IReadOnlyList<InputEvent>> ticks,
+        CompileOptions? compileOptions)
+    {
+        var plan = Plan(lateness, sql);
+        var serial = PlanToCircuit.Compile(plan, snapshotCodecs: null, compileOptions);
+        var parallels = new List<ParallelStructuralCompiledQuery>();
+        try
+        {
+            foreach (var w in new[] { 2, 3, 4 })
+            {
+                Assert.True(
+                    PlanToCircuit.TryCompileParallel(plan, w, out var p, options: compileOptions),
+                    $"parallel compile refused: {sql}");
+                parallels.Add(p!);
+            }
+
+            for (var t = 0; t < ticks.Count; t++)
+            {
+                foreach (var ev in ticks[t])
+                {
+                    if (!serial.Inputs.ContainsKey(ev.Table))
+                    {
+                        continue;
+                    }
+
+                    serial.Table(ev.Table).Insert(ev.Row);
+                    foreach (var p in parallels)
+                    {
+                        p.Table(ev.Table).Insert(ev.Row);
+                    }
+                }
+
+                serial.Step();
+                foreach (var p in parallels)
+                {
+                    p.Step();
+                    if (!p.Current.Equals(serial.Current))
+                    {
+                        Console.Error.WriteLine(
+                            $"SQL: {sql}  LATENESS {lateness}  W={p.Workers}  tick {t}  " +
+                            $"trace={compileOptions?.TraceFamily ?? TraceFamily.Flat}");
+                        Console.Error.WriteLine("ticks:    " + DescribeTicks(ticks));
+                        Console.Error.WriteLine("serial:   " + serial.Current);
+                        Console.Error.WriteLine("parallel: " + p.Current);
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            foreach (var p in parallels)
+            {
+                p.Dispose();
+            }
+        }
+    }
+
     private static bool CheckOne(
         int lateness,
         string sql,

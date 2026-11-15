@@ -360,9 +360,13 @@ public class WindowAggregateMonomorphizeTests
     [Theory]
     [InlineData(1, "SELECT g, ts, v, SUM(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM w")]
     [InlineData(4, "SELECT g, ts, v, MAX(v) OVER (PARTITION BY g ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS m FROM w")]
-    public void MonoIncrementalEqualsBatch_UnderLatenessGc(int workers, string query)
+    public void MonoIncrementalEqualsBatch_MonotoneInsertOnly(int workers, string query)
     {
-        const string ddl = "CREATE TABLE w (g INT NOT NULL, ts BIGINT NOT NULL LATENESS 3, v INT NOT NULL)";
+        // A strictly advancing BIGINT ts, insert only. This used to declare LATENESS 3, but the typed
+        // pipeline wires no LATENESS (no late-row drop, no GC), so it exercised neither; the typed
+        // standalone compile now refuses a LATENESS table (ParallelLatenessCompileTests), and LATENESS
+        // window GC is covered on the structural path.
+        const string ddl = "CREATE TABLE w (g INT NOT NULL, ts BIGINT NOT NULL, v INT NOT NULL)";
         for (var seed = 0; seed < 12; seed++)
         {
             AssertMonoIncrementalEqualsBatch(ddl, query, workers, seed, monotonicTs: true);
