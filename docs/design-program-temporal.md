@@ -210,9 +210,10 @@ See the kickoff prompt; it is reproduced in §2 Q4's tests.
 
 ## 4. Known, out of scope
 
-- `TemporalFilterOp` drops a row from `_accum` only once its weight is positive and expired. A
-  delete that arrives after the row expired leaves a −1 entry that is never GC'd: a small leak,
-  pre-existing and serial.
+- ~~`TemporalFilterOp` drops a row from `_accum` only once its weight is positive and expired. A
+  delete that arrives after the row expired leaves a −1 entry that is never GC'd.~~ Fixed
+  2026-11-15: expiry, and a NULL time key (never valid, also kept forever before), are checked
+  before the weight.
 - The per-tick recompute is O(|integral|) (`now-and-temporal-filters.md`, deferred).
 - Typed paths: a temporal filter forces structural, as before.
 
@@ -286,5 +287,7 @@ views would change existing parallel circuits, ivm-bench's included, so it is le
 - Cross-view partition passthrough on the parallel program (above).
 - Alternatively, a whole-row exchange in front of a filter whose input is not reproducibly placed,
   which would make every shape reshardable (§2 Q3).
-- The crash matrix (`ParallelCrashSafeCheckpointTests`) does not yet carry a `NOW()` view.
-- The `_accum` leak of a delete after expiry (§4).
+- ~~The crash matrix does not carry a `NOW()` view~~ and ~~the `_accum` leak (§4)~~: both done
+  2026-11-15. `ParallelCrashSafeCheckpointTests` has a `NOW()` window whose phase C retracts rows
+  valid at either commit point. A mutant whose `LoadAsync` drops the restored rows fails all four
+  crash cases.

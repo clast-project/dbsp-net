@@ -31,9 +31,18 @@ public class ParallelCrashSafeCheckpointTests
         // maxSeen; phase C sends late rows that only a correctly restored frontier drops.
         "CREATE TABLE e (ts BIGINT NOT NULL LATENESS 3, v INT NOT NULL)",
         "CREATE VIEW per_ts AS SELECT ts, SUM(v) AS s FROM e GROUP BY ts",
+        // A NOW() window (docs/design-program-temporal.md): every replica persists its filter's
+        // rows and the clock; phase C moves the clock past rows that were valid at either commit
+        // point, so only a correctly restored filter retracts them.
+        "CREATE TABLE n (ts TIMESTAMP NOT NULL, v INT NOT NULL)",
+        "CREATE VIEW recent AS SELECT ts, SUM(v) AS s FROM n WHERE ts > NOW() - INTERVAL '5' SECOND GROUP BY ts",
     ];
 
-    private static readonly HashSet<string> Views = new(["agg", "j", "d", "per_ts"], StringComparer.Ordinal);
+    private static readonly HashSet<string> Views = new(["agg", "j", "d", "per_ts", "recent"], StringComparer.Ordinal);
+
+    private const long Sec = 1_000_000L;
+
+    private static DbspNet.Sql.TypeSystem.Timestamp At(long seconds) => new(seconds * Sec);
 
     private static ParallelCompiledProgram Compile(string family, int workers = Workers)
     {
@@ -63,6 +72,14 @@ public class ParallelCrashSafeCheckpointTests
                 p.Table("e").Insert((long)((10 * i) + k), k + 1);
             }
 
+            // Clock 2, 4, 6 s; rows at and just behind it, so some age out within phase A.
+            var clock = 2L * (i + 1);
+            p.AdvanceClock(clock * Sec);
+            for (var k = 0; k < 3; k++)
+            {
+                p.Table("n").Insert(At(clock - k), (10 * i) + k);
+            }
+
             p.Step();
         }
     }
@@ -73,7 +90,11 @@ public class ParallelCrashSafeCheckpointTests
         p.Table("u").Insert(2, 7L);
         p.Table("e").Insert(40L, 1);
         p.Table("e").Insert(30L, 2); // late: max 23 - 3 = 20 admits it
+        p.AdvanceClock(7 * Sec);
+        p.Table("n").Insert(At(7), 5);
         p.Step();
+        p.AdvanceClock(9 * Sec); // a clock-only change: rows at 4 s age out
+        p.Table("n").Delete(At(6), 20); // inserted in phase A, still valid
         p.Table("t").Delete(2, 0.5);
         p.Table("t").Insert(3, 4.25);
         p.Table("u").Insert(6, 9L);
@@ -95,6 +116,13 @@ public class ParallelCrashSafeCheckpointTests
         }
 
         p.Table("e").Insert(41L, 3);
+
+        // Past every row from phases A and B (valid only for ts > 15 s now), plus a late delete of
+        // a row that has already expired, and new rows that stay.
+        p.AdvanceClock(20 * Sec);
+        p.Table("n").Delete(At(2), 0);
+        p.Table("n").Insert(At(18), 7);
+        p.Table("n").Insert(At(19), 8);
         p.Step();
     }
 

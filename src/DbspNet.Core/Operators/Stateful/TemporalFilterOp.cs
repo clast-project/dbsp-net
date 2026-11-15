@@ -153,31 +153,28 @@ internal sealed class TemporalFilterOp<TRow> : IOperator, ISnapshotable, IIntros
     }
 
     /// <summary>Rows currently valid at <paramref name="now"/>, with their full
-    /// (multiplicity-preserving) weight. Also records permanently-expired rows
-    /// in <see cref="_expired"/> for post-emit GC.</summary>
+    /// (multiplicity-preserving) weight. Also records rows that can never be valid
+    /// again (permanently expired, or a NULL time key) in <see cref="_expired"/>
+    /// for post-emit GC.</summary>
     private Dictionary<TRow, long> ComputeValid(long now)
     {
         var result = new Dictionary<TRow, long>();
         foreach (var (row, weight) in _accum)
         {
-            if (weight <= 0)
+            // A row that can never be valid again is dropped whatever its weight: a NULL time key
+            // is never valid, and an expired row stays expired (its key is fixed, the clock only
+            // moves forward). Checked before the weight, so a delete arriving after expiry leaves
+            // no −1 entry behind, and a NULL-keyed row is not kept forever.
+            var key = _timeKey(row);
+            if (key is null || IsPermanentlyExpired(now, key.Value))
             {
+                _expired.Add(row);
                 continue;
             }
 
-            var key = _timeKey(row);
-            if (key is null)
-            {
-                continue; // a NULL time key is never valid
-            }
-
-            if (IsValidAt(now, key.Value))
+            if (weight > 0 && IsValidAt(now, key.Value))
             {
                 result[row] = weight;
-            }
-            else if (IsPermanentlyExpired(now, key.Value))
-            {
-                _expired.Add(row);
             }
         }
 

@@ -142,6 +142,54 @@ public class TemporalFilterCompilerTests : IDisposable
         Assert.Empty(Live(acc));
     }
 
+    /// <summary>
+    /// A delete that arrives after its row expired leaves a −1 entry in the operator's integral. It
+    /// can never become valid (its key is fixed and the clock only moves forward), so it must be
+    /// GC'd like an expired positive row, not kept forever.
+    /// </summary>
+    [Fact]
+    public void DeleteAfterExpiry_LeavesNoState()
+    {
+        var q = Compile("SELECT id, ts FROM events WHERE ts > NOW() - INTERVAL '1' HOUR");
+        var acc = new Dictionary<(int, long), long>();
+        var op = q.Circuit.Operators.OfType<TemporalFilterOp<StructuralRow>>().Single();
+
+        q.AdvanceClock(0);
+        q.Table("events").Insert(1, new Timestamp(0));
+        q.Step();
+        Accumulate(q, acc);
+
+        q.AdvanceClock(2 * Hour); // expires and is GC'd
+        q.Step();
+        Accumulate(q, acc);
+        Assert.Equal(0, op.RetainedRows);
+
+        q.Table("events").Delete(1, new Timestamp(0)); // the late delete
+        q.Step();
+        Accumulate(q, acc);
+        Assert.Empty(acc); // nothing emitted for it
+        Assert.Equal(0, op.RetainedRows);
+    }
+
+    /// <summary>A NULL time key is never valid, so the row is never kept.</summary>
+    [Fact]
+    public void NullTimeKey_LeavesNoState()
+    {
+        var catalog = new Catalog();
+        var resolver = new Resolver(catalog);
+        resolver.Resolve(Parser.ParseStatement("CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP)"));
+        var plan = ((SelectPlan)resolver.Resolve(Parser.ParseStatement(
+            "SELECT id, ts FROM events WHERE ts > NOW() - INTERVAL '1' HOUR"))).Query;
+        var q = PlanToCircuit.Compile(plan);
+        var op = q.Circuit.Operators.OfType<TemporalFilterOp<StructuralRow>>().Single();
+
+        q.AdvanceClock(0);
+        q.Table("events").Insert(1, null);
+        q.Step();
+        Assert.True(q.Current.IsEmpty);
+        Assert.Equal(0, op.RetainedRows);
+    }
+
     [Fact]
     public void Window_RowValidOnlyInsideTheInterval()
     {
