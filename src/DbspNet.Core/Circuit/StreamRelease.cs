@@ -425,6 +425,14 @@ internal static class StreamRelease
             // the process-wide spiller, whose leases other threads' traces change while this walks.
             result = false;
         }
+        else if (t == typeof(ParallelBuildContext) || typeof(IStepBoundaryReduction).IsAssignableFrom(t))
+        {
+            // Registries shared by every replica of a ParallelCircuit: a closure that captured the
+            // CircuitBuilder reaches them, and through a global-max reduction every OTHER replica's
+            // operators and streams — which this replica's plan would then release from its own
+            // thread, racing the replica that owns them (docs/design-parallel-frontier.md).
+            result = false;
+        }
         else if (typeof(DbspNet.Core.Operators.Stateful.Blocks.ITraceBlock).IsAssignableFrom(t))
         {
             // A trace block is bytes, a schema and a file handle: no wiring. A restored trace holds tens

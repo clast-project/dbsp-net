@@ -35,7 +35,12 @@ public static class StatefulOperators
         ArgumentNullException.ThrowIfNull(frontier);
 
         var output = new Stream<ZSet<TRow, Z64>>(ZSet<TRow, Z64>.Empty);
-        builder.AddRawOperator(new LatenessOperator<TRow>(input, output, monotone, lateness, frontier));
+        var op = new LatenessOperator<TRow>(input, output, monotone, lateness, frontier);
+        builder.AddRawOperator(op);
+
+        // On a parallel build, agree maxSeen across the replicas at every step boundary, so each one
+        // drops late rows against the global frontier, not its own shard's.
+        builder.JoinGlobalMax(op);
         return output;
     }
 

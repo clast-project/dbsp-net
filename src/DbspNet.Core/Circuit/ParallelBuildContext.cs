@@ -21,13 +21,38 @@ internal sealed class ParallelBuildContext
     private readonly List<IExchangeCoordinator> _coordinators;
     private int _nextExchange;
 
+    private readonly List<IStepBoundaryReduction> _reductions;
+    private int _nextReduction;
+
     internal ParallelBuildContext(
-        int workerId, int workers, List<IExchangeCoordinator> coordinators, CancellationToken abort)
+        int workerId,
+        int workers,
+        List<IExchangeCoordinator> coordinators,
+        CancellationToken abort,
+        List<IStepBoundaryReduction>? reductions = null)
     {
         WorkerId = workerId;
         Workers = workers;
         _coordinators = coordinators;
         Abort = abort;
+        _reductions = reductions ?? [];
+    }
+
+    /// <summary>
+    /// The step-boundary reduction at the current position in the build, by the same positional
+    /// rule as <see cref="NextCoordinator{T}"/>: the i-th call in every replica's identical build
+    /// maps to <c>reductions[i]</c>. Not thread-safe — replicas are built sequentially.
+    /// </summary>
+    internal TReduction NextReduction<TReduction>(Func<TReduction> factory)
+        where TReduction : IStepBoundaryReduction
+    {
+        var index = _nextReduction++;
+        if (index == _reductions.Count)
+        {
+            _reductions.Add(factory());
+        }
+
+        return (TReduction)_reductions[index];
     }
 
     /// <summary>This replica's worker index in <c>[0, Workers)</c>.</summary>

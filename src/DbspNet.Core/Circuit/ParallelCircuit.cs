@@ -43,6 +43,7 @@ public sealed class ParallelCircuit : IDisposable
 {
     private readonly RootCircuit[] _replicas;
     private readonly IReadOnlyList<IExchangeCoordinator> _coordinators;
+    private readonly IStepBoundaryReduction[] _reductions;
     private readonly CancellationTokenSource _abort;
     private readonly Thread[]? _threads;
     private readonly Barrier? _barrier;
@@ -56,10 +57,14 @@ public sealed class ParallelCircuit : IDisposable
     private bool _disposed;
 
     private ParallelCircuit(
-        RootCircuit[] replicas, IReadOnlyList<IExchangeCoordinator> coordinators, CancellationTokenSource abort)
+        RootCircuit[] replicas,
+        IReadOnlyList<IExchangeCoordinator> coordinators,
+        IStepBoundaryReduction[] reductions,
+        CancellationTokenSource abort)
     {
         _replicas = replicas;
         _coordinators = coordinators;
+        _reductions = reductions;
         _abort = abort;
         _stepErrors = new Exception?[replicas.Length];
         _stepJob = StepJob;
@@ -122,15 +127,16 @@ public sealed class ParallelCircuit : IDisposable
         // the per-replica context carries the worker id. Replicas are built
         // sequentially so the registry fills without locking.
         var coordinators = new List<IExchangeCoordinator>();
+        var reductions = new List<IStepBoundaryReduction>();
         var abort = new CancellationTokenSource();
         var replicas = new RootCircuit[workers];
         for (var w = 0; w < workers; w++)
         {
-            var context = new ParallelBuildContext(w, workers, coordinators, abort.Token);
+            var context = new ParallelBuildContext(w, workers, coordinators, abort.Token, reductions);
             replicas[w] = RootCircuit.Build(configure, context);
         }
 
-        return new ParallelCircuit(replicas, coordinators, abort);
+        return new ParallelCircuit(replicas, coordinators, reductions.ToArray(), abort);
     }
 
     /// <summary>Number of replicas (the <c>W</c> the driver coordinates).</summary>
@@ -285,6 +291,15 @@ public sealed class ParallelCircuit : IDisposable
         // A mid-tick fault means the replicas have diverged (some operators ran,
         // some did not); the run is unrecoverable.
         ThrowOnFailures("One or more workers threw while stepping the parallel circuit.");
+
+        // Every worker is parked between "done" and the next "go": combine the replicas' step-boundary
+        // scalars (a LATENESS column's global max) here, on the driver, with no extra rendezvous. Empty
+        // unless the program declares something that needs one (docs/design-parallel-frontier.md).
+        foreach (var reduction in _reductions)
+        {
+            reduction.Reduce();
+        }
+
         if (StepProfiler.Enabled)
         {
             StepProfiler.CountStep();

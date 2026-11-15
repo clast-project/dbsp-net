@@ -30,6 +30,24 @@ public sealed class CircuitBuilder
     /// </summary>
     internal DbspNet.Core.Operators.Stateful.IFrontier LogicalClock => _root.Clock;
 
+    /// <summary>
+    /// Enter <paramref name="participant"/> into the global-max reduction at this build position
+    /// (docs/design-parallel-frontier.md): after every parallel step the driver takes the max over
+    /// the W replicas' participants and hands it back to each. A no-op on a serial build and at
+    /// W == 1, where the local value already is the global one.
+    /// </summary>
+    internal void JoinGlobalMax(IGlobalMaxParticipant participant)
+    {
+        ArgumentNullException.ThrowIfNull(participant);
+        if (_parallel is null || _parallel.Workers <= 1)
+        {
+            return;
+        }
+
+        var workers = _parallel.Workers;
+        _parallel.NextReduction(() => new GlobalMaxReduction(workers)).Join(_parallel.WorkerId, participant);
+    }
+
     /// <summary>Operators registered so far (for compilers that annotate what they just built).</summary>
     internal int OperatorCount => _root.Operators.Count;
 

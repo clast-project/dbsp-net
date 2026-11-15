@@ -33,8 +33,18 @@ namespace DbspNet.Core.Operators.Stateful;
 /// frontier is re-advanced immediately, so the late-drop stays consistent with
 /// the GC'd downstream traces that were restored alongside it.
 /// </para>
+/// <para>
+/// <b>Parallel.</b> Each replica sees only its shard, so its own max would drop different rows than
+/// the serial path. The operator therefore joins a <see cref="GlobalMaxReduction"/>: after every
+/// parallel step the driver takes the max over the replicas' <c>maxSeen</c> and hands it back to
+/// each (<see cref="AdoptGlobalMax"/>), so every replica starts the next tick from the same
+/// frontier as the serial path would. Within a tick a replica's frontier advances by its own shard's
+/// max, which is never above the serial in-tick value, so GC stays sound. A snapshot is taken
+/// between steps, so every replica persists the same (global) value
+/// (docs/design-parallel-frontier.md).
+/// </para>
 /// </remarks>
-internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntrospectable
+internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntrospectable, IGlobalMaxParticipant
     where TRow : notnull
 {
     private const string StateFile = "frontier.bin";
@@ -100,41 +110,40 @@ internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntros
         var threshold = _frontier.Value; // frontier as of prior ticks
         var localMax = long.MinValue;
         var sawAny = false;
-        ZSet<TRow, Z64> filtered;
+        var anyLate = false;
 
-        if (threshold == long.MinValue)
+        // One scan for the max and for whether anything is late. A late row is below
+        // maxSeen − lateness ≤ maxSeen, so it never raises the max: the max over every row is the max
+        // over the admitted ones. With no frontier yet (MinValue) nothing is late.
+        foreach (var (row, _) in delta)
         {
-            // No frontier advertised yet — admit everything.
-            filtered = delta;
-            foreach (var (row, _) in delta)
+            var t = _monotone(row);
+            if (t < threshold)
             {
-                var t = _monotone(row);
-                if (!sawAny || t > localMax)
-                {
-                    localMax = t;
-                    sawAny = true;
-                }
+                anyLate = true;
+            }
+            else if (!sawAny || t > localMax)
+            {
+                localMax = t;
+                sawAny = true;
             }
         }
-        else
+
+        var filtered = delta;
+        if (anyLate)
         {
-            // Drops only late rows, so the input count is a tight upper bound.
+            // Drops only late rows, so the input count is a tight upper bound. Late rows are rare, so
+            // only a tick that has one pays the copy; every other tick passes the delta through.
             var b = new ZSetBuilder<TRow, Z64>(delta.Count);
             foreach (var (row, w) in delta)
             {
-                var t = _monotone(row);
-                if (t < threshold)
+                if (_monotone(row) < threshold)
                 {
                     _droppedCount++;
                     continue;
                 }
 
                 b.Add(row, w);
-                if (!sawAny || t > localMax)
-                {
-                    localMax = t;
-                    sawAny = true;
-                }
             }
 
             filtered = b.Build();
@@ -197,6 +206,23 @@ internal sealed class LatenessOperator<TRow> : IOperator, ISnapshotable, IIntros
             // with the GC'd downstream state restored alongside this op.
             _frontier.AdvanceTo(SaturatingSub(_maxSeen, _lateness));
         }
+    }
+
+    bool IGlobalMaxParticipant.TryGetLocalMax(out long max)
+    {
+        max = _maxSeen;
+        return _hasMax;
+    }
+
+    void IGlobalMaxParticipant.AdoptGlobalMax(long max)
+    {
+        if (!_hasMax || max > _maxSeen)
+        {
+            _maxSeen = max;
+            _hasMax = true;
+        }
+
+        _frontier.AdvanceTo(SaturatingSub(_maxSeen, _lateness));
     }
 
     private static long SaturatingSub(long a, long b) =>
