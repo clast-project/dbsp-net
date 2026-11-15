@@ -1,0 +1,315 @@
+diff --git a/src/DbspNet.Sql/Compiler/PlanToCircuit.cs b/src/DbspNet.Sql/Compiler/PlanToCircuit.cs
+index 53ecefd..f5cb829 100644
+--- a/src/DbspNet.Sql/Compiler/PlanToCircuit.cs
++++ b/src/DbspNet.Sql/Compiler/PlanToCircuit.cs
+@@ -750,6 +750,11 @@ public static partial class PlanToCircuit
+                 // The closure runs once per replica, in worker order; record placements while
+                 // building replica 0 only.
+                 reshard.Active = replica++ == 0;
++                // EXPERIMENT (DBSPNET_XVIEW_PARTITION=1): one partition map / whole-row map per replica,
++                // shared by every view's CompileContext, so a view-scan sees its producer's partition.
++                var shareXView = Environment.GetEnvironmentVariable("DBSPNET_XVIEW_PARTITION") == "1";
++                var sharedPartition = new Dictionary<Stream<ZSet<StructuralRow, Z64>>, PartitionInfo>(ReferenceEqualityComparer.Instance);
++                var sharedWholeRow = new Dictionary<Stream<ZSet<StructuralRow, Z64>>, Schema>(ReferenceEqualityComparer.Instance);
+                 var streams = new Dictionary<string, Stream<ZSet<StructuralRow, Z64>>>(StringComparer.Ordinal);
+                 var schemas = new Dictionary<string, Schema>(StringComparer.Ordinal);
+ 
+@@ -784,6 +789,8 @@ public static partial class PlanToCircuit
+                     {
+                         Reshard = reshard,
+                         SharedPlans = SharedPlanNodes(optimized),
++                        PartitionMap = shareXView ? sharedPartition : new(ReferenceEqualityComparer.Instance),
++                        WholeRowStreams = shareXView ? sharedWholeRow : new(ReferenceEqualityComparer.Instance),
+                     };
+                     // The scan streams (this program's tables) are whole-row-hashed
+                     // inputs → shard-disjoint. A view-scan resolves to that view's
+@@ -803,6 +810,13 @@ public static partial class PlanToCircuit
+                     var stream = CompilePlan(builder, optimized, ctx);
+                     streams[v.ViewName] = stream;
+                     schemas[v.ViewName] = v.Query.Schema;
++                    if (reshard.Active)
++                    {
++                        // EXPERIMENT diagnostic: the partition a view's output stream carries.
++                        var vp = ctx.GetPartition(stream);
++                        ViewOutputPartitions[v.ViewName] =
++                            $"shardDisjoint={vp.ShardDisjoint} key={(vp.PartitionKey is null ? "null" : "[" + string.Join(",", vp.PartitionKey) + "]")} gathered={vp.Gathered} keySchema={(vp.KeySchema is null ? "null" : vp.KeySchema.Count.ToString(System.Globalization.CultureInfo.InvariantCulture))} arity={v.Query.Schema.Count} root={optimized.GetType().Name} shared={shareXView}";
++                    }
+ 
+                     if (v.IsOutput)
+                     {
+@@ -1352,7 +1366,7 @@ public static partial class PlanToCircuit
+         /// (docs/design-program-temporal.md §2 Q3). Kept apart from <see cref="PartitionInfo"/>, whose
+         /// <c>with</c> copies would carry it onto rows that are not the table's.
+         /// </summary>
+-        public Dictionary<Stream<ZSet<StructuralRow, Z64>>, Schema> WholeRowStreams { get; } =
++        public Dictionary<Stream<ZSet<StructuralRow, Z64>>, Schema> WholeRowStreams { get; init; } =
+             new(ReferenceEqualityComparer.Instance);
+ 
+         /// <summary>
+@@ -1374,9 +1388,16 @@ public static partial class PlanToCircuit
+         /// consulted when <see cref="Workers"/> &gt; 1; empty / <c>default</c>
+         /// (unpartitioned) is always the safe answer.
+         /// </summary>
+-        private readonly Dictionary<Stream<ZSet<StructuralRow, Z64>>, PartitionInfo> _partition =
++        private Dictionary<Stream<ZSet<StructuralRow, Z64>>, PartitionInfo> _partition =
+             new(ReferenceEqualityComparer.Instance);
+ 
++        // EXPERIMENT: share one partition map across the parallel program's per-view contexts.
++        public Dictionary<Stream<ZSet<StructuralRow, Z64>>, PartitionInfo> PartitionMap
++        {
++            get => _partition;
++            init => _partition = value;
++        }
++
+         /// <summary>Record the partition state a compiled stream carries.</summary>
+         public void SetPartition(Stream<ZSet<StructuralRow, Z64>> stream, PartitionInfo info) =>
+             _partition[stream] = info;
+@@ -1385,6 +1406,8 @@ public static partial class PlanToCircuit
+         /// The partition state of a compiled stream, or the unpartitioned default
+         /// (<c>ShardDisjoint=false, PartitionKey=null</c>) if none was recorded.
+         /// </summary>
++        public PartitionInfo LastChainPartition { get; set; }
++
+         public PartitionInfo GetPartition(Stream<ZSet<StructuralRow, Z64>> stream) =>
+             _partition.TryGetValue(stream, out var info) ? info : default;
+ 
+@@ -2847,8 +2870,108 @@ public static partial class PlanToCircuit
+     /// </summary>
+     private static Stream<ZSet<StructuralRow, Z64>> GatherToWorkerZero(
+         CircuitBuilder builder,
+-        Stream<ZSet<StructuralRow, Z64>> input) =>
+-        builder.Exchange(input, static _ => 0);
++        Stream<ZSet<StructuralRow, Z64>> input)
++    {
++        // EXPERIMENT diagnostic: count gathers per view label.
++        var label = builder.BuildLabel ?? "(none)";
++        GatherCounts[label] = GatherCounts.GetValueOrDefault(label) + 1;
++        return builder.Exchange(input, static _ => 0);
++    }
++
++    internal static readonly Dictionary<string, int> GatherCounts = new(StringComparer.Ordinal);
++
++    // EXPERIMENT diagnostic: join sides already placed exactly where the join's exchange would put them
++    // (same key columns in order, same key types → same StablePartitionHash.OfRow), per view label.
++    internal static readonly Dictionary<string, int> JoinSidesPrePartitioned = new(StringComparer.Ordinal);
++
++    private static void NoteJoinSide(CircuitBuilder builder, CompileContext ctx, PartitionInfo p, int[] indices, Schema keySchema, string kind)
++    {
++        if (ctx.Workers <= 1 || ctx.Reshard?.Active != true || indices.Length == 0 || p.PartitionKey is not { } pk
++            || p.Gathered || p.KeySchema is not { } ks || !pk.AsSpan().SequenceEqual(indices) || ks.Count != keySchema.Count)
++        {
++            return;
++        }
++
++        for (var i = 0; i < ks.Count; i++)
++        {
++            if (!Equals(ks[i].Type with { Nullable = false }, keySchema[i].Type with { Nullable = false }))
++            {
++                return;
++            }
++        }
++
++        var label = (builder.BuildLabel ?? "(none)") + ":" + kind;
++        JoinSidesPrePartitioned[label] = JoinSidesPrePartitioned.GetValueOrDefault(label) + 1;
++    }
++
++    // EXPERIMENT (DBSPNET_XVIEW_PROJECT=1): carry a partition through bare-column projections.
++    private static readonly bool s_remapProjections = Environment.GetEnvironmentVariable("DBSPNET_XVIEW_PROJECT") == "1";
++
++    /// <summary>EXPERIMENT: the partition a Filter/Project chain's output carries when every partition
++    /// column survives each projection as a bare column reference (values unchanged, so the recorded
++    /// hash over KeySchema still holds at the new positions); the unpartitioned default otherwise.</summary>
++    private static PartitionInfo RemapThroughChain(LogicalPlan top, PartitionInfo p, CompileContext ctx)
++    {
++        if (p.PartitionKey is null)
++        {
++            return default;
++        }
++
++        var projections = new List<ProjectPlan>();
++        var node = top;
++        while (true)
++        {
++            if (Unwrap(node, ctx) is { } inlined)
++            {
++                node = inlined;
++            }
++            else if (node is FilterPlan f)
++            {
++                node = f.Input;
++            }
++            else if (node is ProjectPlan pp)
++            {
++                projections.Add(pp);
++                node = pp.Input;
++            }
++            else
++            {
++                break;
++            }
++        }
++
++        var key = p.PartitionKey;
++        for (var k = projections.Count - 1; k >= 0; k--)
++        {
++            var items = projections[k].Projections;
++            var mapped = new int[key.Length];
++            for (var i = 0; i < key.Length; i++)
++            {
++                mapped[i] = -1;
++                for (var j = 0; j < items.Count; j++)
++                {
++                    if (items[j].Expression is ResolvedColumn rc && rc.Index == key[i])
++                    {
++                        mapped[i] = j;
++                        break;
++                    }
++                }
++
++                if (mapped[i] < 0)
++                {
++                    return default;
++                }
++            }
++
++            key = mapped;
++        }
++
++        return new PartitionInfo(ShardDisjoint: false, key, p.KeySchema, p.Gathered);
++    }
++
++    internal static readonly Dictionary<string, string> ViewOutputPartitions = new(StringComparer.Ordinal);
++
++    internal static readonly Dictionary<string, int> ElidedAggregates = new(StringComparer.Ordinal);
+ 
+     /// <summary>
+     /// Records that the output of a gathered (unpartitioned) operator lives entirely on
+@@ -3394,10 +3517,12 @@ public static partial class PlanToCircuit
+     {
+         var (inputPlan, stages) = CollectLinearStages(plan, ctx);
+         var hasMap = stages.Exists(st => st.Kind == LinearStageKind.Map);
++        var chainFolded = false;
+         Stream<ZSet<StructuralRow, Z64>> input;
+         if (TryFoldJoinProjection(builder, plan, inputPlan, stages, ctx) is { } folded)
+         {
+             // The join built the first projection's rows; the rest of the chain runs as before.
++            chainFolded = true;
+             input = folded;
+             stages.RemoveAt(0);
+             if (stages.Count == 0)
+@@ -3457,6 +3582,10 @@ public static partial class PlanToCircuit
+                     ctx.WholeRowStreams[result] = wholeRowSchema;
+                 }
+             }
++            else if (s_remapProjections && !chainFolded)
++            {
++                ctx.SetPartition(result, RemapThroughChain(plan, ctx.GetPartition(input), ctx));
++            }
+         }
+ 
+         return result;
+@@ -3693,10 +3822,14 @@ public static partial class PlanToCircuit
+             {
+                 input = folded;
+                 stages.RemoveAt(0);
++                ctx.LastChainPartition = default;
+             }
+             else
+             {
+                 input = CompilePlan(builder, inputPlan, ctx);
++                ctx.LastChainPartition = s_remapProjections && projects && ctx.Workers > 1
++                    ? RemapThroughChain(plan, ctx.GetPartition(input), ctx)
++                    : default;
+             }
+ 
+             chain = stages.ToArray();
+@@ -3895,11 +4028,13 @@ public static partial class PlanToCircuit
+         }
+         else if (fuseExchange)
+         {
+-            (left, leftPre, _) = CompileIndexInputCore(builder, plan.Left, ctx, plan.AllowNullKeys ? null : leftIndices);
++            (left, leftPre, var lp) = CompileIndexInputCore(builder, plan.Left, ctx, plan.AllowNullKeys ? null : leftIndices);
++            NoteJoinSide(builder, ctx, lp ? ctx.LastChainPartition : ctx.GetPartition(left), leftIndices, plan.Left.Schema.SubsetByIndex(leftIndices), "inner.L");
+         }
+         else
+         {
+             left = CompilePlan(builder, plan.Left, ctx);
++            NoteJoinSide(builder, ctx, ctx.GetPartition(left), leftIndices, plan.Left.Schema.SubsetByIndex(leftIndices), "inner.L");
+         }
+ 
+         // INNER: drop NULL-keyed rows on both sides — the equi-predicate is
+@@ -3990,7 +4125,8 @@ public static partial class PlanToCircuit
+             }
+             else if (fuseExchange)
+             {
+-                (right, rightPre, _) = CompileIndexInputCore(builder, plan.Right, ctx, plan.AllowNullKeys ? null : rightIndices);
++                (right, rightPre, var rp) = CompileIndexInputCore(builder, plan.Right, ctx, plan.AllowNullKeys ? null : rightIndices);
++                NoteJoinSide(builder, ctx, rp ? ctx.LastChainPartition : ctx.GetPartition(right), rightIndices, plan.Right.Schema.SubsetByIndex(rightIndices), "inner.R");
+             }
+             else
+             {
+@@ -4265,24 +4401,31 @@ public static partial class PlanToCircuit
+         Stream<ZSet<StructuralRow, Z64>> left;
+         Func<StructuralRow, StructuralRow?>? leftPre = null;
+         var leftProjects = false;
++        PartitionInfo leftChainPartition = default;
+         if (fuseLeft)
+         {
+             (left, leftPre, leftProjects) = CompileIndexInputCore(builder, plan.Left, ctx, nullKeyIndices: null);
++            leftChainPartition = ctx.LastChainPartition;
+         }
+         else
+         {
+             left = CompilePlan(builder, plan.Left, ctx);
+         }
+ 
++        NoteJoinSide(builder, ctx, ctx.Workers <= 1 ? default : leftProjects ? leftChainPartition : ctx.GetPartition(left),
++            leftIndices, leftKeySchema, "left.L");
++
+         Stream<ZSet<StructuralRow, Z64>> right;
+         Func<StructuralRow, StructuralRow?>? rightPre = null;
+         if (fuseExchange)
+         {
+-            (right, rightPre, _) = CompileIndexInputCore(builder, plan.Right, ctx, rightIndices);
++            (right, rightPre, var rp) = CompileIndexInputCore(builder, plan.Right, ctx, rightIndices);
++            NoteJoinSide(builder, ctx, rp ? ctx.LastChainPartition : ctx.GetPartition(right), rightIndices, rightKeySchema, "left.R");
+         }
+         else
+         {
+             right = CompilePlan(builder, plan.Right, ctx);
++            NoteJoinSide(builder, ctx, ctx.GetPartition(right), rightIndices, rightKeySchema, "left.R");
+         }
+ 
+         // A hashed join whose left key has a hot default value splits on it, so the rows sharing it are
+@@ -4300,7 +4443,7 @@ public static partial class PlanToCircuit
+         // key inside ExchangeIndex. At W<=1 `Exchange` is the input itself and
+         // `ExchangeIndex` is the GroupProject emitted before, so W=1 is byte-identical.
+         // The partition a broadcast output inherits: the preserved side's, after its chain.
+-        var leftPartition = ctx.Workers > 1 && !leftProjects ? ctx.GetPartition(left) : default;
++        var leftPartition = ctx.Workers <= 1 ? default : leftProjects ? leftChainPartition : ctx.GetPartition(left);
+         if (!broadcastRight && !fuseExchange)
+         {
+             left = builder.Exchange(left, row => StablePartitionHash.OfRow(row, leftIndices, leftKeySchema));
+@@ -5535,7 +5678,7 @@ public static partial class PlanToCircuit
+ 
+         // The partition the unfused chain's output would carry: its input's through filters only, none
+         // past a projection (as CompileLinearChain records).
+-        var inputPartition = ctx.Workers <= 1 || preProjects ? default : ctx.GetPartition(input);
++        var inputPartition = ctx.Workers <= 1 ? default : preProjects ? ctx.LastChainPartition : ctx.GetPartition(input);
+ 
+         // Group-key extractors. A key is any scalar expression (bare column,
+         // CAST(ts AS DATE), a + b, …), compiled once to a delegate run per row —
+@@ -5599,6 +5742,13 @@ public static partial class PlanToCircuit
+                  && inputPartition.PartitionKey is { } pk
+                  && IsKeySubset(pk, gi));
+ 
++        if (ctx.Workers > 1 && !needsExchange)
++        {
++            // EXPERIMENT diagnostic: count elided aggregate exchanges per view label.
++            var elLabel = builder.BuildLabel ?? "(none)";
++            ElidedAggregates[elLabel] = ElidedAggregates.GetValueOrDefault(elLabel) + 1;
++        }
++
+         var indexed = needsExchange
+             ? ExchangeIndexFused(
+                 builder,

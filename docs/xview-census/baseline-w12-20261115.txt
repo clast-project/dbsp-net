@@ -1,0 +1,78 @@
+VIEW accounts total=4 BroadcastExchangeOp=2 ExchangeOp=2 gathers=0 elidedAgg=0
+VIEW broker_performance total=11 BroadcastExchangeOp=1 ExchangeIndexOp=2 ExchangeIndexStepOp=3 ExchangeOp=5 gathers=3 elidedAgg=1
+VIEW cash_transactions total=2 ExchangeIndexStepOp=2 gathers=0 elidedAgg=0
+VIEW companies total=4 BroadcastExchangeOp=2 ExchangeOp=2 gathers=0 elidedAgg=0
+VIEW customer_concentration total=10 BroadcastExchangeOp=1 ExchangeIndexOp=1 ExchangeIndexStepOp=5 ExchangeOp=3 gathers=2 elidedAgg=0
+VIEW customers total=4 BroadcastExchangeOp=2 ExchangeOp=2 gathers=0 elidedAgg=0
+VIEW daily_market total=2 ExchangeOp=2 gathers=0 elidedAgg=0
+VIEW daily_market_pulse total=6 BroadcastExchangeOp=1 ExchangeIndexOp=2 ExchangeIndexStepOp=1 ExchangeOp=2 gathers=1 elidedAgg=0
+VIEW dim_account total=4 ExchangeIndexStepOp=4 gathers=0 elidedAgg=0
+VIEW dim_customer total=25 ExchangeIndexStepOp=2 ExchangeOp=23 gathers=0 elidedAgg=0
+VIEW dim_security total=2 ExchangeIndexStepOp=2 gathers=0 elidedAgg=0
+VIEW fact_cash_balances total=1 ExchangeIndexStepOp=1 gathers=0 elidedAgg=0
+VIEW fact_cash_transactions total=2 ExchangeIndexStepOp=2 gathers=0 elidedAgg=0
+VIEW fact_holdings total=8 ExchangeIndexStepOp=8 gathers=0 elidedAgg=0
+VIEW fact_market_history total=4 ExchangeIndexStepOp=4 gathers=0 elidedAgg=0
+VIEW fact_trade total=6 ExchangeIndexStepOp=6 gathers=0 elidedAgg=0
+VIEW fact_watches total=4 ExchangeIndexStepOp=4 gathers=0 elidedAgg=0
+VIEW financials total=6 ExchangeIndexOp=1 ExchangeIndexStepOp=3 ExchangeOp=2 gathers=0 elidedAgg=0
+VIEW holdings_history total=2 ExchangeIndexStepOp=2 gathers=0 elidedAgg=0
+VIEW market_volatility total=4 BroadcastExchangeOp=1 ExchangeIndexOp=1 ExchangeIndexStepOp=1 ExchangeOp=1 gathers=0 elidedAgg=0
+VIEW securities total=6 ExchangeIndexOp=1 ExchangeIndexStepOp=3 ExchangeOp=2 gathers=0 elidedAgg=0
+VIEW trade_volume_stats total=8 BroadcastExchangeOp=1 ExchangeIndexOp=2 ExchangeIndexStepOp=3 ExchangeOp=2 gathers=1 elidedAgg=0
+VIEW trades total=2 ExchangeOp=1 ExchangeStepOp=1 gathers=0 elidedAgg=0
+VIEW trades_history total=6 BroadcastExchangeOp=3 ExchangeIndexStepOp=2 ExchangeOp=1 gathers=0 elidedAgg=0
+VIEW watches total=1 ExchangeIndexOp=1 gathers=0 elidedAgg=0
+VIEW watches_history total=2 ExchangeIndexStepOp=2 gathers=0 elidedAgg=0
+VIEW wrk_company_financials total=2 ExchangeIndexStepOp=2 gathers=0 elidedAgg=0
+OUTPART crm_customer_mgmt shardDisjoint=False key=null gathered=False keySchema=null arity=27 root=UnionAllPlan shared=False
+OUTPART reference_tax_rate shardDisjoint=True key=null gathered=False keySchema=null arity=3 root=ProjectPlan shared=False
+OUTPART accounts shardDisjoint=False key=null gathered=False keySchema=null arity=32 root=ProjectPlan shared=False
+OUTPART hr_employee shardDisjoint=True key=null gathered=False keySchema=null arity=9 root=ProjectPlan shared=False
+OUTPART employees shardDisjoint=True key=null gathered=False keySchema=null arity=9 root=ProjectPlan shared=False
+OUTPART dim_broker shardDisjoint=False key=null gathered=False keySchema=null arity=10 root=ProjectPlan shared=False
+OUTPART brokerage_cash_transaction shardDisjoint=False key=null gathered=False keySchema=null arity=4 root=ProjectPlan shared=False
+OUTPART cash_transactions shardDisjoint=False key=null gathered=False keySchema=null arity=5 root=ProjectPlan shared=False
+OUTPART customers shardDisjoint=False key=null gathered=False keySchema=null arity=31 root=ProjectPlan shared=False
+OUTPART syndicated_prospect shardDisjoint=True key=null gathered=False keySchema=null arity=22 root=ProjectPlan shared=False
+OUTPART dim_customer shardDisjoint=False key=null gathered=False keySchema=null arity=31 root=ProjectPlan shared=False
+OUTPART dim_account shardDisjoint=False key=null gathered=False keySchema=null arity=10 root=ProjectPlan shared=False
+OUTPART fact_cash_transactions shardDisjoint=False key=null gathered=False keySchema=null arity=6 root=ProjectPlan shared=False
+OUTPART finwire_company shardDisjoint=False key=null gathered=False keySchema=null arity=15 root=ProjectPlan shared=False
+OUTPART reference_industry shardDisjoint=True key=null gathered=False keySchema=null arity=3 root=ProjectPlan shared=False
+OUTPART reference_status_type shardDisjoint=True key=null gathered=False keySchema=null arity=2 root=ProjectPlan shared=False
+OUTPART companies shardDisjoint=False key=null gathered=False keySchema=null arity=17 root=ProjectPlan shared=False
+OUTPART dim_company shardDisjoint=False key=null gathered=False keySchema=null arity=19 root=ProjectPlan shared=False
+OUTPART finwire_security shardDisjoint=False key=null gathered=False keySchema=null arity=12 root=ProjectPlan shared=False
+OUTPART securities shardDisjoint=False key=null gathered=False keySchema=null arity=14 root=ProjectPlan shared=False
+OUTPART dim_security shardDisjoint=False key=null gathered=False keySchema=null arity=14 root=ProjectPlan shared=False
+OUTPART brokerage_trade shardDisjoint=False key=null gathered=False keySchema=null arity=14 root=ProjectPlan shared=False
+OUTPART brokerage_trade_history shardDisjoint=True key=null gathered=False keySchema=null arity=3 root=ProjectPlan shared=False
+OUTPART reference_trade_type shardDisjoint=True key=null gathered=False keySchema=null arity=4 root=ProjectPlan shared=False
+OUTPART trades_history shardDisjoint=False key=null gathered=False keySchema=null arity=18 root=ProjectPlan shared=False
+OUTPART dim_trade shardDisjoint=False key=null gathered=False keySchema=null arity=9 root=ProjectPlan shared=False
+OUTPART trades shardDisjoint=False key=null gathered=False keySchema=null arity=15 root=ProjectPlan shared=False
+OUTPART fact_trade shardDisjoint=False key=null gathered=False keySchema=null arity=16 root=ProjectPlan shared=False
+OUTPART broker_performance shardDisjoint=False key=null gathered=False keySchema=null arity=23 root=ProjectPlan shared=False
+OUTPART brokerage_daily_market shardDisjoint=False key=null gathered=False keySchema=null arity=6 root=ProjectPlan shared=False
+OUTPART brokerage_holding_history shardDisjoint=False key=null gathered=False keySchema=null arity=4 root=ProjectPlan shared=False
+OUTPART brokerage_watch_history shardDisjoint=False key=null gathered=False keySchema=null arity=4 root=ProjectPlan shared=False
+OUTPART watches_history shardDisjoint=False key=null gathered=False keySchema=null arity=8 root=ProjectPlan shared=False
+OUTPART watches shardDisjoint=False key=null gathered=False keySchema=null arity=9 root=ProjectPlan shared=False
+OUTPART fact_watches shardDisjoint=False key=null gathered=False keySchema=null arity=5 root=ProjectPlan shared=False
+OUTPART customer_concentration shardDisjoint=False key=null gathered=False keySchema=null arity=12 root=ProjectPlan shared=False
+OUTPART daily_market shardDisjoint=False key=null gathered=False keySchema=null arity=10 root=ProjectPlan shared=False
+OUTPART daily_market_pulse shardDisjoint=False key=null gathered=False keySchema=null arity=17 root=ProjectPlan shared=False
+OUTPART reference_date shardDisjoint=True key=null gathered=False keySchema=null arity=18 root=ProjectPlan shared=False
+OUTPART silver_date shardDisjoint=True key=null gathered=False keySchema=null arity=18 root=ProjectPlan shared=False
+OUTPART dim_date shardDisjoint=True key=null gathered=False keySchema=null arity=18 root=ProjectPlan shared=False
+OUTPART fact_cash_balances shardDisjoint=False key=null gathered=False keySchema=null arity=5 root=ProjectPlan shared=False
+OUTPART holdings_history shardDisjoint=False key=null gathered=False keySchema=null arity=12 root=ProjectPlan shared=False
+OUTPART fact_holdings shardDisjoint=False key=null gathered=False keySchema=null arity=12 root=ProjectPlan shared=False
+OUTPART finwire_financial shardDisjoint=False key=null gathered=False keySchema=null arity=17 root=ProjectPlan shared=False
+OUTPART financials shardDisjoint=False key=null gathered=False keySchema=null arity=19 root=ProjectPlan shared=False
+OUTPART wrk_company_financials shardDisjoint=False key=null gathered=False keySchema=null arity=7 root=ProjectPlan shared=False
+OUTPART fact_market_history shardDisjoint=False key=null gathered=False keySchema=null arity=12 root=ProjectPlan shared=False
+OUTPART market_volatility shardDisjoint=False key=null gathered=False keySchema=null arity=14 root=ProjectPlan shared=False
+OUTPART trade_volume_stats shardDisjoint=False key=null gathered=False keySchema=null arity=23 root=ProjectPlan shared=False
+TOTAL ops=419 exchanges=138 BroadcastExchangeOp=14 ExchangeIndexOp=11 ExchangeIndexStepOp=62 ExchangeOp=50 ExchangeStepOp=1 gathers=7 elidedAgg=1

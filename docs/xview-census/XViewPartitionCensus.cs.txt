@@ -1,0 +1,202 @@
+// EXPERIMENT (uncommitted): exchange census of the ivm-bench TPC-DI program at W=12, compile only.
+// IVM_SPEC=<spec.json> [IVM_DATA_ROOT=<raw/3/delta> for broadcast counts] [DBSPNET_XVIEW_PARTITION=1]
+using System.Text.Json;
+using DbspNet.Sql.Compiler;
+using DbspNet.Sql.TypeSystem;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace DbspNet.Tests.Scratch;
+
+public class XViewPartitionCensus
+{
+    private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
+    private readonly ITestOutputHelper _out;
+
+    public XViewPartitionCensus(ITestOutputHelper output) => _out = output;
+
+    [Fact]
+    public async Task Census()
+    {
+        var specPath = Environment.GetEnvironmentVariable("IVM_SPEC");
+        if (string.IsNullOrEmpty(specPath))
+        {
+            return;
+        }
+
+        var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
+        var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
+        var dataRoot = Environment.GetEnvironmentVariable("IVM_DATA_ROOT");
+        var rowCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+        if (!string.IsNullOrEmpty(dataRoot))
+        {
+            foreach (var i in spec.Inputs)
+            {
+                var rel = i.Uri["/data/raw/delta/".Length..];
+                if (await DbspNet.Connectors.EngineeredWood.DeltaRowCounts.TryReadAsync(Path.Combine(dataRoot, rel)) is { } n)
+                {
+                    rowCounts[i.Table] = n;
+                }
+            }
+
+            _out.WriteLine("COUNTS " + string.Join(" ", rowCounts.OrderBy(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value}")));
+        }
+
+        PlanToCircuit.GatherCounts.Clear();
+        PlanToCircuit.ViewOutputPartitions.Clear();
+        PlanToCircuit.JoinSidesPrePartitioned.Clear();
+        PlanToCircuit.ElidedAggregates.Clear();
+        Assert.True(SqlProgram.TryCompileParallel(
+            spec.Program, outputViews, 12, out var compiled, null,
+            new CompileOptions { BroadcastMaxRows = rowCounts.Count > 0 ? 1000 : 0, RelationRowCounts = rowCounts.Count > 0 ? rowCounts : null },
+            numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera));
+        using var _ = compiled;
+        var r0 = compiled!.Circuit.Replicas[0];
+        var perView = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        for (var i = 0; i < r0.Operators.Count; i++)
+        {
+            var name = r0.Operators[i].GetType().Name;
+            var tick = name.IndexOf('`');
+            if (tick > 0)
+            {
+                name = name[..tick];
+            }
+
+            if (!name.Contains("Exchange"))
+            {
+                continue;
+            }
+
+            var label = r0.OperatorLabel(i) ?? "(none)";
+            if (!perView.TryGetValue(label, out var d))
+            {
+                perView[label] = d = new(StringComparer.Ordinal);
+            }
+
+            d[name] = d.GetValueOrDefault(name) + 1;
+        }
+
+        foreach (var (view, d) in perView.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            _out.WriteLine($"VIEW {view} total={d.Values.Sum()} " + string.Join(" ", d.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}"))
+                + $" gathers={PlanToCircuit.GatherCounts.GetValueOrDefault(view) / 12} elidedAgg={PlanToCircuit.ElidedAggregates.GetValueOrDefault(view) / 12}");
+        }
+
+        foreach (var (view, p) in PlanToCircuit.ViewOutputPartitions)
+        {
+            _out.WriteLine($"OUTPART {view} {p}");
+        }
+
+        foreach (var (site, n) in PlanToCircuit.JoinSidesPrePartitioned)
+        {
+            _out.WriteLine($"JOINSIDE {site} {n}");
+        }
+
+        var totals = perView.Values.SelectMany(d => d).GroupBy(kv => kv.Key).ToDictionary(g => g.Key, g => g.Sum(kv => kv.Value));
+        _out.WriteLine($"TOTAL ops={r0.Operators.Count} exchanges={totals.Values.Sum()} " + string.Join(" ", totals.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}"))
+            + $" gathers={PlanToCircuit.GatherCounts.Values.Sum() / 12} elidedAgg={PlanToCircuit.ElidedAggregates.Values.Sum() / 12}");
+    }
+
+    [Fact]
+    public void ViewScanCeiling()
+    {
+        var specPath = Environment.GetEnvironmentVariable("IVM_SPEC");
+        if (string.IsNullOrEmpty(specPath))
+        {
+            return;
+        }
+
+        var spec = JsonSerializer.Deserialize<Spec>(File.ReadAllText(specPath), JsonOpts)!;
+        var outputViews = IvmSpecViews.ToCompile(spec.Outputs, spec.Output_Bindings.Select(o => o.View));
+        var resolved = SqlProgram.Resolve(spec.Program, outputViews, numericStringCoercion: true, nullCollation: NullCollation.Low, numericDialect: NumericDialect.Feldera);
+        var viewNames = resolved.Views.Select(v => v.ViewName).ToHashSet(StringComparer.Ordinal);
+        var tally = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var v in resolved.Views)
+        {
+            var optimized = DbspNet.Sql.Optimizer.PlanOptimizer.Optimize(v.Query);
+            Walk(optimized, v.ViewName);
+            var bottom = optimized;
+            while (bottom is DbspNet.Sql.Plan.FilterPlan or DbspNet.Sql.Plan.ProjectPlan)
+            {
+                bottom = bottom is DbspNet.Sql.Plan.FilterPlan bf ? bf.Input : ((DbspNet.Sql.Plan.ProjectPlan)bottom).Input;
+            }
+
+            var jt = bottom is DbspNet.Sql.Plan.JoinPlan bj ? bj.JoinType.ToString() : "";
+            _out.WriteLine($"BOTTOM {v.ViewName} {bottom.GetType().Name}{jt}");
+        }
+
+        foreach (var (k, n) in tally.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            _out.WriteLine($"CEIL {k} {n}");
+        }
+
+        _out.WriteLine($"CEIL TOTAL {tally.Values.Sum()}");
+
+        string? ViewAtBottom(DbspNet.Sql.Plan.LogicalPlan p)
+        {
+            while (true)
+            {
+                switch (p)
+                {
+                    case DbspNet.Sql.Plan.FilterPlan f: p = f.Input; continue;
+                    case DbspNet.Sql.Plan.ProjectPlan pp: p = pp.Input; continue;
+                    case DbspNet.Sql.Plan.ScanPlan sc: return viewNames.Contains(sc.TableName) ? sc.TableName : null;
+                    default: return null;
+                }
+            }
+        }
+
+        void Note(string view, string kind, DbspNet.Sql.Plan.LogicalPlan input)
+        {
+            if (ViewAtBottom(input) is { } src)
+            {
+                var k = $"{view} {kind} <- {src}";
+                tally[k] = tally.GetValueOrDefault(k) + 1;
+            }
+        }
+
+        void Walk(DbspNet.Sql.Plan.LogicalPlan p, string view)
+        {
+            switch (p)
+            {
+                case DbspNet.Sql.Plan.JoinPlan j: Note(view, $"join{j.JoinType}.L", j.Left); Note(view, $"join{j.JoinType}.R", j.Right); break;
+                case DbspNet.Sql.Plan.AggregatePlan a: Note(view, "agg", a.Input); break;
+                case DbspNet.Sql.Plan.DistinctPlan d: Note(view, "distinct", d.Input); break;
+                case DbspNet.Sql.Plan.PartitionedTopKPlan t: Note(view, "ptopk", t.Input); break;
+                case DbspNet.Sql.Plan.PartitionedRankPlan r: Note(view, "prank", r.Input); break;
+                case DbspNet.Sql.Plan.WindowAggregatePlan w: Note(view, "window", w.Input); break;
+                case DbspNet.Sql.Plan.WindowOffsetPlan w: Note(view, "windowoffset", w.Input); break;
+                case DbspNet.Sql.Plan.SemiJoinPlan sj: Note(view, "semi.L", sj.Input); Note(view, "semi.R", sj.Subquery); break;
+            }
+
+            foreach (var prop in p.GetType().GetProperties())
+            {
+                var val = prop.GetValue(p);
+                if (val is DbspNet.Sql.Plan.LogicalPlan child)
+                {
+                    Walk(child, view);
+                }
+                else if (val is System.Collections.IEnumerable list and not string)
+                {
+                    foreach (var item in list)
+                    {
+                        if (item is DbspNet.Sql.Plan.LogicalPlan c)
+                        {
+                            Walk(c, view);
+                        }
+                    }
+                }
+                else if (val is DbspNet.Sql.Plan.CteRef cte)
+                {
+                    Walk(cte.Plan, view);
+                }
+            }
+        }
+    }
+
+    private sealed record Spec(List<string> Program, List<string>? Outputs, List<Input> Inputs, List<Binding> Output_Bindings);
+
+    private sealed record Input(string Table, string Uri);
+
+    private sealed record Binding(string View);
+}
