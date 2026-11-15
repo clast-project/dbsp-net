@@ -311,8 +311,11 @@ A column declared `LATENESS d` promises that no future value falls more than
   when the key is monotone on both sides. Spine batches GC per batch, using
   each batch's min/max key range.
 
-Two limits apply. `LATENESS` forces the structural compile, and the program
-path does not enforce it yet (state stays unbounded there, which is sound).
+Two limits apply. `LATENESS` forces the structural compile. The program path,
+serial or parallel, accepts `LATENESS` but ignores it: late rows are not dropped
+and no state is collected. The single-query parallel path refuses `LATENESS` and
+falls back to serial
+([#3](https://github.com/clast-project/dbsp-net/issues/3)).
 
 ### Temporal filters (`NOW()`)
 

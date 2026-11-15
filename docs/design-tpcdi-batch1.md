@@ -1,7 +1,19 @@
 # TPC-DI batch 1 at twelve workers: where the time goes, and the plan
 
-Status: in progress. §1–§2 were measured at `2798958`. Broadcast joins (§4a), smallest-first input
-order (§4c) and byte-level string functions (§4d) have shipped; batch 1 is now within ~5% of Feldera locally.
+Status: **goal met — parity in CI on 2026-11-14.** §1–§2 were measured at `2798958`. The levers that
+shipped were broadcast joins (§4a), smallest-first input order (§4c) and byte-level string functions
+(§4d). Further batch-1 work would be for a lead, not for parity.
+
+**Result (ivm-bench PR #98, GCI SF10 preset, twelve workers, pin `86d0ce1`, run
+[43549008875](https://github.com/mdrakiburrahman/ivm-bench/actions/runs/43549008875)).** Every
+engine completed every batch.
+
+| Engine | Batch 1 | Batch 2 | Batch 3 |
+|---|--:|--:|--:|
+| DbspNet | **1:31** | 0:01 | 0:01 |
+| Feldera | 1:31 | 0:07 | 0:08 |
+
+Batch 1 was 1:59 vs 1:34 on #96 and 1:52 vs 1:33 on #95 (§0).
 
 ## 0. Why, and the target
 

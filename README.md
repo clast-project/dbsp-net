@@ -18,9 +18,10 @@ real benchmarks:
 - **Nexmark.** On a 14-core M4 Pro with 10M events, DbspNet at 14 workers beats
   Feldera on all 13 queries that both run, by 1.1× to 20× (2026-11-02). See
   [`docs/benchmarks-comparison.md`](docs/benchmarks-comparison.md).
-- **TPC-DI.** This is the ivm-bench benchmark, which keeps 50 views up to date
-  with 12 workers at SF10. Batch 1 is at parity with Feldera (2026-11-14). See
-  [`docs/design-tpcdi-batch1.md`](docs/design-tpcdi-batch1.md).
+- **TPC-DI.** This is the ivm-bench benchmark, which keeps 50 views up to date.
+  At SF10 with 12 workers, the initial bulk load (batch 1) ties Feldera at 1:31,
+  and the two incremental batches take 1 s each against Feldera's 7–8 s
+  (2026-11-14). See [`docs/design-tpcdi-batch1.md`](docs/design-tpcdi-batch1.md).
 
 [`ARCHITECTURE.md`](ARCHITECTURE.md) maps the codebase.
 [`docs/skipped.md`](docs/skipped.md) lists what is deliberately missing.
@@ -185,8 +186,10 @@ The full list is in [`docs/skipped.md`](docs/skipped.md).
 - `CURRENT_TIME`, which is rejected because it wraps at midnight.
 - DML, transactions, `ALTER`, `CREATE INDEX` and bind parameters. Data enters
   through `Table(...).Push` or connectors.
-- `LATENESS` is not yet enforced on the program path. State there is
-  unbounded, but results are correct.
+- `LATENESS` on the program path (`SqlProgram`, which the server uses). It is
+  accepted but ignored: late rows are not dropped and no state is collected.
+  Only the single-query path enforces it
+  ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
 
 ## Engine
 
@@ -213,7 +216,8 @@ The full list is in [`docs/skipped.md`](docs/skipped.md).
   - A tick journal of source offsets.
   - One-commit parallel checkpoints.
   - Re-sharding a checkpoint to another worker count.
-  - An opt-in run-file layout with incremental checkpoints and lazy restore.
+  - An opt-in run-file layout with incremental checkpoints and lazy restore
+    ([#4](https://github.com/clast-project/dbsp-net/issues/4)).
   
   See [`docs/persistence.md`](docs/persistence.md).
 - **Arrow.** `TableInput.PushArrow` / `CompiledQuery.ToArrowDelta()` and IPC
