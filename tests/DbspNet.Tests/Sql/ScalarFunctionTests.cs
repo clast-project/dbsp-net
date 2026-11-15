@@ -743,6 +743,23 @@ public class ScalarFunctionTests
     }
 
     [Fact]
+    public void ConcatWs_LeadingNullValues_NoLeadingSeparator()
+    {
+        // The TPC-DI phone shape (ivm-bench crm_customer_mgmt.sql): the raw C_CTRY_CODE / C_AREA_CODE are
+        // BIGINT and genuinely NULL for most customers. Standard CONCAT_WS skips NULL arguments wherever
+        // they sit, so no separator leads. Feldera emits '-767-4707' here: it lowers CONCAT_WS as a left
+        // fold from a NULL accumulator, and its concat_ws(sep, NULL, NULL) step returns '' instead of NULL
+        // (issue #6). We deliberately do not copy that.
+        string[] ddl = ["CREATE TABLE t (c BIGINT, a BIGINT, l VARCHAR NOT NULL, e BIGINT)"];
+        const string query =
+            "SELECT CONCAT_WS('-', CAST(c AS VARCHAR), CAST(a AS VARCHAR), l, CAST(e AS VARCHAR)) FROM t";
+        Assert.Equal("767-4707", EvalOne(ddl, query,
+            q => q.Table("t").Insert(new object?[] { null, null, "767-4707", null })));
+        Assert.Equal("420-757-3642-61998", EvalOne(ddl, query,
+            q => q.Table("t").Insert(new object?[] { null, 420L, "757-3642", 61998L })));
+    }
+
+    [Fact]
     public void ConcatWs_AllNullValues_EmptyString()
     {
         Assert.Equal("", EvalOne(
