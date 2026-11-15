@@ -79,6 +79,15 @@ if (args.Length > 0 && args[0] is "nexmark" or "fraud" or "fraud-dump" or "compa
     return DbspNet.Benchmarks.ComparisonBenchmarks.Run(args);
 }
 
+// Parallel LATENESS frontier cost (docs/design-parallel-frontier.md §5):
+// `dotnet run -- parlat [workers] [ticks] [rowsPerTick] [runs]`
+if (args.Length > 0 && args[0] == "parlat")
+{
+    int Arg(int i, int d) => args.Length > i ? int.Parse(args[i], System.Globalization.CultureInfo.InvariantCulture) : d;
+    DbspNet.Benchmarks.ParallelLatenessBenchmark.Run(Arg(1, 12), Arg(2, 20_000), Arg(3, 100), Arg(4, 5));
+    return 0;
+}
+
 // Parallel-scaling sub-command: `dotnet run -- parallel [maxWorkers]`
 if (args.Length > 0 && args[0] == "parallel")
 {

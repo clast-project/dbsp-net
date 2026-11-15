@@ -114,7 +114,8 @@ coverage gap from brief (c): partitioned top-K, RANK, window SUM, LAG, a join re
 aggregate, and a LATENESS aggregate, each restored and then continued for 4 ticks against an
 uninterrupted run. `LatenessOperator`'s per-worker `maxSeen` is persisted per replica, so restore
 reproduces it. Whether a per-shard frontier is the right semantics is a separate question from
-persistence. Runner: `ParallelRunner_RestoreAfterBatch_…` (W=2/4) matches an uninterrupted serial
+persistence. (Settled 2026-11-15: it was not. The frontier is now a global max agreed at every step
+boundary, so every replica persists the same value; docs/design-parallel-frontier.md.) Runner: `ParallelRunner_RestoreAfterBatch_…` (W=2/4) matches an uninterrupted serial
 run and writes nothing on an idle batch. Engine: a W=4 persistent deploy runs parallel, and a
 redeploy asking for W=2 resumes at 4. A serial checkpoint redeployed with W=4 stays serial. Both
 match a from-scratch run. Full suite: 2658 pass.
@@ -317,9 +318,12 @@ Inputs are sharded by `OfWholeRow(row) % W`; every exchange places by its own pa
 | `TopKOp` (global ORDER BY … LIMIT) | all input rows | **worker 0** |
 | global aggregate / hash cross join (empty key) | — | `OWR(empty)` = a constant worker (not 0), which the `OWR(key)` rule already reproduces |
 
-Unreachable on this path (refused or never built): `LatenessOperator`, `TemporalFilterOp`, the
-fixpoints, shared arrangements, `LinearAggregateOp`, `DelayOp`. No per-worker scalar state is
-reachable; tick and logical time are equal on every worker. Spine variants persist per-batch files
+Unreachable on this path (refused or never built): `TemporalFilterOp`, the fixpoints, shared
+arrangements, `LinearAggregateOp`, `DelayOp`. Tick and logical time are equal on every worker.
+`LatenessOperator` (added 2026-11-15) is the one per-worker scalar. Every replica holds the same,
+global `maxSeen` (docs/design-parallel-frontier.md). Its `frontier.bin` is an
+`IdenticalBlobReshardFile`: the rewrite checks that the old workers' copies are byte-identical, and
+copies one to every new worker. Spine variants persist per-batch files
 with the same keys (`TraceFamily = Spine`, not the default).
 
 ### Design: rewrite the snapshot, then restore normally
@@ -1364,7 +1368,10 @@ On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
    (Flink key groups) were considered and not chosen: they only pay off if changing W must be
    cheap and frequent, and they cap W. Work:
    - audit every operator for per-worker (not per-key) state and give each a merge rule;
-     `LatenessOperator.maxSeen` takes the minimum (conservative: delays GC, never wrong);
+     `LatenessOperator.maxSeen` was planned to take the minimum. That was **wrong**: under drop
+     semantics a smaller frontier admits rows the serial path drops. As built, every replica holds
+     the same global value, so the rule is "identical, copy"
+     (docs/design-parallel-frontier.md, 2026-11-15);
    - verification: checkpoint at W_old, restore at W_new, continue, compare against an
      uninterrupted run, over the `WideProgram` operator set, both directions (e.g. 4→12, 12→4,
      3→2), flat and spine; plus a crash during a re-sharding restore leaves the old checkpoint

@@ -186,10 +186,9 @@ The full list is in [`docs/skipped.md`](docs/skipped.md).
 - `CURRENT_TIME`, which is rejected because it wraps at midnight.
 - DML, transactions, `ALTER`, `CREATE INDEX` and bind parameters. Data enters
   through `Table(...).Push` or connectors.
-- `LATENESS` on the *parallel* paths. A program or query that declares it
-  compiles serially: the parallel compile refuses it and reports it as a
-  blocker, because workers don't share a frontier yet
-  ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
+- Temporal filters (`NOW()`) on the parallel *program* path. A program that
+  uses one compiles serially (a `ParallelBlockers` entry). The single-query
+  parallel path does run them, and both parallel paths run `LATENESS`.
 
 ## Engine
 

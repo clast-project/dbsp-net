@@ -192,8 +192,9 @@ The entry points are:
 
 Each one returns `false` when the plan can't shard soundly, and the caller then
 compiles serially. `SqlProgram.ParallelBlockers` explains the refusal. Current
-blockers include `LATENESS`, temporal filters, recursive CTEs and some semi-join
-or difference shapes. Design notes:
+blockers include temporal filters on the program path, recursive CTEs and some
+semi-join or difference shapes. `LATENESS` runs on both structural parallel
+paths. Design notes:
 [`design-structural-parallel.md`](docs/design-structural-parallel.md) and
 [`design-tpcdi-batch1.md`](docs/design-tpcdi-batch1.md).
 
@@ -320,12 +321,27 @@ single-use view inlined into its consumer is analyzed through its body, like a
 CTE. Monotonicity therefore crosses view boundaries exactly as if the views
 were written inline, and the sources stay base-table columns.
 
+**Parallel.** Both structural parallel paths enforce `LATENESS`. Each replica
+sees only its shard, so a frontier built from its own max would drop different
+rows than the serial path. Instead, each replica's `LatenessOperator` joins a
+step-boundary `GlobalMaxReduction`. After every `ParallelCircuit.Step`, the
+driver takes the max of the replicas' `max_seen` and hands it back to each.
+- The driver does this between the "done" rendezvous and the next "go", so it
+  needs no extra barrier or exchange: about 15 ns per column per step at W=12.
+- Every replica therefore drops against the global frontier as of the start of
+  the tick, which is the serial rule and Feldera's (it filters on the delayed
+  waterline).
+- In-tick GC uses the replica's own advance, which never exceeds the serial
+  value.
+- Every replica persists the same `max_seen`. A re-shard checks the copies are
+  byte-identical and copies one to every new worker.
+
+See [`design-parallel-frontier.md`](docs/design-parallel-frontier.md).
+
 Limits: `LATENESS` forces the structural compile on the single-query path. A
 typed program view (`TypeEligibleProgramViews`, off by default) compiles
-without GC, which is sound but unbounded. Both parallel paths refuse `LATENESS`
-(a `ParallelBlockers` entry), so callers fall back to serial: each worker would
-otherwise drop late rows against its own shard's max rather than the global
-one ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
+without GC, which is sound but unbounded. The typed parallel compile refuses
+`LATENESS`.
 
 ### Temporal filters (`NOW()`)
 
