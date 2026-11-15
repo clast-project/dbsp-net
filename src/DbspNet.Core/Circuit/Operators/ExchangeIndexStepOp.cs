@@ -59,6 +59,8 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
         var workers = _workers;
         var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+        var mark = profile ? StepProfiler.PhaseMark.Now() : default;
+        var detail = profile && StepProfiler.PhaseDetail;
 
         // Map, then split by the mapped row's partition. Two inputs can map to one row;
         // both go to the same bucket and merge in the gather.
@@ -71,6 +73,10 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
             // each row is decoded anyway, into one spilling builder per destination, as ExchangeIndexOp does
             // (§5.41); listing the mapped rows would hold the whole delta managed.
             splitRows = grouped;
+        }
+        else if (detail)
+        {
+            splitRows = SplitTimed(buckets);
         }
         else
         foreach (var (row, weight) in _input.Current)
@@ -95,6 +101,7 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
         {
             var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordSplit(_worker, t1 - t0, splitRows);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Split, ref mark);
             t0 = t1;
         }
 
@@ -104,6 +111,7 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
         {
             var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordWait(_worker, t2 - t0);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Wait, ref mark);
             t0 = t2;
         }
 
@@ -123,6 +131,7 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
             if (profile)
             {
                 StepProfiler.RecordGather(_worker, System.Diagnostics.Stopwatch.GetTimestamp() - t0, gatherRows);
+                StepProfiler.RecordPhase(StepProfiler.XPhase.Gather, ref mark);
             }
 
             return;
@@ -145,6 +154,10 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
                     }
                 }
             }
+            else if (bucket is not null && detail)
+            {
+                gatherRows += GatherTimed(bucket, indexed);
+            }
             else if (bucket is not null)
             {
                 foreach (var (row, weight) in ExchangeBuckets.Items(bucket))
@@ -155,12 +168,62 @@ internal sealed class ExchangeIndexStepOp<TKey, TIn, TRow, TWeight> : IOperator
             }
         }
 
+        var build = profile ? StepProfiler.PhaseMark.Now() : default;
         _output.SetCurrent(indexed.Build());
 
         if (profile)
         {
             var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Build, ref build);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Gather, ref mark);
         }
+    }
+
+    // The profiled split under DBSPNET_PROFILE_XPHASE: as the plain loop, with the fused step timed per row.
+    private long SplitTimed(IReadOnlyList<KeyValuePair<TRow, TWeight>>?[] buckets)
+    {
+        var workers = _workers;
+        long rows = 0, ticks = 0, alloc = 0, pause = 0;
+        foreach (var (row, weight) in _input.Current)
+        {
+            var m0 = StepProfiler.PhaseMark.Now();
+            var (keep, mapped) = _step(row);
+            var m1 = StepProfiler.PhaseMark.Now();
+            ticks += m1.Ticks - m0.Ticks;
+            alloc += m1.Alloc - m0.Alloc;
+            pause += m1.Pause - m0.Pause;
+            if (!keep)
+            {
+                continue;
+            }
+
+            var j = ((_partition(mapped) % workers) + workers) % workers;
+            ExchangeBuckets.Add(ref buckets[j], new(mapped, weight));
+            rows++;
+        }
+
+        StepProfiler.AddPhase(StepProfiler.XPhase.Map, ticks, alloc, pause);
+        return rows;
+    }
+
+    // The profiled gather of one list bucket under DBSPNET_PROFILE_XPHASE, with the key projection timed per row.
+    private long GatherTimed(IReadOnlyList<KeyValuePair<TRow, TWeight>> bucket, IndexedZSetBuilder<TKey, TRow, TWeight> indexed)
+    {
+        long rows = 0, ticks = 0, alloc = 0, pause = 0;
+        foreach (var (row, weight) in ExchangeBuckets.Items(bucket))
+        {
+            var m0 = StepProfiler.PhaseMark.Now();
+            var key = _keyOf(row);
+            var m1 = StepProfiler.PhaseMark.Now();
+            ticks += m1.Ticks - m0.Ticks;
+            alloc += m1.Alloc - m0.Alloc;
+            pause += m1.Pause - m0.Pause;
+            indexed.Add(key, row, weight);
+            rows++;
+        }
+
+        StepProfiler.AddPhase(StepProfiler.XPhase.Key, ticks, alloc, pause);
+        return rows;
     }
 }

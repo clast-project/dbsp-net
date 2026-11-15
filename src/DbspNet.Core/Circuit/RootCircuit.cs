@@ -38,6 +38,7 @@ public sealed class RootCircuit
     private long _lastStepTicks;
     private long[]? _opCumTicks;
     private long[]? _opCumAlloc;
+    private long[]? _opCumPause;
     private StepProfiler.OperatorSink? _opExchange;
 
     /// <summary>
@@ -388,6 +389,7 @@ public sealed class RootCircuit
     {
         _opCumTicks ??= new long[_operators.Count];
         _opCumAlloc ??= new long[_operators.Count];
+        _opCumPause ??= new long[_operators.Count];
         _opExchange ??= new StepProfiler.OperatorSink(_operators.Count);
         var outerSink = StepProfiler.CurrentOperator;
         for (var i = 0; i < _operators.Count; i++)
@@ -396,6 +398,7 @@ public sealed class RootCircuit
             // this thread, so the per-op attribution is exact (no cross-thread GC
             // leakage between successive ops).
             var a0 = GC.GetAllocatedBytesForCurrentThread();
+            var p0 = GC.GetTotalPauseDuration().Ticks;
             var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             if (DeltaSizeProfile.Enabled)
             {
@@ -420,6 +423,7 @@ public sealed class RootCircuit
 
             _opCumTicks[i] += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
             _opCumAlloc[i] += GC.GetAllocatedBytesForCurrentThread() - a0;
+            _opCumPause[i] += GC.GetTotalPauseDuration().Ticks - p0;
         }
     }
 
@@ -438,6 +442,11 @@ public sealed class RootCircuit
         if (_opCumAlloc is not null)
         {
             System.Array.Clear(_opCumAlloc);
+        }
+
+        if (_opCumPause is not null)
+        {
+            System.Array.Clear(_opCumPause);
         }
 
         _opExchange?.Clear();
@@ -473,9 +482,11 @@ public sealed class RootCircuit
             var waitMs = _opExchange is not null ? _opExchange.WaitTicks[i] * 1000.0 / freq : 0;
             var splitRows = _opExchange?.SplitRows[i] ?? 0;
             var gatherRows = _opExchange?.GatherRows[i] ?? 0;
+            var pauseMs = _opCumPause is not null ? _opCumPause[i] / (double)TimeSpan.TicksPerMillisecond : 0;
+            var phases = ExchangePhases(i, freq);
             if (op is IIntrospectable m)
             {
-                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label, alloc, waitMs, splitRows, gatherRows));
+                profiles.Add(new OperatorProfile(i, m.MetricName, ms, m.RetainedRows, m.LastOutputRows, label, alloc, waitMs, splitRows, gatherRows, pauseMs, phases));
             }
             else
             {
@@ -486,10 +497,37 @@ public sealed class RootCircuit
                     name = name[..tick];
                 }
 
-                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label, alloc, waitMs, splitRows, gatherRows));
+                profiles.Add(new OperatorProfile(i, name, ms, -1, -1, label, alloc, waitMs, splitRows, gatherRows, pauseMs, phases));
             }
         }
 
         return profiles;
+    }
+
+    // The exchange sub-phase costs of operator i, or null if it recorded none.
+    private PhaseCost[]? ExchangePhases(int i, long freq)
+    {
+        if (_opExchange is not { } sink)
+        {
+            return null;
+        }
+
+        PhaseCost[]? phases = null;
+        for (var p = 0; p < StepProfiler.XPhases; p++)
+        {
+            var at = (i * StepProfiler.XPhases) + p;
+            if (sink.PhaseTicks[at] == 0 && sink.PhaseAlloc[at] == 0)
+            {
+                continue;
+            }
+
+            phases ??= new PhaseCost[StepProfiler.XPhases];
+            phases[p] = new PhaseCost(
+                sink.PhaseTicks[at] * 1000.0 / freq,
+                sink.PhaseAlloc[at],
+                sink.PhasePause[at] / (double)TimeSpan.TicksPerMillisecond);
+        }
+
+        return phases;
     }
 }

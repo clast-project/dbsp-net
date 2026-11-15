@@ -54,6 +54,7 @@ internal sealed class ExchangeStepOp<TIn, TKey, TWeight> : IOperator
         var workers = _workers;
         var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+        var mark = profile ? StepProfiler.PhaseMark.Now() : default;
 
         // Map, then split by the mapped row's partition. Two inputs can map to one row; both go to the
         // same destination and the gather sums them.
@@ -94,6 +95,7 @@ internal sealed class ExchangeStepOp<TIn, TKey, TWeight> : IOperator
         {
             var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordSplit(_worker, t1 - t0, splitRows);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Split, ref mark);
             t0 = t1;
         }
 
@@ -103,6 +105,7 @@ internal sealed class ExchangeStepOp<TIn, TKey, TWeight> : IOperator
         {
             var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordWait(_worker, t2 - t0);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Wait, ref mark);
             t0 = t2;
         }
 
@@ -153,6 +156,7 @@ internal sealed class ExchangeStepOp<TIn, TKey, TWeight> : IOperator
         {
             var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Gather, ref mark);
         }
     }
 }

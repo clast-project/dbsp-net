@@ -1020,6 +1020,80 @@ public sealed class ProgramRunner
                     sb.AppendLine(FormattableString.Invariant(
                         $"  [{e.Op.Index,4}] {e.Op.Name,-22} wait {e.Wait,8:F0} ms ({(allWait > 0 ? e.Wait / allWait * 100 : 0),4:F1}%)  of {e.Total,8:F0} ms  rows {e.Rows,9}  recv max/mean {e.GatherSkew,5:F2}  sent max/mean {e.SplitSkew,5:F2}  {e.Op.Label}"));
                 }
+
+                AppendExchangePhases(sb, exchanges.Select(e => (e.Op, e.Rows)).ToList(), perWorker, top);
+            }
+        }
+
+        // Each exchange's cost by sub-phase (StepProfiler.XPhase), summed over workers, with the GC pause that
+        // landed inside each phase taken out: map (the fused pre-step, timed per row only under
+        // DBSPNET_PROFILE_XPHASE=1), split (partition + bucket, less map), wait, key (the gather's key projection,
+        // per row, XPHASE only), add (the gather's index inserts, less key and build) and build (the final index).
+        private static void AppendExchangePhases(
+            StringBuilder sb,
+            IReadOnlyList<(OperatorProfile Op, long Rows)> exchanges,
+            IReadOnlyList<IReadOnlyList<OperatorProfile>> perWorker,
+            int top)
+        {
+            const int map = 0, split = 1, wait = 2, key = 3, gather = 4, build = 5;
+            var rows = new List<(OperatorProfile Op, long Rows, PhaseCost[] P, double Gc)>();
+            foreach (var (op0, n) in exchanges)
+            {
+                var sum = new PhaseCost[6];
+                double gc = 0;
+                foreach (var worker in perWorker)
+                {
+                    if (op0.Index >= worker.Count)
+                    {
+                        continue;
+                    }
+
+                    var o = worker[op0.Index];
+                    gc += o.GcPauseMs;
+                    if (o.Phases is { } ph)
+                    {
+                        for (var p = 0; p < sum.Length && p < ph.Count; p++)
+                        {
+                            sum[p] += ph[p];
+                        }
+                    }
+                }
+
+                // Nested phases: report split less map, gather less key and build.
+                sum[split] = new PhaseCost(sum[split].Ms - sum[map].Ms, sum[split].AllocBytes - sum[map].AllocBytes, sum[split].GcPauseMs - sum[map].GcPauseMs);
+                var nested = sum[key] + sum[build];
+                sum[gather] = new PhaseCost(sum[gather].Ms - nested.Ms, sum[gather].AllocBytes - nested.AllocBytes, sum[gather].GcPauseMs - nested.GcPauseMs);
+                rows.Add((op0, n, sum, gc));
+            }
+
+            static double ExGc(PhaseCost c) => c.Ms - c.GcPauseMs;
+            static double Own(PhaseCost[] p) => ExGc(p[map]) + ExGc(p[split]) + ExGc(p[key]) + ExGc(p[gather]) + ExGc(p[build]);
+            static double Mib(long b) => b / 1048576.0;
+            static string Cell(PhaseCost c) => FormattableString.Invariant($"{ExGc(c),7:F0}/{Mib(c.AllocBytes),6:F0}");
+
+            sb.AppendLine();
+            sb.AppendLine("-- exchange phases (summed over workers; ms ex-GC / MiB; own = all but wait; gc = pause inside the op) --");
+            sb.AppendLine("  kind                     n     own ms  alloc MiB   gc ms |    map      |   split     |    wait     |    key      |    add      |   build");
+            foreach (var g in rows.GroupBy(r => r.Op.Name).OrderByDescending(g => g.Sum(r => Own(r.P))))
+            {
+                var t = new PhaseCost[6];
+                foreach (var r in g)
+                {
+                    for (var p = 0; p < 6; p++)
+                    {
+                        t[p] += r.P[p];
+                    }
+                }
+
+                sb.AppendLine(FormattableString.Invariant(
+                    $"  {g.Key,-22} {g.Count(),3} {Own(t),10:F0} {Mib(t.Sum(c => c.AllocBytes)),10:F0} {g.Sum(r => r.Gc),7:F0} | {Cell(t[map])} | {Cell(t[split])} | {Cell(t[wait])} | {Cell(t[key])} | {Cell(t[gather])} | {Cell(t[build])}"));
+            }
+
+            sb.AppendLine(FormattableString.Invariant($"  by own ms ex-GC (top {top}):"));
+            foreach (var r in rows.OrderByDescending(r => Own(r.P)).Take(top))
+            {
+                sb.AppendLine(FormattableString.Invariant(
+                    $"  [{r.Op.Index,4}] {r.Op.Name,-20} own {Own(r.P),7:F0} alloc {Mib(r.P.Sum(c => c.AllocBytes)),6:F0} gc {r.Gc,6:F0} rows {r.Rows,9} | {Cell(r.P[map])} | {Cell(r.P[split])} | {Cell(r.P[wait])} | {Cell(r.P[key])} | {Cell(r.P[gather])} | {Cell(r.P[build])}  {r.Op.Label}"));
             }
         }
 

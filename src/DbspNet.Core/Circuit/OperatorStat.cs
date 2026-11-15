@@ -48,6 +48,9 @@ public readonly record struct OperatorStat(
 /// for stateless (linear) operators that expose no metrics. For an exchange in a parallel circuit,
 /// <paramref name="WaitMs"/> is the part of <paramref name="CumulativeMs"/> spent at its barrier, and
 /// <paramref name="SplitRows"/> / <paramref name="GatherRows"/> the rows it sent and received on this worker.
+/// <paramref name="GcPauseMs"/> is the process's GC pause that elapsed while the operator stepped (part of
+/// <paramref name="CumulativeMs"/>); <paramref name="Phases"/>, for an exchange, its cost by sub-phase
+/// (indexed by <c>StepProfiler.XPhase</c>: map, split, wait, key, gather, build), else null.
 /// </summary>
 public readonly record struct OperatorProfile(
     int Index,
@@ -59,7 +62,9 @@ public readonly record struct OperatorProfile(
     long AllocBytes = 0,
     double WaitMs = 0,
     long SplitRows = 0,
-    long GatherRows = 0)
+    long GatherRows = 0,
+    double GcPauseMs = 0,
+    IReadOnlyList<PhaseCost>? Phases = null)
 {
     public override string ToString() => System.FormattableString.Invariant(
         $"[{Index}] {Name}{(Label is null ? "" : $" <{Label}>")}: {CumulativeMs:F1}ms state={RetainedRows} out={LastOutputRows} alloc={AllocBytes}");
@@ -98,4 +103,12 @@ internal interface IIntrospectable
 
     /// <summary>Cumulative state rows / keys garbage-collected since creation.</summary>
     long GcDroppedTotal { get; }
+}
+
+/// <summary>One exchange sub-phase's cost in an <see cref="OperatorProfile"/>: wall time, bytes allocated on
+/// the stepping thread, and the GC pause that elapsed inside it.</summary>
+public readonly record struct PhaseCost(double Ms, long AllocBytes, double GcPauseMs)
+{
+    public static PhaseCost operator +(PhaseCost a, PhaseCost b) =>
+        new(a.Ms + b.Ms, a.AllocBytes + b.AllocBytes, a.GcPauseMs + b.GcPauseMs);
 }

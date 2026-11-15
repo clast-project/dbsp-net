@@ -233,10 +233,28 @@ public sealed class ParallelCircuit : IDisposable
                     WaitMs = a.WaitMs + s.WaitMs,
                     SplitRows = a.SplitRows + s.SplitRows,
                     GatherRows = a.GatherRows + s.GatherRows,
+                    GcPauseMs = a.GcPauseMs + s.GcPauseMs,
+                    Phases = SumPhases(a.Phases, s.Phases),
                     RetainedRows = a.RetainedRows < 0 ? a.RetainedRows : a.RetainedRows + s.RetainedRows,
                     LastOutputRows = a.LastOutputRows < 0 ? a.LastOutputRows : a.LastOutputRows + s.LastOutputRows,
                 };
             }
+        }
+
+        return sum;
+    }
+
+    private static IReadOnlyList<PhaseCost>? SumPhases(IReadOnlyList<PhaseCost>? a, IReadOnlyList<PhaseCost>? b)
+    {
+        if (a is null || b is null)
+        {
+            return a ?? b;
+        }
+
+        var sum = new PhaseCost[Math.Max(a.Count, b.Count)];
+        for (var p = 0; p < sum.Length; p++)
+        {
+            sum[p] = (p < a.Count ? a[p] : default) + (p < b.Count ? b[p] : default);
         }
 
         return sum;

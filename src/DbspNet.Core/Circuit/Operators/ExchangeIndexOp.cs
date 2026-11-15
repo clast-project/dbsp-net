@@ -60,6 +60,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         var workers = _workers;
         var profile = StepProfiler.Active;
         var t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+        var mark = profile ? StepProfiler.PhaseMark.Now() : default;
 
         // Split this shard's rows into one append-only bucket per destination —
         // the input is a Z-set so its keys are distinct, so a bucket never
@@ -100,6 +101,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         {
             var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordSplit(_worker, t1 - t0, splitRows);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Split, ref mark);
             t0 = t1;
         }
 
@@ -109,6 +111,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
         {
             var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordWait(_worker, t2 - t0);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Wait, ref mark);
             t0 = t2;
         }
 
@@ -132,6 +135,7 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
             if (profile)
             {
                 StepProfiler.RecordGather(_worker, System.Diagnostics.Stopwatch.GetTimestamp() - t0, gatherRows);
+                StepProfiler.RecordPhase(StepProfiler.XPhase.Gather, ref mark);
             }
 
             return;
@@ -173,12 +177,15 @@ internal sealed class ExchangeIndexOp<TKey, TRow, TWeight> : IOperator
             }
         }
 
+        var build = profile ? StepProfiler.PhaseMark.Now() : default;
         _output.SetCurrent(indexed.Build());
 
         if (profile)
         {
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Build, ref build);
             var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
             StepProfiler.RecordGather(_worker, t3 - t0, gatherRows);
+            StepProfiler.RecordPhase(StepProfiler.XPhase.Gather, ref mark);
         }
     }
 }

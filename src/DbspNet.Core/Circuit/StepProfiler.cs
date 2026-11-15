@@ -55,6 +55,13 @@ internal static class StepProfiler
         public readonly long[] WaitTicks = new long[operators];
         public readonly long[] SplitRows = new long[operators];
         public readonly long[] GatherRows = new long[operators];
+
+        /// <summary>Per-operator exchange phase costs, <see cref="XPhases"/> slots per operator
+        /// (<c>[op * XPhases + phase]</c>): Stopwatch ticks, bytes allocated on this thread, and
+        /// GC pause (TimeSpan ticks) that elapsed inside the phase.</summary>
+        public readonly long[] PhaseTicks = new long[operators * XPhases];
+        public readonly long[] PhaseAlloc = new long[operators * XPhases];
+        public readonly long[] PhasePause = new long[operators * XPhases];
         public int Index;
 
         public void Clear()
@@ -62,6 +69,63 @@ internal static class StepProfiler
             Array.Clear(WaitTicks);
             Array.Clear(SplitRows);
             Array.Clear(GatherRows);
+            Array.Clear(PhaseTicks);
+            Array.Clear(PhaseAlloc);
+            Array.Clear(PhasePause);
+        }
+    }
+
+    /// <summary>Exchange sub-phases recorded per operator for the operator profile (docs/ivm-bench-gap-analysis.md,
+    /// exchange decomposition). <see cref="Split"/>, <see cref="Wait"/> and <see cref="Gather"/> partition the
+    /// operator's step; <see cref="Map"/> (the fused pre-step) is part of <see cref="Split"/>, and <see cref="Key"/>
+    /// (the gather's key projection) and <see cref="Build"/> (the gather's final index build) are parts of
+    /// <see cref="Gather"/>. <see cref="Map"/> and <see cref="Key"/> are timed per row, so they are recorded only
+    /// under <see cref="PhaseDetail"/>.</summary>
+    internal enum XPhase
+    {
+        Map = 0,
+        Split = 1,
+        Wait = 2,
+        Key = 3,
+        Gather = 4,
+        Build = 5,
+    }
+
+    internal const int XPhases = 6;
+
+    /// <summary>Time the per-row sub-phases (<see cref="XPhase.Map"/>, <see cref="XPhase.Key"/>) as well:
+    /// <c>DBSPNET_PROFILE_XPHASE=1</c>. Adds a few timer reads per row, which land in the enclosing phase.</summary>
+    internal static readonly bool PhaseDetail = Environment.GetEnvironmentVariable("DBSPNET_PROFILE_XPHASE") == "1";
+
+    /// <summary>A phase start: timestamp, this thread's allocated bytes, and the process's total GC pause.</summary>
+    internal readonly struct PhaseMark(long ticks, long alloc, long pause)
+    {
+        public readonly long Ticks = ticks;
+        public readonly long Alloc = alloc;
+        public readonly long Pause = pause;
+
+        public static PhaseMark Now() =>
+            new(Stopwatch.GetTimestamp(), GC.GetAllocatedBytesForCurrentThread(), GC.GetTotalPauseDuration().Ticks);
+    }
+
+    /// <summary>Charge the time since <paramref name="since"/> to <paramref name="phase"/> of the profiled
+    /// operator on this thread (if any), and restart the mark.</summary>
+    internal static void RecordPhase(XPhase phase, ref PhaseMark since)
+    {
+        var now = PhaseMark.Now();
+        AddPhase(phase, now.Ticks - since.Ticks, now.Alloc - since.Alloc, now.Pause - since.Pause);
+        since = now;
+    }
+
+    /// <summary>Add raw totals (accumulated by a per-row loop) to <paramref name="phase"/>.</summary>
+    internal static void AddPhase(XPhase phase, long ticks, long alloc, long pause)
+    {
+        if (_operator is { } op)
+        {
+            var at = (op.Index * XPhases) + (int)phase;
+            op.PhaseTicks[at] += ticks;
+            op.PhaseAlloc[at] += alloc;
+            op.PhasePause[at] += pause;
         }
     }
 
