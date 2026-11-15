@@ -69,6 +69,9 @@ public sealed class ProgramRunner
     private readonly Stopwatch _sinceSnapshot = new();
     private readonly BatchProfile? _profile = ProfileEnabled ? new BatchProfile() : null;
 
+    // The logical clock's source; read only when the program has a NOW() temporal filter.
+    private readonly ProgramClock _clock;
+
     private ProgramRunner(
         RunnerProgram program,
         CompiledProgram? serial,
@@ -76,9 +79,11 @@ public sealed class ProgramRunner
         List<InputBinding> inputs,
         List<(IOutputConnector, RunnerOutput)> outputs,
         object? checkpoint,
-        CheckpointPolicy? policy)
+        CheckpointPolicy? policy,
+        ProgramClock? clock)
     {
         _program = program;
+        _clock = clock ?? ProgramClock.Default;
         Program = serial;
         ParallelProgram = parallel;
         _inputs = inputs;
@@ -112,6 +117,9 @@ public sealed class ProgramRunner
     /// <summary>The data-parallel program this runner drives, or <c>null</c> when it
     /// drives a serial <see cref="Program"/>.</summary>
     public ParallelCompiledProgram? ParallelProgram { get; }
+
+    /// <summary>Where the runner takes <c>NOW()</c> from; see <see cref="ProgramClock"/>.</summary>
+    public ProgramClock Clock => _clock;
 
     /// <summary>The worker count W (1 for a serial program).</summary>
     public int Workers => ParallelProgram?.Workers ?? 1;
@@ -150,12 +158,13 @@ public sealed class ProgramRunner
         IReadOnlyList<IOutputConnector> outputs,
         ICheckpointStore? checkpoint = null,
         CheckpointPolicy? policy = null,
+        ProgramClock? clock = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
         var runnerProgram = RunnerProgram.Of(program);
         var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
-        return new ProgramRunner(runnerProgram, program, null, ins, outs, checkpoint, policy);
+        return new ProgramRunner(runnerProgram, program, null, ins, outs, checkpoint, policy, clock);
     }
 
     /// <summary>
@@ -173,12 +182,13 @@ public sealed class ProgramRunner
         IReadOnlyList<IOutputConnector> outputs,
         IParallelCheckpointStore? checkpoint = null,
         CheckpointPolicy? policy = null,
+        ProgramClock? clock = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(program);
         var runnerProgram = RunnerProgram.Of(program);
         var (ins, outs) = await BindAsync(runnerProgram, inputs, outputs, cancellationToken).ConfigureAwait(false);
-        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint, policy);
+        return new ProgramRunner(runnerProgram, null, program, ins, outs, checkpoint, policy, clock);
     }
 
     private static async ValueTask<(List<InputBinding>, List<(IOutputConnector, RunnerOutput)>)> BindAsync(
@@ -270,6 +280,25 @@ public sealed class ProgramRunner
     {
         foreach (var t in ticks)
         {
+            // The clock the tick first ran at: replaying it makes a NOW() view's ticks exact.
+            if (t.Clock is { } clock && clock != _program.LogicalTime)
+            {
+                _program.AdvanceClock(clock);
+            }
+
+            if (t.Source is null)
+            {
+                // A clock-only tick: no source was read.
+                _program.Step();
+                if (_program.TickCount != t.Tick)
+                {
+                    throw new InvalidDataException(
+                        $"replay reached tick {_program.TickCount} where the journal recorded tick {t.Tick}");
+                }
+
+                continue;
+            }
+
             var b = Binding(t.Source, "the tick journal");
             var batch = await b.Connector.NextAsync(b.Cursor, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidDataException(
@@ -431,6 +460,7 @@ public sealed class ProgramRunner
                     _profile.Source(b.Connector.Name).Add(ingestTicks - pushTicks, pushTicks, rows);
                 }
 
+                var clock = AdvanceClockForStep();
                 var stepStart = _profile is null && !TickTimes ? 0 : Stopwatch.GetTimestamp();
                 _program.Step();
                 if (_profile is not null)
@@ -450,7 +480,7 @@ public sealed class ProgramRunner
                 b.Cursor = batch.Offset;
                 if (_policy.Journal && _checkpoint is not null)
                 {
-                    _pendingTicks.Add(new JournalTick(_program.TickCount, b.Connector.Name, batch.Offset.Serialize()));
+                    _pendingTicks.Add(new JournalTick(_program.TickCount, b.Connector.Name, batch.Offset.Serialize(), clock));
                 }
 
                 // After the cursor moves, so a hook may checkpoint mid-batch (§5.30's restart point).
@@ -462,7 +492,49 @@ public sealed class ProgramRunner
         }
         while (progressed);
 
+        // A clock-only tick (docs/design-program-temporal.md §2 Q1): when time has moved since the
+        // last step, step once more with no input, so this batch's output shows NOW() as of its end,
+        // retractions of rows that aged out included. Feldera steps on a timer for the same reason.
+        if (_program.UsesClock)
+        {
+            var current = _program.LogicalTime;
+            var sample = _clock.Sample();
+            if (current == long.MinValue || sample > current)
+            {
+                _program.AdvanceClock(sample);
+                _program.Step();
+                AccumulateIncrementalChanges();
+                if (_policy.Journal && _checkpoint is not null)
+                {
+                    _pendingTicks.Add(new JournalTick(_program.TickCount, null, null, sample));
+                }
+
+                AfterTick?.Invoke(ticks);
+                ticks++;
+            }
+        }
+
         return ticks;
+    }
+
+    /// <summary>Before a step of a program that reads <c>NOW()</c>: advance the clock to the larger
+    /// of a fresh sample and its current value, and return it; null (and no sample) otherwise.</summary>
+    private long? AdvanceClockForStep()
+    {
+        if (!_program.UsesClock)
+        {
+            return null;
+        }
+
+        var current = _program.LogicalTime;
+        var sample = _clock.Sample();
+        if (current == long.MinValue || sample > current)
+        {
+            _program.AdvanceClock(sample);
+            return sample;
+        }
+
+        return current;
     }
 
     /// <summary>Write every output view's full current contents to its sink (truncate).

@@ -8,8 +8,15 @@ using DbspNet.Core.IO;
 namespace DbspNet.Persistence;
 
 /// <summary>One engine tick in the journal: the source it consumed and that source's cursor
-/// (serialized offset) after it.</summary>
-public sealed record JournalTick(long Tick, string Source, string Offset);
+/// (serialized offset) after it, and, for a program that reads <c>NOW()</c>, the logical clock
+/// the tick ran at (docs/design-program-temporal.md §2 Q1). A clock-only tick consumed no source:
+/// <see cref="Source"/> and <see cref="Offset"/> are null. <see cref="Clock"/> is omitted when the
+/// program does not read the clock, so such a journal is unchanged.</summary>
+public sealed record JournalTick(
+    long Tick,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Source,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Offset,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? Clock = null);
 
 /// <summary>
 /// The per-batch commit of the A2 checkpoint policy (docs/design-durable-state.md §1c): which

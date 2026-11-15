@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Collections.Generic;
+using System.Linq;
 using DbspNet.Core.Algebra;
 using DbspNet.Core.Circuit;
 using DbspNet.Core.Collections;
@@ -40,6 +41,23 @@ public sealed class CompiledProgram : ICompiledCircuit
 
     /// <summary>Commit queued input deltas and fire the whole circuit one tick.</summary>
     public void Step() => Circuit.Step();
+
+    /// <summary>
+    /// Advance the logical clock that <c>NOW()</c> reads, before the next <see cref="Step"/>
+    /// (microseconds since the epoch). Monotone non-decreasing; see <see cref="RootCircuit.AdvanceTime"/>.
+    /// A runner drives it from wall time (docs/design-program-temporal.md).
+    /// </summary>
+    public void AdvanceClock(long microsSinceEpoch) => Circuit.AdvanceTime(microsSinceEpoch);
+
+    /// <summary>The logical clock (<see cref="long.MinValue"/> until first advanced).</summary>
+    public long LogicalTime => Circuit.LogicalTime;
+
+    /// <summary>True when some view reads the clock (a temporal filter), so a driver must
+    /// advance it; a program without <c>NOW()</c> never needs to.</summary>
+    public bool UsesClock => _usesClock ??= Circuit.Operators.Any(
+        o => o is DbspNet.Core.Operators.Stateful.TemporalFilterOp<StructuralRow>);
+
+    private bool? _usesClock;
 
     public TableInput Table(string name) => Inputs[name];
 }

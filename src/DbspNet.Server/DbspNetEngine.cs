@@ -55,7 +55,15 @@ public sealed class DbspNetEngine
     private static readonly int WorkersSetting =
         int.TryParse(Environment.GetEnvironmentVariable("DBSPNET_WORKERS"), out var w) && w > 1 ? w : 1;
 
+    // DBSPNET_CLOCK_RESOLUTION_USECS: the granularity of the clock NOW() reads, in µs (default 1 s,
+    // Feldera's clock_resolution_usecs). See ProgramClock and docs/design-program-temporal.md.
+    private static readonly long ClockResolutionSetting =
+        long.TryParse(Environment.GetEnvironmentVariable("DBSPNET_CLOCK_RESOLUTION_USECS"), out var us) && us >= 1
+            ? us
+            : ProgramClock.DefaultResolutionMicros;
+
     private readonly int _workers;
+    private readonly ProgramClock _clock;
     private readonly CheckpointPolicy? _checkpointPolicy;
     private readonly long _broadcastMaxRows;
     private readonly IReadOnlyList<string> _broadcastViews;
@@ -84,10 +92,13 @@ public sealed class DbspNetEngine
     /// rows, or <c>DBSPNET_BROADCAST_MAX_ROWS</c> when it is null (<see cref="BroadcastJoins"/>). Inputs
     /// are read smallest first unless <paramref name="inputsBySize"/> is false, or, when it is null,
     /// <c>DBSPNET_INPUT_ORDER</c> is <c>spec</c> (<see cref="InputOrder"/>). <paramref name="broadcastViews"/>
-    /// (or <c>DBSPNET_BROADCAST_VIEWS</c> when null) names views to broadcast as small dimensions too.</summary>
+    /// (or <c>DBSPNET_BROADCAST_VIEWS</c> when null) names views to broadcast as small dimensions too.
+    /// <paramref name="clock"/> is where <c>NOW()</c> comes from: by default the wall clock at
+    /// <c>DBSPNET_CLOCK_RESOLUTION_USECS</c> (1 s when unset).</summary>
     public DbspNetEngine(int workers, CheckpointPolicy? checkpointPolicy = null, long? broadcastMaxRows = null, bool? inputsBySize = null,
-        IReadOnlyList<string>? broadcastViews = null)
+        IReadOnlyList<string>? broadcastViews = null, ProgramClock? clock = null)
     {
+        _clock = clock ?? new ProgramClock(TimeProvider.System, ClockResolutionSetting);
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(broadcastMaxRows ?? 0);
         _workers = workers;
@@ -257,9 +268,9 @@ public sealed class DbspNetEngine
         try
         {
             runner = parallel is not null
-                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, checkpoint, policy, cancellationToken)
+                ? await ProgramRunner.CreateAsync(parallel, inputs, outputs, checkpoint, policy, _clock, cancellationToken)
                     .ConfigureAwait(false)
-                : await ProgramRunner.CreateAsync(program!, inputs, outputs, checkpoint, policy, cancellationToken)
+                : await ProgramRunner.CreateAsync(program!, inputs, outputs, checkpoint, policy, _clock, cancellationToken)
                     .ConfigureAwait(false);
         }
         catch

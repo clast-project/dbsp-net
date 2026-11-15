@@ -70,6 +70,31 @@ internal static class ArrowTestData
                     return b.Build();
                 }
 
+            case TimestampType ts:
+                {
+                    // Microseconds since the epoch, given as a DbspNet Timestamp or a raw long.
+                    var b = new TimestampArray.Builder(ts);
+                    foreach (var r in rows)
+                    {
+                        var micros = r[c] switch
+                        {
+                            null => (long?)null,
+                            DbspNet.Sql.TypeSystem.Timestamp t => t.Microseconds,
+                            var v => Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture),
+                        };
+                        if (micros is { } us)
+                        {
+                            b.Append(DateTimeOffset.UnixEpoch.AddTicks(us * 10));
+                        }
+                        else
+                        {
+                            b.AppendNull();
+                        }
+                    }
+
+                    return b.Build();
+                }
+
             default:
                 throw new NotSupportedException($"ArrowTestData does not build {type.Name} columns");
         }

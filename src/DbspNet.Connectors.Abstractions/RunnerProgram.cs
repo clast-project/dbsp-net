@@ -38,6 +38,14 @@ internal abstract class RunnerProgram
 
     public abstract void Step();
 
+    /// <summary>True when the program reads the logical clock (a <c>NOW()</c> temporal filter).</summary>
+    public abstract bool UsesClock { get; }
+
+    /// <summary>The logical clock, <see cref="long.MinValue"/> until first advanced.</summary>
+    public abstract long LogicalTime { get; }
+
+    public abstract void AdvanceClock(long microsSinceEpoch);
+
     /// <summary>Every output view the program materialises (bound to a connector or not)
     /// and its current distinct-row count.</summary>
     public abstract IEnumerable<KeyValuePair<string, long>> ViewRowCounts();
@@ -80,6 +88,12 @@ internal abstract class RunnerProgram
 
         public override void Step() => program.Step();
 
+        public override bool UsesClock => program.UsesClock;
+
+        public override long LogicalTime => program.LogicalTime;
+
+        public override void AdvanceClock(long microsSinceEpoch) => program.AdvanceClock(microsSinceEpoch);
+
         public override IEnumerable<KeyValuePair<string, long>> ViewRowCounts() =>
             program.Outputs.Select(kv => KeyValuePair.Create(kv.Key, kv.Value.RowCount));
 
@@ -118,6 +132,12 @@ internal abstract class RunnerProgram
         }
 
         public override void Step() => program.Step();
+
+        public override bool UsesClock => program.UsesClock;
+
+        public override long LogicalTime => program.LogicalTime;
+
+        public override void AdvanceClock(long microsSinceEpoch) => program.AdvanceClock(microsSinceEpoch);
 
         // Kept current per tick from the deltas once first read (ParallelProgramOutput.RowCount),
         // not formed from the W replica integrals on every read.

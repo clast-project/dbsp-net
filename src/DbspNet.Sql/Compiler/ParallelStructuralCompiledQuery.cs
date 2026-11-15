@@ -114,6 +114,22 @@ public sealed class ParallelCompiledProgram : IDisposable
     public ShardedTableInput Table(string name) => Inputs[name];
 
     /// <summary>
+    /// Advance the logical clock that <c>NOW()</c> reads, on every replica, before the next
+    /// <see cref="Step"/>. Monotone non-decreasing; see <see cref="ParallelCircuit.AdvanceTime"/>.
+    /// </summary>
+    public void AdvanceClock(long microsSinceEpoch) => Circuit.AdvanceTime(microsSinceEpoch);
+
+    /// <summary>The logical clock (<see cref="long.MinValue"/> until first advanced).</summary>
+    public long LogicalTime => Circuit.LogicalTime;
+
+    /// <summary>True when some view reads the clock (a temporal filter); see
+    /// <see cref="CompiledProgram.UsesClock"/>.</summary>
+    public bool UsesClock => _usesClock ??= Circuit.Replicas[0].Operators.Any(
+        o => o is DbspNet.Core.Operators.Stateful.TemporalFilterOp<StructuralRow>);
+
+    private bool? _usesClock;
+
+    /// <summary>
     /// Commit queued input deltas and fire the whole circuit one tick. Output views
     /// are integrated in-circuit, per replica (§10.4), so there is no driver-side
     /// per-tick view work here.
