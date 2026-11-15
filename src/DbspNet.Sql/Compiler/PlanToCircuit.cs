@@ -343,6 +343,7 @@ public static partial class PlanToCircuit
     {
         ArgumentNullException.ThrowIfNull(tables);
         ArgumentNullException.ThrowIfNull(views);
+        ProgramLatenessMode.Check(tables);
         options ??= CompileOptions.Default;
         var codec = StructuralRowCodec.Instance;
         var typedViews = new List<string>();
@@ -442,9 +443,9 @@ public static partial class PlanToCircuit
                     streams[t.TableName] = stream;
                     schemas[t.TableName] = t.Schema;
 
-                    // NOTE (Phase A): declared LATENESS is not enforced across the program
-                    // yet — state is unbounded (sound, just not GC'd), as for unpartitioned
-                    // ranks. Cross-view frontier wiring is a follow-on.
+                    // Declared LATENESS is not enforced across the program (no late-row drop,
+                    // no GC), so ProgramLatenessMode.Check rejects it above unless
+                    // DBSPNET_PROGRAM_LATENESS=ignore. Cross-view frontier wiring: issue #3.
                 }
 
                 foreach (var v in views)
@@ -587,6 +588,7 @@ public static partial class PlanToCircuit
         ArgumentNullException.ThrowIfNull(tables);
         ArgumentNullException.ThrowIfNull(views);
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
+        ProgramLatenessMode.Check(tables);
         compiled = null;
         options ??= CompileOptions.Default;
         var codec = StructuralRowCodec.Instance;

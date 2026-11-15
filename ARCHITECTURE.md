@@ -312,8 +312,9 @@ A column declared `LATENESS d` promises that no future value falls more than
   each batch's min/max key range.
 
 Two limits apply. `LATENESS` forces the structural compile. The program path,
-serial or parallel, accepts `LATENESS` but ignores it: late rows are not dropped
-and no state is collected. The single-query parallel path refuses `LATENESS` and
+serial or parallel, does not enforce `LATENESS` (no late-row drop, no GC), so it
+rejects a declaration (`ProgramLatenessMode`; `DBSPNET_PROGRAM_LATENESS=ignore`
+compiles with it ignored). The single-query parallel path refuses `LATENESS` and
 falls back to serial
 ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
 

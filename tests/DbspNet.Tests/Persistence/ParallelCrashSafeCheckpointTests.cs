@@ -196,13 +196,14 @@ public class ParallelCrashSafeCheckpointTests
     }
 
     // The operators the parallel restore tests did not reach (inventory brief §6): partitioned
-    // top-K, rank, window aggregates and offsets, and a LATENESS-bounded aggregate (per-worker
-    // maxSeen), alongside a join re-keyed by an aggregate.
+    // top-K, rank, window aggregates and offsets, and an aggregate over a second table, alongside a
+    // join re-keyed by an aggregate. (`e` used to declare LATENESS, but the program path never
+    // enforced it, and now rejects it: issue #3.)
     private static readonly string[] WideSql =
     [
         "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)",
         "CREATE TABLE u (a INT NOT NULL, c INT NOT NULL)",
-        "CREATE TABLE e (ts BIGINT NOT NULL LATENESS 5, g INT NOT NULL, v INT NOT NULL)",
+        "CREATE TABLE e (ts BIGINT NOT NULL, g INT NOT NULL, v INT NOT NULL)",
         "CREATE VIEW by_c AS SELECT u.c, SUM(t.b) AS s FROM t JOIN u ON t.a = u.a GROUP BY u.c",
         "CREATE VIEW top2 AS SELECT a, b FROM (" +
         "  SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC) AS rn FROM t) s WHERE rn <= 2",
