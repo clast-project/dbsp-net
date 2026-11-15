@@ -17,8 +17,9 @@ namespace DbspNet.Tests.Persistence;
 /// explicit <see cref="ITableFileSystem"/> reference (no string-path
 /// convenience). Proves the abstraction is the load-bearing surface,
 /// and that the persistence layer's behaviour is identical regardless
-/// of the backing impl. Per-impl contract conformance lives in
-/// <see cref="BlobStoreContractTests"/>.
+/// of the backing impl. (There is no separate per-store contract suite;
+/// a new <see cref="ITableFileSystem"/> should pass these scenarios and
+/// the crash matrices in <c>CrashSafeCheckpointTests</c>.)
 /// </summary>
 public class BlobStoreTests : IDisposable
 {
@@ -91,8 +92,7 @@ public class BlobStoreTests : IDisposable
         // Identical scenario to the local case, but backed by
         // InMemoryTableFileSystem — proves Snapshot doesn't accidentally rely
         // on filesystem semantics. This is the cloud-parity smoke
-        // test: any cloud impl that satisfies BlobStoreContractTests
-        // will also pass this.
+        // test for object-store-shaped backends.
         var fs = new InMemoryTableFileSystem();
 
         var producerOp = new CounterOp { Value = 42 };

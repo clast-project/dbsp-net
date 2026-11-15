@@ -110,12 +110,11 @@ public sealed class DeltaOutputConnector : IOutputConnector, IBlockOutputConnect
             tableArrow = dataArrow;
         }
 
-        // engineered-wood's ParquetWriteOptions.OmitPathInSchema defaults to true, which
-        // drops the ColumnMetaData.path_in_schema field (required by the Parquet spec). The
-        // thrift-generated readers in Apache Arrow / DuckDB / pyarrow enforce it and reject
-        // such files with "TProtocolException: Invalid data". Force it on so DbspNet's output
-        // is readable by standard tooling (the correctness-comparison harness, downstream
-        // consumers).
+        // Pin ParquetWriteOptions.OmitPathInSchema = false explicitly. Early engineered-wood
+        // builds defaulted it to true (the 0.4.0 package defaults to false), which drops
+        // ColumnMetaData.path_in_schema, a field the Parquet spec requires. Arrow, DuckDB and
+        // pyarrow then reject the file with "TProtocolException: Invalid data". Kept explicit
+        // so DbspNet's output stays readable whatever a future package default is.
         // EWPARQUET0002: OmitPathInSchema is marked [Experimental] in the released
         // package. Our use is deliberate and covered by the read-back tests — suppress
         // the experimental diagnostic for this one line rather than project-wide.
