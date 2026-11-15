@@ -5572,3 +5572,35 @@ file block must be under 85,000 bytes and the giant must span several, before an
 restore. Mutants caught: the 16 MiB default (a 108,992-byte block at tick 1), and the writer ignoring
 the cap (`Capped` passing every piece whole).
 Suites: default, forced and forced+critical, 3,769 passed each.
+
+#### 5.59.7 Measured: five reliability runs (2026-11-14)
+
+xt25cap1–5: a clean build of 81d352f (`~/xtpcds/bin-spancap`), batch 1 at the reporter's settings
+(STEP_SPILL_ROWS 262,144, MEMORY_LIMIT_MIB 49,152, W=12, 48 GiB heap), **regions GC**, no cap override,
+with the GC timeline and `XT_LOH_PROFILE=10` on. Run back to back.
+
+| | old cap (16 MiB), regions | xt25cap1–5 (80,000 B), regions |
+|---|---|---|
+| batch 1 completed | 3 of 6 (ila3, ila3q, upk; ila3p, tw, loh1 failed at the site) | **5 of 5** |
+| large block loads | 47,240 in tick 18 (loh1) | **0** in every run |
+| 96 views' `model_rows` | — | identical to xt25tws in all five |
+| drain (ticks 0–18) | 2,550–2,606 s | 2,683–2,692 s (+3–5%) |
+| tick 18 step | 1,751–1,781 s (GC pause 452–471 s) | 1,836–1,857 s (GC pause 428–448 s) |
+| ticks 0–17 step | 514–532 s | 543–555 s |
+| spill at the end | 86–89 GB | 99–101 GB |
+
+At a 50% failure rate, five passes in a row would happen by chance 3% of the time. The deterministic
+check, zero large block loads, held in all five.
+
+**The batch totals are not comparable.** The old passes ran on 86d0ce1, before §5.58. There the first `/wait`
+read at the end of batch 1 also did the distinct row-count upkeep, ~120 s after the drain. The new runs'
+`duration_s` (2,718–2,767 s) therefore matches the old ones' (2,711–2,767) only by that coincidence. The drain
+is the fair figure, and it is 3–5% slower.
+
+Tick 18's GC pause *fell* by 20–40 s, so the extra ~80 s there is mutator time. That is consistent with a
+giant group's span now being read as ~270 60,000-byte blocks instead of one: more header parses, cache
+lookups and k-way-walk steps per group. Spill grows ~12% because each span block now carries its own header and
+compresses alone. Two things confound the step-time comparison: the new runs had the LOH-profile
+EventListener on (Verbose GC events) and the old ones didn't, and the binaries differ (86d0ce1 vs 81d352f).
+A paired A/B (xt25abo/abn 1–2: same binary, segments GC so the old-cap arm doesn't fail, no profiling,
+interleaved, only `DBSPNET_RUN_SPAN_BLOCK_BYTES` differs) separates them; results below when it lands.
