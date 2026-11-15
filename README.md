@@ -186,11 +186,10 @@ The full list is in [`docs/skipped.md`](docs/skipped.md).
 - `CURRENT_TIME`, which is rejected because it wraps at midnight.
 - DML, transactions, `ALTER`, `CREATE INDEX` and bind parameters. Data enters
   through `Table(...).Push` or connectors.
-- `LATENESS` on the program path (`SqlProgram`, which the server uses). The
-  program path doesn't enforce it yet, so a program that declares it is
-  rejected ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
-  `DBSPNET_PROGRAM_LATENESS=ignore` compiles it anyway with the declaration
-  ignored. Only the single-query path enforces `LATENESS`.
+- `LATENESS` on the *parallel* paths. A program or query that declares it
+  compiles serially: the parallel compile refuses it and reports it as a
+  blocker, because workers don't share a frontier yet
+  ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
 
 ## Engine
 

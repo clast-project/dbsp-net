@@ -39,11 +39,20 @@ internal sealed record MonotoneColumn(IReadOnlySet<LatenessSource> Sources, Func
 public sealed class MonotonicityInfo
 {
     private readonly Dictionary<LogicalPlan, MonotoneColumn?[]> _byNode;
+    private readonly LogicalPlan _root;
 
-    internal MonotonicityInfo(Dictionary<LogicalPlan, MonotoneColumn?[]> byNode)
+    internal MonotonicityInfo(Dictionary<LogicalPlan, MonotoneColumn?[]> byNode, LogicalPlan root)
     {
         _byNode = byNode;
+        _root = root;
     }
+
+    /// <summary>
+    /// The verdicts for the analyzed plan's output columns — what a program view
+    /// exports to the views that scan it (<see cref="MonotonicityAnalyzer.Analyze(LogicalPlan, IReadOnlyDictionary{string, MonotoneColumn?[]}?, IReadOnlyDictionary{string, LogicalPlan}?)"/>).
+    /// </summary>
+    internal MonotoneColumn?[] RootColumns =>
+        _byNode.TryGetValue(_root, out var cols) ? cols : new MonotoneColumn?[_root.Schema.Count];
 
     private MonotoneColumn? Get(LogicalPlan node, int column)
     {
@@ -87,17 +96,50 @@ public sealed class MonotonicityInfo
 /// </remarks>
 public static class MonotonicityAnalyzer
 {
-    public static MonotonicityInfo Analyze(LogicalPlan plan)
+    public static MonotonicityInfo Analyze(LogicalPlan plan) => Analyze(plan, null, null);
+
+    /// <summary>
+    /// Program-path analysis (issue #3). <paramref name="viewColumns"/> seeds a scan of an
+    /// already-compiled view with that view's root verdicts (<see cref="MonotonicityInfo.RootColumns"/>),
+    /// so monotonicity — and the base-table <see cref="LatenessSource"/>s behind it — crosses
+    /// view boundaries exactly as if the view were written inline. <paramref name="inlineViews"/>
+    /// are the single-use views the compiler builds in place of their reference; a scan of one
+    /// is analyzed through its body (like a CTE), so the body's own stateful operators, which
+    /// compile under the consumer's analysis, get verdicts too.
+    /// </summary>
+    internal static MonotonicityInfo Analyze(
+        LogicalPlan plan,
+        IReadOnlyDictionary<string, MonotoneColumn?[]>? viewColumns,
+        IReadOnlyDictionary<string, LogicalPlan>? inlineViews)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        var memo = new Dictionary<LogicalPlan, MonotoneColumn?[]>(ReferenceEqualityComparer.Instance);
+        var memo = new AnalysisMemo(viewColumns, inlineViews);
         Visit(plan, memo);
-        return new MonotonicityInfo(memo);
+        return new MonotonicityInfo(memo.ByNode, plan);
+    }
+
+    /// <summary>The memo plus the program-path seeds, threaded through the walk.</summary>
+    internal sealed class AnalysisMemo(
+        IReadOnlyDictionary<string, MonotoneColumn?[]>? viewColumns,
+        IReadOnlyDictionary<string, LogicalPlan>? inlineViews)
+    {
+        public Dictionary<LogicalPlan, MonotoneColumn?[]> ByNode { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public IReadOnlyDictionary<string, MonotoneColumn?[]>? ViewColumns { get; } = viewColumns;
+
+        public IReadOnlyDictionary<string, LogicalPlan>? InlineViews { get; } = inlineViews;
+
+        public bool TryGetValue(LogicalPlan node, out MonotoneColumn?[] cols) => ByNode.TryGetValue(node, out cols!);
+
+        public MonotoneColumn?[] this[LogicalPlan node]
+        {
+            set => ByNode[node] = value;
+        }
     }
 
     private static MonotoneColumn?[] Visit(
         LogicalPlan node,
-        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
+        AnalysisMemo memo)
     {
         if (memo.TryGetValue(node, out var cached))
         {
@@ -111,10 +153,20 @@ public static class MonotonicityAnalyzer
 
     private static MonotoneColumn?[] Compute(
         LogicalPlan node,
-        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
+        AnalysisMemo memo)
     {
         switch (node)
         {
+            // A single-use view compiled in place: analyze its body, as for a CTE.
+            case ScanPlan s when memo.InlineViews is { } inl && inl.TryGetValue(s.TableName, out var body):
+                return ResizeTo(Visit(body, memo), s.Schema.Count);
+
+            // A scan of an already-compiled view: that view's output verdicts. The view's stream
+            // is the same delta stream its body would produce inline, so its root verdicts hold
+            // here unchanged (the sources are base-table LATENESS columns, shared program-wide).
+            case ScanPlan s when memo.ViewColumns is { } vc && vc.TryGetValue(s.TableName, out var seeded):
+                return ResizeTo(seeded, s.Schema.Count);
+
             case ScanPlan s:
             {
                 var cols = new MonotoneColumn?[s.Schema.Count];
@@ -354,7 +406,7 @@ public static class MonotonicityAnalyzer
 
     private static MonotoneColumn?[] ComputeJoin(
         JoinPlan j,
-        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
+        AnalysisMemo memo)
     {
         var left = Visit(j.Left, memo);
         var right = Visit(j.Right, memo);
@@ -417,7 +469,7 @@ public static class MonotonicityAnalyzer
 
     private static MonotoneColumn?[] ComputeUnion(
         UnionAllPlan u,
-        Dictionary<LogicalPlan, MonotoneColumn?[]> memo)
+        AnalysisMemo memo)
     {
         var branches = u.Branches.Select(b => Visit(b, memo)).ToList();
         var cols = new MonotoneColumn?[u.Schema.Count];

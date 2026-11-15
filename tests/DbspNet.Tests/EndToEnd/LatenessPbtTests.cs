@@ -151,7 +151,7 @@ public class LatenessPbtTests
     /// <c>maxSeen</c> then advances on the tick's admitted rows. Per-table, since
     /// each scanned table has its own frontier source.
     /// </summary>
-    private static List<InputEvent> SimulateAdmit(
+    internal static List<InputEvent> SimulateAdmit(
         IReadOnlyList<IReadOnlyList<InputEvent>> ticks, long lateness)
     {
         var admitted = new List<InputEvent>();

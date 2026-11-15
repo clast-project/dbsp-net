@@ -311,12 +311,21 @@ A column declared `LATENESS d` promises that no future value falls more than
   when the key is monotone on both sides. Spine batches GC per batch, using
   each batch's min/max key range.
 
-Two limits apply. `LATENESS` forces the structural compile. The program path,
-serial or parallel, does not enforce `LATENESS` (no late-row drop, no GC), so it
-rejects a declaration (`ProgramLatenessMode`; `DBSPNET_PROGRAM_LATENESS=ignore`
-compiles with it ignored). The single-query parallel path refuses `LATENESS` and
-falls back to serial
-([#3](https://github.com/clast-project/dbsp-net/issues/3)).
+**Programs.** On the serial program path (`CompileProgram`), each declared
+column gets one `EnforceLateness` on the shared table stream, so every view sees
+the same late-row drop, and one frontier shared by the whole program. Each view
+exports its output-column verdicts (`MonotonicityInfo.RootColumns`). A view
+that scans it is analyzed with those verdicts as the scan's seed, and a
+single-use view inlined into its consumer is analyzed through its body, like a
+CTE. Monotonicity therefore crosses view boundaries exactly as if the views
+were written inline, and the sources stay base-table columns.
+
+Limits: `LATENESS` forces the structural compile on the single-query path. A
+typed program view (`TypeEligibleProgramViews`, off by default) compiles
+without GC, which is sound but unbounded. Both parallel paths refuse `LATENESS`
+(a `ParallelBlockers` entry), so callers fall back to serial: each worker would
+otherwise drop late rows against its own shard's max rather than the global
+one ([#3](https://github.com/clast-project/dbsp-net/issues/3)).
 
 ### Temporal filters (`NOW()`)
 

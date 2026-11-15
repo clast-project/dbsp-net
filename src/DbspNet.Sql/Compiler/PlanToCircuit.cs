@@ -343,7 +343,6 @@ public static partial class PlanToCircuit
     {
         ArgumentNullException.ThrowIfNull(tables);
         ArgumentNullException.ThrowIfNull(views);
-        ProgramLatenessMode.Check(tables);
         options ??= CompileOptions.Default;
         var codec = StructuralRowCodec.Instance;
         var typedViews = new List<string>();
@@ -416,8 +415,9 @@ public static partial class PlanToCircuit
         Dictionary<string, TableInput>? inputs = null;
         Dictionary<string, ProgramOutput>? outputs = null;
 
-        var emptyFrontiers = (IReadOnlyDictionary<LatenessSource, IFrontier>)
-            new Dictionary<LatenessSource, IFrontier>();
+        // One frontier per declared LATENESS column, shared program-wide: every view that
+        // (transitively) reads the column GCs against the same frontier (issue #3).
+        var frontiers = new Dictionary<LatenessSource, IFrontier>();
         var emptyShareable = (IReadOnlySet<ArrangementKey>)
             System.Collections.Immutable.ImmutableHashSet<ArrangementKey>.Empty;
 
@@ -440,13 +440,30 @@ public static partial class PlanToCircuit
                 {
                     var (handle, stream) = builder.ZSetInput<StructuralRow, Z64>();
                     inputs[t.TableName] = new TableInput(handle, t.Schema, codec);
+
+                    // For each declared-LATENESS column, interpose an EnforceLateness operator
+                    // that drops late rows and advances the frontier downstream stateful
+                    // operators GC against — as CompileCore does. The shared table stream is
+                    // the enforced one, so every view sees the same late-row drop.
+                    for (var c = 0; c < t.Schema.Count; c++)
+                    {
+                        if (t.Schema.Columns[c].Lateness is { } bound)
+                        {
+                            var index = c;
+                            var frontier = new MutableFrontier();
+                            stream = builder.EnforceLateness(
+                                stream, row => MonotoneKey.Extract(row[index]), bound, frontier);
+                            frontiers[new LatenessSource(t.TableName, c)] = frontier;
+                        }
+                    }
+
                     streams[t.TableName] = stream;
                     schemas[t.TableName] = t.Schema;
-
-                    // Declared LATENESS is not enforced across the program (no late-row drop,
-                    // no GC), so ProgramLatenessMode.Check rejects it above unless
-                    // DBSPNET_PROGRAM_LATENESS=ignore. Cross-view frontier wiring: issue #3.
                 }
+
+                // Each compiled view's output-column monotonicity, so a view that scans it
+                // inherits the verdicts (and the base-table LATENESS sources behind them).
+                var viewMonotonicity = new Dictionary<string, MonotoneColumn?[]>(StringComparer.Ordinal);
 
                 foreach (var v in views)
                 {
@@ -486,9 +503,10 @@ public static partial class PlanToCircuit
                         continue;
                     }
 
-                    var monotonicity = MonotonicityAnalyzer.Analyze(optimizedQuery);
+                    var monotonicity = MonotonicityAnalyzer.Analyze(optimizedQuery, viewMonotonicity, inlineViews);
+                    viewMonotonicity[v.ViewName] = monotonicity.RootColumns;
                     var ctx = new CompileContext(
-                        streams, schemas, codec, snapshotCodecs, options, monotonicity, emptyFrontiers, emptyShareable)
+                        streams, schemas, codec, snapshotCodecs, options, monotonicity, frontiers, emptyShareable)
                     {
                         InlineViews = inlineViews,
                         SingleUseCtes = SingleUseCtes(optimizedQuery, inlineViews),
@@ -588,7 +606,6 @@ public static partial class PlanToCircuit
         ArgumentNullException.ThrowIfNull(tables);
         ArgumentNullException.ThrowIfNull(views);
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
-        ProgramLatenessMode.Check(tables);
         compiled = null;
         options ??= CompileOptions.Default;
         var codec = StructuralRowCodec.Instance;
@@ -969,6 +986,13 @@ public static partial class PlanToCircuit
 
         switch (plan)
         {
+            // The parallel path does not combine LATENESS frontiers across workers yet: each
+            // replica would drop late rows against its own shard's max, not the global one, so
+            // results would differ from the serial path. Refuse, so callers fall back to serial
+            // (issue #3).
+            case ScanPlan s when s.ColumnLateness is { Count: > 0 }:
+                return Block($"LATENESS on {s.TableName} (late rows and GC are not coordinated across workers yet)");
+
             case ScanPlan:
                 return true;
 
