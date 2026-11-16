@@ -1,0 +1,44 @@
+runs 7  engine step median 13177 ms (range 12728-13396)  alloc 62.63 GiB  GC pause median 6521 ms
+
+## by kind (median; ms summed over workers ex-GC; % step = ms/W/step)
+| kind | n | own ms | own % step | gc-in-op ms | alloc MiB | alloc % | map ms | split ms | wait ms | key ms | add ms | build ms |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `ExchangeIndexStepOp` | 62 | 11,472 | 7.3% | 9,688 | 7,338 | 11.4% | 0 | 5,393 | 6,454 | 0 | 5,558 | 424 |
+| `ExchangeIndexOp` | 11 | 3,081 | 1.9% | 1,760 | 1,592 | 2.5% | 0 | 1,401 | 1,641 | 0 | 1,658 | 68 |
+| `ExchangeStepOp` | 1 | 1,406 | 0.9% | 0 | 430 | 0.7% | 0 | 767 | 63 | 0 | 639 | 0 |
+| `ExchangeOp` | 50 | 1,331 | 0.8% | 510 | 736 | 1.1% | 0 | 721 | 5,377 | 0 | 609 | 0 |
+| `BroadcastExchangeOp` | 14 | 0 | 0.0% | 0 | 0 | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 |
+
+## by phase, all exchanges (median)
+| phase | ms ex-GC | % step | alloc MiB | % alloc |
+|---|--:|--:|--:|--:|
+| map | 0 | 0.0% | 0 | 0.0% |
+| split | 8,209 | 5.1% | 4,804 | 7.5% |
+| wait | 13,590 | 8.6% | 0 | 0.0% |
+| key | 0 | 0.0% | 0 | 0.0% |
+| add | 8,505 | 5.3% | 5,012 | 7.8% |
+| build | 497 | 0.3% | 281 | 0.4% |
+| **own (all but wait)** | 16,869 | 10.7% | 10,096 | 15.7% |
+| GC pause inside exchanges | 13,902 | 8.7% | | |
+
+## top sites by median own ex-GC (and by alloc)
+| op | kind | view | rows | own ms (min-max) | own % step | gc-in-op ms | alloc MiB | ns/row ex-GC | map | split | wait | key | add | build |
+|--:|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 235 | `ExchangeIndexOp` | `watches` | 1,106,447 | 2,218 (985-2,765) | 1.4% | 0 | 778 | 2,005 | 0/0 | 1,117/264 | 170/0 | 0/0 | 1,055/461 | 66/53 |
+| 169 | `ExchangeStepOp` | `trades` | 982,180 | 1,406 (1,013-1,507) | 0.9% | 0 | 430 | 1,432 | 0/0 | 767/409 | 63/0 | 0/0 | 639/21 | 0/0 |
+| 142 | `ExchangeIndexStepOp` | `trades_history` | 982,180 | 779 (744-1,192) | 0.5% | 0 | 256 | 793 | 0/0 | 407/27 | 78/0 | 0/0 | 347/208 | 29/21 |
+| 318 | `ExchangeIndexStepOp` | `fact_cash_balances` | 229,343 | 747 (717-761) | 0.5% | 0 | 201 | 3,257 | 0/0 | 454/84 | 154/0 | 0/0 | 271/103 | 15/14 |
+| 230 | `ExchangeIndexStepOp` | `watches_history` | 900,042 | 723 (524-1,523) | 0.5% | 0 | 209 | 803 | 0/0 | 114/27 | 190/0 | 0/0 | 608/182 | 0/0 |
+| 334 | `ExchangeIndexStepOp` | `fact_holdings` | 2,479,768 | 718 (672-779) | 0.5% | 4,819 | 1,062 | 290 | 0/0 | 386/619 | 131/0 | 0/0 | 328/442 | 0/0 |
+| 362 | `ExchangeIndexStepOp` | `fact_market_history` | 664,780 | 713 (173-800) | 0.5% | 0 | 312 | 1,073 | 0/0 | 326/196 | 79/0 | 0/0 | 387/117 | 0/0 |
+| 324 | `ExchangeIndexStepOp` | `holdings_history` | 362,342 | 590 (391-716) | 0.4% | 0 | 238 | 1,628 | 0/0 | 245/76 | 167/0 | 0/0 | 282/142 | 27/20 |
+| 337 | `ExchangeIndexStepOp` | `fact_holdings` | 1,573,919 | 565 (464-579) | 0.4% | 0 | 695 | 359 | 0/0 | 325/422 | 289/0 | 0/0 | 236/273 | 0/0 |
+| 96 | `ExchangeIndexStepOp` | `fact_cash_transactions` | 361,856 | 549 (515-585) | 0.3% | 0 | 128 | 1,517 | 0/0 | 336/62 | 121/0 | 0/0 | 201/66 | 1/0 |
+| 141 | `ExchangeIndexStepOp` | `trades_history` | 390,978 | 454 (200-526) | 0.3% | 0 | 193 | 1,161 | 0/0 | 116/18 | 43/0 | 0/0 | 278/153 | 23/21 |
+| 239 | `ExchangeIndexStepOp` | `fact_watches` | 885,922 | 429 (398-661) | 0.3% | 0 | 295 | 484 | 0/0 | 193/149 | 98/0 | 0/0 | 228/146 | 0/0 |
+| 331 | `ExchangeIndexStepOp` | `fact_holdings` | 930,764 | 367 (306-396) | 0.2% | 0 | 440 | 394 | 0/0 | 179/260 | 154/0 | 0/0 | 173/170 | 16/10 |
+| 172 | `ExchangeIndexStepOp` | `fact_trade` | 982,180 | 426 (396-439) | 0.3% | 0 | 395 | 434 | 0/0 | 198/166 | 52/0 | 0/0 | 189/208 | 32/21 |
+| 370 | `ExchangeIndexOp` | `market_volatility` | 1,282,768 | 242 (203-317) | 0.2% | 0 | 366 | 189 | 0/0 | 100/138 | 169/0 | 0/0 | 138/228 | 0/0 |
+| 288 | `ExchangeIndexOp` | `daily_market_pulse` | 1,282,768 | 407 (379-530) | 0.3% | 0 | 360 | 317 | 0/0 | 105/150 | 114/0 | 0/0 | 324/209 | 0/0 |
+| 329 | `ExchangeIndexStepOp` | `fact_holdings` | 982,180 | 372 (368-387) | 0.2% | 1,049 | 350 | 379 | 0/0 | 154/121 | 57/0 | 0/0 | 189/208 | 29/21 |
+| 332 | `ExchangeIndexStepOp` | `fact_holdings` | 982,180 | 383 (343-408) | 0.2% | 0 | 350 | 390 | 0/0 | 149/121 | 61/0 | 0/0 | 200/208 | 28/21 |
