@@ -79,5 +79,10 @@ site 235) and 1.2 s in inserts.
   aggregates) read hash-indexed Z-sets, so it is the engine's representation choice
   (`docs/comparison-feldera-decisions.md`), not an exchange change.
 
-## Decision
-Pending. Split (5.1% / 7.5%) and gather (5.6% / 8.2%) both fall between the stop and go lines.
+## Decision: closed (Curt, 2026-11-15)
+Split (5.1% / 7.5%) and gather (5.6% / 8.2%) both fell between the stop and go lines, so Curt made
+the call and closed it. Neither piece can be removed whole. The index has to be built somewhere,
+because joins and aggregates read hash-indexed Z-sets. Feldera's shard-and-merge shape belongs to the
+engine-wide sorted-representation question. The cheap partition-hash cleanups (§3) top out around
+1–2% and were not taken. Reopen only alongside a sorted-batch representation, or if a workload makes
+one site, not the whole set, large.

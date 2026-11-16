@@ -724,3 +724,29 @@ Six profiled batch-1 runs at W=12 (SF=3, `99ecf1c`) put their cost at **74 ms of
 (0.5–0.6%)**, and 76% of that is barrier wait. `dim_customer` is 6,440 rows, so each exchange is a
 cheap barrier, not a row copy (28.7 MiB of 62.7 GiB allocation in total). The whole view is 3.2%
 of the step. The idea is closed. Numbers and harness: `docs/xview-census/README.md`.
+
+## Exchanges' own work at W=12 — decomposed, closed (2026-11-15)
+
+The 138 exchanges' own work in batch 1 (W=12, SF=3, `b84c7ae`, 7 profiled runs + 3 per-row detail
+runs) is **10.7% of the step wall and 15.7% of allocation**, after taking out the GC pause that
+lands inside them.
+
+- **The census's hot sites were GC.** Under Server GC a pause stops every worker wherever it is, and
+  the per-op profile charged it to that operator. Op 334 (`fact_holdings`, 4.1 s "own work") is
+  0.72 s ex-GC = 290 ns/row, in line with the gather bench. Op 230 (`watches_history`) is 0.72 s,
+  mostly inserts into ~3.6k large `symbol` groups.
+- **No piece crosses the go line.**
+
+  | piece | % step | % alloc |
+  |---|--:|--:|
+  | split: fused map / partition + bucket | 5.1% (2.4 / 2.7) | 7.5% |
+  | gather: key / inserts / build | 5.6% (2.0 / 3.1 / 0.3) | 8.2% |
+  | largest site (235, `watches` aggregate input) | 1.4% | 1.2% |
+
+- **Closed by Curt.** Neither piece can be removed whole: joins and aggregates read hash-indexed
+  Z-sets, and Feldera's sorted shard-and-merge is the engine-wide representation question. Small
+  leftovers, not taken: aggregate exchanges build the group-key row twice (once only to hash it), and
+  `StablePartitionHash.OfRow` allocates an `int[]` and boxes cells per row (≲1–2% together).
+
+Numbers, profiler and scripts: `docs/xchange-phases/README.md`.
+
