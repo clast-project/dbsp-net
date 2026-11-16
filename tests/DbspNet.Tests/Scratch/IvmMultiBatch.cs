@@ -38,6 +38,11 @@
 //   IVM_INPUT_ORDER   size (default, as the server: smallest input first, DbspNet.Server.InputOrder) | spec
 //   IVM_STEP_PROFILE=1  (parallel) per batch, each worker's step as exchange split / barrier wait / gather / other
 //                     (StepProfiler; STEPPROF lines). Pair with IVM_GC_EVENTS=1 for the GC share.
+//   IVM_JIT_EVENTS=1  per batch and phase (before / drain / output), every method the JIT compiled: dynamic
+//                     (Expression / DynamicMethod) vs generic vs other, by tier (JIT / JITKIND / JITNS / JITTOP lines)
+//   IVM_RESUME_PAUSE_DIR  (with IVM_RESUME) write {dir}/pid after the restore, wait for {dir}/go; after the
+//                     first drain write {dir}/drained and wait for {dir}/go2 (attach `sample` to exactly the drain).
+//                     The same drain pause applies with IVM_RESTART_PAUSE_DIR (in-process restart).
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -203,6 +208,9 @@ public class IvmMultiBatch
         var stepProfile = workers > 1 && Environment.GetEnvironmentVariable("IVM_STEP_PROFILE") == "1";
         // IVM_GC_EVENTS=1: every GC pause during batch 1 (suspend → restart), by generation.
         using var gcEvents = Environment.GetEnvironmentVariable("IVM_GC_EVENTS") == "1" ? new GcPauseListener() : null;
+        // IVM_JIT_EVENTS=1: every method the JIT compiles, per batch phase (drain / output), split into
+        // dynamic (Expression-compiled / DynamicMethod), generic instantiations and the rest, by tier.
+        using var jitEvents = Environment.GetEnvironmentVariable("IVM_JIT_EVENTS") == "1" ? new JitEventListener() : null;
 
         var serial = parallel is null ? CompileSerial() : null;
         var runner = parallel is not null
@@ -316,6 +324,7 @@ public class IvmMultiBatch
 
         var restartAfter = int.TryParse(Environment.GetEnvironmentVariable("IVM_RESTART_AFTER"), out var ra) ? ra : 0;
         var restarted = false;
+        var drainPaused = false;
         var firstBatch = 1;
         DateTime restoreEndUtc = DateTime.MinValue;
         if (resume)
@@ -346,6 +355,17 @@ public class IvmMultiBatch
             }
             ResidencyAt("restore", 1);
             restoreEndUtc = DateTime.UtcNow;
+
+            // IVM_RESUME_PAUSE_DIR: write {dir}/pid after the restore and wait for {dir}/go, then after
+            // the first batch's drain wait for {dir}/go2 (to sample exactly the drain of a fresh process).
+            if (Environment.GetEnvironmentVariable("IVM_RESUME_PAUSE_DIR") is { Length: > 0 } resumePauseDir)
+            {
+                File.WriteAllText(Path.Combine(resumePauseDir, "pid"), Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+                while (!File.Exists(Path.Combine(resumePauseDir, "go")))
+                {
+                    await Task.Delay(50);
+                }
+            }
         }
 
         if (resume && DbspNet.Persistence.Snapshot.ProfileSave)
@@ -459,6 +479,16 @@ public class IvmMultiBatch
                 drainMs = sw.Elapsed.TotalMilliseconds;
                 drainAllocGib = (GC.GetTotalAllocatedBytes(precise: false) - alloc0) / (double)(1L << 30);
                 drainEndUtc = DateTime.UtcNow;
+                if (restarted && !drainPaused
+                    && (Environment.GetEnvironmentVariable("IVM_RESUME_PAUSE_DIR") ?? Environment.GetEnvironmentVariable("IVM_RESTART_PAUSE_DIR")) is { Length: > 0 } drainPauseDir)
+                {
+                    drainPaused = true;
+                    File.WriteAllText(Path.Combine(drainPauseDir, "drained"), "");
+                    while (!File.Exists(Path.Combine(drainPauseDir, "go2")))
+                    {
+                        await Task.Delay(50);
+                    }
+                }
                 if (DbspNet.Core.Operators.Stateful.Blocks.BlockTraceProfile.Enabled)
                 {
                     _out.WriteLine(DbspNet.Core.Operators.Stateful.Blocks.BlockTraceProfile.Report());
@@ -566,6 +596,19 @@ public class IvmMultiBatch
                 string PhaseOf(DateTime at) =>
                     at < restoreEndUtc ? "restore" : at < batchStartUtc ? "before" : at < drainEndUtc ? "drain" : at < outputEndUtc ? "output" : "after";
                 foreach (var line in gcEvents.PerGc(PhaseOf))
+                {
+                    _out.WriteLine(line);
+                }
+            }
+
+            if (jitEvents is not null)
+            {
+                if (!(batch == firstBatch && gcEvents is not null))
+                {
+                    await Task.Delay(2000); // runtime events arrive asynchronously
+                }
+
+                foreach (var line in jitEvents.Report(batch, batchStartUtc, drainEndUtc ?? DateTime.MaxValue, outputEndUtc ?? DateTime.MaxValue))
                 {
                     _out.WriteLine(line);
                 }
@@ -1031,6 +1074,111 @@ public class IvmMultiBatch
             }
 
             _out.WriteLine(string.Create(CultureInfo.InvariantCulture, $"CENSUS took {censusSw.Elapsed.TotalSeconds:F0} s"));
+        }
+    }
+
+    private sealed class JitEventListener : System.Diagnostics.Tracing.EventListener
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<(long Method, long Thread), DateTime> _started = new();
+        private readonly List<(DateTime At, double Ms, long Flags, string Name, long Thread)> _jitted = new();
+
+        // MethodFlags (ClrEtwAll.man): 0x1 dynamic, 0x2 generic, 0x4 shared generic, 0x8 jitted;
+        // bits 7-9 the optimization tier.
+        private static readonly string[] Tiers =
+            ["unknown", "minopt", "optimized", "tier0", "tier1", "tier1-osr", "tier0-instr", "tier1-instr"];
+
+        protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+        {
+            if (source.Name == "Microsoft-Windows-DotNETRuntime")
+            {
+                // JitKeyword (0x10) | JitTracingKeyword (0x1000); MethodJittingStarted is verbose.
+                EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Verbose, (System.Diagnostics.Tracing.EventKeywords)0x1010);
+            }
+        }
+
+        protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+        {
+            if (e.Payload is null || e.PayloadNames is null)
+            {
+                return;
+            }
+
+            object? P(string name)
+            {
+                var i = e.PayloadNames.IndexOf(name);
+                return i < 0 ? null : e.Payload[i];
+            }
+
+            var method = Convert.ToInt64(P("MethodID") ?? 0L, CultureInfo.InvariantCulture);
+            if (e.EventId == 145) // MethodJittingStarted
+            {
+                lock (_gate)
+                {
+                    _started[(method, e.OSThreadId)] = e.TimeStamp;
+                }
+            }
+            else if (e.EventId == 143) // MethodLoadVerbose
+            {
+                var flags = Convert.ToInt64(P("MethodFlags") ?? 0L, CultureInfo.InvariantCulture);
+                if ((flags & 0x8) == 0)
+                {
+                    return; // not jitted (R2R / prejitted code being registered)
+                }
+
+                var name = $"{P("MethodNamespace")}::{P("MethodName")}";
+                lock (_gate)
+                {
+                    var ms = _started.Remove((method, e.OSThreadId), out var start) ? (e.TimeStamp - start).TotalMilliseconds : 0;
+                    _jitted.Add((e.TimeStamp, ms, flags, name, e.OSThreadId));
+                }
+            }
+        }
+
+        private static string Kind(long flags, string name) =>
+            (flags & 0x1) != 0 || name.Contains("lambda_method", StringComparison.Ordinal) ? "dynamic"
+            : (flags & 0x2) != 0 ? "generic"
+            : "other";
+
+        public IEnumerable<string> Report(int batch, DateTime start, DateTime drainEnd, DateTime outputEnd)
+        {
+            List<(DateTime At, double Ms, long Flags, string Name, long Thread)> all;
+            lock (_gate)
+            {
+                all = _jitted.ToList();
+                _jitted.RemoveAll(j => j.At < outputEnd);
+            }
+
+            foreach (var (phase, from, to) in new[] { ("before", DateTime.MinValue, start), ("drain", start, drainEnd), ("output", drainEnd, outputEnd) })
+            {
+                var js = all.Where(j => j.At >= from && j.At < to).ToList();
+                if (js.Count == 0)
+                {
+                    continue;
+                }
+
+                string Sum(IEnumerable<(DateTime At, double Ms, long Flags, string Name, long Thread)> g) =>
+                    string.Create(CultureInfo.InvariantCulture, $"n={g.Count()} ms={g.Sum(j => j.Ms):F0}");
+                yield return $"JIT batch={batch} phase={phase} {Sum(js)} threads={js.Select(j => j.Thread).Distinct().Count()} | "
+                    + string.Join(" | ", js.GroupBy(j => Kind(j.Flags, j.Name)).OrderByDescending(g => g.Sum(j => j.Ms)).Select(g => $"{g.Key} {Sum(g)}"))
+                    + " || " + string.Join(" | ", js.GroupBy(j => Tiers[(j.Flags >> 7) & 0x7]).OrderByDescending(g => g.Sum(j => j.Ms)).Select(g => $"{g.Key} {Sum(g)}"));
+                foreach (var g in js.GroupBy(j => (Kind(j.Flags, j.Name), Tiers[(j.Flags >> 7) & 0x7])).OrderByDescending(g => g.Sum(j => j.Ms)))
+                {
+                    yield return $"JITKIND batch={batch} phase={phase} kind={g.Key.Item1} tier={g.Key.Item2} {Sum(g)} r2r_rejected={g.Count(j => (j.Flags & 0x40) != 0)}";
+                }
+
+                foreach (var g in js.GroupBy(j => j.Name.Split("::")[0] is var ns && ns.Contains('`') ? ns[..ns.IndexOf('`')] : ns)
+                             .OrderByDescending(g => g.Sum(j => j.Ms)).Take(15))
+                {
+                    yield return $"JITNS batch={batch} phase={phase} {Sum(g)} {g.Key}";
+                }
+
+                foreach (var j in js.OrderByDescending(j => j.Ms).Take(20))
+                {
+                    yield return string.Create(CultureInfo.InvariantCulture,
+                        $"JITTOP batch={batch} phase={phase} ms={j.Ms:F1} kind={Kind(j.Flags, j.Name)} tier={Tiers[(j.Flags >> 7) & 0x7]} {(j.Name.Length > 200 ? j.Name[..200] : j.Name)}");
+                }
+            }
         }
     }
 

@@ -1343,6 +1343,68 @@ Where the ~485 ms went (batch-2 drain, fresh process unless stated):
   block once on first use and keep it; the old `ColdStats` counters read 0, and
   `DBSPNET_RESTORE=eager` is a no-op for them.
 
+### The first batch after restore is fresh-process tiering (2026-11-15, issue #8, second pass)
+
+Raw data: `docs/restart-tiering-w12-20261115.txt`. Recipe as above, but with
+`IVM_OUTPUT_MODE=incremental`, the ivm-bench server's mode. **Correction:** the earlier 11-15 runs used the
+harness default, truncate. Their straight runs rewrote every view every batch (`parquet_mb` 175.6 →
+351.3 → 527.0), so "first write without a restart, 0.9–1.3 s" was a *full* write. In incremental mode
+a no-restart batch-2 write is **14–24 ms**. The write after a restore is always a full one: the sink
+truncates on start (§"Increment 6"; Feldera does the same), so the fair baseline is batch 1's full write
+(1.3–1.7 s, same block path, same ~3M output rows). The 43M `view_rows` counts every compiled view, not
+only the 16 outputs.
+
+**Attribution** (new harness instruments: `IVM_JIT_EVENTS=1` per-method JIT events by kind and tier;
+`IVM_RESUME_PAUSE_DIR` to attach a sampler; `DBSPNET_RESTORE_GC=force`; single diagnostic runs):
+- **Restored state is not the cost.** An in-process restart (warm code, the same lazily restored state)
+  drains batch 2 in 134 ms (R2R) / 178 ms (JIT), and its first write takes 1.62 / 1.82 s, i.e. batch 1's.
+  The write faults 235 MB of view blocks in both cases.
+- **GC debt is ruled out.** The whole resumed batch pauses ~30–90 ms; forcing the post-restore
+  collection at the 0.45 GiB heap changes nothing (write 3.02 vs 3.05 s).
+- **The position map is not restore-specific.** The connector rebuilds it on every full write, batch 1
+  included (`addresses=` 150–340 ms for the two big views in both arms).
+- **JIT compile time is small; slow code is not.** Under R2R the drain JITs 47 ms of CPU summed over 25
+  threads (39 ms of it tier-0 generic instantiations R2R did not pregenerate). Expression-compiled
+  delegates come to **4–5 ms**, so the earlier guess was wrong. The 614–877 ms `jit_ms` falls in the
+  *output* phase (~1.3 s of tier-1 and PGO-instrumented rejits), and the `jit_ms` field spans the whole
+  batch. What costs time is code running below tier 1. Hot paths run tier-0, PGO-instrumented
+  (`JIT_CountProfile32` is the top runtime leaf in a sampled write), or R2R code without cross-assembly
+  inlining, until tiering catches up. Composite R2R does not help (drain 268, write 3.06 s).
+- **In the drain, the cost is diffuse.** With `DBSPNET_TICK_TIMES=1`, ingest is 24 ms (no restart: 6) and the
+  steps sum to ~200 ms (~103 ms). Every tick runs 1.5–2.5× slower, the first and daily_market most; by
+  batch 3 the steps match. Barrier-bound: any worker's first-call cost stalls all 12.
+
+**Five alternating rounds** (IL = JIT build; R2R = `-p:PublishReadyToRun=true`; ccd0 =
+`DOTNET_TC_CallCountingDelayMs=0`; PGO0 = `DOTNET_TieredPGO=0`; every restore `view_rows_match=True`):
+
+| arm | resume b2 drain | no-restart b2 | ratio | first write after restore | restart → first output | batch-1 drain |
+|---|--:|--:|--:|--:|--:|--:|
+| A: IL (shipped) | 460 [447–465] | 92 | 5.0× | 2,946 | 3,581 | 13,759 [13,063–13,854] |
+| B: R2R | 272 [269–283] | 91 | 3.0× | 3,251 | 3,685 | 13,133 [12,927–14,217] |
+| C: R2R + ccd0 + PGO0 | **225** [219–225] | 91 | **2.47×** | **1,912** | **2,289** | 10,002 [9,775–10,667] |
+| D: IL + ccd0 + PGO0 | 314 [306–315] | 92 | 3.4× | 1,898 | 2,371 | 10,349 [9,808–10,617] |
+
+Knob split, 3 rounds: E = R2R + ccd0 only: drain 263 (2.5×), write 2,143, restart → first output 2,575,
+**batch 1 9,770 ms**; F = R2R + PGO0 only: 263 (2.8×), 2,643, 3,062, batch 1 11,806 ms.
+
+- **`TC_CallCountingDelayMs=0` alone is worth −25% on batch 1** (13.1 → 9.8 s), and most of the write
+  gain. By default the runtime holds back call counting for 100 ms after any new tier-0 activity. A first
+  batch keeps reaching new operators, so hot methods can stay below tier 1 for seconds (mechanism
+  inferred, not traced).
+- **Nexmark 10M, W=14, two alternating pairs, same binary.** ccd0 + PGO0 costs **~5% W=14** on almost every
+  query (0.87–0.96) and 12–24% at W=1: PGO pays for steady-state throughput, so PGO0 is not a default.
+  **ccd0 alone is neutral**: W=1 0.97–1.09; W=14 within this box's noise (single slow runs on
+  q9/q17/q22, q4/q18 up).
+- **The 2× drain target is not met by any configuration**: best 2.35–2.47× (C), 2.5× with the shippable E.
+  What remains (~45–80 ms over 2×) is first-execution cost spread over every operator.
+- **Test-host crash, once.** One C resume (of ~41 C runs; 0 in ~100 others, 0 in 20+20 targeted repeats
+  of C and B) died with SIGSEGV in `libcoreclr` `GetThreadLocalStaticBase` → `GetThreadStaticsByMethodTable`,
+  a `[ThreadStatic]` access on a `DbspWorker` thread at startup (.NET 10.0.8, osx-arm64, R2R). No known
+  upstream issue found. It is a runtime fault, not attributable to the knobs at this rate.
+
+Not built. Shipping R2R needs a RID in both server Dockerfiles; ccd0 is an environment variable
+(Dockerfile `ENV`). Both wait on Curt.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:

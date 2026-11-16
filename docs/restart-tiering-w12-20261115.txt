@@ -1,0 +1,452 @@
+# Issue #8, 2026-11-15 (second pass). main 0ee50f5 + the harness diagnostics in this commit.
+# SF=3, W=12, DBSPNET_STATE_LAYOUT=runs, DOTNET_gcServer=1, IVM_OUTPUT_MODE=incremental (as the ivm-bench server),
+# IVM_BCAST_MAXROWS=1000, spec = ivm-bench main (spec-main.json). NOTE: the earlier 11-15 data
+# (fresh-restart-w12-20261115.txt) ran with the harness default IVM_OUTPUT_MODE=truncate: its straight runs rewrite every
+# view every batch (parquet_mb 175.6 -> 351.3 -> 527.0), so its "first output write, no restart ~0.9-1.3 s" was a full write.
+# Builds: tests/DbspNet.Tests published twice from ~/tpcdi-ab/wt, -r osx-arm64 --self-contained false,
+# -p:PublishReadyToRun=false (il) | true (r2r). resume = clone of one IVM_STOP_AFTER=1 snapshot+outputs per build, IVM_RESUME=1.
+# ab1: 5 rounds, rotated order. A = il; B = r2r; C = r2r + DOTNET_TC_CallCountingDelayMs=0 DOTNET_TieredPGO=0; D = il + same.
+# ab2: 3 rounds. C again; E = r2r + DOTNET_TC_CallCountingDelayMs=0; F = r2r + DOTNET_TieredPGO=0.
+# (ab2-C-resume-1 is a test-host crash: SIGSEGV in libcoreclr GetThreadLocalStaticBase on a DbspWorker thread; see the doc.)
+## ab1-A-resume-1
+ RESUME tick=20 restore_ms=171 jit_ms=49 jit_methods=948 heap_start_gib=0.45 alloc_gib=0.42 gc_pause_ms=24 heap_end_gib=0.36 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=460 output_ms=2909 counts_ms=631 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=52 gen2=4 release_plan_ms=19 released=418 jit_ms=1555 checkpoint_ms=289 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=30 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=232 output_ms=38 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=19 released=418 jit_ms=162 checkpoint_ms=293 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=130 view_rows_match=True
+## ab1-A-resume-2
+ RESUME tick=20 restore_ms=179 jit_ms=49 jit_methods=948 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=465 output_ms=2970 counts_ms=642 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=33 gen2=4 release_plan_ms=22 released=418 jit_ms=1558 checkpoint_ms=277 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=33 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=258 output_ms=37 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=21 gen2=0 release_plan_ms=22 released=418 jit_ms=72 checkpoint_ms=279 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=142 view_rows_match=True
+## ab1-A-resume-3
+ RESUME tick=20 restore_ms=182 jit_ms=49 jit_methods=948 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=462 output_ms=3076 counts_ms=622 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=32 gen2=4 release_plan_ms=22 released=418 jit_ms=1627 checkpoint_ms=299 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=32 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=262 output_ms=35 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=25 gen2=0 release_plan_ms=22 released=418 jit_ms=141 checkpoint_ms=311 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=149 view_rows_match=True
+## ab1-A-resume-4
+ RESUME tick=20 restore_ms=184 jit_ms=47 jit_methods=948 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.34 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=458 output_ms=2923 counts_ms=657 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=34 gen2=4 release_plan_ms=22 released=418 jit_ms=1602 checkpoint_ms=303 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=34 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=264 output_ms=36 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=22 gen2=0 release_plan_ms=22 released=418 jit_ms=133 checkpoint_ms=283 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=147 view_rows_match=True
+## ab1-A-resume-5
+ RESUME tick=20 restore_ms=188 jit_ms=49 jit_methods=948 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=26 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=447 output_ms=2946 counts_ms=742 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=54 gen2=4 release_plan_ms=21 released=418 jit_ms=1618 checkpoint_ms=287 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=31 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=232 output_ms=35 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=21 released=418 jit_ms=121 checkpoint_ms=312 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=123 view_rows_match=True
+## ab1-A-straight-1
+ RESULT batch=1 ticks=20 drain_ms=13555 output_ms=1469 counts_ms=342 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.63 gc_pause_ms=3442 gen2=5 release_plan_ms=22 released=418 jit_ms=4498 checkpoint_ms=2125 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=46
+ RESULT batch=2 ticks=9 drain_ms=92 output_ms=24 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=22 released=418 jit_ms=43 checkpoint_ms=240 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=101 output_ms=18 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=22 released=418 jit_ms=196 checkpoint_ms=290 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=175 view_rows_match=True
+## ab1-A-straight-2
+ RESULT batch=1 ticks=20 drain_ms=13769 output_ms=1540 counts_ms=230 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.55 gc_pause_ms=3753 gen2=5 release_plan_ms=20 released=418 jit_ms=4544 checkpoint_ms=2162 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=40
+ RESULT batch=2 ticks=9 drain_ms=104 output_ms=23 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=58 gen2=0 release_plan_ms=20 released=418 jit_ms=49 checkpoint_ms=274 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=115 output_ms=20 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=20 released=418 jit_ms=166 checkpoint_ms=300 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=170 view_rows_match=True
+## ab1-A-straight-3
+ RESULT batch=1 ticks=20 drain_ms=13063 output_ms=1968 counts_ms=243 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.65 gc_pause_ms=3442 gen2=5 release_plan_ms=19 released=418 jit_ms=4853 checkpoint_ms=2220 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=5
+ RESULT batch=2 ticks=9 drain_ms=89 output_ms=24 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=19 released=418 jit_ms=43 checkpoint_ms=241 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=121 output_ms=18 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=19 released=418 jit_ms=225 checkpoint_ms=288 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=178 view_rows_match=True
+## ab1-A-straight-4
+ RESULT batch=1 ticks=20 drain_ms=13759 output_ms=1961 counts_ms=251 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.60 gc_pause_ms=3249 gen2=6 release_plan_ms=18 released=418 jit_ms=4085 checkpoint_ms=2140 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=54
+ RESULT batch=2 ticks=9 drain_ms=89 output_ms=23 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=18 released=418 jit_ms=50 checkpoint_ms=234 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=120 output_ms=17 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=18 released=418 jit_ms=136 checkpoint_ms=297 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=177 view_rows_match=True
+## ab1-A-straight-5
+ RESULT batch=1 ticks=20 drain_ms=13854 output_ms=1480 counts_ms=231 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.68 gc_pause_ms=3170 gen2=6 release_plan_ms=21 released=418 jit_ms=4063 checkpoint_ms=2623 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=111 output_ms=22 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=21 released=418 jit_ms=53 checkpoint_ms=220 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=121 output_ms=16 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=21 released=418 jit_ms=180 checkpoint_ms=269 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=185 view_rows_match=True
+## ab1-B-resume-1
+ RESUME tick=20 restore_ms=167 jit_ms=17 jit_methods=436 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=283 output_ms=3353 counts_ms=491 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=32 gen2=4 release_plan_ms=10 released=418 jit_ms=1261 checkpoint_ms=275 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=32 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=199 output_ms=21 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=23 gen2=0 release_plan_ms=10 released=418 jit_ms=37 checkpoint_ms=278 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=148 view_rows_match=True
+## ab1-B-resume-2
+ RESUME tick=20 restore_ms=166 jit_ms=17 jit_methods=436 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=272 output_ms=3054 counts_ms=413 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=65 gen2=5 release_plan_ms=12 released=418 jit_ms=1216 checkpoint_ms=280 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=30 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=171 output_ms=21 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=122 checkpoint_ms=262 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=143 view_rows_match=True
+## ab1-B-resume-3
+ RESUME tick=20 restore_ms=165 jit_ms=17 jit_methods=436 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=27 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=269 output_ms=3262 counts_ms=418 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=33 gen2=4 release_plan_ms=10 released=418 jit_ms=1312 checkpoint_ms=248 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=27 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=172 output_ms=22 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=120 checkpoint_ms=287 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=147 view_rows_match=True
+## ab1-B-resume-4
+ RESUME tick=20 restore_ms=157 jit_ms=17 jit_methods=436 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=277 output_ms=3251 counts_ms=441 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=55 gen2=4 release_plan_ms=12 released=418 jit_ms=1267 checkpoint_ms=259 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=32 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=180 output_ms=21 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=34 checkpoint_ms=261 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=138 view_rows_match=True
+## ab1-B-resume-5
+ RESUME tick=20 restore_ms=162 jit_ms=17 jit_methods=436 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=24 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=270 output_ms=3003 counts_ms=395 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=31 gen2=4 release_plan_ms=10 released=418 jit_ms=1166 checkpoint_ms=259 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=31 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=198 output_ms=21 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=22 gen2=0 release_plan_ms=10 released=418 jit_ms=8 checkpoint_ms=266 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=127 view_rows_match=True
+## ab1-B-straight-1
+ RESULT batch=1 ticks=20 drain_ms=13633 output_ms=1649 counts_ms=226 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.71 gc_pause_ms=3726 gen2=5 release_plan_ms=9 released=418 jit_ms=4314 checkpoint_ms=1797 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=97 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=10 checkpoint_ms=230 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=122 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=153 checkpoint_ms=269 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=143 view_rows_match=True
+## ab1-B-straight-2
+ RESULT batch=1 ticks=20 drain_ms=13133 output_ms=2120 counts_ms=298 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.72 gc_pause_ms=3513 gen2=6 release_plan_ms=11 released=418 jit_ms=3923 checkpoint_ms=2036 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=34
+ RESULT batch=2 ticks=9 drain_ms=86 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=9 gen2=0 release_plan_ms=11 released=418 jit_ms=18 checkpoint_ms=230 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=116 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=166 checkpoint_ms=290 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=134 view_rows_match=True
+## ab1-B-straight-3
+ RESULT batch=1 ticks=20 drain_ms=12927 output_ms=1549 counts_ms=282 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.70 gc_pause_ms=3132 gen2=5 release_plan_ms=11 released=418 jit_ms=3822 checkpoint_ms=1761 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=91 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=10 checkpoint_ms=203 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=104 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=94 checkpoint_ms=290 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=138 view_rows_match=True
+## ab1-B-straight-4
+ RESULT batch=1 ticks=20 drain_ms=12983 output_ms=1865 counts_ms=330 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.70 gc_pause_ms=3238 gen2=6 release_plan_ms=9 released=418 jit_ms=3661 checkpoint_ms=1966 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=161
+ RESULT batch=2 ticks=9 drain_ms=89 output_ms=16 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=11 checkpoint_ms=235 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=122 output_ms=11 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=137 checkpoint_ms=259 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=155 view_rows_match=True
+## ab1-B-straight-5
+ RESULT batch=1 ticks=20 drain_ms=14217 output_ms=1699 counts_ms=301 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.72 gc_pause_ms=3968 gen2=5 release_plan_ms=11 released=418 jit_ms=4252 checkpoint_ms=1714 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=106
+ RESULT batch=2 ticks=9 drain_ms=110 output_ms=15 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=9 gen2=0 release_plan_ms=11 released=418 jit_ms=10 checkpoint_ms=330 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=118 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=102 checkpoint_ms=265 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=139 view_rows_match=True
+## ab1-C-resume-1
+ RESUME tick=20 restore_ms=158 jit_ms=175 jit_methods=1168 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=26 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=219 output_ms=1912 counts_ms=128 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=53 gen2=4 release_plan_ms=12 released=418 jit_ms=786 checkpoint_ms=255 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=31 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=126 output_ms=16 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=108 checkpoint_ms=256 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=133 view_rows_match=True
+## ab1-C-resume-2
+ RESUME tick=20 restore_ms=152 jit_ms=165 jit_methods=1105 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=27 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=222 output_ms=1884 counts_ms=132 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=51 gen2=4 release_plan_ms=12 released=418 jit_ms=794 checkpoint_ms=245 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=30 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=124 output_ms=17 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=107 checkpoint_ms=255 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=124 view_rows_match=True
+## ab1-C-resume-3
+ RESUME tick=20 restore_ms=156 jit_ms=171 jit_methods=1133 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=225 output_ms=1891 counts_ms=126 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=54 gen2=4 release_plan_ms=11 released=418 jit_ms=791 checkpoint_ms=250 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=32 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=125 output_ms=17 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=108 checkpoint_ms=244 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=132 view_rows_match=True
+## ab1-C-resume-4
+ RESUME tick=20 restore_ms=147 jit_ms=162 jit_methods=1093 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=24 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=225 output_ms=1944 counts_ms=135 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=57 gen2=4 release_plan_ms=12 released=418 jit_ms=798 checkpoint_ms=230 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=35 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=125 output_ms=17 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=106 checkpoint_ms=277 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=127 view_rows_match=True
+## ab1-C-resume-5
+ RESUME tick=20 restore_ms=151 jit_ms=166 jit_methods=1102 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=26 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=225 output_ms=1933 counts_ms=162 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=54 gen2=4 release_plan_ms=12 released=418 jit_ms=793 checkpoint_ms=257 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=32 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=123 output_ms=17 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=107 checkpoint_ms=279 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=121 view_rows_match=True
+## ab1-C-straight-1
+ RESULT batch=1 ticks=20 drain_ms=10408 output_ms=1676 counts_ms=134 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3749 gen2=5 release_plan_ms=11 released=418 jit_ms=1280 checkpoint_ms=1204 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=9
+ RESULT batch=2 ticks=9 drain_ms=102 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=54 checkpoint_ms=217 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=105 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=56 checkpoint_ms=273 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=137 view_rows_match=True
+## ab1-C-straight-2
+ RESULT batch=1 ticks=20 drain_ms=9825 output_ms=1394 counts_ms=115 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3112 gen2=5 release_plan_ms=10 released=418 jit_ms=1505 checkpoint_ms=1223 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=38
+ RESULT batch=2 ticks=9 drain_ms=102 output_ms=16 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=58 checkpoint_ms=231 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=107 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=54 checkpoint_ms=245 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=135 view_rows_match=True
+## ab1-C-straight-3
+ RESULT batch=1 ticks=20 drain_ms=9775 output_ms=1230 counts_ms=94 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3601 gen2=5 release_plan_ms=11 released=418 jit_ms=1790 checkpoint_ms=1274 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=90 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=52 checkpoint_ms=203 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=109 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=55 checkpoint_ms=246 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=143 view_rows_match=True
+## ab1-C-straight-4
+ RESULT batch=1 ticks=20 drain_ms=10667 output_ms=1396 counts_ms=145 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3609 gen2=5 release_plan_ms=10 released=418 jit_ms=1261 checkpoint_ms=1265 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=51
+ RESULT batch=2 ticks=9 drain_ms=80 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=52 checkpoint_ms=216 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=91 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=55 checkpoint_ms=291 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=137 view_rows_match=True
+## ab1-C-straight-5
+ RESULT batch=1 ticks=20 drain_ms=10002 output_ms=1176 counts_ms=84 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.77 gc_pause_ms=3067 gen2=5 release_plan_ms=10 released=418 jit_ms=1622 checkpoint_ms=1264 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=91 output_ms=13 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=51 checkpoint_ms=194 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=104 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=55 checkpoint_ms=260 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=138 view_rows_match=True
+## ab1-D-resume-1
+ RESUME tick=20 restore_ms=158 jit_ms=208 jit_methods=2016 heap_start_gib=0.45 alloc_gib=0.42 gc_pause_ms=27 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=315 output_ms=1898 counts_ms=127 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=54 gen2=4 release_plan_ms=11 released=418 jit_ms=1109 checkpoint_ms=274 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=33 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=124 output_ms=25 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=120 checkpoint_ms=258 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=120 view_rows_match=True
+## ab1-D-resume-2
+ RESUME tick=20 restore_ms=166 jit_ms=213 jit_methods=2072 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.34 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=306 output_ms=1891 counts_ms=128 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=52 gen2=4 release_plan_ms=11 released=418 jit_ms=1080 checkpoint_ms=282 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=31 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=123 output_ms=26 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=120 checkpoint_ms=259 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=129 view_rows_match=True
+## ab1-D-resume-3
+ RESUME tick=20 restore_ms=158 jit_ms=206 jit_methods=2055 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=24 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=309 output_ms=1913 counts_ms=140 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=57 gen2=4 release_plan_ms=12 released=418 jit_ms=1014 checkpoint_ms=289 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=35 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=129 output_ms=26 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=121 checkpoint_ms=253 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=131 view_rows_match=True
+## ab1-D-resume-4
+ RESUME tick=20 restore_ms=162 jit_ms=211 jit_methods=2032 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=28 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=315 output_ms=1876 counts_ms=125 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=52 gen2=4 release_plan_ms=11 released=418 jit_ms=1035 checkpoint_ms=286 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=30 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=118 output_ms=25 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=120 checkpoint_ms=292 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=131 view_rows_match=True
+## ab1-D-resume-5
+ RESUME tick=20 restore_ms=165 jit_ms=213 jit_methods=2080 heap_start_gib=0.45 alloc_gib=0.42 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=314 output_ms=1916 counts_ms=134 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=51 gen2=4 release_plan_ms=11 released=418 jit_ms=1092 checkpoint_ms=286 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=29 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=120 output_ms=26 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=120 checkpoint_ms=280 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=133 view_rows_match=True
+## ab1-D-straight-1
+ RESULT batch=1 ticks=20 drain_ms=10349 output_ms=1303 counts_ms=140 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3679 gen2=4 release_plan_ms=12 released=418 jit_ms=1565 checkpoint_ms=1246 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=30
+ RESULT batch=2 ticks=9 drain_ms=90 output_ms=22 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=67 checkpoint_ms=197 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=97 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=60 checkpoint_ms=257 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=192 view_rows_match=True
+## ab1-D-straight-2
+ RESULT batch=1 ticks=20 drain_ms=10001 output_ms=1340 counts_ms=99 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.67 gc_pause_ms=3102 gen2=5 release_plan_ms=12 released=418 jit_ms=1862 checkpoint_ms=1286 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=89
+ RESULT batch=2 ticks=9 drain_ms=112 output_ms=21 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=10 gen2=0 release_plan_ms=12 released=418 jit_ms=66 checkpoint_ms=195 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=124 output_ms=11 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=60 checkpoint_ms=251 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=179 view_rows_match=True
+## ab1-D-straight-3
+ RESULT batch=1 ticks=20 drain_ms=9808 output_ms=1447 counts_ms=113 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3806 gen2=5 release_plan_ms=12 released=418 jit_ms=1565 checkpoint_ms=1263 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=39
+ RESULT batch=2 ticks=9 drain_ms=92 output_ms=21 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=65 checkpoint_ms=208 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=106 output_ms=11 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=60 checkpoint_ms=273 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=172 view_rows_match=True
+## ab1-D-straight-4
+ RESULT batch=1 ticks=20 drain_ms=10385 output_ms=1275 counts_ms=130 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=4158 gen2=5 release_plan_ms=11 released=418 jit_ms=2081 checkpoint_ms=1204 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=28
+ RESULT batch=2 ticks=9 drain_ms=90 output_ms=21 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=66 checkpoint_ms=227 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=107 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=59 checkpoint_ms=267 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=165 view_rows_match=True
+## ab1-D-straight-5
+ RESULT batch=1 ticks=20 drain_ms=10617 output_ms=1253 counts_ms=116 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.79 gc_pause_ms=3706 gen2=5 release_plan_ms=11 released=418 jit_ms=1392 checkpoint_ms=1194 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=62
+ RESULT batch=2 ticks=9 drain_ms=123 output_ms=21 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=10 gen2=0 release_plan_ms=11 released=418 jit_ms=69 checkpoint_ms=360 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=108 output_ms=12 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=60 checkpoint_ms=288 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=162 view_rows_match=True
+## ab2-C-resume-1
+The active test run was aborted. Reason: Test host process crashed
+## ab2-C-resume-2
+ RESUME tick=20 restore_ms=158 jit_ms=174 jit_methods=1142 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=27 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=225 output_ms=1894 counts_ms=158 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=54 gen2=4 release_plan_ms=11 released=418 jit_ms=787 checkpoint_ms=262 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=32 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=136 output_ms=16 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=107 checkpoint_ms=247 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=132 view_rows_match=True
+## ab2-C-resume-3
+ RESUME tick=20 restore_ms=167 jit_ms=184 jit_methods=1248 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=26 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=230 output_ms=1931 counts_ms=172 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=57 gen2=4 release_plan_ms=11 released=418 jit_ms=787 checkpoint_ms=284 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=34 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=137 output_ms=18 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=11 released=418 jit_ms=111 checkpoint_ms=264 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=127 view_rows_match=True
+## ab2-C-straight-1
+ RESULT batch=1 ticks=20 drain_ms=9747 output_ms=1250 counts_ms=110 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.78 gc_pause_ms=3728 gen2=5 release_plan_ms=10 released=418 jit_ms=1116 checkpoint_ms=1230 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=21
+ RESULT batch=2 ticks=9 drain_ms=96 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=53 checkpoint_ms=216 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=100 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.16 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=55 checkpoint_ms=291 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=148 view_rows_match=True
+## ab2-C-straight-2
+ RESULT batch=1 ticks=20 drain_ms=10114 output_ms=1237 counts_ms=187 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.77 gc_pause_ms=3560 gen2=4 release_plan_ms=10 released=418 jit_ms=1117 checkpoint_ms=1239 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=40
+ RESULT batch=2 ticks=9 drain_ms=97 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=52 checkpoint_ms=212 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=113 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=56 checkpoint_ms=296 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=136 view_rows_match=True
+## ab2-C-straight-3
+ RESULT batch=1 ticks=20 drain_ms=10413 output_ms=1239 counts_ms=138 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.79 gc_pause_ms=3587 gen2=5 release_plan_ms=10 released=418 jit_ms=1274 checkpoint_ms=1189 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=38
+ RESULT batch=2 ticks=9 drain_ms=101 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=52 checkpoint_ms=210 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=122 output_ms=10 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=57 checkpoint_ms=284 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=140 view_rows_match=True
+## ab2-E-resume-1
+ RESUME tick=20 restore_ms=169 jit_ms=186 jit_methods=950 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=263 output_ms=2143 counts_ms=150 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=53 gen2=4 release_plan_ms=13 released=418 jit_ms=1627 checkpoint_ms=271 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=31 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=189 output_ms=19 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=13 released=418 jit_ms=499 checkpoint_ms=261 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=123 view_rows_match=True
+## ab2-E-resume-2
+ RESUME tick=20 restore_ms=158 jit_ms=176 jit_methods=912 heap_start_gib=0.45 alloc_gib=0.42 gc_pause_ms=24 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=274 output_ms=2184 counts_ms=124 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=35 gen2=4 release_plan_ms=15 released=418 jit_ms=1638 checkpoint_ms=243 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=35 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=211 output_ms=18 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=24 gen2=0 release_plan_ms=15 released=418 jit_ms=582 checkpoint_ms=321 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=130 view_rows_match=True
+## ab2-E-resume-3
+ RESUME tick=20 restore_ms=161 jit_ms=177 jit_methods=906 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=27 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=257 output_ms=2134 counts_ms=145 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=53 gen2=4 release_plan_ms=16 released=418 jit_ms=1629 checkpoint_ms=259 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=31 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=197 output_ms=19 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=16 released=418 jit_ms=541 checkpoint_ms=293 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=130 view_rows_match=True
+## ab2-E-straight-1
+ RESULT batch=1 ticks=20 drain_ms=10141 output_ms=1271 counts_ms=106 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.42 gc_pause_ms=3290 gen2=4 release_plan_ms=12 released=418 jit_ms=3809 checkpoint_ms=1313 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=43
+ RESULT batch=2 ticks=9 drain_ms=105 output_ms=13 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=55 gen2=0 release_plan_ms=12 released=418 jit_ms=187 checkpoint_ms=253 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=100 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=12 released=418 jit_ms=137 checkpoint_ms=278 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=137 view_rows_match=True
+## ab2-E-straight-2
+ RESULT batch=1 ticks=20 drain_ms=9593 output_ms=1350 counts_ms=124 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.49 gc_pause_ms=3140 gen2=5 release_plan_ms=13 released=418 jit_ms=3093 checkpoint_ms=1350 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=99
+ RESULT batch=2 ticks=9 drain_ms=110 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=13 released=418 jit_ms=139 checkpoint_ms=231 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=115 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=13 released=418 jit_ms=139 checkpoint_ms=242 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=142 view_rows_match=True
+## ab2-E-straight-3
+ RESULT batch=1 ticks=20 drain_ms=9770 output_ms=1268 counts_ms=105 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.48 gc_pause_ms=3456 gen2=6 release_plan_ms=13 released=418 jit_ms=3596 checkpoint_ms=1505 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=98 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=13 released=418 jit_ms=132 checkpoint_ms=218 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=120 output_ms=9 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=12 gen2=0 release_plan_ms=13 released=418 jit_ms=153 checkpoint_ms=282 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=139 view_rows_match=True
+## ab2-F-resume-1
+ RESUME tick=20 restore_ms=157 jit_ms=18 jit_methods=478 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=260 output_ms=2643 counts_ms=499 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=50 gen2=4 release_plan_ms=9 released=418 jit_ms=821 checkpoint_ms=257 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=29 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=149 output_ms=19 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=6 checkpoint_ms=263 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=132 view_rows_match=True
+## ab2-F-resume-2
+ RESUME tick=20 restore_ms=168 jit_ms=18 jit_methods=478 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=25 heap_end_gib=0.34 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=263 output_ms=2631 counts_ms=425 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=33 gen2=4 release_plan_ms=10 released=418 jit_ms=742 checkpoint_ms=248 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=26 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=152 output_ms=19 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=10 released=418 jit_ms=31 checkpoint_ms=276 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=133 view_rows_match=True
+## ab2-F-resume-3
+ RESUME tick=20 restore_ms=164 jit_ms=18 jit_methods=478 heap_start_gib=0.45 alloc_gib=0.41 gc_pause_ms=24 heap_end_gib=0.35 restore_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=267 output_ms=2743 counts_ms=342 view_rows=43273131 parquet_mb=351.3 drain_alloc_gib=0.12 gc_pause_ms=56 gen2=4 release_plan_ms=8 released=418 jit_ms=744 checkpoint_ms=247 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=35 resumed=1
+ RESULT batch=3 ticks=9 drain_ms=150 output_ms=19 counts_ms=0 view_rows=43274361 parquet_mb=351.5 drain_alloc_gib=0.15 gc_pause_ms=0 gen2=0 release_plan_ms=8 released=418 jit_ms=6 checkpoint_ms=277 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0 resumed=1
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=131 view_rows_match=True
+## ab2-F-straight-1
+ RESULT batch=1 ticks=20 drain_ms=11806 output_ms=1502 counts_ms=212 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.74 gc_pause_ms=3451 gen2=6 release_plan_ms=9 released=418 jit_ms=1694 checkpoint_ms=1519 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=2 ticks=9 drain_ms=95 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=9 checkpoint_ms=198 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=110 output_ms=10 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=70 checkpoint_ms=275 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=140 view_rows_match=True
+## ab2-F-straight-2
+ RESULT batch=1 ticks=20 drain_ms=12046 output_ms=1980 counts_ms=217 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.71 gc_pause_ms=3283 gen2=6 release_plan_ms=9 released=418 jit_ms=1650 checkpoint_ms=1610 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=22
+ RESULT batch=2 ticks=9 drain_ms=92 output_ms=13 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=9 checkpoint_ms=197 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=111 output_ms=10 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=9 released=418 jit_ms=75 checkpoint_ms=271 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=139 view_rows_match=True
+## ab2-F-straight-3
+ RESULT batch=1 ticks=20 drain_ms=11365 output_ms=1961 counts_ms=196 view_rows=43272656 parquet_mb=175.6 drain_alloc_gib=43.76 gc_pause_ms=3085 gen2=6 release_plan_ms=7 released=418 jit_ms=1831 checkpoint_ms=1614 snapshot_mib=1435.5 written_mib=1435.5 peak_ws_mib=0 output_gc_ms=9
+ RESULT batch=2 ticks=9 drain_ms=106 output_ms=14 counts_ms=0 view_rows=43273131 parquet_mb=175.7 drain_alloc_gib=0.14 gc_pause_ms=0 gen2=0 release_plan_ms=7 released=418 jit_ms=9 checkpoint_ms=217 snapshot_mib=1438.1 written_mib=4.9 peak_ws_mib=0 output_gc_ms=0
+ RESULT batch=3 ticks=9 drain_ms=113 output_ms=10 counts_ms=0 view_rows=43274361 parquet_mb=175.8 drain_alloc_gib=0.17 gc_pause_ms=0 gen2=0 release_plan_ms=7 released=418 jit_ms=74 checkpoint_ms=283 snapshot_mib=1438.6 written_mib=5.5 peak_ws_mib=0 output_gc_ms=0
+ RESTORE workers=12 restore_workers=12 reshard_ms=0 tick=38 restore_ms=149 view_rows_match=True
+
+# Nexmark 10M events, batch 10000, runs 3, W=14 (DbspNet.Benchmarks built at ~/tpcdi-ab/wt, JIT build, NEXMARK_GEN=feldera NEXMARK_STRINGS=utf8).
+# Two alternating pairs per comparison; per-run lines below (W1= / W14= events/s).
+## nx-plain-1 (no knobs)
+  q0: W1=   5,294,663  W14=  12,538,970 events/s    2.37×  ok
+  q1: W1=   3,736,497  W14=  10,495,584 events/s    2.81×  ok
+  q2: W1=   6,445,572  W14=  11,908,722 events/s    1.85×  ok
+  q3: W1=  38,966,317  W14=  12,136,330 events/s    0.31×  ok
+  q4: W1=   3,753,292  W14=   4,494,762 events/s    1.20×  ok
+  q9: W1=   2,503,469  W14=   4,591,006 events/s    1.83×  ok
+  q5: W1=     590,610  W14=   2,806,581 events/s    4.75×  ok
+  q7:    1,011,892 events/s  (single-only)
+  q8: W1=  24,740,166  W14=   9,787,944 events/s    0.40×  ok
+  q12: W1=   5,502,125  W14=   6,011,054 events/s    1.09×  ok
+  q15: W1=   5,190,596  W14=   3,977,371 events/s    0.77×  ok
+  q16: W1=   3,753,828  W14=   4,501,911 events/s    1.20×  ok
+  q17: W1=   4,288,154  W14=   8,025,206 events/s    1.87×  ok
+  q18: W1=   2,161,379  W14=   5,665,297 events/s    2.62×  ok
+  q19: W1=   2,223,536  W14=   5,551,231 events/s    2.50×  ok
+  q20: W1=   3,115,975  W14=   5,079,220 events/s    1.63×  ok
+  q22: W1=   2,511,080  W14=   9,232,280 events/s    3.68×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-knobs-1 (DOTNET_TC_CallCountingDelayMs=0 DOTNET_TieredPGO=0)
+  q0: W1=   4,855,680  W14=  11,896,168 events/s    2.45×  ok
+  q1: W1=   3,225,980  W14=   9,897,479 events/s    3.07×  ok
+  q2: W1=   6,131,064  W14=  11,286,562 events/s    1.84×  ok
+  q3: W1=  34,368,147  W14=  11,699,474 events/s    0.34×  ok
+  q4: W1=   3,089,226  W14=   4,245,655 events/s    1.37×  ok
+  q9: W1=   2,229,770  W14=   4,344,284 events/s    1.95×  ok
+  q5: W1=     454,295  W14=   2,404,674 events/s    5.29×  ok
+  q7:      917,399 events/s  (single-only)
+  q8: W1=  15,894,953  W14=   9,418,175 events/s    0.59×  ok
+  q12: W1=   3,916,574  W14=   8,795,542 events/s    2.25×  ok
+  q15: W1=   3,956,609  W14=   4,446,784 events/s    1.12×  ok
+  q16: W1=   3,299,045  W14=   5,032,043 events/s    1.53×  ok
+  q17: W1=   3,643,216  W14=   7,716,260 events/s    2.12×  ok
+  q18: W1=   2,064,536  W14=   5,458,385 events/s    2.64×  ok
+  q19: W1=   2,095,125  W14=   5,298,695 events/s    2.53×  ok
+  q20: W1=   2,680,266  W14=   4,575,017 events/s    1.71×  ok
+  q22: W1=   1,938,193  W14=   8,041,478 events/s    4.15×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-plain-2 (no knobs)
+  q0: W1=   5,801,129  W14=  12,509,556 events/s    2.16×  ok
+  q1: W1=   3,975,352  W14=  10,484,805 events/s    2.64×  ok
+  q2: W1=   7,336,761  W14=  11,983,432 events/s    1.63×  ok
+  q3: W1=  38,668,534  W14=  12,191,005 events/s    0.32×  ok
+  q4: W1=   3,748,806  W14=   4,560,093 events/s    1.22×  ok
+  q9: W1=   2,597,754  W14=   4,639,191 events/s    1.79×  ok
+  q5: W1=     594,509  W14=   2,453,848 events/s    4.13×  ok
+  q7:      995,618 events/s  (single-only)
+  q8: W1=  19,852,866  W14=  10,205,832 events/s    0.51×  ok
+  q12: W1=   5,423,659  W14=   9,309,252 events/s    1.72×  ok
+  q15: W1=   5,263,750  W14=   4,821,440 events/s    0.92×  ok
+  q16: W1=   3,734,620  W14=   5,397,800 events/s    1.45×  ok
+  q17: W1=   4,260,508  W14=   8,006,548 events/s    1.88×  ok
+  q18: W1=   2,160,382  W14=   5,637,450 events/s    2.61×  ok
+  q19: W1=   2,283,019  W14=   4,395,443 events/s    1.93×  ok
+  q20: W1=   3,220,973  W14=   4,894,337 events/s    1.52×  ok
+  q22: W1=   2,650,744  W14=   9,229,360 events/s    3.48×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-knobs-2 (DOTNET_TC_CallCountingDelayMs=0 DOTNET_TieredPGO=0)
+  q0: W1=   4,915,144  W14=  12,032,743 events/s    2.45×  ok
+  q1: W1=   3,187,501  W14=   9,958,005 events/s    3.12×  ok
+  q2: W1=   6,127,891  W14=  11,267,358 events/s    1.84×  ok
+  q3: W1=  33,815,451  W14=  11,423,171 events/s    0.34×  ok
+  q4: W1=   3,081,403  W14=   4,302,417 events/s    1.40×  ok
+  q9: W1=   2,237,511  W14=   4,365,735 events/s    1.95×  ok
+  q5: W1=     459,842  W14=   2,399,855 events/s    5.22×  ok
+  q7:      926,409 events/s  (single-only)
+  q8: W1=  20,563,125  W14=   9,496,317 events/s    0.46×  ok
+  q12: W1=   4,451,764  W14=   8,753,542 events/s    1.97×  ok
+  q15: W1=   3,985,977  W14=   4,431,416 events/s    1.11×  ok
+  q16: W1=   3,264,058  W14=   5,014,105 events/s    1.54×  ok
+  q17: W1=   3,599,096  W14=   7,400,321 events/s    2.06×  ok
+  q18: W1=   2,069,638  W14=   5,596,049 events/s    2.70×  ok
+  q19: W1=   2,109,910  W14=   5,294,838 events/s    2.51×  ok
+  q20: W1=   2,662,861  W14=   4,581,278 events/s    1.72×  ok
+  q22: W1=   1,991,140  W14=   8,034,430 events/s    4.04×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-plain2-1 (no knobs)
+  q0: W1=   5,821,218  W14=  12,466,380 events/s    2.14×  ok
+  q1: W1=   3,974,660  W14=  10,678,713 events/s    2.69×  ok
+  q2: W1=   7,342,411  W14=  11,874,582 events/s    1.62×  ok
+  q3: W1=  39,330,748  W14=  12,350,692 events/s    0.31×  ok
+  q4: W1=   3,784,163  W14=   3,794,590 events/s    1.00×  ok
+  q9: W1=   2,582,679  W14=   4,617,389 events/s    1.79×  ok
+  q5: W1=     597,171  W14=   2,799,393 events/s    4.69×  ok
+  q7:    1,034,655 events/s  (single-only)
+  q8: W1=  21,889,310  W14=   9,716,328 events/s    0.44×  ok
+  q12: W1=   5,515,311  W14=   9,163,135 events/s    1.66×  ok
+  q15: W1=   5,262,053  W14=   4,783,418 events/s    0.91×  ok
+  q16: W1=   3,756,807  W14=   5,270,461 events/s    1.40×  ok
+  q17: W1=   4,215,704  W14=   8,148,494 events/s    1.93×  ok
+  q18: W1=   2,141,753  W14=   4,168,284 events/s    1.95×  ok
+  q19: W1=   2,255,999  W14=   5,212,329 events/s    2.31×  ok
+  q20: W1=   3,090,465  W14=   4,722,766 events/s    1.53×  ok
+  q22: W1=   2,627,428  W14=   9,015,411 events/s    3.43×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-ccd0-1 (DOTNET_TC_CallCountingDelayMs=0)
+  q0: W1=   5,810,441  W14=  12,455,711 events/s    2.14×  ok
+  q1: W1=   4,000,986  W14=  10,891,375 events/s    2.72×  ok
+  q2: W1=   7,302,019  W14=  12,023,426 events/s    1.65×  ok
+  q3: W1=  38,204,087  W14=  12,309,766 events/s    0.32×  ok
+  q4: W1=   3,764,221  W14=   4,538,616 events/s    1.21×  ok
+  q9: W1=   2,587,573  W14=   4,638,704 events/s    1.79×  ok
+  q5: W1=     607,616  W14=   2,830,661 events/s    4.66×  ok
+  q7:    1,044,077 events/s  (single-only)
+  q8: W1=  26,071,656  W14=   9,750,579 events/s    0.37×  ok
+  q12: W1=   5,598,229  W14=   8,321,450 events/s    1.49×  ok
+  q15: W1=   5,456,412  W14=   4,033,796 events/s    0.74×  ok
+  q16: W1=   3,743,666  W14=   5,153,339 events/s    1.38×  ok
+  q17: W1=   4,281,445  W14=   6,080,134 events/s    1.42×  ok
+  q18: W1=   2,162,592  W14=   4,198,419 events/s    1.94×  ok
+  q19: W1=   2,304,890  W14=   5,383,525 events/s    2.34×  ok
+  q20: W1=   3,277,078  W14=   4,795,078 events/s    1.46×  ok
+  q22: W1=   2,704,669  W14=   9,286,084 events/s    3.43×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-plain2-2 (no knobs)
+  q0: W1=   5,331,472  W14=  12,588,942 events/s    2.36×  ok
+  q1: W1=   3,748,883  W14=  10,872,522 events/s    2.90×  ok
+  q2: W1=   6,572,896  W14=  12,016,902 events/s    1.83×  ok
+  q3: W1=  38,899,532  W14=  12,309,239 events/s    0.32×  ok
+  q4: W1=   3,746,864  W14=   4,901,252 events/s    1.31×  ok
+  q9: W1=   2,505,279  W14=   4,626,371 events/s    1.85×  ok
+  q5: W1=     588,108  W14=   2,809,850 events/s    4.78×  ok
+  q7:      965,165 events/s  (single-only)
+  q8: W1=  25,076,905  W14=   9,561,403 events/s    0.38×  ok
+  q12: W1=   5,618,642  W14=   9,186,028 events/s    1.63×  ok
+  q15: W1=   5,218,373  W14=   3,803,070 events/s    0.73×  ok
+  q16: W1=   3,719,912  W14=   5,051,009 events/s    1.36×  ok
+  q17: W1=   4,128,498  W14=   7,084,023 events/s    1.72×  ok
+  q18: W1=   2,052,636  W14=   3,909,805 events/s    1.90×  ok
+  q19: W1=   2,216,119  W14=   5,488,084 events/s    2.48×  ok
+  q20: W1=   3,109,546  W14=   3,546,359 events/s    1.14×  ok
+  q22: W1=   2,567,496  W14=   9,098,305 events/s    3.54×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)
+## nx-ccd0-2 (DOTNET_TC_CallCountingDelayMs=0)
+  q0: W1=   5,788,615  W14=  12,697,369 events/s    2.19×  ok
+  q1: W1=   3,994,861  W14=  10,593,533 events/s    2.65×  ok
+  q2: W1=   7,282,824  W14=  12,012,964 events/s    1.65×  ok
+  q3: W1=  37,422,993  W14=  12,284,627 events/s    0.33×  ok
+  q4: W1=   3,748,654  W14=   4,884,912 events/s    1.30×  ok
+  q9: W1=   2,615,078  W14=   3,775,561 events/s    1.44×  ok
+  q5: W1=     587,485  W14=   2,511,306 events/s    4.27×  ok
+  q7:    1,005,428 events/s  (single-only)
+  q8: W1=  25,259,931  W14=   9,914,397 events/s    0.39×  ok
+  q12: W1=   5,544,051  W14=   9,121,285 events/s    1.65×  ok
+  q15: W1=   5,318,006  W14=   3,840,099 events/s    0.72×  ok
+  q16: W1=   3,727,718  W14=   5,148,776 events/s    1.38×  ok
+  q17: W1=   4,242,024  W14=   7,363,546 events/s    1.74×  ok
+  q18: W1=   2,073,874  W14=   5,065,080 events/s    2.44×  ok
+  q19: W1=   2,243,000  W14=   5,258,747 events/s    2.34×  ok
+  q20: W1=   3,136,725  W14=   3,459,212 events/s    1.10×  ok
+  q22: W1=   2,676,029  W14=   6,074,592 events/s    2.27×  ok
+  q11: unsupported — needs a SESSION windowing table function (Feldera omits q11 too — it has no session-window support)

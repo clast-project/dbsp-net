@@ -42,9 +42,11 @@ internal static class CheckpointGcMode
     /// </summary>
     internal static void AfterLazyRestore()
     {
+        // DBSPNET_RESTORE_GC=force (diagnostic): collect whatever the heap size.
+        var setting = Environment.GetEnvironmentVariable("DBSPNET_RESTORE_GC");
         if (!Runs.StateLayout.Runs || !Runs.RunColdGroups.Enabled
-            || Environment.GetEnvironmentVariable("DBSPNET_RESTORE_GC") == "0"
-            || GC.GetTotalMemory(forceFullCollection: false) < (1L << 30)) // a small heap has no debt worth paying early
+            || setting == "0"
+            || (setting != "force" && GC.GetTotalMemory(forceFullCollection: false) < (1L << 30))) // a small heap has no debt worth paying early
         {
             return;
         }
