@@ -1,0 +1,96 @@
+Issue #8: ccd0/R2R under the server GC env, .NET 10.0.15 vs 11.0.0 (2026-11-17). See design-durable-state.md.
+Commit ffb5482 (+ Decimal128 alias for net11). ivm-bench SF=3, W=12, IVM_OUTPUT_MODE=incremental, IVM_BCAST_MAXROWS=1000,
+DBSPNET_STATE_LAYOUT=runs, DOTNET_gcServer=1 DOTNET_gcConcurrent=0. Mac mini M4, 64 GiB, osx-arm64.
+Arms: il/r2r = JIT/ReadyToRun publish; 10/11 = runtime; c = DOTNET_TC_CallCountingDelayMs=0; d = DOTNET_GCDynamicAdaptationMode=0.
+Format: median [min-max] ms; ratio = resume b2 drain / straight b2 drain.
+
+== ab3: 5 alternating rounds
+round 1 Tue Nov 17 05:52:10 PST 2026 order: r2r11c il11 il10c r2r11 r2r10c il10 il11c r2r10
+round 2 Tue Nov 17 05:56:36 PST 2026 order: r2r11 il10c il11 r2r11c r2r10 il11c il10 r2r10c
+round 3 Tue Nov 17 06:01:03 PST 2026 order: il11c r2r10 r2r11c il11 il10c r2r11 r2r10c il10
+round 4 Tue Nov 17 06:05:28 PST 2026 order: il11 r2r11c r2r10 il11c il10 r2r10c r2r11 il10c
+round 5 Tue Nov 17 06:09:54 PST 2026 order: r2r10c il10 il11c r2r10 r2r11c il11 il10c r2r11
+il10: n=5/5  restore 184 [177-185] | resume b2 drain 458 [448-463] out 2942 [2891-3128] | straight b2 drain 96 [88-153] out 23 [23-24] | ratio 4.77x | b1 drain 12466 [12382-12657] out 1586 [1439-1670] | resume b3 236 [227-237] | restore->first-out 3576
+il10c: n=5/5  restore 168 [165-176] | resume b2 drain 416 [412-436] out 1805 [1764-1827] | straight b2 drain 110 [101-120] out 22 [22-24] | ratio 3.78x | b1 drain 8736 [8619-9199] out 1140 [1059-1227] | resume b3 178 [162-179] | restore->first-out 2390
+il11: n=5/5  restore 178 [177-188] | resume b2 drain 420 [414-436] out 3538 [3492-3659] | straight b2 drain 62 [60-74] out 23 [23-24] | ratio 6.77x | b1 drain 14028 [13719-14271] out 1521 [1488-1558] | resume b3 187 [181-199] | restore->first-out 4146
+il11c: n=5/5  restore 173 [171-187] | resume b2 drain 389 [374-397] out 1870 [1831-1901] | straight b2 drain 57 [50-57] out 22 [22-23] | ratio 6.82x | b1 drain 10032 [9809-10285] out 1094 [1086-1126] | resume b3 116 [105-138] | restore->first-out 2429
+r2r10: n=5/5  restore 162 [159-164] | resume b2 drain 272 [268-279] out 3334 [3023-3532] | straight b2 drain 94 [92-102] out 14 [14-15] | ratio 2.89x | b1 drain 12450 [12326-12676] out 1691 [1632-1901] | resume b3 179 [161-188] | restore->first-out 3768
+r2r10c: n=5/5  restore 149 [141-157] | resume b2 drain 251 [244-256] out 2078 [2069-2085] | straight b2 drain 104 [92-111] out 13 [13-14] | ratio 2.41x | b1 drain 8981 [8852-9188] out 1260 [1227-1405] | resume b3 201 [183-207] | restore->first-out 2474
+r2r11: n=5/5  restore 174 [170-185] | resume b2 drain 222 [219-238] out 3957 [3774-4044] | straight b2 drain 49 [46-64] out 14 [14-15] | ratio 4.53x | b1 drain 13403 [13059-13973] out 1713 [1644-1990] | resume b3 124 [115-131] | restore->first-out 4361
+r2r11c: n=5/5  restore 173 [162-179] | resume b2 drain 186 [180-189] out 2602 [2579-2652] | straight b2 drain 44 [44-51] out 14 [14-15] | ratio 4.23x | b1 drain 10213 [10026-10617] out 1448 [1373-1473] | resume b3 144 [133-163] | restore->first-out 2966
+BAD: []
+
+== ab3 averages: batch 1 (straight) and resumed batch 2 GC/JIT
+il10 b1: jit_ms=4147.2 drain_alloc_gib=43.6 gen2=6.0 gc_pause_ms=3396.8 | resume b2: jit_ms=1530 output_gc_ms=71 gc_pause_ms=92 
+il10c b1: jit_ms=4046.6 drain_alloc_gib=43.5 gen2=6.6 gc_pause_ms=3515.4 | resume b2: jit_ms=1811 output_gc_ms=67 gc_pause_ms=87 
+il11 b1: jit_ms=5155.0 drain_alloc_gib=43.6 gen2=11.8 gc_pause_ms=4799.2 | resume b2: jit_ms=1760 output_gc_ms=161 gc_pause_ms=188 
+il11c b1: jit_ms=4402.6 drain_alloc_gib=43.5 gen2=12.0 gc_pause_ms=4564.2 | resume b2: jit_ms=1942 output_gc_ms=156 gc_pause_ms=178 
+r2r10 b1: jit_ms=3840.4 drain_alloc_gib=43.7 gen2=6.6 gc_pause_ms=3482.0 | resume b2: jit_ms=1244 output_gc_ms=67 gc_pause_ms=87 
+r2r10c b1: jit_ms=3542.0 drain_alloc_gib=43.5 gen2=6.8 gc_pause_ms=3576.8 | resume b2: jit_ms=1640 output_gc_ms=64 gc_pause_ms=89 
+r2r11 b1: jit_ms=4382.8 drain_alloc_gib=43.7 gen2=12.8 gc_pause_ms=4557.2 | resume b2: jit_ms=1465 output_gc_ms=152 gc_pause_ms=189 
+r2r11c b1: jit_ms=4145.4 drain_alloc_gib=43.5 gen2=12.4 gc_pause_ms=4680.6 | resume b2: jit_ms=1884 output_gc_ms=159 gc_pause_ms=182 
+
+== ab4: DATAS check, 3 rounds
+round 1 Tue Nov 17 06:12:15 PST 2026
+round 2 Tue Nov 17 06:14:10 PST 2026
+round 3 Tue Nov 17 06:16:05 PST 2026
+r2r10c: n=3/3  restore 147 [147-151] | resume b2 drain 252 [251-253] out 2065 [2060-2085] | straight b2 drain 107 [102-124] out 13 [13-14] | ratio 2.36x | b1 drain 8900 [8874-8904] out 1226 [1224-1261] | resume b3 190 [188-195] | restore->first-out 2463
+r2r10cd: n=3/3  restore 148 [144-149] | resume b2 drain 250 [247-260] out 2092 [2084-2100] | straight b2 drain 98 [97-103] out 14 [14-14] | ratio 2.55x | b1 drain 8849 [8741-8906] out 1366 [1232-1448] | resume b3 197 [194-198] | restore->first-out 2483
+r2r11c: n=3/3  restore 173 [161-175] | resume b2 drain 187 [182-189] out 2563 [2559-2570] | straight b2 drain 44 [42-45] out 14 [13-15] | ratio 4.25x | b1 drain 10158 [9921-10404] out 1436 [1372-1451] | resume b3 157 [145-161] | restore->first-out 2925
+r2r11cd: n=3/3  restore 164 [158-166] | resume b2 drain 183 [179-194] out 2513 [2481-2537] | straight b2 drain 56 [45-60] out 14 [14-14] | ratio 3.27x | b1 drain 8870 [8465-9035] out 1572 [1484-1580] | resume b3 139 [128-145] | restore->first-out 2850
+BAD: []
+r2r10c b1: gen2=7 gc_pause_ms=3494 
+r2r10cd b1: gen2=7 gc_pause_ms=3373 
+r2r11c b1: gen2=12 gc_pause_ms=4567 
+r2r11cd b1: gen2=7 gc_pause_ms=3185 
+
+== nx3: Nexmark 10M events, batch 10k, 3 runs, W=1 and W=14; 2 alternating passes; DbspNet.Benchmarks own GC config
+10-1 Tue Nov 17 06:24:27 PST 2026
+11c-1 Tue Nov 17 06:31:35 PST 2026
+10cd-1 Tue Nov 17 06:38:55 PST 2026
+11-1 Tue Nov 17 06:46:15 PST 2026
+10c-1 Tue Nov 17 06:53:32 PST 2026
+11cd-1 Tue Nov 17 07:00:38 PST 2026
+11cd-2 Tue Nov 17 07:07:40 PST 2026
+10c-2 Tue Nov 17 07:15:05 PST 2026
+11-2 Tue Nov 17 07:22:17 PST 2026
+10cd-2 Tue Nov 17 07:29:36 PST 2026
+11c-2 Tue Nov 17 07:36:47 PST 2026
+10-2 Tue Nov 17 07:44:15 PST 2026
+
+--- W1: net10 default M events/s (mean of 2 passes), other arms as ratio to it; per-pass raw in brackets
+q0     5.83  10c=1.00  10cd=0.97  11=0.99  11c=1.00  11cd=1.02   raw: 10:5.82/5.84 10c:5.81/5.82 10cd:5.49/5.78 11:5.79/5.75 11c:5.86/5.84 11cd:5.95/5.94
+q1     3.97  10c=0.97  10cd=1.02  11=1.03  11c=1.04  11cd=1.01   raw: 10:4.00/3.95 10c:3.87/3.83 10cd:4.00/4.06 11:4.11/4.04 11c:4.13/4.14 11cd:3.90/4.13
+q2     7.31  10c=0.99  10cd=1.00  11=0.99  11c=1.00  11cd=1.02   raw: 10:7.34/7.29 10c:7.12/7.30 10cd:7.34/7.31 11:7.24/7.22 11c:7.35/7.34 11cd:7.45/7.46
+q3    39.09  10c=0.97  10cd=0.96  11=1.01  11c=1.00  11cd=0.98   raw: 10:39.09/39.09 10c:38.02/37.95 10cd:36.72/38.67 11:39.38/39.90 11c:39.61/38.69 11cd:38.55/38.44
+q4     3.74  10c=1.00  10cd=1.01  11=0.99  11c=1.01  11cd=1.00   raw: 10:3.72/3.76 10c:3.76/3.75 10cd:3.77/3.77 11:3.69/3.74 11c:3.80/3.78 11cd:3.66/3.84
+q9     2.57  10c=0.94  10cd=1.01  11=1.02  11c=1.01  11cd=1.01   raw: 10:2.55/2.58 10c:2.24/2.58 10cd:2.58/2.58 11:2.59/2.62 11c:2.61/2.56 11cd:2.59/2.61
+q5     0.59  10c=1.07  10cd=1.05  11=1.02  11c=1.01  11cd=1.02   raw: 10:0.58/0.59 10c:0.64/0.61 10cd:0.61/0.62 11:0.58/0.62 11c:0.60/0.59 11cd:0.59/0.60
+q8    25.47  10c=0.91  10cd=0.97  11=0.89  11c=0.87  11cd=0.96   raw: 10:25.14/25.81 10c:21.26/25.05 10cd:24.91/24.62 11:24.56/20.58 11c:21.37/22.75 11cd:23.04/25.66
+q12    5.34  10c=1.02  10cd=1.02  11=1.03  11c=1.05  11cd=1.06   raw: 10:5.28/5.41 10c:5.63/5.31 10cd:5.42/5.46 11:5.38/5.59 11c:5.61/5.62 11cd:5.64/5.63
+q15    5.29  10c=0.99  10cd=1.02  11=1.03  11c=1.05  11cd=1.03   raw: 10:5.27/5.31 10c:5.48/4.95 10cd:5.43/5.39 11:5.40/5.45 11c:5.53/5.53 11cd:5.45/5.43
+q16    3.61  10c=1.04  10cd=1.04  11=1.04  11c=1.05  11cd=1.03   raw: 10:3.61/3.61 10c:3.77/3.74 10cd:3.74/3.77 11:3.79/3.71 11c:3.82/3.77 11cd:3.67/3.79
+q17    4.35  10c=1.01  10cd=0.97  11=0.95  11c=0.97  11cd=1.00   raw: 10:4.38/4.32 10c:4.33/4.42 10cd:4.08/4.38 11:4.14/4.12 11c:4.19/4.24 11cd:4.39/4.27
+q18    2.07  10c=1.01  10cd=1.02  11=1.03  11c=1.01  11cd=1.07   raw: 10:2.17/1.97 10c:2.11/2.06 10cd:2.11/2.11 11:2.15/2.11 11c:2.12/2.08 11cd:2.18/2.25
+q19    2.28  10c=1.02  10cd=1.01  11=0.97  11c=0.98  11cd=1.00   raw: 10:2.28/2.29 10c:2.33/2.32 10cd:2.30/2.31 11:2.20/2.24 11c:2.25/2.24 11cd:2.29/2.29
+q20    3.06  10c=1.02  10cd=1.03  11=1.01  11c=1.03  11cd=1.03   raw: 10:3.04/3.08 10c:3.23/3.05 10cd:3.05/3.24 11:2.98/3.21 11c:3.16/3.16 11cd:3.12/3.17
+q22    2.62  10c=0.97  10cd=1.04  11=0.98  11c=1.03  11cd=1.04   raw: 10:2.60/2.65 10c:2.73/2.37 10cd:2.72/2.74 11:2.49/2.67 11c:2.74/2.69 11cd:2.68/2.77
+geomean 10c=0.994 10cd=1.008 11=0.997 11c=1.007 11cd=1.017
+--- W14: net10 default M events/s (mean of 2 passes), other arms as ratio to it; per-pass raw in brackets
+q0    12.39  10c=0.99  10cd=1.02  11=1.11  11c=0.95  11cd=0.98   raw: 10:12.51/12.26 10c:12.04/12.44 10cd:12.71/12.68 11:13.56/13.96 11c:11.40/12.05 11cd:12.04/12.16
+q1    10.56  10c=0.98  10cd=1.03  11=0.97  11c=1.08  11cd=1.06   raw: 10:10.72/10.40 10c:10.16/10.58 10cd:10.97/10.75 11:10.18/10.35 11c:11.43/11.48 11cd:11.20/11.22
+q2    11.78  10c=0.98  10cd=1.03  11=0.97  11c=1.10  11cd=1.07   raw: 10:11.91/11.65 10c:11.17/11.83 10cd:12.13/12.03 11:11.48/11.34 11c:12.91/12.95 11cd:12.46/12.84
+q3    12.12  10c=1.02  10cd=1.01  11=1.08  11c=1.08  11cd=1.09   raw: 10:12.14/12.10 10c:12.30/12.31 10cd:12.24/12.34 11:13.21/13.00 11c:13.16/13.07 11cd:13.15/13.17
+q4     4.15  10c=1.01  10cd=1.10  11=1.24  11c=1.25  11cd=1.23   raw: 10:4.57/3.72 10c:4.62/3.76 10cd:4.63/4.54 11:5.19/5.14 11c:5.20/5.20 11cd:5.20/5.03
+q9     4.60  10c=1.00  10cd=1.00  11=1.03  11c=1.03  11cd=1.04   raw: 10:4.57/4.63 10c:4.64/4.59 10cd:4.63/4.54 11:4.76/4.73 11c:4.74/4.70 11cd:4.77/4.81
+q5     2.80  10c=0.95  10cd=1.00  11=0.97  11c=0.97  11cd=1.01   raw: 10:2.81/2.80 10c:2.82/2.51 10cd:2.79/2.81 11:2.71/2.71 11c:2.74/2.72 11cd:2.80/2.85
+q8     9.97  10c=1.03  10cd=1.03  11=1.09  11c=1.10  11cd=1.10   raw: 10:9.89/10.05 10c:10.38/10.22 10cd:10.32/10.25 11:10.85/10.92 11c:10.99/11.04 11cd:10.93/11.07
+q12    9.28  10c=0.99  10cd=0.82  11=1.03  11c=0.96  11cd=0.92   raw: 10:9.35/9.21 10c:9.09/9.21 10cd:9.17/6.12 11:9.54/9.51 11c:8.73/9.17 11cd:8.32/8.72
+q15    4.80  10c=1.02  10cd=0.93  11=1.04  11c=0.96  11cd=1.04   raw: 10:4.76/4.85 10c:4.91/4.90 10cd:4.95/4.02 11:4.88/5.08 11c:4.61/4.63 11cd:5.00/5.01
+q16    5.46  10c=0.98  10cd=0.99  11=0.92  11c=0.91  11cd=0.98   raw: 10:5.44/5.48 10c:5.40/5.35 10cd:5.33/5.46 11:4.94/5.15 11c:4.93/4.97 11cd:5.46/5.29
+q17    7.96  10c=1.01  10cd=1.03  11=0.93  11c=1.00  11cd=1.04   raw: 10:8.00/7.91 10c:8.05/7.98 10cd:8.44/7.93 11:7.47/7.27 11c:8.32/7.53 11cd:8.51/8.05
+q18    5.72  10c=0.99  10cd=1.00  11=0.80  11c=0.89  11cd=1.02   raw: 10:5.64/5.80 10c:5.55/5.78 10cd:5.75/5.69 11:4.71/4.44 11c:5.04/5.18 11cd:6.01/5.71
+q19    5.35  10c=1.00  10cd=1.02  11=1.01  11c=1.00  11cd=1.02   raw: 10:5.40/5.30 10c:5.42/5.30 10cd:5.38/5.58 11:5.21/5.56 11c:5.53/5.17 11cd:5.60/5.29
+q20    4.35  10c=1.10  10cd=1.10  11=1.14  11c=1.10  11cd=1.12   raw: 10:4.93/3.77 10c:4.76/4.82 10cd:4.78/4.83 11:4.98/4.90 11c:4.54/5.00 11cd:4.86/4.85
+q22    9.23  10c=0.97  10cd=1.00  11=1.04  11c=1.05  11cd=1.05   raw: 10:9.21/9.25 10c:9.24/8.69 10cd:9.30/9.20 11:10.01/9.17 11c:9.98/9.38 11cd:9.67/9.72
+geomean 10c=1.001 10cd=1.006 11=1.018 11c=1.024 11cd=1.046

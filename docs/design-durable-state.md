@@ -1405,6 +1405,54 @@ Knob split, 3 rounds: E = R2R + ccd0 only: drain 263 (2.5×), write 2,143, resta
 Not built. Shipping R2R needs a RID in both server Dockerfiles; ccd0 is an environment variable
 (Dockerfile `ENV`). Both wait on Curt.
 
+### The knobs under the server's GC settings, and .NET 10 vs .NET 11 (2026-11-17, issue #8)
+
+Raw data: `docs/restart-tiering-net11-20261117.txt`. Same recipe and the same commit (ffb5482, with the
+`Decimal128` alias below for net11), but with the ivm-bench server's GC environment (`DOTNET_gcServer=1
+DOTNET_gcConcurrent=0`, DATAS at its default; the 11-15 runs left `gcConcurrent` at its default).
+Runtimes 10.0.15 and 11.0.0. Five alternating rounds of 8 arms, each a resume run and a straight run,
+every restore `view_rows_match=True`; ms, medians:
+
+| arm | batch-1 drain | b2 drain, no restart | b2 drain after restore | first write after restore | restart → first output |
+|---|--:|--:|--:|--:|--:|
+| net10 IL (shipped) | 12,466 | 96 | 458 | 2,942 | 3,576 |
+| net10 IL + ccd0 | 8,736 | 110 | 416 | 1,805 | **2,390** |
+| net10 R2R | 12,450 | 94 | 272 | 3,334 | 3,768 |
+| net10 R2R + ccd0 | 8,981 | 104 | 251 | 2,078 | 2,474 |
+| net11 IL | 14,028 | 62 | 420 | 3,538 | 4,146 |
+| net11 IL + ccd0 | 10,032 | 57 | 389 | 1,870 | 2,429 |
+| net11 R2R | 13,403 | 49 | 222 | 3,957 | 4,361 |
+| net11 R2R + ccd0 | 10,213 | 44 | 186 | 2,602 | 2,966 |
+
+DATAS check, 3 rounds, all R2R + ccd0 (DATAS0 = `DOTNET_GCDynamicAdaptationMode=0`): net10 8,900 /
+8,849 (DATAS0) batch 1, first write 2,065 / 2,092; net11 10,158 / **8,870** batch 1, first write 2,563 /
+2,513.
+
+- **ccd0 holds under the server's GC settings, on both runtimes:** batch 1 −28–30%, first write after
+  restore −1.1–1.3 s. No crash in these 80 runs (20 fresh ccd0 resume starts) or the 24 of the DATAS check.
+- **R2R is a wash for restart → first output.** It cuts the restored drain (416 → 251 ms on net10), but the
+  first write gets slower by about as much (1,805 → 2,078), on both runtimes. ccd0 does nearly all of the
+  work; R2R matters only if the restored drain is the metric.
+- **net11's batch-1 slowdown (+8–15%) is DATAS.** Allocation is identical (43.6 GiB), but net11 runs twice the
+  gen-2 collections (6 → 12) and pauses ~1.2 s longer. DATAS0 restores net10's time (8.87 vs 8.90 s,
+  gen-2 back to 7); on net10 it does nothing. The June preview showed the same retune on Nexmark.
+- **net11 halves the small-batch drain** (no restart 94 → 49 ms, after restore 272 → 222 ms R2R). The
+  restart *ratio* therefore looks worse (4.2–4.5×) while every absolute number improves. The 2× target
+  is a ratio against a denominator the runtime just halved.
+- **net11's first write after restore is ~0.45 s slower** than net10's, with DATAS0 and equal GC pauses
+  (~80 ms). That is the runtime, not GC; not attributed further.
+- **Nexmark 10M, two alternating passes per arm, geometric mean vs net10 default:** W=1 all six arms within
+  ±2%. W=14: ccd0 neutral on both runtimes (net10 1.001; net11 1.024 vs 1.018); net11 1.018 (q4 +24%,
+  q20 +14%, q18 −20%); net11 + ccd0 + DATAS0 1.046 (q18 back to 1.02); net10 + ccd0 + DATAS0 1.006.
+- **net11 does not build as-is:** it adds `System.Numerics.Decimal128`, ambiguous with
+  `Clast.DatabaseDecimal.Values.Decimal128` (CS0104) in `StructuralRowHash.cs` and
+  `TypedLinearAggregators.cs`. A `using` alias in each fixes it and is inert on net10. Retargeting also
+  touches six TFM pins (`Directory.Build.props`, Arrow, Persistence, Connectors.Abstractions,
+  Connectors.EngineeredWood, Server).
+
+Recommendation: ship ccd0 alone (Dockerfile `ENV`); R2R optional. When moving to net11, add DATAS0 in the
+same change. Still waiting on Curt.
+
 ### Targets (approved 2026-10-31)
 
 On ivm-bench SF=3, W=8 and W=12, 5 alternating runs per arm:
