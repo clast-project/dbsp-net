@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 using System.Numerics;
 using Clast.DatabaseDecimal.Values;
+using Decimal128 = Clast.DatabaseDecimal.Values.Decimal128;
 
 namespace DbspNet.Core.Collections;
 
