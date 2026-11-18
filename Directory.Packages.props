@@ -5,7 +5,7 @@
   <ItemGroup>
     <PackageVersion Include="Apache.Arrow" Version="23.0.0" />
     <PackageVersion Include="Clast.BloomFilter" Version="0.2.0" />
-    <PackageVersion Include="Clast.DatabaseDecimal" Version="0.3.0" />
+    <PackageVersion Include="Clast.DatabaseDecimal" Version="0.4.0" />
     <PackageVersion Include="coverlet.collector" Version="6.0.4" />
     <PackageVersion Include="CsCheck" Version="4.4.0" />
     <PackageVersion Include="EngineeredWood.DeltaLake.Table" Version="0.4.0" />
