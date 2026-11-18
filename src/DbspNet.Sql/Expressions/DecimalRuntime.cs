@@ -123,8 +123,14 @@ internal static class DecimalRuntime
     public static double ToDouble(Decimal128 value, int scale) =>
         (double)value.Mantissa / Math.Pow(10, scale);
 
-    public static Utf8String ToUtf8(Decimal128 value, DecimalType type) =>
-        Utf8String.Of(DecimalText.Format(value, type));
+    /// <summary>DECIMAL → VARCHAR formatted straight to UTF-8 bytes; no intermediate string.</summary>
+    public static Utf8String ToUtf8(Decimal128 value, DecimalType type)
+    {
+        Span<byte> buf = stackalloc byte[DecimalText.MaxFormattedLength(type)];
+        return DecimalText.TryFormat(value, type, buf, out var n)
+            ? Utf8String.FromBytes(buf[..n].ToArray())
+            : Utf8String.Of(DecimalText.Format(value, type));
+    }
 
     public static int ToInt32(Decimal128 value, int scale) =>
         checked((int)ScaleHelper.Rescale128(value.Mantissa, scale, 0, DecimalRounding.HalfUp));

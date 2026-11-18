@@ -1,9 +1,12 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using Clast.DatabaseDecimal;
+using Clast.DatabaseDecimal.Binary;
 using Clast.DatabaseDecimal.Values;
 using DbspNet.Sql.TypeSystem;
 
@@ -129,9 +132,9 @@ internal static class ArrowColumns
         // widen it to Int128.
         SqlDecimalType => array switch
         {
-            Decimal128Array d128 => ExtractDecimal(d128, from, rowCount),
-            Decimal64Array d64 => ExtractDecimal64(d64, from, rowCount),
-            Decimal32Array d32 => ExtractDecimal32(d32, from, rowCount),
+            Decimal128Array d128 => ExtractDecimal(d128, 16, from, rowCount),
+            Decimal64Array d64 => ExtractDecimal(d64, 8, from, rowCount),
+            Decimal32Array d32 => ExtractDecimal(d32, 4, from, rowCount),
             _ => throw new NotSupportedException(
                 $"DECIMAL source column is {array.GetType().Name}; expected Decimal32/64/128Array"),
         },
@@ -419,52 +422,33 @@ internal static class ArrowColumns
         return result;
     }
 
-    private static object?[] ExtractDecimal64(Decimal64Array a, int from, int n)
+    /// <summary>
+    /// Decodes an Arrow decimal column (16-, 8- or 4-byte little-endian two's-complement mantissas)
+    /// into <see cref="Decimal128"/> cells. <see cref="DecimalBinary"/> owns the layout: at width 16 on
+    /// a little-endian host it is one block copy; narrower widths sign-extend to Int128 (the same
+    /// scaled value).
+    /// </summary>
+    private static object?[] ExtractDecimal(Apache.Arrow.Arrays.FixedSizeBinaryArray a, int byteWidth, int from, int n)
     {
         var result = new object?[n];
-        for (var i = 0; i < n; i++)
+        if (n == 0)
         {
-            // 8-byte little-endian signed mantissa; sign-extend to Int128 (same scaled value).
-            result[i] = a.IsNull(from + i)
-                ? null
-                : new Decimal128((Int128)BinaryPrimitives.ReadInt64LittleEndian(a.GetBytes(from + i)));
+            return result;
         }
 
-        return result;
-    }
-
-    private static object?[] ExtractDecimal32(Decimal32Array a, int from, int n)
-    {
-        var result = new object?[n];
-        for (var i = 0; i < n; i++)
+        var mantissas = ArrayPool<Decimal128>.Shared.Rent(n);
+        try
         {
-            // 4-byte little-endian signed mantissa; sign-extend to Int128.
-            result[i] = a.IsNull(from + i)
-                ? null
-                : new Decimal128((Int128)BinaryPrimitives.ReadInt32LittleEndian(a.GetBytes(from + i)));
-        }
-
-        return result;
-    }
-
-    private static object?[] ExtractDecimal(Decimal128Array a, int from, int n)
-    {
-        var result = new object?[n];
-        for (var i = 0; i < n; i++)
-        {
-            if (a.IsNull(from + i))
+            var source = a.ValueBuffer.Span.Slice((a.Offset + from) * byteWidth, n * byteWidth);
+            DecimalBinary.ReadDecimal128(source, byteWidth, DecimalByteOrder.LittleEndian, mantissas.AsSpan(0, n));
+            for (var i = 0; i < n; i++)
             {
-                result[i] = null;
-                continue;
+                result[i] = a.IsNull(from + i) ? null : mantissas[i];
             }
-
-            // Reinterpret the 16-byte Arrow Decimal128 buffer slot directly
-            // as Int128. Arrow stores Decimal128 little-endian; .NET's Int128
-            // in-memory layout is also little-endian on every supported
-            // platform (x64, ARM64), so the bit pattern matches with no
-            // shuffling. The previous BinaryPrimitives + Int128 ctor path
-            // produced the same value with extra arithmetic.
-            result[i] = new Decimal128(MemoryMarshal.Read<Int128>(a.GetBytes(from + i)));
+        }
+        finally
+        {
+            ArrayPool<Decimal128>.Shared.Return(mantissas);
         }
 
         return result;

@@ -964,21 +964,12 @@ internal static class SqlCasts
         double.TryParse(s.Span, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var value)
             ? value : ParseDouble(s.ToStringDecoded());
 
-    /// <summary>CAST(varchar AS DECIMAL): the decimal parser reads chars, so decode into a stack buffer
-    /// (exactly what <see cref="Utf8String.ToStringDecoded"/> would produce) instead of a new string.</summary>
+    /// <summary>CAST(varchar AS DECIMAL) straight from the UTF-8 bytes. Since Clast.DatabaseDecimal 0.4.0
+    /// the library's UTF-8 overload decodes (not byte-widens) into a bounded buffer, which is what this
+    /// method used to do by hand.</summary>
     public static Clast.DatabaseDecimal.Values.Decimal128 ParseDecimal128Utf8(
-        Utf8String s, Clast.DatabaseDecimal.DecimalType type, Clast.DatabaseDecimal.DecimalRounding rounding)
-    {
-        var bytes = s.Span;
-        if (bytes.Length <= 128)
-        {
-            Span<char> chars = stackalloc char[128];
-            var n = System.Text.Encoding.UTF8.GetChars(bytes, chars);
-            return Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128(chars[..n], type, rounding);
-        }
-
-        return Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128(s.ToStringDecoded().AsSpan(), type, rounding);
-    }
+        Utf8String s, Clast.DatabaseDecimal.DecimalType type, Clast.DatabaseDecimal.DecimalRounding rounding) =>
+        Clast.DatabaseDecimal.Text.DecimalText.ParseDecimal128(s.Span, type, rounding);
 
     // Number / boolean -> VARCHAR, formatted straight to UTF-8 bytes. The invariant-culture default
     // format is the same text NumericToString produces; the string path stays as the fallback.
